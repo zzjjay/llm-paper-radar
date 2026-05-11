@@ -100,12 +100,12 @@ def _full_block(rank: int, p: Paper) -> str:
 📡 来源: {_source_badge(p)}
 
 #### 中文摘要
-{p.summary_zh or ''}
+{p.summary_zh or ""}
 
 {hl_zh}
 
 #### English Summary
-{p.summary_en or ''}
+{p.summary_en or ""}
 
 {hl_en}
 
@@ -193,6 +193,7 @@ def render_daily(
 
 
 if __name__ == "__main__":
+
     @click.command()
     @click.option("--date", default=None)
     @click.option("--backfill-days", default=0, type=int)
@@ -213,8 +214,13 @@ if __name__ == "__main__":
                 print(f"render: skip {target.date()}")
                 continue
             render_daily(
-                target, in_path, digests_dir, readme, index,
-                cfg.render.full_top_n, cfg.filter.threshold,
+                target,
+                in_path,
+                digests_dir,
+                readme,
+                index,
+                cfg.render.full_top_n,
+                cfg.filter.threshold,
             )
             print(f"render: wrote digest for {target.date()}")
 

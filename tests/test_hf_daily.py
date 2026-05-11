@@ -32,10 +32,10 @@ async def test_hf_daily_fetch_includes_daily_and_trending():
 
 
 def test_parse_trending_ranks_extracts_arxiv_ids_with_position():
-    html = '''<a href="/papers/2402.17764">A</a>
+    html = """<a href="/papers/2402.17764">A</a>
 <div>noise</div>
 <a href="/papers/2503.12345">B</a>
-<a href="/papers/2402.17764">A again</a>'''
+<a href="/papers/2402.17764">A again</a>"""
     ranks = parse_trending_ranks(html)
     assert ranks["2402.17764"] == 1
     assert ranks["2503.12345"] == 2

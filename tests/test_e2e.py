@@ -15,10 +15,15 @@ from sources.base import Paper, SourceRecord
 
 def _mk_raw(id_, source, **extras):
     return Paper(
-        id=id_, title=f"Paper {id_}", authors=["A"], abstract=f"abs {id_}",
-        url=f"https://arxiv.org/abs/{id_}", pdf_url=None,
+        id=id_,
+        title=f"Paper {id_}",
+        authors=["A"],
+        abstract=f"abs {id_}",
+        url=f"https://arxiv.org/abs/{id_}",
+        pdf_url=None,
         published_at=datetime(2026, 5, 10, tzinfo=UTC),
-        primary_category="cs.CL", categories=["cs.CL"],
+        primary_category="cs.CL",
+        categories=["cs.CL"],
         sources=[SourceRecord(name=source, fetched_at=datetime.now(UTC), extras=extras)],
     )
 
@@ -30,18 +35,25 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     raw_root = tmp_path / "raw"
     raw_dir = raw_root / "2026-05-11"
     raw_dir.mkdir(parents=True)
-    (raw_dir / "arxiv.json").write_text(json.dumps([
-        _mk_raw("X", "arxiv").model_dump(mode="json"),
-        _mk_raw("Y", "arxiv").model_dump(mode="json"),
-    ]))
-    (raw_dir / "hf_daily.json").write_text(json.dumps([
-        _mk_raw("X", "hf_daily", upvotes=20).model_dump(mode="json"),
-    ]))
+    (raw_dir / "arxiv.json").write_text(
+        json.dumps(
+            [
+                _mk_raw("X", "arxiv").model_dump(mode="json"),
+                _mk_raw("Y", "arxiv").model_dump(mode="json"),
+            ]
+        )
+    )
+    (raw_dir / "hf_daily.json").write_text(
+        json.dumps(
+            [
+                _mk_raw("X", "hf_daily", upvotes=20).model_dump(mode="json"),
+            ]
+        )
+    )
 
-    cfg = Config(dedupe=DedupeConfig(
-        cross_day_strategy="lenient",
-        source_priority=["hf_daily", "arxiv"]
-    ))
+    cfg = Config(
+        dedupe=DedupeConfig(cross_day_strategy="lenient", source_priority=["hf_daily", "arxiv"])
+    )
 
     deduped_path = tmp_path / "deduped" / "2026-05-11.json"
     deduped_path.parent.mkdir()
@@ -66,8 +78,10 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     sum_prompt.write_text("summarize")
     fake_sum = AsyncMock()
     fake_sum.call_json.return_value = {
-        "summary_zh": "中文", "highlights_zh": ["🎯 a"],
-        "summary_en": "English", "highlights_en": ["🎯 a"],
+        "summary_zh": "中文",
+        "highlights_zh": ["🎯 a"],
+        "summary_en": "English",
+        "highlights_en": ["🎯 a"],
     }
     await summarize_papers(
         scored_path, summarized_path, sum_prompt, fake_sum, threshold=7, concurrency=2

@@ -72,8 +72,12 @@ if __name__ == "__main__":
                 continue
             n = asyncio.run(
                 summarize_papers(
-                    in_path, out_path, prompt_path, client,
-                    cfg.filter.threshold, cfg.summarize.concurrency,
+                    in_path,
+                    out_path,
+                    prompt_path,
+                    client,
+                    cfg.filter.threshold,
+                    cfg.summarize.concurrency,
                 )
             )
             print(f"summarize: processed {n} papers for {target.date()}")

@@ -32,11 +32,13 @@ class TwitterRSSHubSource(Source):
                 except httpx.HTTPError:
                     continue
                 for item in feed.entries:
-                    blob = " ".join([
-                        item.get("title", ""),
-                        item.get("description", ""),
-                        item.get("summary", ""),
-                    ])
+                    blob = " ".join(
+                        [
+                            item.get("title", ""),
+                            item.get("description", ""),
+                            item.get("summary", ""),
+                        ]
+                    )
                     for aid in extract_arxiv_ids(blob):
                         id_to_accounts.setdefault(aid, set()).add(acc)
 

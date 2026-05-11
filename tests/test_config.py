@@ -1,5 +1,7 @@
 from pathlib import Path
-from pipeline.config import load_config, Config
+
+from pipeline.config import Config, load_config
+
 
 def test_load_config_from_yaml(tmp_path: Path):
     yaml_text = """

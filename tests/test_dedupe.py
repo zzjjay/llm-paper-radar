@@ -29,7 +29,12 @@ def test_merge_papers_combines_sources_and_uses_priority():
     hf_p.abstract = "hf abs"
 
     priority = [
-        "hf_daily", "reddit", "semantic_scholar", "papers_with_code", "twitter_rsshub", "arxiv"
+        "hf_daily",
+        "reddit",
+        "semantic_scholar",
+        "papers_with_code",
+        "twitter_rsshub",
+        "arxiv",
     ]
     merged = merge_papers([arxiv_p, hf_p], priority)
     assert len(merged) == 1
@@ -61,10 +66,9 @@ def test_dedupe_for_date_writes_files_and_marks_seen_before(tmp_path: Path):
     out_path = tmp_path / "deduped" / "2026-05-11.json"
     out_path.parent.mkdir(parents=True)
 
-    cfg = Config(dedupe=DedupeConfig(
-        cross_day_strategy="lenient",
-        source_priority=["hf_daily", "arxiv"]
-    ))
+    cfg = Config(
+        dedupe=DedupeConfig(cross_day_strategy="lenient", source_priority=["hf_daily", "arxiv"])
+    )
     n = dedupe_for_date(
         date=datetime(2026, 5, 11, tzinfo=UTC),
         raw_root=tmp_path / "raw",

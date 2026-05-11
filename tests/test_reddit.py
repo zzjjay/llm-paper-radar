@@ -34,9 +34,7 @@ async def test_reddit_extracts_arxiv_links_only(monkeypatch):
     <link href="http://arxiv.org/pdf/2402.17764v1.pdf" type="application/pdf"/>
   </entry>
 </feed>"""
-    respx.get("http://export.arxiv.org/api/query").mock(
-        return_value=Response(200, text=arxiv_xml)
-    )
+    respx.get("http://export.arxiv.org/api/query").mock(return_value=Response(200, text=arxiv_xml))
 
     src = RedditSource(subreddit="LocalLLaMA", top_window="day")
     papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
@@ -61,10 +59,26 @@ async def test_reddit_returns_empty_when_no_arxiv_links(monkeypatch):
     no_links_fixture = {
         "data": {
             "children": [
-                {"data": {"id": "p1", "title": "How to fine-tune", "selftext": "no link here",
-                          "score": 10, "num_comments": 1, "permalink": "/r/x/p1/"}},
-                {"data": {"id": "p2", "title": "Random thread", "selftext": "",
-                          "score": 5, "num_comments": 0, "permalink": "/r/x/p2/"}},
+                {
+                    "data": {
+                        "id": "p1",
+                        "title": "How to fine-tune",
+                        "selftext": "no link here",
+                        "score": 10,
+                        "num_comments": 1,
+                        "permalink": "/r/x/p1/",
+                    }
+                },
+                {
+                    "data": {
+                        "id": "p2",
+                        "title": "Random thread",
+                        "selftext": "",
+                        "score": 5,
+                        "num_comments": 0,
+                        "permalink": "/r/x/p2/",
+                    }
+                },
             ]
         }
     }

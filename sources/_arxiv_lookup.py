@@ -1,4 +1,5 @@
 """Shared: extract arXiv IDs from text, refetch full metadata via arXiv API."""
+
 from __future__ import annotations
 
 import re

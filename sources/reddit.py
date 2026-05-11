@@ -44,9 +44,7 @@ class RedditSource(Source):
         id_to_extras: dict[str, dict] = {}
         for child in data.get("data", {}).get("children", []):
             post = child.get("data", {})
-            text_blob = " ".join(
-                [post.get("title", ""), post.get("selftext", "")]
-            )
+            text_blob = " ".join([post.get("title", ""), post.get("selftext", "")])
             ids = extract_arxiv_ids(text_blob)
             for aid in ids:
                 id_to_extras.setdefault(

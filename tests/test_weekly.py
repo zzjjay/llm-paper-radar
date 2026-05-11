@@ -8,10 +8,15 @@ from sources.base import Paper, SourceRecord
 
 def _mk(id_, score, day_offset):
     p = Paper(
-        id=id_, title=f"Title {id_}", authors=[], abstract="a",
-        url=f"https://x/{id_}", pdf_url=None,
+        id=id_,
+        title=f"Title {id_}",
+        authors=[],
+        abstract="a",
+        url=f"https://x/{id_}",
+        pdf_url=None,
         published_at=datetime(2026, 5, 10, tzinfo=UTC) - timedelta(days=day_offset),
-        primary_category="cs.CL", categories=["cs.CL"],
+        primary_category="cs.CL",
+        categories=["cs.CL"],
         sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
     )
     p.relevance_score = score

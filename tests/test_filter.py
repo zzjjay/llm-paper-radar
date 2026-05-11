@@ -11,10 +11,15 @@ from sources.base import Paper, SourceRecord
 
 def _mk(id_, title, abstract):
     return Paper(
-        id=id_, title=title, authors=[], abstract=abstract,
-        url="https://x", pdf_url=None,
+        id=id_,
+        title=title,
+        authors=[],
+        abstract=abstract,
+        url="https://x",
+        pdf_url=None,
         published_at=datetime(2026, 5, 10, tzinfo=UTC),
-        primary_category="cs.CL", categories=["cs.CL"],
+        primary_category="cs.CL",
+        categories=["cs.CL"],
         sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
     )
 
@@ -22,8 +27,7 @@ def _mk(id_, title, abstract):
 @pytest.mark.asyncio
 async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
-    deduped = [_mk("1", "FP4 quant for LLM", "Quantization."),
-               _mk("2", "Random RAG paper", "RAG.")]
+    deduped = [_mk("1", "FP4 quant for LLM", "Quantization."), _mk("2", "Random RAG paper", "RAG.")]
     deduped_path = tmp_path / "in.json"
     deduped_path.write_text(json.dumps([p.model_dump(mode="json") for p in deduped]))
     out_path = tmp_path / "scored.json"

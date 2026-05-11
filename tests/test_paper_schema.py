@@ -1,5 +1,7 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 import pytest
+
 from sources.base import Paper, SourceRecord
 
 
@@ -11,10 +13,10 @@ def test_paper_minimal_construction():
         abstract="We introduce a 1-bit LLM variant.",
         url="https://arxiv.org/abs/2402.17764",
         pdf_url="https://arxiv.org/pdf/2402.17764.pdf",
-        published_at=datetime(2026, 5, 10, tzinfo=timezone.utc),
+        published_at=datetime(2026, 5, 10, tzinfo=UTC),
         primary_category="cs.CL",
         categories=["cs.CL", "cs.LG"],
-        sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(timezone.utc))],
+        sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
     )
     assert p.id == "2402.17764"
     assert p.relevance_score is None
@@ -26,7 +28,7 @@ def test_paper_minimal_construction():
 def test_source_record_with_extras():
     r = SourceRecord(
         name="reddit",
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=datetime.now(UTC),
         extras={"score": 230, "num_comments": 67},
     )
     assert r.extras["score"] == 230
@@ -40,10 +42,10 @@ def test_paper_round_trip_json():
         abstract="a",
         url="https://x",
         pdf_url=None,
-        published_at=datetime(2026, 5, 10, tzinfo=timezone.utc),
+        published_at=datetime(2026, 5, 10, tzinfo=UTC),
         primary_category="cs.CL",
         categories=["cs.CL"],
-        sources=[SourceRecord(name="arxiv", fetched_at=datetime(2026, 5, 11, tzinfo=timezone.utc))],
+        sources=[SourceRecord(name="arxiv", fetched_at=datetime(2026, 5, 11, tzinfo=UTC))],
     )
     js = p.model_dump_json()
     p2 = Paper.model_validate_json(js)
@@ -53,4 +55,4 @@ def test_paper_round_trip_json():
 
 def test_invalid_source_name_rejected():
     with pytest.raises(ValueError):
-        SourceRecord(name="not_a_source", fetched_at=datetime.now(timezone.utc))
+        SourceRecord(name="not_a_source", fetched_at=datetime.now(UTC))

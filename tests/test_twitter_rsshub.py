@@ -29,9 +29,7 @@ async def test_twitter_rsshub_collects_arxiv_links(monkeypatch):
     <link href="http://arxiv.org/pdf/2402.17764v1.pdf" type="application/pdf"/>
   </entry>
 </feed>"""
-    respx.get("http://export.arxiv.org/api/query").mock(
-        return_value=Response(200, text=arxiv_xml)
-    )
+    respx.get("http://export.arxiv.org/api/query").mock(return_value=Response(200, text=arxiv_xml))
 
     src = TwitterRSSHubSource(accounts=["_akhaliq"])
     papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
