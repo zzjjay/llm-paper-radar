@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,7 @@ async def test_hf_daily_fetch_includes_daily_and_trending():
         return_value=Response(200, text=FIXTURE_TREND.read_text())
     )
     src = HFDailySource()
-    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=timezone.utc))
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
     assert len(papers) >= 1
 
     has_daily = any("upvotes" in s.extras for p in papers for s in p.sources)
@@ -51,5 +51,5 @@ async def test_hf_daily_continues_when_trending_fails():
         return_value=Response(500, text="oops")
     )
     src = HFDailySource()
-    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=timezone.utc))
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
     assert len(papers) >= 1

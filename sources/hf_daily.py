@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -43,7 +43,7 @@ class HFDailySource(Source):
             except httpx.HTTPError as e:
                 print(f"hf_daily: trending fetch failed ({e}); continuing with daily only")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         papers: dict[str, Paper] = {}
 
         for item in daily_items:
@@ -117,7 +117,7 @@ if __name__ == "__main__":
             print("hf_daily source disabled")
             return
         src = HFDailySource()
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
             papers = asyncio.run(src.fetch(target))
