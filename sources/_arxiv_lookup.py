@@ -68,4 +68,10 @@ async def fetch_arxiv_by_ids(
                 ],
             )
         )
+    if len(papers) < len(ids):
+        missing = set(ids) - {p.id for p in papers}
+        print(
+            f"_arxiv_lookup: arxiv returned {len(papers)}/{len(ids)} requested papers;"
+            f" missing: {sorted(missing)}"
+        )
     return papers
