@@ -55,6 +55,31 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_filter_skips_papers_with_empty_metadata(tmp_path: Path, monkeypatch):
+    """Trending-only stubs (e.g. hf_daily trending-rank-only entries) carry
+    no title/abstract and must be skipped before reaching the LLM — otherwise
+    Haiku invents scores from nothing."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    stub = _mk("stub", "", "")
+    real = _mk("real", "BitNet b1.58", "1-bit LLM with FP4 quantization.")
+    in_path = tmp_path / "in.json"
+    in_path.write_text(json.dumps([p.model_dump(mode="json") for p in [stub, real]]))
+    out_path = tmp_path / "scored.json"
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("score this")
+
+    fake = AsyncMock()
+    fake.call_json.return_value = {"relevance_score": 9, "reason": "good"}
+    await filter_papers(in_path, out_path, prompt_path, fake, concurrency=2)
+
+    out = json.loads(out_path.read_text())
+    by_id = {p["id"]: p for p in out}
+    assert by_id["stub"]["relevance_score"] is None
+    assert by_id["real"]["relevance_score"] == 9
+    assert fake.call_json.call_count == 1  # only the real paper was scored
+
+
+@pytest.mark.asyncio
 async def test_filter_handles_per_paper_failure(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
     deduped = [_mk("1", "good", "good"), _mk("2", "bad", "bad")]

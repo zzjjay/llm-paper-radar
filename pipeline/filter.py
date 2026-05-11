@@ -10,6 +10,12 @@ from sources.base import Paper
 
 
 async def _score_one(paper: Paper, prompt: str, client: LLMClient, sem: asyncio.Semaphore) -> Paper:
+    # Skip stub papers (e.g. hf_daily trending-only entries with no metadata).
+    # Without a title or abstract there is nothing for the LLM to assess.
+    if not paper.title.strip() or not paper.abstract.strip():
+        paper.relevance_score = None
+        paper.relevance_reason = "skipped: missing title/abstract"
+        return paper
     user_msg = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
     async with sem:
         try:
