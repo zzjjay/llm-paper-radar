@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from anthropic import AsyncAnthropic
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 class LLMClient:
@@ -24,8 +27,10 @@ class LLMClient:
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        if text.startswith("```"):
-            text = text.strip("`").split("\n", 1)[1].rsplit("```", 1)[0]
+        # Tolerate markdown fences and inline prose: extract first {...} block
+        m = _JSON_BLOCK_RE.search(text)
+        if m:
+            text = m.group(0)
         return json.loads(text)
 
 

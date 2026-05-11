@@ -90,6 +90,15 @@ def test_sort_papers_heat_primary_relevance_tiebreaker():
     assert [p.id for p in sorted_] == ["b", "c", "a"]
 
 
+def test_sort_papers_relevance_outweighs_modest_heat():
+    """A 9/10 paper with low heat should outrank an 8/10 paper with modest heat
+    (composite score = heat + relevance*RELEVANCE_WEIGHT pulls relevance up)."""
+    high_rel_low_heat = _mk("hr", 9, hf_upvotes=2)
+    mid_rel_modest_heat = _mk("mr", 8, hf_upvotes=18)
+    sorted_ = sort_papers([mid_rel_modest_heat, high_rel_low_heat])
+    assert [p.id for p in sorted_] == ["hr", "mr"]
+
+
 def test_render_daily_writes_top10_full_then_table(tmp_path: Path):
     summarized_path = tmp_path / "summarized.json"
     papers = [_mk(f"id{i}", 9, trending_rank=i + 1) for i in range(15)]

@@ -12,6 +12,7 @@ from sources.base import Paper
 
 REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
+RELEVANCE_WEIGHT = 20
 
 
 def heat_score(p: Paper) -> float:
@@ -37,11 +38,17 @@ def heat_score(p: Paper) -> float:
     return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5 + 10 * len(twitter_accounts)
 
 
+def composite_score(p: Paper) -> float:
+    """Heat + relevance*WEIGHT. Lets a 9/10 paper outweigh ~20 HF upvotes,
+    while a viral paper (trending #1 = +100 heat) can still surface lower-relevance work."""
+    return heat_score(p) + (p.relevance_score or 0) * RELEVANCE_WEIGHT
+
+
 def sort_papers(papers: list[Paper]) -> list[Paper]:
-    """Heat-primary; relevance breaks ties."""
+    """Composite primary; heat as tiebreaker."""
     return sorted(
         papers,
-        key=lambda p: (heat_score(p), p.relevance_score or 0),
+        key=lambda p: (composite_score(p), heat_score(p)),
         reverse=True,
     )
 
@@ -87,28 +94,36 @@ def _source_badge(p: Paper) -> str:
     return ", ".join(parts)
 
 
+def _summary_block(
+    label: str, summary: str | None, highlights: list[str], failed_label: str
+) -> str:
+    if not summary:
+        return f"#### {label}\n*{failed_label}*\n"
+    hl = "\n".join(f"- {h}" for h in highlights)
+    return f"#### {label}\n{summary}\n\n{hl}\n" if hl else f"#### {label}\n{summary}\n"
+
+
 def _full_block(rank: int, p: Paper) -> str:
     code_part = f" · [GitHub]({p.code_url})" if p.code_url else ""
+    pdf_part = f" · [PDF]({p.pdf_url})" if p.pdf_url else ""
     revisited = " 🔁" if p.seen_before else ""
-    hl_zh = "\n".join(f"- {h}" for h in p.highlights_zh)
-    hl_en = "\n".join(f"- {h}" for h in p.highlights_en)
     primary_source = p.sources[0].name if p.sources else "unknown"
+    cats = ", ".join(p.categories) if p.categories else p.primary_category
+    authors_short = ", ".join(p.authors[:3]) + ("..." if len(p.authors) > 3 else "")
+    zh_block = _summary_block(
+        "中文摘要", p.summary_zh, p.highlights_zh, "(摘要生成失败)"
+    )
+    en_block = _summary_block(
+        "English Summary", p.summary_en, p.highlights_en, "(Summary generation failed)"
+    )
     return f"""### {rank}. {p.title} ({p.relevance_score}/10){revisited}
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
-👥 {", ".join(p.authors[:3])}{"..." if len(p.authors) > 3 else ""} · 🏷 {", ".join(p.categories)}
-🔗 [arXiv]({p.url}) · [PDF]({p.pdf_url}){code_part}
+👥 {authors_short} · 🏷 {cats}
+🔗 [arXiv]({p.url}){pdf_part}{code_part}
 📡 来源: {_source_badge(p)}
 
-#### 中文摘要
-{p.summary_zh or ""}
-
-{hl_zh}
-
-#### English Summary
-{p.summary_en or ""}
-
-{hl_en}
-
+{zh_block}
+{en_block}
 ---
 """
 
