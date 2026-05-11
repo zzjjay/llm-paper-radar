@@ -1,133 +1,14 @@
 # LLM 推理优化日报 · 2026-05-11
 
 > 📅 抓取窗口: 2026-05-11 (UTC daily window)
-> 📊 共扫描 93 篇 → 通过过滤 5 篇 (阈值 ≥7)
+> 📊 共扫描 93 篇 → 通过过滤 0 篇 (阈值 ≥7)
 
 > 这是 [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar) 自动生成的最新一日 digest。
 > 历史: [INDEX.md](INDEX.md) · 配置: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
 
-## 🔥 Top 5 (Full Detail)
-
-### 1. UniPrefill: Universal Long-Context Prefill Acceleration via Block-wise Dynamic Sparsification (8/10)
-**hf_daily** · `2605.06221` · 2026-05-07
-👥 Qihang Fan, Huaibo Huang, Zhiying Wu... · 🏷 
-🔗 [arXiv](https://arxiv.org/abs/2605.06221) · [PDF](https://arxiv.org/pdf/2605.06221.pdf)
-📡 来源: hf_daily (👍 18, 💬 1)
-
-#### 中文摘要
-现有长上下文 prefill 加速方法（稀疏 attention）主要针对全注意力模型，迁移到线性/滑动窗口混合架构时性能显著下降，且与 continuous batching 不兼容，难以集成进 vLLM 等推理引擎。UniPrefill 提出块级动态稀疏化框架，在 token 级别直接加速计算，覆盖几乎任意模型架构。该框架以 continuous batching operator 形式实现，并扩展 vLLM 调度策略以原生支持 prefill-decode 协同处理与 tensor parallel，TTFT 最高加速 2.1×，且随并发请求数增加加速效果更显著。
-
-- 🎯 方法：块级动态稀疏化在 token 级别加速计算，统一支持全注意力、线性/全注意力混合、滑动窗口/全注意力混合等架构
-- 📊 结果：TTFT 最高加速 2.1×，并发请求数增大时加速比进一步提升
-- 🔧 工程：以 continuous batching operator 集成进 vLLM，扩展调度器原生支持 prefill-decode 协同与 tensor parallel
-- 💡 创新：首个兼容 continuous batching 的通用 prefill 加速框架，解决现有稀疏 attention 方法的架构局限性
-
-#### English Summary
-Existing long-context prefill acceleration methods based on sparse attention are largely limited to full-attention models and suffer significant performance degradation when applied to hybrid architectures (e.g., linear/full or sliding window/full attention hybrids); they are also generally incompatible with continuous batching, hindering integration with modern inference engines like vLLM. UniPrefill introduces a block-wise dynamic sparsification framework that accelerates computation at the token level and is applicable to virtually any model architecture. It is implemented as a continuous batching operator with extended vLLM scheduling that natively supports prefill-decode co-processing and tensor parallelism, achieving up to 2.1× TTFT speedup that scales with the number of concurrent requests.
-
-- 🎯 Method: Block-wise dynamic sparsification at the token level, universally supporting full-attention, linear/full-attention hybrid, and sliding window/full-attention hybrid architectures
-- 📊 Result: Up to 2.1× TTFT speedup, with acceleration becoming more pronounced as concurrent request count increases
-- 🔧 Engineering: Integrated into vLLM as a continuous batching operator with extended scheduler for native prefill-decode co-processing and tensor parallel support
-- 💡 Innovation: First prefill acceleration framework compatible with continuous batching, overcoming the architectural limitations of existing sparse attention approaches
-
----
-
-### 2. MISA: Mixture of Indexer Sparse Attention for Long-Context LLM Inference (8/10)
-**hf_daily** · `2605.07363` · 2026-05-08
-👥 Ruijie Zhou, Fanxu Meng, Yufei Xu... · 🏷 
-🔗 [arXiv](https://arxiv.org/abs/2605.07363) · [PDF](https://arxiv.org/pdf/2605.07363.pdf)
-📡 来源: hf_daily (👍 12, 💬 1)
-
-#### 中文摘要
-
-
-
-
-#### English Summary
-
-
-
-
----
-
-### 3. Fast Byte Latent Transformer (7/10)
-**hf_daily** · `2605.08044` · 2026-05-08
-👥 Julie Kallini, Artidoro Pagnoni, Tomasz Limisiewicz... · 🏷 
-🔗 [arXiv](https://arxiv.org/abs/2605.08044) · [PDF](https://arxiv.org/pdf/2605.08044.pdf)
-📡 来源: hf_daily (👍 5)
-
-#### 中文摘要
-字节级语言模型（BLT）无需子词词表即可匹配 token 级模型性能，但逐字节自回归生成速度慢。本文针对 BLT 推理瓶颈提出三种方法：BLT-D 引入块级扩散目标（block-wise diffusion），实现每步并行生成多个字节；BLT-S 借鉴 speculative decoding，让本地解码器越过正常 patch 边界起草字节再用全模型验证；BLT-DV 在扩散生成后增加自回归验证步骤提升质量。三种方法在生成任务上内存带宽开销均比原 BLT 降低 50% 以上。
-
-- 🎯 BLT-D：在标准 next-byte 预测损失之外引入块级扩散辅助目标，每个解码步并行生成多字节，大幅减少前向传播次数
-- 📊 所有方法在生成任务上内存带宽消耗估算比原 BLT 低 >50%
-- 💡 BLT-S：本地解码器越过正常 patch 边界生成草稿字节，再用单次全模型前向传播验证，速度与质量可灵活权衡
-- 🔧 BLT-DV：扩散生成 + 自回归验证两阶段结合，在 BLT-D 速度基础上提升生成质量
-
-#### English Summary
-Byte-level language models like BLT match token-level performance without subword vocabularies, but suffer from slow byte-by-byte autoregressive generation. This work introduces three methods to accelerate BLT inference: BLT-D trains with an auxiliary block-wise diffusion objective to generate multiple bytes in parallel per decoding step; BLT-S applies speculative decoding principles by having the local decoder draft bytes past normal patch boundaries, verified with a single full-model forward pass; BLT-DV augments BLT-D with an autoregressive verification step after diffusion-based generation to recover quality. All three methods achieve an estimated memory-bandwidth cost over 50% lower than standard BLT on generation tasks.
-
-- 🎯 BLT-D: adds a block-wise diffusion auxiliary objective alongside next-byte prediction loss, enabling parallel multi-byte generation per decoding step to reduce forward pass count
-- 📊 All proposed methods achieve estimated >50% reduction in memory-bandwidth cost vs. baseline BLT on generation tasks
-- 💡 BLT-S: local decoder drafts bytes beyond normal patch boundaries, verified in a single full-model forward pass—offering a speed-quality tradeoff similar to speculative decoding
-- 🔧 BLT-DV: two-stage pipeline combining diffusion-based parallel generation with an autoregressive verification step to improve output quality over BLT-D
-
----
-
-### 4. SpecBlock: Block-Iterative Speculative Decoding with Dynamic Tree Drafting (9/10)
-**hf_daily** · `2605.07243` · 2026-05-08
-👥 Weijie Shi, Qiang Xu, Fan Deng... · 🏷 
-🔗 [arXiv](https://arxiv.org/abs/2605.07243) · [PDF](https://arxiv.org/pdf/2605.07243.pdf)
-📡 来源: hf_daily (👍 2, 💬 2)
-
-#### 中文摘要
-Speculative decoding 中，自回归 drafter（如 EAGLE-3）保留路径依赖但每层都需调用一次 drafter，开销不低；并行 drafter 一次前向预测多个位置但忽略位置间依赖，导致验证拒绝率高。SpecBlock 提出块迭代（block-iterative）drafting：每次前向生成 K 个有依赖关系的 token（一个 block），通过层内 hidden state 位移和跨 block 继承传递路径依赖。配合联合训练的 rank head 动态分配分支预算、valid-prefix mask 过滤无效训练前缀，以及部署时基于 bandit 的选择性在线适应，SpecBlock 以 EAGLE-3 44–52% 的 drafting 开销实现 8–13% 更高的平均加速比，在线适应后进一步提升至 11–19%。
-
-- 🎯 方法：块迭代 drafting，每次前向生成 K 个依赖 token，层内 hidden state shift + 跨 block 继承同时保留路径依赖
-- 📊 结果：以 EAGLE-3 drafting 开销的 44–52% 实现 8–13% 更高的平均加速比
-- 💡 创新：co-trained rank head 动态分配各位置分支数，替代固定 top-k 树结构
-- 🔧 工程：cost-aware bandit 利用验证器免费反馈做选择性在线更新，进一步将加速优势扩大至 11–19%
-
-#### English Summary
-Speculative decoding acceleration is constrained by a trade-off: autoregressive drafters like EAGLE-3 maintain token dependency but incur one drafter call per tree depth, while parallel drafters reduce calls but ignore inter-position dependency, raising rejection rates. SpecBlock introduces a block-iterative drafting strategy where each forward pass produces K dependent positions via intra-block layer-wise hidden state shifting and inter-block state inheritance, preserving path dependence at low cost. A co-trained rank head dynamically allocates branching budgets per position, and a valid-prefix mask prevents training on unreachable prefixes. A cost-aware bandit at deployment selectively applies online updates only when throughput gain justifies the update cost, extending the advantage further. SpecBlock achieves 8–13% higher mean speedup over EAGLE-3 at only 44–52% of its drafting cost, extending to 11–19% with online adaptation.
-
-- 🎯 Method: Block-iterative drafting generates K dependent tokens per forward via intra-block hidden state shift and inter-block state inheritance
-- 📊 Result: 8–13% higher mean speedup over EAGLE-3 at 44–52% of its drafting cost
-- 💡 Innovation: Co-trained rank head dynamically allocates per-position branching budget, replacing fixed top-k tree construction
-- 🔧 Engineering: Cost-aware bandit leverages free verifier feedback for selective online updates, boosting speedup advantage to 11–19%
-
----
-
-### 5. Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility (9/10)
-**hf_daily** · `2605.06105` · 2026-05-07
-👥 Jungsuk Oh, Hyeseo Jeon, Hyunjune Ji... · 🏷 
-🔗 [arXiv](https://arxiv.org/abs/2605.06105) · [PDF](https://arxiv.org/pdf/2605.06105.pdf)
-📡 来源: hf_daily (👍 1, 💬 1)
-
-#### 中文摘要
-decoder-only LLM 的长上下文推理瓶颈在于 prefill 阶段的 prompt token 在每层都需缓存 KV 并在 decode 阶段反复被 attend。SPEED 提出非对称 KV 可见性策略：prompt token 的 KV 状态只在浅层（低层）物化，而 decode 阶段的 token 保持全深度；仅保留一个 BoS anchor token 贯穿全层。在 Llama-3.1-8B 的 128K 上下文场景下，仅用 75% 层数处理 prefill token，OLMES 基准均分从 51.4 仅降至 51.2，同时 TTFT 提升 33%、TPOT 提升 22%、active KV 内存减少 25%。
-
-- 🎯 方法：prompt token KV 状态仅保留在浅层，decode token 保持全深度，通过 BoS anchor 维持语义连接，不修改模型权重
-- 📊 结果：128K 上下文下，75% 层数用于 prefill 时，TTFT 提升 33%，TPOT 提升 22%，KV 内存减少 25%
-- 📊 精度：OLMES 均分 51.2 vs 基线 51.4，精度损失极小（差距 0.2）
-- 💡 创新：与压缩/量化上层 KV 不同，SPEED 直接从 decode 可见集中剔除上层 prompt KV，是阶段非对称的可见性剪枝
-
-#### English Summary
-Long-context inference in decoder-only LLMs is bottlenecked by prompt tokens being fully cached at every layer and repeatedly attended during autoregressive decoding. SPEED (Shallow Prefill, dEEp Decode) introduces a phase-asymmetric KV-visibility policy: non-anchor prompt tokens materialize KV states only in lower layers, while decode-phase tokens remain full-depth, with a single BoS anchor bridging all layers. On Llama-3.1-8B at 128K context, using 75% of layers for prefill tokens yields an OLMES average score of 51.2 versus 51.4 for the full-depth baseline, while improving TTFT by 33%, TPOT by 22%, and reducing active KV memory by 25%. Layer-wise analysis suggests the retained shallow layers already capture the main prompt-selection and representation-stabilization functions.
-
-- 🎯 Method: Prompt token KV states are materialized only in shallow layers; decode tokens remain full-depth; a BoS anchor preserves semantic continuity without weight modification
-- 📊 Results: At 128K context with 75% layer coverage for prefill, TTFT improves by 33%, TPOT by 22%, and active KV memory reduces by 25%
-- 📊 Accuracy: OLMES average score 51.2 vs. baseline 51.4—only 0.2-point degradation across benchmarks
-- 💡 Innovation: Unlike KV compression or quantization of upper layers, SPEED entirely removes upper-layer prompt KVs from the decode visibility set, a phase-asymmetric pruning approach
-
----
+## 🔥 Top 0 (Full Detail)
 
 ## 📚 完整列表 (按分数降序)
 
 | # | Title | Score | Sources | Code | Date |
 |---|-------|-------|---------|------|------|
-| 1 | [UniPrefill: Universal Long-Context Prefill Acceleration via Block-wise Dynamic Sparsification](https://arxiv.org/abs/2605.06221) | 8 | hf_daily | — | 05-07 |
-| 2 | [MISA: Mixture of Indexer Sparse Attention for Long-Context LLM Inference](https://arxiv.org/abs/2605.07363) | 8 | hf_daily | — | 05-08 |
-| 3 | [Fast Byte Latent Transformer](https://arxiv.org/abs/2605.08044) | 7 | hf_daily | — | 05-08 |
-| 4 | [SpecBlock: Block-Iterative Speculative Decoding with Dynamic Tree Drafting](https://arxiv.org/abs/2605.07243) | 9 | hf_daily | — | 05-08 |
-| 5 | [Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility](https://arxiv.org/abs/2605.06105) | 9 | hf_daily | — | 05-07 |
