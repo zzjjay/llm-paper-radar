@@ -246,58 +246,56 @@ For each field (title, abstract, authors, etc.), take the value from the highest
 ### Relevance Prompt (`prompts/relevance.md`)
 
 ```
-你是一名专注于 LLM 推理优化的研究者，主要关心:
-- 模型量化 (post-training 和 QAT，包括 FP4/FP8/INT4/INT8/二值/三值，以及 MXFP4/NVFP4/rocFP4 等具体格式)
-- 模型剪枝与稀疏化 (含 N:M 稀疏)
-- KV cache 压缩与管理 (PagedAttention, Quest, H2O 等)
-- 推测解码与并行采样 (EAGLE, Medusa, Lookahead)
-- LLM 推理引擎与系统 (vLLM, SGLang, TensorRT-LLM, llama.cpp, MLX)
-- MoE 压缩与高效推理
-- 知识蒸馏 (用于压缩场景)
-- 边端/移动端 LLM 部署
-- LoRA / QLoRA / 量化 + 微调结合
+You are a researcher focused on LLM inference optimization. Your primary interests:
+- Model quantization (post-training and QAT, including FP4/FP8/INT4/INT8/binary/ternary, and concrete formats like MXFP4/NVFP4/rocFP4)
+- Model pruning and sparsification (including N:M sparsity)
+- KV cache compression and management (PagedAttention, Quest, H2O, etc.)
+- Speculative decoding and parallel sampling (EAGLE, Medusa, Lookahead)
+- LLM inference engines and systems (vLLM, SGLang, TensorRT-LLM, llama.cpp, MLX)
+- MoE compression and efficient inference
+- Knowledge distillation (for compression)
+- Edge / mobile LLM deployment
+- LoRA / QLoRA / quantization + fine-tuning combinations
 
-不感兴趣的方向:
+Not of interest:
 - RLHF, alignment, safety
-- Agent / tool use / RAG
-- 多模态 (除非涉及压缩/量化)
-- 纯训练算法 (除非和压缩强相关)
+- Agents / tool use / RAG
+- Multimodal (unless it involves compression / quantization)
+- Pure training algorithms (unless strongly related to compression)
 
-给定一篇 paper 的标题和摘要，输出:
-- relevance_score: 0-10 整数
-  - 9-10: 量化/压缩/推理优化方向的核心新方法
-  - 7-8: 强相关 (新 system 工作 / 新硬件适配 / 应用研究 / 相关 benchmark)
-  - 4-6: 弱相关 (相关但是 incremental)
-  - 0-3: 不相关
-- reason: 一句中文短理由 (≤30 字)
+Given a paper's title and abstract, output:
+- relevance_score: integer 0-10
+  - 9-10: core new method in quantization / compression / inference optimization
+  - 7-8: strongly related (new systems work / hardware adaptation / applied research / relevant benchmark)
+  - 4-6: weakly related (related but incremental)
+  - 0-3: unrelated
+- reason: one short English sentence (≤20 words)
 
-仅返回 JSON: {"relevance_score": int, "reason": str}
+Return JSON only: {"relevance_score": int, "reason": str}
 ```
 
 ### `pipeline/summarize.py` — Summary + Highlights
 
 - **Model**: Claude Sonnet 4.6 (`claude-sonnet-4-6`)
 - **Input**: title + full abstract + (if present) HF/Reddit comment excerpts
-- **Output**: JSON with `summary_zh`, `highlights_zh`, `summary_en`, `highlights_en`
+- **Output**: JSON with `summary` and `highlights` (English only)
 - **Concurrency**: 20 parallel
 - **Triggered**: only on papers with `relevance_score >= 7` (~30–50/day)
 
 ### Summary Prompt (`prompts/summary.md`)
 
 ```
-你正在为一名 LLM 推理优化研究者写中英双语 paper 摘要 (该研究者熟悉量化/压缩/系统优化领域)。
+You are writing a paper summary for an LLM inference optimization researcher (who is familiar with quantization / compression / systems optimization).
 
-要求:
-1. summary_zh: 3-5 句中文，覆盖 (a) 解决什么问题 (b) 核心方法 (c) 主要结果。
-   不要套话 ("本文提出了一种新方法..." 这种禁用), 直接写技术内容。
-2. highlights_zh: 2-4 个 bullet, 每个 ≤40 字, 必须包含具体数字 (压缩比/加速比/精度损失等) 当 abstract 中有时。
-   用 emoji 前缀: 🎯 方法 / 📊 结果 / 💡 创新 / ⚠️ 局限 / 🔧 工程
-3. summary_en: 3-5 sentence English version, parallel content to summary_zh.
-4. highlights_en: parallel English highlights, same emoji prefixes, one-to-one with highlights_zh.
-5. 保留英文术语原文 (如 GPTQ, FP8, KV cache), 不要硬翻。
-6. 如果 abstract 信息不足以判断某点，就省略，不要编造。
+Requirements:
+1. summary: 3-5 sentence English summary covering (a) what problem it solves (b) core method (c) main results.
+   No filler phrases like "this paper proposes a novel method...". Get directly to the technical content.
+2. highlights: 2-4 bullet points, each ≤25 words. Must include concrete numbers (compression ratio / speedup / accuracy delta, etc.) when present in the abstract.
+   Use emoji prefixes: 🎯 Method / 📊 Result / 💡 Innovation / ⚠️ Limitation / 🔧 Engineering
+3. Preserve technical English terms verbatim (e.g. GPTQ, FP8, KV cache). Do not paraphrase well-known names.
+4. If the abstract lacks information to support a point, omit it. Do not fabricate.
 
-仅返回 JSON: {"summary_zh": str, "highlights_zh": list[str], "summary_en": str, "highlights_en": list[str]}
+Return JSON only: {"summary": str, "highlights": list[str]}
 ```
 
 ### Cost Estimate
@@ -305,10 +303,10 @@ For each field (title, abstract, authors, etc.), take the value from the highest
 | Stage | Daily Cost | Monthly |
 |-------|-----------|---------|
 | Filter (Haiku, ~500 papers, with cache) | $0.25 | ~$7.5 |
-| Summarize (Sonnet, ~50 papers, dual lang) | $0.45 | ~$13 |
-| **Total** | **~$0.70** | **~$20** |
+| Summarize (Sonnet, ~50 papers, English only) | $0.30 | ~$9 |
+| **Total** | **~$0.55** | **~$16** |
 
-(Range $15–25 depending on daily volume.)
+(Range $12–20 depending on daily volume.)
 
 ---
 
@@ -317,11 +315,11 @@ For each field (title, abstract, authors, etc.), take the value from the highest
 ### `digests/YYYY-MM-DD.md` Structure
 
 ```markdown
-# LLM 推理优化日报 · 2026-05-11
+# LLM Inference Optimization Daily · 2026-05-11
 
-> 📅 抓取窗口: 2026-05-10 00:00 UTC ~ 2026-05-11 00:00 UTC
-> 📊 共扫描 487 篇 → 通过过滤 38 篇 (阈值 ≥7)
-> 💰 LLM 成本: $0.52
+> 📅 Window: 2026-05-10 00:00 UTC ~ 2026-05-11 00:00 UTC
+> 📊 Scanned 487 papers → passed filter 38 (threshold ≥7)
+> 💰 LLM cost: $0.52
 
 ## 🔥 Top 10 (Full Detail)
 
@@ -329,20 +327,16 @@ For each field (title, abstract, authors, etc.), take the value from the highest
 **<primary_source>** · `<arxiv_id>` · <published_at>
 👥 <authors> · 🏷 <categories>
 🔗 [arXiv](url) · [PDF](pdf_url) · [GitHub](code_url)
-📡 来源: arxiv, hf_daily (👍 142, 💬 28), reddit (🔥 score 580)
+📡 Sources: arxiv, hf_daily (👍 142, 💬 28), reddit (🔥 score 580)
 
-#### 中文摘要
-<summary_zh>
-- <highlights_zh items>
-
-#### English Summary
-<summary_en>
-- <highlights_en items>
+#### Summary
+<summary>
+- <highlights items>
 
 ---
 ... (entries 2–10) ...
 
-## 📚 完整列表 (按分数降序)
+## 📚 Full List (by score, descending)
 
 | # | Title | Score | Sources | Code | Date |
 |---|-------|-------|---------|------|------|
@@ -380,8 +374,8 @@ This means a paper that is rank-1 on HF trending starts with +100 heat and almos
 Always overwritten with the latest day's digest. Top banner:
 
 ```markdown
-> 这是 [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar) 自动生成的最新一日 digest。
-> 历史: [INDEX.md](INDEX.md) · 配置: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
+> Auto-generated daily digest from [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar).
+> History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
 ```
 
 ### `INDEX.md`
@@ -389,10 +383,10 @@ Always overwritten with the latest day's digest. Top banner:
 Grouped by month, one line per day:
 
 ```markdown
-# 历史 Digest 索引
+# Digest History Index
 
 ## 2026 May
-- [05-11](digests/2026-05-11.md) — 487 扫描, 38 通过, top: BitNet b1.58
+- [05-11](digests/2026-05-11.md) — 487 scanned, 38 passed, top: BitNet b1.58
 - [05-10](digests/2026-05-10.md) — ...
 
 ## 2026 April

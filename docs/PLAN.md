@@ -2144,8 +2144,8 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
 
     fake = AsyncMock()
     fake.call_json.side_effect = [
-        {"relevance_score": 9, "reason": "FP4 量化方法"},
-        {"relevance_score": 1, "reason": "RAG 不相关"},
+        {"relevance_score": 9, "reason": "FP4 quantization method"},
+        {"relevance_score": 1, "reason": "RAG, not relevant"},
     ]
 
     n = await filter_papers(
@@ -2158,7 +2158,7 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
     assert n == 2
     out = json.loads(out_path.read_text())
     assert out[0]["relevance_score"] == 9
-    assert out[0]["relevance_reason"] == "FP4 量化方法"
+    assert out[0]["relevance_reason"] == "FP4 quantization method"
     assert out[1]["relevance_score"] == 1
 
 
@@ -2323,18 +2323,16 @@ async def test_summarize_only_runs_for_above_threshold(tmp_path: Path, monkeypat
 
     fake = AsyncMock()
     fake.call_json.return_value = {
-        "summary_zh": "中文摘要",
-        "highlights_zh": ["🎯 a", "📊 b"],
-        "summary_en": "English summary",
-        "highlights_en": ["🎯 a", "📊 b"],
+        "summary": "English summary",
+        "highlights": ["🎯 a", "📊 b"],
     }
     n = await summarize_papers(in_path, out_path, prompt_path, fake, threshold=7, concurrency=2)
     assert n == 3  # all written, but only 2 summarized
     out = json.loads(out_path.read_text())
     by_id = {p["id"]: p for p in out}
-    assert by_id["hi"]["summary_zh"] == "中文摘要"
-    assert by_id["hi2"]["summary_en"] == "English summary"
-    assert by_id["low"]["summary_zh"] is None
+    assert by_id["hi"]["summary"] == "English summary"
+    assert by_id["hi2"]["summary"] == "English summary"
+    assert by_id["low"]["summary"] is None
     # LLM called only for above-threshold papers
     assert fake.call_json.call_count == 2
 ```
@@ -2534,8 +2532,8 @@ def test_render_daily_writes_top10_full_then_table(tmp_path: Path):
 
     out = (digests_dir / "2026-05-11.md").read_text()
     assert "## 🔥 Top 10" in out
-    assert out.count("#### 中文摘要") == 10
-    assert "## 📚 完整列表" in out
+    assert out.count("#### Summary") == 10
+    assert "## 📚 Full List" in out
     # below-threshold excluded
     assert "id|low" not in out and "Title low" not in out
     # README mirrors the digest
@@ -2658,17 +2656,12 @@ def _full_block(rank: int, p: Paper) -> str:
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
 👥 {", ".join(p.authors[:3])}{"..." if len(p.authors) > 3 else ""} · 🏷 {", ".join(p.categories)}
 🔗 [arXiv]({p.url}) · [PDF]({p.pdf_url}){code_part}
-📡 来源: {_source_badge(p)}
+📡 Sources: {_source_badge(p)}
 
-#### 中文摘要
-{p.summary_zh or ''}
+#### Summary
+{p.summary or ''}
 
-{hl_zh}
-
-#### English Summary
-{p.summary_en or ''}
-
-{hl_en}
+{hl}
 
 ---
 """
@@ -2681,7 +2674,7 @@ def _table_row(rank: int, p: Paper) -> str:
 
 
 def render_index_line(date: datetime, scanned: int, passed: int, top_title: str) -> str:
-    return f"- [{date.strftime('%m-%d')}](digests/{date.strftime('%Y-%m-%d')}.md) — {scanned} 扫描, {passed} 通过, top: {top_title}"
+    return f"- [{date.strftime('%m-%d')}](digests/{date.strftime('%Y-%m-%d')}.md) — {scanned} scanned, {passed} passed, top: {top_title}"
 
 
 def render_daily(
@@ -2700,18 +2693,18 @@ def render_daily(
     revisited = [p for p in surviving if p.seen_before]
 
     body = []
-    body.append(f"# LLM 推理优化日报 · {date.strftime('%Y-%m-%d')}\n")
-    body.append(f"> 📅 抓取窗口: {date.strftime('%Y-%m-%d')} (UTC daily window)")
-    body.append(f"> 📊 共扫描 {scanned} 篇 → 通过过滤 {len(surviving)} 篇 (阈值 ≥{threshold})")
+    body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
+    body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
+    body.append(f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)} (threshold ≥{threshold})")
     body.append("")
-    body.append(f"> 这是 [llm-paper-radar]({REPO_URL}) 自动生成的最新一日 digest。")
-    body.append("> 历史: [INDEX.md](INDEX.md) · 配置: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6\n")
+    body.append(f"> Auto-generated daily digest from [llm-paper-radar]({REPO_URL}).")
+    body.append("> History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6\n")
 
     body.append(f"## 🔥 Top {min(full_top_n, len(surviving))} (Full Detail)\n")
     for i, p in enumerate(surviving[:full_top_n], start=1):
         body.append(_full_block(i, p))
 
-    body.append("## 📚 完整列表 (按分数降序)\n")
+    body.append("## 📚 Full List (by score, descending)\n")
     body.append("| # | Title | Score | Sources | Code | Date |")
     body.append("|---|-------|-------|---------|------|------|")
     for i, p in enumerate(surviving, start=1):
@@ -2744,7 +2737,7 @@ def render_daily(
         else:
             index_path.write_text(existing + "\n" + new_line + "\n")
     else:
-        index_path.write_text("# 历史 Digest 索引\n\n" + new_line + "\n")
+        index_path.write_text("# Digest History Index\n\n" + new_line + "\n")
 
 
 if __name__ == "__main__":
@@ -2847,7 +2840,7 @@ def test_weekly_aggregates_past_seven_days(tmp_path: Path):
     assert len(files) == 1
     text = files[0].read_text()
     assert "Top 20" in text
-    assert "Per-source" in text or "来源贡献" in text
+    assert "Per-source" in text
 ```
 
 - [ ] **Step 14.2: Run test to verify it fails**
@@ -2900,16 +2893,14 @@ def render_weekly(
     iso = end_date.isocalendar()
     fname = f"{iso.year}-W{iso.week:02d}.md"
     body = []
-    body.append(f"# 周报 · Week {iso.week} of {iso.year} (ending {end_date.date()})\n")
-    body.append(f"## Top {len(surviving)} (本周精华)\n")
+    body.append(f"# Weekly · Week {iso.week} of {iso.year} (ending {end_date.date()})\n")
+    body.append(f"## Top {len(surviving)} (Week's highlights)\n")
     for i, p in enumerate(surviving, start=1):
         body.append(f"### {i}. [{p.title}]({p.url}) ({p.relevance_score}/10)")
-        if p.summary_zh:
-            body.append(f"\n{p.summary_zh}\n")
-        if p.summary_en:
-            body.append(f"\n*{p.summary_en}*\n")
+        if p.summary:
+            body.append(f"\n{p.summary}\n")
 
-    body.append("\n## 来源贡献 / Per-source contribution\n")
+    body.append("\n## Per-source contribution\n")
     body.append("| Source | Count |")
     body.append("|--------|-------|")
     for src, cnt in src_counts.most_common():
@@ -3242,8 +3233,7 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     sum_prompt.write_text("summarize")
     fake_sum = AsyncMock()
     fake_sum.call_json.return_value = {
-        "summary_zh": "中文", "highlights_zh": ["🎯 a"],
-        "summary_en": "English", "highlights_en": ["🎯 a"],
+        "summary": "English", "highlights": ["🎯 a"],
     }
     await summarize_papers(scored_path, summarized_path, sum_prompt, fake_sum, threshold=7, concurrency=2)
     assert fake_sum.call_json.call_count == 1  # only the score=9 paper
