@@ -1,3 +1,3 @@
-# 历史 Digest 索引
+# Digest History Index
 
-- [05-11](digests/2026-05-11.md) — 93 扫描, 5 通过, top: SpecBlock: Block-Iterative Speculative Decoding wi
+- [05-11](digests/2026-05-11.md) — 93 scanned, 5 passed, top: SpecBlock: Block-Iterative Speculative Decoding wi
