@@ -38,16 +38,14 @@ async def test_summarize_only_runs_for_above_threshold(tmp_path: Path, monkeypat
 
     fake = AsyncMock()
     fake.call_json.return_value = {
-        "summary_zh": "中文摘要",
-        "highlights_zh": ["🎯 a", "📊 b"],
-        "summary_en": "English summary",
-        "highlights_en": ["🎯 a", "📊 b"],
+        "summary": "English summary",
+        "highlights": ["🎯 a", "📊 b"],
     }
     n = await summarize_papers(in_path, out_path, prompt_path, fake, threshold=7, concurrency=2)
     assert n == 3
     out = json.loads(out_path.read_text())
     by_id = {p["id"]: p for p in out}
-    assert by_id["hi"]["summary_zh"] == "中文摘要"
-    assert by_id["hi2"]["summary_en"] == "English summary"
-    assert by_id["low"]["summary_zh"] is None
+    assert by_id["hi"]["summary"] == "English summary"
+    assert by_id["hi2"]["summary"] == "English summary"
+    assert by_id["low"]["summary"] is None
     assert fake.call_json.call_count == 2

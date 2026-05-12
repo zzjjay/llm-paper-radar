@@ -36,8 +36,8 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
 
     fake = AsyncMock()
     fake.call_json.side_effect = [
-        {"relevance_score": 9, "reason": "FP4 量化方法"},
-        {"relevance_score": 1, "reason": "RAG 不相关"},
+        {"relevance_score": 9, "reason": "FP4 quantization method"},
+        {"relevance_score": 1, "reason": "RAG, not relevant"},
     ]
 
     n = await filter_papers(
@@ -50,7 +50,7 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
     assert n == 2
     out = json.loads(out_path.read_text())
     assert out[0]["relevance_score"] == 9
-    assert out[0]["relevance_reason"] == "FP4 量化方法"
+    assert out[0]["relevance_reason"] == "FP4 quantization method"
     assert out[1]["relevance_score"] == 1
 
 

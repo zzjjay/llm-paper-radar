@@ -14,7 +14,7 @@ def _mk(
     reddit_score=0,
     trending_rank=None,
     twitter_accounts=None,
-    summary_zh="zh",
+    summary="en",
 ):  # noqa: E501
     now = datetime.now(UTC)
     sources = [
@@ -59,10 +59,8 @@ def _mk(
         sources=sources,
     )
     p.relevance_score = score
-    p.summary_zh = summary_zh
-    p.highlights_zh = ["🎯 zh hl"]
-    p.summary_en = "en"
-    p.highlights_en = ["🎯 en hl"]
+    p.summary = summary
+    p.highlights = ["🎯 hl"]
     return p
 
 
@@ -121,8 +119,8 @@ def test_render_daily_writes_top10_full_then_table(tmp_path: Path):
 
     out = (digests_dir / "2026-05-11.md").read_text()
     assert "## 🔥 Top 10" in out
-    assert out.count("#### 中文摘要") == 10
-    assert "## 📚 完整列表" in out
+    assert out.count("#### Summary") == 10
+    assert "## 📚 Full List" in out
     assert "id|low" not in out and "Title low" not in out
     assert readme.read_text() == out
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()

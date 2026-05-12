@@ -78,10 +78,8 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     sum_prompt.write_text("summarize")
     fake_sum = AsyncMock()
     fake_sum.call_json.return_value = {
-        "summary_zh": "中文",
-        "highlights_zh": ["🎯 a"],
-        "summary_en": "English",
-        "highlights_en": ["🎯 a"],
+        "summary": "English",
+        "highlights": ["🎯 a"],
     }
     await summarize_papers(
         scored_path, summarized_path, sum_prompt, fake_sum, threshold=7, concurrency=2

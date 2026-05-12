@@ -20,8 +20,7 @@ def _mk(id_, score, day_offset):
         sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
     )
     p.relevance_score = score
-    p.summary_zh = "z"
-    p.summary_en = "e"
+    p.summary = "e"
     return p
 
 
@@ -48,4 +47,4 @@ def test_weekly_aggregates_past_seven_days(tmp_path: Path):
     assert len(files) == 1
     text = files[0].read_text()
     assert "Top 20" in text
-    assert "Per-source" in text or "来源贡献" in text
+    assert "Per-source" in text

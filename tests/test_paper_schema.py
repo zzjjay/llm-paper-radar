@@ -20,7 +20,7 @@ def test_paper_minimal_construction():
     )
     assert p.id == "2402.17764"
     assert p.relevance_score is None
-    assert p.highlights_zh == []
+    assert p.highlights == []
     assert p.seen_before is False
     assert p.code_url is None
 
