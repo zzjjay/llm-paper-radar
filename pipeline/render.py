@@ -94,13 +94,11 @@ def _source_badge(p: Paper) -> str:
     return ", ".join(parts)
 
 
-def _summary_block(
-    label: str, summary: str | None, highlights: list[str], failed_label: str
-) -> str:
+def _summary_block(summary: str | None, highlights: list[str]) -> str:
     if not summary:
-        return f"#### {label}\n*{failed_label}*\n"
+        return "#### Summary\n*(Summary generation failed)*\n"
     hl = "\n".join(f"- {h}" for h in highlights)
-    return f"#### {label}\n{summary}\n\n{hl}\n" if hl else f"#### {label}\n{summary}\n"
+    return f"#### Summary\n{summary}\n\n{hl}\n" if hl else f"#### Summary\n{summary}\n"
 
 
 def _full_block(rank: int, p: Paper) -> str:
@@ -110,20 +108,14 @@ def _full_block(rank: int, p: Paper) -> str:
     primary_source = p.sources[0].name if p.sources else "unknown"
     cats = ", ".join(p.categories) if p.categories else p.primary_category
     authors_short = ", ".join(p.authors[:3]) + ("..." if len(p.authors) > 3 else "")
-    zh_block = _summary_block(
-        "中文摘要", p.summary_zh, p.highlights_zh, "(摘要生成失败)"
-    )
-    en_block = _summary_block(
-        "English Summary", p.summary_en, p.highlights_en, "(Summary generation failed)"
-    )
+    summary_block = _summary_block(p.summary, p.highlights)
     return f"""### {rank}. {p.title} ({p.relevance_score}/10){revisited}
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
 👥 {authors_short} · 🏷 {cats}
 🔗 [arXiv]({p.url}){pdf_part}{code_part}
-📡 来源: {_source_badge(p)}
+📡 Sources: {_source_badge(p)}
 
-{zh_block}
-{en_block}
+{summary_block}
 ---
 """
 
@@ -140,7 +132,7 @@ def _table_row(rank: int, p: Paper) -> str:
 def render_index_line(date: datetime, scanned: int, passed: int, top_title: str) -> str:
     day = date.strftime("%m-%d")
     full = date.strftime("%Y-%m-%d")
-    return f"- [{day}](digests/{full}.md) — {scanned} 扫描, {passed} 通过, top: {top_title}"
+    return f"- [{day}](digests/{full}.md) — {scanned} scanned, {passed} passed, top: {top_title}"
 
 
 def render_daily(
@@ -159,13 +151,15 @@ def render_daily(
     revisited = [p for p in surviving if p.seen_before]
 
     body = []
-    body.append(f"# LLM 推理优化日报 · {date.strftime('%Y-%m-%d')}\n")
-    body.append(f"> 📅 抓取窗口: {date.strftime('%Y-%m-%d')} (UTC daily window)")
-    body.append(f"> 📊 共扫描 {scanned} 篇 → 通过过滤 {len(surviving)} 篇 (阈值 ≥{threshold})")
-    body.append("")
-    body.append(f"> 这是 [llm-paper-radar]({REPO_URL}) 自动生成的最新一日 digest。")
+    body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
+    body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
     body.append(
-        "> 历史: [INDEX.md](INDEX.md) · 配置: [config.yaml](config.yaml)"
+        f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)} (threshold ≥{threshold})"
+    )
+    body.append("")
+    body.append(f"> Auto-generated daily digest from [llm-paper-radar]({REPO_URL}).")
+    body.append(
+        "> History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml)"
         " · Powered by Claude Sonnet 4.6\n"
     )
 
@@ -173,7 +167,7 @@ def render_daily(
     for i, p in enumerate(surviving[:full_top_n], start=1):
         body.append(_full_block(i, p))
 
-    body.append("## 📚 完整列表 (按分数降序)\n")
+    body.append("## 📚 Full List (by score, descending)\n")
     body.append("| # | Title | Score | Sources | Code | Date |")
     body.append("|---|-------|-------|---------|------|------|")
     for i, p in enumerate(surviving, start=1):
@@ -204,7 +198,7 @@ def render_daily(
         else:
             index_path.write_text(existing + "\n" + new_line + "\n")
     else:
-        index_path.write_text("# 历史 Digest 索引\n\n" + new_line + "\n")
+        index_path.write_text("# Digest History Index\n\n" + new_line + "\n")
 
 
 if __name__ == "__main__":

@@ -39,16 +39,14 @@ def render_weekly(
     iso = end_date.isocalendar()
     fname = f"{iso.year}-W{iso.week:02d}.md"
     body = []
-    body.append(f"# 周报 · Week {iso.week} of {iso.year} (ending {end_date.date()})\n")
-    body.append(f"## Top {len(surviving)} (本周精华)\n")
+    body.append(f"# Weekly Digest · Week {iso.week} of {iso.year} (ending {end_date.date()})\n")
+    body.append(f"## Top {len(surviving)} (This week's highlights)\n")
     for i, p in enumerate(surviving, start=1):
         body.append(f"### {i}. [{p.title}]({p.url}) ({p.relevance_score}/10)")
-        if p.summary_zh:
-            body.append(f"\n{p.summary_zh}\n")
-        if p.summary_en:
-            body.append(f"\n*{p.summary_en}*\n")
+        if p.summary:
+            body.append(f"\n{p.summary}\n")
 
-    body.append("\n## 来源贡献 / Per-source contribution\n")
+    body.append("\n## Per-source contribution\n")
     body.append("| Source | Count |")
     body.append("|--------|-------|")
     for src, cnt in src_counts.most_common():

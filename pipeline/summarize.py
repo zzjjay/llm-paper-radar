@@ -16,10 +16,8 @@ async def _summarize_one(
     async with sem:
         try:
             r = await client.call_json(prompt, user, max_tokens=900)
-            paper.summary_zh = r.get("summary_zh")
-            paper.highlights_zh = r.get("highlights_zh", [])
-            paper.summary_en = r.get("summary_en")
-            paper.highlights_en = r.get("highlights_en", [])
+            paper.summary = r.get("summary")
+            paper.highlights = r.get("highlights") or []
         except Exception as e:
             print(f"summarize: paper {paper.id} failed: {e}")
     return paper

@@ -38,10 +38,8 @@ class Paper(BaseModel):
 
     relevance_score: int | None = None
     relevance_reason: str | None = None
-    summary_zh: str | None = None
-    highlights_zh: list[str] = Field(default_factory=list)
-    summary_en: str | None = None
-    highlights_en: list[str] = Field(default_factory=list)
+    summary: str | None = None
+    highlights: list[str] = Field(default_factory=list)
     seen_before: bool = False
 
 
