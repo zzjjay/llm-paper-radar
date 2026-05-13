@@ -139,8 +139,44 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     assert "## 📚 Full List" in out
     # Below-threshold paper excluded from both highlights and full list.
     assert "Title low" not in out
-    assert readme.read_text() == out
+    # README is bootstrapped from the doc template with the digest spliced in,
+    # so it contains the digest body but isn't byte-equal to it.
+    readme_text = readme.read_text()
+    assert "<!-- LATEST_START -->" in readme_text
+    assert "## 🔥 Highlights by topic" in readme_text
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()
+
+
+def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
+    """README has docs + LATEST markers; render should splice digest between
+    them and leave the docs intact (must not overwrite the whole README)."""
+    summarized_path = tmp_path / "summarized.json"
+    papers = [_mk(f"id{i}", 9, trending_rank=i + 1) for i in range(3)]
+    summarized_path.write_text(json.dumps([p.model_dump(mode="json") for p in papers]))
+
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "# My Radar\n\n## Docs above\nintro text\n\n"
+        "<!-- LATEST_START -->\nold digest goes here\n<!-- LATEST_END -->\n\n"
+        "## Docs below\ntrailing text\n"
+    )
+
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=tmp_path / "digests",
+        readme_path=readme,
+        index_path=tmp_path / "INDEX.md",
+        threshold=7,
+        topic_caps={"ptq": 3, "_default": 2},
+    )
+
+    content = readme.read_text()
+    assert content.startswith("# My Radar\n")
+    assert "## Docs above\nintro text" in content
+    assert "## Docs below\ntrailing text" in content
+    assert "old digest goes here" not in content  # replaced
+    assert "## 🔥 Highlights by topic" in content  # new digest spliced in
 
 
 def test_render_index_line_includes_summary_stats():

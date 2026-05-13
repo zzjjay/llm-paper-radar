@@ -193,6 +193,35 @@ def _table_row(rank: int, p: Paper) -> str:
     )
 
 
+LATEST_START = "<!-- LATEST_START -->"
+LATEST_END = "<!-- LATEST_END -->"
+
+
+def _splice_into_readme(readme_path: Path, digest_text: str) -> None:
+    """Inject the rendered digest between the LATEST markers in README.md.
+    If the markers are missing (or README is the legacy whole-digest layout),
+    rewrite the README to the doc template with the markers in place."""
+    if readme_path.exists():
+        existing = readme_path.read_text()
+    else:
+        existing = ""
+    if LATEST_START in existing and LATEST_END in existing:
+        before, _, rest = existing.partition(LATEST_START)
+        _, _, after = rest.partition(LATEST_END)
+        new = f"{before}{LATEST_START}\n\n{digest_text}\n\n{LATEST_END}{after}"
+        readme_path.write_text(new)
+        return
+    # Bootstrap: write the doc README with the digest spliced in. The static
+    # template lives next to render.py so we don't need a separate doc system.
+    template_path = Path(__file__).parent / "readme_template.md"
+    template = template_path.read_text()
+    new = template.replace(
+        f"{LATEST_START}\n{LATEST_END}",
+        f"{LATEST_START}\n\n{digest_text}\n\n{LATEST_END}",
+    )
+    readme_path.write_text(new)
+
+
 def render_index_line(date: datetime, scanned: int, passed: int, top_title: str) -> str:
     day = date.strftime("%m-%d")
     full = date.strftime("%Y-%m-%d")
@@ -270,7 +299,7 @@ def render_daily(
     digests_dir.mkdir(parents=True, exist_ok=True)
     digest_path = digests_dir / f"{date.strftime('%Y-%m-%d')}.md"
     digest_path.write_text(text)
-    readme_path.write_text(text)
+    _splice_into_readme(readme_path, text)
 
     top_title = surviving[0].title if surviving else "(no papers passed)"
     new_line = render_index_line(date, scanned, len(surviving), top_title[:50])

@@ -114,4 +114,7 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     out = (digests / "2026-05-11.md").read_text()
     assert "Paper X" in out
     assert "Paper Y" not in out
-    assert readme.read_text() == out
+    readme_text = readme.read_text()
+    assert "<!-- LATEST_START -->" in readme_text
+    assert "Paper X" in readme_text  # digest body got spliced in
+    assert "Paper Y" not in readme_text  # below-threshold paper still excluded
