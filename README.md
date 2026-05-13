@@ -1,84 +1,67 @@
-# LLM Inference Optimization Daily · 2026-05-11
+# LLM Inference Optimization Daily · 2026-05-12
 
-> 📅 Window: 2026-05-11 (UTC daily)
-> 📊 Scanned 93 papers → passed filter 4 → highlighted 4 (threshold ≥7)
+> 📅 Window: 2026-05-12 (UTC daily)
+> 📊 Scanned 97 papers → passed filter 3 → highlighted 3 (threshold ≥7)
 
 > Auto-generated daily digest from [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar).
 > History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
 
 ## 🔥 Highlights by topic
 
-### Knowledge distillation (top 2 of cap 3)
+### Pruning / sparsity (top 1 of cap 3)
 
-### 1. UniSD: Towards a Unified Self-Distillation Framework for Large Language Models (7/10) 🔁
-**hf_daily** · `2605.06597` · 2026-05-07
-👥 Yiqiao Jin, Yiyang Wang, Lucheng Fu... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.06597) · [PDF](https://arxiv.org/pdf/2605.06597.pdf)
-📡 Sources: hf_daily (👍 10, 💬 1)
-🧪 distillation · Self-distillation with multi-teacher agreement, EMA stabilization, token-level contrastive learning, feature matching, divergence clipping
-
-#### Summary
-UniSD addresses the instability and unreliability of self-distillation (SD) for LLMs, where self-generated trajectories produce noisy supervision signals. The framework integrates five complementary mechanisms—multi-teacher agreement, EMA teacher stabilization, token-level contrastive learning, feature matching, and divergence clipping—into a unified pipeline to systematically study how these components interact and when SD outperforms static imitation. Evaluated across six benchmarks and six models from three families, the full pipeline (UniSDfull) achieves +5.4 points over the base model and +2.8 points over the strongest baseline.
-
-- 🎯 Method: Unifies multi-teacher agreement, EMA stabilization, token-level contrastive learning, feature matching, and divergence clipping into one SD framework.
-- 📊 Result: UniSDfull improves +5.4 points over base model and +2.8 points over strongest baseline across six benchmarks.
-- 💡 Innovation: Systematic ablation reveals which SD components drive gains and how they interact across tasks and model families.
-- ⚠️ Limitation: Requires no stronger external teacher, but relies on self-generated trajectories whose correctness remains task-dependent.
-
----
-
-### 2. Trajectory as the Teacher: Few-Step Discrete Flow Matching via Energy-Navigated Distillation (7/10) 🔁
-**hf_daily** · `2605.07924` · 2026-05-08
-👥 Amin Karimi Monsefi, Dominic Culver, Nikhil Bhendawade... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.07924) · [PDF](https://arxiv.org/pdf/2605.07924.pdf)
-📡 Sources: hf_daily (💬 1)
-🧪 distillation · trajectory-shaped discrete flow matching distillation with energy guidance · 170M · cal: training-only shaping; inference cost unchanged · perf: 128x faster inference (8 vs 1024 steps)
+### 1. SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training (9/10) 🔁
+**hf_daily** · `2605.08738` · 2026-05-09
+👥 Shengkun Tang, Zekun Wang, Bo Zheng... · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.08738) · [PDF](https://arxiv.org/pdf/2605.08738.pdf)
+📡 Sources: hf_daily (👍 8, 💬 1)
+🧪 pruning+distillation · Structured expert pruning + knowledge distillation + multi-token prediction · Qwen3-Next-80A3B → 23A2B · cal: Large-scale continual pretraining required (progressive pruning schedules over training run) · perf: Unknown
 
 #### Summary
-Discrete flow matching for text generation requires many forward passes, and trajectory distillation is limited not by student capacity but by noisy teacher trajectories built from blind stochastic jumps. TS-DFM introduces an energy-based compass that evaluates candidate continuations at each midpoint during training to select coherent trajectories, while leaving inference cost unchanged. On 170M-parameter language modeling, the distilled 8-step student achieves 32% lower perplexity than the 1,024-step teacher at 128× speedup, outperforming discrete-generation baselines trained on 6× more data or using 5× larger models.
+Systematic study of structured pruning and knowledge distillation (KD) for compressing MoE LLMs during large-scale continued pretraining, addressing initialization, expert compression, and training strategy choices. Key findings: pruned initialization consistently beats training from scratch; one-shot expert compression methods converge similarly after sufficient training, motivating a partial-preservation expert merging strategy; combining LM loss with KD and multi-token prediction (MTP) distillation outperforms KD alone; progressive pruning schedules outperform one-shot compression. Applied to Qwen3-Next-80A3B, producing a 23A2B model with competitive performance.
 
-- 🎯 Method: Energy-navigated trajectory shaping at training midpoints guides discrete flow matching distillation without adding inference cost.
-- 📊 Result: 8-step student achieves 32% lower perplexity than the 1,024-step teacher at 128× inference speedup on 170M-parameter LM.
-- 📊 Result: Best perplexity among discrete-generation baselines, outperforming methods with 6× more data or 5× larger models.
-- 💡 Innovation: Reframes distillation bottleneck as trajectory quality rather than student capacity, using lightweight energy evaluator only during training.
+- 🎯 Method: Compresses Qwen3-Next-80A3B → 23A2B (~3.5× active-parameter reduction) via pruning + KD + MTP distillation during continued pretraining.
+- 📊 Result: Pruned initialization consistently outperforms training target architecture from scratch under equal training budget across depth, width, and expert compression.
+- 💡 Innovation: Partial-preservation expert merging + MTP distillation yields consistent downstream gains; progressive pruning schedules outperform one-shot compression.
+- 📊 Result: Different one-shot expert compression methods converge to similar final performance after large-scale continual pretraining, simplifying compression design choices.
 
 ---
 
 ### KV cache compression (top 1 of cap 3)
 
-### 3. Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility (8/10) 🔁
-**hf_daily** · `2605.06105` · 2026-05-07
-👥 Jungsuk Oh, Hyeseo Jeon, Hyunjune Ji... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.06105) · [PDF](https://arxiv.org/pdf/2605.06105.pdf)
-📡 Sources: hf_daily (👍 1, 💬 1)
-🧪 kv_cache · Layer-asymmetric KV visibility, shallow prefill deep decode · Llama-3.1-8B · cal: No calibration; layer-wise diagnostic study provided · perf: 33% TTFT improvement, 22% TPOT improvement, 25% active KV memory reduction
+### 2. Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction (9/10) 🔁
+**hf_daily** · `2605.09649` · 2026-05-10
+👥 Ngoc Bui, Hieu Trung Nguyen, Arman Cohan... · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.09649) · [PDF](https://arxiv.org/pdf/2605.09649.pdf)
+📡 Sources: hf_daily (👍 10, 💬 1)
+🧪 kv_cache · learnable retention gates with global eviction policy · cal: Unknown; appears to require lightweight gate training · perf: Reduces KV memory footprint; end-to-end speedup not explicitly stated
 
 #### Summary
-Long-context LLM inference is bottlenecked by prefill KV cache creation and repeated decode-phase attention over all cached prompt tokens. SPEED introduces a phase-asymmetric KV-visibility policy where non-anchor prompt tokens only materialize KV states in lower layers (shallow prefill), while decode-phase tokens remain full-depth. A minimal BoS anchor token preserves full-depth visibility. On Llama-3.1-8B at 128K context with 75% layer depth for prefill tokens, SPEED achieves 51.2 vs 51.4 OLMES average score baseline while delivering 33% TTFT improvement, 22% TPOT reduction, and 25% active KV memory reduction.
+KV cache eviction in long-context inference typically degrades vs. full-cache attention, but this work argues selective eviction can improve generation by reducing attention dilution from irrelevant tokens. The method introduces learnable retention gates that assign utility scores to KV entries, with a shared final scoring projection to calibrate scores across all layers and heads, enabling a single global eviction policy where tokens from different layers, heads, and modalities compete for cache capacity. Theoretical analysis justifies geometric retention as a query-agnostic proxy for future utility, and empirical results show the method matches or surpasses full-cache inference across long-context language, vision-language, and multi-turn dialogue benchmarks while substantially reducing KV memory.
 
-- 🎯 Method: Prefill tokens restricted to lower 75% of layers for KV cache; decode tokens remain full-depth; BoS token serves as full-depth anchor.
-- 📊 Result: 33% TTFT speedup, 22% TPOT reduction, 25% KV memory savings at 128K context with <0.2 point OLMES accuracy drop.
-- 💡 Innovation: Phase-asymmetric KV visibility—removes prefill tokens from upper-layer decode attention entirely, rather than compressing or approximating their KV states.
-- ⚠️ Limitation: Evaluated only on Llama-3.1-8B instruction-tuning; upper-layer prompt KV removal may impact tasks requiring deep cross-token reasoning.
+- 🎯 Method: Lightweight learnable retention gates + shared cross-layer/head scoring projection for global KV cache eviction under unified memory budget.
+- 💡 Innovation: Reframes KV eviction not as compression approximation but as attention dilution reduction — selective eviction can outperform full-cache inference.
+- 📊 Result: Substantially reduced KV memory while matching or surpassing full-cache inference on long-context LM, vision-language, and multi-turn dialogue benchmarks.
+- 💡 Innovation: Single global eviction policy allows tokens across different layers, heads, and modalities to compete directly for cache capacity.
 
 ---
 
-### Diffusion compression (top 1 of cap 3)
+### Speculative decoding (top 1 of cap 3)
 
-### 4. Normalizing Trajectory Models (7/10) 🔁
-**hf_daily** · `2605.08078` · 2026-05-08
-👥 Jiatao Gu, Tianrong Chen, Ying Shen... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.08078) · [PDF](https://arxiv.org/pdf/2605.08078.pdf)
-📡 Sources: hf_daily (👍 8, 💬 1)
-🧪 diffusion_compression · normalizing flow trajectory model, step distillation · cal: trainable from scratch or from pretrained flow-matching models · perf: 4-step generation; speedup vs standard diffusion not quantified end-to-end
+### 3. SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding (7/10) 🔁
+**hf_daily** · `2605.10453` · 2026-05-11
+👥 Anton Plaksin, Sergei Krutikov, Sergei Skvortsov... · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.10453) · [PDF](https://arxiv.org/pdf/2605.10453.pdf)
+📡 Sources: hf_daily (👍 7, 💬 1)
+🧪 speculative_decoding · low-rank LM-head parameterization · cal: minimal training pipeline adjustments required · perf: 4-5x speedup over standard LM-head; 8-9% end-to-end gain vs prior vocab-truncation methods
 
 #### Summary
-Diffusion models' Gaussian denoising assumption breaks down in few-step generation regimes, and existing solutions (distillation, consistency training, adversarial objectives) abandon the likelihood framework. NTM replaces each reverse step with an expressive conditional normalizing flow, enabling exact likelihood training across the full trajectory. Architecturally, NTM uses shallow invertible blocks per step combined with a deep parallel predictor across the trajectory, supporting training from scratch or initialization from pretrained flow-matching models. The exact trajectory likelihood enables self-distillation via a lightweight denoiser, achieving competitive text-to-image generation in 4 sampling steps while preserving exact likelihoods.
+Speculative decoding bottlenecks in the drafter's LM-head projection to large vocabularies are typically addressed via vocabulary truncation, which adds complexity. SlimSpec applies low-rank parameterization to the EAGLE-3 drafter's LM-head, compressing the inner representation dimension while preserving full vocabulary coverage. Evaluated across three target models and multiple benchmarks in both latency- and throughput-bound regimes, SlimSpec achieves 4-5× acceleration over the standard LM-head and up to 8-9% end-to-end speedup improvement over existing methods with minimal training and inference pipeline changes.
 
-- 🎯 Method: Each reverse diffusion step modeled as a conditional normalizing flow with exact likelihood, enabling end-to-end training across the trajectory.
-- 💡 Innovation: Self-distillation from NTM's own score function trains a lightweight denoiser producing high-quality samples in 4 steps without external teacher.
-- 📊 Result: Matches or outperforms strong text-to-image baselines in 4 sampling steps while uniquely retaining exact trajectory likelihood.
-- 🔧 Engineering: Shallow invertible blocks per step + deep parallel trajectory predictor; initializable from pretrained flow-matching models.
+- 🎯 Method: Low-rank factorization of the drafter LM-head in EAGLE-3 to compress inner representation dimension while retaining full vocabulary support.
+- 📊 Result: 4-5× acceleration over standard LM-head architecture with competitive acceptance length across three target models.
+- 📊 Result: Up to 8-9% end-to-end speedup improvement over existing vocabulary truncation methods.
+- 💡 Innovation: Avoids vocabulary curation, complex inference-time logic, or training setup modifications required by prior truncation approaches.
 
 ---
 
@@ -86,15 +69,13 @@ Diffusion models' Gaussian denoising assumption breaks down in few-step generati
 
 | # | Title | Score | Topic | Pract | Bucket | Sources | Code | Date |
 |---|-------|-------|-------|-------|--------|---------|------|------|
-| 1 | [Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility](https://arxiv.org/abs/2605.06105) | 8 | 4 | 4 | KV cache compression | hf_daily | — | 05-07 |
-| 2 | [UniSD: Towards a Unified Self-Distillation Framework for Large Language Models](https://arxiv.org/abs/2605.06597) | 7 | 4 | 3 | Knowledge distillation | hf_daily | — | 05-07 |
-| 3 | [Normalizing Trajectory Models](https://arxiv.org/abs/2605.08078) | 7 | 4 | 3 | Diffusion compression | hf_daily | — | 05-08 |
-| 4 | [Trajectory as the Teacher: Few-Step Discrete Flow Matching via Energy-Navigated Distillation](https://arxiv.org/abs/2605.07924) | 7 | 4 | 3 | Knowledge distillation | hf_daily | — | 05-08 |
+| 1 | [Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction](https://arxiv.org/abs/2605.09649) | 9 | 5 | 4 | KV cache compression | hf_daily | — | 05-10 |
+| 2 | [SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training](https://arxiv.org/abs/2605.08738) | 9 | 5 | 4 | Pruning / sparsity | hf_daily | — | 05-09 |
+| 3 | [SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding](https://arxiv.org/abs/2605.10453) | 7 | 3 | 4 | Speculative decoding | hf_daily | — | 05-11 |
 
 
 ## 🔁 Revisited
 
-- [UniSD: Towards a Unified Self-Distillation Framework for Large Language Models](https://arxiv.org/abs/2605.06597) — score 7
-- [Trajectory as the Teacher: Few-Step Discrete Flow Matching via Energy-Navigated Distillation](https://arxiv.org/abs/2605.07924) — score 7
-- [Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility](https://arxiv.org/abs/2605.06105) — score 8
-- [Normalizing Trajectory Models](https://arxiv.org/abs/2605.08078) — score 7
+- [SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training](https://arxiv.org/abs/2605.08738) — score 9
+- [Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction](https://arxiv.org/abs/2605.09649) — score 9
+- [SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding](https://arxiv.org/abs/2605.10453) — score 7
