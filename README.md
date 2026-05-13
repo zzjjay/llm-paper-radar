@@ -1,7 +1,7 @@
 # LLM Inference Optimization Daily · 2026-05-12
 
 > 📅 Window: 2026-05-12 (UTC daily)
-> 📊 Scanned 518 papers → passed filter 14 → highlighted 13 (threshold ≥7)
+> 📊 Scanned 518 papers → passed filter 14 → highlighted 12 (threshold ≥7)
 
 > Auto-generated daily digest from [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar).
 > History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
@@ -44,7 +44,7 @@ ADMM-Q addresses degraded model utility in PTQ weight quantization at sub-4-bit 
 
 ---
 
-### QAT / low-bit pretraining (top 2 of cap 3)
+### QAT / low-bit pretraining (top 2 of cap 2)
 
 ### 3. Pretraining large language models with MXFP4 (8/10)
 **arxiv** · `2605.09825` · 2026-05-11
@@ -80,81 +80,9 @@ Trellis-coded quantization (QTIP) achieves state-of-the-art 2-bit PTQ for LLMs, 
 
 ---
 
-### Pruning / sparsity (top 1 of cap 3)
+### KV cache compression (top 1 of cap 2)
 
-### 5. SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training (9/10) 🔁
-**hf_daily** · `2605.08738` · 2026-05-09
-👥 Shengkun Tang, Zekun Wang, Bo Zheng... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.08738) · [PDF](https://arxiv.org/pdf/2605.08738.pdf)
-📡 Sources: hf_daily (👍 8, 💬 1)
-🧪 pruning · MoE expert pruning + knowledge distillation + multi-token prediction distillation · Qwen3-Next-80A3B (compressed to 23A2B) · cal: large-scale continual pretraining at compression scale
-
-#### Summary
-Addresses the question of how structured pruning and knowledge distillation should be applied during large-scale MoE model pretraining. Systematically studies depth/width/expert compression on MoE models, finding that pruning a pretrained MoE consistently outperforms training the target architecture from scratch under equal compute budgets. Introduces a partial-preservation expert merging strategy, combines KD with LM loss, proposes multi-token prediction (MTP) distillation, and uses progressive pruning schedules—compressing Qwen3-Next-80A3B to a 23A2B model with competitive performance.
-
-- 🎯 Method: Partial-preservation expert merging + MTP distillation + progressive pruning to compress Qwen3-Next-80A3B → 23A2B (~71% active parameter reduction)
-- 📊 Result: Pruned MoE initialization consistently outperforms training target architecture from scratch under same token/compute budget across all compression axes
-- 💡 Innovation: MTP distillation and combining KD with LM loss yield consistent gains, especially on knowledge-intensive benchmarks
-- 📊 Result: Progressive pruning schedules outperform one-shot compression given same training tokens, indicating gradual architecture transitions improve optimization
-
----
-
-### Knowledge distillation (top 3 of cap 3)
-
-### 6. SOMA: Efficient Multi-turn LLM Serving via Small Language Model (8/10)
-**arxiv** · `2605.11317` · 2026-05-11
-👥 Xueqi Cheng, Qiong Wu, Zhengyi Zhou... · 🏷 cs.CL, cs.AI
-🔗 [arXiv](https://arxiv.org/abs/2605.11317) · [PDF](https://arxiv.org/pdf/2605.11317v1)
-📡 Sources: arxiv
-🧪 distillation · localized knowledge distillation + LoRA fine-tuning · cal: soft-prompt mining + LoRA fine-tuning on early turns; cost unknown · perf: reduced latency/memory in multi-turn dialogue; gate enables rollback
-
-#### Summary
-Multi-turn LLM serving incurs high cost because full dialogue history is concatenated each turn and routed to large proprietary models. SOMA exploits early conversation turns to estimate a local response manifold, then adapts a small surrogate model via localized LoRA fine-tuning to handle subsequent turns. Soft prompts are learned to maximize semantic divergence between large and small model responses (surfacing misaligned directions), with anti-degeneration control and distillation into prompt-free LoRA inference; a gating mechanism enables one-time switching with rollback on quality drift.
-
-- 🎯 Method: Early turns used to mine hard cases via soft prompt optimization maximizing semantic divergence, then distilled into localized LoRA adapters for the surrogate small model.
-- 💡 Innovation: One-time switch gate from large to small model with drift-triggered rollback, eliminating per-turn large model inference after warm-up phase.
-- 🔧 Engineering: Surrogate runs without prompts at inference (prompts only used during local fine-tuning), reducing latency, memory, and API costs for multi-turn serving.
-- ⚠️ Limitation: Abstract lacks concrete speedup/compression ratios or accuracy delta numbers; quantitative results are only described as 'extensive experiments show effectiveness'.
-
----
-
-### 7. ReAD: Reinforcement-Guided Capability Distillation for Large Language Models (7/10)
-**arxiv** · `2605.11290` · 2026-05-11
-👥 Xueqi Cheng, Xugui Zhou, Tyler Derr... · 🏷 cs.CL, cs.AI
-🔗 [arXiv](https://arxiv.org/abs/2605.11290) · [PDF](https://arxiv.org/pdf/2605.11290v1)
-📡 Sources: arxiv
-🧪 distillation · reinforcement-guided capability distillation with contextual bandit budget allocation
-
-#### Summary
-Capability distillation compresses LLMs while preserving task-relevant abilities, but existing methods treat capabilities as independent targets, ignoring cross-capability interference. ReAD addresses this by modeling capability interdependence: it infers task-essential capabilities, generates capability-targeted supervision dynamically, and uses an uncertainty-aware contextual bandit to adaptively allocate a fixed token distillation budget based on expected utility gains. Experiments show ReAD improves downstream task utility under the same token budget while reducing harmful cross-capability spillover compared to strong baselines.
-
-- 🎯 Method: Uncertainty-aware contextual bandit adaptively allocates fixed distillation token budget across capabilities based on expected utility gains
-- 💡 Innovation: Explicitly models cross-capability transfer during distillation, identifying that budget allocation induces systematic, budget-dependent capability interference
-- 📊 Result: Outperforms strong baselines in downstream utility under equal token budget while reducing harmful spillover and wasted distillation effort
-- ⚠️ Limitation: Evaluation scope limited to fixed token budget regime; absolute compression ratios and speedup numbers not reported in abstract
-
----
-
-### 8. Curriculum Learning-Guided Progressive Distillation in Large Language Models (7/10)
-**arxiv** · `2605.11260` · 2026-05-11
-👥 Jincheng Cao, Fanzhi Zeng, Leqi Liu... · 🏷 cs.LG, cs.AI
-🔗 [arXiv](https://arxiv.org/abs/2605.11260) · [PDF](https://arxiv.org/pdf/2605.11260v1)
-📡 Sources: arxiv
-🧪 distillation · Curriculum Learning-Guided Progressive Distillation · cal: unknown; curriculum construction + multi-teacher scheduling cost not detailed · perf: not reported
-
-#### Summary
-Existing LLM knowledge distillation ignores training data ordering and teacher-student capacity mismatch, causing the counterintuitive failure where stronger teachers produce worse students. CLPD addresses this by combining an explicit curriculum (organizing training examples easy-to-hard) with an implicit curriculum (progressively scheduling teachers of increasing capacity), aligned so data difficulty matches teacher strength. The framework is modular and plugs into standard distillation algorithms; empirical results on reasoning benchmarks show consistent improvements over standard distillation, data-ordering-only, and teacher-scheduling-only baselines.
-
-- 🎯 Method: Dual curriculum — explicit easy-to-hard data ordering + implicit progressive teacher scheduling — jointly addresses data difficulty and capacity mismatch in LLM distillation.
-- 💡 Innovation: Identifies and directly tackles the counterintuitive phenomenon where stronger teachers fail to produce better student models in standard distillation.
-- 📊 Result: CLPD consistently outperforms standard distillation and each individual curriculum component across multiple reasoning benchmarks.
-- 🔧 Engineering: Modular design integrates into existing distillation algorithms with minimal overhead.
-
----
-
-### KV cache compression (top 1 of cap 3)
-
-### 9. Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction (9/10) 🔁
+### 5. Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction (9/10) 🔁
 **hf_daily** · `2605.09649` · 2026-05-10
 👥 Ngoc Bui, Hieu Trung Nguyen, Arman Cohan... · 🏷 cs.CL
 🔗 [arXiv](https://arxiv.org/abs/2605.09649) · [PDF](https://arxiv.org/pdf/2605.09649.pdf)
@@ -171,9 +99,9 @@ KV cache eviction in long-context inference typically degrades performance versu
 
 ---
 
-### Speculative decoding (top 2 of cap 3)
+### Speculative decoding (top 2 of cap 2)
 
-### 10. SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding (7/10) 🔁
+### 6. SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding (7/10) 🔁
 **arxiv** · `2605.10453` · 2026-05-11
 👥 Anton Plaksin, Sergei Krutikov, Sergei Skvortsov... · 🏷 cs.LG, cs.CL
 🔗 [arXiv](https://arxiv.org/abs/2605.10453) · [PDF](https://arxiv.org/pdf/2605.10453.pdf)
@@ -190,7 +118,7 @@ Speculative decoding drafters face a computational bottleneck at the LM-head due
 
 ---
 
-### 11. CATS: Cascaded Adaptive Tree Speculation for Memory-Limited LLM Inference Acceleration (7/10)
+### 7. CATS: Cascaded Adaptive Tree Speculation for Memory-Limited LLM Inference Acceleration (7/10)
 **arxiv** · `2605.11186` · 2026-05-11
 👥 Yuning Han, Yangchenchen Jin, Dylan Zhao... · 🏷 cs.LG, cs.AI
 🔗 [arXiv](https://arxiv.org/abs/2605.11186) · [PDF](https://arxiv.org/pdf/2605.11186v1)
@@ -207,9 +135,64 @@ Auto-regressive LLM decoding is memory-bandwidth-bound, and existing speculative
 
 ---
 
-### Other (top 2 of cap 3)
+### Knowledge distillation (top 2 of cap 2)
 
-### 12. Compute Where it Counts: Self Optimizing Language Models (7/10)
+### 8. SOMA: Efficient Multi-turn LLM Serving via Small Language Model (8/10)
+**arxiv** · `2605.11317` · 2026-05-11
+👥 Xueqi Cheng, Qiong Wu, Zhengyi Zhou... · 🏷 cs.CL, cs.AI
+🔗 [arXiv](https://arxiv.org/abs/2605.11317) · [PDF](https://arxiv.org/pdf/2605.11317v1)
+📡 Sources: arxiv
+🧪 distillation · localized knowledge distillation + LoRA fine-tuning · cal: soft-prompt mining + LoRA fine-tuning on early turns; cost unknown · perf: reduced latency/memory in multi-turn dialogue; gate enables rollback
+
+#### Summary
+Multi-turn LLM serving incurs high cost because full dialogue history is concatenated each turn and routed to large proprietary models. SOMA exploits early conversation turns to estimate a local response manifold, then adapts a small surrogate model via localized LoRA fine-tuning to handle subsequent turns. Soft prompts are learned to maximize semantic divergence between large and small model responses (surfacing misaligned directions), with anti-degeneration control and distillation into prompt-free LoRA inference; a gating mechanism enables one-time switching with rollback on quality drift.
+
+- 🎯 Method: Early turns used to mine hard cases via soft prompt optimization maximizing semantic divergence, then distilled into localized LoRA adapters for the surrogate small model.
+- 💡 Innovation: One-time switch gate from large to small model with drift-triggered rollback, eliminating per-turn large model inference after warm-up phase.
+- 🔧 Engineering: Surrogate runs without prompts at inference (prompts only used during local fine-tuning), reducing latency, memory, and API costs for multi-turn serving.
+- ⚠️ Limitation: Abstract lacks concrete speedup/compression ratios or accuracy delta numbers; quantitative results are only described as 'extensive experiments show effectiveness'.
+
+---
+
+### 9. ReAD: Reinforcement-Guided Capability Distillation for Large Language Models (7/10)
+**arxiv** · `2605.11290` · 2026-05-11
+👥 Xueqi Cheng, Xugui Zhou, Tyler Derr... · 🏷 cs.CL, cs.AI
+🔗 [arXiv](https://arxiv.org/abs/2605.11290) · [PDF](https://arxiv.org/pdf/2605.11290v1)
+📡 Sources: arxiv
+🧪 distillation · reinforcement-guided capability distillation with contextual bandit budget allocation
+
+#### Summary
+Capability distillation compresses LLMs while preserving task-relevant abilities, but existing methods treat capabilities as independent targets, ignoring cross-capability interference. ReAD addresses this by modeling capability interdependence: it infers task-essential capabilities, generates capability-targeted supervision dynamically, and uses an uncertainty-aware contextual bandit to adaptively allocate a fixed token distillation budget based on expected utility gains. Experiments show ReAD improves downstream task utility under the same token budget while reducing harmful cross-capability spillover compared to strong baselines.
+
+- 🎯 Method: Uncertainty-aware contextual bandit adaptively allocates fixed distillation token budget across capabilities based on expected utility gains
+- 💡 Innovation: Explicitly models cross-capability transfer during distillation, identifying that budget allocation induces systematic, budget-dependent capability interference
+- 📊 Result: Outperforms strong baselines in downstream utility under equal token budget while reducing harmful spillover and wasted distillation effort
+- ⚠️ Limitation: Evaluation scope limited to fixed token budget regime; absolute compression ratios and speedup numbers not reported in abstract
+
+---
+
+### Pruning / sparsity (top 1 of cap 2)
+
+### 10. SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training (9/10) 🔁
+**hf_daily** · `2605.08738` · 2026-05-09
+👥 Shengkun Tang, Zekun Wang, Bo Zheng... · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.08738) · [PDF](https://arxiv.org/pdf/2605.08738.pdf)
+📡 Sources: hf_daily (👍 8, 💬 1)
+🧪 pruning · MoE expert pruning + knowledge distillation + multi-token prediction distillation · Qwen3-Next-80A3B (compressed to 23A2B) · cal: large-scale continual pretraining at compression scale
+
+#### Summary
+Addresses the question of how structured pruning and knowledge distillation should be applied during large-scale MoE model pretraining. Systematically studies depth/width/expert compression on MoE models, finding that pruning a pretrained MoE consistently outperforms training the target architecture from scratch under equal compute budgets. Introduces a partial-preservation expert merging strategy, combines KD with LM loss, proposes multi-token prediction (MTP) distillation, and uses progressive pruning schedules—compressing Qwen3-Next-80A3B to a 23A2B model with competitive performance.
+
+- 🎯 Method: Partial-preservation expert merging + MTP distillation + progressive pruning to compress Qwen3-Next-80A3B → 23A2B (~71% active parameter reduction)
+- 📊 Result: Pruned MoE initialization consistently outperforms training target architecture from scratch under same token/compute budget across all compression axes
+- 💡 Innovation: MTP distillation and combining KD with LM loss yield consistent gains, especially on knowledge-intensive benchmarks
+- 📊 Result: Progressive pruning schedules outperform one-shot compression given same training tokens, indicating gradual architecture transitions improve optimization
+
+---
+
+### Other (top 2 of cap 2)
+
+### 11. Compute Where it Counts: Self Optimizing Language Models (7/10)
 **arxiv** · `2605.10875` · 2026-05-11
 👥 Yash Akhauri, Mohamed S. Abdelfattah · 🏷 cs.LG, cs.CL
 🔗 [arXiv](https://arxiv.org/abs/2605.10875) · [PDF](https://arxiv.org/pdf/2605.10875v1)
@@ -226,7 +209,7 @@ Static compression methods apply uniform compute budgets across all tokens durin
 
 ---
 
-### 13. Reinforce Adjoint Matching: Scaling RL Post-Training of Diffusion and Flow-Matching Models (7/10)
+### 12. Reinforce Adjoint Matching: Scaling RL Post-Training of Diffusion and Flow-Matching Models (7/10)
 **arxiv** · `2605.10759` · 2026-05-11
 👥 Andreas Bergmeister, Stefanie Jegelka, Nikolas Nüsken... · 🏷 cs.LG, cs.CV
 🔗 [arXiv](https://arxiv.org/abs/2605.10759) · [PDF](https://arxiv.org/pdf/2605.10759v1)
@@ -265,6 +248,6 @@ RL post-training of diffusion/flow-matching models typically requires expensive 
 
 ## 🔁 Revisited
 
-- [SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training](https://arxiv.org/abs/2605.08738) — score 9
 - [Make Each Token Count: Towards Improving Long-Context Performance with KV Cache Eviction](https://arxiv.org/abs/2605.09649) — score 9
 - [SlimSpec: Low-Rank Draft LM-Head for Accelerated Speculative Decoding](https://arxiv.org/abs/2605.10453) — score 7
+- [SlimQwen: Exploring the Pruning and Distillation in Large MoE Model Pre-training](https://arxiv.org/abs/2605.08738) — score 9
