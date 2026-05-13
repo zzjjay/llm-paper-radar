@@ -24,21 +24,20 @@ class ArxivSource(Source):
 
     async def fetch(self, target_date: datetime) -> list[Paper]:
         """Fetch papers submitted within ~24h ending at target_date (UTC)."""
+        # arXiv expects literal '+' between OR'd terms. httpx's params= encoder
+        # turns '+' into '%2B', which arXiv treats as part of a literal string
+        # match — the query then matches nothing. Build the URL by hand instead.
         cat_query = "+OR+".join(f"cat:{c}" for c in self.categories)
         all_entries: list[dict] = []
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
             start = 0
             for _ in range(self.max_pages):
-                resp = await client.get(
-                    self.BASE_URL,
-                    params={
-                        "search_query": cat_query,
-                        "start": start,
-                        "max_results": self.page_size,
-                        "sortBy": "submittedDate",
-                        "sortOrder": "descending",
-                    },
+                url = (
+                    f"{self.BASE_URL}?search_query={cat_query}&start={start}"
+                    f"&max_results={self.page_size}"
+                    f"&sortBy=submittedDate&sortOrder=descending"
                 )
+                resp = await client.get(url)
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:
