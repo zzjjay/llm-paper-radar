@@ -67,8 +67,20 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     prompt.write_text("score this")
     fake_filter = AsyncMock()
     fake_filter.call_json.side_effect = [
-        {"relevance_score": 9, "reason": "good"},
-        {"relevance_score": 4, "reason": "weak"},
+        {
+            "hard_gate": False,
+            "topic_relevance": 5,
+            "practicality": 4,
+            "topic_bucket": "ptq",
+            "reason": "good",
+        },
+        {
+            "hard_gate": False,
+            "topic_relevance": 2,
+            "practicality": 1,
+            "topic_bucket": "other",
+            "reason": "weak",
+        },
     ]
     await filter_papers(deduped_path, scored_path, prompt, fake_filter, concurrency=2)
 
@@ -89,7 +101,15 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     digests = tmp_path / "digests"
     readme = tmp_path / "README.md"
     index = tmp_path / "INDEX.md"
-    render_daily(date, summarized_path, digests, readme, index, full_top_n=10, threshold=7)
+    render_daily(
+        date,
+        summarized_path,
+        digests,
+        readme,
+        index,
+        threshold=7,
+        topic_caps={"compression": 5, "_default": 3},
+    )
 
     out = (digests / "2026-05-11.md").read_text()
     assert "Paper X" in out

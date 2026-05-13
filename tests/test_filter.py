@@ -36,8 +36,21 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
 
     fake = AsyncMock()
     fake.call_json.side_effect = [
-        {"relevance_score": 9, "reason": "FP4 quantization method"},
-        {"relevance_score": 1, "reason": "RAG, not relevant"},
+        {
+            "hard_gate": False,
+            "topic_relevance": 5,
+            "practicality": 4,
+            "topic_bucket": "ptq",
+            "compression_type": "ptq",
+            "reason": "FP4 quantization method",
+        },
+        {
+            "hard_gate": True,
+            "topic_relevance": 0,
+            "practicality": 0,
+            "topic_bucket": "other",
+            "reason": "RAG, not relevant",
+        },
     ]
 
     n = await filter_papers(
@@ -49,9 +62,10 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
     )
     assert n == 2
     out = json.loads(out_path.read_text())
-    assert out[0]["relevance_score"] == 9
+    assert out[0]["relevance_score"] == 9  # 5 + 4
     assert out[0]["relevance_reason"] == "FP4 quantization method"
-    assert out[1]["relevance_score"] == 1
+    assert out[0]["relevance_breakdown"]["topic_bucket"] == "ptq"
+    assert out[1]["relevance_score"] == 0  # hard_gate forces composite to 0
 
 
 @pytest.mark.asyncio
@@ -69,13 +83,19 @@ async def test_filter_skips_papers_with_empty_metadata(tmp_path: Path, monkeypat
     prompt_path.write_text("score this")
 
     fake = AsyncMock()
-    fake.call_json.return_value = {"relevance_score": 9, "reason": "good"}
+    fake.call_json.return_value = {
+        "hard_gate": False,
+        "topic_relevance": 5,
+        "practicality": 4,
+        "topic_bucket": "ptq",
+        "reason": "good",
+    }
     await filter_papers(in_path, out_path, prompt_path, fake, concurrency=2)
 
     out = json.loads(out_path.read_text())
     by_id = {p["id"]: p for p in out}
     assert by_id["stub"]["relevance_score"] is None
-    assert by_id["real"]["relevance_score"] == 9
+    assert by_id["real"]["relevance_score"] == 9  # 5 + 4
     assert fake.call_json.call_count == 1  # only the real paper was scored
 
 
@@ -91,7 +111,13 @@ async def test_filter_handles_per_paper_failure(tmp_path: Path, monkeypatch):
 
     fake = AsyncMock()
     fake.call_json.side_effect = [
-        {"relevance_score": 8, "reason": "ok"},
+        {
+            "hard_gate": False,
+            "topic_relevance": 4,
+            "practicality": 4,
+            "topic_bucket": "ptq",
+            "reason": "ok",
+        },
         Exception("boom"),
     ]
     await filter_papers(deduped_path, out_path, prompt_path, fake, concurrency=2)

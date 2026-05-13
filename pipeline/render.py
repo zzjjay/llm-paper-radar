@@ -14,6 +14,41 @@ REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
 RELEVANCE_WEIGHT = 20
 
+BUCKET_ORDER = [
+    "ptq",
+    "qat",
+    "pruning",
+    "distillation",
+    "kv_cache",
+    "diffusion_compression",
+    "speculative_decoding",
+    "survey",
+    "other",
+]
+BUCKET_TITLES = {
+    "ptq": "PTQ (post-training quantization)",
+    "qat": "QAT / low-bit pretraining",
+    "pruning": "Pruning / sparsity",
+    "distillation": "Knowledge distillation",
+    "kv_cache": "KV cache compression",
+    "diffusion_compression": "Diffusion compression",
+    "speculative_decoding": "Speculative decoding",
+    "survey": "Survey",
+    "other": "Other",
+}
+
+
+def _bucket_of(p: Paper) -> str:
+    bd = p.relevance_breakdown or {}
+    bucket = bd.get("topic_bucket")
+    if bucket in BUCKET_TITLES:
+        return bucket
+    return "other"
+
+
+def _cap_for(bucket: str, caps: dict[str, int]) -> int:
+    return caps.get(bucket, caps.get("_default", 3))
+
 
 def heat_score(p: Paper) -> float:
     """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5 + twitter_account_bonus.
@@ -101,6 +136,27 @@ def _summary_block(summary: str | None, highlights: list[str]) -> str:
     return f"#### Summary\n{summary}\n\n{hl}\n" if hl else f"#### Summary\n{summary}\n"
 
 
+def _signal_line(p: Paper) -> str:
+    bd = p.relevance_breakdown or {}
+    parts = []
+    ctype = bd.get("compression_type")
+    if ctype and ctype != "unknown":
+        parts.append(str(ctype))
+    fmt = bd.get("format_or_method")
+    if fmt and fmt != "unknown":
+        parts.append(str(fmt))
+    largest = bd.get("largest_model_tested")
+    if largest and largest != "unknown":
+        parts.append(str(largest))
+    cal = bd.get("calibration_cost")
+    if cal and cal != "unknown":
+        parts.append(f"cal: {cal}")
+    perf = bd.get("inference_perf")
+    if perf and perf != "unknown":
+        parts.append(f"perf: {perf}")
+    return f"🧪 {' · '.join(parts)}\n" if parts else ""
+
+
 def _full_block(rank: int, p: Paper) -> str:
     code_part = f" · [GitHub]({p.code_url})" if p.code_url else ""
     pdf_part = f" · [PDF]({p.pdf_url})" if p.pdf_url else ""
@@ -109,12 +165,13 @@ def _full_block(rank: int, p: Paper) -> str:
     cats = ", ".join(p.categories) if p.categories else p.primary_category
     authors_short = ", ".join(p.authors[:3]) + ("..." if len(p.authors) > 3 else "")
     summary_block = _summary_block(p.summary, p.highlights)
+    signal_line = _signal_line(p)
     return f"""### {rank}. {p.title} ({p.relevance_score}/10){revisited}
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
 👥 {authors_short} · 🏷 {cats}
 🔗 [arXiv]({p.url}){pdf_part}{code_part}
 📡 Sources: {_source_badge(p)}
-
+{signal_line}
 {summary_block}
 ---
 """
@@ -124,8 +181,15 @@ def _table_row(rank: int, p: Paper) -> str:
     sources = "+".join({s.name for s in p.sources})
     code = "✅" if p.code_url else "—"
     date_str = p.published_at.strftime("%m-%d")
+    bd = p.relevance_breakdown or {}
+    bucket = BUCKET_TITLES.get(_bucket_of(p), "Other")
+    topic = bd.get("topic_relevance")
+    pract = bd.get("practicality")
+    topic_str = "—" if topic is None else str(topic)
+    pract_str = "—" if pract is None else str(pract)
     return (
-        f"| {rank} | [{p.title}]({p.url}) | {p.relevance_score} | {sources} | {code} | {date_str} |"
+        f"| {rank} | [{p.title}]({p.url}) | {p.relevance_score} | {topic_str} | {pract_str}"
+        f" | {bucket} | {sources} | {code} | {date_str} |"
     )
 
 
@@ -135,26 +199,41 @@ def render_index_line(date: datetime, scanned: int, passed: int, top_title: str)
     return f"- [{day}](digests/{full}.md) — {scanned} scanned, {passed} passed, top: {top_title}"
 
 
+def _group_with_caps(
+    papers: list[Paper], topic_caps: dict[str, int]
+) -> dict[str, list[Paper]]:
+    """Bucket sorted papers and apply per-bucket caps. Input order is preserved."""
+    grouped: dict[str, list[Paper]] = {b: [] for b in BUCKET_ORDER}
+    for p in papers:
+        grouped[_bucket_of(p)].append(p)
+    return {b: ps[: _cap_for(b, topic_caps)] for b, ps in grouped.items()}
+
+
 def render_daily(
     date: datetime,
     summarized_path: Path,
     digests_dir: Path,
     readme_path: Path,
     index_path: Path,
-    full_top_n: int,
     threshold: int,
+    topic_caps: dict[str, int] | None = None,
 ) -> None:
+    if topic_caps is None:
+        topic_caps = {"_default": 3}
     all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
     scanned = len(all_papers)
     surviving = [p for p in all_papers if (p.relevance_score or 0) >= threshold]
     surviving = sort_papers(surviving)
-    revisited = [p for p in surviving if p.seen_before]
+    grouped = _group_with_caps(surviving, topic_caps)
+    highlighted_total = sum(len(ps) for ps in grouped.values())
+    revisited = [p for ps in grouped.values() for p in ps if p.seen_before]
 
     body = []
     body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
     body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
     body.append(
-        f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)} (threshold ≥{threshold})"
+        f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)}"
+        f" → highlighted {highlighted_total} (threshold ≥{threshold})"
     )
     body.append("")
     body.append(f"> Auto-generated daily digest from [llm-paper-radar]({REPO_URL}).")
@@ -163,13 +242,21 @@ def render_daily(
         " · Powered by Claude Sonnet 4.6\n"
     )
 
-    body.append(f"## 🔥 Top {min(full_top_n, len(surviving))} (Full Detail)\n")
-    for i, p in enumerate(surviving[:full_top_n], start=1):
-        body.append(_full_block(i, p))
+    body.append("## 🔥 Highlights by topic\n")
+    rank = 0
+    for bucket in BUCKET_ORDER:
+        papers = grouped[bucket]
+        if not papers:
+            continue
+        cap = _cap_for(bucket, topic_caps)
+        body.append(f"### {BUCKET_TITLES[bucket]} (top {len(papers)} of cap {cap})\n")
+        for p in papers:
+            rank += 1
+            body.append(_full_block(rank, p))
 
     body.append("## 📚 Full List (by score, descending)\n")
-    body.append("| # | Title | Score | Sources | Code | Date |")
-    body.append("|---|-------|-------|---------|------|------|")
+    body.append("| # | Title | Score | Topic | Pract | Bucket | Sources | Code | Date |")
+    body.append("|---|-------|-------|-------|-------|--------|---------|------|------|")
     for i, p in enumerate(surviving, start=1):
         body.append(_table_row(i, p))
     body.append("")
@@ -228,8 +315,8 @@ if __name__ == "__main__":
                 digests_dir,
                 readme,
                 index,
-                cfg.render.full_top_n,
                 cfg.filter.threshold,
+                cfg.render.topic_caps,
             )
             print(f"render: wrote digest for {target.date()}")
 

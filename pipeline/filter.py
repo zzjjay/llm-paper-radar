@@ -8,6 +8,38 @@ from pipeline.config import load_config
 from pipeline.llm_client import LLMClient, load_prompt
 from sources.base import Paper
 
+_BREAKDOWN_FIELDS = (
+    "hard_gate",
+    "topic_relevance",
+    "practicality",
+    "compression_type",
+    "topic_bucket",
+    "model_domain",
+    "format_or_method",
+    "largest_model_tested",
+    "accuracy_benchmarks",
+    "accuracy_summary",
+    "inference_perf",
+    "calibration_cost",
+    "peak_memory",
+)
+
+
+def _clip(value, lo: int, hi: int) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return lo
+    return max(lo, min(hi, v))
+
+
+def _composite(result: dict) -> int:
+    if result.get("hard_gate"):
+        return 0
+    topic = _clip(result.get("topic_relevance"), 0, 5)
+    pract = _clip(result.get("practicality"), 0, 5)
+    return topic + pract
+
 
 async def _score_one(paper: Paper, prompt: str, client: LLMClient, sem: asyncio.Semaphore) -> Paper:
     # Skip stub papers (e.g. hf_daily trending-only entries with no metadata).
@@ -19,13 +51,15 @@ async def _score_one(paper: Paper, prompt: str, client: LLMClient, sem: asyncio.
     user_msg = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
     async with sem:
         try:
-            result = await client.call_json(prompt, user_msg, max_tokens=200)
-            paper.relevance_score = int(result.get("relevance_score", 0))
-            paper.relevance_reason = str(result.get("reason", ""))[:120]
+            result = await client.call_json(prompt, user_msg, max_tokens=600)
+            paper.relevance_score = _composite(result)
+            paper.relevance_reason = str(result.get("reason", ""))[:160]
+            paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
         except Exception as e:
             print(f"filter: paper {paper.id} failed: {e}")
             paper.relevance_score = None
             paper.relevance_reason = None
+            paper.relevance_breakdown = None
     return paper
 
 

@@ -38,6 +38,7 @@ class Paper(BaseModel):
 
     relevance_score: int | None = None
     relevance_reason: str | None = None
+    relevance_breakdown: dict | None = None
     summary: str | None = None
     highlights: list[str] = Field(default_factory=list)
     seen_before: bool = False

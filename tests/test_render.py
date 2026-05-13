@@ -15,6 +15,9 @@ def _mk(
     trending_rank=None,
     twitter_accounts=None,
     summary="en",
+    topic_bucket="ptq",
+    topic_relevance=5,
+    practicality=4,
 ):  # noqa: E501
     now = datetime.now(UTC)
     sources = [
@@ -61,6 +64,16 @@ def _mk(
     p.relevance_score = score
     p.summary = summary
     p.highlights = ["🎯 hl"]
+    p.relevance_breakdown = {
+        "topic_bucket": topic_bucket,
+        "topic_relevance": topic_relevance,
+        "practicality": practicality,
+        "compression_type": "quantization",
+        "format_or_method": "W4A16",
+        "largest_model_tested": "Llama-3-70B",
+        "calibration_cost": "data-free",
+        "inference_perf": "1.5x",
+    }
     return p
 
 
@@ -97,8 +110,9 @@ def test_sort_papers_relevance_outweighs_modest_heat():
     assert [p.id for p in sorted_] == ["hr", "mr"]
 
 
-def test_render_daily_writes_top10_full_then_table(tmp_path: Path):
+def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     summarized_path = tmp_path / "summarized.json"
+    # 15 PTQ papers (cap 5) + 1 below threshold
     papers = [_mk(f"id{i}", 9, trending_rank=i + 1) for i in range(15)]
     below = _mk("low", 5)
     summarized_path.write_text(json.dumps([p.model_dump(mode="json") for p in papers + [below]]))
@@ -113,15 +127,18 @@ def test_render_daily_writes_top10_full_then_table(tmp_path: Path):
         digests_dir=digests_dir,
         readme_path=readme,
         index_path=index,
-        full_top_n=10,
         threshold=7,
+        topic_caps={"ptq": 5, "_default": 3},
     )
 
     out = (digests_dir / "2026-05-11.md").read_text()
-    assert "## 🔥 Top 10" in out
-    assert out.count("#### Summary") == 10
+    assert "## 🔥 Highlights by topic" in out
+    assert "### PTQ (post-training quantization) (top 5 of cap 5)" in out
+    # Caps apply to highlights, not full list. 15 pass threshold; cap surfaces 5.
+    assert out.count("#### Summary") == 5
     assert "## 📚 Full List" in out
-    assert "id|low" not in out and "Title low" not in out
+    # Below-threshold paper excluded from both highlights and full list.
+    assert "Title low" not in out
     assert readme.read_text() == out
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()
 

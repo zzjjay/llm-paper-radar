@@ -19,8 +19,10 @@ summarize:
   model: claude-sonnet-4-6
   concurrency: 20
 render:
-  full_top_n: 10
   truncate_after: 10
+  topic_caps:
+    compression: 5
+    _default: 3
 dedupe:
   cross_day_strategy: lenient
   source_priority: [hf_daily, arxiv]
@@ -33,3 +35,4 @@ dedupe:
     assert cfg.sources.arxiv.enabled is True
     assert cfg.sources.arxiv.categories == ["cs.CL", "cs.LG"]
     assert cfg.dedupe.source_priority[0] == "hf_daily"
+    assert cfg.render.topic_caps == {"compression": 5, "_default": 3}
