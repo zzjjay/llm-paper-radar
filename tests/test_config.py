@@ -21,8 +21,8 @@ summarize:
 render:
   truncate_after: 10
   topic_caps:
-    compression: 5
-    _default: 3
+    ptq: 3
+    _default: 2
 dedupe:
   cross_day_strategy: lenient
   source_priority: [hf_daily, arxiv]
@@ -35,4 +35,4 @@ dedupe:
     assert cfg.sources.arxiv.enabled is True
     assert cfg.sources.arxiv.categories == ["cs.CL", "cs.LG"]
     assert cfg.dedupe.source_priority[0] == "hf_daily"
-    assert cfg.render.topic_caps == {"compression": 5, "_default": 3}
+    assert cfg.render.topic_caps == {"ptq": 3, "_default": 2}

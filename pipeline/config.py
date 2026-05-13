@@ -52,7 +52,7 @@ class SummarizeConfig(BaseModel):
 
 class RenderConfig(BaseModel):
     truncate_after: int = 10
-    topic_caps: dict[str, int] = Field(default_factory=lambda: {"_default": 3})
+    topic_caps: dict[str, int] = Field(default_factory=lambda: {"ptq": 3, "_default": 2})
 
 
 class DedupeConfig(BaseModel):

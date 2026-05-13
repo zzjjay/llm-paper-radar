@@ -17,11 +17,11 @@ RELEVANCE_WEIGHT = 20
 BUCKET_ORDER = [
     "ptq",
     "qat",
-    "pruning",
-    "distillation",
     "kv_cache",
-    "diffusion_compression",
     "speculative_decoding",
+    "distillation",
+    "pruning",
+    "diffusion_compression",
     "survey",
     "other",
 ]
@@ -219,7 +219,7 @@ def render_daily(
     topic_caps: dict[str, int] | None = None,
 ) -> None:
     if topic_caps is None:
-        topic_caps = {"_default": 3}
+        topic_caps = {"ptq": 3, "_default": 2}
     all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
     scanned = len(all_papers)
     surviving = [p for p in all_papers if (p.relevance_score or 0) >= threshold]
