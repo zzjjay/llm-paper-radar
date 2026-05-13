@@ -36,7 +36,6 @@ class SourcesConfig(BaseModel):
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
     reddit: RedditConfig = RedditConfig()
     semantic_scholar: SemanticScholarConfig = SemanticScholarConfig()
-    papers_with_code: SimpleSourceConfig = SimpleSourceConfig()
     twitter_rsshub: TwitterConfig = TwitterConfig()
 
 

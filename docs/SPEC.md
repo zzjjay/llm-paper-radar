@@ -40,7 +40,6 @@ GitHub Actions (cron daily 23:00 UTC)
         │     ├─ sources/hf_daily.py
         │     ├─ sources/reddit.py
         │     ├─ sources/semantic_scholar.py
-        │     ├─ sources/papers_with_code.py
         │     └─ sources/twitter_rsshub.py
         │           ↓
         │     data/raw/YYYY-MM-DD/{source}.json
@@ -70,7 +69,6 @@ llm-paper-radar/
 │   ├── hf_daily.py
 │   ├── reddit.py
 │   ├── semantic_scholar.py
-│   ├── papers_with_code.py
 │   └── twitter_rsshub.py
 ├── pipeline/
 │   ├── dedupe.py
@@ -147,7 +145,6 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 
 ### Tier 3 — Supplementary
 
-#### `sources/papers_with_code.py`
 - Source: RSS feed `https://paperswithcode.com/latest/rss.xml` (PwC search API is unstable)
 - Extras retained: `code_url` (highlighted in render)
 - Expected: ~50–100 papers/day (high overlap with arXiv, dedupe handles)
@@ -178,7 +175,7 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 
 ```python
 class SourceRecord(BaseModel):
-    name: Literal["arxiv", "hf_daily", "reddit", "semantic_scholar", "papers_with_code", "twitter_rsshub"]
+    name: Literal["arxiv", "hf_daily", "reddit", "semantic_scholar", "twitter_rsshub"]
     fetched_at: datetime
     extras: dict = {}            # source-specific (upvotes, score, thread_url, ...)
 
@@ -215,7 +212,7 @@ class Paper(BaseModel):
 
 **Field-merge priority** when same paper appears across sources:
 ```
-hf_daily > reddit > semantic_scholar > papers_with_code > twitter_rsshub > arxiv (fallback)
+hf_daily > reddit > semantic_scholar > twitter_rsshub > arxiv (fallback)
 ```
 For each field (title, abstract, authors, etc.), take the value from the highest-priority source that has a non-empty value. arXiv serves as the safety net.
 
@@ -436,7 +433,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [arxiv, hf_daily, reddit, semantic_scholar, papers_with_code, twitter_rsshub]
+        source: [arxiv, hf_daily, reddit, semantic_scholar, twitter_rsshub]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -615,8 +612,6 @@ sources:
     enabled: true
     seeds_file: seeds.yaml
     citation_window_days: 7
-  papers_with_code:
-    enabled: true
   twitter_rsshub:
     enabled: true
     accounts:
@@ -647,7 +642,6 @@ dedupe:
     - hf_daily
     - reddit
     - semantic_scholar
-    - papers_with_code
     - twitter_rsshub
     - arxiv
 ```

@@ -11,7 +11,6 @@ SourceName = Literal[
     "hf_daily",
     "reddit",
     "semantic_scholar",
-    "papers_with_code",
     "twitter_rsshub",
 ]
 

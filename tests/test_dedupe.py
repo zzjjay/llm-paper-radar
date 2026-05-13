@@ -32,7 +32,6 @@ def test_merge_papers_combines_sources_and_uses_priority():
         "hf_daily",
         "reddit",
         "semantic_scholar",
-        "papers_with_code",
         "twitter_rsshub",
         "arxiv",
     ]
