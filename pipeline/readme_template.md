@@ -151,13 +151,23 @@ If everything is wired up, you'll see `data/raw/`, `data/deduped/`, `data/scored
 
 ### 6. Schedule it
 
-This repo ships a GitHub Actions workflow at `.github/workflows/daily.yml` that runs the pipeline daily at **12:00 UTC** and pushes the digest. To use it, set repo secrets:
+**Option A — host crontab (works behind a corporate Anthropic proxy).** This is what this fork actually uses, because the LLM endpoint sits inside the AMD network and isn't reachable from public CI runners:
+
+```bash
+crontab -e
+# add (replace path):
+0 6 * * * /absolute/path/to/llm-paper-radar/scripts/daily.sh
+```
+
+`scripts/daily.sh` sources `~/.bashrc` for the Anthropic env vars, runs the full pipeline (`fetch → dedupe → filter → summarize → render`), and only commits + pushes when something actually changed. Logs land in `scripts/log/YYYY-MM-DD.log`.
+
+**Option B — GitHub Actions (forks with a public sk-ant key).** The `.github/workflows/daily.yml` workflow has the schedule commented out, but everything else is wired up. To use it, set repo secrets and re-enable the schedule line:
 
 | secret | required | what for |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | yes | sk-ant-… key, OR a placeholder like `dummy` if you're routing through a proxy |
-| `ANTHROPIC_BASE_URL` | optional | proxy / gateway URL (e.g. `https://your-proxy/Anthropic`); leave unset for default api.anthropic.com |
-| `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers required by your proxy (e.g. `Subscription-Key: …`) |
+| `ANTHROPIC_API_KEY` | yes | sk-ant-… key |
+| `ANTHROPIC_BASE_URL` | optional | proxy / gateway URL; leave unset for default api.anthropic.com |
+| `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers required by your proxy |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | optional | enable Reddit source |
 | `SEMANTIC_SCHOLAR_API_KEY` | optional | enable Semantic Scholar source |
 | `RSSHUB_BASE_URL` | optional | enable Twitter source |
@@ -167,17 +177,7 @@ This repo ships a GitHub Actions workflow at `.github/workflows/daily.yml` that 
 Settings → Secrets and variables → Actions → New repository secret
 ```
 
-The workflow re-fetches today's papers, runs the full pipeline, and commits to `main` as `llm-paper-radar[bot]`.
-
-If you'd rather run it on your own machine (e.g. behind a corporate Anthropic proxy that can't be exposed to GitHub):
-
-```bash
-crontab -e
-# add (replace path):
-0 6 * * * /absolute/path/to/llm-paper-radar/scripts/daily.sh
-```
-
-`scripts/daily.sh` is idempotent: it `git pull --rebase`s first, runs the pipeline, and only commits if there are real changes.
+Then uncomment the `schedule:` block in `.github/workflows/daily.yml`. The workflow runs on the `main` branch and commits as `llm-paper-radar[bot]`.
 
 ---
 
