@@ -50,6 +50,20 @@ def _cap_for(bucket: str, caps: dict[str, int]) -> int:
     return caps.get(bucket, caps.get("_default", 3))
 
 
+def _caps_summary(caps: dict[str, int]) -> str:
+    """One-line human summary of the cap config, e.g. 'Up to 3 PTQ, 2 others'."""
+    default = caps.get("_default", 3)
+    overrides = [
+        (bucket, n)
+        for bucket, n in caps.items()
+        if bucket != "_default" and n != default and bucket in BUCKET_TITLES
+    ]
+    overrides.sort(key=lambda kv: BUCKET_ORDER.index(kv[0]))
+    parts = [f"{n} {bucket.upper().replace('_', ' ')}" for bucket, n in overrides]
+    parts.append(f"{default} others")
+    return "Up to " + ", ".join(parts)
+
+
 def heat_score(p: Paper) -> float:
     """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5 + twitter_account_bonus.
     Trending bonus = 100/rank for rank 1..30, else 0.
@@ -272,13 +286,16 @@ def render_daily(
     )
 
     body.append("## 🔥 Highlights by topic\n")
+    body.append(
+        f"_{_caps_summary(topic_caps)} per topic — change in"
+        " [`config.yaml`](config.yaml) under `render.topic_caps`._\n"
+    )
     rank = 0
     for bucket in BUCKET_ORDER:
         papers = grouped[bucket]
         if not papers:
             continue
-        cap = _cap_for(bucket, topic_caps)
-        body.append(f"### {BUCKET_TITLES[bucket]} (top {len(papers)} of cap {cap})\n")
+        body.append(f"### {BUCKET_TITLES[bucket]}\n")
         for p in papers:
             rank += 1
             body.append(_full_block(rank, p))

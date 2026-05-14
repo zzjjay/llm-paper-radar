@@ -133,7 +133,10 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
 
     out = (digests_dir / "2026-05-11.md").read_text()
     assert "## 🔥 Highlights by topic" in out
-    assert "### PTQ (post-training quantization) (top 5 of cap 5)" in out
+    assert "### PTQ (post-training quantization)" in out
+    assert "(top 5 of cap 5)" not in out  # the verbose annotation is gone
+    assert "Up to 5 PTQ, 3 others" in out  # caps summary line
+    assert "config.yaml" in out  # points users to where to change it
     # Caps apply to highlights, not full list. 15 pass threshold; cap surfaces 5.
     assert out.count("#### Summary") == 5
     assert "## 📚 Full List" in out
