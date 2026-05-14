@@ -37,7 +37,14 @@ class ArxivSource(Source):
                     f"&max_results={self.page_size}"
                     f"&sortBy=submittedDate&sortOrder=descending"
                 )
-                resp = await client.get(url)
+                # arXiv occasionally 429s shared CI IPs. Back off and retry a few times.
+                for attempt in range(4):
+                    resp = await client.get(url)
+                    if resp.status_code != 429:
+                        break
+                    wait = 5 * (2**attempt)  # 5s, 10s, 20s, 40s
+                    print(f"arxiv: 429 on page start={start}, sleeping {wait}s before retry")
+                    await asyncio.sleep(wait)
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:

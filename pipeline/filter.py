@@ -56,7 +56,16 @@ async def _score_one(paper: Paper, prompt: str, client: LLMClient, sem: asyncio.
             paper.relevance_reason = str(result.get("reason", ""))[:160]
             paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
         except Exception as e:
-            print(f"filter: paper {paper.id} failed: {e}")
+            # tenacity wraps the real failure in RetryError; surface the
+            # underlying exception so log lines say what actually went wrong.
+            cause = e
+            inner = getattr(e, "last_attempt", None)
+            if inner is not None and inner.failed:
+                try:
+                    cause = inner.exception() or e
+                except Exception:
+                    pass
+            print(f"filter: paper {paper.id} failed: {type(cause).__name__}: {cause}")
             paper.relevance_score = None
             paper.relevance_reason = None
             paper.relevance_breakdown = None
