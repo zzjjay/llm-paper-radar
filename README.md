@@ -24,7 +24,9 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 ## 🔥 Highlights by topic
 
-### PTQ (post-training quantization) (top 1 of cap 3)
+_Up to 3 PTQ, 2 others per topic — change in [`config.yaml`](config.yaml) under `render.topic_caps`._
+
+### PTQ (post-training quantization)
 
 ### 1. Provable Quantization with Randomized Hadamard Transform (7/10) 🔁
 **arxiv** · `2605.13810` · 2026-05-13
@@ -43,7 +45,7 @@ Vector quantization using randomized Hadamard transform (HD) lacks strong theore
 
 ---
 
-### Knowledge distillation (top 2 of cap 2)
+### Knowledge distillation
 
 ### 2. Prefix Teach, Suffix Fade: Local Teachability Collapse in Strong-to-Weak On-Policy Distillation (7/10) 🔁
 **arxiv** · `2605.13643` · 2026-05-13
@@ -79,7 +81,7 @@ Reasoning distillation from LLMs to compact models suffers from noisy rationales
 
 ---
 
-### Pruning / sparsity (top 1 of cap 2)
+### Pruning / sparsity
 
 ### 4. STOP: Structured On-Policy Pruning of Long-Form Reasoning in Low-Data Regimes (7/10) 🔁
 **arxiv** · `2605.13165` · 2026-05-13
