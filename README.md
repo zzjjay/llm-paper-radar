@@ -14,10 +14,10 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 <!-- LATEST_START -->
 
-# LLM Inference Optimization Daily · 2026-05-14
+# LLM Inference Optimization Daily · 2026-05-17
 
-> 📅 Window: 2026-05-14 (UTC daily)
-> 📊 Scanned 358 papers → passed filter 4 → highlighted 4 (threshold ≥7)
+> 📅 Window: 2026-05-17 (UTC daily)
+> 📊 Scanned 50 papers → passed filter 0 → highlighted 0 (threshold ≥7)
 
 > Auto-generated daily digest from [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar).
 > History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
@@ -26,96 +26,11 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 _Up to 3 PTQ, 2 others per topic — change in [`config.yaml`](config.yaml) under `render.topic_caps`._
 
-### PTQ (post-training quantization)
-
-### 1. Provable Quantization with Randomized Hadamard Transform (7/10) 🔁
-**arxiv** · `2605.13810` · 2026-05-13
-👥 Ying Feng, Piotr Indyk, Michael Kapralov... · 🏷 cs.LG, cs.DS
-🔗 [arXiv](https://arxiv.org/abs/2605.13810) · [PDF](https://arxiv.org/pdf/2605.13810v1)
-📡 Sources: arxiv
-🧪 ptq · Hadamard rotation + dithered scalar quantization · cal: Data-free (random projection + offset). · perf: O(d log d) vs O(d²) for dense rotation; no end-to-end speedup measured.
-
-#### Summary
-Vector quantization using randomized Hadamard transform (HD) lacks strong theoretical guarantees due to HD's discrete structure, despite its O(d log d) efficiency advantage over Θ(d²) dense rotations. This work analyzes dithered quantization (random scalar offset subtracted before quantizing) combined with a single randomized Hadamard transform, proving it is unbiased and achieves MSE bounds asymptotically matching those of truly random rotation matrices. Specifically, a dithered TurboQuant achieves MSE (π√3/2 + o(1))·4^{-b} at b bits per coordinate, with the o(1) term vanishing uniformly over all unit vectors as quantization levels grow.
-
-- 🎯 Method: Dithered quantization with single randomized Hadamard transform (HD) adds random scalar offset at negligible cost, enabling provable guarantees matching dense random rotations.
-- 📊 Result: MSE bound (π√3/2 + o(1))·4^{-b} at b bits/coordinate, asymptotically matching optimal dense-rotation quantization.
-- 💡 Innovation: Reduces computational cost from Θ(d²) (dense rotation) to O(d log d) (HD) while preserving asymptotically tight theoretical MSE guarantees.
-- 📊 Result: o(1) error term vanishes uniformly over all unit vectors and all dimensions as quantization levels grow, giving strong dimension-free guarantees.
-
----
-
-### Knowledge distillation
-
-### 2. Prefix Teach, Suffix Fade: Local Teachability Collapse in Strong-to-Weak On-Policy Distillation (7/10) 🔁
-**arxiv** · `2605.13643` · 2026-05-13
-👥 Kaiyuan Liu, Ziyuan Zhuang, Yang Bai... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.13643) · [PDF](https://arxiv.org/pdf/2605.13643v1)
-📡 Sources: arxiv
-🧪 distillation · on-policy distillation with trajectory-specific supervision truncation · Qwen3 (family; scale unknown) · cal: on-policy rollouts required; change-point detection on trajectories (cost not quantified) · perf: not reported
-
-#### Summary
-On-policy distillation (OPD) trains student models on self-generated rollouts with dense teacher feedback, but full-sequence supervision degrades when later trajectory segments lack discriminative teacher-student contrast—a failure mode termed 'local teachability collapse'. The proposed fix is a trajectory-specific release rule that measures the teacher's margin over the student's top-K candidate set at NLTK-sentence granularity, then truncates dense OPD supervision at a BIC-style downward change point. Evaluated on the Qwen3 model family, the method outperforms standard full-trajectory OPD on five in-domain benchmarks across multiple student scales while better preserving out-of-domain capabilities.
-
-- 🎯 Method: Truncate dense OPD supervision when teacher-student margin drops below a BIC-detected change point across sentence-level segments, rather than supervising full trajectories.
-- 📊 Result: Outperforms full-trajectory OPD on 5 in-domain benchmarks at various student scales using Qwen3 model family.
-- 💡 Innovation: Introduces 'local teachability collapse'—the insight that non-zero teacher-student advantage does not guarantee discriminative, learnable feedback at trajectory suffix regions.
-- 📊 Result: Better out-of-domain capability preservation compared to baseline distillation methods, suggesting reduced over-supervision harm.
-
----
-
-### 3. GateKD: Confidence-Gated Closed-Loop Distillation for Robust Reasoning (7/10) 🔁
-**arxiv** · `2605.13136` · 2026-05-13
-👥 Kasidit Sermsri, Teerapong Panboonyuen · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.13136) · [PDF](https://arxiv.org/pdf/2605.13136v1)
-📡 Sources: arxiv
-🧪 distillation · confidence-gated reasoning distillation · Flan-T5
-
-#### Summary
-Reasoning distillation from LLMs to compact models suffers from noisy rationales and hallucinated supervision due to open-loop teacher-student interactions that assume uniform teacher reliability. GateKD addresses this with a closed-loop framework using three confidence-gated mechanisms: soft supervision filtering, hidden-state alignment conditioned on teacher confidence, and reliability-filtered attention distillation. Evaluated on commonsense, logical, and symbolic reasoning benchmarks with T5/Flan-T5 backbones, GateKD consistently outperforms open-loop distillation baselines, with particularly substantial gains on logical and symbolic reasoning tasks.
-
-- 🎯 Method: Three-component confidence gating (soft supervision, hidden-state evolution, attention distillation) forms a closed feedback loop suppressing hallucination transfer.
-- 📊 Result: Consistent improvements over strong open-loop baselines on commonsense, logical, and symbolic reasoning benchmarks using T5 and Flan-T5 backbones.
-- 💡 Innovation: Teacher treated as dynamic gatekeeper—confidence score continuously modulates distillation signal rather than assuming uniform teacher reliability.
-- ⚠️ Limitation: Performance degrades measurably when any single gating component is removed, indicating sensitivity to full framework integrity.
-
----
-
-### Pruning / sparsity
-
-### 4. STOP: Structured On-Policy Pruning of Long-Form Reasoning in Low-Data Regimes (7/10) 🔁
-**arxiv** · `2605.13165` · 2026-05-13
-👥 Chenjun Xu, Zhennan Zhou, Zhan Su... · 🏷 cs.CL
-🔗 [arXiv](https://arxiv.org/abs/2605.13165) · [PDF](https://arxiv.org/pdf/2605.13165v1)
-📡 Sources: arxiv
-🧪 pruning · on-policy reasoning trace pruning via ECN (Earliest Correct Node) · DeepSeek-R1-Distill-LLaMA-3-8B · cal: self-distilled traces on low-data fine-tuning; cost not quantified in words · perf: 19.4-42.4% reduction in generated tokens; end-to-end latency not explicitly reported
-
-#### Summary
-Long CoT reasoning models suffer from overthinking—generating redundant post-solution tokens that inflate inference cost, particularly problematic in low-data fine-tuning regimes where large-scale distillation is unavailable. STOP (Structured On-policy Pruning) addresses this by constructing self-distilled traces, parsing them into structured reasoning trees via node segmentation and taxonomy annotation, then truncating each trace at the Earliest Correct Node (ECN)—the shortest prefix ending at a correct answering conclusion. On DeepSeek-R1-Distill-Qwen-7B and DeepSeek-R1-Distill-LLaMA-3-8B across GSM8K, Math 500, and AIME 2024, STOP achieves 19.4–42.4% token reduction with minimal accuracy degradation while inducing less distributional shift than teacher-guided pruning approaches.
-
-- 🎯 Method: On-policy structured pruning via reasoning-tree construction + ECN truncation removes redundant post-solution reasoning while preserving semantic continuity.
-- 📊 Result: 19.4–42.4% token reduction across GSM8K, Math 500, AIME 2024 with accuracy largely preserved in low-data fine-tuning.
-- 💡 Innovation: ECN (Earliest Correct Node) identifies shortest correct prefix, reallocating reasoning effort from backtracking/verification toward productive exploration.
-- ⚠️ Limitation: Evaluated only in low-data fine-tuning regimes; effectiveness at scale or with full training data not demonstrated.
-
----
-
 ## 📚 Full List (by score, descending)
 
 | # | Title | Score | Topic | Pract | Bucket | Sources | Code | Date |
 |---|-------|-------|-------|-------|--------|---------|------|------|
-| 1 | [Provable Quantization with Randomized Hadamard Transform](https://arxiv.org/abs/2605.13810) | 7 | 4 | 3 | PTQ (post-training quantization) | arxiv | — | 05-13 |
-| 2 | [Prefix Teach, Suffix Fade: Local Teachability Collapse in Strong-to-Weak On-Policy Distillation](https://arxiv.org/abs/2605.13643) | 7 | 4 | 3 | Knowledge distillation | arxiv | — | 05-13 |
-| 3 | [STOP: Structured On-Policy Pruning of Long-Form Reasoning in Low-Data Regimes](https://arxiv.org/abs/2605.13165) | 7 | 4 | 3 | Pruning / sparsity | arxiv | — | 05-13 |
-| 4 | [GateKD: Confidence-Gated Closed-Loop Distillation for Robust Reasoning](https://arxiv.org/abs/2605.13136) | 7 | 4 | 3 | Knowledge distillation | arxiv | — | 05-13 |
 
-
-## 🔁 Revisited
-
-- [Provable Quantization with Randomized Hadamard Transform](https://arxiv.org/abs/2605.13810) — score 7
-- [Prefix Teach, Suffix Fade: Local Teachability Collapse in Strong-to-Weak On-Policy Distillation](https://arxiv.org/abs/2605.13643) — score 7
-- [GateKD: Confidence-Gated Closed-Loop Distillation for Robust Reasoning](https://arxiv.org/abs/2605.13136) — score 7
-- [STOP: Structured On-Policy Pruning of Long-Form Reasoning in Low-Data Regimes](https://arxiv.org/abs/2605.13165) — score 7
 
 <!-- LATEST_END -->
 
