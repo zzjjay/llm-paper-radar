@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import httpx
 
+from sources._arxiv_lookup import fetch_arxiv_by_ids
 from sources.base import Paper, Source, SourceRecord
 
 TRENDING_LINK_RE = re.compile(r'href="/papers/(\d{4}\.\d{4,5})"')
@@ -75,6 +76,8 @@ class HFDailySource(Source):
                 sources=[SourceRecord(name="hf_daily", fetched_at=now, extras=extras)],
             )
 
+        # IDs in trending that we already have full metadata for: just record rank.
+        missing_ids: list[str] = []
         for arxiv_id, rank in trending_ranks.items():
             tr_record = SourceRecord(
                 name="hf_daily", fetched_at=now, extras={"trending_rank": rank}
@@ -82,18 +85,25 @@ class HFDailySource(Source):
             if arxiv_id in papers:
                 papers[arxiv_id].sources.append(tr_record)
             else:
-                papers[arxiv_id] = Paper(
-                    id=arxiv_id,
-                    title="",
-                    authors=[],
-                    abstract="",
-                    url=f"https://arxiv.org/abs/{arxiv_id}",
-                    pdf_url=f"https://arxiv.org/pdf/{arxiv_id}.pdf",
-                    published_at=target_date,
-                    primary_category="unknown",
-                    categories=[],
-                    sources=[tr_record],
+                missing_ids.append(arxiv_id)
+
+        # Enrich trending-only IDs via arXiv lookup so we don't emit blank stubs
+        # (the filter would just drop them, producing an empty digest — common on
+        # weekends when HF's daily_papers endpoint returns nothing).
+        if missing_ids:
+            extras_per_id = {aid: {"trending_rank": trending_ranks[aid]} for aid in missing_ids}
+            try:
+                enriched = await fetch_arxiv_by_ids(
+                    missing_ids, source_name="hf_daily", extras_per_id=extras_per_id
                 )
+            except httpx.HTTPError as e:
+                print(
+                    f"hf_daily: arxiv lookup for {len(missing_ids)} trending IDs failed ({e});"
+                    f" dropping those entries"
+                )
+                enriched = []
+            for p in enriched:
+                papers[p.id] = p
 
         return list(papers.values())
 

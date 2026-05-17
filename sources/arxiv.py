@@ -37,14 +37,29 @@ class ArxivSource(Source):
                     f"&max_results={self.page_size}"
                     f"&sortBy=submittedDate&sortOrder=descending"
                 )
-                # arXiv occasionally 429s shared CI IPs. Back off and retry a few times.
+                # arXiv occasionally 429s shared CI IPs and intermittently times
+                # out / drops the connection. Back off and retry on both.
+                resp = None
+                last_exc: Exception | None = None
                 for attempt in range(4):
-                    resp = await client.get(url)
-                    if resp.status_code != 429:
-                        break
-                    wait = 5 * (2**attempt)  # 5s, 10s, 20s, 40s
-                    print(f"arxiv: 429 on page start={start}, sleeping {wait}s before retry")
+                    try:
+                        resp = await client.get(url)
+                        if resp.status_code != 429:
+                            last_exc = None
+                            break
+                        wait = 5 * (2**attempt)  # 5s, 10s, 20s, 40s
+                        print(f"arxiv: 429 on page start={start}, sleeping {wait}s before retry")
+                    except (httpx.TimeoutException, httpx.TransportError) as e:
+                        last_exc = e
+                        wait = 5 * (2**attempt)
+                        print(
+                            f"arxiv: {type(e).__name__} on page start={start}, "
+                            f"sleeping {wait}s before retry"
+                        )
                     await asyncio.sleep(wait)
+                if last_exc is not None:
+                    raise last_exc
+                assert resp is not None
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:

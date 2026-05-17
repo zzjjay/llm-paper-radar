@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import UTC, datetime
 
@@ -28,9 +29,27 @@ async def fetch_arxiv_by_ids(
     extras_per_id = extras_per_id or {}
     id_query = ",".join(ids)
     url = "http://export.arxiv.org/api/query"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(url, params={"id_list": id_query, "max_results": len(ids)})
-        resp.raise_for_status()
+    params = {"id_list": id_query, "max_results": len(ids)}
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        last_exc: Exception | None = None
+        resp = None
+        for attempt in range(4):
+            try:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                last_exc = None
+                break
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                last_exc = e
+                wait = 5 * (2**attempt)
+                print(
+                    f"_arxiv_lookup: {type(e).__name__} fetching {len(ids)} ids,"
+                    f" sleeping {wait}s before retry"
+                )
+                await asyncio.sleep(wait)
+        if last_exc is not None:
+            raise last_exc
+        assert resp is not None
     feed = feedparser.parse(resp.text)
     now = datetime.now(UTC)
     papers: list[Paper] = []
