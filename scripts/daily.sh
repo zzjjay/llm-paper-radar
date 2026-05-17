@@ -14,8 +14,12 @@ echo "================================================================"
 echo "[$(date -Is)] daily.sh start"
 
 # Pull in user env (ANTHROPIC_BASE_URL / ANTHROPIC_CUSTOM_HEADERS / PATH / uv).
+# Disable -u while sourcing: ~/.bashrc references vars like LS_COLORS that are
+# unset in cron's environment, which would otherwise kill the script here.
 # shellcheck disable=SC1090
+set +u
 source "$HOME/.bashrc" || true
+set -u
 
 if [[ -z "${ANTHROPIC_CUSTOM_HEADERS:-}" ]]; then
     echo "[$(date -Is)] ERROR: ANTHROPIC_CUSTOM_HEADERS not set after sourcing ~/.bashrc"
