@@ -15,9 +15,20 @@ async def _summarize_one(
     user = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
     async with sem:
         try:
-            r = await client.call_json(prompt, user, max_tokens=900)
+            r = await client.call_json(prompt, user, max_tokens=1100)
             paper.summary = r.get("summary")
             paper.highlights = r.get("highlights") or []
+            related = r.get("related_methods") or []
+            # Defensive: drop malformed entries and cap to 3.
+            paper.related_methods = [
+                {
+                    "name": str(m.get("name", "")).strip(),
+                    "relation": str(m.get("relation", "")).strip(),
+                    "arxiv_id": (m.get("arxiv_id") or None),
+                }
+                for m in related
+                if isinstance(m, dict) and m.get("name")
+            ][:3]
         except Exception as e:
             print(f"summarize: paper {paper.id} failed: {e}")
     return paper
@@ -35,7 +46,15 @@ async def summarize_papers(
     papers = [Paper.model_validate(p) for p in json.loads(raw)]
     prompt = load_prompt(prompt_path)
     sem = asyncio.Semaphore(concurrency)
-    targets = [p for p in papers if (p.relevance_score or 0) >= threshold]
+    # Watched-author papers bypass the score threshold: the whole point of the
+    # watchlist is to never miss what these groups publish, even if a particular
+    # paper scores below 7.
+    targets = [
+        p
+        for p in papers
+        if (p.relevance_score or 0) >= threshold
+        or any(s.name == "arxiv_authors" for s in p.sources)
+    ]
     await asyncio.gather(*[_summarize_one(p, prompt, client, sem) for p in targets])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = json.dumps([p.model_dump(mode="json") for p in papers], indent=2)

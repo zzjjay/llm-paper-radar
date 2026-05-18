@@ -46,7 +46,7 @@ run_step() {
 
 # Fetch all sources (today only). Source-level failures (e.g. credentials missing)
 # print and continue per-source, so don't abort the whole job on one bad source.
-for src in hf_daily arxiv reddit semantic_scholar twitter_rsshub; do
+for src in hf_daily arxiv arxiv_authors reddit semantic_scholar twitter_rsshub; do
     echo "[$(date -Is)] fetch: $src"
     uv run python -m "sources.$src" --backfill-days 0 || echo "  ($src returned non-zero, continuing)"
 done

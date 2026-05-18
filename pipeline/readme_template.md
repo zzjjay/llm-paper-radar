@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + Twitter (RSSHub), scores each one with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), groups the survivors by topic bucket (PTQ / QAT / KV cache / Speculative decoding / Distillation / Pruning / …), and renders a daily Markdown digest. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + Twitter (RSSHub), scores each one with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each with a topic bucket (PTQ / QAT / KV cache / Speculative decoding / Distillation / Pruning / …), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -10,7 +10,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 ## 📰 Today's digest
 
-> Auto-updated daily at 06:00 local time. Older digests live under [`digests/`](digests/) — see [INDEX.md](INDEX.md).
+> Auto-updated daily at 06:00 local time. The README is the **compact table view** — full summaries, why-selected rationale, and related methods live under [`digests/`](digests/), one md per day. See [INDEX.md](INDEX.md) for history.
 
 <!-- LATEST_START -->
 <!-- LATEST_END -->
@@ -52,7 +52,11 @@ Surviving papers are grouped by `topic_bucket`. The digest shows at most:
 
 PTQ gets the highest cap because the team's focus is on quantization recipes and PTQ tends to dominate the daily volume. Caps are set in [`config.yaml`](config.yaml) under `render.topic_caps` and can be overridden without touching code.
 
-The full ranked table (no caps) lives below the highlights so nothing gets lost — the caps only control what bubbles up to the "🔥 Highlights by topic" section.
+In the README compact view, *every* surviving paper appears in the main table — the per-bucket caps only control which papers get a full detail block on the per-day digest page. Nothing gets lost; the cap just controls how much real estate a single bucket can hog on the detail page.
+
+### 👤 Watched authors
+
+A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass the score-≥7 threshold** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
 
 ---
 
@@ -60,7 +64,7 @@ The full ranked table (no caps) lives below the highlights so nothing gets lost 
 
 ```
    ┌────────────┐     fetchers (one per source)
-   │  sources   │ ─── arxiv + hf_daily + reddit + semantic_scholar + twitter_rsshub
+   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + reddit + semantic_scholar + twitter_rsshub
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
          ↓

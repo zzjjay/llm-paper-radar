@@ -7,4 +7,4 @@
 
 - [05-17](digests/2026-05-17.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-18](digests/2026-05-18.md) — 30 scanned, 2 passed, top: Distilling Long-CoT Reasoning through Collaborativ
+- [05-18](digests/2026-05-18.md) — 32 scanned, 2 passed, top: Distilling Long-CoT Reasoning through Collaborativ

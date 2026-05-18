@@ -132,21 +132,25 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     )
 
     out = (digests_dir / "2026-05-11.md").read_text()
+    # Detail page keeps the topic-bucket section with rich blocks.
     assert "## 🔥 Highlights by topic" in out
     assert "### PTQ (post-training quantization)" in out
     assert "(top 5 of cap 5)" not in out  # the verbose annotation is gone
     assert "Up to 5 PTQ, 3 others" in out  # caps summary line
     assert "config.yaml" in out  # points users to where to change it
-    # Caps apply to highlights, not full list. 15 pass threshold; cap surfaces 5.
+    # Caps apply to highlights. 15 pass threshold; cap surfaces 5 detail blocks.
     assert out.count("#### Summary") == 5
-    assert "## 📚 Full List" in out
-    # Below-threshold paper excluded from both highlights and full list.
+    # Below-threshold paper excluded from detail page.
     assert "Title low" not in out
-    # README is bootstrapped from the doc template with the digest spliced in,
-    # so it contains the digest body but isn't byte-equal to it.
+    # README is the compact table-only view, links into the detail page.
     readme_text = readme.read_text()
     assert "<!-- LATEST_START -->" in readme_text
-    assert "## 🔥 Highlights by topic" in readme_text
+    assert "## 🔥 Highlighted papers" in readme_text
+    assert "| # | Paper | Authors | Date | Bucket | Details |" in readme_text
+    # Every surviving paper appears in the compact main table (no cap applied).
+    assert readme_text.count("digests/2026-05-11.md#p-id") == 15
+    # Below-threshold paper still excluded.
+    assert "Title low" not in readme_text
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()
 
 
@@ -179,7 +183,9 @@ def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
     assert "## Docs above\nintro text" in content
     assert "## Docs below\ntrailing text" in content
     assert "old digest goes here" not in content  # replaced
-    assert "## 🔥 Highlights by topic" in content  # new digest spliced in
+    # README is the compact table-only view; topic detail lives in digests/.
+    assert "## 🔥 Highlighted papers" in content
+    assert "| # | Paper | Authors | Date | Bucket | Details |" in content
 
 
 def test_render_index_line_includes_summary_stats():

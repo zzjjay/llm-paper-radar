@@ -31,12 +31,27 @@ class TwitterConfig(BaseModel):
     accounts: list[str] = []
 
 
+class WatchedAuthor(BaseModel):
+    name: str
+    affiliation: str = ""
+
+
+class ArxivAuthorsConfig(BaseModel):
+    enabled: bool = True
+    window_days: int = 7
+    # Restrict author search to these arXiv categories. Defaults cover the
+    # compression/quant/diffusion space; widen if you want everything.
+    categories: list[str] = ["cs.LG", "cs.CL", "cs.CV", "cs.AR", "stat.ML"]
+    authors: list[WatchedAuthor] = []
+
+
 class SourcesConfig(BaseModel):
     arxiv: ArxivConfig = ArxivConfig()
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
     reddit: RedditConfig = RedditConfig()
     semantic_scholar: SemanticScholarConfig = SemanticScholarConfig()
     twitter_rsshub: TwitterConfig = TwitterConfig()
+    arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
 
 
 class FilterConfig(BaseModel):

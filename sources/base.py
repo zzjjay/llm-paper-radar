@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 SourceName = Literal[
     "arxiv",
+    "arxiv_authors",
     "hf_daily",
     "reddit",
     "semantic_scholar",
@@ -40,6 +41,10 @@ class Paper(BaseModel):
     relevance_breakdown: dict | None = None
     summary: str | None = None
     highlights: list[str] = Field(default_factory=list)
+    # Up to 3 prior methods the paper directly compares against / builds on,
+    # extracted from the abstract by the summarize step. Each entry:
+    # {"name": str, "relation": str, "arxiv_id": str | None}.
+    related_methods: list[dict] = Field(default_factory=list)
     seen_before: bool = False
 
 
