@@ -69,7 +69,7 @@ Pull from the abstract; use "unknown" if absent. Keep strings short.
 - inference_perf: ≤15 words (e.g. "1.8x speedup over AWQ on A100", "no end-to-end perf reported")
 - calibration_cost: ≤15 words (e.g. "data-free", "128 samples, <1 A100-hour", "1 day full QAT")
 - peak_memory: ≤10 words; "unknown" if absent
-- reason: ≤25 words explaining the score
+- reason: ≤40 字说明打分理由
 
 # Few-shot anchors
 
@@ -125,3 +125,9 @@ Return JSON only, no prose, no markdown fences:
   "peak_memory": str,
   "reason": str
 }
+
+# Language
+
+All free-text fields above (`reason`, `accuracy_summary`, `inference_perf`, `calibration_cost`, `peak_memory`) MUST be written in **中文**. Technical English terms — model names (Llama-3-70B, Qwen3-MoE), number formats (FP8, W4A16, MXFP4, NVFP4, INT4), method/architecture names (GPTQ, AWQ, KV cache, attention head), benchmark names (MMLU, HumanEval, AIME), units (PPL, ms, GB, tokens/s) — must be preserved verbatim in English; do NOT translate them.
+
+Enum-like fields (`compression_type`, `topic_bucket`, `model_domain`, `format_or_method`) keep their existing English enum values exactly as documented above.

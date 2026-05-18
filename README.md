@@ -25,16 +25,14 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 | # | Bucket | Paper | Authors | Date | Details |
 |---|--------|-------|---------|------|---------|
-| 1 | 👤 Watched · Song Han | [SANA-WM: Efficient Minute-Scale World Modeling with Hybrid Linear Diffusion Transformer](https://arxiv.org/abs/2605.15178) | Haoyi Zhu, Haozhe Liu, Yuyang Zhao et al. | 2026-05-14 | [📄](digests/2026-05-18.md#p-2605-15178) |
-| 2 | 👤 Watched · Song Han | [AnyFlow: Any-Step Video Diffusion Model with On-Policy Flow Map Distillation](https://arxiv.org/abs/2605.13724) 🔁 | Yuchao Gu, Guian Fang, Yuxin Jiang et al. | 2026-05-13 | [📄](digests/2026-05-18.md#p-2605-13724) |
+| 1 | 👤 Watched · Song Han | [AnyFlow: Any-Step Video Diffusion Model with On-Policy Flow Map Distillation](https://arxiv.org/abs/2605.13724) 🔁 | Yuchao Gu, Guian Fang, Yuxin Jiang et al. | 2026-05-13 | [📄](digests/2026-05-18.md#p-2605-13724) |
+| 2 | 👤 Watched · Song Han | [SANA-WM: Efficient Minute-Scale World Modeling with Hybrid Linear Diffusion Transformer](https://arxiv.org/abs/2605.15178) | Haoyi Zhu, Haozhe Liu, Yuyang Zhao et al. | 2026-05-14 | [📄](digests/2026-05-18.md#p-2605-15178) |
 | 3 | Knowledge distillation | [Distilling Long-CoT Reasoning through Collaborative Step-wise Multi-Teacher Decoding](https://arxiv.org/abs/2605.02290) 🔁 | Taewon Yun, Jisu Shin, Jeonghwan Choi et al. | 2026-05-04 | [📄](digests/2026-05-18.md#p-2605-02290) |
-| 4 | KV cache compression | [GQLA: Group-Query Latent Attention for Hardware-Adaptive Large Language Model Decoding](https://arxiv.org/abs/2605.15250) 🔁 | Fanxu Meng | 2026-05-14 | [📄](digests/2026-05-18.md#p-2605-15250) |
 
 ## 🔁 Revisited
 
-- [AnyFlow: Any-Step Video Diffusion Model with On-Policy Flow Map Distillation](https://arxiv.org/abs/2605.13724) — score 0
+- [AnyFlow: Any-Step Video Diffusion Model with On-Policy Flow Map Distillation](https://arxiv.org/abs/2605.13724) — score 7
 - [Distilling Long-CoT Reasoning through Collaborative Step-wise Multi-Teacher Decoding](https://arxiv.org/abs/2605.02290) — score 7
-- [GQLA: Group-Query Latent Attention for Hardware-Adaptive Large Language Model Decoding](https://arxiv.org/abs/2605.15250) — score 8
 
 
 <!-- LATEST_END -->

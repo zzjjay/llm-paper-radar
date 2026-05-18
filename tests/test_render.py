@@ -132,14 +132,14 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     )
 
     out = (digests_dir / "2026-05-11.md").read_text()
-    # Detail page keeps the topic-bucket section with rich blocks.
-    assert "## 🔥 Highlights by topic" in out
-    assert "### PTQ (post-training quantization)" in out
+    # Detail page keeps the topic-bucket section with rich blocks (CN labels).
+    assert "## 🔥 主题精选" in out
+    assert "### PTQ（训练后量化）" in out
     assert "(top 5 of cap 5)" not in out  # the verbose annotation is gone
-    assert "Up to 5 PTQ, 3 others" in out  # caps summary line
+    assert "PTQ 5 篇，其它 3 篇" in out  # caps summary line in CN
     assert "config.yaml" in out  # points users to where to change it
     # Caps apply to highlights. 15 pass threshold; cap surfaces 5 detail blocks.
-    assert out.count("#### Summary") == 5
+    assert out.count("#### 摘要") == 5
     # Below-threshold paper excluded from detail page.
     assert "Title low" not in out
     # README is the compact table-only view, links into the detail page.

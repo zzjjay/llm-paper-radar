@@ -37,6 +37,18 @@ BUCKET_TITLES = {
     "survey": "Survey",
     "other": "Other",
 }
+# Detail-page section headers — tech terms stay English, glue words Chinese.
+BUCKET_TITLES_CN = {
+    "ptq": "PTQ（训练后量化）",
+    "qat": "QAT / 低比特预训练",
+    "pruning": "Pruning / 稀疏化",
+    "distillation": "知识蒸馏",
+    "kv_cache": "KV cache 压缩",
+    "diffusion_compression": "Diffusion 压缩",
+    "speculative_decoding": "投机解码",
+    "survey": "Survey / 综述",
+    "other": "其它",
+}
 
 
 def _bucket_of(p: Paper) -> str:
@@ -52,7 +64,7 @@ def _cap_for(bucket: str, caps: dict[str, int]) -> int:
 
 
 def _caps_summary(caps: dict[str, int]) -> str:
-    """One-line human summary of the cap config, e.g. 'Up to 3 PTQ, 2 others'."""
+    """One-line CN summary of the cap config, e.g. 'PTQ 3 篇，其它 2 篇'."""
     default = caps.get("_default", 3)
     overrides = [
         (bucket, n)
@@ -60,9 +72,9 @@ def _caps_summary(caps: dict[str, int]) -> str:
         if bucket != "_default" and n != default and bucket in BUCKET_TITLES
     ]
     overrides.sort(key=lambda kv: BUCKET_ORDER.index(kv[0]))
-    parts = [f"{n} {bucket.upper().replace('_', ' ')}" for bucket, n in overrides]
-    parts.append(f"{default} others")
-    return "Up to " + ", ".join(parts)
+    parts = [f"{bucket.upper().replace('_', ' ')} {n} 篇" for bucket, n in overrides]
+    parts.append(f"其它 {default} 篇")
+    return "，".join(parts)
 
 
 def heat_score(p: Paper) -> float:
@@ -169,15 +181,15 @@ def _watched_meta(p: Paper) -> tuple[list[str], list[str]] | None:
 
 def _summary_block(summary: str | None, highlights: list[str]) -> str:
     if not summary:
-        return "#### Summary\n*(Summary generation failed)*\n"
+        return "#### 摘要\n*（摘要生成失败）*\n"
     hl = "\n".join(f"- {h}" for h in highlights)
-    return f"#### Summary\n{summary}\n\n{hl}\n" if hl else f"#### Summary\n{summary}\n"
+    return f"#### 摘要\n{summary}\n\n{hl}\n" if hl else f"#### 摘要\n{summary}\n"
 
 
 def _related_methods_block(p: Paper) -> str:
     if not p.related_methods:
         return ""
-    lines = ["#### 📎 Related / compared methods"]
+    lines = ["#### 📎 相关方法 / 对比基线"]
     for m in p.related_methods:
         name = m.get("name", "").strip()
         if not name:
@@ -193,7 +205,7 @@ def _related_methods_block(p: Paper) -> str:
 def _why_selected_line(p: Paper) -> str:
     """One-line rationale derived from the Haiku rubric breakdown."""
     bd = p.relevance_breakdown or {}
-    bucket = BUCKET_TITLES.get(_bucket_of(p), "Other")
+    bucket = BUCKET_TITLES_CN.get(_bucket_of(p), "其它")
     topic = bd.get("topic_relevance")
     pract = bd.get("practicality")
     reason = (p.relevance_reason or "").strip()
@@ -205,7 +217,7 @@ def _why_selected_line(p: Paper) -> str:
         pieces.append(f"composite {score}/10")
     if reason:
         pieces.append(reason)
-    return "#### 🧭 Why this paper\n" + " · ".join(pieces) + "\n"
+    return "#### 🧭 为什么推送这篇\n" + " · ".join(pieces) + "\n"
 
 
 def _signal_line(p: Paper) -> str:
@@ -367,42 +379,42 @@ def _render_detail_md(
     highlighted_total: int,
 ) -> str:
     body: list[str] = []
-    body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
-    body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
+    body.append(f"# LLM 推理优化日报 · {date.strftime('%Y-%m-%d')}\n")
+    body.append(f"> 📅 窗口：{date.strftime('%Y-%m-%d')}（UTC daily）")
     body.append(
-        f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)}"
-        f" → highlighted {highlighted_total} (threshold ≥{threshold})"
-        f" · 👤 {len(watched_papers)} from watched authors"
+        f"> 📊 扫描 {scanned} 篇 → 通过过滤 {len(surviving)}"
+        f" → 精选 {highlighted_total}（阈值 ≥{threshold}）"
+        f" · 👤 {len(watched_papers)} 篇来自关注作者"
     )
     body.append("")
-    body.append(f"> Auto-generated daily digest from [llm-paper-radar]({REPO_URL}).")
+    body.append(f"> 自动生成自 [llm-paper-radar]({REPO_URL}).")
     body.append(
-        "> History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml)"
-        " · Powered by Claude Sonnet 4.6 · Compact tables live in"
-        " [README.md](../README.md).\n"
+        "> 历史归档：[INDEX.md](INDEX.md) · 配置：[config.yaml](../config.yaml)"
+        " · 摘要模型 Claude Sonnet 4.6 · 紧凑表格视图见"
+        " [README.md](../README.md)。\n"
     )
 
     rank = 0
     if watched_papers:
-        body.append("## 👤 Watched authors\n")
+        body.append("## 👤 关注作者\n")
         body.append(
-            "_Papers by authors on the watchlist in [`config.yaml`](../config.yaml)"
-            " under `sources.arxiv_authors.authors`. Surfaced regardless of score._\n"
+            "_作者白名单配置在 [`config.yaml`](../config.yaml) 的"
+            " `sources.arxiv_authors.authors`；这些论文绕过打分阈值，全部展示。_\n"
         )
         for p in watched_papers:
             rank += 1
             body.append(_watched_block(rank, p))
 
-    body.append("## 🔥 Highlights by topic\n")
+    body.append("## 🔥 主题精选\n")
     body.append(
-        f"_{_caps_summary(topic_caps)} per topic — change in"
-        " [`config.yaml`](../config.yaml) under `render.topic_caps`._\n"
+        f"_每个主题最多展示：{_caps_summary(topic_caps)}；可在"
+        " [`config.yaml`](../config.yaml) 的 `render.topic_caps` 修改。_\n"
     )
     for bucket in BUCKET_ORDER:
         papers = grouped[bucket]
         if not papers:
             continue
-        body.append(f"### {BUCKET_TITLES[bucket]}\n")
+        body.append(f"### {BUCKET_TITLES_CN[bucket]}\n")
         for p in papers:
             rank += 1
             body.append(_full_block(rank, p))
