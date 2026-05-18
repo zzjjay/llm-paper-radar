@@ -145,9 +145,9 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     # README is the compact table-only view, links into the detail page.
     readme_text = readme.read_text()
     assert "<!-- LATEST_START -->" in readme_text
-    assert "## 🔥 Highlighted papers" in readme_text
-    assert "| # | Paper | Authors | Date | Bucket | Details |" in readme_text
-    # Every surviving paper appears in the compact main table (no cap applied).
+    assert "## 📚 Papers" in readme_text
+    assert "| # | Bucket | Paper | Authors | Date | Details |" in readme_text
+    # Every surviving paper appears in the compact table (no cap applied).
     assert readme_text.count("digests/2026-05-11.md#p-id") == 15
     # Below-threshold paper still excluded.
     assert "Title low" not in readme_text
@@ -184,8 +184,8 @@ def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
     assert "## Docs below\ntrailing text" in content
     assert "old digest goes here" not in content  # replaced
     # README is the compact table-only view; topic detail lives in digests/.
-    assert "## 🔥 Highlighted papers" in content
-    assert "| # | Paper | Authors | Date | Bucket | Details |" in content
+    assert "## 📚 Papers" in content
+    assert "| # | Bucket | Paper | Authors | Date | Details |" in content
 
 
 def test_render_index_line_includes_summary_stats():
