@@ -14,10 +14,10 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 <!-- LATEST_START -->
 
-# LLM Inference Optimization Daily · 2026-05-17
+# LLM Inference Optimization Daily · 2026-05-18
 
-> 📅 Window: 2026-05-17 (UTC daily)
-> 📊 Scanned 50 papers → passed filter 1 → highlighted 1 (threshold ≥7)
+> 📅 Window: 2026-05-18 (UTC daily)
+> 📊 Scanned 30 papers → passed filter 2 → highlighted 2 (threshold ≥7)
 
 > Auto-generated daily digest from [llm-paper-radar](https://github.com/zhaolin-amd/llm-paper-radar).
 > History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml) · Powered by Claude Sonnet 4.6
@@ -26,22 +26,41 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 _Up to 3 PTQ, 2 others per topic — change in [`config.yaml`](config.yaml) under `render.topic_caps`._
 
-### Diffusion compression
+### KV cache compression
 
-### 1. SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer (7/10) 🔁
-**hf_daily** · `2509.24695` · 2025-09-29
-👥 Junsong Chen, Yuyang Zhao, Jincheng Yu... · 🏷 cs.CV, cs.AI
-🔗 [arXiv](https://arxiv.org/abs/2509.24695) · [PDF](https://arxiv.org/pdf/2509.24695v2)
-📡 Sources: hf_daily (📈 trending #3)
-🧪 diffusion_compression · Linear attention + constant-memory KV cache + NVFP4 quantization · SANA-Video (1.3B parameters) · cal: 12 days on 64 H100 GPUs (training cost, not calibration-specific) · perf: 2.4x speedup with NVFP4 (71s→29s for 5s 720p); 16x faster latency vs comparable models
+### 1. GQLA: Group-Query Latent Attention for Hardware-Adaptive Large Language Model Decoding (8/10)
+**hf_daily** · `2605.15250` · 2026-05-14
+👥 Fanxu Meng · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.15250) · [PDF](https://arxiv.org/pdf/2605.15250.pdf)
+📡 Sources: hf_daily (💬 1)
+🧪 kv_cache · Group-Query Latent Attention (GQLA), low-rank KV compression with dual decoding paths · Llama-3-8B · cal: No retraining needed; TransMLA→TransGQLA conversion from pretrained GQA checkpoint. · perf: Hardware-adaptive: MQA-absorb on H100, GQA+MTP on H20; supports 8-way tensor parallelism.
 
 #### Summary
-SANA-Video addresses efficient high-resolution, long-duration video generation using a Linear Diffusion Transformer (Linear DiT) architecture. The core innovations are linear attention replacing vanilla softmax attention to handle the large token counts in video, and a constant-memory KV cache derived from linear attention's cumulative properties enabling block-wise autoregressive generation without memory growth. The model trains in 12 days on 64 H100 GPUs (1% of MovieGen cost) and achieves competitive quality vs. Wan 2.1-1.3B and SkyReel-V2-1.3B while running 16× faster, with NVFP4 deployment on RTX 5090 giving 2.4× inference speedup.
+MLA in DeepSeek-V2/V3 compresses KV cache into low-rank latents but exposes only one decoding path (absorbed MQA), which is optimized for H100 compute-bandwidth ratios and breaks tensor parallelism and Multi-Token Prediction on bandwidth-limited GPUs like H20. GQLA adds a second algebraically equivalent GQA decoding path over the same weights, allowing runtime selection of either MQA-absorb (H100) or GQA+MTP (H20) without retraining or custom kernels, plus up to 8-way tensor parallelism on the GQA path. TransGQLA converts pretrained GQA checkpoints (e.g., LLaMA-3-8B) into GQLA models, achieving 28.125% of the GQA baseline KV cache footprint on the MQA-absorb path while preserving GQA-level memory traffic on the per-group path.
 
-- 🎯 Method: Block-wise autoregressive Linear DiT with constant-memory KV cache enables minute-long 720p video generation at fixed memory cost
-- 📊 Result: 16× latency reduction vs. comparable small diffusion models (Wan 2.1-1.3B, SkyReel-V2-1.3B) at competitive quality
-- 📊 Result: NVFP4 on RTX 5090 reduces 5-second 720p generation from 71s to 29s (2.4× speedup)
-- 🔧 Engineering: Training cost only 12 days on 64 H100 GPUs, ~1% of MovieGen training cost
+- 🎯 Method: Two algebraically equivalent decoding paths (MQA-absorb / GQA) over one weight set, runtime-selected to match H100 vs H20 rooflines
+- 📊 Result: KV cache compressed to 28.125% of GQA baseline on MQA-absorb path for LLaMA-3-8B via TransGQLA conversion
+- 💡 Innovation: TransGQLA converts pretrained GQA checkpoints to GQLA without pretraining from scratch, inheriting MLA's low-rank latent compression
+- 🔧 Engineering: Supports up to 8-way zero-redundancy tensor parallelism on GQA path; enables Multi-Token Prediction gains on H20 with no custom kernels
+
+---
+
+### Knowledge distillation
+
+### 2. Distilling Long-CoT Reasoning through Collaborative Step-wise Multi-Teacher Decoding (7/10)
+**hf_daily** · `2605.02290` · 2026-05-04
+👥 Taewon Yun, Jisu Shin, Jeonghwan Choi... · 🏷 cs.CL
+🔗 [arXiv](https://arxiv.org/abs/2605.02290) · [PDF](https://arxiv.org/pdf/2605.02290.pdf)
+📡 Sources: hf_daily (👍 22, 💬 1)
+🧪 distillation · collaborative multi-teacher step-wise reasoning distillation · cal: multi-teacher decoding with beam search; cost not detailed · perf: no substantial efficiency overhead reported
+
+#### Summary
+Distilling Long-CoT reasoning from large reasoning models (LRMs) to smaller students is hampered by existing curation-based methods that select complete traces post-hoc, missing inter-model collaboration and dynamic exploration. CoRD addresses this with a step-wise multi-teacher decoding framework where heterogeneous LRMs collaboratively construct reasoning trajectories via predictive perplexity-based scoring and beam search, maintaining diverse high-potential hypotheses at each step. The resulting distillation data yields near teacher-level student performance with fewer, more structured supervision signals, and generalizes to out-of-domain and open-ended settings.
+
+- 🎯 Method: Step-wise beam search over heterogeneous LRMs scored by predictive perplexity, enabling joint Long-CoT trajectory construction rather than post-hoc trace selection.
+- 📊 Result: Achieves near teacher-level student performance with fewer structured supervision signals and no substantial efficiency overhead.
+- 💡 Innovation: Replaces single-teacher or post-hoc curation with dynamic multi-teacher collaborative decoding, capturing complementary reasoning across heterogeneous LRMs.
+- ⚠️ Limitation: Abstract lacks concrete compression ratios, accuracy deltas, or speedup numbers to quantify improvements precisely.
 
 ---
 
@@ -49,12 +68,9 @@ SANA-Video addresses efficient high-resolution, long-duration video generation u
 
 | # | Title | Score | Topic | Pract | Bucket | Sources | Code | Date |
 |---|-------|-------|-------|-------|--------|---------|------|------|
-| 1 | [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) | 7 | 3 | 4 | Diffusion compression | hf_daily | — | 09-29 |
+| 1 | [Distilling Long-CoT Reasoning through Collaborative Step-wise Multi-Teacher Decoding](https://arxiv.org/abs/2605.02290) | 7 | 4 | 3 | Knowledge distillation | hf_daily | — | 05-04 |
+| 2 | [GQLA: Group-Query Latent Attention for Hardware-Adaptive Large Language Model Decoding](https://arxiv.org/abs/2605.15250) | 8 | 4 | 4 | KV cache compression | hf_daily | — | 05-14 |
 
-
-## 🔁 Revisited
-
-- [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) — score 7
 
 <!-- LATEST_END -->
 

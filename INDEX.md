@@ -6,3 +6,5 @@
 - [05-14](digests/2026-05-14.md) — 358 scanned, 4 passed, top: Provable Quantization with Randomized Hadamard Tra
 
 - [05-17](digests/2026-05-17.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+
+- [05-18](digests/2026-05-18.md) — 30 scanned, 2 passed, top: Distilling Long-CoT Reasoning through Collaborativ
