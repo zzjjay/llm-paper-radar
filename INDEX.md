@@ -1,7 +1,7 @@
 # Digest History Index
 
-- [05-11](digests/2026-05-11.md) — 100 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
-- [05-12](digests/2026-05-12.md) — 98 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-11](digests/2026-05-11.md) — 100 scanned, 7 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-12](digests/2026-05-12.md) — 98 scanned, 5 passed, top: SANA-Video: Efficient Video Generation with Block 
 - [05-13](digests/2026-05-13.md) — 98 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 - [05-14](digests/2026-05-14.md) — 98 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
 
@@ -9,51 +9,51 @@
 
 - [05-18](digests/2026-05-18.md) — 232 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-19](digests/2026-05-19.md) — 357 scanned, 26 passed, top: LongLive-2.0: An NVFP4 Parallel Infrastructure for
+- [05-19](digests/2026-05-19.md) — 332 scanned, 18 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-16](digests/2026-05-16.md) — 295 scanned, 7 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-16](digests/2026-05-16.md) — 295 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-15](digests/2026-05-15.md) — 343 scanned, 9 passed, top: Causal Forcing++: Scalable Few-Step Autoregressive
+- [05-15](digests/2026-05-15.md) — 343 scanned, 8 passed, top: Causal Forcing++: Scalable Few-Step Autoregressive
 
 - [05-10](digests/2026-05-10.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-09](digests/2026-05-09.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-09](digests/2026-05-09.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [05-08](digests/2026-05-08.md) — 87 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-07](digests/2026-05-07.md) — 74 scanned, 2 passed, top: Stream-R1: Reliability-Perplexity Aware Reward Dis
+- [05-07](digests/2026-05-07.md) — 74 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-06](digests/2026-05-06.md) — 72 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-06](digests/2026-05-06.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [05-05](digests/2026-05-05.md) — 75 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-04](digests/2026-05-04.md) — 71 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-04](digests/2026-05-04.md) — 71 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-03](digests/2026-05-03.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-03](digests/2026-05-03.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [05-02](digests/2026-05-02.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-01](digests/2026-05-01.md) — 74 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-01](digests/2026-05-01.md) — 74 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-30](digests/2026-04-30.md) — 68 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [04-29](digests/2026-04-29.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-29](digests/2026-04-29.md) — 72 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-28](digests/2026-04-28.md) — 85 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [04-27](digests/2026-04-27.md) — 66 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-27](digests/2026-04-27.md) — 66 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [04-26](digests/2026-04-26.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-26](digests/2026-04-26.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-25](digests/2026-04-25.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [04-24](digests/2026-04-24.md) — 72 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-24](digests/2026-04-24.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-23](digests/2026-04-23.md) — 80 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-22](digests/2026-04-22.md) — 87 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [04-21](digests/2026-04-21.md) — 97 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-21](digests/2026-04-21.md) — 97 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [04-20](digests/2026-04-20.md) — 78 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
