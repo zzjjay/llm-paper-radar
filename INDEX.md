@@ -2,18 +2,18 @@
 
 - [05-11](digests/2026-05-11.md) — 100 scanned, 7 passed, top: SANA-Video: Efficient Video Generation with Block 
 - [05-12](digests/2026-05-12.md) — 98 scanned, 5 passed, top: SANA-Video: Efficient Video Generation with Block 
-- [05-13](digests/2026-05-13.md) — 98 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
-- [05-14](digests/2026-05-14.md) — 98 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-13](digests/2026-05-13.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [05-14](digests/2026-05-14.md) — 50 scanned, 1 passed, top: KL for a KL: On-Policy Distillation with Control V
 
-- [05-17](digests/2026-05-17.md) — 177 scanned, 7 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-17](digests/2026-05-17.md) — 127 scanned, 6 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
 
-- [05-18](digests/2026-05-18.md) — 232 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-18](digests/2026-05-18.md) — 188 scanned, 6 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
-- [05-19](digests/2026-05-19.md) — 332 scanned, 18 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-19](digests/2026-05-19.md) — 283 scanned, 13 passed, top: LongLive-2.0: An NVFP4 Parallel Infrastructure for
 
-- [05-16](digests/2026-05-16.md) — 295 scanned, 6 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-16](digests/2026-05-16.md) — 245 scanned, 5 passed, top: IO-SVD: Input-Output Whitened SVD for Adaptive-Ran
 
-- [05-15](digests/2026-05-15.md) — 343 scanned, 8 passed, top: Causal Forcing++: Scalable Few-Step Autoregressive
+- [05-15](digests/2026-05-15.md) — 295 scanned, 7 passed, top: Causal Forcing++: Scalable Few-Step Autoregressive
 
 - [05-10](digests/2026-05-10.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
