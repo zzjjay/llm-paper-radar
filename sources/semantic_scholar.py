@@ -95,15 +95,24 @@ if __name__ == "__main__":
 
     @click.command()
     @click.option("--backfill-days", default=0, type=int)
+    @click.option(
+        "--window-days",
+        default=None,
+        type=int,
+        help="Override citation_window_days from config for this run.",
+    )
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
-    def main(backfill_days: int, out_dir: Path):
+    def main(backfill_days: int, window_days: int | None, out_dir: Path):
         cfg = load_config()
         if not cfg.sources.semantic_scholar.enabled:
             print("semantic_scholar disabled")
             return
+        effective_window = (
+            window_days if window_days is not None else cfg.sources.semantic_scholar.citation_window_days
+        )
         src = SemanticScholarSource(
             seeds_file=Path(cfg.sources.semantic_scholar.seeds_file),
-            citation_window_days=cfg.sources.semantic_scholar.citation_window_days,
+            citation_window_days=effective_window,
         )
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):

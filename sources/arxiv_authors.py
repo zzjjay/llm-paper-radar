@@ -209,8 +209,14 @@ if __name__ == "__main__":
 
     @click.command()
     @click.option("--backfill-days", default=0, type=int)
+    @click.option(
+        "--window-days",
+        default=None,
+        type=int,
+        help="Override window_days from config for this run.",
+    )
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
-    def main(backfill_days: int, out_dir: Path):
+    def main(backfill_days: int, window_days: int | None, out_dir: Path):
         cfg = load_config()
         sub = cfg.sources.arxiv_authors
         if not sub.enabled:
@@ -220,10 +226,11 @@ if __name__ == "__main__":
             print("arxiv_authors: no authors configured, skipping")
             return
         specs = [WatchedAuthorSpec(name=a.name, affiliation=a.affiliation) for a in sub.authors]
+        effective_window = window_days if window_days is not None else sub.window_days
         src = ArxivAuthorsSource(
             authors=specs,
             categories=sub.categories,
-            window_days=sub.window_days,
+            window_days=effective_window,
         )
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
