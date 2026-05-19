@@ -140,12 +140,43 @@ Sources without credentials will silently produce 0 papers. To enable:
 
 `hf_daily` and `arxiv` work without credentials.
 
-### 4. Tune the prompt and topic caps
+### 4. Customize the filter rubric
 
-- Edit [`prompts/relevance.md`](prompts/relevance.md) to bias the rubric toward your team's focus areas (e.g. swap "compression" for "RL" or "robotics").
-- Adjust [`config.yaml`](config.yaml) — categories, threshold, per-bucket caps, source priority for dedup tie-breaks.
+The scoring rubric lives entirely in [`prompts/relevance.md`](prompts/relevance.md) — there is no Python change needed to retarget the radar at a different domain.
 
-### 5. Smoke-test the chain
+What to edit, in rough order of leverage:
+
+1. **`# What we care about`** — swap the Primary / Secondary / Out-of-scope bullets for your topic (e.g. replace "LLM compression" with "RL fine-tuning", "robot learning", "agent evals"). This single section drives most of the model's judgment.
+2. **`## topic_relevance (0-5)`** — re-anchor each level for your domain. The Haiku scorer follows these anchors literally; vague anchors → noisy scores.
+3. **`# Hard gates`** — list paper shapes that should always score 0 (e.g. "BERT-base only" for compression; for RL you might gate "tabular-only / no neural net").
+4. **`topic_bucket` enum** — these become the section headings in the daily digest. Keep them few (≤10) and mutually distinct; the digest groups + caps by bucket.
+5. **Few-shot examples** — at least 3 positive + 2 negative anchors with the exact `topic_relevance` / `practicality` / `topic_bucket` values you want. This is the highest-ROI edit; the model imitates these.
+
+The JSON output schema at the bottom of the prompt must stay structurally the same (`pipeline/filter.py` parses it), but you can change the enum values inside.
+
+After editing, dry-run on existing deduped data without re-fetching:
+
+```bash
+uv run python -m pipeline.filter --backfill-days 6 \
+    --in-root data/deduped --out-root /tmp/scored-test
+ls /tmp/scored-test/                          # inspect a few JSONs by hand
+```
+
+### 5. Tune the config knobs
+
+Companion settings in [`config.yaml`](config.yaml) — change these without touching the prompt:
+
+| key | default | what it does |
+|---|---|---|
+| `filter.threshold` | 7 | composite (`topic_relevance + practicality`) cutoff for digest inclusion |
+| `render.topic_caps` | `{ptq: 3, _default: 2}` | max papers per bucket in the daily digest; `_default` applies to unlisted buckets |
+| `render.truncate_after` | 10 | hard cap on the full-list table |
+| `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
+| `sources.semantic_scholar.citation_window_days` | 7 | default fetch window for citation tracking (CLI `--window-days` overrides) |
+| `sources.arxiv_authors.window_days` | 7 | default fetch window for watched-authors source (CLI `--window-days` overrides) |
+| `dedupe.source_priority` | hf_daily → … → arxiv | tie-breaker order when the same paper shows up from multiple sources |
+
+### 6. Smoke-test the chain
 
 ```bash
 ./scripts/daily.sh             # logs to scripts/log/YYYY-MM-DD.log
@@ -153,7 +184,7 @@ Sources without credentials will silently produce 0 papers. To enable:
 
 If everything is wired up, you'll see `data/raw/`, `data/deduped/`, `data/scored/`, `data/summarized/` populate, then a fresh `digests/YYYY-MM-DD.md` plus an updated `README.md`.
 
-### 6. Schedule it
+### 7. Schedule it
 
 **Option A — host crontab (works behind a corporate Anthropic proxy).** This is what this fork actually uses, because the LLM endpoint sits inside the AMD network and isn't reachable from public CI runners:
 
