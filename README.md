@@ -31,10 +31,6 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 | 4 | Pruning & distillation | [Backtracking When It Strays: Mitigating Dual Exposure Biases in LLM Reasoning Distillation](https://arxiv.org/abs/2605.19433) | Bing Wang, Shaotian Yan, Chen Shen et al. | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19433) |
 | 5 | Diffusion compression | [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) 🔁 | Junsong Chen, Yuyang Zhao, Jincheng Yu et al. | 2025-09-29 | [📄](digests/2026-05-20.md#p-2509-24695) |
 
-## 🔁 Revisited
-
-- [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) — score 8
-
 
 <!-- LATEST_END -->
 

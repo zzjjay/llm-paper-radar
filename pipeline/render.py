@@ -459,14 +459,14 @@ def _render_compact_md(
     digest_filename: str,
 ) -> str:
     """Compact README view: header + one combined table (watched first, then
-    bucketed in BUCKET_ORDER) + Revisited."""
+    bucketed in BUCKET_ORDER). The 🔁 marker on titles already signals
+    previously-seen papers, so no separate Revisited list."""
     watched_ids = {p.id for p in watched_papers}
     non_watched = sorted(
         (p for p in surviving if p.id not in watched_ids),
         key=_bucket_sort_key,
     )
     combined = watched_papers + non_watched
-    revisited = [p for p in combined if p.seen_before]
 
     body: list[str] = []
     body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
@@ -492,12 +492,6 @@ def _render_compact_md(
         body.append("")
     else:
         body.append("_Nothing surfaced today (everything was hard-gated, no watchlist hits)._\n")
-
-    if revisited:
-        body.append("## 🔁 Revisited\n")
-        for p in revisited[:5]:
-            body.append(f"- [{p.title}]({p.url}) — score {p.relevance_score}")
-        body.append("")
 
     return "\n".join(body)
 
