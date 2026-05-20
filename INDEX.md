@@ -356,3 +356,5 @@
 - [11-22](digests/2025-11-22.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+
+- [05-20](digests/2026-05-20.md) — 299 scanned, 5 passed, top: SANA-Video: Efficient Video Generation with Block 
