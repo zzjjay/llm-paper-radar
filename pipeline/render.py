@@ -442,6 +442,15 @@ def _render_detail_md(
     return "\n".join(body)
 
 
+def _bucket_sort_key(p: Paper) -> tuple[int, float, float]:
+    """Sort key for the compact README table: bucket position first (in
+    BUCKET_ORDER), then composite score desc, then heat desc. Papers with
+    an unknown/legacy bucket sink to the end."""
+    b = _bucket_of(p)
+    bucket_idx = BUCKET_ORDER.index(b) if b in BUCKET_ORDER else len(BUCKET_ORDER)
+    return (bucket_idx, -composite_score(p), -heat_score(p))
+
+
 def _render_compact_md(
     date: datetime,
     scanned: int,
@@ -449,9 +458,13 @@ def _render_compact_md(
     surviving: list[Paper],
     digest_filename: str,
 ) -> str:
-    """Compact README view: header + one combined table (watched first) + Revisited."""
+    """Compact README view: header + one combined table (watched first, then
+    bucketed in BUCKET_ORDER) + Revisited."""
     watched_ids = {p.id for p in watched_papers}
-    non_watched = [p for p in surviving if p.id not in watched_ids]
+    non_watched = sorted(
+        (p for p in surviving if p.id not in watched_ids),
+        key=_bucket_sort_key,
+    )
     combined = watched_papers + non_watched
     revisited = [p for p in combined if p.seen_before]
 

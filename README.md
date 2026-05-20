@@ -25,11 +25,11 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 | # | Bucket | Paper | Authors | Date | Details |
 |---|--------|-------|---------|------|---------|
-| 1 | Diffusion compression | [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) 🔁 | Junsong Chen, Yuyang Zhao, Jincheng Yu et al. | 2025-09-29 | [📄](digests/2026-05-20.md#p-2509-24695) |
-| 2 | KV cache compression | [OScaR: The Occam's Razor for Extreme KV Cache Quantization in LLMs and Beyond](https://arxiv.org/abs/2605.19660) | Zunhai Su, Rui Yang, Chao Zhang et al. | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19660) |
-| 3 | PTQ (post-training quantization) | [TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization](https://arxiv.org/abs/2605.19561) | Zukang Xu, Xing Hu, Dawei Yang | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19561) |
+| 1 | PTQ (post-training quantization) | [TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization](https://arxiv.org/abs/2605.19561) | Zukang Xu, Xing Hu, Dawei Yang | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19561) |
+| 2 | PTQ (post-training quantization) | [K-Quantization and its Impact on Output Performance](https://arxiv.org/abs/2605.19645) | Robin Baki Davidsson, Pierre Nugues | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19645) |
+| 3 | KV cache compression | [OScaR: The Occam's Razor for Extreme KV Cache Quantization in LLMs and Beyond](https://arxiv.org/abs/2605.19660) | Zunhai Su, Rui Yang, Chao Zhang et al. | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19660) |
 | 4 | Pruning & distillation | [Backtracking When It Strays: Mitigating Dual Exposure Biases in LLM Reasoning Distillation](https://arxiv.org/abs/2605.19433) | Bing Wang, Shaotian Yan, Chen Shen et al. | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19433) |
-| 5 | PTQ (post-training quantization) | [K-Quantization and its Impact on Output Performance](https://arxiv.org/abs/2605.19645) | Robin Baki Davidsson, Pierre Nugues | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19645) |
+| 5 | Diffusion compression | [SANA-Video: Efficient Video Generation with Block Linear Diffusion Transformer](https://arxiv.org/abs/2509.24695) 🔁 | Junsong Chen, Yuyang Zhao, Jincheng Yu et al. | 2025-09-29 | [📄](digests/2026-05-20.md#p-2509-24695) |
 
 ## 🔁 Revisited
 
