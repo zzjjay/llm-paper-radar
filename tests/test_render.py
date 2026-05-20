@@ -13,7 +13,6 @@ def _mk(
     hf_upvotes=0,
     reddit_score=0,
     trending_rank=None,
-    twitter_accounts=None,
     summary="en",
     topic_bucket="ptq",
     topic_relevance=5,
@@ -40,14 +39,6 @@ def _mk(
                 name="hf_daily",
                 fetched_at=now,
                 extras={"trending_rank": trending_rank},
-            )
-        )
-    if twitter_accounts:
-        sources.append(
-            SourceRecord(
-                name="twitter_rsshub",
-                fetched_at=now,
-                extras={"accounts": twitter_accounts},
             )
         )
     p = Paper(
@@ -80,8 +71,8 @@ def _mk(
 
 
 def test_heat_score_combines_all_signals():
-    p = _mk("x", 9, hf_upvotes=10, reddit_score=99, trending_rank=2, twitter_accounts=["a", "b"])
-    expected = (100 / 2) + 10 + math.log(100) * 5 + 10 * 2
+    p = _mk("x", 9, hf_upvotes=10, reddit_score=99, trending_rank=2)
+    expected = (100 / 2) + 10 + math.log(100) * 5
     assert abs(heat_score(p) - expected) < 0.01
 
 

@@ -26,11 +26,6 @@ class SemanticScholarConfig(BaseModel):
     citation_window_days: int = 7
 
 
-class TwitterConfig(BaseModel):
-    enabled: bool = True
-    accounts: list[str] = []
-
-
 class WatchedAuthor(BaseModel):
     name: str
     affiliation: str = ""
@@ -50,7 +45,6 @@ class SourcesConfig(BaseModel):
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
     reddit: RedditConfig = RedditConfig()
     semantic_scholar: SemanticScholarConfig = SemanticScholarConfig()
-    twitter_rsshub: TwitterConfig = TwitterConfig()
     arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
 
 

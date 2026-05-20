@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + Twitter (RSSHub), kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -97,7 +97,7 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
 
 ```
    ┌────────────┐     fetchers (one per source, all in parallel via daily.sh)
-   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + reddit + semantic_scholar + twitter_rsshub
+   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + reddit + semantic_scholar
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
          ↓
@@ -174,7 +174,6 @@ Sources without credentials will silently produce 0 papers. To enable:
 |---|---|
 | Reddit (LocalLLaMA) | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` |
 | Semantic Scholar | `SEMANTIC_SCHOLAR_API_KEY` + seed papers in [`seeds.yaml`](seeds.yaml) |
-| Twitter (via RSSHub) | `RSSHUB_BASE_URL` pointing at a self-hosted RSSHub |
 
 `hf_daily` and `arxiv` work without credentials.
 
@@ -245,7 +244,6 @@ crontab -e
 | `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers required by your proxy |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | optional | enable Reddit source |
 | `SEMANTIC_SCHOLAR_API_KEY` | optional | enable Semantic Scholar source |
-| `RSSHUB_BASE_URL` | optional | enable Twitter source |
 | `TEAMS_WEBHOOK_URL` | optional | failure notifications |
 
 ```
@@ -269,10 +267,10 @@ llm-paper-radar/
 │   └── summarize.md             # summary format prompt
 ├── sources/                     # one fetcher per upstream
 │   ├── arxiv.py
+│   ├── arxiv_authors.py
 │   ├── hf_daily.py
 │   ├── reddit.py
-│   ├── semantic_scholar.py
-│   └── twitter_rsshub.py
+│   └── semantic_scholar.py
 ├── pipeline/
 │   ├── config.py                # Pydantic config model
 │   ├── llm_client.py            # async Anthropic wrapper with prompt cache

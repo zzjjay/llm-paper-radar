@@ -88,13 +88,11 @@ def _caps_summary(caps: dict[str, int]) -> str:
 
 
 def heat_score(p: Paper) -> float:
-    """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5 + twitter_account_bonus.
-    Trending bonus = 100/rank for rank 1..30, else 0.
-    Twitter bonus = 10 per distinct account that linked it."""
+    """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5.
+    Trending bonus = 100/rank for rank 1..30, else 0."""
     trending_bonus = 0.0
     hf_upvotes = 0
     reddit_score = 0
-    twitter_accounts: set[str] = set()
     for s in p.sources:
         if s.name == "hf_daily":
             if "trending_rank" in s.extras:
@@ -105,9 +103,7 @@ def heat_score(p: Paper) -> float:
                 hf_upvotes = max(hf_upvotes, s.extras.get("upvotes", 0) or 0)
         elif s.name == "reddit":
             reddit_score = max(reddit_score, s.extras.get("score", 0) or 0)
-        elif s.name == "twitter_rsshub":
-            twitter_accounts.update(s.extras.get("accounts", []))
-    return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5 + 10 * len(twitter_accounts)
+    return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5
 
 
 def composite_score(p: Paper) -> float:
@@ -130,7 +126,6 @@ def _source_badge(p: Paper) -> str:
     hf_up = hf_cm = 0
     hf_trend = None
     reddit_sc = reddit_cm = 0
-    twitter_accs: set[str] = set()
     watched_authors: list[str] = []
     other: set[str] = set()
     for s in p.sources:
@@ -144,8 +139,6 @@ def _source_badge(p: Paper) -> str:
         elif s.name == "reddit":
             reddit_sc = max(reddit_sc, s.extras.get("score", 0) or 0)
             reddit_cm = max(reddit_cm, s.extras.get("num_comments", 0) or 0)
-        elif s.name == "twitter_rsshub":
-            twitter_accs.update(s.extras.get("accounts", []))
         elif s.name == "arxiv_authors":
             for n in s.extras.get("matched_authors", []):
                 if n not in watched_authors:
@@ -164,8 +157,6 @@ def _source_badge(p: Paper) -> str:
         parts.append(f"hf_daily ({', '.join(bits)})")
     if reddit_sc or reddit_cm:
         parts.append(f"reddit (🔥 {reddit_sc}, 💬 {reddit_cm})")
-    if twitter_accs:
-        parts.append(f"twitter ({', '.join(sorted(twitter_accs))})")
     if watched_authors:
         parts.append(f"watched ({', '.join(watched_authors)})")
     for o in sorted(other):
