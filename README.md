@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + Twitter (RSSHub), scores each one with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), groups the survivors by topic bucket (PTQ / QAT / KV cache / Speculative decoding / Distillation / Pruning / …), and renders a daily Markdown digest. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + Twitter (RSSHub), kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -10,7 +10,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 ## 📰 Today's digest
 
-> Auto-updated daily at 06:00 local time. Older digests live under [`digests/`](digests/) — see [INDEX.md](INDEX.md).
+> Auto-updated daily at 06:00 local time. The README is the **compact table view** — full summaries, why-selected rationale, and related methods live under [`digests/`](digests/), one md per day. See [INDEX.md](INDEX.md) for history.
 
 <!-- LATEST_START -->
 
@@ -38,48 +38,66 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 ## 🧮 How papers are scored
 
-Every paper goes through Claude Haiku 4.5 with [`prompts/relevance.md`](prompts/relevance.md). The model returns a structured JSON breakdown; the orchestrator combines it into a 0–10 composite score.
+Two stages: a cheap local **keyword prefilter**, then **Claude Haiku 4.5** scoring with [`prompts/relevance.md`](prompts/relevance.md).
 
-### Two axes
+### Stage 1 — keyword prefilter (local, free)
+
+Configured under `filter.prefilter` in [`config.yaml`](config.yaml). Each paper's title + abstract is matched against two word-boundary-aware lists:
+- **whitelist** (e.g. `PTQ`, `AWQ`, `MXFP4`, `W4A4`, `BitNet`, `KV cache quantization`, …)
+- **blacklist** (e.g. `image classification`, `ImageNet`, `federated learning`, `RAG`, …)
+
+If a paper has **zero whitelist hits AND ≥ `max_blacklist_hits` (default 2) blacklist hits**, it's hard-gated locally with no Haiku call. Word boundaries are enforced so `QuIP` doesn't match inside `equipping` and `MIT` doesn't match inside `Amit`.
+
+This is conservative on purpose — anything ambiguous goes to the LLM. Add patterns over time based on what you see in rejected.jsonl.
+
+### Stage 2 — Haiku two-axis rubric
+
+Haiku returns a structured JSON breakdown which the orchestrator combines into a 0–10 composite.
 
 | axis | range | what it captures |
 |---|---|---|
-| `topic_relevance` | 0–5 | How squarely the paper sits in LLM compression. 5 = core PTQ/QAT/pruning/etc. with proper accuracy benchmarks. 3 = compression-adjacent (sparse attention coupled with quant, comprehensive survey). 0 = unrelated. |
-| `practicality` | 0–5 | Algorithm simplicity + clear inference perf impact + low calibration cost + small GPU memory footprint. 5 = AWQ-style "few lines, big speedup, data-free." 0 = complex, no perf benefit, intractable calibration. |
+| `topic_relevance` | 0–5 | How squarely the paper sits in LLM compression. 5 = core PTQ/QAT/KV/low-bit/pruning_distill/diffusion work with proper accuracy benchmarks. 3 = compression-adjacent (sparse attention coupled with quant). 0 = unrelated. |
+| `practicality` | 0–5 | Algorithm simplicity + clear OR plausible inference perf + low calibration cost + small GPU memory footprint. 5 = AWQ-style "few lines, big speedup, data-free." Already-shipped numbers are a bonus, not a requirement — a credible deployment path is enough. 0 = complex, intractable calibration, no perf story. |
 
-`relevance_score = topic_relevance + practicality` (so 0–10). A paper passes the highlight gate at **score ≥ 7**.
+`relevance_score = topic_relevance + practicality` (so 0–10). **There is no numeric threshold** — every paper with `hard_gate=false` is surfaced. Per-bucket caps below control digest length.
 
 ### Hard gate
 
-`hard_gate = true` zeros both axes. Triggered when the paper is unambiguously off-topic — RAG, agents, alignment, multimodal-without-compression, pure training algorithms, or models smaller than 1B parameters tested on toys (BERT-base, GPT-2-small).
+`hard_gate = true` zeros both axes. Triggered when:
+- Topic completely unrelated to compression: RAG, agents, alignment, multimodal-without-compression, pure training algorithms
+- **Pure speculative decoding** with no compression angle (coupled spec + quant is in scope, routed by primary contribution)
+- **Survey papers** — always
+- Anything compression-adjacent that doesn't fit one of the six topic buckets
+- Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
 
 ### Topic buckets and per-bucket caps
 
-Surviving papers are grouped by `topic_bucket`. The digest shows at most:
+The six buckets are **fixed** — no `other`, no `survey`. Papers that don't fit are hard-gated rather than forced into a catch-all. Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
 
-| bucket | cap |
-|---|---|
-| **PTQ** | 3 |
-| **QAT / low-bit pretraining** | 2 |
-| **KV cache compression** | 2 |
-| **Speculative decoding** | 2 |
-| **Knowledge distillation** | 2 |
-| **Pruning / sparsity** | 2 |
-| Diffusion compression | 2 |
-| Survey | 2 |
-| Other | 2 |
+| bucket | cap | what goes here |
+|---|---|---|
+| **`ptq`** | 8 | Post-training quantization, weight-only / weight-activation / KV-quant when PTQ recipe is the primary contribution. Bit-width ≥ 3. Examples: GPTQ, AWQ, SmoothQuant, QuaRot, SpinQuant, MXFP4 PTQ, NVFP4 |
+| **`low_bits`** | 5 | Sub-3-bit (≤ 2-bit) quantization, regardless of training method. Examples: BitNet b1.58, AQLM, VPTQ, QuIP#, ternary, binary |
+| **`qat`** | 5 | Quantization-aware training or PTQ + full-network fine-tune. Bit-width ≥ 3. Examples: LLM-QAT, EfficientQAT, PB-LLM |
+| **`kv_cache`** | 5 | KV cache compression where the layout / eviction is the main contribution. Examples: KIVI, KVQuant, H2O, StreamingLLM |
+| **`pruning_distill`** | 3 | Pruning, sparsity, distillation. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
+| **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
 
-PTQ gets the highest cap because the team's focus is on quantization recipes and PTQ tends to dominate the daily volume. Caps are set in [`config.yaml`](config.yaml) under `render.topic_caps` and can be overridden without touching code.
+Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
 
-The full ranked table (no caps) lives below the highlights so nothing gets lost — the caps only control what bubbles up to the "🔥 Highlights by topic" section.
+In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
+
+### 👤 Watched authors
+
+A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass per-bucket caps** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
 
 ---
 
 ## 🛠 Pipeline
 
 ```
-   ┌────────────┐     fetchers (one per source)
-   │  sources   │ ─── arxiv + hf_daily + reddit + semantic_scholar + twitter_rsshub
+   ┌────────────┐     fetchers (one per source, all in parallel via daily.sh)
+   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + reddit + semantic_scholar + twitter_rsshub
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
          ↓
@@ -88,18 +106,23 @@ The full ranked table (no caps) lives below the highlights so nothing gets lost 
    └─────┬──────┘            ↓
          │            data/deduped/YYYY-MM-DD.json
          ↓
-   ┌────────────┐     pipeline/filter.py     (Claude Haiku 4.5)
-   │   filter   │ ─── two-axis rubric → composite 0-10 + relevance_breakdown
+   ┌────────────┐     pipeline/filter.py
+   │   filter   │ ─── stage 1: keyword prefilter (local, free) →
+   │            │                obvious off-topic → hard_gate, no LLM call
+   │            │     stage 2: Claude Haiku 4.5 + prompts/relevance.md →
+   │            │                two-axis score + topic_bucket + breakdown
    └─────┬──────┘            ↓
          │            data/scored/YYYY-MM-DD.json
          ↓
-   ┌────────────┐     pipeline/summarize.py  (Claude Sonnet 4.6)
-   │ summarize  │ ─── only papers ≥ threshold get an English summary + highlights
+   ┌────────────┐     pipeline/summarize.py  (Claude Sonnet 4.6, prompts/summary.md)
+   │ summarize  │ ─── every non-hard-gated paper → 中文 summary + highlights
+   │            │                                  + up to 3 related/compared methods
    └─────┬──────┘            ↓
          │            data/summarized/YYYY-MM-DD.json
          ↓
    ┌────────────┐     pipeline/render.py
-   │   render   │ ─── group by bucket, apply caps, splice into README + digest
+   │   render   │ ─── compact README table (bucket-ordered) +
+   │            │     detail page (grouped by bucket, capped per-bucket)
    └────────────┘            ↓
                       digests/YYYY-MM-DD.md  +  README.md  +  INDEX.md
 ```
@@ -183,8 +206,10 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 
 | key | default | what it does |
 |---|---|---|
-| `filter.threshold` | 7 | composite (`topic_relevance + practicality`) cutoff for digest inclusion |
-| `render.topic_caps` | `{ptq: 3, _default: 2}` | max papers per bucket in the daily digest; `_default` applies to unlisted buckets |
+| `filter.model` | `claude-haiku-4-5` | scoring model; swap to `claude-sonnet-4-6` if Haiku judges too coarsely |
+| `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
+| `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
+| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
 | `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.semantic_scholar.citation_window_days` | 7 | default fetch window for citation tracking (CLI `--window-days` overrides) |
@@ -237,7 +262,7 @@ Then uncomment the `schedule:` block in `.github/workflows/daily.yml`. The workf
 llm-paper-radar/
 ├── README.md                    # this file (LATEST_START/END auto-updated)
 ├── INDEX.md                     # one-line per past digest, newest first
-├── config.yaml                  # source toggles, models, threshold, topic_caps
+├── config.yaml                  # source toggles, models, prefilter, topic_caps
 ├── seeds.yaml                   # Semantic Scholar seed papers
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
