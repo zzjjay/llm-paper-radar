@@ -34,26 +34,31 @@ async def _summarize_one(
     return paper
 
 
+def _passed_gate(p: Paper) -> bool:
+    if p.relevance_score is None:
+        return False
+    bd = p.relevance_breakdown or {}
+    return not bd.get("hard_gate", False)
+
+
 async def summarize_papers(
     in_path: Path,
     out_path: Path,
     prompt_path: Path,
     client: LLMClient,
-    threshold: int,
     concurrency: int,
 ) -> int:
     raw = await asyncio.to_thread(Path(in_path).read_text)
     papers = [Paper.model_validate(p) for p in json.loads(raw)]
     prompt = load_prompt(prompt_path)
     sem = asyncio.Semaphore(concurrency)
-    # Watched-author papers bypass the score threshold: the whole point of the
-    # watchlist is to never miss what these groups publish, even if a particular
-    # paper scores below 7.
+    # Summarize everything that wasn't hard-gated. Watched-author papers
+    # always qualify (they're not hard-gated by definition unless prefilter
+    # caught them, and the watchlist exists precisely to never miss those).
     targets = [
         p
         for p in papers
-        if (p.relevance_score or 0) >= threshold
-        or any(s.name == "arxiv_authors" for s in p.sources)
+        if _passed_gate(p) or any(s.name == "arxiv_authors" for s in p.sources)
     ]
     await asyncio.gather(*[_summarize_one(p, prompt, client, sem) for p in targets])
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +98,6 @@ if __name__ == "__main__":
                     out_path,
                     prompt_path,
                     client,
-                    cfg.filter.threshold,
                     cfg.summarize.concurrency,
                 )
             )

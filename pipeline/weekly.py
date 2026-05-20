@@ -10,12 +10,18 @@ from pipeline.render import sort_papers
 from sources.base import Paper
 
 
+def _passed_gate(p: Paper) -> bool:
+    if p.relevance_score is None:
+        return False
+    bd = p.relevance_breakdown or {}
+    return not bd.get("hard_gate", False)
+
+
 def render_weekly(
     end_date: datetime,
     summarized_root: Path,
     out_dir: Path,
     top_n: int,
-    threshold: int,
 ) -> None:
     all_papers: list[Paper] = []
     for d in range(7):
@@ -31,7 +37,7 @@ def render_weekly(
         prev = by_id.get(p.id)
         if not prev or (p.relevance_score or 0) > (prev.relevance_score or 0):
             by_id[p.id] = p
-    surviving = [p for p in by_id.values() if (p.relevance_score or 0) >= threshold]
+    surviving = [p for p in by_id.values() if _passed_gate(p)]
     surviving = sort_papers(surviving)[:top_n]
 
     src_counts = Counter(s.name for p in surviving for s in p.sources)
@@ -70,7 +76,7 @@ if __name__ == "__main__":
             if end_date
             else datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         )
-        render_weekly(end, in_root, out_dir, top_n=20, threshold=cfg.filter.threshold)
+        render_weekly(end, in_root, out_dir, top_n=20)
         print(f"weekly: digest written for week ending {end.date()}")
 
     main()

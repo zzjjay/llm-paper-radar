@@ -75,11 +75,12 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
             "reason": "good",
         },
         {
-            "hard_gate": False,
-            "topic_relevance": 2,
-            "practicality": 1,
-            "topic_bucket": "other",
-            "reason": "weak",
+            # Paper Y is off-topic: hard-gated by the LLM, must be excluded.
+            "hard_gate": True,
+            "topic_relevance": 0,
+            "practicality": 0,
+            "topic_bucket": "ptq",
+            "reason": "off-topic",
         },
     ]
     await filter_papers(deduped_path, scored_path, prompt, fake_filter, concurrency=2)
@@ -90,13 +91,11 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     sum_prompt.write_text("summarize")
     fake_sum = AsyncMock()
     fake_sum.call_json.return_value = {
-        "summary": "English",
+        "summary": "中文摘要",
         "highlights": ["🎯 a"],
     }
-    await summarize_papers(
-        scored_path, summarized_path, sum_prompt, fake_sum, threshold=7, concurrency=2
-    )
-    assert fake_sum.call_json.call_count == 1
+    await summarize_papers(scored_path, summarized_path, sum_prompt, fake_sum, concurrency=2)
+    assert fake_sum.call_json.call_count == 1  # only the non-hard-gated paper is summarized
 
     digests = tmp_path / "digests"
     readme = tmp_path / "README.md"
@@ -107,8 +106,7 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
         digests,
         readme,
         index,
-        threshold=7,
-        topic_caps={"compression": 5, "_default": 3},
+        topic_caps={"ptq": 5, "_default": 3},
     )
 
     out = (digests / "2026-05-11.md").read_text()
@@ -117,4 +115,4 @@ async def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch):
     readme_text = readme.read_text()
     assert "<!-- LATEST_START -->" in readme_text
     assert "Paper X" in readme_text  # digest body got spliced in
-    assert "Paper Y" not in readme_text  # below-threshold paper still excluded
+    assert "Paper Y" not in readme_text  # hard-gated paper still excluded

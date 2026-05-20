@@ -15,40 +15,38 @@ REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
 RELEVANCE_WEIGHT = 20
 
+# Bucket enum (six). Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
 BUCKET_ORDER = [
     "ptq",
+    "low_bits",
     "qat",
     "kv_cache",
-    "speculative_decoding",
-    "distillation",
-    "pruning",
-    "diffusion_compression",
-    "survey",
-    "other",
+    "pruning_distill",
+    "diffusion",
 ]
 BUCKET_TITLES = {
     "ptq": "PTQ (post-training quantization)",
-    "qat": "QAT / low-bit pretraining",
-    "pruning": "Pruning / sparsity",
-    "distillation": "Knowledge distillation",
+    "low_bits": "Low-bit (≤ 2-bit)",
+    "qat": "QAT",
     "kv_cache": "KV cache compression",
-    "diffusion_compression": "Diffusion compression",
-    "speculative_decoding": "Speculative decoding",
-    "survey": "Survey",
-    "other": "Other",
+    "pruning_distill": "Pruning & distillation",
+    "diffusion": "Diffusion compression",
 }
 # Detail-page section headers — tech terms stay English, glue words Chinese.
 BUCKET_TITLES_CN = {
     "ptq": "PTQ（训练后量化）",
-    "qat": "QAT / 低比特预训练",
-    "pruning": "Pruning / 稀疏化",
-    "distillation": "知识蒸馏",
+    "low_bits": "Low-bit（≤ 2-bit）",
+    "qat": "QAT（量化感知训练）",
     "kv_cache": "KV cache 压缩",
-    "diffusion_compression": "Diffusion 压缩",
-    "speculative_decoding": "投机解码",
-    "survey": "Survey / 综述",
-    "other": "其它",
+    "pruning_distill": "Pruning / 蒸馏",
+    "diffusion": "Diffusion 压缩",
 }
+
+# Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
+# one of the six valid values. These papers should have been hard-gated by
+# the LLM, but defensively we still surface them in the compact table while
+# excluding them from the bucketed "Highlights" section.
+UNBUCKETED = "_unbucketed"
 
 
 def _bucket_of(p: Paper) -> str:
@@ -56,7 +54,19 @@ def _bucket_of(p: Paper) -> str:
     bucket = bd.get("topic_bucket")
     if bucket in BUCKET_TITLES:
         return bucket
-    return "other"
+    return UNBUCKETED
+
+
+def _passed_gate(p: Paper) -> bool:
+    """True when the paper has a real score and was not hard-gated.
+
+    Replaces the old `relevance_score >= threshold` filter. There is no
+    numeric threshold anymore — anything not hard-gated bubbles up; bucket
+    caps in `render.topic_caps` control digest length."""
+    if p.relevance_score is None:
+        return False
+    bd = p.relevance_breakdown or {}
+    return not bd.get("hard_gate", False)
 
 
 def _cap_for(bucket: str, caps: dict[str, int]) -> int:
@@ -303,7 +313,13 @@ def _bucket_cell(p: Paper) -> str:
     if meta is not None:
         matched, _ = meta
         return f"👤 Watched · {', '.join(matched)}"
-    return BUCKET_TITLES.get(_bucket_of(p), "Other")
+    b = _bucket_of(p)
+    if b == UNBUCKETED:
+        # Show the raw bucket the LLM returned, so debugging stale enums
+        # is obvious. Falls back to "—" if no breakdown at all.
+        raw = (p.relevance_breakdown or {}).get("topic_bucket") or "—"
+        return f"? {raw}"
+    return BUCKET_TITLES[b]
 
 
 def _compact_row(rank: int, p: Paper, digest_filename: str) -> str:
@@ -355,10 +371,15 @@ def render_index_line(date: datetime, scanned: int, passed: int, top_title: str)
 def _group_with_caps(
     papers: list[Paper], topic_caps: dict[str, int]
 ) -> dict[str, list[Paper]]:
-    """Bucket sorted papers and apply per-bucket caps. Input order is preserved."""
+    """Bucket sorted papers and apply per-bucket caps. Input order is preserved.
+    Papers whose bucket is not one of the six valid values are dropped from
+    the bucketed view (they still appear in the compact table)."""
     grouped: dict[str, list[Paper]] = {b: [] for b in BUCKET_ORDER}
     for p in papers:
-        grouped[_bucket_of(p)].append(p)
+        b = _bucket_of(p)
+        if b == UNBUCKETED:
+            continue
+        grouped[b].append(p)
     return {b: ps[: _cap_for(b, topic_caps)] for b, ps in grouped.items()}
 
 
@@ -371,7 +392,6 @@ MAIN_TABLE_HEADER = (
 def _render_detail_md(
     date: datetime,
     scanned: int,
-    threshold: int,
     watched_papers: list[Paper],
     grouped: dict[str, list[Paper]],
     topic_caps: dict[str, int],
@@ -382,8 +402,8 @@ def _render_detail_md(
     body.append(f"# LLM 推理优化日报 · {date.strftime('%Y-%m-%d')}\n")
     body.append(f"> 📅 窗口：{date.strftime('%Y-%m-%d')}（UTC daily）")
     body.append(
-        f"> 📊 扫描 {scanned} 篇 → 通过过滤 {len(surviving)}"
-        f" → 精选 {highlighted_total}（阈值 ≥{threshold}）"
+        f"> 📊 扫描 {scanned} 篇 → 未被 hard_gate {len(surviving)}"
+        f" → 精选 {highlighted_total}（按主题上限）"
         f" · 👤 {len(watched_papers)} 篇来自关注作者"
     )
     body.append("")
@@ -399,7 +419,7 @@ def _render_detail_md(
         body.append("## 👤 关注作者\n")
         body.append(
             "_作者白名单配置在 [`config.yaml`](../config.yaml) 的"
-            " `sources.arxiv_authors.authors`；这些论文绕过打分阈值，全部展示。_\n"
+            " `sources.arxiv_authors.authors`；这些论文绕过主题上限，全部展示。_\n"
         )
         for p in watched_papers:
             rank += 1
@@ -425,7 +445,6 @@ def _render_detail_md(
 def _render_compact_md(
     date: datetime,
     scanned: int,
-    threshold: int,
     watched_papers: list[Paper],
     surviving: list[Paper],
     digest_filename: str,
@@ -440,14 +459,14 @@ def _render_compact_md(
     body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
     body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
     body.append(
-        f"> 📊 Scanned {scanned} papers → passed filter {len(surviving)}"
-        f" (threshold ≥{threshold}) · 👤 {len(watched_papers)} from watched authors"
+        f"> 📊 Scanned {scanned} papers → passed hard_gate {len(surviving)}"
+        f" · 👤 {len(watched_papers)} from watched authors"
     )
     body.append("")
     body.append(
         f"> Table only — full summaries / why-selected / related methods live in"
         f" the [detail page]({digest_filename})."
-        f" Watched-author papers bypass the threshold and sit at the top."
+        f" Watched-author papers sit at the top."
         f" History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml)"
         f" · Generated by [llm-paper-radar]({REPO_URL}).\n"
     )
@@ -459,7 +478,7 @@ def _render_compact_md(
             body.append(_compact_row(i, p, digest_filename))
         body.append("")
     else:
-        body.append("_Nothing surfaced today (no threshold passes, no watchlist hits)._\n")
+        body.append("_Nothing surfaced today (everything was hard-gated, no watchlist hits)._\n")
 
     if revisited:
         body.append("## 🔁 Revisited\n")
@@ -476,16 +495,16 @@ def render_daily(
     digests_dir: Path,
     readme_path: Path,
     index_path: Path,
-    threshold: int,
     topic_caps: dict[str, int] | None = None,
 ) -> None:
     if topic_caps is None:
-        topic_caps = {"ptq": 3, "_default": 2}
+        topic_caps = {"ptq": 5, "_default": 2}
     all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
     scanned = len(all_papers)
     watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
     watched_ids = {p.id for p in watched_papers}
-    surviving = [p for p in all_papers if (p.relevance_score or 0) >= threshold]
+    # No threshold: everything that isn't hard-gated (and has a real score) surfaces.
+    surviving = [p for p in all_papers if _passed_gate(p)]
     surviving = sort_papers(surviving)
     # Don't repeat watched papers in the topic-bucket highlights; they already
     # have a dedicated section above.
@@ -496,7 +515,6 @@ def render_daily(
     detail_text = _render_detail_md(
         date,
         scanned,
-        threshold,
         watched_papers,
         grouped,
         topic_caps,
@@ -513,7 +531,6 @@ def render_daily(
     compact_text = _render_compact_md(
         date,
         scanned,
-        threshold,
         watched_papers,
         surviving,
         digest_filename=f"{digests_dir.name}/{digest_filename}",
@@ -563,7 +580,6 @@ if __name__ == "__main__":
                 digests_dir,
                 readme,
                 index,
-                cfg.filter.threshold,
                 cfg.render.topic_caps,
             )
             print(f"render: wrote digest for {target.date()}")

@@ -28,11 +28,11 @@ Every paper goes through Claude Haiku 4.5 with [`prompts/relevance.md`](prompts/
 | `topic_relevance` | 0–5 | How squarely the paper sits in LLM compression. 5 = core PTQ/QAT/pruning/etc. with proper accuracy benchmarks. 3 = compression-adjacent (sparse attention coupled with quant, comprehensive survey). 0 = unrelated. |
 | `practicality` | 0–5 | Algorithm simplicity + clear inference perf impact + low calibration cost + small GPU memory footprint. 5 = AWQ-style "few lines, big speedup, data-free." 0 = complex, no perf benefit, intractable calibration. |
 
-`relevance_score = topic_relevance + practicality` (so 0–10). A paper passes the highlight gate at **score ≥ 7**.
+`relevance_score = topic_relevance + practicality` (so 0–10). There is no numeric threshold — every paper with `hard_gate=false` is surfaced. Per-bucket caps below control digest length.
 
 ### Hard gate
 
-`hard_gate = true` zeros both axes. Triggered when the paper is unambiguously off-topic — RAG, agents, alignment, multimodal-without-compression, pure training algorithms, or models smaller than 1B parameters tested on toys (BERT-base, GPT-2-small).
+`hard_gate = true` zeros both axes. Triggered when the paper is unambiguously off-topic — RAG, agents, alignment, multimodal-without-compression, pure training algorithms, pure speculative decoding without a compression angle, survey papers, anything that doesn't fit one of the six topic buckets, or models smaller than 1B parameters tested on toys (BERT-base, GPT-2-small). A cheap keyword prefilter (`filter.prefilter` in `config.yaml`) hard-gates obvious off-topic locally before burning an LLM call.
 
 ### Topic buckets and per-bucket caps
 
@@ -40,23 +40,20 @@ Surviving papers are grouped by `topic_bucket`. The digest shows at most:
 
 | bucket | cap |
 |---|---|
-| **PTQ** | 3 |
-| **QAT / low-bit pretraining** | 2 |
-| **KV cache compression** | 2 |
-| **Speculative decoding** | 2 |
-| **Knowledge distillation** | 2 |
-| **Pruning / sparsity** | 2 |
-| Diffusion compression | 2 |
-| Survey | 2 |
-| Other | 2 |
+| **PTQ** (post-training quantization, ≥ 3-bit) | 5 |
+| **Low-bit** (≤ 2-bit, any training method) | 3 |
+| **QAT** (quantization-aware training, ≥ 3-bit) | 3 |
+| **KV cache compression** | 3 |
+| **Pruning & distillation** | 2 |
+| **Diffusion compression** | 2 |
 
-PTQ gets the highest cap because the team's focus is on quantization recipes and PTQ tends to dominate the daily volume. Caps are set in [`config.yaml`](config.yaml) under `render.topic_caps` and can be overridden without touching code.
+The six buckets are fixed — there is no `other` or `survey` bucket; papers that don't fit are hard-gated instead of forced into a catch-all. Caps live in [`config.yaml`](config.yaml) under `render.topic_caps` and can be overridden without touching code.
 
 In the README compact view, *every* surviving paper appears in the main table — the per-bucket caps only control which papers get a full detail block on the per-day digest page. Nothing gets lost; the cap just controls how much real estate a single bucket can hog on the detail page.
 
 ### 👤 Watched authors
 
-A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass the score-≥7 threshold** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
+A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass per-bucket caps** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
 
 ---
 
@@ -79,7 +76,7 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
          │            data/scored/YYYY-MM-DD.json
          ↓
    ┌────────────┐     pipeline/summarize.py  (Claude Sonnet 4.6)
-   │ summarize  │ ─── only papers ≥ threshold get an English summary + highlights
+   │ summarize  │ ─── every non-hard-gated paper gets a Chinese summary + highlights
    └─────┬──────┘            ↓
          │            data/summarized/YYYY-MM-DD.json
          ↓
@@ -168,8 +165,8 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 
 | key | default | what it does |
 |---|---|---|
-| `filter.threshold` | 7 | composite (`topic_relevance + practicality`) cutoff for digest inclusion |
-| `render.topic_caps` | `{ptq: 3, _default: 2}` | max papers per bucket in the daily digest; `_default` applies to unlisted buckets |
+| `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches and 0 whitelist hits are hard-gated locally, no LLM call |
+| `render.topic_caps` | `{ptq: 5, low_bits: 3, qat: 3, kv_cache: 3, pruning_distill: 2, diffusion: 2, _default: 2}` | max papers per bucket on the per-day detail page |
 | `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.semantic_scholar.citation_window_days` | 7 | default fetch window for citation tracking (CLI `--window-days` overrides) |
@@ -222,7 +219,7 @@ Then uncomment the `schedule:` block in `.github/workflows/daily.yml`. The workf
 llm-paper-radar/
 ├── README.md                    # this file (LATEST_START/END auto-updated)
 ├── INDEX.md                     # one-line per past digest, newest first
-├── config.yaml                  # source toggles, models, threshold, topic_caps
+├── config.yaml                  # source toggles, models, prefilter, topic_caps
 ├── seeds.yaml                   # Semantic Scholar seed papers
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)

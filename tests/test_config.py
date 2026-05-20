@@ -13,7 +13,6 @@ sources:
     enabled: true
 filter:
   model: claude-haiku-4-5-20251001
-  threshold: 7
   concurrency: 50
 summarize:
   model: claude-sonnet-4-6
@@ -31,7 +30,9 @@ dedupe:
     p.write_text(yaml_text)
     cfg = load_config(p)
     assert isinstance(cfg, Config)
-    assert cfg.filter.threshold == 7
+    # threshold field has been removed; prefilter is the new local gate.
+    assert not hasattr(cfg.filter, "threshold")
+    assert cfg.filter.prefilter.enabled is True
     assert cfg.sources.arxiv.enabled is True
     assert cfg.sources.arxiv.categories == ["cs.CL", "cs.LG"]
     assert cfg.dedupe.source_priority[0] == "hf_daily"

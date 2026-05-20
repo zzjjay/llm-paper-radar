@@ -18,6 +18,7 @@ def _mk(
     topic_bucket="ptq",
     topic_relevance=5,
     practicality=4,
+    hard_gate=False,
 ):  # noqa: E501
     now = datetime.now(UTC)
     sources = [
@@ -68,6 +69,7 @@ def _mk(
         "topic_bucket": topic_bucket,
         "topic_relevance": topic_relevance,
         "practicality": practicality,
+        "hard_gate": hard_gate,
         "compression_type": "quantization",
         "format_or_method": "W4A16",
         "largest_model_tested": "Llama-3-70B",
@@ -112,10 +114,10 @@ def test_sort_papers_relevance_outweighs_modest_heat():
 
 def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     summarized_path = tmp_path / "summarized.json"
-    # 15 PTQ papers (cap 5) + 1 below threshold
+    # 15 PTQ papers (cap 5) + 1 hard-gated paper that must be excluded.
     papers = [_mk(f"id{i}", 9, trending_rank=i + 1) for i in range(15)]
-    below = _mk("low", 5)
-    summarized_path.write_text(json.dumps([p.model_dump(mode="json") for p in papers + [below]]))
+    gated = _mk("low", 0, hard_gate=True)
+    summarized_path.write_text(json.dumps([p.model_dump(mode="json") for p in papers + [gated]]))
 
     digests_dir = tmp_path / "digests"
     readme = tmp_path / "README.md"
@@ -127,7 +129,6 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
         digests_dir=digests_dir,
         readme_path=readme,
         index_path=index,
-        threshold=7,
         topic_caps={"ptq": 5, "_default": 3},
     )
 
@@ -135,21 +136,20 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     # Detail page keeps the topic-bucket section with rich blocks (CN labels).
     assert "## 🔥 主题精选" in out
     assert "### PTQ（训练后量化）" in out
-    assert "(top 5 of cap 5)" not in out  # the verbose annotation is gone
     assert "PTQ 5 篇，其它 3 篇" in out  # caps summary line in CN
     assert "config.yaml" in out  # points users to where to change it
-    # Caps apply to highlights. 15 pass threshold; cap surfaces 5 detail blocks.
+    # Caps apply to highlights. 15 pass hard_gate; cap surfaces 5 detail blocks.
     assert out.count("#### 摘要") == 5
-    # Below-threshold paper excluded from detail page.
+    # Hard-gated paper excluded from detail page.
     assert "Title low" not in out
     # README is the compact table-only view, links into the detail page.
     readme_text = readme.read_text()
     assert "<!-- LATEST_START -->" in readme_text
     assert "## 📚 Papers" in readme_text
     assert "| # | Bucket | Paper | Authors | Date | Details |" in readme_text
-    # Every surviving paper appears in the compact table (no cap applied).
+    # Every surviving (non-hard-gated) paper appears in the compact table.
     assert readme_text.count("digests/2026-05-11.md#p-id") == 15
-    # Below-threshold paper still excluded.
+    # Hard-gated paper still excluded.
     assert "Title low" not in readme_text
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()
 
@@ -174,7 +174,6 @@ def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
         digests_dir=tmp_path / "digests",
         readme_path=readme,
         index_path=tmp_path / "INDEX.md",
-        threshold=7,
         topic_caps={"ptq": 3, "_default": 2},
     )
 

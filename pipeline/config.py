@@ -54,10 +54,29 @@ class SourcesConfig(BaseModel):
     arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
 
 
+class KeywordRule(BaseModel):
+    pattern: str
+    weight: int
+
+
+class PrefilterConfig(BaseModel):
+    """Cheap keyword prefilter that runs before the LLM judge. Papers with
+    no whitelist hits AND >= `max_blacklist_hits` blacklist matches are
+    hard-gated locally without burning a Haiku call.
+
+    Word-boundary matching is applied — `QuIP` will not match inside
+    `equipping`, `MIT` will not match inside `Amit`."""
+
+    enabled: bool = True
+    whitelist: list[KeywordRule] = Field(default_factory=list)
+    blacklist: list[KeywordRule] = Field(default_factory=list)
+    max_blacklist_hits: int = 2
+
+
 class FilterConfig(BaseModel):
     model: str = "claude-haiku-4-5-20251001"
-    threshold: int = Field(7, ge=0, le=10)
     concurrency: int = 50
+    prefilter: PrefilterConfig = PrefilterConfig()
 
 
 class SummarizeConfig(BaseModel):
@@ -67,7 +86,18 @@ class SummarizeConfig(BaseModel):
 
 class RenderConfig(BaseModel):
     truncate_after: int = 10
-    topic_caps: dict[str, int] = Field(default_factory=lambda: {"ptq": 3, "_default": 2})
+    # New bucket enum: [ptq, qat, low_bits, kv_cache, pruning_distill, diffusion]
+    topic_caps: dict[str, int] = Field(
+        default_factory=lambda: {
+            "ptq": 5,
+            "low_bits": 3,
+            "qat": 3,
+            "kv_cache": 3,
+            "pruning_distill": 2,
+            "diffusion": 2,
+            "_default": 2,
+        }
+    )
 
 
 class DedupeConfig(BaseModel):

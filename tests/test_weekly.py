@@ -6,7 +6,7 @@ from pipeline.weekly import render_weekly
 from sources.base import Paper, SourceRecord
 
 
-def _mk(id_, score, day_offset):
+def _mk(id_, score, day_offset, hard_gate: bool = False):
     p = Paper(
         id=id_,
         title=f"Title {id_}",
@@ -20,6 +20,7 @@ def _mk(id_, score, day_offset):
         sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
     )
     p.relevance_score = score
+    p.relevance_breakdown = {"hard_gate": hard_gate, "topic_bucket": "ptq"}
     p.summary = "e"
     return p
 
@@ -40,7 +41,6 @@ def test_weekly_aggregates_past_seven_days(tmp_path: Path):
         summarized_root=summarized,
         out_dir=out_dir,
         top_n=20,
-        threshold=7,
     )
 
     files = list(out_dir.glob("*.md"))
