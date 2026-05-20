@@ -23,7 +23,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 ## 📚 Papers
 
-| # | Bucket | Paper | Authors | Date | Details |
+| # | Bucket | Paper | Authors | Date | Why |
 |---|--------|-------|---------|------|---------|
 | 1 | PTQ (post-training quantization) | [TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization](https://arxiv.org/abs/2605.19561) | Zukang Xu, Xing Hu, Dawei Yang | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19561) |
 | 2 | PTQ (post-training quantization) | [K-Quantization and its Impact on Output Performance](https://arxiv.org/abs/2605.19645) | Robin Baki Davidsson, Pierre Nugues | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19645) |

@@ -137,7 +137,7 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     readme_text = readme.read_text()
     assert "<!-- LATEST_START -->" in readme_text
     assert "## 📚 Papers" in readme_text
-    assert "| # | Bucket | Paper | Authors | Date | Details |" in readme_text
+    assert "| # | Bucket | Paper | Authors | Date | Why |" in readme_text
     # Every surviving (non-hard-gated) paper appears in the compact table.
     assert readme_text.count("digests/2026-05-11.md#p-id") == 15
     # Hard-gated paper still excluded.
@@ -175,7 +175,7 @@ def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
     assert "old digest goes here" not in content  # replaced
     # README is the compact table-only view; topic detail lives in digests/.
     assert "## 📚 Papers" in content
-    assert "| # | Bucket | Paper | Authors | Date | Details |" in content
+    assert "| # | Bucket | Paper | Authors | Date | Why |" in content
 
 
 def test_render_index_line_includes_summary_stats():

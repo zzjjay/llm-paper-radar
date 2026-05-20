@@ -314,7 +314,7 @@ def _bucket_cell(p: Paper) -> str:
 
 
 def _compact_row(rank: int, p: Paper, digest_filename: str) -> str:
-    """README/compact view: # | Bucket | Paper | Authors | Date | Details."""
+    """README/compact view: # | Bucket | Paper | Authors | Date | Why."""
     revisited = " 🔁" if p.seen_before else ""
     title_cell = f"[{p.title}]({p.url}){revisited}"
     date_str = p.published_at.strftime("%Y-%m-%d")
@@ -375,7 +375,7 @@ def _group_with_caps(
 
 
 MAIN_TABLE_HEADER = (
-    "| # | Bucket | Paper | Authors | Date | Details |\n"
+    "| # | Bucket | Paper | Authors | Date | Why |\n"
     "|---|--------|-------|---------|------|---------|"
 )
 
