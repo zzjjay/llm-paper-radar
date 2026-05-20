@@ -89,12 +89,12 @@ class RenderConfig(BaseModel):
     # New bucket enum: [ptq, qat, low_bits, kv_cache, pruning_distill, diffusion]
     topic_caps: dict[str, int] = Field(
         default_factory=lambda: {
-            "ptq": 5,
-            "low_bits": 3,
-            "qat": 3,
-            "kv_cache": 3,
-            "pruning_distill": 2,
-            "diffusion": 2,
+            "ptq": 8,
+            "low_bits": 5,
+            "qat": 5,
+            "kv_cache": 5,
+            "pruning_distill": 3,
+            "diffusion": 3,
             "_default": 2,
         }
     )
