@@ -487,6 +487,48 @@ def _render_compact_md(
     return "\n".join(body)
 
 
+def _load_day(
+    date: datetime,
+    summarized_path: Path,
+    digests_dir: Path,
+    topic_caps: dict[str, int],
+) -> tuple[int, list[Paper], list[Paper]]:
+    """Write the per-day digest file and return (scanned, watched, surviving)
+    for downstream README rendering."""
+    all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
+    scanned = len(all_papers)
+    watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
+    watched_ids = {p.id for p in watched_papers}
+    surviving = sort_papers([p for p in all_papers if _passed_gate(p)])
+    topic_pool = [p for p in surviving if p.id not in watched_ids]
+    grouped = _group_with_caps(topic_pool, topic_caps)
+    highlighted_total = sum(len(ps) for ps in grouped.values())
+
+    detail_text = _render_detail_md(
+        date, scanned, watched_papers, grouped, topic_caps, surviving, highlighted_total
+    )
+    digests_dir.mkdir(parents=True, exist_ok=True)
+    (digests_dir / f"{date.strftime('%Y-%m-%d')}.md").write_text(detail_text)
+    return scanned, watched_papers, surviving
+
+
+def _update_index(
+    date: datetime, index_path: Path, scanned: int, surviving: list[Paper]
+) -> None:
+    top_title = surviving[0].title if surviving else "(no papers passed)"
+    new_line = render_index_line(date, scanned, len(surviving), top_title[:50])
+    if index_path.exists():
+        existing = index_path.read_text()
+        marker = f"](digests/{date.strftime('%Y-%m-%d')}.md)"
+        if marker in existing:
+            updated_lines = [new_line if marker in ln else ln for ln in existing.splitlines()]
+            index_path.write_text("\n".join(updated_lines) + "\n")
+        else:
+            index_path.write_text(existing + "\n" + new_line + "\n")
+    else:
+        index_path.write_text("# Digest History Index\n\n" + new_line + "\n")
+
+
 def render_daily(
     date: datetime,
     summarized_path: Path,
@@ -497,35 +539,10 @@ def render_daily(
 ) -> None:
     if topic_caps is None:
         topic_caps = {"ptq": 5, "_default": 2}
-    all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
-    scanned = len(all_papers)
-    watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
-    watched_ids = {p.id for p in watched_papers}
-    # No threshold: everything that isn't hard-gated (and has a real score) surfaces.
-    surviving = [p for p in all_papers if _passed_gate(p)]
-    surviving = sort_papers(surviving)
-    # Don't repeat watched papers in the topic-bucket highlights; they already
-    # have a dedicated section above.
-    topic_pool = [p for p in surviving if p.id not in watched_ids]
-    grouped = _group_with_caps(topic_pool, topic_caps)
-    highlighted_total = sum(len(ps) for ps in grouped.values())
-
-    detail_text = _render_detail_md(
-        date,
-        scanned,
-        watched_papers,
-        grouped,
-        topic_caps,
-        surviving,
-        highlighted_total,
+    scanned, watched_papers, surviving = _load_day(
+        date, summarized_path, digests_dir, topic_caps
     )
-    digests_dir.mkdir(parents=True, exist_ok=True)
     digest_filename = f"{date.strftime('%Y-%m-%d')}.md"
-    digest_path = digests_dir / digest_filename
-    digest_path.write_text(detail_text)
-
-    # README compact view links into the detail file via a relative path that
-    # works from the repo root.
     compact_text = _render_compact_md(
         date,
         scanned,
@@ -534,21 +551,88 @@ def render_daily(
         digest_filename=f"{digests_dir.name}/{digest_filename}",
     )
     _splice_into_readme(readme_path, compact_text)
+    _update_index(date, index_path, scanned, surviving)
 
-    top_title = surviving[0].title if surviving else "(no papers passed)"
-    new_line = render_index_line(date, scanned, len(surviving), top_title[:50])
-    if index_path.exists():
-        existing = index_path.read_text()
-        marker = f"](digests/{date.strftime('%Y-%m-%d')}.md)"
-        if marker in existing:
-            updated_lines = []
-            for ln in existing.splitlines():
-                updated_lines.append(new_line if marker in ln else ln)
-            index_path.write_text("\n".join(updated_lines) + "\n")
-        else:
-            index_path.write_text(existing + "\n" + new_line + "\n")
+
+def _render_aggregated_compact_md(
+    days: list[tuple[datetime, int, list[Paper], list[Paper]]],
+    digests_dir_name: str,
+) -> str:
+    """N-day rollup compact view: one merged table sorted by bucket (then the
+    per-bucket sort key). Watched-author papers sit at the top. Each row links
+    to its own day's digest page."""
+    days_sorted = sorted(days, key=lambda x: x[0], reverse=True)  # newest first
+    start_date = min(d[0] for d in days)
+    end_date = max(d[0] for d in days)
+    total_scanned = sum(s for _, s, _, _ in days)
+
+    watched_pairs: list[tuple[datetime, Paper]] = []
+    other_pairs: list[tuple[datetime, Paper]] = []
+    seen_ids: set[str] = set()
+    for date, _, watched, surviving in days_sorted:
+        watched_id_set = {p.id for p in watched}
+        for p in watched:
+            if p.id in seen_ids:
+                continue
+            seen_ids.add(p.id)
+            watched_pairs.append((date, p))
+        for p in surviving:
+            if p.id in watched_id_set or p.id in seen_ids:
+                continue
+            seen_ids.add(p.id)
+            other_pairs.append((date, p))
+    other_pairs.sort(key=lambda dp: _bucket_sort_key(dp[1]))
+    combined = watched_pairs + other_pairs
+
+    span = f"{start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
+    body: list[str] = []
+    body.append(f"# LLM Inference Optimization Daily · {len(days)}-day · {span}\n")
+    body.append(f"> 📅 Window: {span}")
+    body.append(
+        f"> 📊 Scanned {total_scanned} papers → surfaced {len(combined)}"
+        f" · 👤 {len(watched_pairs)} from watched authors"
+    )
+    body.append("")
+    body.append(
+        "> Table only — full summaries / why-selected / related methods live in the"
+        f" per-day detail pages under [`{digests_dir_name}/`]({digests_dir_name}/)."
+        " Watched-author papers sit at the top."
+        " History: [INDEX.md](INDEX.md) · Config: [config.yaml](config.yaml)"
+        f" · Generated by [llm-paper-radar]({REPO_URL}).\n"
+    )
+    body.append(f"## 📚 Papers ({len(days)}-day rollup)\n")
+    if combined:
+        body.append(MAIN_TABLE_HEADER)
+        for i, (date, p) in enumerate(combined, start=1):
+            digest_filename = f"{digests_dir_name}/{date.strftime('%Y-%m-%d')}.md"
+            body.append(_compact_row(i, p, digest_filename))
+        body.append("")
     else:
-        index_path.write_text("# Digest History Index\n\n" + new_line + "\n")
+        body.append("_Nothing surfaced in this window._\n")
+    return "\n".join(body)
+
+
+def render_aggregated(
+    targets: list[tuple[datetime, Path]],
+    digests_dir: Path,
+    readme_path: Path,
+    index_path: Path,
+    topic_caps: dict[str, int] | None = None,
+) -> None:
+    """Render each day's digest + INDEX entry, then splice one merged
+    N-day table into README."""
+    if topic_caps is None:
+        topic_caps = {"ptq": 5, "_default": 2}
+    days: list[tuple[datetime, int, list[Paper], list[Paper]]] = []
+    for date, in_path in targets:
+        scanned, watched, surviving = _load_day(date, in_path, digests_dir, topic_caps)
+        _update_index(date, index_path, scanned, surviving)
+        days.append((date, scanned, watched, surviving))
+        print(f"render: wrote digest for {date.date()}")
+    if not days:
+        return
+    aggregated = _render_aggregated_compact_md(days, digests_dir.name)
+    _splice_into_readme(readme_path, aggregated)
 
 
 if __name__ == "__main__":
@@ -566,20 +650,21 @@ if __name__ == "__main__":
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
         else:
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        targets: list[tuple[datetime, Path]] = []
         for delta in reversed(range(backfill_days + 1)):
             target = base - timedelta(days=delta)
             in_path = in_root / f"{target.strftime('%Y-%m-%d')}.json"
             if not in_path.exists():
                 print(f"render: skip {target.date()}")
                 continue
-            render_daily(
-                target,
-                in_path,
-                digests_dir,
-                readme,
-                index,
-                cfg.render.topic_caps,
-            )
-            print(f"render: wrote digest for {target.date()}")
+            targets.append((target, in_path))
+
+        if backfill_days > 0:
+            render_aggregated(targets, digests_dir, readme, index, cfg.render.topic_caps)
+        else:
+            for target, in_path in targets:
+                render_daily(target, in_path, digests_dir, readme, index, cfg.render.topic_caps)
+                print(f"render: wrote digest for {target.date()}")
 
     main()

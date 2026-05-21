@@ -99,6 +99,11 @@ if __name__ == "__main__":
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = base - timedelta(days=delta)
+            if backfill_days > 0 and (
+                Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
+            ).exists():
+                print(f"dedupe: skip {target.date()} (digest exists)")
+                continue
             out = out_root / f"{target.strftime('%Y-%m-%d')}.json"
             n = dedupe_for_date(target, raw_root, out, seen_path, cfg)
             print(f"dedupe: {n} unique papers for {target.date()}")

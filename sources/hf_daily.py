@@ -130,6 +130,11 @@ if __name__ == "__main__":
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
+            if backfill_days > 0 and (
+                Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
+            ).exists():
+                print(f"hf_daily: skip {target.date()} (digest exists)")
+                continue
             papers = asyncio.run(src.fetch(target))
             day_dir = out_dir / target.strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)

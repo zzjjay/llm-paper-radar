@@ -86,6 +86,11 @@ if __name__ == "__main__":
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
+            if backfill_days > 0 and (
+                Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
+            ).exists():
+                print(f"reddit: skip {target.date()} (digest exists)")
+                continue
             try:
                 papers = asyncio.run(src.fetch(target))
             except Exception as e:

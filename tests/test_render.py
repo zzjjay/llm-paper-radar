@@ -3,7 +3,13 @@ import math
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pipeline.render import heat_score, render_daily, render_index_line, sort_papers
+from pipeline.render import (
+    heat_score,
+    render_aggregated,
+    render_daily,
+    render_index_line,
+    sort_papers,
+)
 from sources.base import Paper, SourceRecord
 
 
@@ -176,6 +182,39 @@ def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
     # README is the compact table-only view; topic detail lives in digests/.
     assert "## 📚 Papers" in content
     assert "| # | Bucket | Paper | Authors | Date | Why |" in content
+
+
+def test_render_aggregated_merges_n_days_into_single_readme_table(tmp_path: Path):
+    """Aggregation mode: README gets one merged table covering all days; each
+    row links to its own day's digest; per-day digest files still written."""
+    digests_dir = tmp_path / "digests"
+    readme = tmp_path / "README.md"
+    index = tmp_path / "INDEX.md"
+
+    targets = []
+    for day, ids in [(11, ["a1", "a2"]), (12, ["b1"]), (13, ["c1", "c2"])]:
+        path = tmp_path / f"sum-{day}.json"
+        papers = [_mk(i, 9) for i in ids]
+        path.write_text(json.dumps([p.model_dump(mode="json") for p in papers]))
+        targets.append((datetime(2026, 5, day, tzinfo=UTC), path))
+
+    render_aggregated(targets, digests_dir, readme, index, topic_caps={"ptq": 5, "_default": 3})
+
+    # Per-day digest files all written.
+    for day in (11, 12, 13):
+        assert (digests_dir / f"2026-05-{day}.md").exists()
+    # README has the rollup header and one row per paper, each linking to its
+    # own day's digest.
+    content = readme.read_text()
+    assert "3-day · 2026-05-11 → 2026-05-13" in content
+    assert "Scanned 5 papers → surfaced 5" in content
+    for day, ids in [(11, ["a1", "a2"]), (12, ["b1"]), (13, ["c1", "c2"])]:
+        for pid in ids:
+            assert f"digests/2026-05-{day}.md#p-{pid}" in content
+    # INDEX gets one line per day.
+    idx = index.read_text()
+    for day in (11, 12, 13):
+        assert f"[05-{day}](digests/2026-05-{day}.md)" in idx
 
 
 def test_render_index_line_includes_summary_stats():
