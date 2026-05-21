@@ -566,7 +566,7 @@ if __name__ == "__main__":
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
         else:
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        for delta in range(backfill_days + 1):
+        for delta in reversed(range(backfill_days + 1)):
             target = base - timedelta(days=delta)
             in_path = in_root / f"{target.strftime('%Y-%m-%d')}.json"
             if not in_path.exists():
