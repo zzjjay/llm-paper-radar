@@ -28,7 +28,7 @@ BUCKET_TITLES = {
     "ptq": "PTQ",
     "low_bits": "Low-bit (≤ 2-bit)",
     "qat": "QAT",
-    "kv_cache": "KV cache compression",
+    "kv_cache": "KV cache",
     "pruning_distill": "Pruning & distillation",
     "diffusion": "Diffusion compression",
 }
