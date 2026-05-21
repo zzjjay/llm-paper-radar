@@ -5,15 +5,15 @@
 - [05-13](digests/2026-05-13.md) — 50 scanned, 0 passed, top: (no papers passed)
 - [05-14](digests/2026-05-14.md) — 50 scanned, 1 passed, top: KL for a KL: On-Policy Distillation with Control V
 
-- [05-17](digests/2026-05-17.md) — 127 scanned, 6 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
+- [05-17](digests/2026-05-17.md) — 127 scanned, 4 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
 
-- [05-18](digests/2026-05-18.md) — 188 scanned, 6 passed, top: WinQ: Accelerating Quantization-Aware Training of 
+- [05-18](digests/2026-05-18.md) — 188 scanned, 7 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
-- [05-19](digests/2026-05-19.md) — 283 scanned, 13 passed, top: LongLive-2.0: An NVFP4 Parallel Infrastructure for
+- [05-19](digests/2026-05-19.md) — 291 scanned, 11 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [05-16](digests/2026-05-16.md) — 245 scanned, 5 passed, top: IO-SVD: Input-Output Whitened SVD for Adaptive-Ran
+- [05-16](digests/2026-05-16.md) — 245 scanned, 4 passed, top: DiRotQ: Rotation-Aware Quantization for 4-bit Diff
 
-- [05-15](digests/2026-05-15.md) — 295 scanned, 7 passed, top: Causal Forcing++: Scalable Few-Step Autoregressive
+- [05-15](digests/2026-05-15.md) — 296 scanned, 7 passed, top: XFP: Quality-Targeted Adaptive Codebook Quantizati
 
 - [05-10](digests/2026-05-10.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 
@@ -357,4 +357,6 @@
 
 - [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-20](digests/2026-05-20.md) — 299 scanned, 5 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [05-20](digests/2026-05-20.md) — 261 scanned, 4 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
+
+- [05-21](digests/2026-05-21.md) — 29 scanned, 3 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
