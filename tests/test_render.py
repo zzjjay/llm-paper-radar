@@ -217,6 +217,49 @@ def test_render_aggregated_merges_n_days_into_single_readme_table(tmp_path: Path
         assert f"[05-{day}](digests/2026-05-{day}.md)" in idx
 
 
+def test_compact_table_slots_watched_papers_into_topic_bucket(tmp_path: Path):
+    """Watched-author papers should sort into their topic bucket alongside
+    everyone else, not into a separate 'Watched' bucket. Hard-gated watched
+    papers still surface (the watchlist's whole point) — but placed in their
+    declared topic bucket."""
+    now = datetime.now(UTC)
+    watched_hard_gated = _mk(
+        "w1",
+        0,
+        topic_bucket="diffusion",
+        hard_gate=True,
+    )
+    watched_hard_gated.sources.append(
+        SourceRecord(
+            name="arxiv_authors",
+            fetched_at=now,
+            extras={"matched_authors": ["Song Han"], "affiliations": ["MIT HAN Lab"]},
+        )
+    )
+    regular = _mk("r1", 9, topic_bucket="ptq")
+
+    summarized_path = tmp_path / "summarized.json"
+    summarized_path.write_text(
+        json.dumps([p.model_dump(mode="json") for p in [watched_hard_gated, regular]])
+    )
+    readme = tmp_path / "README.md"
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=tmp_path / "digests",
+        readme_path=readme,
+        index_path=tmp_path / "INDEX.md",
+    )
+    text = readme.read_text()
+    # The bucket column shows the topic bucket, not "👤 Watched · Song Han".
+    assert "👤 Watched · Song Han" not in text
+    # Watched paper surfaces in its declared topic bucket (Diffusion).
+    assert "Diffusion compression" in text
+    assert "Title w1" in text
+    # Header still reports the watched count for situational awareness.
+    assert "👤 1 from watched authors" in text
+
+
 def test_render_index_line_includes_summary_stats():
     line = render_index_line(
         datetime(2026, 5, 11, tzinfo=UTC),
