@@ -130,7 +130,7 @@ async def _score_one(
         if should_gate:
             result = _prefilter_hard_gate_result(bl)
             paper.relevance_score = _composite(result)
-            paper.relevance_reason = result["reason"][:160]
+            paper.relevance_reason = result["reason"]
             paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
             return paper
 
@@ -139,7 +139,7 @@ async def _score_one(
         try:
             result = await client.call_json(prompt, user_msg, max_tokens=600)
             paper.relevance_score = _composite(result)
-            paper.relevance_reason = str(result.get("reason", ""))[:160]
+            paper.relevance_reason = str(result.get("reason", ""))
             paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
         except Exception as e:
             # tenacity wraps the real failure in RetryError; surface the

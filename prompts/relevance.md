@@ -80,7 +80,7 @@ Pull from the abstract; use "unknown" if absent. Keep strings short.
 - inference_perf: ≤15 words (e.g. "1.8x speedup over AWQ on A100", "no end-to-end perf reported")
 - calibration_cost: ≤15 words (e.g. "data-free", "128 samples, <1 A100-hour", "1 day full QAT")
 - peak_memory: ≤10 words; "unknown" if absent
-- reason: ≤40 字说明打分理由
+- reason: 60-120 字简述打分理由，必须是完整句子，不要被字数限制硬切
 
 # Few-shot anchors
 
