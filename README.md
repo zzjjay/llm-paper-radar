@@ -25,11 +25,11 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic S
 
 | # | Bucket | Paper | Authors | Date | Why |
 |---|--------|-------|---------|------|---------|
-| 1 | PTQ | [LongLive-2.0: An NVFP4 Parallel Infrastructure for Long Video Generation](https://arxiv.org/abs/2605.18739) 🔁 | Yukang Chen, Luozhou Wang, Wei Huang et al. | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-18739) |
-| 2 | PTQ | [TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization](https://arxiv.org/abs/2605.19561) 🔁 | Zukang Xu, Xing Hu, Dawei Yang | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19561) |
-| 3 | PTQ | [GAMMA: Global Bit Allocation for Mixed-Precision Models under Arbitrary Budgets](https://arxiv.org/abs/2605.18475) 🔁 | Zhangyang Yao, Haiyan Zhao, Haoyu Wang et al. | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-18475) |
-| 4 | PTQ | [MARR: Module-Adaptive Residual Reconstruction for Low-Bit Post-Training Quantization](https://arxiv.org/abs/2605.17997) 🔁 | Le Su, Xing Luo, Zhi Jin | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-17997) |
-| 5 | PTQ | [XFP: Quality-Targeted Adaptive Codebook Quantization with Sparse Outlier Separation for LLM Inference](https://arxiv.org/abs/2605.14844) 🔁 | Thomas Witt | 2026-05-14 | [📄](digests/2026-05-15.md#p-2605-14844) |
+| 1 | PTQ | [TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization](https://arxiv.org/abs/2605.19561) 🔁 | Zukang Xu, Xing Hu, Dawei Yang | 2026-05-19 | [📄](digests/2026-05-20.md#p-2605-19561) |
+| 2 | PTQ | [GAMMA: Global Bit Allocation for Mixed-Precision Models under Arbitrary Budgets](https://arxiv.org/abs/2605.18475) 🔁 | Zhangyang Yao, Haiyan Zhao, Haoyu Wang et al. | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-18475) |
+| 3 | PTQ | [MARR: Module-Adaptive Residual Reconstruction for Low-Bit Post-Training Quantization](https://arxiv.org/abs/2605.17997) 🔁 | Le Su, Xing Luo, Zhi Jin | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-17997) |
+| 4 | PTQ | [XFP: Quality-Targeted Adaptive Codebook Quantization with Sparse Outlier Separation for LLM Inference](https://arxiv.org/abs/2605.14844) 🔁 | Thomas Witt | 2026-05-14 | [📄](digests/2026-05-15.md#p-2605-14844) |
+| 5 | PTQ | [LongLive-2.0: An NVFP4 Parallel Infrastructure for Long Video Generation](https://arxiv.org/abs/2605.18739) 🔁 | Yukang Chen, Luozhou Wang, Wei Huang et al. | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-18739) |
 | 6 | PTQ | [Mix-Quant: Quantized Prefilling, Precise Decoding for Agentic LLMs](https://arxiv.org/abs/2605.20315) | Haiquan Lu, Zigeng Chen, Gongfan Fang et al. | 2026-05-19 | [📄](digests/2026-05-21.md#p-2605-20315) |
 | 7 | PTQ | [Measuring Maximum Activations in Open Large Language Models](https://arxiv.org/abs/2605.15572) 🔁 | Luxuan Chen, Han Tian, Xinran Chen et al. | 2026-05-15 | [📄](digests/2026-05-19.md#p-2605-15572) |
 | 8 | PTQ | [Attention Sinks and Outliers in Attention Residuals](https://arxiv.org/abs/2605.17887) 🔁 | Haozheng Luo, Haoran Dai, Shaoyang Zhang et al. | 2026-05-18 | [📄](digests/2026-05-19.md#p-2605-17887) |
@@ -118,6 +118,18 @@ The six buckets are **fixed** — no `other`, no `survey`. Papers that don't fit
 Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
 
 In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
+
+### Table ordering
+
+The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion), then within each bucket by a composite score:
+
+```
+composite   = relevance_score × 30 + heat_score
+heat_score  = trending_bonus + hf_daily_upvotes + log(reddit_score + 1) × 5
+trending_bonus = 100 / hf_daily_rank   (rank 1..30, else 0)
+```
+
+`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. Tweak the weight via `RELEVANCE_WEIGHT` in [`pipeline/render.py`](pipeline/render.py).
 
 ### 👤 Watched authors
 

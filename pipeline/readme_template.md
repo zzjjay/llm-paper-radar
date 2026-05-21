@@ -68,6 +68,18 @@ Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit
 
 In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
 
+### Table ordering
+
+The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion), then within each bucket by a composite score:
+
+```
+composite   = relevance_score × 30 + heat_score
+heat_score  = trending_bonus + hf_daily_upvotes + log(reddit_score + 1) × 5
+trending_bonus = 100 / hf_daily_rank   (rank 1..30, else 0)
+```
+
+`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. Tweak the weight via `RELEVANCE_WEIGHT` in [`pipeline/render.py`](pipeline/render.py).
+
 ### 👤 Watched authors
 
 A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass per-bucket caps** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.

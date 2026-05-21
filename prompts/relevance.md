@@ -111,6 +111,7 @@ Coupled spec-decoding (in scope, route by compression):
 Negative (hard_gate=true):
 - "Pure EAGLE-3 / Medusa / Lookahead spec decoding with no quantization"  →  hard_gate (was previously in scope; no longer)
 - "Comprehensive PTQ survey, 100+ methods, HF Daily 50 upvotes"  →  hard_gate (surveys removed from scope)
+- "LongLive-2.0: An NVFP4 Parallel Infrastructure for Long Video Generation"  →  hard_gate (NVFP4 in the title, but the primary contribution is long-video world modeling; quantization is one bullet in the deployment section, not a new PTQ recipe. Mention of a standard quant format ≠ a compression contribution)
 - "Agentic RAG with tool use"
 - "Pruning study on BERT-base only"
 - "Multimodal benchmark without any compression method"

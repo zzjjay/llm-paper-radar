@@ -13,7 +13,7 @@ from sources.base import Paper
 
 REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
-RELEVANCE_WEIGHT = 20
+RELEVANCE_WEIGHT = 30
 
 # Bucket enum (six). Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
 BUCKET_ORDER = [
