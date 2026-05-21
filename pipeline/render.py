@@ -259,7 +259,8 @@ def _watched_block(rank: int, p: Paper) -> str:
 
 def _full_block(rank: int, p: Paper) -> str:
     code_part = f" · [GitHub]({p.code_url})" if p.code_url else ""
-    pdf_part = f" · [PDF]({p.pdf_url})" if p.pdf_url else ""
+    hf_url = f"https://huggingface.co/papers/{p.id}"
+    alpha_url = f"https://www.alphaxiv.org/abs/{p.id}"
     revisited = " 🔁" if p.seen_before else ""
     primary_source = p.sources[0].name if p.sources else "unknown"
     cats = ", ".join(p.categories) if p.categories else p.primary_category
@@ -272,7 +273,7 @@ def _full_block(rank: int, p: Paper) -> str:
     return f"""{anchor}### {rank}. {p.title} ({p.relevance_score}/10){revisited}
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
 👥 {authors_short} · 🏷 {cats}
-🔗 [arXiv]({p.url}){pdf_part}{code_part}
+🔗 [arXiv]({p.url}) · [HF]({hf_url}) · [alphaxiv]({alpha_url}){code_part}
 📡 Sources: {_source_badge(p)}
 {signal_line}
 {why_line}
