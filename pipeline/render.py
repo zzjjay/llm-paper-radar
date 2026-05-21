@@ -25,7 +25,7 @@ BUCKET_ORDER = [
     "diffusion",
 ]
 BUCKET_TITLES = {
-    "ptq": "PTQ (post-training quantization)",
+    "ptq": "PTQ",
     "low_bits": "Low-bit (≤ 2-bit)",
     "qat": "QAT",
     "kv_cache": "KV cache compression",
@@ -310,20 +310,13 @@ def _bucket_cell(p: Paper) -> str:
     return BUCKET_TITLES[b]
 
 
-def _compact_row(
-    rank: int, p: Paper, digest_filename: str, show_bucket: bool = True
-) -> str:
-    """README/compact view: # | Bucket | Paper | Authors | Date | Why.
-
-    `show_bucket=False` blanks the Bucket cell so consecutive rows with the
-    same bucket visually merge — Markdown has no real rowspan, this is the
-    cleanest approximation."""
-    bucket = _bucket_cell(p) if show_bucket else ""
+def _compact_row(rank: int, p: Paper, digest_filename: str) -> str:
+    """README/compact view: # | Bucket | Paper | Authors | Date | Why."""
     revisited = " 🔁" if p.seen_before else ""
     title_cell = f"[{p.title}]({p.url}){revisited}"
     date_str = p.published_at.strftime("%Y-%m-%d")
     return (
-        f"| {rank} | {bucket} | {title_cell} | {_authors_short(p)}"
+        f"| {rank} | {_bucket_cell(p)} | {title_cell} | {_authors_short(p)}"
         f" | {date_str} | {_details_link(p, digest_filename)} |"
     )
 
@@ -482,11 +475,8 @@ def _render_compact_md(
     body.append("## 📚 Papers\n")
     if combined:
         body.append(MAIN_TABLE_HEADER)
-        prev_bucket: str | None = None
         for i, p in enumerate(combined, start=1):
-            cur = _bucket_cell(p)
-            body.append(_compact_row(i, p, digest_filename, show_bucket=cur != prev_bucket))
-            prev_bucket = cur
+            body.append(_compact_row(i, p, digest_filename))
         body.append("")
     else:
         body.append("_Nothing surfaced today (everything was hard-gated)._\n")
@@ -610,12 +600,9 @@ def _render_aggregated_compact_md(
     body.append(f"## 📚 Papers ({len(days)}-day rollup)\n")
     if pairs:
         body.append(MAIN_TABLE_HEADER)
-        prev_bucket: str | None = None
         for i, (date, p) in enumerate(pairs, start=1):
             digest_filename = f"{digests_dir_name}/{date.strftime('%Y-%m-%d')}.md"
-            cur = _bucket_cell(p)
-            body.append(_compact_row(i, p, digest_filename, show_bucket=cur != prev_bucket))
-            prev_bucket = cur
+            body.append(_compact_row(i, p, digest_filename))
         body.append("")
     else:
         body.append("_Nothing surfaced in this window._\n")

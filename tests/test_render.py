@@ -260,27 +260,6 @@ def test_compact_table_slots_watched_papers_into_topic_bucket(tmp_path: Path):
     assert "👤 1 from watched authors" in text
 
 
-def test_compact_table_collapses_repeated_bucket_cells(tmp_path: Path):
-    """Adjacent rows in the same bucket should leave the Bucket cell blank —
-    Markdown has no rowspan, so this is the visual-merge approximation."""
-    papers = [_mk(f"p{i}", 9, topic_bucket="ptq") for i in range(3)]
-    summarized_path = tmp_path / "summarized.json"
-    summarized_path.write_text(json.dumps([p.model_dump(mode="json") for p in papers]))
-    readme = tmp_path / "README.md"
-    render_daily(
-        date=datetime(2026, 5, 11, tzinfo=UTC),
-        summarized_path=summarized_path,
-        digests_dir=tmp_path / "digests",
-        readme_path=readme,
-        index_path=tmp_path / "INDEX.md",
-    )
-    rows = [ln for ln in readme.read_text().splitlines() if ln.startswith("| ") and "PTQ" in ln or ln.startswith("| 2 ") or ln.startswith("| 3 ")]
-    # First PTQ row shows the bucket; rows 2 and 3 leave it blank.
-    assert any("| 1 | PTQ" in ln for ln in rows)
-    assert any(ln.startswith("| 2 |  |") for ln in rows)
-    assert any(ln.startswith("| 3 |  |") for ln in rows)
-
-
 def test_render_index_line_includes_summary_stats():
     line = render_index_line(
         datetime(2026, 5, 11, tzinfo=UTC),
