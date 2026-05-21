@@ -81,18 +81,35 @@ days), so always confirm the date with the user if it matters.
 
 ### 3. Decision loop
 
-For each paper, use `AskUserQuestion` with these options:
+For each paper, use `AskUserQuestion`. **The `AskUserQuestion` tool caps
+options at 4**, so use exactly these four:
 
 | Label | Action |
 |---|---|
-| **Accept → add seed + send to wiki** | Run both `seed_add.py` and the quark-wiki ingest. Default suggestion when the paper is clearly on-topic and the user has time. |
-| **Accept → add seed only** | Just `seed_add.py`. Use when the paper is a good citation-graph neighbor but the user doesn't want a full wiki page yet. |
-| **Accept → wiki only** | Skip `seed_add.py`, run quark-wiki ingest. Use when the paper is interesting reading but not a strong "find similar papers" seed (e.g. a survey-of-surveys, a position paper). |
+| **Accept → seed + wiki** | Run both `seed_add.py` and the quark-wiki ingest. Default suggestion when the paper is clearly on-topic and the user has time. |
+| **Accept → seed only** | Just `seed_add.py`. Use when the paper is a good citation-graph neighbor but the user doesn't want a full wiki page yet. |
 | **Reject** | Ask for a one-phrase reason, then run `seed_reject.py`. Optionally ask "any blacklist phrases to add?" — only suggest this if the reason is "off-topic" or similar, never for "uninteresting" rejects. |
 | **Defer** | Skip with no log. Sometimes the user wants to think about it. Don't pester. |
 
-Batch the questions when there are many papers (≥5) — multiple
-`AskUserQuestion` calls in one message is allowed by the harness.
+(If the user genuinely wants "wiki only — don't seed", they pick **Defer**
+here and invoke `quark-wiki` directly afterward. Surfacing that as a
+fifth option is not worth burning the 4-option limit — wiki-only is rare
+and the workaround is one line.)
+
+**Question text MUST include the full paper title.** Don't abbreviate
+to a short name + tagline; users routinely ask "what's the full name?"
+when the title is hidden, which wastes a round-trip. Include arXiv id
+and bucket too. Example shape:
+
+```
+"OScaR: The Occam's Razor for Extreme KV Cache Quantization in LLMs
+and Beyond (arXiv:2605.19660, kv_cache, 10/10) — 22 HF upvotes,
+3.0x decode speedup, open-source CUDA kernels. 怎么处理？"
+```
+
+Batch the questions when there are several papers — `AskUserQuestion`
+accepts up to 4 questions in one call. For digests with more than 4
+papers, paginate (4 papers at a time).
 
 ### 4. Execute decisions
 
