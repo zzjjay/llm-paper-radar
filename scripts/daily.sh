@@ -73,7 +73,7 @@ for src in hf_daily arxiv reddit; do
     uv run python -m "sources.$src" --backfill-days "${BACKFILL}" \
         || echo "  ($src returned non-zero, continuing)"
 done
-for src in arxiv_authors semantic_scholar; do
+for src in arxiv_authors semantic_scholar openreview; do
     echo "[$(date -Is)] fetch: $src (--window-days ${DAYS})"
     uv run python -m "sources.$src" --backfill-days 0 --window-days "${DAYS}" \
         || echo "  ($src returned non-zero, continuing)"

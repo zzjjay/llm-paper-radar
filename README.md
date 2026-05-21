@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + OpenReview, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 

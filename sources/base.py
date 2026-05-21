@@ -10,6 +10,7 @@ SourceName = Literal[
     "arxiv",
     "arxiv_authors",
     "hf_daily",
+    "openreview",
     "reddit",
     "semantic_scholar",
 ]

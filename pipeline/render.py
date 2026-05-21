@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from urllib.parse import quote_plus
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -257,10 +258,29 @@ def _watched_block(rank: int, p: Paper) -> str:
     return f"{title_line}\n{header}{rest}"
 
 
+ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}$")
+
+
+def _links_line(p: Paper) -> str:
+    """Detail-page link row. arXiv-shaped IDs get arXiv/HF/alphaxiv + an
+    OpenReview title-search; OpenReview-native papers (id starts with `or-`)
+    get the forum link only. GitHub is appended whenever known."""
+    parts: list[str] = []
+    if ARXIV_ID_RE.match(p.id):
+        parts.append(f"[arXiv]({p.url})")
+        parts.append(f"[HF](https://huggingface.co/papers/{p.id})")
+        parts.append(f"[alphaxiv](https://www.alphaxiv.org/abs/{p.id})")
+        parts.append(
+            f"[OpenReview](https://openreview.net/search?term={quote_plus(p.title)})"
+        )
+    else:
+        parts.append(f"[OpenReview]({p.url})")
+    if p.code_url:
+        parts.append(f"[GitHub]({p.code_url})")
+    return " · ".join(parts)
+
+
 def _full_block(rank: int, p: Paper) -> str:
-    code_part = f" · [GitHub]({p.code_url})" if p.code_url else ""
-    hf_url = f"https://huggingface.co/papers/{p.id}"
-    alpha_url = f"https://www.alphaxiv.org/abs/{p.id}"
     revisited = " 🔁" if p.seen_before else ""
     primary_source = p.sources[0].name if p.sources else "unknown"
     cats = ", ".join(p.categories) if p.categories else p.primary_category
@@ -273,7 +293,7 @@ def _full_block(rank: int, p: Paper) -> str:
     return f"""{anchor}### {rank}. {p.title} ({p.relevance_score}/10){revisited}
 **{primary_source}** · `{p.id}` · {p.published_at.date()}
 👥 {authors_short} · 🏷 {cats}
-🔗 [arXiv]({p.url}) · [HF]({hf_url}) · [alphaxiv]({alpha_url}){code_part}
+🔗 {_links_line(p)}
 📡 Sources: {_source_badge(p)}
 {signal_line}
 {why_line}

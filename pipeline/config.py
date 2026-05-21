@@ -40,12 +40,21 @@ class ArxivAuthorsConfig(BaseModel):
     authors: list[WatchedAuthor] = []
 
 
+class OpenReviewConfig(BaseModel):
+    enabled: bool = True
+    window_days: int = 7
+    # Venue invitation prefixes — the fetcher appends `/-/Submission`. Examples:
+    # "ICLR.cc/2026/Conference", "NeurIPS.cc/2025/Conference", "ICML.cc/2026/Conference".
+    venues: list[str] = []
+
+
 class SourcesConfig(BaseModel):
     arxiv: ArxivConfig = ArxivConfig()
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
     reddit: RedditConfig = RedditConfig()
     semantic_scholar: SemanticScholarConfig = SemanticScholarConfig()
     arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
+    openreview: OpenReviewConfig = OpenReviewConfig()
 
 
 class KeywordRule(BaseModel):
