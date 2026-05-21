@@ -46,4 +46,4 @@ echo
 echo "$installed skill(s) installed under $SKILLS_DST"
 echo
 echo "Next: start a fresh Claude Code session in this repo so the skill is"
-echo "picked up. Trigger with phrases like \"scout compression papers\"."
+echo "picked up. Trigger paper-triage with \"triage papers\" or \"/paper-triage\"."

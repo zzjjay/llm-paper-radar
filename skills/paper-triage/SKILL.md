@@ -1,9 +1,9 @@
 ---
-name: llm-compression-paper-scout
-description: Use when the user asks to curate / triage / accept-reject / ingest papers from today's or recent llm-paper-radar digests. Trigger phrases include "scout compression papers", "看今天的 paper digest", "triage radar papers", "/scout-papers", or any reference to walking through the radar's daily/weekly digest interactively. The skill does NOT fetch or score papers — that's the cron-driven daily.sh. It only handles the human-in-the-loop accept/reject step on top of the already-rendered digest, calling scripts/seed_add.py and scripts/seed_reject.py on behalf of the user and optionally handing accepted papers to quark-wiki.
+name: paper-triage
+description: Use when the user asks to triage / curate / accept-reject / ingest papers from today's or recent llm-paper-radar digests. Trigger phrases include "triage papers", "triage today's digest", "看今天的 paper digest", "/paper-triage", "/triage-papers", "scout compression papers", or any reference to walking through the radar's daily/weekly digest interactively. The skill does NOT fetch or score papers — that's the cron-driven daily.sh. It only handles the human-in-the-loop accept/reject step on top of the already-rendered digest, calling scripts/seed_add.py and scripts/seed_reject.py on behalf of the user and optionally handing accepted papers to quark-wiki.
 ---
 
-# llm-compression-paper-scout
+# paper-triage
 
 Human-in-the-loop curation layer on top of the `llm-paper-radar` cron pipeline.
 
@@ -16,8 +16,9 @@ prefilter blacklist).
 
 ## When to invoke
 
-- User says "scout/triage/curate compression papers", "看今天 radar 的 paper",
-  "/scout-papers", "review today's digest", etc.
+- User says "triage papers", "triage today's digest", "看今天 radar 的 paper",
+  "/paper-triage", "/triage-papers", "review today's digest",
+  "scout compression papers", etc.
 - After a `daily.sh` run completed and the user wants to process the output.
 - Any time the user references the radar's `digests/YYYY-MM-DD.md` and asks
   to act on individual papers.
