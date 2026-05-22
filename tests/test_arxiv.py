@@ -17,7 +17,11 @@ async def test_arxiv_fetch_parses_entries():
         return_value=Response(200, text=FIXTURE.read_text())
     )
     src = ArxivSource(categories=["cs.CL"])
-    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
+    # Fixture has papers published 2026-05-10. Target the day they were
+    # published so the historical window [target, target+24h) includes them
+    # — the source switches to historical mode for any target older than
+    # ~5 days, which any real "now" will trigger.
+    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
     assert len(papers) >= 1
     p = papers[0]
     assert p.id  # arXiv ID like "2405.xxxxx"
