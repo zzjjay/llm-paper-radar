@@ -59,117 +59,117 @@
 
 - [04-19](digests/2026-04-19.md) — 180 scanned, 1 passed, top: Predictive Multi-Tier Memory Management for KV Cac
 
-- [04-18](digests/2026-04-18.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-18](digests/2026-04-18.md) — 171 scanned, 3 passed, top: Open-TQ-Metal: Fused Compressed-Domain Attention f
 
-- [04-17](digests/2026-04-17.md) — 78 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-17](digests/2026-04-17.md) — 296 scanned, 3 passed, top: Cross-Tokenizer LLM Distillation through a Byte-Le
 
-- [04-16](digests/2026-04-16.md) — 82 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-16](digests/2026-04-16.md) — 301 scanned, 1 passed, top: The Illusion of Equivalence: Systematic FP16 Diver
 
-- [04-15](digests/2026-04-15.md) — 90 scanned, 3 passed, top: Rethinking On-Policy Distillation of Large Languag
+- [04-15](digests/2026-04-15.md) — 331 scanned, 3 passed, top: Robust Ultra Low-Bit Post-Training Quantization vi
 
-- [04-14](digests/2026-04-14.md) — 97 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-14](digests/2026-04-14.md) — 331 scanned, 5 passed, top: OSC: Hardware Efficient W4A4 Quantization via Outl
 
-- [04-13](digests/2026-04-13.md) — 79 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-13](digests/2026-04-13.md) — 362 scanned, 5 passed, top: CASK: Core-Aware Selective KV Compression for Reas
 
-- [04-12](digests/2026-04-12.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-12](digests/2026-04-12.md) — 169 scanned, 3 passed, top: CodeQuant: Unified Clustering and Quantization for
 
-- [04-11](digests/2026-04-11.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-11](digests/2026-04-11.md) — 140 scanned, 1 passed, top: CodeComp: Structural KV Cache Compression for Agen
 
-- [04-10](digests/2026-04-10.md) — 91 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-10](digests/2026-04-10.md) — 300 scanned, 2 passed, top: MEMENTO: Teaching LLMs to Manage Their Own Context
 
-- [04-09](digests/2026-04-09.md) — 79 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-09](digests/2026-04-09.md) — 327 scanned, 6 passed, top: HiFloat4 Format for Language Model Pre-training on
 
-- [04-08](digests/2026-04-08.md) — 80 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-08](digests/2026-04-08.md) — 365 scanned, 6 passed, top: Does a Global Perspective Help Prune Sparse MoEs E
 
-- [04-07](digests/2026-04-07.md) — 86 scanned, 2 passed, top: TriAttention: Efficient Long Reasoning with Trigon
+- [04-07](digests/2026-04-07.md) — 335 scanned, 3 passed, top: TriAttention: Efficient Long Reasoning with Trigon
 
-- [04-06](digests/2026-04-06.md) — 67 scanned, 4 passed, top: Swift-SVD: Theoretical Optimality Meets Practical 
+- [04-06](digests/2026-04-06.md) — 291 scanned, 5 passed, top: TriAttention: Efficient Long Reasoning with Trigon
 
-- [04-05](digests/2026-04-05.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-05](digests/2026-04-05.md) — 161 scanned, 3 passed, top: BWTA: Accurate and Efficient Binarized Transformer
 
-- [04-04](digests/2026-04-04.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-04](digests/2026-04-04.md) — 141 scanned, 0 passed, top: (no papers passed)
 
-- [04-03](digests/2026-04-03.md) — 95 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-03](digests/2026-04-03.md) — 281 scanned, 2 passed, top: Stochastic KV Routing: Enabling Adaptive Depth-Wis
 
-- [04-02](digests/2026-04-02.md) — 80 scanned, 4 passed, top: Embarrassingly Simple Self-Distillation Improves C
+- [04-02](digests/2026-04-02.md) — 305 scanned, 2 passed, top: Fast NF4 Dequantization Kernels for Large Language
 
-- [04-01](digests/2026-04-01.md) — 93 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-01](digests/2026-04-01.md) — 337 scanned, 1 passed, top: MF-QAT: Multi-Format Quantization-Aware Training f
 
-- [03-31](digests/2026-03-31.md) — 85 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-31](digests/2026-03-31.md) — 301 scanned, 0 passed, top: (no papers passed)
 
-- [03-30](digests/2026-03-30.md) — 65 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-30](digests/2026-03-30.md) — 274 scanned, 5 passed, top: Adaptive Block-Scaled Data Types
 
-- [03-29](digests/2026-03-29.md) — 50 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-29](digests/2026-03-29.md) — 136 scanned, 1 passed, top: RSR-core: A High-Performance Engine for Low-Bit Ma
 
-- [03-28](digests/2026-03-28.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-28](digests/2026-03-28.md) — 137 scanned, 1 passed, top: ScoutAttention: Efficient KV Cache Offloading via 
 
-- [03-27](digests/2026-03-27.md) — 79 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-27](digests/2026-03-27.md) — 282 scanned, 2 passed, top: TTKV: Temporal-Tiered KV Cache for Long-Context LL
 
-- [03-26](digests/2026-03-26.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-26](digests/2026-03-26.md) — 272 scanned, 2 passed, top: GlowQ: Group-Shared LOw-Rank Approximation for Qua
 
-- [03-25](digests/2026-03-25.md) — 84 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-25](digests/2026-03-25.md) — 310 scanned, 2 passed, top: Demystifying When Pruning Works via Representation
 
-- [03-24](digests/2026-03-24.md) — 91 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-24](digests/2026-03-24.md) — 301 scanned, 2 passed, top: EchoKV: Efficient KV Cache Compression via Similar
 
-- [03-23](digests/2026-03-23.md) — 87 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-23](digests/2026-03-23.md) — 303 scanned, 2 passed, top: FAAR: Format-Aware Adaptive Rounding for NVFP4
 
-- [03-22](digests/2026-03-22.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-22](digests/2026-03-22.md) — 163 scanned, 1 passed, top: Structural Sensitivity in Compressed Transformers:
 
-- [03-21](digests/2026-03-21.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-21](digests/2026-03-21.md) — 153 scanned, 1 passed, top: Beyond Token Eviction: Mixed-Dimension Budget Allo
 
-- [03-20](digests/2026-03-20.md) — 82 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-20](digests/2026-03-20.md) — 302 scanned, 2 passed, top: The Residual Stream Is All You Need: On the Redund
 
-- [03-19](digests/2026-03-19.md) — 83 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-19](digests/2026-03-19.md) — 309 scanned, 4 passed, top: AIMER: Calibration-Free Task-Agnostic MoE Pruning
 
-- [03-18](digests/2026-03-18.md) — 100 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-18](digests/2026-03-18.md) — 334 scanned, 4 passed, top: Q-Drift: Quantization-Aware Drift Correction for D
 
-- [03-17](digests/2026-03-17.md) — 96 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-17](digests/2026-03-17.md) — 340 scanned, 4 passed, top: Frequency Matters: Fast Model-Agnostic Data Curati
 
-- [03-16](digests/2026-03-16.md) — 80 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-16](digests/2026-03-16.md) — 376 scanned, 1 passed, top: LookaheadKV: Fast and Accurate KV Cache Eviction b
 
-- [03-15](digests/2026-03-15.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-15](digests/2026-03-15.md) — 181 scanned, 2 passed, top: SemantiCache: Efficient KV Cache Compression via S
 
-- [03-14](digests/2026-03-14.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-14](digests/2026-03-14.md) — 178 scanned, 2 passed, top: SVD Contextual Sparsity Predictors for Fast LLM In
 
-- [03-13](digests/2026-03-13.md) — 98 scanned, 5 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
+- [03-13](digests/2026-03-13.md) — 308 scanned, 3 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
 
-- [03-12](digests/2026-03-12.md) — 79 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-12](digests/2026-03-12.md) — 313 scanned, 4 passed, top: LongFlow: Efficient KV Cache Compression for Reaso
 
-- [03-11](digests/2026-03-11.md) — 80 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-11](digests/2026-03-11.md) — 333 scanned, 4 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
 
-- [03-10](digests/2026-03-10.md) — 99 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-10](digests/2026-03-10.md) — 336 scanned, 1 passed, top: Sparse-BitNet: 1.58-bit LLMs are Naturally Friendl
 
-- [03-09](digests/2026-03-09.md) — 81 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-09](digests/2026-03-09.md) — 334 scanned, 5 passed, top: SERQ: Saliency-Aware Low-Rank Error Reconstruction
 
-- [03-08](digests/2026-03-08.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-08](digests/2026-03-08.md) — 174 scanned, 0 passed, top: (no papers passed)
 
-- [03-07](digests/2026-03-07.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-07](digests/2026-03-07.md) — 146 scanned, 0 passed, top: (no papers passed)
 
-- [03-06](digests/2026-03-06.md) — 74 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-06](digests/2026-03-06.md) — 287 scanned, 4 passed, top: MASQuant: Modality-Aware Smoothing Quantization fo
 
-- [03-05](digests/2026-03-05.md) — 71 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-05](digests/2026-03-05.md) — 325 scanned, 6 passed, top: SlideSparse: Fast and Flexible (2N-2):2N Structure
 
-- [03-04](digests/2026-03-04.md) — 93 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-04](digests/2026-03-04.md) — 329 scanned, 4 passed, top: Dissecting Quantization Error: A Concentration-Ali
 
-- [03-03](digests/2026-03-03.md) — 91 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-03](digests/2026-03-03.md) — 339 scanned, 1 passed, top: Practical FP4 Training for Large-Scale MoE Models 
 
-- [03-02](digests/2026-03-02.md) — 72 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-02](digests/2026-03-02.md) — 338 scanned, 5 passed, top: FreeAct: Freeing Activations for LLM Quantization
 
-- [03-01](digests/2026-03-01.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [03-01](digests/2026-03-01.md) — 174 scanned, 1 passed, top: KVSlimmer: Theoretical Insights and Practical Opti
 
-- [02-28](digests/2026-02-28.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-28](digests/2026-02-28.md) — 169 scanned, 1 passed, top: RelayCaching: Accelerating LLM Collaboration via D
 
-- [02-27](digests/2026-02-27.md) — 78 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-27](digests/2026-02-27.md) — 295 scanned, 1 passed, top: GRAIL: Post-hoc Compensation by Linear Reconstruct
 
-- [02-26](digests/2026-02-26.md) — 81 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-26](digests/2026-02-26.md) — 318 scanned, 3 passed, top: InnerQ: Hardware-Aware Tuning-Free Quantization of
 
-- [02-25](digests/2026-02-25.md) — 82 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-25](digests/2026-02-25.md) — 318 scanned, 5 passed, top: D-COT: Disciplined Chain-of-Thought Learning for E
 
-- [02-24](digests/2026-02-24.md) — 75 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-24](digests/2026-02-24.md) — 293 scanned, 1 passed, top: Don't Ignore the Tail: Decoupling top-K Probabilit
 
-- [02-23](digests/2026-02-23.md) — 68 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-23](digests/2026-02-23.md) — 274 scanned, 1 passed, top: A Replicate-and-Quantize Strategy for Plug-and-Pla
 
-- [02-22](digests/2026-02-22.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-22](digests/2026-02-22.md) — 152 scanned, 0 passed, top: (no papers passed)
 
 - [02-21](digests/2026-02-21.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
