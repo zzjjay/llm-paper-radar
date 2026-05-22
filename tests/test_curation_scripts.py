@@ -56,7 +56,7 @@ def isolated_repo(tmp_path: Path, monkeypatch):
     (tmp_path / "config.yaml").write_text(
         textwrap.dedent("""
         filter:
-          model: claude-haiku-4-5
+          model: claude-sonnet-4-6
           concurrency: 50
           prefilter:
             enabled: true

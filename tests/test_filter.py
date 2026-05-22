@@ -227,5 +227,13 @@ async def test_filter_handles_per_paper_failure(tmp_path: Path, monkeypatch):
     ]
     await filter_papers(deduped_path, out_path, prompt_path, fake, concurrency=2)
     out = json.loads(out_path.read_text())
-    assert any(r["relevance_score"] == 8 for r in out)
-    assert any(r["relevance_score"] is None for r in out)
+    by_id = {r["id"]: r for r in out}
+    # Successful scoring path: composite = 4 + 4 = 8.
+    assert by_id["1"]["relevance_score"] == 8
+    # Failure path no longer silently drops with score=None — paper is
+    # preserved as hard_gate=True with a diagnosable reason so it stays
+    # visible downstream and can be retried.
+    failed = by_id["2"]
+    assert failed["relevance_score"] == 0
+    assert failed["relevance_breakdown"]["hard_gate"] is True
+    assert "judge unavailable" in failed["relevance_reason"]

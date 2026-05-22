@@ -217,11 +217,12 @@ def test_render_aggregated_merges_n_days_into_single_readme_table(tmp_path: Path
         assert f"[05-{day}](digests/2026-05-{day}.md)" in idx
 
 
-def test_compact_table_slots_watched_papers_into_topic_bucket(tmp_path: Path):
-    """Watched-author papers should sort into their topic bucket alongside
-    everyone else, not into a separate 'Watched' bucket. Hard-gated watched
-    papers still surface (the watchlist's whole point) — but placed in their
-    declared topic bucket."""
+def test_compact_table_excludes_hard_gated_watched_papers(tmp_path: Path):
+    """Watched-author papers are visibility insurance ("never miss"), but
+    a paper the LLM judge has marked hard_gate=True (out of scope) is
+    noise — the main table omits it even if a watched author is on the
+    author list. The detail page's dedicated 👤 section can still surface
+    them; the compact table stays focused on in-scope work."""
     now = datetime.now(UTC)
     watched_hard_gated = _mk(
         "w1",
@@ -251,13 +252,13 @@ def test_compact_table_slots_watched_papers_into_topic_bucket(tmp_path: Path):
         index_path=tmp_path / "INDEX.md",
     )
     text = readme.read_text()
-    # The bucket column shows the topic bucket, not "👤 Watched · Song Han".
-    assert "👤 Watched · Song Han" not in text
-    # Watched paper surfaces in its declared topic bucket (Diffusion).
-    assert "Diffusion compression" in text
-    assert "Title w1" in text
-    # Header still reports the watched count for situational awareness.
-    assert "👤 1 from watched authors" in text
+    # The hard-gated watched paper is dropped from the compact table.
+    assert "Title w1" not in text
+    # Regular passing paper is still there.
+    assert "Title r1" in text
+    # Header reports zero watched authors in the table (since the only
+    # watched paper was hard-gated and dropped).
+    assert "👤 0 from watched authors" in text
 
 
 def test_render_index_line_includes_summary_stats():

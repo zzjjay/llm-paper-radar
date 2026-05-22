@@ -92,6 +92,20 @@ def _prefilter_hard_gate_result(blacklist_hits: list[str]) -> dict:
     keyword prefilter. Looks indistinguishable from a Haiku hard_gate
     response so downstream stages don't special-case it."""
     reason = f"prefilter: 命中黑名单 {', '.join(blacklist_hits[:3])}"
+    return _hard_gate_result(reason)
+
+
+def _judge_unavailable_result(error: Exception) -> dict:
+    """`_BREAKDOWN_FIELDS`-shaped dict for papers where the Haiku judge
+    failed every retry (empty response, persistent JSON parse error, API
+    outage). Stored as hard_gate=True so the paper is preserved with a
+    diagnosable reason rather than silently disappearing with score=None.
+    Reprocessed on next cron run."""
+    reason = f"judge unavailable: {type(error).__name__}: {error}"[:200]
+    return _hard_gate_result(reason)
+
+
+def _hard_gate_result(reason: str) -> dict:
     return {
         "hard_gate": True,
         "topic_relevance": 0,
@@ -137,7 +151,7 @@ async def _score_one(
     user_msg = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
     async with sem:
         try:
-            result = await client.call_json(prompt, user_msg, max_tokens=600)
+            result = await client.call_json(prompt, user_msg, max_tokens=1024)
             paper.relevance_score = _composite(result)
             paper.relevance_reason = str(result.get("reason", ""))
             paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
@@ -152,9 +166,13 @@ async def _score_one(
                 except Exception:
                     pass
             print(f"filter: paper {paper.id} failed: {type(cause).__name__}: {cause}")
-            paper.relevance_score = None
-            paper.relevance_reason = None
-            paper.relevance_breakdown = None
+            # Don't silently drop the paper with score=None — store a
+            # hard_gate=True record with a diagnosable reason so the
+            # failure is visible downstream and the paper can be retried.
+            result = _judge_unavailable_result(cause)
+            paper.relevance_score = _composite(result)
+            paper.relevance_reason = result["reason"]
+            paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
     return paper
 
 

@@ -70,13 +70,13 @@ class PrefilterConfig(BaseModel):
 
 
 class FilterConfig(BaseModel):
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-sonnet-4-6"
     concurrency: int = 50
     prefilter: PrefilterConfig = PrefilterConfig()
 
 
 class SummarizeConfig(BaseModel):
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-opus-4-7"
     concurrency: int = 20
 
 

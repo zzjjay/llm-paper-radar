@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -19,7 +19,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview
 
 ## 🧮 How papers are scored
 
-Two stages: a cheap local **keyword prefilter**, then **Claude Haiku 4.5** scoring with [`prompts/relevance.md`](prompts/relevance.md).
+Two stages: a cheap local **keyword prefilter**, then **Claude Sonnet 4.6** scoring with [`prompts/relevance.md`](prompts/relevance.md).
 
 ### Stage 1 — keyword prefilter (local, free)
 
@@ -105,12 +105,12 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
    ┌────────────┐     pipeline/filter.py
    │   filter   │ ─── stage 1: keyword prefilter (local, free) →
    │            │                obvious off-topic → hard_gate, no LLM call
-   │            │     stage 2: Claude Haiku 4.5 + prompts/relevance.md →
+   │            │     stage 2: Claude Sonnet 4.6 + prompts/relevance.md →
    │            │                two-axis score + topic_bucket + breakdown
    └─────┬──────┘            ↓
          │            data/scored/YYYY-MM-DD.json
          ↓
-   ┌────────────┐     pipeline/summarize.py  (Claude Sonnet 4.6, prompts/summary.md)
+   ┌────────────┐     pipeline/summarize.py  (Claude Opus 4.7, prompts/summary.md)
    │ summarize  │ ─── every non-hard-gated paper → 中文 summary + highlights
    │            │                                  + up to 3 related/compared methods
    └─────┬──────┘            ↓
@@ -200,7 +200,7 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 
 | key | default | what it does |
 |---|---|---|
-| `filter.model` | `claude-haiku-4-5` | scoring model; swap to `claude-sonnet-4-6` if Haiku judges too coarsely |
+| `filter.model` | `claude-sonnet-4-6` | scoring model; drop to `claude-haiku-4-5` if cost matters more than judgement quality |
 | `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
 | `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
 | `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |

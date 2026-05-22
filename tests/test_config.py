@@ -12,10 +12,10 @@ sources:
   hf_daily:
     enabled: true
 filter:
-  model: claude-haiku-4-5-20251001
+  model: claude-sonnet-4-6
   concurrency: 50
 summarize:
-  model: claude-sonnet-4-6
+  model: claude-opus-4-7
   concurrency: 20
 render:
   truncate_after: 10

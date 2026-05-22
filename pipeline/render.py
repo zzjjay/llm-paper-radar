@@ -32,7 +32,7 @@ BUCKET_TITLES = {
     "kv_cache": "KV cache",
     "pruning_distill": "Pruning & distillation",
     "diffusion": "Diffusion compression",
-    "survey": "Survey / methodology",
+    "survey": "Survey",
 }
 # Detail-page section headers — tech terms stay English, glue words Chinese.
 BUCKET_TITLES_CN = {
@@ -420,7 +420,7 @@ def _render_detail_md(
     body.append(f"> 自动生成自 [llm-paper-radar]({REPO_URL}).")
     body.append(
         "> 历史归档：[INDEX.md](INDEX.md) · 配置：[config.yaml](../config.yaml)"
-        " · 摘要模型 Claude Sonnet 4.6 · 紧凑表格视图见"
+        " · 摘要模型 Claude Opus 4.7 · 紧凑表格视图见"
         " [README.md](../README.md)。\n"
     )
 
@@ -472,11 +472,12 @@ def _render_compact_md(
     that passed hard_gate. Watched-author papers sort into their topic bucket
     alongside everyone else; the detail page's dedicated 👤 section still
     highlights them. The 🔁 marker on titles signals previously-seen papers."""
-    # Watched-author papers bypass hard_gate (the watchlist's whole point is
-    # to never miss them), so merge them in even when not in `surviving`.
-    surviving_ids = {p.id for p in surviving}
-    extra_watched = [p for p in watched_papers if p.id not in surviving_ids]
-    combined = sorted(surviving + extra_watched, key=_bucket_sort_key)
+    # Watched-author papers are visibility insurance ("never miss"), but a
+    # paper the LLM judge has marked hard_gate=True (out of scope) is
+    # noise — keep it out of the main table even if a watched author is on
+    # the author list. The detail page still lists watched papers in its
+    # dedicated section.
+    combined = sorted(surviving, key=_bucket_sort_key)
     watched_count = sum(1 for p in combined if _watched_meta(p) is not None)
 
     body: list[str] = []
@@ -597,17 +598,13 @@ def _render_aggregated_compact_md(
 
     pairs: list[tuple[datetime, Paper]] = []
     seen_ids: set[str] = set()
-    # Watched-author papers bypass hard_gate (the watchlist's whole point is
-    # to never miss them), so include them even when not in `surviving`.
-    for date, _, watched, surviving in days_sorted:
-        surviving_ids = {p.id for p in surviving}
+    # Watched-author papers are visibility insurance ("never miss"), but a
+    # paper the LLM judge has marked hard_gate=True (out of scope) is
+    # noise — keep it out of the rollup table even if a watched author is
+    # on the author list.
+    for date, _, _watched, surviving in days_sorted:
         for p in surviving:
             if p.id in seen_ids:
-                continue
-            seen_ids.add(p.id)
-            pairs.append((date, p))
-        for p in watched:
-            if p.id in seen_ids or p.id in surviving_ids:
                 continue
             seen_ids.add(p.id)
             pairs.append((date, p))
