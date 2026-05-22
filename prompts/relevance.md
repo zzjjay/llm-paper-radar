@@ -11,12 +11,7 @@ Secondary (still in scope):
 - Pruning / sparsity + knowledge distillation (merged bucket `pruning_distill`): N:M, structured, unstructured, MoE expert pruning, small-student-from-large-teacher KD, reasoning distillation
 - Diffusion model compression — quantization / pruning / distillation / step-distillation on diffusion or flow-matching backbones
 
-Also in scope — methodology / measurement / cross-method comparison work that does not propose a new algorithm but produces actionable guidance for compression engineers (bucket = `survey`):
-- Empirical comparisons of multiple PTQ / QAT / KV-quant methods on common benchmarks
-- Analyses of LLM bottlenecks for compression (activation distributions, outlier characterization, KV-cache memory profiles, MoE-specific issues)
-- General LLM evaluation methodology aimed at compression (which benchmarks track quality loss faithfully, calibration-data design, RULER-style long-context probes used to diagnose quant degradation)
-- Position / methodology papers that re-frame how to think about a compression problem, even without a new algorithm
-- NOT in this bucket: classical "review article" surveys that just summarize 100+ methods without new measurements — those still hard_gate.
+Also in scope — work that does not propose a new algorithm but produces actionable guidance for compression engineers via new measurement, comparison, or methodology (bucket = `survey`). Pure review-article surveys that only summarize prior methods without new measurement still hard_gate.
 
 Out of scope — `hard_gate=true`:
 - RAG / agents / tool use
