@@ -85,7 +85,7 @@ trending_bonus = 100 / hf_daily_rank   (rank 1..30, else 0)
 
 ### 👤 Watched authors
 
-A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Their papers get a dedicated **👤 Watched authors** section at the top of the digest and **bypass per-bucket caps** — the point of the watchlist is to never miss what these groups publish. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
+A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Each per-day detail page has a dedicated **👤 Watched authors** section showing *all* of their papers, bypassing per-bucket caps. The compact README table still surfaces them inline alongside everyone else, but only when they pass `hard_gate` — out-of-scope work from a watched author (e.g. video / world-model papers) stays in the detail page and does not pollute the main table. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
 
 ---
 
