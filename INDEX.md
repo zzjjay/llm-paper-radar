@@ -360,3 +360,5 @@
 - [05-20](digests/2026-05-20.md) — 261 scanned, 4 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
 
 - [05-21](digests/2026-05-21.md) — 29 scanned, 3 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
+
+- [05-22](digests/2026-05-22.md) — 34 scanned, 1 passed, top: KVServe: Service-Aware KV Cache Compression for Co
