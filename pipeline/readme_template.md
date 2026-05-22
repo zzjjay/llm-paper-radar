@@ -50,6 +50,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 - **Pure review-article surveys** that only enumerate prior methods with no new measurement — hard_gate. Empirical comparison studies, bottleneck analyses, and evaluation-methodology papers now go to the `survey` bucket instead.
 - Anything compression-adjacent that doesn't fit one of the seven topic buckets
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
+- **`ptq` bucket — stricter scale rule**: any PTQ paper whose largest experiment is < 7B parameters → hard_gate. Sub-7B PTQ (FLAN-T5-base, CLIP-ViT, GPT-2, OPT-1.3B, Pythia-1.4B) does not predict large-scale behavior — accuracy gaps at 1B routinely flip at 7B+. Modern LLM family + unknown size → default trust. Other buckets keep the < 1B threshold.
 - **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / TensorRT-LLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
 
 ### Topic buckets and per-bucket caps
