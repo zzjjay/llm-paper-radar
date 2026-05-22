@@ -189,7 +189,14 @@ if __name__ == "__main__":
             ).exists():
                 print(f"arxiv: skip {target.date()} (digest exists)")
                 continue
-            papers = asyncio.run(src.fetch(target))
+            try:
+                papers = asyncio.run(src.fetch(target))
+            except Exception as e:
+                # A 429 storm or transient error on one day must not kill
+                # the whole backfill — log and continue to the next day so
+                # we don't lose progress on 30 days because of day 5.
+                print(f"arxiv: skip {target.date()} due to {type(e).__name__}: {e}")
+                continue
             day_dir = out_dir / target.strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
             out_path = day_dir / "arxiv.json"
