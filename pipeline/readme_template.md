@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + OpenReview, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of six fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + OpenReview, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -47,13 +47,13 @@ Haiku returns a structured JSON breakdown which the orchestrator combines into a
 `hard_gate = true` zeros both axes. Triggered when:
 - Topic completely unrelated to compression: RAG, agents, alignment, multimodal-without-compression, pure training algorithms
 - **Pure speculative decoding** with no compression angle (coupled spec + quant is in scope, routed by primary contribution)
-- **Survey papers** — always
-- Anything compression-adjacent that doesn't fit one of the six topic buckets
+- **Pure review-article surveys** that only enumerate prior methods with no new measurement — hard_gate. Empirical comparison studies, bottleneck analyses, and evaluation-methodology papers now go to the `survey` bucket instead.
+- Anything compression-adjacent that doesn't fit one of the seven topic buckets
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
 
 ### Topic buckets and per-bucket caps
 
-The six buckets are **fixed** — no `other`, no `survey`. Papers that don't fit are hard-gated rather than forced into a catch-all. Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
+The seven buckets are **fixed** — no `other`. Papers that don't fit are hard-gated rather than forced into a catch-all. Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
 
 | bucket | cap | what goes here |
 |---|---|---|
@@ -63,14 +63,17 @@ The six buckets are **fixed** — no `other`, no `survey`. Papers that don't fit
 | **`kv_cache`** | 5 | KV cache compression where the layout / eviction is the main contribution. Examples: KIVI, KVQuant, H2O, StreamingLLM |
 | **`pruning_distill`** | 3 | Pruning, sparsity, distillation. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
 | **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
+| **`survey`** | 3 | Methodology / measurement / cross-method comparison that doesn't propose a new algorithm but gives actionable guidance. Examples: empirical PTQ comparisons, activation/outlier bottleneck studies, LLM-evaluation methodology for compression. Pure review-article surveys still hard_gate. |
 
 Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
+
+Survey-vs-algorithm tie-break: if the primary contribution is a new algorithm (new loss / rotation / datatype / calibration recipe), bucket by the algorithm even if the paper also contains broad benchmarking. `survey` is only for work whose primary contribution is the measurement / comparison / methodology itself.
 
 In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
 
 ### Table ordering
 
-The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion), then within each bucket by a composite score:
+The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey), then within each bucket by a composite score:
 
 ```
 composite   = relevance_score × 30 + heat_score
@@ -201,7 +204,7 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 | `filter.model` | `claude-haiku-4-5` | scoring model; swap to `claude-sonnet-4-6` if Haiku judges too coarsely |
 | `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
 | `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
-| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
+| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
 | `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.semantic_scholar.citation_window_days` | 7 | default fetch window for citation tracking (CLI `--window-days` overrides) |

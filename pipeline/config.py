@@ -89,7 +89,7 @@ class SummarizeConfig(BaseModel):
 
 class RenderConfig(BaseModel):
     truncate_after: int = 10
-    # New bucket enum: [ptq, qat, low_bits, kv_cache, pruning_distill, diffusion]
+    # New bucket enum: [ptq, qat, low_bits, kv_cache, pruning_distill, diffusion, survey]
     topic_caps: dict[str, int] = Field(
         default_factory=lambda: {
             "ptq": 8,
@@ -98,6 +98,7 @@ class RenderConfig(BaseModel):
             "kv_cache": 5,
             "pruning_distill": 3,
             "diffusion": 3,
+            "survey": 3,
             "_default": 2,
         }
     )

@@ -9,11 +9,11 @@
 
 - [05-18](digests/2026-05-18.md) — 188 scanned, 7 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
-- [05-19](digests/2026-05-19.md) — 291 scanned, 10 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-19](digests/2026-05-19.md) — 291 scanned, 7 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [05-16](digests/2026-05-16.md) — 245 scanned, 4 passed, top: DiRotQ: Rotation-Aware Quantization for 4-bit Diff
+- [05-16](digests/2026-05-16.md) — 245 scanned, 3 passed, top: DiRotQ: Rotation-Aware Quantization for 4-bit Diff
 
-- [05-15](digests/2026-05-15.md) — 296 scanned, 4 passed, top: Forcing-KV: Hybrid KV Cache Compression for Effici
+- [05-15](digests/2026-05-15.md) — 296 scanned, 3 passed, top: Forcing-KV: Hybrid KV Cache Compression for Effici
 
 - [05-10](digests/2026-05-10.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
 

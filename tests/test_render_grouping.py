@@ -35,10 +35,11 @@ def test_ptq_capped_at_5_others_at_default_3():
 
 
 def test_unknown_bucket_is_dropped_from_grouped_view():
-    """`other`, `survey`, `speculative_decoding` are no longer valid buckets;
-    papers carrying these tags should be dropped from the bucketed
-    highlights section. They still flow through `surviving` for the compact
-    table (tested separately in test_render)."""
+    """`other` and `speculative_decoding` are not valid buckets; papers
+    carrying these tags should be dropped from the bucketed highlights
+    section. They still flow through `surviving` for the compact table
+    (tested separately in test_render). `survey` IS a valid bucket as
+    of the methodology/comparison expansion."""
     legacy = _mk("legacy", "speculative_decoding")
     valid = _mk("v", "ptq")
     grouped = _group_with_caps([legacy, valid], {"_default": 3})
@@ -60,9 +61,17 @@ def test_per_bucket_override_wins_over_default():
     assert len(grouped["qat"]) == 1
 
 
-def test_bucket_order_matches_six_bucket_enum():
+def test_bucket_order_matches_seven_bucket_enum():
     """Ensure render's BUCKET_ORDER stays in sync with prompts/relevance.md."""
     from pipeline.render import BUCKET_ORDER
 
-    expected = {"ptq", "low_bits", "qat", "kv_cache", "pruning_distill", "diffusion"}
+    expected = {
+        "ptq",
+        "low_bits",
+        "qat",
+        "kv_cache",
+        "pruning_distill",
+        "diffusion",
+        "survey",
+    }
     assert set(BUCKET_ORDER) == expected

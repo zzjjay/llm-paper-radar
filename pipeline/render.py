@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import re
-from urllib.parse import quote_plus
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,7 +15,7 @@ REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
 RELEVANCE_WEIGHT = 30
 
-# Bucket enum (six). Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
+# Bucket enum (seven). Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
 BUCKET_ORDER = [
     "ptq",
     "low_bits",
@@ -24,6 +23,7 @@ BUCKET_ORDER = [
     "kv_cache",
     "pruning_distill",
     "diffusion",
+    "survey",
 ]
 BUCKET_TITLES = {
     "ptq": "PTQ",
@@ -32,6 +32,7 @@ BUCKET_TITLES = {
     "kv_cache": "KV cache",
     "pruning_distill": "Pruning & distillation",
     "diffusion": "Diffusion compression",
+    "survey": "Survey / methodology",
 }
 # Detail-page section headers — tech terms stay English, glue words Chinese.
 BUCKET_TITLES_CN = {
@@ -41,6 +42,7 @@ BUCKET_TITLES_CN = {
     "kv_cache": "KV cache 压缩",
     "pruning_distill": "Pruning / 蒸馏",
     "diffusion": "Diffusion 压缩",
+    "survey": "Survey / 方法论与对比",
 }
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
@@ -262,17 +264,16 @@ ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}$")
 
 
 def _links_line(p: Paper) -> str:
-    """Detail-page link row. arXiv-shaped IDs get arXiv/HF/alphaxiv + an
-    OpenReview title-search; OpenReview-native papers (id starts with `or-`)
-    get the forum link only. GitHub is appended whenever known."""
+    """Detail-page link row. arXiv-shaped IDs get arXiv + alphaxiv; HF is
+    only added when the paper was actually surfaced via hf_daily (otherwise
+    huggingface.co/papers/<id> 404s). OpenReview-native papers (id starts
+    with `or-`) get the forum link. GitHub is appended whenever known."""
     parts: list[str] = []
     if ARXIV_ID_RE.match(p.id):
         parts.append(f"[arXiv]({p.url})")
-        parts.append(f"[HF](https://huggingface.co/papers/{p.id})")
         parts.append(f"[alphaxiv](https://www.alphaxiv.org/abs/{p.id})")
-        parts.append(
-            f"[OpenReview](https://openreview.net/search?term={quote_plus(p.title)})"
-        )
+        if any(s.name == "hf_daily" for s in p.sources):
+            parts.append(f"[HF](https://huggingface.co/papers/{p.id})")
     else:
         parts.append(f"[OpenReview]({p.url})")
     if p.code_url:
@@ -505,6 +506,19 @@ def _render_compact_md(
     return "\n".join(body)
 
 
+def _compute_day(
+    summarized_path: Path,
+) -> tuple[int, list[Paper], list[Paper]]:
+    """Read a summarized JSON and return (scanned, watched, surviving).
+    Side-effect free — does NOT write a digest file. Use this from any
+    caller that only needs the in-memory triple (e.g. rollup queries)."""
+    all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
+    scanned = len(all_papers)
+    watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
+    surviving = sort_papers([p for p in all_papers if _passed_gate(p)])
+    return scanned, watched_papers, surviving
+
+
 def _load_day(
     date: datetime,
     summarized_path: Path,
@@ -513,11 +527,8 @@ def _load_day(
 ) -> tuple[int, list[Paper], list[Paper]]:
     """Write the per-day digest file and return (scanned, watched, surviving)
     for downstream README rendering."""
-    all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
-    scanned = len(all_papers)
-    watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
+    scanned, watched_papers, surviving = _compute_day(summarized_path)
     watched_ids = {p.id for p in watched_papers}
-    surviving = sort_papers([p for p in all_papers if _passed_gate(p)])
     topic_pool = [p for p in surviving if p.id not in watched_ids]
     grouped = _group_with_caps(topic_pool, topic_caps)
     highlighted_total = sum(len(ps) for ps in grouped.values())
