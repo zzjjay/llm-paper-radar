@@ -50,6 +50,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 - **Pure review-article surveys** that only enumerate prior methods with no new measurement — hard_gate. Empirical comparison studies, bottleneck analyses, and evaluation-methodology papers now go to the `survey` bucket instead.
 - Anything compression-adjacent that doesn't fit one of the seven topic buckets
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
+- **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / TensorRT-LLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
 
 ### Topic buckets and per-bucket caps
 
@@ -61,7 +62,7 @@ The seven buckets are **fixed** — no `other`. Papers that don't fit are hard-g
 | **`low_bits`** | 5 | Sub-3-bit (≤ 2-bit) quantization, regardless of training method. Examples: BitNet b1.58, AQLM, VPTQ, QuIP#, ternary, binary |
 | **`qat`** | 5 | Quantization-aware training or PTQ + full-network fine-tune. Bit-width ≥ 3. Examples: LLM-QAT, EfficientQAT, PB-LLM |
 | **`kv_cache`** | 5 | KV cache compression where the layout / eviction is the main contribution. Examples: KIVI, KVQuant, H2O, StreamingLLM |
-| **`pruning_distill`** | 3 | Pruning, sparsity, distillation. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
+| **`pruning_distill`** | 3 | Pruning, sparsity, distillation **with a credible deployment path on existing kernels** (N:M structured, MoE expert pruning, layer drop, SFT-style KD). Unstructured-sparsity methods that depend on speculative GPU kernels → hard_gate. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
 | **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
 | **`survey`** | 3 | Methodology / measurement / cross-method comparison that doesn't propose a new algorithm but gives actionable guidance. Examples: empirical PTQ comparisons, activation/outlier bottleneck studies, LLM-evaluation methodology for compression. Pure review-article surveys still hard_gate. |
 
