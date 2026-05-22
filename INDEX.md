@@ -7,9 +7,9 @@
 
 - [05-17](digests/2026-05-17.md) — 127 scanned, 2 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
 
-- [05-18](digests/2026-05-18.md) — 188 scanned, 3 passed, top: WinQ: Accelerating Quantization-Aware Training of 
+- [05-18](digests/2026-05-18.md) — 188 scanned, 2 passed, top: VeriCache: Turning Lossy KV Cache into Lossless LL
 
-- [05-19](digests/2026-05-19.md) — 291 scanned, 9 passed, top: Measuring Maximum Activations in Open Large Langua
+- [05-19](digests/2026-05-19.md) — 291 scanned, 5 passed, top: Measuring Maximum Activations in Open Large Langua
 
 - [05-16](digests/2026-05-16.md) — 245 scanned, 4 passed, top: Measuring Maximum Activations in Open Large Langua
 
@@ -357,6 +357,6 @@
 
 - [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
-- [05-20](digests/2026-05-20.md) — 261 scanned, 5 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
+- [05-20](digests/2026-05-20.md) — 261 scanned, 4 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
 
-- [05-21](digests/2026-05-21.md) — 29 scanned, 3 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
+- [05-21](digests/2026-05-21.md) — 29 scanned, 3 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
