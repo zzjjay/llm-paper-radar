@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + Semantic Scholar + OpenReview, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Haiku 4.5 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -93,7 +93,7 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
 
 ```
    ┌────────────┐     fetchers (one per source, all in parallel via daily.sh)
-   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + reddit + semantic_scholar
+   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + openreview + reddit
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
          ↓
@@ -169,9 +169,8 @@ Sources without credentials will silently produce 0 papers. To enable:
 | source | env vars / config |
 |---|---|
 | Reddit (LocalLLaMA) | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` |
-| Semantic Scholar | `SEMANTIC_SCHOLAR_API_KEY` + seed papers in [`seeds.yaml`](seeds.yaml) |
 
-`hf_daily` and `arxiv` work without credentials.
+`hf_daily`, `arxiv`, `arxiv_authors`, and `openreview` work without credentials.
 
 ### 4. Customize the filter rubric
 
@@ -207,7 +206,6 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 | `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
 | `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
-| `sources.semantic_scholar.citation_window_days` | 7 | default fetch window for citation tracking (CLI `--window-days` overrides) |
 | `sources.arxiv_authors.window_days` | 7 | default fetch window for watched-authors source (CLI `--window-days` overrides) |
 | `dedupe.source_priority` | hf_daily → … → arxiv | tie-breaker order when the same paper shows up from multiple sources |
 
@@ -239,7 +237,6 @@ crontab -e
 | `ANTHROPIC_BASE_URL` | optional | proxy / gateway URL; leave unset for default api.anthropic.com |
 | `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers required by your proxy |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | optional | enable Reddit source |
-| `SEMANTIC_SCHOLAR_API_KEY` | optional | enable Semantic Scholar source |
 | `TEAMS_WEBHOOK_URL` | optional | failure notifications |
 
 ```
@@ -257,7 +254,7 @@ llm-paper-radar/
 ├── README.md                    # this file (LATEST_START/END auto-updated)
 ├── INDEX.md                     # one-line per past digest, newest first
 ├── config.yaml                  # source toggles, models, prefilter, topic_caps
-├── seeds.yaml                   # Semantic Scholar seed papers
+├── seeds.yaml                   # curated index of important papers per bucket (used by paper-triage skill)
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
 │   └── summarize.md             # summary format prompt
@@ -265,8 +262,8 @@ llm-paper-radar/
 │   ├── arxiv.py
 │   ├── arxiv_authors.py
 │   ├── hf_daily.py
-│   ├── reddit.py
-│   └── semantic_scholar.py
+│   ├── openreview.py
+│   └── reddit.py
 ├── pipeline/
 │   ├── config.py                # Pydantic config model
 │   ├── llm_client.py            # async Anthropic wrapper with prompt cache

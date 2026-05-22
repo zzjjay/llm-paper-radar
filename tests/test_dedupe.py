@@ -31,7 +31,6 @@ def test_merge_papers_combines_sources_and_uses_priority():
     priority = [
         "hf_daily",
         "reddit",
-        "semantic_scholar",
         "arxiv",
     ]
     merged = merge_papers([arxiv_p, hf_p], priority)

@@ -1,5 +1,7 @@
 # LLM Paper Radar Implementation Plan
 
+> **Historical document.** This plan reflects the original build. Step 7 (`sources/semantic_scholar.py`, `tests/test_semantic_scholar.py`, `SemanticScholarConfig`) was implemented but later **removed** — the SS public API rate-limits without a key, doesn't index brand-new arXiv papers for weeks, and the arxiv-id-only filter dropped ~70% of returned citations, leaving the source with near-zero net yield. The `seeds.yaml` file is kept as a curated index of important papers per bucket, consumed by the paper-triage skill — no longer by SS.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a daily-running automated pipeline that fetches papers from 6 sources, dedupes, filters via Claude Haiku, summarizes via Claude Sonnet (Chinese + English), renders a Markdown digest, and publishes to a public GitHub repo via GitHub Actions.

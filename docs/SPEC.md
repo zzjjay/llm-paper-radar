@@ -37,10 +37,10 @@ GitHub Actions (cron daily 23:00 UTC)
         │
         ├── Fetch (parallel matrix, continue-on-error per source)
         │     ├─ sources/arxiv.py
+        │     ├─ sources/arxiv_authors.py
         │     ├─ sources/hf_daily.py
-        │     ├─ sources/reddit.py
-        │     ├─ sources/semantic_scholar.py
-        │     └─ sources/twitter_rsshub.py
+        │     ├─ sources/openreview.py
+        │     └─ sources/reddit.py
         │           ↓
         │     data/raw/YYYY-MM-DD/{source}.json
         │
@@ -66,10 +66,10 @@ llm-paper-radar/
 │   ├── __init__.py
 │   ├── base.py              # Source ABC + unified Paper schema
 │   ├── arxiv.py
+│   ├── arxiv_authors.py
 │   ├── hf_daily.py
-│   ├── reddit.py
-│   ├── semantic_scholar.py
-│   └── twitter_rsshub.py
+│   ├── openreview.py
+│   └── reddit.py
 ├── pipeline/
 │   ├── dedupe.py
 │   ├── filter.py
@@ -136,13 +136,6 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 - Logic: filter posts containing `arxiv.org/abs/XXXX.XXXXX`; extract arXiv IDs via regex; refetch full metadata from arXiv API; record `reddit_score`, `reddit_comments_count`, `thread_url` in extras
 - Expected: 5–15 papers/day with arXiv links
 
-#### `sources/semantic_scholar.py`
-- API: `https://api.semanticscholar.org/graph/v1/paper/{seed_id}/citations`
-- Config: `seeds.yaml` with ~20 foundational papers
-- Window: last 7 days of new citations per seed
-- Rate limit: 1 req/sec without key, higher with `SEMANTIC_SCHOLAR_API_KEY`
-- Expected: 20–50 papers/day
-
 ### Tier 3 — Supplementary
 
 - Source: RSS feed `https://paperswithcode.com/latest/rss.xml` (PwC search API is unstable)
@@ -162,9 +155,8 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 | arXiv | 400 | Complete coverage |
 | HF Daily | 20 | Community heat signal |
 | r/LocalLLaMA | 5–15 | Industry adoption signal |
-| Semantic Scholar | 30 | Citation graph (covers arXiv blind spots) |
-| PwC | 80 | Code availability tag |
-| Twitter (RSSHub) | 5–20 | Author commentary signal |
+| arxiv_authors (watched groups) | 5–10 | Never-miss for curated authors |
+| OpenReview | 5–20 | Pre-arXiv ICLR/NeurIPS submissions |
 | **After dedupe** | **~450–500** | → LLM filter |
 
 ---
@@ -175,7 +167,7 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 
 ```python
 class SourceRecord(BaseModel):
-    name: Literal["arxiv", "hf_daily", "reddit", "semantic_scholar", "twitter_rsshub"]
+    name: Literal["arxiv", "arxiv_authors", "hf_daily", "openreview", "reddit"]
     fetched_at: datetime
     extras: dict = {}            # source-specific (upvotes, score, thread_url, ...)
 
@@ -212,7 +204,7 @@ class Paper(BaseModel):
 
 **Field-merge priority** when same paper appears across sources:
 ```
-hf_daily > reddit > semantic_scholar > twitter_rsshub > arxiv (fallback)
+hf_daily > openreview > reddit > arxiv_authors > arxiv (fallback)
 ```
 For each field (title, abstract, authors, etc.), take the value from the highest-priority source that has a non-empty value. arXiv serves as the safety net.
 
@@ -433,7 +425,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [arxiv, hf_daily, reddit, semantic_scholar, twitter_rsshub]
+        source: [arxiv, arxiv_authors, hf_daily, openreview, reddit]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -443,7 +435,6 @@ jobs:
         env:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
           RSSHUB_BASE_URL: ${{ secrets.RSSHUB_BASE_URL }}
         continue-on-error: true
       - uses: actions/upload-artifact@v4
@@ -576,7 +567,6 @@ jobs:
 | `REDDIT_CLIENT_SECRET` | yes | Reddit OAuth |
 | `TEAMS_WEBHOOK_URL` | yes | Failure alerts |
 | `RSSHUB_BASE_URL` | optional | If absent, twitter source disabled |
-| `SEMANTIC_SCHOLAR_API_KEY` | optional | Higher rate limit |
 
 ### Pipeline Timing
 
@@ -608,10 +598,6 @@ sources:
     enabled: true
     subreddit: LocalLLaMA
     top_window: day
-  semantic_scholar:
-    enabled: true
-    seeds_file: seeds.yaml
-    citation_window_days: 7
   twitter_rsshub:
     enabled: true
     accounts:
@@ -641,12 +627,11 @@ dedupe:
   source_priority:
     - hf_daily
     - reddit
-    - semantic_scholar
     - twitter_rsshub
     - arxiv
 ```
 
-### `seeds.yaml` (Semantic Scholar seed papers)
+### `seeds.yaml` (curated index of important papers per bucket; consumed by the paper-triage skill)
 
 ```yaml
 seeds:
@@ -704,7 +689,6 @@ gh secret set REDDIT_CLIENT_ID
 gh secret set REDDIT_CLIENT_SECRET
 gh secret set TEAMS_WEBHOOK_URL
 gh secret set RSSHUB_BASE_URL          # optional
-gh secret set SEMANTIC_SCHOLAR_API_KEY # optional
 
 # 4. Edit config.yaml + seeds.yaml + prompts/*.md as needed
 

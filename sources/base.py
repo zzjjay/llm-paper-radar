@@ -12,7 +12,6 @@ SourceName = Literal[
     "hf_daily",
     "openreview",
     "reddit",
-    "semantic_scholar",
 ]
 
 

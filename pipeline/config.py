@@ -20,12 +20,6 @@ class RedditConfig(BaseModel):
     top_window: str = "day"
 
 
-class SemanticScholarConfig(BaseModel):
-    enabled: bool = True
-    seeds_file: str = "seeds.yaml"
-    citation_window_days: int = 7
-
-
 class WatchedAuthor(BaseModel):
     name: str
     affiliation: str = ""
@@ -52,7 +46,6 @@ class SourcesConfig(BaseModel):
     arxiv: ArxivConfig = ArxivConfig()
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
     reddit: RedditConfig = RedditConfig()
-    semantic_scholar: SemanticScholarConfig = SemanticScholarConfig()
     arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
     openreview: OpenReviewConfig = OpenReviewConfig()
 
