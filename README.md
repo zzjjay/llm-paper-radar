@@ -65,13 +65,13 @@ Configured under `filter.prefilter` in [`config.yaml`](config.yaml). Each paper'
 - **whitelist** (e.g. `PTQ`, `AWQ`, `MXFP4`, `W4A4`, `BitNet`, `KV cache quantization`, …)
 - **blacklist** (e.g. `image classification`, `ImageNet`, `federated learning`, `RAG`, …)
 
-If a paper has **zero whitelist hits AND ≥ `max_blacklist_hits` (default 2) blacklist hits**, it's hard-gated locally with no Haiku call. Word boundaries are enforced so `QuIP` doesn't match inside `equipping` and `MIT` doesn't match inside `Amit`.
+If a paper has **zero whitelist hits AND ≥ `max_blacklist_hits` (default 2) blacklist hits**, it's hard-gated locally with no LLM call. Word boundaries are enforced so `QuIP` doesn't match inside `equipping` and `MIT` doesn't match inside `Amit`.
 
 This is conservative on purpose — anything ambiguous goes to the LLM. Add patterns over time based on what you see in rejected.jsonl.
 
-### Stage 2 — Haiku two-axis rubric
+### Stage 2 — Sonnet two-axis rubric
 
-Haiku returns a structured JSON breakdown which the orchestrator combines into a 0–10 composite.
+Sonnet returns a structured JSON breakdown which the orchestrator combines into a 0–10 composite.
 
 | axis | range | what it captures |
 |---|---|---|
@@ -217,7 +217,7 @@ The scoring rubric lives entirely in [`prompts/relevance.md`](prompts/relevance.
 What to edit, in rough order of leverage:
 
 1. **`# What we care about`** — swap the Primary / Secondary / Out-of-scope bullets for your topic (e.g. replace "LLM compression" with "RL fine-tuning", "robot learning", "agent evals"). This single section drives most of the model's judgment.
-2. **`## topic_relevance (0-5)`** — re-anchor each level for your domain. The Haiku scorer follows these anchors literally; vague anchors → noisy scores.
+2. **`## topic_relevance (0-5)`** — re-anchor each level for your domain. The Sonnet scorer follows these anchors literally; vague anchors → noisy scores.
 3. **`# Hard gates`** — list paper shapes that should always score 0 (e.g. "BERT-base only" for compression; for RL you might gate "tabular-only / no neural net").
 4. **`topic_bucket` enum** — these become the section headings in the daily digest. Keep them few (≤10) and mutually distinct; the digest groups + caps by bucket.
 5. **Few-shot examples** — at least 3 positive + 2 negative anchors with the exact `topic_relevance` / `practicality` / `topic_bucket` values you want. This is the highest-ROI edit; the model imitates these.
