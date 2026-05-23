@@ -263,7 +263,7 @@
 
 - [01-07](digests/2026-01-07.md) — 324 scanned, 0 passed, top: (no papers passed)
 
-- [01-06](digests/2026-01-06.md) — 290 scanned, 4 passed, top: Joint Encoding of KV-Cache Blocks for Scalable LLM
+- [01-06](digests/2026-01-06.md) — 290 scanned, 3 passed, top: Joint Encoding of KV-Cache Blocks for Scalable LLM
 
 - [01-05](digests/2026-01-05.md) — 234 scanned, 2 passed, top: Crystal-KV: Efficient KV Cache Management for Chai
 
@@ -273,7 +273,7 @@
 
 - [01-02](digests/2026-01-02.md) — 126 scanned, 0 passed, top: (no papers passed)
 
-- [01-01](digests/2026-01-01.md) — 153 scanned, 1 passed, top: Can Large Language Models Still Explain Themselves
+- [01-01](digests/2026-01-01.md) — 153 scanned, 0 passed, top: (no papers passed)
 
 - [12-31](digests/2025-12-31.md) — 186 scanned, 2 passed, top: More Than Bits: Multi-Envelope Double Binary Facto
 
@@ -355,7 +355,7 @@
 
 - [11-22](digests/2025-11-22.md) — 50 scanned, 2 passed, top: DFlash: Block Diffusion for Flash Speculative Deco
 
-- [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-21](digests/2025-11-21.md) — 72 scanned, 3 passed, top: Nemotron Elastic: Towards Efficient Many-in-One Re
 
 - [05-20](digests/2026-05-20.md) — 261 scanned, 4 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
 
