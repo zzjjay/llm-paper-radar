@@ -48,6 +48,7 @@ Mapping:
 # Hard gates (set `hard_gate=true`; both scores → 0)
 Always hard_gate if any of these apply:
 - Topic completely unrelated to compression: RAG, agents, alignment, multimodal app without compression, pure training method.
+- **Model release / technical report** that introduces a specific model or model family without a new compression algorithm. Signals: title or abstract is the model name (e.g. "Ministral 3", "Qwen3-Coder Technical Report", "GLM-4.5", "SmolDocling"); abstract opens "We introduce / present / release X, a [size]B model..."; weights are the artifact. The fact that the model is small / efficient / "ultra-compact" does NOT make it a compression paper. Exception: if the *primary* contribution is a compression recipe used to train the model from scratch (e.g. BitNet b1.58 trained at 1.58-bit) and the paper describes that recipe in algorithmic detail, it stays in scope under the appropriate bucket.
 - **Pure speculative decoding** with no compression angle.
 - **Pure review-article survey** that only enumerates prior methods with no new measurement, comparison, or analysis. Empirical comparison studies and methodology papers go to the `survey` bucket — do NOT hard_gate those.
 - Pure pruning / KD work without an LLM angle (e.g. CNN-only pruning).
@@ -120,6 +121,7 @@ Coupled spec-decoding (in scope, route by compression):
 - Spec decoding + KV-quant → 4 / 4 / kv_cache
 
 Negative (hard_gate=true):
+- "Ministral 3 Technical Report" / "We introduce Qwen3-Coder, a [size]B model trained on ..." / "SmolDocling: an ultra-compact vision-language model"  →  hard_gate (model release / technical report — the artifact is the model + weights, not a compression algorithm. "Ultra-compact" / "small" / "efficient" in the title is a marketing adjective, not a compression contribution. Even when the model is genuinely small, there is no PTQ / QAT / KV / pruning recipe a compression engineer can take from the paper)
 - "Pure EAGLE-3 / Medusa / Lookahead spec decoding with no quantization"  →  hard_gate (was previously in scope; no longer)
 - "Comprehensive PTQ review article: enumerates 120 methods, no new measurement"  →  hard_gate (pure review article, no original analysis — the `survey` bucket requires new measurement / comparison / methodology)
 - "LongLive-2.0: An NVFP4 Parallel Infrastructure for Long Video Generation"  →  hard_gate (NVFP4 in the title, but the primary contribution is long-video world modeling; quantization is one bullet in the deployment section, not a new PTQ recipe. Mention of a standard quant format ≠ a compression contribution)
