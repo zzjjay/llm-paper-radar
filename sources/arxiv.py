@@ -166,6 +166,7 @@ def _entry_published(entry: dict) -> datetime:
 
 if __name__ == "__main__":
     import json
+    import time
     from pathlib import Path
 
     import click
@@ -175,13 +176,45 @@ if __name__ == "__main__":
     @click.command()
     @click.option("--backfill-days", default=0, type=int)
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
-    def main(backfill_days: int, out_dir: Path):
+    @click.option(
+        "--batch-size",
+        default=10,
+        type=int,
+        help="Days per batch before the long inter-batch sleep. "
+             "Picked so total requests per batch stays well under arxiv's soft-ban threshold.",
+    )
+    @click.option(
+        "--batch-pause",
+        default=300,
+        type=int,
+        help="Seconds to sleep between batches (default 300 = 5 min). "
+             "Long enough for arxiv to fully cool any per-IP throttle counters.",
+    )
+    @click.option(
+        "--day-pause",
+        default=25,
+        type=int,
+        help="Seconds to sleep between days within a batch. "
+             "25s matches _backfill_6mo.py's polite pace.",
+    )
+    def main(
+        backfill_days: int,
+        out_dir: Path,
+        batch_size: int,
+        batch_pause: int,
+        day_pause: int,
+    ):
         cfg = load_config()
         if not cfg.sources.arxiv.enabled:
             print("arxiv source disabled")
             return
         src = ArxivSource(categories=cfg.sources.arxiv.categories)
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Build the list of days to actually fetch (skipping those whose
+        # digest already exists). Done up front so batching boundaries land
+        # on real work, not on a run of skips.
+        targets: list[datetime] = []
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
             if backfill_days > 0 and (
@@ -189,6 +222,11 @@ if __name__ == "__main__":
             ).exists():
                 print(f"arxiv: skip {target.date()} (digest exists)")
                 continue
+            targets.append(target)
+
+        total = len(targets)
+        fetched = 0
+        for idx, target in enumerate(targets):
             try:
                 papers = asyncio.run(src.fetch(target))
             except Exception as e:
@@ -196,26 +234,43 @@ if __name__ == "__main__":
                 # the whole backfill — log and continue to the next day so
                 # we don't lose progress on 30 days because of day 5.
                 print(f"arxiv: skip {target.date()} due to {type(e).__name__}: {e}")
+            else:
+                day_dir = out_dir / target.strftime("%Y-%m-%d")
+                day_dir.mkdir(parents=True, exist_ok=True)
+                out_path = day_dir / "arxiv.json"
+                # Defensive: a fetch that returns 0 papers must NOT overwrite an
+                # existing non-empty arxiv.json. Without this guard, backfills
+                # that fail to reach old days (e.g. the source's pagination depth
+                # was too shallow) silently destroy historical data. Either a
+                # real "no papers today" outcome is rare for cs.CL/cs.LG/cs.AR,
+                # or a failure mode worth a loud WARN.
+                if not papers and out_path.exists() and out_path.stat().st_size > 2:
+                    print(
+                        f"arxiv: WARN skip write for {target.date()} — fetch returned 0 papers "
+                        f"but existing file has data ({out_path.stat().st_size} bytes). "
+                        f"Refusing to clobber. Investigate upstream."
+                    )
+                else:
+                    out_path.write_text(
+                        json.dumps([p.model_dump(mode="json") for p in papers], indent=2)
+                    )
+                    print(f"arxiv: wrote {len(papers)} papers for {target.date()}")
+
+            fetched += 1
+            is_last = idx == total - 1
+            if is_last:
                 continue
-            day_dir = out_dir / target.strftime("%Y-%m-%d")
-            day_dir.mkdir(parents=True, exist_ok=True)
-            out_path = day_dir / "arxiv.json"
-            # Defensive: a fetch that returns 0 papers must NOT overwrite an
-            # existing non-empty arxiv.json. Without this guard, backfills
-            # that fail to reach old days (e.g. the source's pagination depth
-            # was too shallow) silently destroy historical data. Either a
-            # real "no papers today" outcome is rare for cs.CL/cs.LG/cs.AR,
-            # or a failure mode worth a loud WARN.
-            if not papers and out_path.exists() and out_path.stat().st_size > 2:
+            # Inter-batch pause lands AFTER every batch_size-th fetched day
+            # (counted across both successes and failures, so a single bad
+            # day doesn't shift the batch boundary). Skipped days don't
+            # count — they made no requests.
+            if fetched % batch_size == 0:
                 print(
-                    f"arxiv: WARN skip write for {target.date()} — fetch returned 0 papers "
-                    f"but existing file has data ({out_path.stat().st_size} bytes). "
-                    f"Refusing to clobber. Investigate upstream."
+                    f"arxiv: batch boundary ({fetched}/{total} done), "
+                    f"sleeping {batch_pause}s before next batch"
                 )
-                continue
-            out_path.write_text(
-                json.dumps([p.model_dump(mode="json") for p in papers], indent=2)
-            )
-            print(f"arxiv: wrote {len(papers)} papers for {target.date()}")
+                time.sleep(batch_pause)
+            else:
+                time.sleep(day_pause)
 
     main()
