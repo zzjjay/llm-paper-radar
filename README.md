@@ -455,7 +455,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview
 | 428 | Survey | [Compressed code: the hidden effects of quantization and distillation on programming tokens](https://arxiv.org/abs/2601.02563) | Viacheslav Siniaev, Iaroslav Chelombitko, Aleksey Komissarov | 2026-01-05 | [📄](digests/2026-01-05.md#p-2601-02563) |
 | 429 | Trending | [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) 🔁 | Jian Chen, Yesheng Liang, Zhijian Liu | 2026-02-05 | [📄](digests/2025-11-22.md#p-2602-06036) |
 | 430 | Trending | [Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion](https://arxiv.org/abs/2605.12825) 🔁 | Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham et al. | 2026-05-12 | [📄](digests/2025-11-22.md#p-2605-12825) |
-| 431 | ? pruning | [Nemotron Elastic: Towards Efficient Many-in-One Reasoning LLMs](https://arxiv.org/abs/2511.16664) | Ali Taghibakhshi, Sharath Turuvekere Sreenivas, Saurav Muralidharan et al. | 2025-11-20 | [📄](digests/2025-11-21.md#p-2511-16664) |
+| 431 | Pruning & distillation | [Nemotron Elastic: Towards Efficient Many-in-One Reasoning LLMs](https://arxiv.org/abs/2511.16664) | Ali Taghibakhshi, Sharath Turuvekere Sreenivas, Saurav Muralidharan et al. | 2025-11-20 | [📄](digests/2025-11-21.md#p-2511-16664) |
 
 
 <!-- LATEST_END -->
