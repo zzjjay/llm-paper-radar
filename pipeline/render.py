@@ -40,7 +40,7 @@ BUCKET_TITLES = {
     "qat": "QAT",
     "kv_cache": "KV cache",
     "pruning_distill": "Pruning & distillation",
-    "diffusion": "Diffusion compression",
+    "diffusion": "Diffusion",
     "survey": "Survey",
     "trending": "Trending",
 }
@@ -51,7 +51,7 @@ BUCKET_TITLES_CN = {
     "qat": "QAT（量化感知训练）",
     "kv_cache": "KV cache 压缩",
     "pruning_distill": "Pruning / 蒸馏",
-    "diffusion": "Diffusion 压缩",
+    "diffusion": "Diffusion",
     "survey": "Survey / 方法论与对比",
     "trending": "Trending / 高热度但未归桶",
 }

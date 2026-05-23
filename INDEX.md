@@ -1,6 +1,6 @@
 # Digest History Index
 
-- [05-11](digests/2026-05-11.md) — 550 scanned, 7 passed, top: ConQuR: Corner Aligned Activation Quantization via
+- [05-11](digests/2026-05-11.md) — 550 scanned, 6 passed, top: ConQuR: Corner Aligned Activation Quantization via
 - [05-12](digests/2026-05-12.md) — 517 scanned, 7 passed, top: SlimQwen: Exploring the Pruning and Distillation i
 - [05-13](digests/2026-05-13.md) — 451 scanned, 8 passed, top: SPHERICAL KV: Angle-Domain Attention and Rate-Dist
 - [05-14](digests/2026-05-14.md) — 382 scanned, 1 passed, top: Minimal-Intervention KV Retention via Set-Conditio
@@ -29,17 +29,17 @@
 
 - [05-04](digests/2026-05-04.md) — 293 scanned, 2 passed, top: Statistically-Lossless Quantization of Large Langu
 
-- [05-03](digests/2026-05-03.md) — 179 scanned, 4 passed, top: EGAD: Entropy-Guided Adaptive Distillation for Tok
+- [05-03](digests/2026-05-03.md) — 179 scanned, 3 passed, top: SplitZip: Ultra Fast Lossless KV Compression for D
 
-- [05-02](digests/2026-05-02.md) — 173 scanned, 3 passed, top: MTA: Multi-Granular Trajectory Alignment for Large
+- [05-02](digests/2026-05-02.md) — 173 scanned, 2 passed, top: Quantization Undoes Alignment: Bias Emergence in C
 
 - [05-01](digests/2026-05-01.md) — 302 scanned, 4 passed, top: BWLA: Breaking the Barrier of W1AX Post-Training Q
 
-- [04-30](digests/2026-04-30.md) — 310 scanned, 1 passed, top: VitaLLM: A Versatile, Ultra-Compact Ternary LLM Ac
+- [04-30](digests/2026-04-30.md) — 310 scanned, 0 passed, top: (no papers passed)
 
 - [04-29](digests/2026-04-29.md) — 273 scanned, 2 passed, top: Exploring the Limits of Pruning: Task-Specific Neu
 
-- [04-28](digests/2026-04-28.md) — 285 scanned, 4 passed, top: Rethinking KV Cache Eviction via a Unified Informa
+- [04-28](digests/2026-04-28.md) — 285 scanned, 3 passed, top: Rethinking KV Cache Eviction via a Unified Informa
 
 - [04-27](digests/2026-04-27.md) — 304 scanned, 7 passed, top: Coverage-Based Calibration for Post-Training Quant
 
@@ -111,7 +111,7 @@
 
 - [03-24](digests/2026-03-24.md) — 301 scanned, 2 passed, top: EchoKV: Efficient KV Cache Compression via Similar
 
-- [03-23](digests/2026-03-23.md) — 303 scanned, 2 passed, top: FAAR: Format-Aware Adaptive Rounding for NVFP4
+- [03-23](digests/2026-03-23.md) — 303 scanned, 1 passed, top: FAAR: Format-Aware Adaptive Rounding for NVFP4
 
 - [03-22](digests/2026-03-22.md) — 163 scanned, 1 passed, top: Structural Sensitivity in Compressed Transformers:
 
@@ -133,7 +133,7 @@
 
 - [03-13](digests/2026-03-13.md) — 308 scanned, 3 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
 
-- [03-12](digests/2026-03-12.md) — 313 scanned, 4 passed, top: LongFlow: Efficient KV Cache Compression for Reaso
+- [03-12](digests/2026-03-12.md) — 313 scanned, 3 passed, top: LongFlow: Efficient KV Cache Compression for Reaso
 
 - [03-11](digests/2026-03-11.md) — 333 scanned, 4 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
 
@@ -219,7 +219,7 @@
 
 - [01-29](digests/2026-01-29.md) — 491 scanned, 9 passed, top: HeRo-Q: A General Framework for Stable Low Bit Qua
 
-- [01-28](digests/2026-01-28.md) — 327 scanned, 2 passed, top: Enhancing Post-Training Quantization via Future Ac
+- [01-28](digests/2026-01-28.md) — 327 scanned, 1 passed, top: Enhancing Post-Training Quantization via Future Ac
 
 - [01-27](digests/2026-01-27.md) — 339 scanned, 6 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
 
@@ -235,7 +235,7 @@
 
 - [01-21](digests/2026-01-21.md) — 283 scanned, 2 passed, top: What Makes Low-Bit Quantization-Aware Training Wor
 
-- [01-20](digests/2026-01-20.md) — 296 scanned, 4 passed, top: Jet-RL: Enabling On-Policy FP8 Reinforcement Learn
+- [01-20](digests/2026-01-20.md) — 296 scanned, 3 passed, top: Jet-RL: Enabling On-Policy FP8 Reinforcement Learn
 
 - [01-19](digests/2026-01-19.md) — 272 scanned, 0 passed, top: (no papers passed)
 
@@ -247,7 +247,7 @@
 
 - [01-15](digests/2026-01-15.md) — 260 scanned, 0 passed, top: (no papers passed)
 
-- [01-14](digests/2026-01-14.md) — 262 scanned, 5 passed, top: Ministral 3
+- [01-14](digests/2026-01-14.md) — 262 scanned, 4 passed, top: Benchmarking Post-Training Quantization of Large L
 
 - [01-13](digests/2026-01-13.md) — 282 scanned, 2 passed, top: Ministral 3
 
@@ -275,7 +275,7 @@
 
 - [01-01](digests/2026-01-01.md) — 153 scanned, 0 passed, top: (no papers passed)
 
-- [12-31](digests/2025-12-31.md) — 186 scanned, 2 passed, top: More Than Bits: Multi-Envelope Double Binary Facto
+- [12-31](digests/2025-12-31.md) — 186 scanned, 1 passed, top: More Than Bits: Multi-Envelope Double Binary Facto
 
 - [12-30](digests/2025-12-30.md) — 198 scanned, 1 passed, top: OptRot: Mitigating Weight Outliers via Data-Free R
 

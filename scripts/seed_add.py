@@ -59,7 +59,7 @@ SECTION_HEADER = {
     "qat":             "# ---- QAT (secondary) ----",
     "kv_cache":        "# ---- KV cache (secondary) ----",
     "pruning_distill": "# ---- Pruning & distillation (low priority, merged bucket) ----",
-    "diffusion":       "# ---- Diffusion compression (low priority) ----",
+    "diffusion":       "# ---- Diffusion (low priority) ----",
     "trending":        "# ---- Trending (hf_daily-popular, no other bucket fits) ----",
 }
 

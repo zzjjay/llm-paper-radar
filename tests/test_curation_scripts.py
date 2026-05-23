@@ -47,7 +47,7 @@ def isolated_repo(tmp_path: Path, monkeypatch):
           # ---- Pruning & distillation (low priority, merged bucket) ----
           - { id: arXiv:2306.11695, name: Wanda,       category: pruning_distill }
 
-          # ---- Diffusion compression (low priority) ----
+          # ---- Diffusion (low priority) ----
           - { id: arXiv:2302.04304, name: Q-Diffusion, category: diffusion }
         """).lstrip()
     )
