@@ -47,12 +47,12 @@ SCORED_DIR = REPO_ROOT / "data" / "scored"
 SUMMARIZED_DIR = REPO_ROOT / "data" / "summarized"
 
 VALID_BUCKETS = {
-    "ptq", "low_bits", "qat", "kv_cache", "pruning_distill", "diffusion", "trending",
+    "ptq", "low_bits", "qat", "kv_cache", "pruning_distill", "diffusion", "survey", "trending",
 }
 
 # Header comments mark the start of each bucket section in seeds.yaml.
 # When inserting, we append to the LAST line of the matching section so
-# the file's hand-curated layout survives.
+# the file's hand-curated layout survives. Order matches BUCKET_ORDER.
 SECTION_HEADER = {
     "ptq":             "# ---- PTQ (primary) ----",
     "low_bits":        "# ---- Low-bit (≤ 2 bits, primary) ----",
@@ -60,7 +60,8 @@ SECTION_HEADER = {
     "kv_cache":        "# ---- KV cache (secondary) ----",
     "pruning_distill": "# ---- Pruning & distillation (low priority, merged bucket) ----",
     "diffusion":       "# ---- Diffusion (low priority) ----",
-    "trending":        "# ---- Trending (hf_daily-popular, no other bucket fits) ----",
+    "survey":          "# ---- Survey / methodology (low priority) ----",
+    "trending":        "# ---- Trending (compression-adjacent decoding-acceleration, no other bucket fits) ----",
 }
 
 ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}$")

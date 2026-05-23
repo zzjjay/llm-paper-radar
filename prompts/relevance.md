@@ -18,9 +18,9 @@ Out of scope — `hard_gate=true`:
 - Alignment / RLHF / safety
 - Multimodal applications without a compression angle
 - Pure training algorithms unrelated to compression
-- **Pure speculative decoding** (EAGLE / Medusa / Lookahead-style) with no compression angle. If spec decoding is *coupled with quantization* (e.g. quantized drafter, KV-quant + speculation), it is in scope — bucket by primary compression contribution (`ptq` / `kv_cache` / `low_bits`).
+- **Pure speculative decoding** (EAGLE / Medusa / Lookahead-style) with no compression angle. If spec decoding is *coupled with quantization* (e.g. quantized drafter, KV-quant + speculation), it is in scope — bucket by primary compression contribution (`ptq` / `kv_cache` / `low_bits`). If it has no compression angle but presents a meaningful parallel/dual-view decoding framework worth tracking, use the `trending` bucket instead of hard_gate — but the bar is high; routine EAGLE/Medusa variants still hard_gate.
 - **Pure review-article surveys** that only enumerate prior methods with no new measurement or analysis — hard_gate. (Empirical comparisons / methodology papers go to `survey`, not hard_gate.)
-- Anything compression-adjacent that does not fit one of the seven buckets — hard_gate rather than misclassify
+- Anything compression-adjacent that does not fit one of the eight buckets — hard_gate rather than misclassify
 
 # Scoring (two axes, each 0-5)
 
@@ -51,38 +51,38 @@ Always hard_gate if any of these apply:
 - **Model release / technical report** that introduces a specific model or model family without a new compression algorithm. Signals: title or abstract is the model name (e.g. "Ministral 3", "Qwen3-Coder Technical Report", "GLM-4.5", "SmolDocling"); abstract opens "We introduce / present / release X, a [size]B model..."; weights are the artifact. The fact that the model is small / efficient / "ultra-compact" does NOT make it a compression paper. Exception: if the *primary* contribution is a compression recipe used to train the model from scratch (e.g. BitNet b1.58 trained at 1.58-bit) and the paper describes that recipe in algorithmic detail, it stays in scope under the appropriate bucket.
 - **Custom-silicon / FPGA / ASIC accelerator** papers whose primary contribution is a hardware design or a hardware-generator framework rather than a compression algorithm. Signals: TSMC/Samsung process node in the abstract ("16nm", "7nm"), area / power / FOM as the headline metrics (mm², mW, TOPS/W), Booth multipliers / systolic arrays / LUT datapath as the contribution, FPGA bitstream as the artifact. Even when the accelerator targets a known low-bit format (ternary, INT4, NVFP4), the work is out of scope unless it also produces a new quantization / pruning recipe that a compression engineer can apply to a *fixed pretrained model* on standard inference stacks (vLLM / TensorRT-LLM / SGLang). Custom-kernel work on *commodity* hardware (CUDA / Metal / Triton) that implements a specific compression algorithm IS in scope (e.g. fused INT4 KV-cache attention kernels on Apple Silicon).
 - **RL-trained / on-policy / runtime-decision compression** that requires either (a) an RL search loop (GRPO / PPO / single-step RL) to discover the compression configuration, (b) an LLM-agent-in-the-loop driving the compression decisions, or (c) a runtime policy / dynamic per-token decision over arbitrary unstructured sparsity, dynamic bit-widths, or other patterns with no matching kernel in vLLM / TensorRT-LLM / SGLang. The deployment surface is too large: even when the final model is "static", the recipe a compression engineer has to reproduce is an RL pipeline plus custom kernels. Standard offline calibration (GPTQ-style, even when expensive) does NOT trip this rule — only RL / agentic / per-token-online decision logic does.
-- **Pure speculative decoding** with no compression angle.
+- **Pure speculative decoding** with no compression angle (unless the paper presents a meaningful parallel/dual-view decoding framework worth tracking — those go to the `trending` bucket, see below).
 - **Pure review-article survey** that only enumerates prior methods with no new measurement, comparison, or analysis. Empirical comparison studies and methodology papers go to the `survey` bucket — do NOT hard_gate those.
 - Pure pruning / KD work without an LLM angle (e.g. CNN-only pruning).
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small only). If size is unknown but the paper is on a modern LLM family (Llama, Qwen, Mistral, DeepSeek, GLM, etc.), do NOT gate.
-- **PTQ bucket only — stricter scale rule**: any paper that would otherwise land in `ptq` whose largest experiment is **< 7B parameters** → hard_gate. PTQ recipes that only validate on sub-7B models (FLAN-T5-base, CLIP-ViT, GPT-2, BERT, OPT-1.3B, Pythia-1.4B, etc.) don't predict large-scale behavior — accuracy/perplexity gaps at 1B-scale routinely flip at 7B+. Modern LLM family + unknown exact size → do NOT gate (default trust). Applies to `ptq` only; `low_bits`, `qat`, `kv_cache`, `pruning_distill`, `diffusion`, `survey` keep the < 1B threshold.
-- Compression-adjacent but does not fit any of the seven buckets — hard_gate rather than force into `other`.
+- **PTQ bucket only — stricter scale rule**: any paper that would otherwise land in `ptq` whose largest experiment is **< 7B parameters** → hard_gate. PTQ recipes that only validate on sub-7B models (FLAN-T5-base, CLIP-ViT, GPT-2, BERT, OPT-1.3B, Pythia-1.4B, etc.) don't predict large-scale behavior — accuracy/perplexity gaps at 1B-scale routinely flip at 7B+. Modern LLM family + unknown exact size → do NOT gate (default trust). Applies to `ptq` only; `low_bits`, `qat`, `kv_cache`, `pruning_distill`, `diffusion`, `survey`, `trending` keep the < 1B threshold.
+- Compression-adjacent but does not fit any of the eight buckets — hard_gate rather than force into `other`.
 
 # Topic buckets
 
-Eight buckets total: seven LLM-classified buckets plus one render-only bucket (`trending`). The LLM picks one of the seven; `trending` is reserved for post-hoc manual overrides and **MUST NOT** be returned by the LLM.
+Eight buckets total — all LLM-pickable. The first seven are strict compression buckets; `trending` is a soft catch-all for compression-adjacent decoding-acceleration work that doesn't fit the strict seven but is conceptually close enough to track (parallel/dual-view drafters, etc.). Always prefer a strict bucket when the paper fits one — only fall back to `trending` when nothing else is appropriate.
 
-| bucket | description | examples | LLM picks? |
-|---|---|---|---|
-| `ptq` | Post-training quantization. Weight-only / weight-activation / activation quant / KV-quant when the *primary* contribution is the PTQ recipe and **bit-width ≥ 3**. | GPTQ, AWQ, SmoothQuant, QuaRot, SpinQuant, OmniQuant, MXFP4 PTQ, NVFP4 calibration, W4A16, W4A8, W8A8, FP8 OCP, Hadamard rotation PTQ | yes |
-| `qat` | Quantization-aware training, or PTQ + finetune that requires gradient updates over the full network, with **bit-width ≥ 3**. | LLM-QAT, EfficientQAT, PB-LLM, FP8 QAT | yes |
-| `low_bits` | Sub-3-bit (≤ 2-bit) quantization, **regardless of training method**. Takes priority over `ptq` / `qat` whenever weights are ≤ 2 bits. | BitNet b1.58 (1.58-bit), 1-bit pretraining, AQLM (2-bit), VPTQ (2-bit), QuIP# (2-bit lattice), ternary, binary | yes |
-| `kv_cache` | KV cache compression: eviction (StreamingLLM, H2O), low-rank KV, KV-quant when the *main* contribution is the KV layout (otherwise → `ptq`), paged KV layout. | KIVI, KVQuant, WKVQuant, H2O, StreamingLLM | yes |
-| `pruning_distill` | Pruning, sparsity, or knowledge distillation. N:M sparsity, structured/unstructured pruning, MoE expert pruning, small-student-from-large-teacher KD, reasoning distillation. | Wanda, SparseGPT, LLM-Pruner, Sheared LLaMA, MiniLLM, DistillBERT-style | yes |
-| `diffusion` | **Quantization only** targeting diffusion or flow-matching backbones. Non-quantization efficiency work (step-distillation, pruning, sampling-trajectory tweaks, guidance methods, architecture redesign) → out of scope, hard_gate. | Q-Diffusion (INT4 PTQ), PTQ4DM, SVDQuant, DiRotQ | yes |
-| `survey` | Work that does **not** propose a new algorithm but produces actionable guidance for compression engineers via new measurement, comparison, or methodology. Pure review-article surveys with no new measurement still hard_gate. | "Measuring Maximum Activations in Open LLMs", "A Reproducibility Study of PTQ Methods on Llama-3", outlier-feature analysis across model families, RULER-style probes for diagnosing quant degradation | yes |
-| `trending` | **Render-only / manual-override bucket.** Reserved for high-heat hf_daily papers (heat > 10) that the seven LLM buckets above can't accept — typically speculative-decoding / parallel-decoding work with no compression angle that the team still wants to track (e.g. Orthrus, DFlash). Entries land here by post-hoc edits to `data/summarized/*.json`, never by LLM judgment. | Orthrus (dual-view diffusion parallel token gen), DFlash (block diffusion drafter for spec decoding) | **NO — never** |
+| bucket | description | examples |
+|---|---|---|
+| `ptq` | Post-training quantization. Weight-only / weight-activation / activation quant / KV-quant when the *primary* contribution is the PTQ recipe and **bit-width ≥ 3**. | GPTQ, AWQ, SmoothQuant, QuaRot, SpinQuant, OmniQuant, MXFP4 PTQ, NVFP4 calibration, W4A16, W4A8, W8A8, FP8 OCP, Hadamard rotation PTQ |
+| `low_bits` | Sub-3-bit (≤ 2-bit) quantization, **regardless of training method**. Takes priority over `ptq` / `qat` whenever weights are ≤ 2 bits. | BitNet b1.58 (1.58-bit), 1-bit pretraining, AQLM (2-bit), VPTQ (2-bit), QuIP# (2-bit lattice), ternary, binary |
+| `qat` | Quantization-aware training, or PTQ + finetune that requires gradient updates over the full network, with **bit-width ≥ 3**. | LLM-QAT, EfficientQAT, PB-LLM, FP8 QAT |
+| `kv_cache` | KV cache compression: eviction (StreamingLLM, H2O), low-rank KV, KV-quant when the *main* contribution is the KV layout (otherwise → `ptq`), paged KV layout. | KIVI, KVQuant, WKVQuant, H2O, StreamingLLM |
+| `pruning_distill` | Pruning, sparsity, or knowledge distillation. N:M sparsity, structured/unstructured pruning, MoE expert pruning, small-student-from-large-teacher KD, reasoning distillation. | Wanda, SparseGPT, LLM-Pruner, Sheared LLaMA, MiniLLM, DistillBERT-style |
+| `diffusion` | **Quantization only** targeting diffusion or flow-matching backbones. Non-quantization efficiency work (step-distillation, pruning, sampling-trajectory tweaks, guidance methods, architecture redesign) → out of scope, hard_gate. | Q-Diffusion (INT4 PTQ), PTQ4DM, SVDQuant, DiRotQ |
+| `survey` | Work that does **not** propose a new algorithm but produces actionable guidance for compression engineers via new measurement, comparison, or methodology. Pure review-article surveys with no new measurement still hard_gate. | "Measuring Maximum Activations in Open LLMs", "A Reproducibility Study of PTQ Methods on Llama-3", outlier-feature analysis across model families, RULER-style probes for diagnosing quant degradation |
+| `trending` | Compression-adjacent **decoding-acceleration** work without a direct compression algorithm — parallel decoding, dual-view diffusion drafters, spec-decoding frameworks that are conceptually close to compression but don't fit the seven strict buckets. Use sparingly; if a clean PTQ/QAT/KV/pruning fit exists, prefer that. Pure-architecture / world-model / non-LLM work is still hard_gate. | Orthrus (dual-view diffusion parallel token gen), DFlash (block diffusion drafter for spec decoding) |
 
 **Bit-width tie-break**: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 3-bit PTQ paper goes to `ptq`. A 1.58-bit ternary trained from scratch goes to `low_bits`, not `qat`.
 
 **Survey-vs-algorithm tie-break**: if the paper's primary contribution is a new algorithm (new loss, new rotation, new datatype, new calibration recipe), bucket by the algorithm even if the paper also contains broad benchmarking. The `survey` bucket is only for work whose primary contribution is the *measurement / comparison / methodology* itself.
 
-If a paper does not fit any of the seven LLM-pickable buckets cleanly, set `hard_gate=true` — there is no `other` bucket, and `trending` is **off-limits** to the LLM.
+If a paper does not fit any of the eight buckets cleanly, set `hard_gate=true` — there is no `other` bucket.
 
 # Signals to extract
 Pull from the abstract; use "unknown" if absent. Keep strings short.
 
-- compression_type: one of [ptq, qat, low_bits, kv_cache, pruning_distill, diffusion, survey]
+- compression_type: one of [ptq, low_bits, qat, kv_cache, pruning_distill, diffusion, survey, trending]
 - topic_bucket: same enum as compression_type
 - model_domain: one of [language, diffusion, vision, multimodal]
 - format_or_method: e.g. "W4A16", "MXFP4", "FP8 OCP", "2:4 sparsity", "GPTQ-variant", "Hadamard rotation", "1.58-bit ternary"

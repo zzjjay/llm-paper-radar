@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven LLM-classified topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), with an eighth render-only **Trending** bucket reserved for manual overrides of high-heat hf_daily papers that don't fit the seven, and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of eight topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology / Trending), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -493,7 +493,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 ### Topic buckets and per-bucket caps
 
-Seven LLM-classified buckets plus one render-only **`trending`** bucket (eight total). The LLM picks one of the seven; `trending` is reserved for post-hoc manual overrides of high-heat hf_daily papers and is never returned by the LLM. Papers that don't fit any LLM-pickable bucket are hard-gated rather than forced into a catch-all (no `other`). Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
+Eight LLM-pickable buckets — the first seven are strict compression buckets, `trending` is a soft catch-all for compression-adjacent decoding-acceleration work. Papers that don't fit any bucket are hard-gated rather than forced into a catch-all (no `other`). Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
 
 | bucket | cap | what goes here |
 |---|---|---|
@@ -504,7 +504,7 @@ Seven LLM-classified buckets plus one render-only **`trending`** bucket (eight t
 | **`pruning_distill`** | 3 | Pruning, sparsity, distillation **with a credible deployment path on existing kernels** (N:M structured, MoE expert pruning, layer drop, SFT-style KD). Unstructured-sparsity methods that depend on speculative GPU kernels → hard_gate. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
 | **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
 | **`survey`** | 3 | Methodology / measurement / cross-method comparison that doesn't propose a new algorithm but gives actionable guidance. Examples: empirical PTQ comparisons, activation/outlier bottleneck studies, LLM-evaluation methodology for compression. Pure review-article surveys still hard_gate. |
-| **`trending`** | 3 | **Render-only.** Manual-override target for high-heat hf_daily papers (heat > 10) that the seven LLM buckets can't accept — typically speculative/parallel decoding work the team wants to track. Examples: Orthrus, DFlash. |
+| **`trending`** | 3 | Compression-adjacent **decoding-acceleration** work without a direct compression algorithm — parallel/dual-view drafters, spec-decoding frameworks that don't fit the seven strict buckets. Soft catch-all; use sparingly. Routine EAGLE/Medusa variants still hard_gate. Examples: Orthrus, DFlash. |
 
 Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
 

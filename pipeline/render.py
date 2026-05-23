@@ -21,9 +21,10 @@ STAR_WEIGHT = 3.0
 STAR_BONUS_CAP = 25.0
 
 # Bucket enum. Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
-# `trending` is a render/curation-only bucket — the LLM never classifies into
-# it; entries get there via manual topic_bucket override (typically for
-# hf_daily-popular papers, heat > 10, that don't cleanly fit the other six).
+# `trending` is the soft 8th catch-all for compression-adjacent decoding-
+# acceleration work (parallel/dual-view drafters, etc.) that doesn't fit
+# the seven strict compression buckets; the LLM can pick it directly, and
+# it's also the landing spot for manual overrides of hf_daily-popular papers.
 BUCKET_ORDER = [
     "ptq",
     "low_bits",
