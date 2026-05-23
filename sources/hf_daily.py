@@ -63,6 +63,15 @@ class HFDailySource(Source):
                 "num_comments": paper_obj.get("numComments", item.get("numComments", 0)),
             }
 
+            # HF surfaces the official repo + star count directly in the API
+            # response; treat as a soft heat signal in render.heat_score.
+            github_repo = paper_obj.get("githubRepo")
+            github_stars = paper_obj.get("githubStars")
+            code_url = github_repo if isinstance(github_repo, str) and "github.com" in github_repo else None
+            code_meta = None
+            if code_url and isinstance(github_stars, int):
+                code_meta = {"stars": github_stars, "source": "hf_daily", "fetched_at": now}
+
             papers[arxiv_id] = Paper(
                 id=arxiv_id,
                 title=paper_obj.get("title", item.get("title", "")).strip(),
@@ -73,6 +82,8 @@ class HFDailySource(Source):
                 published_at=published_at,
                 primary_category="cs.CL",
                 categories=[],
+                code_url=code_url,
+                code_meta=code_meta,
                 sources=[SourceRecord(name="hf_daily", fetched_at=now, extras=extras)],
             )
 

@@ -32,6 +32,10 @@ class Paper(BaseModel):
     primary_category: str
     categories: list[str]
     code_url: str | None = None
+    # Populated by `pipeline.enrich_github` for papers with a known `code_url`.
+    # Shape: {"stars": int, "created_at": datetime, "fetched_at": datetime}.
+    # Used only as a soft signal in `render.heat_score`; never gated on.
+    code_meta: dict | None = None
 
     sources: list[SourceRecord]
 

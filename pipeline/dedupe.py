@@ -27,7 +27,7 @@ def merge_papers(papers: list[Paper], source_priority: list[str]) -> list[Paper]
         all_sources = [g.sources[0] for g in group]
         head.sources = all_sources
         for other in group_sorted[1:]:
-            for fld in ("title", "abstract", "pdf_url", "code_url"):
+            for fld in ("title", "abstract", "pdf_url", "code_url", "code_meta"):
                 if not getattr(head, fld) and getattr(other, fld):
                     setattr(head, fld, getattr(other, fld))
             if not head.authors and other.authors:

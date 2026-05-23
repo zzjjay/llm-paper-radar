@@ -14,6 +14,11 @@ from sources.base import Paper
 REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
 RELEVANCE_WEIGHT = 30
+# Star bonus = log(stars+1) * STAR_WEIGHT, capped at STAR_BONUS_CAP.
+# Tuned so that ~1k-star repo ≈ HF trending #5; framework repos (10k+) cap
+# out at 25 so they can't outweigh a 9/10 relevance paper (RELEVANCE_WEIGHT=30).
+STAR_WEIGHT = 3.0
+STAR_BONUS_CAP = 25.0
 
 # Bucket enum. Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
 # `trending` is a render/curation-only bucket — the LLM never classifies into
@@ -96,8 +101,19 @@ def _caps_summary(caps: dict[str, int]) -> str:
     return "，".join(parts)
 
 
+def _star_bonus(p: Paper) -> float:
+    """Capped log-scaled bonus from GitHub stars of the paper's official repo.
+    Only HF-sourced papers carry `code_meta.stars` today (HF API includes it
+    for free). arXiv/openreview/reddit-only papers contribute 0 here."""
+    meta = p.code_meta or {}
+    stars = meta.get("stars")
+    if not isinstance(stars, int) or stars <= 0:
+        return 0.0
+    return min(math.log(stars + 1) * STAR_WEIGHT, STAR_BONUS_CAP)
+
+
 def heat_score(p: Paper) -> float:
-    """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5.
+    """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5 + star_bonus.
     Trending bonus = 100/rank for rank 1..30, else 0."""
     trending_bonus = 0.0
     hf_upvotes = 0
@@ -112,7 +128,7 @@ def heat_score(p: Paper) -> float:
                 hf_upvotes = max(hf_upvotes, s.extras.get("upvotes", 0) or 0)
         elif s.name == "reddit":
             reddit_score = max(reddit_score, s.extras.get("score", 0) or 0)
-    return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5
+    return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5 + _star_bonus(p)
 
 
 def composite_score(p: Paper) -> float:

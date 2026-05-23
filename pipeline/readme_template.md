@@ -79,11 +79,12 @@ The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache �
 
 ```
 composite   = relevance_score × 30 + heat_score
-heat_score  = trending_bonus + hf_daily_upvotes + log(reddit_score + 1) × 5
-trending_bonus = 100 / hf_daily_rank   (rank 1..30, else 0)
+heat_score  = trending_bonus + hf_daily_upvotes + log(reddit_score + 1) × 5 + star_bonus
+trending_bonus = 100 / hf_daily_rank             (rank 1..30, else 0)
+star_bonus     = min(log(github_stars + 1) × 3, 25)
 ```
 
-`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. Tweak the weight via `RELEVANCE_WEIGHT` in [`pipeline/render.py`](pipeline/render.py).
+`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. `star_bonus` adds a soft signal when the paper has an official GitHub repo (read directly from HF's `githubStars` field, no API call): ~1k stars ≈ +21, capped at 25 so a popular framework repo can't outweigh a high-relevance paper. Papers without a known repo simply get 0 — never penalized. Tweak weights via `RELEVANCE_WEIGHT`, `STAR_WEIGHT`, `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py).
 
 ### 👤 Watched authors
 
