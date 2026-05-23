@@ -61,8 +61,12 @@ def test_per_bucket_override_wins_over_default():
     assert len(grouped["qat"]) == 1
 
 
-def test_bucket_order_matches_seven_bucket_enum():
-    """Ensure render's BUCKET_ORDER stays in sync with prompts/relevance.md."""
+def test_bucket_order_matches_bucket_enum():
+    """Ensure render's BUCKET_ORDER stays in sync with prompts/relevance.md.
+
+    `trending` is render-only (manual override target) and not part of the
+    LLM classification enum, but it still belongs in BUCKET_ORDER so the
+    renderer can emit a Trending section."""
     from pipeline.render import BUCKET_ORDER
 
     expected = {
@@ -73,5 +77,6 @@ def test_bucket_order_matches_seven_bucket_enum():
         "pruning_distill",
         "diffusion",
         "survey",
+        "trending",
     }
     assert set(BUCKET_ORDER) == expected

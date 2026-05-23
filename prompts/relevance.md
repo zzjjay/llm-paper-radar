@@ -73,6 +73,8 @@ Always hard_gate if any of these apply:
 
 If a paper does not fit any of the seven buckets cleanly, set `hard_gate=true` — there is no `other` bucket.
 
+**Note on `trending`**: the renderer also has a `trending` bucket, but it is **render-only**. It exists for manual overrides of high-heat hf_daily papers (heat > 10) that the seven-bucket scheme can't accept (e.g. speculative-decoding work with no compression angle but the team wants to track). The LLM must never classify into `trending` — keep using the seven enum values above and let `hard_gate=true` do its job; overrides happen post-hoc in `data/summarized/*.json`.
+
 # Signals to extract
 Pull from the abstract; use "unknown" if absent. Keep strings short.
 

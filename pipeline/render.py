@@ -15,7 +15,10 @@ REPO_URL = "https://github.com/zhaolin-amd/llm-paper-radar"
 TRENDING_BONUS_CAP = 30
 RELEVANCE_WEIGHT = 30
 
-# Bucket enum (seven). Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
+# Bucket enum. Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
+# `trending` is a render/curation-only bucket — the LLM never classifies into
+# it; entries get there via manual topic_bucket override (typically for
+# hf_daily-popular papers, heat > 10, that don't cleanly fit the other six).
 BUCKET_ORDER = [
     "ptq",
     "low_bits",
@@ -24,6 +27,7 @@ BUCKET_ORDER = [
     "pruning_distill",
     "diffusion",
     "survey",
+    "trending",
 ]
 BUCKET_TITLES = {
     "ptq": "PTQ",
@@ -33,6 +37,7 @@ BUCKET_TITLES = {
     "pruning_distill": "Pruning & distillation",
     "diffusion": "Diffusion compression",
     "survey": "Survey",
+    "trending": "Trending",
 }
 # Detail-page section headers — tech terms stay English, glue words Chinese.
 BUCKET_TITLES_CN = {
@@ -43,6 +48,7 @@ BUCKET_TITLES_CN = {
     "pruning_distill": "Pruning / 蒸馏",
     "diffusion": "Diffusion 压缩",
     "survey": "Survey / 方法论与对比",
+    "trending": "Trending / 高热度但未归桶",
 }
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not

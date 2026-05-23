@@ -463,8 +463,8 @@ A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview
 | 436 | Survey | [Direction-Preserving Number Representations](https://arxiv.org/abs/2605.07662) | Bardia Zadeh, George A. Constantinides | 2026-05-08 | [📄](digests/2026-05-08.md#p-2605-07662) |
 | 437 | Survey | [Compressed code: the hidden effects of quantization and distillation on programming tokens](https://arxiv.org/abs/2601.02563) | Viacheslav Siniaev, Iaroslav Chelombitko, Aleksey Komissarov | 2026-01-05 | [📄](digests/2026-01-05.md#p-2601-02563) |
 | 438 | Survey | [Can Large Language Models Still Explain Themselves? Investigating the Impact of Quantization on Self-Explanations](https://arxiv.org/abs/2601.00282) | Qianli Wang, Nils Feldhus, Pepa Atanasova et al. | 2026-01-01 | [📄](digests/2026-01-01.md#p-2601-00282) |
-| 439 | Survey | [Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion](https://arxiv.org/abs/2605.12825) 🔁 | Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham et al. | 2026-05-12 | [📄](digests/2025-11-22.md#p-2605-12825) |
-| 440 | ? speculative_decoding | [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) 🔁 | Jian Chen, Yesheng Liang, Zhijian Liu | 2026-02-05 | [📄](digests/2025-11-22.md#p-2602-06036) |
+| 439 | Trending | [Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion](https://arxiv.org/abs/2605.12825) 🔁 | Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham et al. | 2026-05-12 | [📄](digests/2025-11-22.md#p-2605-12825) |
+| 440 | Trending | [DFlash: Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036) 🔁 | Jian Chen, Yesheng Liang, Zhijian Liu | 2026-02-05 | [📄](digests/2025-11-22.md#p-2602-06036) |
 
 
 <!-- LATEST_END -->
