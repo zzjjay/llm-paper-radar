@@ -353,7 +353,7 @@
 
 - [11-23](digests/2025-11-23.md) — 164 scanned, 1 passed, top: Kitty: Accurate and Efficient 2-bit KV Cache Quant
 
-- [11-22](digests/2025-11-22.md) — 50 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-22](digests/2025-11-22.md) — 50 scanned, 2 passed, top: DFlash: Block Diffusion for Flash Speculative Deco
 
 - [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
