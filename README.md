@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven fixed topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of seven LLM-classified topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology), with an eighth render-only **Trending** bucket reserved for manual overrides of high-heat hf_daily papers that don't fit the seven, and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -493,7 +493,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 ### Topic buckets and per-bucket caps
 
-The seven buckets are **fixed** — no `other`. Papers that don't fit are hard-gated rather than forced into a catch-all. Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
+Seven LLM-classified buckets plus one render-only **`trending`** bucket (eight total). The LLM picks one of the seven; `trending` is reserved for post-hoc manual overrides of high-heat hf_daily papers and is never returned by the LLM. Papers that don't fit any LLM-pickable bucket are hard-gated rather than forced into a catch-all (no `other`). Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
 
 | bucket | cap | what goes here |
 |---|---|---|
@@ -504,6 +504,7 @@ The seven buckets are **fixed** — no `other`. Papers that don't fit are hard-g
 | **`pruning_distill`** | 3 | Pruning, sparsity, distillation **with a credible deployment path on existing kernels** (N:M structured, MoE expert pruning, layer drop, SFT-style KD). Unstructured-sparsity methods that depend on speculative GPU kernels → hard_gate. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
 | **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
 | **`survey`** | 3 | Methodology / measurement / cross-method comparison that doesn't propose a new algorithm but gives actionable guidance. Examples: empirical PTQ comparisons, activation/outlier bottleneck studies, LLM-evaluation methodology for compression. Pure review-article surveys still hard_gate. |
+| **`trending`** | 3 | **Render-only.** Manual-override target for high-heat hf_daily papers (heat > 10) that the seven LLM buckets can't accept — typically speculative/parallel decoding work the team wants to track. Examples: Orthrus, DFlash. |
 
 Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
 
@@ -513,7 +514,7 @@ In the README compact view, *every* surviving paper appears in the main table (n
 
 ### Table ordering
 
-The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey), then within each bucket by a composite score:
+The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey → Trending), then within each bucket by a composite score:
 
 ```
 composite   = relevance_score × 30 + heat_score
@@ -644,7 +645,7 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 | `filter.model` | `claude-sonnet-4-6` | scoring model; drop to `claude-haiku-4-5` if cost matters more than judgement quality |
 | `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
 | `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
-| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
+| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, trending: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
 | `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.arxiv_authors.window_days` | 7 | default fetch window for watched-authors source (CLI `--window-days` overrides) |

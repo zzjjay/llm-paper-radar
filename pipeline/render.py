@@ -57,9 +57,9 @@ BUCKET_TITLES_CN = {
 }
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
-# one of the six valid values. These papers should have been hard-gated by
-# the LLM, but defensively we still surface them in the compact table while
-# excluding them from the bucketed "Highlights" section.
+# one of the eight valid values in BUCKET_ORDER. These papers should have
+# been hard-gated by the LLM, but defensively we still surface them in the
+# compact table while excluding them from the bucketed "Highlights" section.
 UNBUCKETED = "_unbucketed"
 
 
@@ -404,8 +404,8 @@ def _group_with_caps(
     papers: list[Paper], topic_caps: dict[str, int]
 ) -> dict[str, list[Paper]]:
     """Bucket sorted papers and apply per-bucket caps. Input order is preserved.
-    Papers whose bucket is not one of the six valid values are dropped from
-    the bucketed view (they still appear in the compact table)."""
+    Papers whose bucket is not one of the eight valid values in BUCKET_ORDER
+    are dropped from the bucketed view (they still appear in the compact table)."""
     grouped: dict[str, list[Paper]] = {b: [] for b in BUCKET_ORDER}
     for p in papers:
         b = _bucket_of(p)
