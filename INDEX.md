@@ -5,13 +5,13 @@
 - [05-13](digests/2026-05-13.md) — 451 scanned, 8 passed, top: SPHERICAL KV: Angle-Domain Attention and Rate-Dist
 - [05-14](digests/2026-05-14.md) — 382 scanned, 1 passed, top: Minimal-Intervention KV Retention via Set-Conditio
 
-- [05-17](digests/2026-05-17.md) — 127 scanned, 2 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
+- [05-17](digests/2026-05-17.md) — 177 scanned, 2 passed, top: TriAxialKV: Toward Extreme Low-Precision KV-Cache 
 
 - [05-18](digests/2026-05-18.md) — 188 scanned, 2 passed, top: VeriCache: Turning Lossy KV Cache into Lossless LL
 
 - [05-19](digests/2026-05-19.md) — 291 scanned, 5 passed, top: Measuring Maximum Activations in Open Large Langua
 
-- [05-16](digests/2026-05-16.md) — 245 scanned, 4 passed, top: Measuring Maximum Activations in Open Large Langua
+- [05-16](digests/2026-05-16.md) — 295 scanned, 4 passed, top: Measuring Maximum Activations in Open Large Langua
 
 - [05-15](digests/2026-05-15.md) — 296 scanned, 2 passed, top: BEAM: Binary Expert Activation Masking for Dynamic
 
@@ -55,7 +55,7 @@
 
 - [04-21](digests/2026-04-21.md) — 308 scanned, 5 passed, top: SAW-INT4: System-Aware 4-Bit KV-Cache Quantization
 
-- [04-20](digests/2026-04-20.md) — 78 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [04-20](digests/2026-04-20.md) — 381 scanned, 6 passed, top: GSQ: Highly-Accurate Low-Precision Scalar Quantiza
 
 - [04-19](digests/2026-04-19.md) — 180 scanned, 1 passed, top: Predictive Multi-Tier Memory Management for KV Cac
 
@@ -171,194 +171,196 @@
 
 - [02-22](digests/2026-02-22.md) — 152 scanned, 0 passed, top: (no papers passed)
 
-- [02-21](digests/2026-02-21.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-21](digests/2026-02-21.md) — 50 scanned, 0 passed, top: (no papers passed)
 
-- [02-20](digests/2026-02-20.md) — 73 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-20](digests/2026-02-20.md) — 73 scanned, 0 passed, top: (no papers passed)
 
-- [02-19](digests/2026-02-19.md) — 71 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-19](digests/2026-02-19.md) — 71 scanned, 0 passed, top: (no papers passed)
 
-- [02-18](digests/2026-02-18.md) — 75 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-18](digests/2026-02-18.md) — 75 scanned, 0 passed, top: (no papers passed)
 
-- [02-17](digests/2026-02-17.md) — 86 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-17](digests/2026-02-17.md) — 288 scanned, 3 passed, top: 1-Bit Wonder: Improving QAT Performance in the Low
 
-- [02-16](digests/2026-02-16.md) — 82 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-16](digests/2026-02-16.md) — 288 scanned, 5 passed, top: BPDQ: Bit-Plane Decomposition Quantization on a Va
 
-- [02-15](digests/2026-02-15.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-15](digests/2026-02-15.md) — 158 scanned, 1 passed, top: QuRL: Efficient Reinforcement Learning with Quanti
 
-- [02-14](digests/2026-02-14.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-14](digests/2026-02-14.md) — 146 scanned, 0 passed, top: (no papers passed)
 
-- [02-13](digests/2026-02-13.md) — 91 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-13](digests/2026-02-13.md) — 91 scanned, 0 passed, top: (no papers passed)
 
-- [02-12](digests/2026-02-12.md) — 98 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-12](digests/2026-02-12.md) — 365 scanned, 2 passed, top: Extending Puzzle for Mixture-of-Experts Reasoning 
 
-- [02-11](digests/2026-02-11.md) — 100 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-11](digests/2026-02-11.md) — 414 scanned, 3 passed, top: SnapMLA: Efficient Long-Context MLA Decoding via H
 
-- [02-10](digests/2026-02-10.md) — 100 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-10](digests/2026-02-10.md) — 394 scanned, 6 passed, top: Is Retraining-Free Enough? The Necessity of Router
 
-- [02-09](digests/2026-02-09.md) — 93 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [02-09](digests/2026-02-09.md) — 414 scanned, 12 passed, top: CompilerKV: Risk-Adaptive KV Compression via Offli
 
-- [02-08](digests/2026-02-08.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [02-08](digests/2026-02-08.md) — 166 scanned, 2 passed, top: DeltaKV: Residual-Based KV Cache Compression via L
 
-- [02-07](digests/2026-02-07.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [02-07](digests/2026-02-07.md) — 182 scanned, 5 passed, top: ParisKV: Fast and Drift-Robust KV-Cache Retrieval 
 
-- [02-06](digests/2026-02-06.md) — 47 scanned, 0 passed, top: (no papers passed)
+- [02-06](digests/2026-02-06.md) — 372 scanned, 3 passed, top: NanoQuant: Efficient Sub-1-Bit Quantization of Lar
 
-- [02-05](digests/2026-02-05.md) — 50 scanned, 4 passed, top: FASA: Frequency-aware Sparse Attention
+- [02-05](digests/2026-02-05.md) — 407 scanned, 6 passed, top: FASA: Frequency-aware Sparse Attention
 
-- [02-04](digests/2026-02-04.md) — 50 scanned, 4 passed, top: LycheeDecode: Accelerating Long-Context LLM Infere
+- [02-04](digests/2026-02-04.md) — 454 scanned, 8 passed, top: TurboBoA: Faster and Exact Attention-aware Quantiz
 
-- [02-03](digests/2026-02-03.md) — 50 scanned, 3 passed, top: Fast Autoregressive Video Diffusion and World Mode
+- [02-03](digests/2026-02-03.md) — 476 scanned, 9 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
 
-- [02-02](digests/2026-02-02.md) — 41 scanned, 2 passed, top: Quartet II: Accurate LLM Pre-Training in NVFP4 by 
+- [02-02](digests/2026-02-02.md) — 561 scanned, 13 passed, top: Quartet II: Accurate LLM Pre-Training in NVFP4 by 
 
-- [02-01](digests/2026-02-01.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [02-01](digests/2026-02-01.md) — 236 scanned, 5 passed, top: SFMP: Fine-Grained, Hardware-Friendly and Search-F
 
-- [01-31](digests/2026-01-31.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-31](digests/2026-01-31.md) — 244 scanned, 1 passed, top: QuantLRM: Quantization of Large Reasoning Models v
 
-- [01-30](digests/2026-01-30.md) — 45 scanned, 2 passed, top: ECO: Quantized Training without Full-Precision Mas
+- [01-30](digests/2026-01-30.md) — 449 scanned, 10 passed, top: Unveiling the Potential of Quantization with MXFP4
 
-- [01-29](digests/2026-01-29.md) — 22 scanned, 1 passed, top: FP8-RL: A Practical and Stable Low-Precision Stack
+- [01-29](digests/2026-01-29.md) — 491 scanned, 9 passed, top: HeRo-Q: A General Framework for Stable Low Bit Qua
 
-- [01-28](digests/2026-01-28.md) — 21 scanned, 0 passed, top: (no papers passed)
+- [01-28](digests/2026-01-28.md) — 327 scanned, 2 passed, top: Enhancing Post-Training Quantization via Future Ac
 
-- [01-27](digests/2026-01-27.md) — 40 scanned, 1 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
+- [01-27](digests/2026-01-27.md) — 339 scanned, 6 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
 
-- [01-26](digests/2026-01-26.md) — 18 scanned, 1 passed, top: Jet-RL: Enabling On-Policy FP8 Reinforcement Learn
+- [01-26](digests/2026-01-26.md) — 303 scanned, 4 passed, top: Is Finer Better? The Limits of Microscaling Format
 
-- [01-25](digests/2026-01-25.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-25](digests/2026-01-25.md) — 147 scanned, 1 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
 
-- [01-24](digests/2026-01-24.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-24](digests/2026-01-24.md) — 151 scanned, 0 passed, top: (no papers passed)
 
-- [01-23](digests/2026-01-23.md) — 27 scanned, 1 passed, top: HERMES: KV Cache as Hierarchical Memory for Effici
+- [01-23](digests/2026-01-23.md) — 265 scanned, 0 passed, top: (no papers passed)
 
-- [01-22](digests/2026-01-22.md) — 26 scanned, 0 passed, top: (no papers passed)
+- [01-22](digests/2026-01-22.md) — 212 scanned, 0 passed, top: (no papers passed)
 
-- [01-21](digests/2026-01-21.md) — 32 scanned, 1 passed, top: Which Reasoning Trajectories Teach Students to Rea
+- [01-21](digests/2026-01-21.md) — 283 scanned, 2 passed, top: What Makes Low-Bit Quantization-Aware Training Wor
 
-- [01-20](digests/2026-01-20.md) — 11 scanned, 0 passed, top: (no papers passed)
+- [01-20](digests/2026-01-20.md) — 296 scanned, 4 passed, top: Jet-RL: Enabling On-Policy FP8 Reinforcement Learn
 
-- [01-19](digests/2026-01-19.md) — 22 scanned, 0 passed, top: (no papers passed)
+- [01-19](digests/2026-01-19.md) — 272 scanned, 0 passed, top: (no papers passed)
 
-- [01-18](digests/2026-01-18.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-18](digests/2026-01-18.md) — 147 scanned, 0 passed, top: (no papers passed)
 
-- [01-17](digests/2026-01-17.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-17](digests/2026-01-17.md) — 136 scanned, 1 passed, top: Preserving Fairness and Safety in Quantized LLMs T
 
-- [01-16](digests/2026-01-16.md) — 38 scanned, 1 passed, top: Transition Matching Distillation for Fast Video Ge
+- [01-16](digests/2026-01-16.md) — 267 scanned, 2 passed, top: MHA2MLA-VLM: Enabling DeepSeek's Economical Multi-
 
-- [01-15](digests/2026-01-15.md) — 27 scanned, 1 passed, top: Distribution-Aligned Sequence Distillation for Sup
+- [01-15](digests/2026-01-15.md) — 260 scanned, 0 passed, top: (no papers passed)
 
-- [01-14](digests/2026-01-14.md) — 24 scanned, 2 passed, top: Ministral 3
+- [01-14](digests/2026-01-14.md) — 262 scanned, 5 passed, top: Ministral 3
 
-- [01-13](digests/2026-01-13.md) — 42 scanned, 1 passed, top: GlimpRouter: Efficient Collaborative Inference by 
+- [01-13](digests/2026-01-13.md) — 282 scanned, 2 passed, top: Ministral 3
 
-- [01-12](digests/2026-01-12.md) — 31 scanned, 0 passed, top: (no papers passed)
+- [01-12](digests/2026-01-12.md) — 298 scanned, 5 passed, top: ARCQuant: Boosting NVFP4 Quantization with Augment
 
-- [01-11](digests/2026-01-11.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-11](digests/2026-01-11.md) — 147 scanned, 2 passed, top: Garbage Attention in Large Language Models: BOS Si
 
-- [01-10](digests/2026-01-10.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-10](digests/2026-01-10.md) — 151 scanned, 0 passed, top: (no papers passed)
 
-- [01-09](digests/2026-01-09.md) — 33 scanned, 2 passed, top: ReHyAt: Recurrent Hybrid Attention for Video Diffu
+- [01-09](digests/2026-01-09.md) — 255 scanned, 1 passed, top: FLRQ: Faster LLM Quantization with Flexible Low-Ra
 
-- [01-08](digests/2026-01-08.md) — 20 scanned, 0 passed, top: (no papers passed)
+- [01-08](digests/2026-01-08.md) — 294 scanned, 1 passed, top: Sparsity-Aware Low-Rank Representation for Efficie
 
-- [01-07](digests/2026-01-07.md) — 27 scanned, 0 passed, top: (no papers passed)
+- [01-07](digests/2026-01-07.md) — 324 scanned, 0 passed, top: (no papers passed)
 
-- [01-06](digests/2026-01-06.md) — 25 scanned, 0 passed, top: (no papers passed)
+- [01-06](digests/2026-01-06.md) — 290 scanned, 4 passed, top: Joint Encoding of KV-Cache Blocks for Scalable LLM
 
-- [01-05](digests/2026-01-05.md) — 15 scanned, 0 passed, top: (no papers passed)
+- [01-05](digests/2026-01-05.md) — 234 scanned, 2 passed, top: Crystal-KV: Efficient KV Cache Management for Chai
 
-- [01-04](digests/2026-01-04.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-04](digests/2026-01-04.md) — 138 scanned, 0 passed, top: (no papers passed)
 
-- [01-03](digests/2026-01-03.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [01-03](digests/2026-01-03.md) — 138 scanned, 0 passed, top: (no papers passed)
 
-- [01-02](digests/2026-01-02.md) — 7 scanned, 0 passed, top: (no papers passed)
+- [01-02](digests/2026-01-02.md) — 126 scanned, 0 passed, top: (no papers passed)
 
-- [01-01](digests/2026-01-01.md) — 20 scanned, 0 passed, top: (no papers passed)
+- [01-01](digests/2026-01-01.md) — 153 scanned, 1 passed, top: Can Large Language Models Still Explain Themselves
 
-- [12-31](digests/2025-12-31.md) — 7 scanned, 0 passed, top: (no papers passed)
+- [12-31](digests/2025-12-31.md) — 186 scanned, 2 passed, top: More Than Bits: Multi-Envelope Double Binary Facto
 
-- [12-30](digests/2025-12-30.md) — 31 scanned, 2 passed, top: LiveTalk: Real-Time Multimodal Interactive Video D
+- [12-30](digests/2025-12-30.md) — 198 scanned, 1 passed, top: OptRot: Mitigating Weight Outliers via Data-Free R
 
-- [12-29](digests/2025-12-29.md) — 15 scanned, 0 passed, top: (no papers passed)
+- [12-29](digests/2025-12-29.md) — 216 scanned, 0 passed, top: (no papers passed)
 
-- [12-28](digests/2025-12-28.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-28](digests/2025-12-28.md) — 138 scanned, 2 passed, top: Improving Generalization in LLM Structured Pruning
 
-- [12-27](digests/2025-12-27.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-27](digests/2025-12-27.md) — 122 scanned, 1 passed, top: Fragile Knowledge, Robust Instruction-Following: T
 
-- [12-26](digests/2025-12-26.md) — 7 scanned, 0 passed, top: (no papers passed)
+- [12-26](digests/2025-12-26.md) — 135 scanned, 1 passed, top: TimeBill: Time-Budgeted Inference for Large Langua
 
-- [12-25](digests/2025-12-25.md) — 17 scanned, 2 passed, top: TurboDiffusion: Accelerating Video Diffusion Model
+- [12-25](digests/2025-12-25.md) — 150 scanned, 1 passed, top: Rethinking Output Alignment For 1-bit Post-Trainin
 
-- [12-24](digests/2025-12-24.md) — 19 scanned, 0 passed, top: (no papers passed)
+- [12-24](digests/2025-12-24.md) — 185 scanned, 1 passed, top: Distilling the Essence: Efficient Reasoning Distil
 
-- [12-23](digests/2025-12-23.md) — 24 scanned, 0 passed, top: (no papers passed)
+- [12-23](digests/2025-12-23.md) — 175 scanned, 0 passed, top: (no papers passed)
 
-- [12-22](digests/2025-12-22.md) — 22 scanned, 0 passed, top: (no papers passed)
+- [12-22](digests/2025-12-22.md) — 245 scanned, 2 passed, top: MixKVQ: Query-Aware Mixed-Precision KV Cache Quant
 
-- [12-21](digests/2025-12-21.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-21](digests/2025-12-21.md) — 118 scanned, 0 passed, top: (no papers passed)
 
-- [12-20](digests/2025-12-20.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-20](digests/2025-12-20.md) — 130 scanned, 1 passed, top: MoE Pathfinder: Trajectory-driven Expert Pruning
 
-- [12-19](digests/2025-12-19.md) — 38 scanned, 0 passed, top: (no papers passed)
+- [12-19](digests/2025-12-19.md) — 261 scanned, 2 passed, top: CodeGEMM: A Codebook-Centric Approach to Efficient
 
-- [12-18](digests/2025-12-18.md) — 31 scanned, 0 passed, top: (no papers passed)
+- [12-18](digests/2025-12-18.md) — 251 scanned, 2 passed, top: Bandwidth-Efficient Adaptive Mixture-of-Experts vi
 
-- [12-17](digests/2025-12-17.md) — 39 scanned, 0 passed, top: (no papers passed)
+- [12-17](digests/2025-12-17.md) — 281 scanned, 1 passed, top: CTkvr: KV Cache Retrieval for Long-Context LLMs vi
 
-- [12-16](digests/2025-12-16.md) — 41 scanned, 1 passed, top: Few-Step Distillation for Text-to-Image Generation
+- [12-16](digests/2025-12-16.md) — 246 scanned, 3 passed, top: EVICPRESS: Joint KV-Cache Compression and Eviction
 
-- [12-15](digests/2025-12-15.md) — 21 scanned, 1 passed, top: Fairy2i: Training Complex LLMs from Real LLMs with
+- [12-15](digests/2025-12-15.md) — 279 scanned, 4 passed, top: Fairy2i: Training Complex LLMs from Real LLMs with
 
-- [12-14](digests/2025-12-14.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-14](digests/2025-12-14.md) — 156 scanned, 1 passed, top: Resting Neurons, Active Insights: Robustifying Act
 
-- [12-13](digests/2025-12-13.md) — 0 scanned, 0 passed, top: (no papers passed)
+- [12-13](digests/2025-12-13.md) — 140 scanned, 0 passed, top: (no papers passed)
 
-- [12-12](digests/2025-12-12.md) — 25 scanned, 0 passed, top: (no papers passed)
+- [12-12](digests/2025-12-12.md) — 222 scanned, 2 passed, top: Hold Onto That Thought: Assessing KV Cache Compres
 
-- [12-11](digests/2025-12-11.md) — 22 scanned, 0 passed, top: (no papers passed)
+- [12-11](digests/2025-12-11.md) — 241 scanned, 2 passed, top: SparseSwaps: Tractable LLM Pruning Mask Refinement
 
-- [12-10](digests/2025-12-10.md) — 27 scanned, 2 passed, top: MemLoRA: Distilling Expert Adapters for On-Device 
+- [12-10](digests/2025-12-10.md) — 248 scanned, 1 passed, top: Training-free Context-adaptive Attention for Effic
 
-- [12-09](digests/2025-12-09.md) — 32 scanned, 0 passed, top: (no papers passed)
+- [12-09](digests/2025-12-09.md) — 233 scanned, 0 passed, top: (no papers passed)
 
-- [12-08](digests/2025-12-08.md) — 24 scanned, 2 passed, top: TwinFlow: Realizing One-step Generation on Large M
+- [12-08](digests/2025-12-08.md) — 269 scanned, 2 passed, top: Leveraging KV Similarity for Online Structured Pru
 
-- [12-07](digests/2025-12-07.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-07](digests/2025-12-07.md) — 166 scanned, 0 passed, top: (no papers passed)
 
-- [12-06](digests/2025-12-06.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-06](digests/2025-12-06.md) — 124 scanned, 0 passed, top: (no papers passed)
 
-- [12-05](digests/2025-12-05.md) — 88 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-05](digests/2025-12-05.md) — 257 scanned, 3 passed, top: SignRoundV2: Closing the Performance Gap in Extrem
 
-- [12-04](digests/2025-12-04.md) — 76 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-04](digests/2025-12-04.md) — 243 scanned, 3 passed, top: SignRoundV2: Toward Closing the Performance Gap in
 
-- [12-03](digests/2025-12-03.md) — 98 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-03](digests/2025-12-03.md) — 295 scanned, 4 passed, top: Data-Free Pruning of Self-Attention Layers in LLMs
 
-- [12-02](digests/2025-12-02.md) — 97 scanned, 4 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-02](digests/2025-12-02.md) — 290 scanned, 1 passed, top: Fairy2i: Training Complex LLMs from Real LLMs with
 
-- [12-01](digests/2025-12-01.md) — 82 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [12-01](digests/2025-12-01.md) — 326 scanned, 6 passed, top: KV Pareto: Systems-Level Optimization of KV Cache 
 
-- [11-30](digests/2025-11-30.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-30](digests/2025-11-30.md) — 162 scanned, 2 passed, top: WUSH: Near-Optimal Adaptive Transforms for LLM Qua
 
-- [11-29](digests/2025-11-29.md) — 50 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-29](digests/2025-11-29.md) — 163 scanned, 1 passed, top: G-KV: Decoding-Time KV Cache Eviction with Global 
 
-- [11-28](digests/2025-11-28.md) — 57 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-28](digests/2025-11-28.md) — 221 scanned, 1 passed, top: TWEO: Transformers Without Extreme Outliers Enable
 
-- [11-27](digests/2025-11-27.md) — 70 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-27](digests/2025-11-27.md) — 232 scanned, 2 passed, top: Outlier Smoothing with Closed-Form Rotations for W
 
-- [11-26](digests/2025-11-26.md) — 83 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-26](digests/2025-11-26.md) — 298 scanned, 0 passed, top: (no papers passed)
 
-- [11-25](digests/2025-11-25.md) — 81 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-25](digests/2025-11-25.md) — 303 scanned, 2 passed, top: EfficientXpert: Efficient Domain Adaptation for La
 
-- [11-24](digests/2025-11-24.md) — 74 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-24](digests/2025-11-24.md) — 261 scanned, 4 passed, top: CafeQ: Calibration-free Quantization via Learned T
 
-- [11-23](digests/2025-11-23.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-23](digests/2025-11-23.md) — 164 scanned, 1 passed, top: Kitty: Accurate and Efficient 2-bit KV Cache Quant
 
-- [11-22](digests/2025-11-22.md) — 50 scanned, 1 passed, top: SANA-Video: Efficient Video Generation with Block 
+- [11-22](digests/2025-11-22.md) — 50 scanned, 3 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [11-21](digests/2025-11-21.md) — 72 scanned, 2 passed, top: SANA-Video: Efficient Video Generation with Block 
 
 - [05-20](digests/2026-05-20.md) — 261 scanned, 4 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
 
-- [05-21](digests/2026-05-21.md) — 29 scanned, 3 passed, top: OScaR: The Occam's Razor for Extreme KV Cache Quan
+- [05-21](digests/2026-05-21.md) — 344 scanned, 5 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
 
-- [05-22](digests/2026-05-22.md) — 34 scanned, 1 passed, top: KVServe: Service-Aware KV Cache Compression for Co
+- [05-22](digests/2026-05-22.md) — 273 scanned, 1 passed, top: KVServe: Service-Aware KV Cache Compression for Co
+
+- [05-23](digests/2026-05-23.md) — 65 scanned, 3 passed, top: Quantization-Aware Distillation for NVFP4 Inferenc
