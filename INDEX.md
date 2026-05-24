@@ -3,7 +3,7 @@
 - [05-11](digests/2026-05-11.md) — 550 scanned, 7 passed, top: ADMM-Q: An Improved Hessian-based Weight Quantizer
 - [05-12](digests/2026-05-12.md) — 519 scanned, 5 passed, top: Search Your Block Floating Point Scales!
 - [05-13](digests/2026-05-13.md) — 498 scanned, 4 passed, top: SPHERICAL KV: Angle-Domain Attention and Rate-Dist
-- [05-14](digests/2026-05-14.md) — 432 scanned, 3 passed, top: Minimal-Intervention KV Retention via Set-Conditio
+- [05-14](digests/2026-05-14.md) — 432 scanned, 2 passed, top: Minimal-Intervention KV Retention via Set-Conditio
 
 - [05-17](digests/2026-05-17.md) — 203 scanned, 2 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
@@ -19,9 +19,9 @@
 
 - [05-09](digests/2026-05-09.md) — 294 scanned, 6 passed, top: AAAC: Activation-Aware Adaptive Codebooks for 4-bi
 
-- [05-08](digests/2026-05-08.md) — 556 scanned, 5 passed, top: Finer is Better (with the Right Scaling)
+- [05-08](digests/2026-05-08.md) — 556 scanned, 4 passed, top: Finer is Better (with the Right Scaling)
 
-- [05-07](digests/2026-05-07.md) — 574 scanned, 7 passed, top: Layer Collapse in Diffusion Language Models
+- [05-07](digests/2026-05-07.md) — 574 scanned, 6 passed, top: Layer Collapse in Diffusion Language Models
 
 - [05-06](digests/2026-05-06.md) — 352 scanned, 1 passed, top: OSAQ: Outlier Self-Absorption for Accurate Low-bit
 
@@ -31,9 +31,9 @@
 
 - [05-03](digests/2026-05-03.md) — 179 scanned, 1 passed, top: What Single-Prompt Accuracy Misses: A Multi-Varian
 
-- [05-02](digests/2026-05-02.md) — 173 scanned, 2 passed, top: MTA: Multi-Granular Trajectory Alignment for Large
+- [05-02](digests/2026-05-02.md) — 173 scanned, 1 passed, top: MTA: Multi-Granular Trajectory Alignment for Large
 
-- [05-01](digests/2026-05-01.md) — 302 scanned, 4 passed, top: BWLA: Breaking the Barrier of W1AX Post-Training Q
+- [05-01](digests/2026-05-01.md) — 302 scanned, 3 passed, top: BWLA: Breaking the Barrier of W1AX Post-Training Q
 
 - [04-30](digests/2026-04-30.md) — 310 scanned, 0 passed, top: (no papers passed)
 
@@ -45,7 +45,7 @@
 
 - [04-26](digests/2026-04-26.md) — 144 scanned, 0 passed, top: (no papers passed)
 
-- [04-25](digests/2026-04-25.md) — 146 scanned, 1 passed, top: Scaling Multi-Node Mixture-of-Experts Inference Us
+- [04-25](digests/2026-04-25.md) — 146 scanned, 0 passed, top: (no papers passed)
 
 - [04-24](digests/2026-04-24.md) — 248 scanned, 1 passed, top: Hybrid Policy Distillation for LLMs
 
@@ -53,7 +53,7 @@
 
 - [04-22](digests/2026-04-22.md) — 330 scanned, 6 passed, top: RateQuant: Optimal Mixed-Precision KV Cache Quanti
 
-- [04-21](digests/2026-04-21.md) — 309 scanned, 5 passed, top: SAW-INT4: System-Aware 4-Bit KV-Cache Quantization
+- [04-21](digests/2026-04-21.md) — 309 scanned, 3 passed, top: SAW-INT4: System-Aware 4-Bit KV-Cache Quantization
 
 - [04-20](digests/2026-04-20.md) — 382 scanned, 6 passed, top: GSQ: Highly-Accurate Low-Precision Scalar Quantiza
 
@@ -103,13 +103,13 @@
 
 - [03-28](digests/2026-03-28.md) — 137 scanned, 1 passed, top: ScoutAttention: Efficient KV Cache Offloading via 
 
-- [03-27](digests/2026-03-27.md) — 282 scanned, 2 passed, top: When Perplexity Lies: Generation-Focused Distillat
+- [03-27](digests/2026-03-27.md) — 282 scanned, 1 passed, top: When Perplexity Lies: Generation-Focused Distillat
 
 - [03-26](digests/2026-03-26.md) — 272 scanned, 1 passed, top: GlowQ: Group-Shared LOw-Rank Approximation for Qua
 
 - [03-25](digests/2026-03-25.md) — 310 scanned, 0 passed, top: (no papers passed)
 
-- [03-24](digests/2026-03-24.md) — 301 scanned, 2 passed, top: EchoKV: Efficient KV Cache Compression via Similar
+- [03-24](digests/2026-03-24.md) — 301 scanned, 1 passed, top: EchoKV: Efficient KV Cache Compression via Similar
 
 - [03-23](digests/2026-03-23.md) — 303 scanned, 0 passed, top: (no papers passed)
 
@@ -139,7 +139,7 @@
 
 - [03-10](digests/2026-03-10.md) — 336 scanned, 1 passed, top: Sparse-BitNet: 1.58-bit LLMs are Naturally Friendl
 
-- [03-09](digests/2026-03-09.md) — 335 scanned, 6 passed, top: SERQ: Saliency-Aware Low-Rank Error Reconstruction
+- [03-09](digests/2026-03-09.md) — 335 scanned, 5 passed, top: SERQ: Saliency-Aware Low-Rank Error Reconstruction
 
 - [03-08](digests/2026-03-08.md) — 174 scanned, 0 passed, top: (no papers passed)
 
@@ -205,7 +205,7 @@
 
 - [02-05](digests/2026-02-05.md) — 357 scanned, 6 passed, top: To 2:4 Sparsity and Beyond: Neuron-level Activatio
 
-- [02-04](digests/2026-02-04.md) — 404 scanned, 6 passed, top: TurboBoA: Faster and Exact Attention-aware Quantiz
+- [02-04](digests/2026-02-04.md) — 404 scanned, 5 passed, top: TurboBoA: Faster and Exact Attention-aware Quantiz
 
 - [02-03](digests/2026-02-03.md) — 426 scanned, 6 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
 
@@ -213,11 +213,11 @@
 
 - [02-01](digests/2026-02-01.md) — 186 scanned, 6 passed, top: SFMP: Fine-Grained, Hardware-Friendly and Search-F
 
-- [01-31](digests/2026-01-31.md) — 194 scanned, 2 passed, top: QuantLRM: Quantization of Large Reasoning Models v
+- [01-31](digests/2026-01-31.md) — 194 scanned, 1 passed, top: QuantLRM: Quantization of Large Reasoning Models v
 
 - [01-30](digests/2026-01-30.md) — 399 scanned, 9 passed, top: Unveiling the Potential of Quantization with MXFP4
 
-- [01-29](digests/2026-01-29.md) — 441 scanned, 8 passed, top: MixQuant: Pushing the Limits of Block Rotations in
+- [01-29](digests/2026-01-29.md) — 441 scanned, 7 passed, top: MixQuant: Pushing the Limits of Block Rotations in
 
 - [01-28](digests/2026-01-28.md) — 277 scanned, 2 passed, top: Enhancing Post-Training Quantization via Future Ac
 
@@ -293,7 +293,7 @@
 
 - [12-23](digests/2025-12-23.md) — 175 scanned, 1 passed, top: Distilling to Hybrid Attention Models via KL-Guide
 
-- [12-22](digests/2025-12-22.md) — 195 scanned, 2 passed, top: MixKVQ: Query-Aware Mixed-Precision KV Cache Quant
+- [12-22](digests/2025-12-22.md) — 195 scanned, 1 passed, top: MixKVQ: Query-Aware Mixed-Precision KV Cache Quant
 
 - [12-21](digests/2025-12-21.md) — 68 scanned, 0 passed, top: (no papers passed)
 
@@ -333,9 +333,9 @@
 
 - [12-03](digests/2025-12-03.md) — 245 scanned, 4 passed, top: Data-Free Pruning of Self-Attention Layers in LLMs
 
-- [12-02](digests/2025-12-02.md) — 240 scanned, 2 passed, top: TokenPowerBench: Benchmarking the Power Consumptio
+- [12-02](digests/2025-12-02.md) — 240 scanned, 1 passed, top: Fairy2i: Training Complex LLMs from Real LLMs with
 
-- [12-01](digests/2025-12-01.md) — 276 scanned, 5 passed, top: Four Over Six: More Accurate NVFP4 Quantization wi
+- [12-01](digests/2025-12-01.md) — 276 scanned, 4 passed, top: Four Over Six: More Accurate NVFP4 Quantization wi
 
 - [11-30](digests/2025-11-30.md) — 112 scanned, 2 passed, top: WUSH: Near-Optimal Adaptive Transforms for LLM Qua
 
@@ -343,7 +343,7 @@
 
 - [11-28](digests/2025-11-28.md) — 171 scanned, 1 passed, top: TWEO: Transformers Without Extreme Outliers Enable
 
-- [11-27](digests/2025-11-27.md) — 182 scanned, 3 passed, top: Outlier Smoothing with Closed-Form Rotations for W
+- [11-27](digests/2025-11-27.md) — 182 scanned, 1 passed, top: Outlier Smoothing with Closed-Form Rotations for W
 
 - [11-26](digests/2025-11-26.md) — 248 scanned, 0 passed, top: (no papers passed)
 
