@@ -68,7 +68,7 @@ run_step() {
 # Fetch all sources over the requested window. Per-day sources loop via
 # --backfill-days; windowed sources (arxiv_authors, openreview) take
 # --window-days and fetch once. Source-level failures print and continue.
-for src in hf_daily arxiv reddit; do
+for src in hf_daily arxiv; do
     echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL})"
     uv run python -m "sources.$src" --backfill-days "${BACKFILL}" \
         || echo "  ($src returned non-zero, continuing)"

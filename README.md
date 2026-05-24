@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + Reddit + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of eight topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology / Trending), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of eight topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology / Trending), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](#-setup-your-own-radar) · [Repo layout](#-repo-layout)
 
@@ -463,7 +463,7 @@ The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache �
 
 ```
 composite   = relevance_score × 30 + heat_score
-heat_score  = trending_bonus + hf_daily_upvotes + log(reddit_score + 1) × 5 + star_bonus
+heat_score  = trending_bonus + hf_daily_upvotes + star_bonus
 trending_bonus = 100 / hf_daily_rank             (rank 1..30, else 0)
 star_bonus     = min(log(github_stars + 1) × 3, 25)
 ```
@@ -480,7 +480,7 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
 
 ```
    ┌────────────┐     fetchers (one per source, all in parallel via daily.sh)
-   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + openreview + reddit
+   │  sources   │ ─── arxiv + arxiv_authors + hf_daily + openreview
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
          ↓
@@ -551,13 +551,7 @@ export ANTHROPIC_CUSTOM_HEADERS="Subscription-Key: ..."
 
 ### 3. (Optional) Add other source credentials
 
-Sources without credentials will silently produce 0 papers. To enable:
-
-| source | env vars / config |
-|---|---|
-| Reddit (LocalLLaMA) | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` |
-
-`hf_daily`, `arxiv`, `arxiv_authors`, and `openreview` work without credentials.
+All four sources (`hf_daily`, `arxiv`, `arxiv_authors`, `openreview`) work without credentials.
 
 ### 4. Customize the filter rubric
 
@@ -623,7 +617,6 @@ crontab -e
 | `ANTHROPIC_API_KEY` | yes | sk-ant-… key |
 | `ANTHROPIC_BASE_URL` | optional | proxy / gateway URL; leave unset for default api.anthropic.com |
 | `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers required by your proxy |
-| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | optional | enable Reddit source |
 | `TEAMS_WEBHOOK_URL` | optional | failure notifications |
 
 ```
@@ -649,8 +642,7 @@ llm-paper-radar/
 │   ├── arxiv.py
 │   ├── arxiv_authors.py
 │   ├── hf_daily.py
-│   ├── openreview.py
-│   └── reddit.py
+│   └── openreview.py
 ├── pipeline/
 │   ├── config.py                # Pydantic config model
 │   ├── llm_client.py            # async Anthropic wrapper with prompt cache

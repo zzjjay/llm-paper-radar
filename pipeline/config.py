@@ -14,12 +14,6 @@ class SimpleSourceConfig(BaseModel):
     enabled: bool = True
 
 
-class RedditConfig(BaseModel):
-    enabled: bool = True
-    subreddit: str = "LocalLLaMA"
-    top_window: str = "day"
-
-
 class WatchedAuthor(BaseModel):
     name: str
     affiliation: str = ""
@@ -45,7 +39,6 @@ class OpenReviewConfig(BaseModel):
 class SourcesConfig(BaseModel):
     arxiv: ArxivConfig = ArxivConfig()
     hf_daily: SimpleSourceConfig = SimpleSourceConfig()
-    reddit: RedditConfig = RedditConfig()
     arxiv_authors: ArxivAuthorsConfig = ArxivAuthorsConfig()
     openreview: OpenReviewConfig = OpenReviewConfig()
 

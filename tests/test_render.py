@@ -1,5 +1,4 @@
 import json
-import math
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +16,6 @@ def _mk(
     id_,
     score,
     hf_upvotes=0,
-    reddit_score=0,
     trending_rank=None,
     summary="en",
     topic_bucket="ptq",
@@ -32,11 +30,6 @@ def _mk(
             name="hf_daily",
             fetched_at=now,
             extras={"upvotes": hf_upvotes, "num_comments": 0},
-        ),
-        SourceRecord(
-            name="reddit",
-            fetched_at=now,
-            extras={"score": reddit_score, "num_comments": 0},
         ),
     ]
     if trending_rank is not None:
@@ -77,8 +70,8 @@ def _mk(
 
 
 def test_heat_score_combines_all_signals():
-    p = _mk("x", 9, hf_upvotes=10, reddit_score=99, trending_rank=2)
-    expected = (100 / 2) + 10 + math.log(100) * 5
+    p = _mk("x", 9, hf_upvotes=10, trending_rank=2)
+    expected = (100 / 2) + 10
     assert abs(heat_score(p) - expected) < 0.01
 
 

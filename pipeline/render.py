@@ -105,7 +105,7 @@ def _caps_summary(caps: dict[str, int]) -> str:
 def _star_bonus(p: Paper) -> float:
     """Capped log-scaled bonus from GitHub stars of the paper's official repo.
     Only HF-sourced papers carry `code_meta.stars` today (HF API includes it
-    for free). arXiv/openreview/reddit-only papers contribute 0 here."""
+    for free). arXiv/openreview-only papers contribute 0 here."""
     meta = p.code_meta or {}
     stars = meta.get("stars")
     if not isinstance(stars, int) or stars <= 0:
@@ -114,11 +114,10 @@ def _star_bonus(p: Paper) -> float:
 
 
 def heat_score(p: Paper) -> float:
-    """Heat = trending_bonus + hf_upvotes + log(reddit_score+1)*5 + star_bonus.
+    """Heat = trending_bonus + hf_upvotes + star_bonus.
     Trending bonus = 100/rank for rank 1..30, else 0."""
     trending_bonus = 0.0
     hf_upvotes = 0
-    reddit_score = 0
     for s in p.sources:
         if s.name == "hf_daily":
             if "trending_rank" in s.extras:
@@ -127,9 +126,7 @@ def heat_score(p: Paper) -> float:
                     trending_bonus = max(trending_bonus, 100.0 / rank)
             if "upvotes" in s.extras:
                 hf_upvotes = max(hf_upvotes, s.extras.get("upvotes", 0) or 0)
-        elif s.name == "reddit":
-            reddit_score = max(reddit_score, s.extras.get("score", 0) or 0)
-    return trending_bonus + hf_upvotes + math.log(reddit_score + 1) * 5 + _star_bonus(p)
+    return trending_bonus + hf_upvotes + _star_bonus(p)
 
 
 def composite_score(p: Paper) -> float:
@@ -151,7 +148,6 @@ def _source_badge(p: Paper) -> str:
     """One badge per distinct source name; consolidate hf_daily's two extras shapes."""
     hf_up = hf_cm = 0
     hf_trend = None
-    reddit_sc = reddit_cm = 0
     watched_authors: list[str] = []
     other: set[str] = set()
     for s in p.sources:
@@ -162,9 +158,6 @@ def _source_badge(p: Paper) -> str:
             if "trending_rank" in s.extras:
                 rank = s.extras["trending_rank"]
                 hf_trend = rank if hf_trend is None else min(hf_trend, rank)
-        elif s.name == "reddit":
-            reddit_sc = max(reddit_sc, s.extras.get("score", 0) or 0)
-            reddit_cm = max(reddit_cm, s.extras.get("num_comments", 0) or 0)
         elif s.name == "arxiv_authors":
             for n in s.extras.get("matched_authors", []):
                 if n not in watched_authors:
@@ -181,8 +174,6 @@ def _source_badge(p: Paper) -> str:
         if hf_cm:
             bits.append(f"💬 {hf_cm}")
         parts.append(f"hf_daily ({', '.join(bits)})")
-    if reddit_sc or reddit_cm:
-        parts.append(f"reddit (🔥 {reddit_sc}, 💬 {reddit_cm})")
     if watched_authors:
         parts.append(f"watched ({', '.join(watched_authors)})")
     for o in sorted(other):

@@ -27,11 +27,11 @@ def test_paper_minimal_construction():
 
 def test_source_record_with_extras():
     r = SourceRecord(
-        name="reddit",
+        name="hf_daily",
         fetched_at=datetime.now(UTC),
-        extras={"score": 230, "num_comments": 67},
+        extras={"upvotes": 230, "num_comments": 67},
     )
-    assert r.extras["score"] == 230
+    assert r.extras["upvotes"] == 230
 
 
 def test_paper_round_trip_json():

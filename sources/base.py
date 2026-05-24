@@ -11,7 +11,6 @@ SourceName = Literal[
     "arxiv_authors",
     "hf_daily",
     "openreview",
-    "reddit",
 ]
 
 
