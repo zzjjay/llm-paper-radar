@@ -84,6 +84,11 @@ run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACK
 run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" || exit 6
 run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || exit 7
 
+# Snapshot the rendered paper list + INDEX into backups/<utc-ts>-w<N>d/
+# so each run leaves a browsable record (git history is preserve-only;
+# this gives a side-by-side comparison surface without `git show` games).
+DAYS="${DAYS}" run_step "snapshot" ./scripts/snapshot.sh || echo "  (snapshot failed, continuing)"
+
 DATE_STR=$(date -u +%Y-%m-%d)
 
 # Commit + push if anything changed. The window may produce multiple digest
@@ -91,7 +96,7 @@ DATE_STR=$(date -u +%Y-%m-%d)
 if [[ -z "$(git status --porcelain)" ]]; then
     echo "[$(date -Is)] no changes to commit"
 else
-    git add data/summarized digests/ README.md INDEX.md data/seen.json 2>/dev/null || true
+    git add data/summarized digests/ README.md INDEX.md data/seen.json backups/ 2>/dev/null || true
     if [[ -z "$(git diff --cached --name-only)" ]]; then
         echo "[$(date -Is)] nothing staged after add"
     else
