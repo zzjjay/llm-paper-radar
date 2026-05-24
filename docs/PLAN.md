@@ -1,6 +1,12 @@
 # LLM Paper Radar Implementation Plan
 
-> **Historical document.** This plan reflects the original build. Step 7 (`sources/semantic_scholar.py`, `tests/test_semantic_scholar.py`, `SemanticScholarConfig`) was implemented but later **removed** — the SS public API rate-limits without a key, doesn't index brand-new arXiv papers for weeks, and the arxiv-id-only filter dropped ~70% of returned citations, leaving the source with near-zero net yield. The `seeds.yaml` file is kept as a curated index of important papers per bucket, consumed by the paper-triage skill — no longer by SS.
+> **Historical document.** This plan reflects the original build. Sources listed below have since been **removed** — the running pipeline now uses only `arxiv`, `arxiv_authors`, `hf_daily`, `openreview`:
+>
+> - **Step 6 (`sources/reddit.py`, `tests/test_reddit.py`, `RedditConfig`)** — removed. `REDDIT_CLIENT_ID` was never set in the deployment env, so it returned 0 papers on every run; the source was effectively dead.
+> - **Step 7 (`sources/semantic_scholar.py`, `tests/test_semantic_scholar.py`, `SemanticScholarConfig`)** — removed. The SS public API rate-limits without a key, doesn't index brand-new arXiv papers for weeks, and the arxiv-id-only filter dropped ~70% of returned citations, leaving the source with near-zero net yield.
+> - **`sources/twitter_rsshub.py` / `TwitterConfig` / `RSSHUB_BASE_URL`** — removed. RSSHub Twitter route is brittle (X frequently bans IPs); the conditional source was never reliable enough to deploy.
+>
+> The `seeds.yaml` file is kept as a curated index of important papers per bucket, consumed by the paper-triage skill — no longer by SS.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

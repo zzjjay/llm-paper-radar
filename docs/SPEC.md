@@ -18,7 +18,6 @@ The HuggingFace signal explicitly leans on the trending board (`https://huggingf
 - No web dashboard — Markdown + git is the UI.
 - No PDF parsing — abstracts only.
 - No coverage of: RLHF / alignment / safety, agents / RAG, multimodal (unless related to compression), training algorithms (unless compression-related).
-- No X/Twitter for v1 unless RSSHub instance is available (kept as conditional source).
 
 ### Success Criteria
 
@@ -39,8 +38,7 @@ GitHub Actions (cron daily 23:00 UTC)
         │     ├─ sources/arxiv.py
         │     ├─ sources/arxiv_authors.py
         │     ├─ sources/hf_daily.py
-        │     ├─ sources/openreview.py
-        │     └─ sources/reddit.py
+        │     └─ sources/openreview.py
         │           ↓
         │     data/raw/YYYY-MM-DD/{source}.json
         │
@@ -68,8 +66,7 @@ llm-paper-radar/
 │   ├── arxiv.py
 │   ├── arxiv_authors.py
 │   ├── hf_daily.py
-│   ├── openreview.py
-│   └── reddit.py
+│   └── openreview.py
 ├── pipeline/
 │   ├── dedupe.py
 │   ├── filter.py
@@ -128,33 +125,12 @@ Fetches **two HF surfaces** and merges them:
 
 Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct `extras` fields. A paper appearing in both surfaces gets merged in dedupe (sources list keeps both records). Trending rank is a primary input to the heat score in §6.
 
-### Tier 2 — Secondary (also daily)
-
-#### `sources/reddit.py`
-- API: `https://oauth.reddit.com/r/LocalLLaMA/top.json?t=day&limit=50`
-- Auth: OAuth via `REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET`
-- Logic: filter posts containing `arxiv.org/abs/XXXX.XXXXX`; extract arXiv IDs via regex; refetch full metadata from arXiv API; record `reddit_score`, `reddit_comments_count`, `thread_url` in extras
-- Expected: 5–15 papers/day with arXiv links
-
-### Tier 3 — Supplementary
-
-- Source: RSS feed `https://paperswithcode.com/latest/rss.xml` (PwC search API is unstable)
-- Extras retained: `code_url` (highlighted in render)
-- Expected: ~50–100 papers/day (high overlap with arXiv, dedupe handles)
-
-#### `sources/twitter_rsshub.py` (conditional, depends on self-hosted RSSHub)
-- URL: `${RSSHUB_BASE_URL}/twitter/user/<account>` per account
-- Accounts (from config.yaml): `_akhaliq`, `Tim_Dettmers`, `HanLab_MIT`, `vllm_project`, `danielhanchen`, `tri_dao`, `omarsar0`
-- Logic: same as Reddit — filter for arXiv links, extract IDs, merge
-- **Known fragility**: RSSHub Twitter route is brittle (X frequently bans IPs). Source skips silently when unreachable. Manual monthly health check recommended.
-
 ### Volume Summary
 
 | Source | Daily Volume | Primary Value |
 |--------|-------------|---------------|
 | arXiv | 400 | Complete coverage |
 | HF Daily | 20 | Community heat signal |
-| r/LocalLLaMA | 5–15 | Industry adoption signal |
 | arxiv_authors (watched groups) | 5–10 | Never-miss for curated authors |
 | OpenReview | 5–20 | Pre-arXiv ICLR/NeurIPS submissions |
 | **After dedupe** | **~450–500** | → LLM filter |
@@ -167,7 +143,7 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 
 ```python
 class SourceRecord(BaseModel):
-    name: Literal["arxiv", "arxiv_authors", "hf_daily", "openreview", "reddit"]
+    name: Literal["arxiv", "arxiv_authors", "hf_daily", "openreview"]
     fetched_at: datetime
     extras: dict = {}            # source-specific (upvotes, score, thread_url, ...)
 
@@ -204,7 +180,7 @@ class Paper(BaseModel):
 
 **Field-merge priority** when same paper appears across sources:
 ```
-hf_daily > openreview > reddit > arxiv_authors > arxiv (fallback)
+hf_daily > openreview > arxiv_authors > arxiv (fallback)
 ```
 For each field (title, abstract, authors, etc.), take the value from the highest-priority source that has a non-empty value. arXiv serves as the safety net.
 
@@ -266,7 +242,7 @@ Return JSON only: {"relevance_score": int, "reason": str}
 ### `pipeline/summarize.py` — Summary + Highlights
 
 - **Model**: Claude Sonnet 4.6 (`claude-sonnet-4-6`)
-- **Input**: title + full abstract + (if present) HF/Reddit comment excerpts
+- **Input**: title + full abstract + (if present) HF comment excerpts
 - **Output**: JSON with `summary` and `highlights` (English only)
 - **Concurrency**: 20 parallel
 - **Triggered**: only on papers with `relevance_score >= 7` (~30–50/day)
@@ -316,7 +292,7 @@ Return JSON only: {"summary": str, "highlights": list[str]}
 **<primary_source>** · `<arxiv_id>` · <published_at>
 👥 <authors> · 🏷 <categories>
 🔗 [arXiv](url) · [PDF](pdf_url) · [GitHub](code_url)
-📡 Sources: arxiv, hf_daily (👍 142, 💬 28), reddit (🔥 score 580)
+📡 Sources: arxiv, hf_daily (👍 142, 💬 28)
 
 #### Summary
 <summary>
@@ -329,7 +305,7 @@ Return JSON only: {"summary": str, "highlights": list[str]}
 
 | # | Title | Score | Sources | Code | Date |
 |---|-------|-------|---------|------|------|
-| 1 | ... | 10 | arxiv, hf, reddit | ✅ | 05-10 |
+| 1 | ... | 10 | arxiv, hf | ✅ | 05-10 |
 | 2 | ... | 9 | hf, ss | ✅ | 05-10 |
 | ... |
 | 38 | ... | 7 | arxiv | — | 05-10 |
@@ -348,8 +324,7 @@ sort_key = (heat_score desc, relevance_score desc)
 heat_score = (
     trending_bonus       # max 100, from HF trending rank
     + hf_upvotes
-    + log(reddit_score + 1) * 5
-    + twitter_account_bonus  # 10 per distinct account that linked it
+    + star_bonus         # min(log(github_stars+1) * 3, 25)
 )
 
 trending_bonus =  100 / trending_rank   if rank ≤ 30 else 0
@@ -425,17 +400,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        source: [arxiv, arxiv_authors, hf_daily, openreview, reddit]
+        source: [arxiv, arxiv_authors, hf_daily, openreview]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync
       - name: Fetch ${{ matrix.source }}
         run: uv run python -m sources.${{ matrix.source }} --backfill-days ${{ inputs.backfill_days || 0 }}
-        env:
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          RSSHUB_BASE_URL: ${{ secrets.RSSHUB_BASE_URL }}
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         with:
@@ -563,10 +534,9 @@ jobs:
 | Secret | Required | Purpose |
 |--------|----------|---------|
 | `ANTHROPIC_API_KEY` | yes | Claude API |
-| `REDDIT_CLIENT_ID` | yes | Reddit OAuth |
-| `REDDIT_CLIENT_SECRET` | yes | Reddit OAuth |
-| `TEAMS_WEBHOOK_URL` | yes | Failure alerts |
-| `RSSHUB_BASE_URL` | optional | If absent, twitter source disabled |
+| `ANTHROPIC_BASE_URL` | optional | proxy / gateway URL |
+| `ANTHROPIC_CUSTOM_HEADERS` | optional | extra headers for proxy |
+| `TEAMS_WEBHOOK_URL` | optional | Failure alerts |
 
 ### Pipeline Timing
 
@@ -594,20 +564,6 @@ sources:
     categories: [cs.CL, cs.LG, cs.AR]
   hf_daily:
     enabled: true
-  reddit:
-    enabled: true
-    subreddit: LocalLLaMA
-    top_window: day
-  twitter_rsshub:
-    enabled: true
-    accounts:
-      - _akhaliq
-      - Tim_Dettmers
-      - HanLab_MIT
-      - vllm_project
-      - danielhanchen
-      - tri_dao
-      - omarsar0
 
 filter:
   model: claude-haiku-4-5-20251001
@@ -626,8 +582,8 @@ dedupe:
   cross_day_strategy: lenient
   source_priority:
     - hf_daily
-    - reddit
-    - twitter_rsshub
+    - openreview
+    - arxiv_authors
     - arxiv
 ```
 
@@ -685,10 +641,7 @@ cd llm-paper-radar
 
 # 3. Configure secrets
 gh secret set ANTHROPIC_API_KEY
-gh secret set REDDIT_CLIENT_ID
-gh secret set REDDIT_CLIENT_SECRET
-gh secret set TEAMS_WEBHOOK_URL
-gh secret set RSSHUB_BASE_URL          # optional
+gh secret set TEAMS_WEBHOOK_URL        # optional, for failure alerts
 
 # 4. Edit config.yaml + seeds.yaml + prompts/*.md as needed
 
@@ -701,10 +654,8 @@ gh run watch
 
 ### Required External Setup (User-side)
 
-1. **Reddit OAuth app** — create at https://www.reddit.com/prefs/apps (script type, free)
-2. **Anthropic API key** — at console.anthropic.com
-3. **Microsoft Teams incoming webhook** — channel settings → Connectors → Incoming Webhook
-4. **RSSHub instance** (optional, for Twitter source) — Docker on a VPS or your server
+1. **Anthropic API key** — at console.anthropic.com
+2. **Microsoft Teams incoming webhook** (optional) — channel settings → Connectors → Incoming Webhook
 
 ---
 
@@ -712,7 +663,6 @@ gh run watch
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|-----------|
-| RSSHub Twitter route gets banned | High | Source skips silently; monthly health check reminder |
 | Anthropic API rate limit | Low | 50 concurrency well within tier limits; backoff in client |
 | arXiv API outage | Low | Other Tier 1 source (HF Daily) still works |
 | LLM hallucinates relevance | Medium | Threshold + reason field allows audit; can adjust prompt |
@@ -729,15 +679,13 @@ Resolved:
 - ✅ GitHub account: `zhaolin-amd`
 
 Outstanding (deployment-time, not blocking design):
-- Microsoft Teams incoming webhook URL — needed before first run
-- RSSHub base URL — if absent, twitter source auto-disables; can be added later
+- Microsoft Teams incoming webhook URL — optional, for failure alerts
 
 ---
 
 ## 13. Out of Scope (v2 candidates)
 
 - Personal feedback loop: thumbs-up/down per paper → fine-tune relevance prompt
-- Switch to SocialData.tools / TwitterAPI.io if RSSHub proves too unstable
 - PDF parsing for deeper summaries (when abstract is uninformative)
 - Web dashboard or HF Space frontend
 - Slack/Discord push for top-tier papers
