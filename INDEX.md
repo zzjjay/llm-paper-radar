@@ -21,7 +21,7 @@
 
 - [05-08](digests/2026-05-08.md) — 556 scanned, 5 passed, top: Finer is Better (with the Right Scaling)
 
-- [05-07](digests/2026-05-07.md) — 574 scanned, 8 passed, top: Layer Collapse in Diffusion Language Models
+- [05-07](digests/2026-05-07.md) — 574 scanned, 7 passed, top: Layer Collapse in Diffusion Language Models
 
 - [05-06](digests/2026-05-06.md) — 352 scanned, 1 passed, top: OSAQ: Outlier Self-Absorption for Accurate Low-bit
 
@@ -117,7 +117,7 @@
 
 - [03-21](digests/2026-03-21.md) — 153 scanned, 1 passed, top: Beyond Token Eviction: Mixed-Dimension Budget Allo
 
-- [03-20](digests/2026-03-20.md) — 302 scanned, 1 passed, top: DAQ: Delta-Aware Quantization for Post-Training LL
+- [03-20](digests/2026-03-20.md) — 302 scanned, 0 passed, top: (no papers passed)
 
 - [03-19](digests/2026-03-19.md) — 309 scanned, 1 passed, top: AIMER: Calibration-Free Task-Agnostic MoE Pruning
 
@@ -175,7 +175,7 @@
 
 - [02-20](digests/2026-02-20.md) — 235 scanned, 0 passed, top: (no papers passed)
 
-- [02-19](digests/2026-02-19.md) — 279 scanned, 2 passed, top: ARKV: Adaptive and Resource-Efficient KV Cache Man
+- [02-19](digests/2026-02-19.md) — 279 scanned, 1 passed, top: ARKV: Adaptive and Resource-Efficient KV Cache Man
 
 - [02-18](digests/2026-02-18.md) — 296 scanned, 1 passed, top: Fast KV Compaction via Attention Matching
 
@@ -191,7 +191,7 @@
 
 - [02-12](digests/2026-02-12.md) — 315 scanned, 2 passed, top: Extending Puzzle for Mixture-of-Experts Reasoning 
 
-- [02-11](digests/2026-02-11.md) — 364 scanned, 3 passed, top: SnapMLA: Efficient Long-Context MLA Decoding via H
+- [02-11](digests/2026-02-11.md) — 364 scanned, 2 passed, top: SnapMLA: Efficient Long-Context MLA Decoding via H
 
 - [02-10](digests/2026-02-10.md) — 344 scanned, 3 passed, top: Is Retraining-Free Enough? The Necessity of Router
 
@@ -219,9 +219,9 @@
 
 - [01-29](digests/2026-01-29.md) — 441 scanned, 8 passed, top: MixQuant: Pushing the Limits of Block Rotations in
 
-- [01-28](digests/2026-01-28.md) — 277 scanned, 3 passed, top: Enhancing Post-Training Quantization via Future Ac
+- [01-28](digests/2026-01-28.md) — 277 scanned, 2 passed, top: Enhancing Post-Training Quantization via Future Ac
 
-- [01-27](digests/2026-01-27.md) — 289 scanned, 5 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
+- [01-27](digests/2026-01-27.md) — 289 scanned, 4 passed, top: Fast KVzip: Efficient and Accurate LLM Inference w
 
 - [01-26](digests/2026-01-26.md) — 253 scanned, 5 passed, top: Is Finer Better? The Limits of Microscaling Format
 
