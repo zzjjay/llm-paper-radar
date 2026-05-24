@@ -7,9 +7,9 @@
 
 - [05-17](digests/2026-05-17.md) — 203 scanned, 2 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
-- [05-18](digests/2026-05-18.md) — 427 scanned, 5 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-18](digests/2026-05-18.md) — 429 scanned, 5 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [05-19](digests/2026-05-19.md) — 228 scanned, 3 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-19](digests/2026-05-19.md) — 402 scanned, 9 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
 - [05-16](digests/2026-05-16.md) — 186 scanned, 1 passed, top: DiRotQ: Rotation-Aware Quantization for 4-bit Diff
 
@@ -357,12 +357,12 @@
 
 - [11-21](digests/2025-11-21.md) — 192 scanned, 5 passed, top: Nemotron Elastic: Towards Efficient Many-in-One Re
 
-- [05-20](digests/2026-05-20.md) — 400 scanned, 7 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
+- [05-20](digests/2026-05-20.md) — 400 scanned, 6 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
 
 - [05-21](digests/2026-05-21.md) — 405 scanned, 5 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
 
 - [05-22](digests/2026-05-22.md) — 332 scanned, 0 passed, top: (no papers passed)
 
-- [05-23](digests/2026-05-23.md) — 101 scanned, 15 passed, top: Grid Games: The Power of Multiple Grids for Quanti
+- [05-23](digests/2026-05-23.md) — 101 scanned, 14 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
 
 - [05-24](digests/2026-05-24.md) — 50 scanned, 0 passed, top: (no papers passed)
