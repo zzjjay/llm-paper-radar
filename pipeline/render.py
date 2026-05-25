@@ -882,7 +882,7 @@ if __name__ == "__main__":
 
     @click.command()
     @click.option("--date", default=None)
-    @click.option("--backfill-days", default=0, type=int)
+    @click.option("--backfill-days", default=0, type=int, help="Process today + N days back. Default 0 = today only. Each day is fetched/processed independently.")
     @click.option("--in-root", default="data/summarized", type=click.Path(path_type=Path))
     @click.option("--digests-dir", default="digests", type=click.Path(path_type=Path))
     @click.option("--readme", default="README.md", type=click.Path(path_type=Path))

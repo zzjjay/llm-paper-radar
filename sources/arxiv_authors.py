@@ -208,12 +208,12 @@ if __name__ == "__main__":
     from pipeline.config import load_config
 
     @click.command()
-    @click.option("--backfill-days", default=0, type=int)
+    @click.option("--backfill-days", default=0, type=int, help="Loop the wrapper N+1 times (default 0 = once). The actual fetch is a single windowed query — see --window-days.")
     @click.option(
         "--window-days",
         default=None,
         type=int,
-        help="Override window_days from config for this run.",
+        help="Single query spanning the last N days (overrides config window_days). 1 API call, output written under today's data/raw/ dir.",
     )
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
     def main(backfill_days: int, window_days: int | None, out_dir: Path):

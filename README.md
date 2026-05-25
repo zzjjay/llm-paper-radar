@@ -173,17 +173,17 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
                       digests/YYYY-MM-DD.md (+ _en.md)  +  README.md  +  INDEX.md
 ```
 
-Each stage is independently runnable from the CLI. Per-day sources take `--backfill-days`; windowed sources (`arxiv_authors`, `openreview`) take `--window-days` and fetch once:
+Each stage is independently runnable from the CLI. Every command defaults to **today only** — add `--backfill-days N` to process today + N days back (e.g. `--backfill-days 6` for a 7-day batch). Windowed sources (`arxiv_authors`, `openreview`) take `--window-days` instead and fetch the whole window in one call.
 
 ```bash
-uv run python -m sources.hf_daily       --backfill-days 0
-uv run python -m sources.arxiv          --backfill-days 0
-uv run python -m sources.arxiv_authors  --backfill-days 0 --window-days 7
-uv run python -m sources.openreview     --backfill-days 0 --window-days 7
-uv run python -m pipeline.dedupe        --backfill-days 0
-uv run python -m pipeline.filter        --backfill-days 0
-uv run python -m pipeline.summarize     --backfill-days 0
-uv run python -m pipeline.render        --backfill-days 0
+uv run python -m sources.hf_daily
+uv run python -m sources.arxiv
+uv run python -m sources.arxiv_authors  --window-days 7
+uv run python -m sources.openreview     --window-days 7
+uv run python -m pipeline.dedupe
+uv run python -m pipeline.filter
+uv run python -m pipeline.summarize
+uv run python -m pipeline.render
 ```
 
 `scripts/daily.sh` chains the fetch → dedupe → filter → summarize sequence, then runs three optional wrappers (`auto_paper_river` → `translate_paper_river` → `render` → `snapshot`) and finally `git commit && git push` if anything changed. The wrappers are governed by env vars: set `PAPER_RIVER_SKIP=1` to skip auto-generation of paper-river `.org` files, and `PAPER_RIVER_MAX=N` to cap how many get generated per run.

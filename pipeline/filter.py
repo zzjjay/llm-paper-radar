@@ -290,7 +290,7 @@ if __name__ == "__main__":
 
     @click.command()
     @click.option("--date", default=None)
-    @click.option("--backfill-days", default=0, type=int)
+    @click.option("--backfill-days", default=0, type=int, help="Process today + N days back. Default 0 = today only. Each day is fetched/processed independently.")
     @click.option("--in-root", default="data/deduped", type=click.Path(path_type=Path))
     @click.option("--out-root", default="data/scored", type=click.Path(path_type=Path))
     @click.option("--prompt-path", default="prompts/relevance.md", type=click.Path(path_type=Path))

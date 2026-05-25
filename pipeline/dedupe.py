@@ -87,7 +87,7 @@ if __name__ == "__main__":
 
     @click.command()
     @click.option("--date", default=None, help="YYYY-MM-DD; default today UTC")
-    @click.option("--backfill-days", default=0, type=int)
+    @click.option("--backfill-days", default=0, type=int, help="Process today + N days back. Default 0 = today only. Each day is fetched/processed independently.")
     @click.option("--raw-root", default="data/raw", type=click.Path(path_type=Path))
     @click.option("--out-root", default="data/deduped", type=click.Path(path_type=Path))
     @click.option("--seen-path", default="data/seen.json", type=click.Path(path_type=Path))

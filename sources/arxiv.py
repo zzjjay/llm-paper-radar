@@ -174,7 +174,7 @@ if __name__ == "__main__":
     from pipeline.config import load_config
 
     @click.command()
-    @click.option("--backfill-days", default=0, type=int)
+    @click.option("--backfill-days", default=0, type=int, help="Process today + N days back. Default 0 = today only. Each day is fetched/processed independently.")
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
     @click.option(
         "--batch-size",
