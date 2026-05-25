@@ -60,11 +60,11 @@ If the skill is unavailable in this session, report that and exit."
 
 echo "[$(date -Is)] gen_paper_river: ${ID} → invoking /ljg-paper-river"
 # acceptEdits permission mode: skill can use Write + web tools without
-# interactive prompts. Headless mode (no -p flag interactivity).
-claude -p \
+# interactive prompts. Pipe the prompt via stdin so it isn't gobbled by
+# the variadic --allowedTools flag.
+printf '%s' "$PROMPT" | claude -p \
     --permission-mode acceptEdits \
-    --allowedTools "Write,Edit,Read,WebSearch,WebFetch,Bash" \
-    "$PROMPT"
+    --allowedTools "Write,Edit,Read,WebSearch,WebFetch,Bash"
 exit_code=$?
 
 # Verify the file actually appeared (skill may have silently failed).
@@ -72,6 +72,29 @@ new_file=$(ls paper-river/ 2>/dev/null | grep -E "(${ID_DOT}|${ID_DASH})\.org$" 
 if [[ -z "$new_file" ]]; then
     echo "gen_paper_river: ${ID} skill ran (exit=${exit_code}) but no file was written" >&2
     exit 3
+fi
+
+# Post-process: the skill defaults `#+title:` to a slug like "paper-river-GSQ".
+# Replace with the paper's real title from data/summarized/ so the .org
+# self-identifies by paper name (Org exports this header verbatim).
+REAL_TITLE=$(uv run python -c "
+import json, sys
+from pathlib import Path
+for f in sorted(Path('data/summarized').glob('*.json')):
+    try:
+        for p in json.loads(f.read_text()):
+            if (p.get('id') or '').split(':')[-1] == '${ID_DOT}':
+                print((p.get('title') or '').strip())
+                sys.exit(0)
+    except Exception:
+        continue
+" 2>/dev/null)
+if [[ -n "$REAL_TITLE" ]]; then
+    # In-place edit; only touches the first #+title: line. Sed uses | as
+    # delimiter so titles containing '/' don't need escaping.
+    REAL_TITLE_ESCAPED=$(printf '%s' "$REAL_TITLE" | sed 's/[|&\\]/\\&/g')
+    sed -i "0,/^#+title:/s|^#+title:.*|#+title:      ${REAL_TITLE_ESCAPED}|" "paper-river/${new_file}"
+    echo "gen_paper_river: ${ID} #+title → ${REAL_TITLE:0:80}"
 fi
 
 echo "[$(date -Is)] gen_paper_river: ${ID} → paper-river/${new_file}"
