@@ -103,7 +103,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "related_header": "#### 📎 相关方法 / 对比基线",
         "why_header": "#### 🧭 为什么推送这篇",
         "paper_river_header": "#### 🌊 Paper River",
-        "paper_river_line": "倒读批判链 → {links}",
+        "paper_river_line": "[倒读批判链]({link})",
         "unbucketed_label": "其它",
         "caps_unit": "篇",
         "caps_join": "，",
@@ -138,7 +138,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "related_header": "#### 📎 Related methods / baselines",
         "why_header": "#### 🧭 Why this paper",
         "paper_river_header": "#### 🌊 Paper River",
-        "paper_river_line": "Back-read critique chain → {links}",
+        "paper_river_line": "[Back-read critique chain]({link})",
         "unbucketed_label": "other",
         "caps_unit": "",
         "caps_join": ", ",
@@ -174,23 +174,18 @@ def _paper_river_files(p: Paper, paper_river_dir: Path | None) -> dict[str, Path
 
 
 def _paper_river_block(p: Paper, paper_river_dir: Path | None, lang: str) -> str:
-    """One-section auto-link to the paper-river file(s), scoped to detail-page
-    `_full_block` callers (watched + topic highlights only — the compact
-    README table is intentionally untouched). Renders `[zh] · [en]` link
-    pills (in that fixed order) for whichever files exist. Empty string
-    when no file at all."""
+    """One-section auto-link to the paper-river file matching the digest's
+    language. Scoped to detail-page `_full_block` callers (watched + topic
+    highlights only — the compact README table is intentionally untouched).
+    zh digest → links to the zh `.org`; en digest → links to the `_en.org`.
+    Empty string when no file in that language exists."""
     files = _paper_river_files(p, paper_river_dir)
-    if not files:
+    f = files.get(lang)
+    if f is None:
         return ""
     s = STRINGS[lang]
-    # Fixed zh-then-en order so the layout stays predictable, matching the
-    # README Why-column `[zh] · [en]` convention.
-    pills: list[str] = []
-    for lang_key in ("zh", "en"):
-        f = files.get(lang_key)
-        if f is not None:
-            pills.append(f"[{lang_key}](../paper-river/{f.name})")
-    return f"{s['paper_river_header']}\n{s['paper_river_line'].format(links=' · '.join(pills))}\n\n"
+    link = f"../paper-river/{f.name}"
+    return f"{s['paper_river_header']}\n{s['paper_river_line'].format(link=link)}\n\n"
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
 # one of the eight valid values in BUCKET_ORDER. These papers should have

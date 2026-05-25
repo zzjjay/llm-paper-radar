@@ -334,9 +334,9 @@ def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_p
 
 def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Path):
     """When paper-river/*<id>.org exists, _full_block inserts a Paper River
-    section between Why and Summary. Renders `[zh] · [en]` pills for whichever
-    language files exist. Compact README table is NOT affected — the link only
-    shows in the detail page (watched + topic highlights)."""
+    section between Why and Summary. The zh digest links to the zh org file
+    only; the _en digest links to the `_en.org` file only — each language
+    keeps its own link. Compact README table is NOT affected."""
     summarized_path = tmp_path / "summarized.json"
     p_river = _mk("2604.18556", 9, trending_rank=1)  # has org files
     p_river.summary_en = "en"  # forces _en digest too
@@ -362,17 +362,21 @@ def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Pa
         paper_river_dir=pr_dir,
     )
 
-    detail = (digests_dir / "2026-05-11.md").read_text()
-    # River section rendered with bilingual `[zh] · [en]` pills, fixed order.
-    assert "#### 🌊 Paper River" in detail
-    assert "[zh](../paper-river/GSQ-2604.18556.org)" in detail
-    assert "[en](../paper-river/GSQ-2604.18556_en.org)" in detail
-    # zh appears before en in the pill order.
-    zh_pos = detail.find("[zh](../paper-river/GSQ-2604.18556.org)")
-    en_pos = detail.find("[en](../paper-river/GSQ-2604.18556_en.org)")
-    assert zh_pos < en_pos
+    # zh digest: only the zh link, with the Chinese label.
+    detail_zh = (digests_dir / "2026-05-11.md").read_text()
+    assert "#### 🌊 Paper River" in detail_zh
+    assert "[倒读批判链](../paper-river/GSQ-2604.18556.org)" in detail_zh
+    assert "GSQ-2604.18556_en.org" not in detail_zh
+
+    # en digest: only the en link, with the English label.
+    detail_en = (digests_dir / "2026-05-11_en.md").read_text()
+    assert "#### 🌊 Paper River" in detail_en
+    assert "[Back-read critique chain](../paper-river/GSQ-2604.18556_en.org)" in detail_en
+    # zh-only file must not leak into the en digest.
+    assert "(../paper-river/GSQ-2604.18556.org)" not in detail_en
+
     # The other paper (no org file) does NOT get a river section.
-    no_river_block = detail.split("p-9999-99999")[-1].split("---")[0]
+    no_river_block = detail_zh.split("p-9999-99999")[-1].split("---")[0]
     assert "Paper River" not in no_river_block
     # Compact README table is untouched by river logic — only digests/<date>.md.
     # Scope the check to the LATEST_START..LATEST_END block so the docs section
