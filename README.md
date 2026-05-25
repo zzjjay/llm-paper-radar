@@ -207,9 +207,11 @@ uv run python -m pipeline.render
 
 ### 🌊 Paper River (optional)
 
-For each surfaced paper, `scripts/daily.sh` invokes the [`ljg-paper-river`](https://github.com/lijigang/ljg-skills) Claude Code skill to produce a deep-lineage analysis — "倒读法": recursively trace 5 layers of intellectual ancestry, then walk forward Feynman-style — saved as `paper-river/<acronym>-<arxiv-id>.org` and auto-translated to an `_en.org` sibling. Render links each digest to its own language. Disable with `PAPER_RIVER_SKIP=1`; render works fine without any `.org` file.
+**What.** A deep-lineage analysis per surfaced paper — "倒读法": recursively trace 5 layers of intellectual ancestry, then walk forward Feynman-style. Written by Claude via the [`ljg-paper-river`](https://github.com/lijigang/ljg-skills) skill.
 
-Install the skill once:
+**How it plugs in.** `scripts/daily.sh` invokes the skill for each surfaced paper, saves the output as `paper-river/<acronym>-<arxiv-id>.org`, and auto-translates it into an `_en.org` sibling. Render links each digest to its own language (zh digest → `.org`, en digest → `_en.org`). Set `PAPER_RIVER_SKIP=1` to skip; render works fine without any `.org` file.
+
+**Install** (one-time, two slash commands):
 
 ```
 /plugin marketplace add lijigang/ljg-skills
