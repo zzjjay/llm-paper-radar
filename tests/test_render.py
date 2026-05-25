@@ -367,8 +367,15 @@ def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Pa
     no_river_block = detail.split("p-9999-99999")[-1].split("---")[0]
     assert "Paper River" not in no_river_block
     # Compact README table is untouched by river logic — only digests/<date>.md.
+    # Scope the check to the LATEST_START..LATEST_END block so the docs section
+    # (which mentions "Paper River" by design as an Optional Pipeline blurb)
+    # doesn't false-fail this assertion.
     readme_text = (tmp_path / "README.md").read_text()
-    assert "Paper River" not in readme_text
+    start = readme_text.find("<!-- LATEST_START -->")
+    end = readme_text.find("<!-- LATEST_END -->")
+    assert start != -1 and end != -1, "README missing LATEST markers"
+    compact_block = readme_text[start:end]
+    assert "Paper River" not in compact_block
 
 
 def test_render_daily_skips_en_digest_when_no_summary_en(tmp_path: Path):
