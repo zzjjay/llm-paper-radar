@@ -332,6 +332,45 @@ def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_p
     assert "2026-05-12_en.md#p-zhonly" not in text2
 
 
+def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Path):
+    """When paper-river/*<id-slug>.org exists, _full_block inserts a Paper
+    River section between Why and Summary. Compact README table is NOT
+    affected — the link only shows in the detail page (watched + topic
+    highlights)."""
+    summarized_path = tmp_path / "summarized.json"
+    p_river = _mk("2604.18556", 9, trending_rank=1)  # has org file
+    p_river.summary_en = "en"  # forces _en file too, for parity
+    p_no_river = _mk("9999.99999", 9, trending_rank=2)  # no org file
+    summarized_path.write_text(
+        json.dumps([p_river.model_dump(mode="json"), p_no_river.model_dump(mode="json")])
+    )
+
+    pr_dir = tmp_path / "paper-river"
+    pr_dir.mkdir()
+    (pr_dir / "gsq-2604-18556.org").write_text("dummy")
+
+    digests_dir = tmp_path / "digests"
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=digests_dir,
+        readme_path=tmp_path / "README.md",
+        index_path=tmp_path / "INDEX.md",
+        paper_river_dir=pr_dir,
+    )
+
+    detail = (digests_dir / "2026-05-11.md").read_text()
+    # River link rendered for the paper with a matching org file.
+    assert "#### 🌊 Paper River" in detail
+    assert "../paper-river/gsq-2604-18556.org" in detail
+    # The other paper (no org file) does NOT get a river section.
+    no_river_block = detail.split("p-9999-99999")[-1].split("---")[0]
+    assert "Paper River" not in no_river_block
+    # Compact README table is untouched by river logic — only digests/<date>.md.
+    readme_text = (tmp_path / "README.md").read_text()
+    assert "Paper River" not in readme_text
+
+
 def test_render_daily_skips_en_digest_when_no_summary_en(tmp_path: Path):
     """Back-compat: days summarized before bilingual output have summary_en=None
     on every paper. The _en file must NOT be written in that case."""

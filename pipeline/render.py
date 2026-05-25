@@ -102,6 +102,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "summary_missing": "*（摘要生成失败）*",
         "related_header": "#### 📎 相关方法 / 对比基线",
         "why_header": "#### 🧭 为什么推送这篇",
+        "paper_river_header": "#### 🌊 Paper River",
+        "paper_river_line": "倒读批判链 → [{path}](../{path})",
         "unbucketed_label": "其它",
         "caps_unit": "篇",
         "caps_join": "，",
@@ -135,6 +137,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "summary_missing": "*(summary generation failed)*",
         "related_header": "#### 📎 Related methods / baselines",
         "why_header": "#### 🧭 Why this paper",
+        "paper_river_header": "#### 🌊 Paper River",
+        "paper_river_line": "Back-read critique chain → [{path}](../{path})",
         "unbucketed_label": "other",
         "caps_unit": "",
         "caps_join": ", ",
@@ -146,6 +150,32 @@ def _bucket_title_for(lang: str, bucket: str) -> str:
     if lang == "en":
         return BUCKET_TITLES_EN_DETAIL[bucket]
     return BUCKET_TITLES_CN[bucket]
+
+
+def _paper_river_file(p: Paper, paper_river_dir: Path | None) -> Path | None:
+    """Look up the optional paper-river file for this paper. We glob for
+    `paper-river/*<id-slug>.org` so files can be named with a human-readable
+    acronym prefix (e.g. gsq-2604-18556.org) but the lookup still keys on
+    the arxiv ID. Returns the first match or None."""
+    if paper_river_dir is None or not paper_river_dir.exists():
+        return None
+    id_slug = p.id.replace(".", "-")
+    matches = sorted(paper_river_dir.glob(f"*{id_slug}.org"))
+    return matches[0] if matches else None
+
+
+def _paper_river_block(p: Paper, paper_river_dir: Path | None, lang: str) -> str:
+    """One-section auto-link to the paper-river file, scoped to detail-page
+    `_full_block` callers (watched + topic highlights only — the compact
+    README table is intentionally untouched). Empty string when no file."""
+    f = _paper_river_file(p, paper_river_dir)
+    if f is None:
+        return ""
+    s = STRINGS[lang]
+    # Path rendered relative to digests/<date>.md (which sits one level deep).
+    rel = f"paper-river/{f.name}"
+    # Trailing \n\n preserves the blank line before the next section header.
+    return f"{s['paper_river_header']}\n{s['paper_river_line'].format(path=rel)}\n\n"
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
 # one of the eight valid values in BUCKET_ORDER. These papers should have
@@ -363,16 +393,21 @@ def _signal_line(p: Paper, lang: str = "zh") -> str:
     return f"🧪 {' · '.join(parts)}\n" if parts else ""
 
 
-def _watched_block(rank: int, p: Paper, lang: str = "zh") -> str:
+def _watched_block(
+    rank: int,
+    p: Paper,
+    lang: str = "zh",
+    paper_river_dir: Path | None = None,
+) -> str:
     """Same as _full_block but prefixed with the watched-author/affiliation tag."""
     meta = _watched_meta(p)
     if meta is None:
-        return _full_block(rank, p, lang)
+        return _full_block(rank, p, lang, paper_river_dir)
     matched, affs = meta
     tag_authors = ", ".join(matched)
     tag_affs = " — " + "; ".join(affs) if affs else ""
     header = f"> 👤 {tag_authors}{tag_affs}\n"
-    block = _full_block(rank, p, lang)
+    block = _full_block(rank, p, lang, paper_river_dir)
     # Splice the header after the title line so it sits with the metadata.
     title_line, _, rest = block.partition("\n")
     return f"{title_line}\n{header}{rest}"
@@ -399,7 +434,12 @@ def _links_line(p: Paper) -> str:
     return " · ".join(parts)
 
 
-def _full_block(rank: int, p: Paper, lang: str = "zh") -> str:
+def _full_block(
+    rank: int,
+    p: Paper,
+    lang: str = "zh",
+    paper_river_dir: Path | None = None,
+) -> str:
     revisited = " 🔁" if p.seen_before else ""
     primary_source = p.sources[0].name if p.sources else "unknown"
     cats = ", ".join(p.categories) if p.categories else p.primary_category
@@ -415,6 +455,7 @@ def _full_block(rank: int, p: Paper, lang: str = "zh") -> str:
     summary_block = _summary_block(summary, highlights, lang)
     signal_line = _signal_line(p, lang)
     why_line = _why_selected_line(p, lang)
+    river_block = _paper_river_block(p, paper_river_dir, lang)
     related = _related_methods_block(related_list, lang)
     anchor = f'<a id="{_paper_anchor(p)}"></a>\n'
     return f"""{anchor}### {rank}. {p.title} ({p.relevance_score}/10){revisited}
@@ -424,7 +465,7 @@ def _full_block(rank: int, p: Paper, lang: str = "zh") -> str:
 📡 Sources: {_source_badge(p)}
 {signal_line}
 {why_line}
-{summary_block}
+{river_block}{summary_block}
 {related}---
 """
 
@@ -542,6 +583,7 @@ def _render_detail_md(
     surviving: list[Paper],
     highlighted_total: int,
     lang: str = "zh",
+    paper_river_dir: Path | None = None,
 ) -> str:
     s = STRINGS[lang]
     date_str = date.strftime("%Y-%m-%d")
@@ -566,7 +608,7 @@ def _render_detail_md(
         body.append(s["watched_section_blurb"])
         for p in watched_papers:
             rank += 1
-            body.append(_watched_block(rank, p, lang))
+            body.append(_watched_block(rank, p, lang, paper_river_dir))
 
     body.append(s["topics_section_title"])
     body.append(s["topics_section_blurb"].format(caps_line=_caps_summary(topic_caps, lang)))
@@ -577,7 +619,7 @@ def _render_detail_md(
         body.append(f"### {_bucket_title_for(lang, bucket)}\n")
         for p in papers:
             rank += 1
-            body.append(_full_block(rank, p, lang))
+            body.append(_full_block(rank, p, lang, paper_river_dir))
 
     return "\n".join(body)
 
@@ -663,6 +705,7 @@ def _load_day(
     summarized_path: Path,
     digests_dir: Path,
     topic_caps: dict[str, int],
+    paper_river_dir: Path | None = None,
 ) -> tuple[int, list[Paper], list[Paper]]:
     """Write the per-day digest file(s) and return (scanned, watched, surviving)
     for downstream README rendering. Always writes the Chinese <date>.md;
@@ -687,6 +730,7 @@ def _load_day(
             surviving,
             highlighted_total,
             lang,
+            paper_river_dir,
         )
         (digests_dir / f"{date_str}{suffix}.md").write_text(text)
     return scanned, watched_papers, surviving
@@ -716,11 +760,12 @@ def render_daily(
     readme_path: Path,
     index_path: Path,
     topic_caps: dict[str, int] | None = None,
+    paper_river_dir: Path | None = None,
 ) -> None:
     if topic_caps is None:
         topic_caps = {"ptq": 5, "_default": 2}
     scanned, watched_papers, surviving = _load_day(
-        date, summarized_path, digests_dir, topic_caps
+        date, summarized_path, digests_dir, topic_caps, paper_river_dir
     )
     date_str = date.strftime("%Y-%m-%d")
     digest_filename = f"{digests_dir.name}/{date_str}.md"
@@ -803,6 +848,7 @@ def render_aggregated(
     readme_path: Path,
     index_path: Path,
     topic_caps: dict[str, int] | None = None,
+    paper_river_dir: Path | None = None,
 ) -> None:
     """Render each day's digest + INDEX entry, then splice one merged
     N-day table into README."""
@@ -810,7 +856,9 @@ def render_aggregated(
         topic_caps = {"ptq": 5, "_default": 2}
     days: list[tuple[datetime, int, list[Paper], list[Paper]]] = []
     for date, in_path in targets:
-        scanned, watched, surviving = _load_day(date, in_path, digests_dir, topic_caps)
+        scanned, watched, surviving = _load_day(
+            date, in_path, digests_dir, topic_caps, paper_river_dir
+        )
         _update_index(date, index_path, scanned, surviving)
         days.append((date, scanned, watched, surviving))
         print(f"render: wrote digest for {date.date()}")
@@ -829,7 +877,8 @@ if __name__ == "__main__":
     @click.option("--digests-dir", default="digests", type=click.Path(path_type=Path))
     @click.option("--readme", default="README.md", type=click.Path(path_type=Path))
     @click.option("--index", default="INDEX.md", type=click.Path(path_type=Path))
-    def main(date, backfill_days, in_root, digests_dir, readme, index):
+    @click.option("--paper-river-dir", default="paper-river", type=click.Path(path_type=Path))
+    def main(date, backfill_days, in_root, digests_dir, readme, index, paper_river_dir):
         cfg = load_config()
         if date:
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
@@ -846,10 +895,15 @@ if __name__ == "__main__":
             targets.append((target, in_path))
 
         if backfill_days > 0:
-            render_aggregated(targets, digests_dir, readme, index, cfg.render.topic_caps)
+            render_aggregated(
+                targets, digests_dir, readme, index, cfg.render.topic_caps, paper_river_dir
+            )
         else:
             for target, in_path in targets:
-                render_daily(target, in_path, digests_dir, readme, index, cfg.render.topic_caps)
+                render_daily(
+                    target, in_path, digests_dir, readme, index, cfg.render.topic_caps,
+                    paper_river_dir,
+                )
                 print(f"render: wrote digest for {target.date()}")
 
     main()
