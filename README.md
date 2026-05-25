@@ -226,6 +226,10 @@ llm-paper-radar/
 ├── INDEX.md                     # one-line per past digest, newest first
 ├── config.yaml                  # source toggles, models, prefilter, topic_caps
 ├── seeds.yaml                   # curated index of important papers per bucket (used by paper-triage skill)
+├── install.sh                   # symlinks skills/* into ~/.claude/skills/; run once after clone
+├── docs/
+│   ├── SPEC.md                  # design spec — buckets, scoring axes, pipeline contract
+│   └── PLAN.md                  # implementation plan + change log
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
 │   └── summary.md               # bilingual (zh + en) summary format prompt
@@ -238,7 +242,7 @@ llm-paper-radar/
 │   ├── config.py                # Pydantic config model
 │   ├── llm_client.py            # async Anthropic wrapper with prompt cache
 │   ├── dedupe.py
-│   ├── filter.py                # two-axis scoring
+│   ├── filter.py                # two-axis scoring + milestone trending override
 │   ├── summarize.py             # bilingual zh + en summaries
 │   ├── render.py                # bucket grouping + README splicing + Paper River link
 │   ├── readme_template.md       # static doc template (this file's source)
@@ -252,6 +256,8 @@ llm-paper-radar/
 │   ├── translate_paper_river.py # auto-translate zh paper-river/*.org → _en.org
 │   ├── seed_add.py              # add a paper to seeds.yaml
 │   └── seed_reject.py           # log a paper into data/curation/rejected.jsonl
+├── skills/                      # in-repo Claude Code skills (symlinked by install.sh)
+│   └── paper-triage/            # daily triage workflow over the digest queue
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
