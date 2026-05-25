@@ -483,13 +483,13 @@ def _authors_short(p: Paper, limit: int = 3) -> str:
 
 
 def _details_link(p: Paper, digest_filename: str, en_filename: str | None = None) -> str:
-    """Why-column link. Append a sibling `[en](...)` when an English digest
-    file exists for the same day; older days (no _en file) stay single-link."""
+    """Why-column link. Symmetric `[zh](...) · [en](...)` when both files
+    exist; older days (no _en file) fall back to `[zh](...)` alone."""
     anchor = _paper_anchor(p)
-    main = f"[📄]({digest_filename}#{anchor})"
+    zh = f"[zh]({digest_filename}#{anchor})"
     if en_filename:
-        return f"{main} · [en]({en_filename}#{anchor})"
-    return main
+        return f"{zh} · [en]({en_filename}#{anchor})"
+    return zh
 
 
 def _bucket_cell(p: Paper) -> str:

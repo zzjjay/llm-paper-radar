@@ -314,7 +314,7 @@ def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_p
         index_path=tmp_path / "INDEX.md",
     )
     text = readme.read_text()
-    assert "[📄](digests/2026-05-11.md#p-withen) · [en](digests/2026-05-11_en.md#p-withen)" in text
+    assert "[zh](digests/2026-05-11.md#p-withen) · [en](digests/2026-05-11_en.md#p-withen)" in text
 
     # Second day with no EN data: single-link, no `· [en]` suffix.
     p_zh = _mk("zhonly", 9, trending_rank=1)
@@ -328,7 +328,7 @@ def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_p
         index_path=tmp_path / "INDEX.md",
     )
     text2 = readme.read_text()
-    assert "[📄](digests/2026-05-12.md#p-zhonly)" in text2
+    assert "[zh](digests/2026-05-12.md#p-zhonly)" in text2
     assert "2026-05-12_en.md#p-zhonly" not in text2
 
 
