@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
-# Save the current README paper list + INDEX to backups/<utc-timestamp>-w<window>d/.
+# Save the current README paper list to snapshots/<start>-<end>-<N>days.md.
 # Called from daily.sh after render; can also be run manually any time
 # to capture the current state of the working tree.
 #
 # Usage:
-#   ./scripts/snapshot.sh            # uses DAYS env var or "manual"
-#   DAYS=7 ./scripts/snapshot.sh     # tagged with -w7d
-#   LABEL=rescreen ./scripts/snapshot.sh   # custom label suffix
+#   ./scripts/snapshot.sh            # window (start/end/N) all parsed from README
+#   LABEL=rescreen ./scripts/snapshot.sh   # appended before .md
 #
-# Output layout:
-#   backups/<UTC-YYYYMMDD-HHMMSS>-w<N>d/
-#     paper-list.md       # the LATEST_START..LATEST_END block of README
-#                         # (the only part that changes per run)
-#     INDEX.md            # full INDEX (small, copied verbatim)
-#     bucket-counts.txt   # cheap diff helper: paper count per bucket
-#     header.txt          # window + scanned/surfaced summary
-#     meta.txt            # git HEAD sha + timestamp
+# Output:
+#   snapshots/<YYYYMMDD>-<YYYYMMDD>-<N>days[-<label>].md
+#     - top: window line + scanned/surfaced line + git sha + snapshot ts
+#     - body: the LATEST_START..LATEST_END block of README
 
 set -uo pipefail
 
@@ -27,40 +22,45 @@ if [[ ! -f README.md ]]; then
     exit 1
 fi
 
-TS="$(date -u +%Y%m%d-%H%M%S)"
-# Window tag: numeric DAYS becomes "w7d", non-numeric (e.g. manual label) used verbatim.
-DAYS_RAW="${DAYS:-manual}"
-if [[ "$DAYS_RAW" =~ ^[0-9]+$ ]]; then
-    TAG="w${DAYS_RAW}d"
-else
-    TAG="$DAYS_RAW"
+# Parse window from the "> 📅 Window: YYYY-MM-DD → YYYY-MM-DD" line.
+WINDOW_LINE="$(grep -m1 -E "^> 📅 Window" README.md || true)"
+if [[ -z "$WINDOW_LINE" ]]; then
+    echo "snapshot: could not find '📅 Window' line in README.md" >&2
+    exit 1
 fi
-[[ -n "${LABEL:-}" ]] && TAG="${TAG}-${LABEL}"
-SNAP_DIR="backups/${TS}-${TAG}"
-mkdir -p "$SNAP_DIR"
+# Extract the two YYYY-MM-DD dates in order.
+read -r START_DASH END_DASH < <(echo "$WINDOW_LINE" | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}" | head -2 | tr '\n' ' ')
+if [[ -z "${START_DASH:-}" || -z "${END_DASH:-}" ]]; then
+    echo "snapshot: failed to parse start/end from: $WINDOW_LINE" >&2
+    exit 1
+fi
+START="${START_DASH//-/}"
+END="${END_DASH//-/}"
 
-# Extract the LATEST_START..LATEST_END block from README. That marker pair
-# wraps the digest content; everything outside is static documentation.
-awk '/<!-- LATEST_START -->/{flag=1} flag; /<!-- LATEST_END -->/{flag=0}' \
-    README.md > "$SNAP_DIR/paper-list.md"
+# Window length N is always derived from the parsed window so the filename
+# never disagrees with the content. DAYS env is intentionally ignored here.
+START_EPOCH="$(date -u -d "$START_DASH" +%s)"
+END_EPOCH="$(date -u -d "$END_DASH" +%s)"
+N=$(( (END_EPOCH - START_EPOCH) / 86400 ))
 
-# INDEX.md is ~10KB even for 184 days — copy whole.
-[[ -f INDEX.md ]] && cp INDEX.md "$SNAP_DIR/INDEX.md"
+NAME="${START}-${END}-${N}days"
+[[ -n "${LABEL:-}" ]] && NAME="${NAME}-${LABEL}"
 
-# Per-bucket paper count for cheap diff of "what changed in distribution".
-awk -F'|' '/^\| [0-9]/{print $3}' README.md \
-    | sed 's/^ *//;s/ *$//' \
-    | sort | uniq -c | sort -rn > "$SNAP_DIR/bucket-counts.txt"
+mkdir -p snapshots
+OUT="snapshots/${NAME}.md"
 
-# Top-level header (window + scanned/surfaced counts).
-grep -E "^> 📅 Window|^> 📊 Scanned" README.md | head -2 > "$SNAP_DIR/header.txt"
+SCANNED_LINE="$(grep -m1 -E "^> 📊 Scanned" README.md || true)"
+TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+GIT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
-# Provenance: git sha + UTC timestamp for traceability.
 {
-    echo "ts_utc=${TS}"
-    echo "window=${DAYS:-manual}"
-    echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
-    [[ -n "${LABEL:-}" ]] && echo "label=${LABEL}"
-} > "$SNAP_DIR/meta.txt"
+    echo "<!-- snapshot: ${NAME} -->"
+    echo "<!-- ts_utc=${TS_UTC} git_head=${GIT_HEAD} -->"
+    echo
+    [[ -n "$WINDOW_LINE"  ]] && echo "$WINDOW_LINE"
+    [[ -n "$SCANNED_LINE" ]] && echo "$SCANNED_LINE"
+    echo
+    awk '/<!-- LATEST_START -->/{flag=1} flag; /<!-- LATEST_END -->/{flag=0}' README.md
+} > "$OUT"
 
-echo "snapshot → $SNAP_DIR"
+echo "snapshot → $OUT"

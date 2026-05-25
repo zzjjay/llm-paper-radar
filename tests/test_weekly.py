@@ -40,11 +40,43 @@ def test_weekly_aggregates_past_seven_days(tmp_path: Path):
         end_date=datetime(2026, 5, 11, tzinfo=UTC),
         summarized_root=summarized,
         out_dir=out_dir,
-        top_n=20,
     )
 
     files = list(out_dir.glob("*.md"))
     assert len(files) == 1
+    assert files[0].name == "20260505-20260511.md"
     text = files[0].read_text()
-    assert "Top 20" in text
-    assert "Per-source" in text
+
+    # Header + compact table, no Top-N truncation, no per-source section.
+    assert "Weekly Digest · 2026-05-05 → 2026-05-11" in text
+    assert "Surfaced: 35 papers" in text
+    assert "| # | Bucket | Paper | Authors | Date | Why |" in text
+    assert "Per-source" not in text
+    # All 35 papers present: count data rows (skip header + separator).
+    data_rows = [
+        ln for ln in text.splitlines() if ln.startswith("| ") and "Bucket" not in ln
+    ]
+    # 35 data rows + 1 separator row "|---|..."
+    assert len([ln for ln in data_rows if not ln.startswith("|---")]) == 35
+
+    # Why-column points to ../digests/<date>.md (relative from weekly/).
+    assert "../digests/2026-05-11.md#p-d0p0" in text
+
+
+def test_weekly_drops_hard_gated(tmp_path: Path):
+    summarized = tmp_path / "summarized"
+    summarized.mkdir()
+    date = datetime(2026, 5, 11, tzinfo=UTC)
+    papers = [
+        _mk("keep", 9, day_offset=0),
+        _mk("drop", 9, day_offset=0, hard_gate=True),
+    ]
+    (summarized / f"{date.strftime('%Y-%m-%d')}.json").write_text(
+        json.dumps([p.model_dump(mode="json") for p in papers])
+    )
+
+    out_dir = tmp_path / "weekly"
+    render_weekly(end_date=date, summarized_root=summarized, out_dir=out_dir)
+    text = (out_dir / "20260505-20260511.md").read_text()
+    assert "keep" in text
+    assert "p-drop" not in text
