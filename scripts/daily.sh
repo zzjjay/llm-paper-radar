@@ -93,12 +93,25 @@ run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACK
 run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" || exit 5
 run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" || exit 6
 
-# Auto-translate any new paper-river/*.org that lacks an _en.org sibling
+# Auto-generate paper-river .org files for every surfaced paper that
+# doesn't have one yet. Delegates to scripts/auto_paper_river.py which
+# scans data/summarized/, dedupes against paper-river/, and invokes
+# scripts/gen_paper_river.sh per paper (which runs the ljg-paper-river
+# Claude Code skill in headless mode). Default has NO cap — set
+# PAPER_RIVER_MAX=N to cap per run (e.g. 2 in cron, unlimited for
+# weekend backfills). PAPER_RIVER_SKIP=1 disables this step entirely.
+# Non-fatal: pipeline ships even if generation fails.
+if [[ "${PAPER_RIVER_SKIP:-0}" -eq 1 ]]; then
+    echo "[$(date -Is)] auto_paper_river: skipped (PAPER_RIVER_SKIP=1)"
+else
+    run_step "auto_paper_river" uv run python scripts/auto_paper_river.py --no-warn-sleep \
+        || echo "  (auto_paper_river failed, continuing)"
+fi
+
+# Auto-translate any zh paper-river/*.org that lacks an _en.org sibling
 # BEFORE render, so the resulting `_en.org` files get picked up by this
-# run's render step (which globs paper-river/ to inject `[zh] · [en]`
-# pills into digest detail pages). Files are produced manually by the
-# ljg-paper-river skill (Chinese only). Non-fatal: pipeline ships even
-# if translation fails or there's nothing to translate.
+# run's render step. Runs AFTER auto_paper_river so the just-generated
+# zh files get translated in the same run. Non-fatal.
 run_step "translate_paper_river" uv run python scripts/translate_paper_river.py --all \
     || echo "  (paper-river translation failed, continuing)"
 

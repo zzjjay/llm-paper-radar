@@ -22,6 +22,18 @@ if [[ ! -f README.md ]]; then
     exit 1
 fi
 
+# Best-effort: generate paper-river for any surfaced paper missing one,
+# then translate any zh paper-river without an _en sibling. Both share
+# paper-river/ with daily.sh, so file-existence dedup means snapshot
+# won't redo what daily already did. PAPER_RIVER_SKIP=1 disables both.
+# Non-fatal — snapshot proceeds even if generation/translation flakes.
+if [[ "${PAPER_RIVER_SKIP:-0}" -ne 1 ]]; then
+    uv run python scripts/auto_paper_river.py --no-warn-sleep \
+        || echo "snapshot: auto_paper_river failed, continuing"
+    uv run python scripts/translate_paper_river.py --all \
+        || echo "snapshot: translate_paper_river failed, continuing"
+fi
+
 # Parse window from the "> 📅 Window: YYYY-MM-DD → YYYY-MM-DD" line.
 WINDOW_LINE="$(grep -m1 -E "^> 📅 Window" README.md || true)"
 if [[ -z "$WINDOW_LINE" ]]; then
