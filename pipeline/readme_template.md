@@ -274,7 +274,8 @@ llm-paper-radar/
 │   ├── daily.sh                 # cron entrypoint: fetch → ... → push (--no-fetch skips fetch)
 │   └── snapshot.sh              # captures the current README paper-list into snapshots/
 ├── digests/
-│   └── YYYY-MM-DD.md            # daily digest archive
+│   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
+│   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
 ├── weekly/
 │   └── YYYYMMDD-YYYYMMDD.md     # weekly digest (full table, # | Bucket | Paper | …)
 ├── snapshots/

@@ -254,6 +254,54 @@ def test_compact_table_excludes_hard_gated_watched_papers(tmp_path: Path):
     assert "👤 0 from watched authors" in text
 
 
+def test_render_daily_writes_en_digest_when_summary_en_present(tmp_path: Path):
+    """Bilingual digest: render writes both <date>.md and <date>_en.md when
+    at least one paper carries summary_en; the EN file uses English labels."""
+    summarized_path = tmp_path / "summarized.json"
+    p = _mk("id1", 9, trending_rank=1)
+    p.summary_en = "English summary body"
+    p.highlights_en = ["🎯 method"]
+    p.related_methods_en = [{"name": "GPTQ", "relation": "beaten by 1pt", "arxiv_id": "2210.17323"}]
+    summarized_path.write_text(json.dumps([p.model_dump(mode="json")]))
+
+    digests_dir = tmp_path / "digests"
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=digests_dir,
+        readme_path=tmp_path / "README.md",
+        index_path=tmp_path / "INDEX.md",
+    )
+
+    zh = (digests_dir / "2026-05-11.md").read_text()
+    en = (digests_dir / "2026-05-11_en.md").read_text()
+    assert "LLM 推理优化日报" in zh and "#### 摘要" in zh
+    assert "LLM Inference Optimization Daily" in en
+    assert "#### Summary" in en and "English summary body" in en
+    assert "PTQ (post-training quantization)" in en  # EN bucket header
+    assert "Why this paper" in en
+    assert "Related methods / baselines" in en
+
+
+def test_render_daily_skips_en_digest_when_no_summary_en(tmp_path: Path):
+    """Back-compat: days summarized before bilingual output have summary_en=None
+    on every paper. The _en file must NOT be written in that case."""
+    summarized_path = tmp_path / "summarized.json"
+    p = _mk("id1", 9, trending_rank=1)  # summary_en defaults to None
+    summarized_path.write_text(json.dumps([p.model_dump(mode="json")]))
+
+    digests_dir = tmp_path / "digests"
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=digests_dir,
+        readme_path=tmp_path / "README.md",
+        index_path=tmp_path / "INDEX.md",
+    )
+    assert (digests_dir / "2026-05-11.md").exists()
+    assert not (digests_dir / "2026-05-11_en.md").exists()
+
+
 def test_render_index_line_includes_summary_stats():
     line = render_index_line(
         datetime(2026, 5, 11, tzinfo=UTC),

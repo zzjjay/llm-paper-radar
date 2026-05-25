@@ -13,22 +13,29 @@ async def _summarize_one(
     paper: Paper, prompt: str, client: LLMClient, sem: asyncio.Semaphore
 ) -> Paper:
     user = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
+
+    def _clean_related(related: list) -> list[dict]:
+        return [
+            {
+                "name": str(m.get("name", "")).strip(),
+                "relation": str(m.get("relation", "")).strip(),
+                "arxiv_id": (m.get("arxiv_id") or None),
+            }
+            for m in related
+            if isinstance(m, dict) and m.get("name")
+        ][:3]
+
     async with sem:
         try:
-            r = await client.call_json(prompt, user, max_tokens=1100)
+            # ~2000 tokens budgets both summaries plus highlights & related lists
+            # without spilling on dense abstracts. Bumped from 1100 (CN-only).
+            r = await client.call_json(prompt, user, max_tokens=2000)
             paper.summary = r.get("summary")
             paper.highlights = r.get("highlights") or []
-            related = r.get("related_methods") or []
-            # Defensive: drop malformed entries and cap to 3.
-            paper.related_methods = [
-                {
-                    "name": str(m.get("name", "")).strip(),
-                    "relation": str(m.get("relation", "")).strip(),
-                    "arxiv_id": (m.get("arxiv_id") or None),
-                }
-                for m in related
-                if isinstance(m, dict) and m.get("name")
-            ][:3]
+            paper.related_methods = _clean_related(r.get("related_methods") or [])
+            paper.summary_en = r.get("summary_en")
+            paper.highlights_en = r.get("highlights_en") or []
+            paper.related_methods_en = _clean_related(r.get("related_methods_en") or [])
         except Exception as e:
             print(f"summarize: paper {paper.id} failed: {e}")
     return paper

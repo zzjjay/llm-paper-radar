@@ -47,6 +47,13 @@ class Paper(BaseModel):
     # extracted from the abstract by the summarize step. Each entry:
     # {"name": str, "relation": str, "arxiv_id": str | None}.
     related_methods: list[dict] = Field(default_factory=list)
+    # English-language siblings. Populated by summarize in the same LLM call.
+    # name/arxiv_id stay language-agnostic; only `relation` differs from
+    # related_methods. Absence (None / []) means the day was summarized before
+    # bilingual output was added — render falls back to skipping the _en file.
+    summary_en: str | None = None
+    highlights_en: list[str] = Field(default_factory=list)
+    related_methods_en: list[dict] = Field(default_factory=list)
     seen_before: bool = False
 
 
