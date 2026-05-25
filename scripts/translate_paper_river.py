@@ -52,7 +52,7 @@ English. Output a complete Org-mode document. Strict rules:
      FP8, …), benchmarks (MMLU, GSM8K, HumanEval, …), models (Llama-3-70B,
      Qwen3, Mistral, DeepSeek, …), math (`Δw`, `H^{-1}`, `O(n^3)`, `2-3 bpp`, …),
      algorithm names (Gumbel-Softmax, Cholesky, Hessian, …), tool/library names
-     (GGUF, llama.cpp, vLLM, TensorRT-LLM, …).
+     (GGUF, llama.cpp, vLLM, …).
 
 2. **Translate** the narrative prose, section headings (`*`, `**`, `***`),
    inline comments inside code blocks, and any other natural-language content.

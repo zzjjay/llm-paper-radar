@@ -95,7 +95,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 - `accuracy_benchmarks ∈ {none, unknown}` AND composite ≤ 7 — unless compared against an established baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …) or `topic_relevance ≥ 4` AND `practicality ≥ 4`
 - Largest model < 1B parameters (BERT-base, GPT-2-small)
 - **`ptq` only**: largest model < 7B (gaps at 1B routinely flip at 7B+; modern LLM family + unknown size = default trust)
-- Unstructured sparsity needing novel GPU kernels not in shipping stacks (vLLM / TRT-LLM / SGLang); N:M, MoE expert pruning, layer drop stay in scope
+- Unstructured sparsity needing novel GPU kernels not in shipping stacks (vLLM / SGLang); N:M, MoE expert pruning, layer drop stay in scope
 
 ### Topic buckets and per-bucket caps
 

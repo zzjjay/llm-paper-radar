@@ -53,7 +53,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 - **No benchmark validation AND would otherwise score ≤ 7**: `accuracy_benchmarks` ∈ {none, unknown} AND `topic_relevance + practicality ≤ 7` → hard_gate, unless the paper explicitly compares against an established compression baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …). A high-relevance + high-practicality paper (TR ≥ 4 AND PR ≥ 4) can still surface without a benchmark.
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
 - **`ptq` bucket — stricter scale rule**: any PTQ paper whose largest experiment is < 7B parameters → hard_gate. Sub-7B PTQ (FLAN-T5-base, CLIP-ViT, GPT-2, OPT-1.3B, Pythia-1.4B) does not predict large-scale behavior — accuracy gaps at 1B routinely flip at 7B+. Modern LLM family + unknown size → default trust. Other buckets keep the < 1B threshold.
-- **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / TensorRT-LLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
+- **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
 
 ### Topic buckets and per-bucket caps
 
