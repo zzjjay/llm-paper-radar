@@ -363,8 +363,8 @@
 
 - [05-22](digests/2026-05-22.md) — 332 scanned, 0 passed, top: (no papers passed)
 
-- [05-23](digests/2026-05-23.md) — 101 scanned, 14 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
+- [05-23](digests/2026-05-23.md) — 101 scanned, 15 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
 
-- [05-24](digests/2026-05-24.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [05-24](digests/2026-05-24.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
 - [05-25](digests/2026-05-25.md) — 0 scanned, 0 passed, top: (no papers passed)
