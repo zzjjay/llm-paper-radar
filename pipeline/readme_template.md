@@ -140,7 +140,20 @@ uv run python -m pipeline.render    --backfill-days 0
 
 `scripts/daily.sh` chains all of these, then `git commit && git push` if anything changed.
 
-> **Optional · 🌊 Paper River.** The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<id-slug>.org` file exists (`<id-slug>` = arXiv id with dots → dashes, e.g. `2604.18556` → `2604-18556`). Those `.org` files are manual deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the personal-collection `ljg-paper-river` Claude Code skill (not bundled with this repo). Write `.org` files by hand if you don't have the skill; no cron hook, generation is on-demand.
+### 🌊 Paper River (optional companion analyses)
+
+The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<id-slug>.org` file exists (`<id-slug>` = arXiv id with dots → dashes, e.g. `2604.18556` → `2604-18556`). Those `.org` files are manual deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the `ljg-paper-river` Claude Code skill. No cron hook; generation is on-demand. Render works fine without it (no file → no link).
+
+**Install the skill.** It ships in the [`lijigang/ljg-skills`](https://github.com/lijigang/ljg-skills) Claude Code plugin marketplace — install in two slash commands, no clone needed (`master` branch = org-mode output, which is what `pipeline/render.py` expects):
+
+```
+/plugin marketplace add lijigang/ljg-skills
+/plugin install ljg-skills@ljg-skills
+```
+
+The plugin bundles the whole `ljg-*` collection (all `ljg-*` skills become available); `ljg-paper-river` is the one this repo uses. Verify with `/skills | grep ljg-paper-river`.
+
+Then invoke per paper (e.g. `/ljg-paper-river https://arxiv.org/abs/<id>`), save the output as `paper-river/<acronym>-<id-slug>.org` from the radar repo root, and re-run `uv run python -m pipeline.render --date <date>` (or the next `daily.sh`).
 
 ---
 
