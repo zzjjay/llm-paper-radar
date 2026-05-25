@@ -1,0 +1,321 @@
+#+title:      Quant.npu: Enabling Efficient Mobile NPU Inference for on-device LLMs via Fully Static Quantization
+#+date:       [2026-05-25 Mon 07:12]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T071206-en
+#+source:     https://arxiv.org/abs/2605.20295
+#+authors:    Jinghe Zhang, Daliang Xu, Chenghua Wang, Weikai Xie, Tao Qi, Yun Ma, Mengwei Xu, Gang Huang
+#+venue:      arXiv preprint, May 2026
+
+* The Problem River
+
+Your phone needs to run an LLM locally. The NPU inside the chip — the dedicated AI accelerator — runs integer operations 10× faster and 4× more power-efficiently than floating point. But it has a quirky constraint: every scale factor must be locked in at compile time; nothing can be measured on the fly during inference. The trouble is that LLM activations are naturally haunted by "outlier giants," and without a live look you simply cannot pin down the right scale.
+
+This river is the story of researchers asking, one after another: *How do you fix that scale in advance so that an LLM runs both fast and accurately on an NPU?* The difficulty is razor-edged: locking the scale precisely tends to kill throughput, and optimizing for throughput tends to ruin precision. The mainstream academic approach assumes you can measure dynamically; industrial deployment forbids it. The two paths are twisted against each other from the very start.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers - LLM.int8()
+  |
+  | Problem observed: A handful of "giant" channels in LLM activations
+  |                   blow up the entire tensor, making uniform quantization fail.
+  | Solution: Identify those giants and route them through FP16;
+  |           send everything else through INT8.
+  v
+[2022] Xiao et al. - SmoothQuant
+  |
+  | Problem: Splitting channels is hardware-unfriendly and requires two code paths.
+  | Solution: "Migrate" the large activation values proportionally onto the weights,
+  |           making both sides easier to quantize.
+  v
+[2022] Frantar - GPTQ
+  |
+  | Problem: Quantizing weights to 4-bit while preserving accuracy.
+  | Solution: Use Hessian second-order information to compensate
+  |           errors column by column.
+  v
+[2024] Ashkboos - QuaRot
+  |
+  | Problem: SmoothQuant only rescales; extreme outliers still blow up.
+  | Solution: Apply a Hadamard rotation to spread outliers
+  |           evenly across all channels.
+  v
+[2024] Liu et al. - SpinQuant
+  |
+  | Problem: A fixed Hadamard matrix is not the optimal rotation.
+  | Solution: Make the rotation matrix learnable
+  |           (Cayley optimization preserves orthogonality).
+  v
+[2024] Sun et al. - FlatQuant
+  |
+  | Problem: Rotation is a constrained transformation; can we be more flexible?
+  | Solution: Use a learnable affine transform to "flatten" the distribution.
+  | Hidden flaw: Training secretly relies on dynamic quantization;
+  |              deploy to static hardware and it collapses.
+  v
+[2024] Saha et al. - MobileQuant  (parallel branch)
+  |
+  | Problem: Bring PTQ to a mobile NPU — must be fully static.
+  | Solution: Directly learn per-tensor static parameters,
+  |           but without any rotation.
+  v
+[2026] *Quant.npu*  (target paper)
+  |
+  | Problem: Combining rotation with fully static quantization breaks training —
+  |          the two optimization targets fight each other.
+  | Solution: Rotation-aware initialization + two-stage selective optimization +
+  |           sensitivity-aware mixed precision.
+  v
+[?]  Next: Operator-level hardware co-design? NPU-aware training from scratch?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering the "Activation Giants"
+
+*** What problem did it see?
+
+Before this work, the community treated deep-model quantization as a pure engineering exercise: convert float32 to int8, accept a few percent accuracy loss, move on. But once LLMs hit scale, that recipe broke. Quantizing OPT-175B naively to INT8 sent performance from excellent to near-random.
+
+The authors examined activation distributions and found something strange: most channels behaved perfectly, staying within a small numeric range, but a tiny fraction (fewer than 1%) had values 100× larger than the rest. With a few "giants" dominating each tensor, a single uniform scale was hopeless — either the scale was too coarse and small values collapsed to zero, or too fine and the giants saturated.
+
+*** Its solution
+
+Handle the giants separately. During online inference, before each matrix multiplication, the layer scans the current batch of activations, identifies the outlier channels, routes them through FP16, and routes everything else through INT8. The two partial results are then merged.
+
+*** Why it worked — and what new pitfalls it opened
+
+The outlier channels are few, but they carry a disproportionate share of information. Crushing them destroys the model's most critical signal. Keeping them at high precision restored model quality.
+
+But two new problems emerged: first, hardware must support "mixed-precision dispatch," complicating control flow; second, every inference pass requires a dynamic scan to locate the giants, which defeats half the motivation for quantization in the first place. The next paper arrived to address both.
+
+** 2022 | SmoothQuant: Pushing the Giants onto the Weights
+
+*** What problem did it see?
+
+LLM.int8()'s split path was hard on hardware. The more fundamental pain: outliers are an activation problem — the weights have always been well-behaved. Could we make the activations well-behaved too?
+
+*** Its solution
+
+A mathematical sleight of hand. In a matrix multiplication Y = X @ W, if you multiply each channel of X by a scalar s (scaling it down) and divide the corresponding row of W by s (scaling it up), the result is identical. SmoothQuant does exactly this: shrink the giant activation channels by a per-channel s, transferring their magnitude to the weights. The weights become slightly harder to quantize, but weight quantization is always done offline once — the cost is negligible.
+
+One clean trade: activations become flat enough for uniform INT8; weights become slightly less regular but are pre-computed and frozen.
+
+*** Why it worked — and what new pitfalls it opened
+
+Activation outliers are a distribution problem, and distribution problems can be fixed with scaling. In one stroke, the dynamic mixed-path approach became a static single-path approach, reducing hardware complexity by an order of magnitude.
+
+The pitfall: scaling is "one-dimensional migration." If an activation channel is both large and directional in a way that a single scalar cannot capture, SmoothQuant cannot fully tame it. As models grew larger and outliers grew more extreme, SmoothQuant began to crack under pressure. A heavier tool was needed.
+
+** 2022 | GPTQ: An Industrial-Grade Answer on the Weight Side
+
+*** What problem did it see?
+
+While the activation side was fighting its battles, the weight side had its own war. GPTQ stayed out of the activation debate and focused entirely on weights: could you quantize to 4-bit with almost no accuracy loss?
+
+Naïve round-to-nearest at 4-bit causes massive degradation, because each weight's rounding error propagates forward through layers and compounds.
+
+*** Its solution
+
+Instead of quantizing each weight in isolation, process weights column by column, using the Hessian matrix to identify which weights are most sensitive to the final loss. When quantizing the current column, compensate the resulting error into the yet-unquantized columns. The procedure is essentially a layer-level least-squares solve.
+
+*** Why it worked — and what new pitfalls it opened
+
+GPTQ elevated quantization from a "rounding problem" to a "constrained optimization problem." Once you see it that way, a full suite of mathematical tools becomes available.
+
+Its limitation: it only handles weights — activations still run in FP16. To reach W4A8 (4-bit weights + 8-bit activations), you still need progress on the activation side. GPTQ became a near-universal component of production quantization pipelines, but it is not the end of this river.
+
+** 2024 | QuaRot: "Rotating" Giants into Ordinary Values
+
+*** What problem did it see?
+
+SmoothQuant can only rescale per-channel, but activation outliers have directional structure. What if you could change the viewing angle of the entire activation tensor so that outliers spread across all channels, eliminating the need to treat them specially?
+
+*** Its solution
+
+A mathematical magic trick. The Hadamard matrix H satisfies H^T @ H = I, so Y = X @ W = (X @ H) @ (H^T @ W) — exactly equivalent. But look at X @ H: the values that were concentrated in a few giant channels get spread across all channels, so every channel ends up with a similar magnitude.
+
+Pre-multiply H and H^T into the weights offline; at runtime there is zero added cost. Once the activations are "rotated flat," per-tensor INT8 quantization is sufficient.
+
+*** Why it worked — and what new pitfalls it opened
+
+Scaling moves one dimension; rotation can redistribute an entire coordinate system. The essence of outliers is "a few channels with huge variance, all others small" — rotation can rebalance that variance.
+
+But QuaRot used a fixed, textbook Hadamard matrix. The obvious next question: a textbook H is not necessarily optimal for your particular LLM. The obvious next step — make H learnable.
+
+** 2024 | SpinQuant: Making the Rotation Matrix Learnable
+
+*** What problem did it see?
+
+QuaRot applied a fixed Hadamard and called it done, but every model and every layer has a different activation distribution. A fixed matrix is provably suboptimal. Could the rotation matrix be optimized just like model weights?
+
+*** Its solution
+
+Treat the rotation matrix as a learnable parameter and back-propagate through a small calibration dataset. The matrix must remain orthogonal (otherwise H^T @ H ≠ I and the mathematical equivalence breaks), so Cayley parameterization is used — a continuous optimization technique that preserves orthogonality throughout training.
+
+After training, the learned R1 (shared across layers) and R2 (specific to V projections) are folded into the weights; deployment has zero overhead.
+
+*** Why it worked — and what new pitfalls it opened
+
+Fixed transform → learned transform is a standard machine-learning upgrade. "Rotation flattens outliers" was previously an empirical observation; now it becomes "find the rotation that best fits your data," shifting from hand-crafted features to learned features.
+
+But there is a very subtle pitfall: the training simulates *dynamic* quantization — the scale is recomputed from min/max on every batch. This means R is optimized under the assumption that the scale can always adapt. The moment you deploy to hardware that permits only static quantization, the scale is frozen and the rotation R learned under the dynamic assumption is no longer optimal. The paper does not make this explicit, but it is exactly the pitfall that Quant.npu was born to fix.
+
+** 2024 | FlatQuant: A More Flexible Version of Rotation
+
+*** What problem did it see?
+
+SpinQuant learns an orthogonal rotation — a constrained family of transforms. If you allow a more general transformation (not necessarily orthogonal, only invertible), could you flatten the activation distribution even further, making it even more quantization-friendly?
+
+*** Its solution
+
+Insert a learnable affine transform A before each layer's activations, and insert A^{-1} before the corresponding weights, preserving mathematical equivalence. The optimization objective is to make A @ X as flat as possible — a flat distribution means a small max/min ratio and thus smaller quantization error.
+
+*** Why it worked — and what new pitfalls it opened
+
+Rotation is a subset of affine transforms; more degrees of freedom generally yield a better solution. FlatQuant indeed outperforms SpinQuant on many benchmarks.
+
+But it inherits SpinQuant's hidden illness — *training secretly relies on dynamic quantization*. The published results assume dynamic scales are available at inference time, so the learned A is optimal only under that assumption. When Quant.npu ported FlatQuant directly to an NPU (forced fully static), accuracy on SmolLM2-1.7B dropped by 15.61% — the learned A was simply unusable.
+
+At this point, a clearly visible chasm had opened between the mainstream academic approach and industrial NPU deployment.
+
+** 2024 | MobileQuant (Parallel Branch): Facing the NPU Directly
+
+*** What problem did it see?
+
+While academia was playing sophisticated dynamic-quantization games, practitioners encountered a different kind of pain: mobile NPUs simply do not allow dynamic quantization. To run an LLM on a phone, you must be fully static.
+
+*** Its solution
+
+Abandon the rotation machinery entirely. Directly learn per-tensor static scales and zero-points. Run a calibration pass, obtain a fixed set of parameters, deploy.
+
+*** Why it worked — and what new pitfalls it opened
+
+A pragmatist's answer: get it running on the NPU first, optimize later.
+
+The pitfall is equally obvious: without rotation, outliers go untreated; per-tensor static parameters get hijacked by a few giant channels; accuracy drops significantly. In the Quant.npu paper, MobileQuant serves as the most direct baseline — evidence that this industrial branch never managed to merge with the academic rotation track.
+
+** 2026 | Quant.npu: Making Rotation and Fully Static Quantization One Thing
+
+*** What problem did it see?
+
+Transplanting FlatQuant/SpinQuant rotations directly into a static deployment caused accuracy collapse. Adding rotation on top of MobileQuant-style static quantization caused training to diverge.
+
+Attempting to jointly optimize the rotation matrix and static quantization parameters together produced completely unstable training dynamics: each update to the rotation matrix changed the activation distribution, which changed the optimal scale, which invalidated the rotation update — both sides fighting, neither converging.
+
+More granular observations:
+- If the initial static scale is wrong — clipping too aggressively (signal lost) or too loosely (resolution wasted) — no amount of subsequent optimization can recover.
+- Making *all* scales learnable actually made things worse: some scales learned values that were harmful rather than helpful, disrupting convergence.
+
+*** Its solution
+
+Three coordinated techniques:
+
+1. *Rotation- and bit-width-aware initialization*: Choose different initialization strategies depending on whether a tensor has been rotated and what the target bit-width is. Post-rotation activations are more Gaussian; mean-based initialization converges fast for them. Unrotated tensors still need min-max initialization.
+2. *Two-stage optimization* (discrepancy-aware selective optimization): First, optimize the "rotated, well-behaved" tensors with gradient-based methods. Then, handle the "unrotated, hard-to-optimize" tensors with static calibration. The two classes of parameters follow separate pipelines and no longer interfere with each other.
+3. *Sensitivity-aware mixed precision*: Measure each layer's sensitivity to quantization, preserve 16-bit for critical layers, apply 8-bit or 4-bit elsewhere. Fast and accurate.
+
+*** Why it worked — and what new pitfalls it opened
+
+It identified something all prior work had missed: introducing rotation fundamentally changes the optimal strategy for *which scales should be learned and which should be fixed*. Making that interaction explicit allowed the problem to be decomposed cleanly.
+
+On a real Qualcomm SM8650 NPU, Quant.npu achieves accuracy within 2.58% of the dynamic-assumption SoTA while running 15.1% faster — the first time "rotation + fully static" has been made into a deployable product.
+
+Remaining pitfalls: all of this work lives at the algorithm level; hardware microarchitecture, compiler back-ends, and operator scheduling have not been co-optimized. As models grow beyond 3B parameters, the ceiling of per-tensor static quantization will appear very quickly.
+
+* Frontier Extensions
+
+This river is still very fresh at Quant.npu (May 2026). Two foreseeable directions:
+
+1. *Hardware–algorithm co-design*: Today, algorithms unilaterally adapt to NPU constraints. The next step is the reverse: at NPU design time, build in native support for rotation-matrix fusion and mixed-precision scheduling. This has already happened on the GPU side (Tensor Core support for FP8); NPUs have not yet caught up.
+2. *Quantization-aware training from the start*: Quant.npu is still a PTQ method. If models were trained or post-trained to "know they will be quantized" for static deployment (QAT targeting static hardware), the outlier problem might be sidestepped entirely.
+
+As of May 2026, Quant.npu is the leading edge of the "rotation + fully static NPU" line.
+
+* One Diagram
+
+#+begin_example
+                  outliers growing more extreme ----------->
+  +----------+----------+----------+----------+----------+
+  |          |          |          |          |          |
+  | LLM.int8 | Smooth   |  QuaRot  | SpinQuant| FlatQuant|
+  |   2022   |  Quant   |   2024   |   2024   |   2024   |
+  |          |  2022    |          |          |          |
+  | "Pull    | "Push    | "Spread  | "Learn   | "More    |
+  |  giants  |  giants  |  giants  |  the     |  flexible|
+  |  out and |  onto    |  across  |  best    |  transform
+  |  treat   |  weights"|  all     |  spread" |"          |
+  |  them    |          |  channels|          |          |
+  |  specially          |"         |          |          |
+  |          |          |          |          |          |
+  | Mixed-   | 1-D      | Fixed    | Learned  | Learned  |
+  | precision| rescaling| Hadamard | orthog.  | affine   |
+  | dispatch | can't    | not      | matrix   | flatten  |
+  | complex  | handle   | learnable| trained  | trained  |
+  |          | extremes |          | w/ dyn.  | w/ dyn.  |
+  |          |          |          | quant.   | quant.   |
+  +----------+----------+----------+----------+----------+
+                                                  |
+          dynamic quantization assumption --- deploy to static NPU → collapse
+                                                  |
+                                                  v
+                                          +----------------+
+                                          |  *Quant.npu*   |
+                                          |     2026       |
+                                          |                |
+                                          | Rotation and   |
+                                          | static quant.  |
+                                          | unified        |
+                                          |                |
+                                          | 1. Rotation-   |
+                                          |    & bit-width-|
+                                          |    aware init  |
+                                          | 2. Two-stage   |
+                                          |    selective   |
+                                          |    optim.      |
+                                          | 3. Mixed       |
+                                          |    precision   |
+                                          |                |
+                                          | Runs on real   |
+                                          | NPU hardware;  |
+                                          | 15% faster than|
+                                          | SOTA           |
+                                          +----------------+
+
+                          +-------------+
+  Parallel branch:        | MobileQuant |
+                          |   2024      |
+                          | Directly    |
+                          | trains      |
+                          | static      |
+                          | params; no  |
+                          | rotation    |
+                          +-------------+
+#+end_example
+
+* Insight
+
+Reading through this line of work, the most important observation is not that "rotation techniques keep getting fancier." It is that *a crack opened between academic research and industrial deployment — and then someone stitched it back together*.
+
+During 2022–2024, the mainstream quantization research agenda was "how to use smarter transforms to reduce LLM quantization error." But every method quietly assumed a hidden premise: *activation ranges can be measured dynamically at inference time*. On a GPU this is essentially free — computing min/max costs almost nothing. On a mobile NPU, a dynamic measurement burns seven vector cycles — enough time to finish the bottleneck INT8 matrix multiplication.
+
+So academic SoTA, when dropped into industrial deployment, collapsed completely.
+
+Quant.npu's real contribution is not inventing a new transform. It is *the first paper to honestly include "fully static" as a first-class optimization target*. Once the team assumed static deployment throughout, they discovered that the coupling between the rotation matrix and the quantization scales behaves completely differently — a relationship none of the prior papers had seen, because none of them had ever optimized under a static constraint.
+
+This suggests a general heuristic: *when academia and industry disagree about what constitutes the hard problem, either academia is ignoring a real constraint, or industry has not yet caught up to a real opportunity.* Quant.npu is a case of the former.
+
+The most likely next step is to open the constraints even further — not just static quantization, but pulling the entire NPU operator graph and memory schedule into the optimization objective. As model scale continues to rise and per-tensor static quantization hits its ceiling, hardware may start offering "mixed static/pseudo-dynamic" features, enabling the next round of rotation-technique upgrades.
+
+* Takeaways
+
+1. *How to find problems: watch for constraint mismatches.* Academia polishes techniques under assumption A; industrial deployment only permits assumption B. The gap between them almost always contains overlooked, high-value problems. QuaRot, SpinQuant, and FlatQuant all avoided confronting the static constraint honestly — so Quant.npu was born in that gap.
+
+2. *How to make progress: add the constraint honestly.* When you incorporate an industrial constraint (here: "NPU must be fully static") as a genuine part of the training objective, problems that appeared solved reopen as live research questions. This is a reliable mechanism for generating new results.
+
+3. *Look at interactions, not isolated components.* Quant.npu's core insight is that the rotation matrix and scale parameters are strongly coupled and must be considered jointly. Prior work optimized them separately — because joint optimization is hard. But hard is where the opportunity lives. Much of the "we optimize these separately" in the literature is really "joint optimization was too difficult," and difficulty is exactly where new work can emerge.
+
+4. *Practical implications:*
+   - Don't default to chasing the highest-accuracy baseline; chase the highest-accuracy baseline that can actually run on real hardware.
+   - Revisit the methods in your field that are "SOTA but never deployed." They almost always hide an overlooked constraint.
+   - Translate "hardware constraints" into "optimization constraints," so that algorithms actively adapt to hardware rather than waiting for hardware to catch up to algorithms.

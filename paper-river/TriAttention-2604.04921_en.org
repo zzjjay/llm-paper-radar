@@ -1,0 +1,223 @@
+#+title:      TriAttention: Efficient Long Reasoning with Trigonometric KV Compression
+#+date:       [2026-05-25 Mon 06:41]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T064159-en
+#+source:     https://arxiv.org/abs/2604.04921
+#+authors:    Weian Mao, Xi Lin, Wei Huang, Yuxin Xie, Tianfu Fu, Bohan Zhuang, Song Han, Yukang Chen
+#+venue:      arXiv 2026 (cs.CL)
+
+* The River of the Problem
+
+As a model reasons, it stacks every token's K and V into GPU memory — the longer the reasoning chain, the sooner memory explodes. Can we keep only the tokens that will genuinely be needed later, discard the rest, and still not make the model stupider?
+
+The question is hard because "which tokens will matter in the future" must be decided right now — before the model has seen that future. Generation after generation of methods has gambled on a proxy signal: which signal best predicts "will still be attended to later"? Betting wrong breaks the reasoning chain and makes answers inconsistent.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: Nothing else yet — attention was just crowned king
+  | Legacy:  Every token's K/V must be kept; memory O(N); collapses at long N
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem: KV cache grows without bound; model grinds to a halt
+  | Solution: Keep a few leading "sink" tokens + a sliding window
+  | Legacy:   Everything in between is discarded; only streaming chat works,
+  |           not tasks that require looking back
+  v
+[2023] Zhang et al. - H2O
+  |
+  | Problem: A fixed window discards genuinely important content tokens
+  | Solution: Retain tokens with high cumulative attention — "heavy hitters"
+  | Legacy:   Global accumulation absorbs noise; once evicted a token is gone —
+  |           tokens that become important late are already lost
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Problem: Global accumulation is inefficient and unrelated to the current query
+  | Solution: Use attention from a small observation window at the prompt tail
+  |           to vote for top-K keys
+  | Legacy:   Scoring uses only the most recent few queries — keys outside the
+  |           window never get a chance to surface
+  v
+[2025] Cai et al. - R-KV (+ LazyEviction)
+  |
+  | Problem: Reasoning models change their minds mid-generation; old scores expire;
+  |          redundant CoT also balloons cache size
+  | Solution: Roll the "recent query" window forward; add redundancy deduplication,
+  |           purpose-built for long CoT reasoning
+  | Legacy:   Still scores in post-RoPE space; queries are rotated, so the pool
+  |           of usable representative queries is tiny
+  v
+[2026] Mao et al. - TriAttention (this paper)
+
+  Finding: Shift the viewpoint to before RoPE — Q/K vectors in pre-RoPE space
+           are highly concentrated around a fixed non-zero center in each head's
+           dominant frequency bands, and that center is stable across positions
+           and inputs (Q/K concentration). Substituting these constant vectors
+           back into the RoPE attention formula yields a logit that depends on
+           only one thing: the distance Δ between query and key. Expanding it
+           gives a trigonometric series in Δ — a curve that tells you which
+           distances this head prefers, computed entirely from the center vectors,
+           with no need to observe queries at inference time.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Handing Sequence Modeling to Attention, but Running Up a KV-Memory Debt
+
+*** What problem did it see?
+
+RNNs process tokens one by one — too slow, and long-range information fades.
+
+*** Its solution
+
+Replace everything with attention: every position can look at every other position in one shot. Parallel, effective.
+
+*** Why it worked — and where the new trap was buried
+
+Attention turns "where to look" into learnable weights; the model picks for itself. But the natural price is that generating each token requires keeping every historical token's K and V in memory. As the sequence grows, memory is O(N); at tens of thousands of tokens it simply runs out. Every KV cache compression effort that follows is fundamentally paying off this debt.
+
+** 2023 | StreamingLLM: Forget Accounting — Just Chop: Keep the Head and the Tail
+
+*** What problem did it see?
+
+For streaming applications (perpetual chat), a complete KV cache is out of the question. But naive truncation reveals a strange failure: drop the very first few tokens and the model collapses immediately.
+
+*** Its solution
+
+It discovered the "attention sink" phenomenon: the very first tokens absorb a large share of attention regardless of their content. So the retention scheme became: a few leading sink tokens plus a trailing sliding window, with everything in between discarded.
+
+*** Why it worked — and where the new trap was buried
+
+The sinks act like a ground wire, draining excess attention so softmax stays numerically stable. This enables unlimited conversation, but at a steep cost — the specific content of the middle segment evaporates entirely. Ask "what was that detail you mentioned earlier?" and the model is lost. Any task requiring look-back fails.
+
+** 2023 | H2O: Don't Cut by Position — Cut by Attention Frequency
+
+*** What problem did it see?
+
+StreamingLLM cuts by position, completely ignoring content. But obviously some middle tokens matter more than newly arrived ones — key facts, proper names, the subject of the question.
+
+*** Its solution
+
+Accumulate, token by token during decoding, the attention each token receives; tokens that keep getting "flipped" are heavy hitters and are kept; cold ones are evicted. The criterion shifts from geometric position to historical heat.
+
+*** Why it worked — and where the new trap was buried
+
+The intuition flows naturally: what has always been attended to should continue to be. But (1) global accumulation absorbs noise as well; (2) once evicted a token cannot return — a token that is cold early but becomes critical later is already gone. This static, greedy decision process is especially unfriendly to reasoning models.
+
+** 2024 | SnapKV: Don't Look at All History — Look at the Current Question
+
+*** What problem did it see?
+
+H2O's cumulative sum has no direct connection to what the model is answering right now. As generation begins at the prompt tail, the relevant signal is "which keys does the query near the question attend to?"
+
+*** Its solution
+
+Drop global accumulation entirely. Instead, use attention from a small observation window at the end of the prompt to vote: the top-K keys attended to by those queries are kept; everything else is cleared. One-shot selection — clean and efficient.
+
+*** Why it worked — and where the new trap was buried
+
+Tying "importance" to "relevance to the current question" raises the hit rate considerably. But a new flaw remains: only a small window of queries participates in scoring, so keys that would have been summoned from outside that window never get a chance. Fine for short Q&A; broken for long reasoning.
+
+** 2025 | R-KV: A Version Purpose-Built for Models That Think While They Write
+
+*** What problem did it see?
+
+SnapKV suits the scenario where the prompt is delivered all at once. Reasoning models (DeepSeek-R1, QwQ, and similar) generate chain-of-thought on the fly — their thinking pivots mid-stream, making old importance scores instantly stale; meanwhile CoT is long and repetitive, so cache redundancy is enormous.
+
+*** Its solution
+
+Roll the scoring window forward over the most recently generated queries; layer on a redundancy detector that proactively drops repetitive tokens. The concurrent LazyEviction pushes this idea further: evict only after a token has been seen repeatedly inside the observation window, leaving room for delayed decisions.
+
+*** Why it worked — and where the new trap was buried
+
+Much closer to the real rhythm of reasoning. But the authors themselves acknowledge a hard ceiling: expand the observation window beyond ~25 queries and performance falls back. Why? Because all these methods score in post-RoPE space, and after RoPE rotation the query direction drifts with position — only the most recent few queries can serve as reliable representatives. Queries further back are already misaligned; their reference value is low.
+
+At this point five generations share the same dead end: post-RoPE queries are unstable, so the observation window is forced to stay small, so important keys keep leaking through. The problem is not "which window to use" — it is "why we must use a window at all."
+
+** 2026 | TriAttention: Stop Scoring with Queries — Go Back to Before RoPE
+
+*** What problem did it see?
+
+All five predecessors struggled inside post-RoPE space. TriAttention moves the viewpoint one step earlier: if queries are unstable because RoPE rotates them, what does the picture look like before the rotation?
+
+*** Its solution
+
+It observes an unexpected phenomenon: pre-RoPE Q and K vectors in each head's dominant frequency bands are highly concentrated around a fixed non-zero center, and that center is stable across positions and across inputs (Q/K concentration).
+
+If Q and K approximately equal their respective centers, substituting these constant vectors back into the RoPE attention formula produces a logit that depends on exactly one thing: the distance Δ between query and key. Expanding gives a trigonometric series with Δ as the independent variable:
+
+#+begin_example
+logit(Δ) ≈ sum_f  a_f * cos(omega_f * Δ)  +  b_f * sin(omega_f * Δ)
+#+end_example
+
+This curve tells you which distances from itself this head prefers — some prefer near neighbors, some prefer the far end (attention sinks), some exhibit periodic peaks. All of this can be computed offline from the center vectors; there is no need to observe queries at inference time at all.
+
+At scoring time a Q/K norm term is added to handle the minority of heads with low concentration, and the concentration metric automatically weights the two components.
+
+*** Why it worked — and where the new traps are buried
+
+The proxy signal is switched from "attention of the last few queries" to "this head's fixed distance-preference curve" — the latter is determined by the model weights, independent of current position, and requires no observation window. RoPE rotation was a headache for prior work because prior work insisted on measuring after the rotation; TriAttention simply goes to measure before it. On AIME25: 2.5× throughput and 10.7× KV memory reduction at matched accuracy; twice the accuracy of the baseline at matched efficiency.
+
+New traps: (1) offline calibration is needed to obtain the center vectors; (2) Q/K concentration is not satisfied by 100% of heads — a minority still falls back to the norm term; (3) the whole analytical framework depends on RoPE — switching to a different positional encoding requires reworking the theory from scratch.
+
+* Frontier Extensions
+
+As of 2026-05, TriAttention was published just over a month ago (2026-04-06) and no clear direct successors are yet visible. But following the same vein, several directions are predictable:
+
+- *Bringing the pre-RoPE viewpoint to the prefill stage*: this paper focuses on decoding KV compression, but attention sparsity during prefill is equally exploitable.
+- *Stacking with quantization*: the existence of a pre-RoPE center implies that the effective information dimensionality of Q/K is lower than expected, potentially offering a new calibration anchor for low-bit quantization.
+- *Extending to non-RoPE architectures*: ALiBi, NoPE, and others also have their own distance–attention structures; the "distance-preference curve" as a class of concept may be a more universal abstraction.
+
+* One Diagram to See It All
+
+#+begin_example
+        Memory O(N), explosion at long sequences   <-- the shared root problem
+                |
+                v
+     +---------------------------------------------+
+     | What proxy signal decides who gets kept?    |
+     +---------------------------------------------+
+                |
+   +-------+-------+-------+-------+--------+
+   |       |       |       |       |        |
+ position  global  local   rolling  head's intrinsic
+ (sink+    cumul.  window  window   distance-preference
+  window)  attn    attn    attn     curve
+   |       |       |       |        |
+ Streaming H2O   SnapKV   R-KV   TriAttention
+  LLM   2023    2024     2025    2026
+  2023
+   |       |       |       |        |
+ content  noisy  leaks   too few   bypass queries:
+ lost     accum  outside queries   pre-RoPE center
+                 window            + trigonometric series
+
+  position    historical  current   real-time  structural
+  heuristic   frequency   snapshot  rolling    prior
+  (heuristic) (cumulative)(snapshot)(rolling)  (intrinsic)
+#+end_example
+
+Five steps across, and the entire line does the same thing: push the proxy signal for "importance" steadily closer to "what future demand will actually require." From watching position and history, to watching the current question and real-time generation, and finally TriAttention — which stops watching queries altogether and reads the head's intrinsic preference directly.
+
+* Insight
+
+On the surface, five generations competed on "KV compression." The deeper shift is *from dynamic observation to static structure*.
+
+The first four generations share a default assumption: to predict who will matter in the future, you must watch what the query is doing now. So they invented various "windows" — global accumulation windows, prompt-tail windows, rolling windows — and poured all their effort into tuning "which segment of queries to watch."
+
+TriAttention's reversal is this: queries are inherently unstable (continuously rotated by RoPE), so anchoring to them was always awkward. But a head's Q/K center is stable — it is that head's "personality," unchanged by input or position. Personality determines which key distances the head was always going to prefer. Once you have mapped the personality, you no longer need to watch what the head is doing right now.
+
+This is the kind of paradigm jump that is easy to overlook: when you notice that every incremental improvement moves along the same dimension with diminishing returns, it usually means you need to change the unit of measurement. Pre-RoPE vs. post-RoPE is exactly that change of units.
+
+The most probable next direction: treat "head intrinsic preference" as an independent research object — not just for KV compression, but also for designing draft models in speculative decoding, for head-level quantization policy, and for attention interpretability. The true output of this line may not be "yet another compression method" but rather the long-overdue recognition that *a head is an object with a personality*.
+
+* Takeaways
+
+- When every recent paper on a research thread is micro-tuning the same variable (here: the size and placement of the observation window), resist the urge to join the race. Ask instead: what is the prerequisite that makes this variable exist at all? Removing that prerequisite often opens an entirely new space.
+- Things that have been rotated or transformed inside a model are hard to analyze. Whenever possible, move the viewpoint to before the transform (pre-RoPE, pre-norm, pre-softmax) — structurally stable patterns often appear there, and those patterns are free priors.
+- Offline calibration is an underrated lever. As long as a quantity is stable in distribution, it can be computed once offline at zero runtime cost — this is especially valuable for inference infrastructure.
+- Practical landing point: the next time you work on KV compression / sparse attention / quantization, start with a head-level pre-RoPE Q/K distribution profile. If concentration is high, this paper's framework applies directly; if it is low, you have at minimum gained a feature more stable than raw attention scores.

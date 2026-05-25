@@ -1,0 +1,270 @@
+#+title:      Runtime-Certified Bounded-Error Quantized Attention
+#+date:       [2026-05-25 Mon 07:23]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T072316-en
+#+source:     https://arxiv.org/abs/2605.20868
+#+authors:    Dean Calver
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* The Problem River
+
+During long-context inference, the KV cache devours GPU memory and bandwidth — on LLaMA-3.1-8B with a 128K context, KV alone takes 17 GB, and decoding every single token requires reading the entire cache all over again. Compressing it (INT8, INT4) can cut that cost by half to three-quarters, but compression introduces errors, and no existing system can tell you at runtime "something went wrong on this step."
+
+Everyone working in this space has been doing the same thing: squeezing the KV smaller. Nobody has done the other thing: issuing a runtime receipt that says "I can guarantee the error on this step stays within some bound," and pulling a safety cord to recover precision when that guarantee is in jeopardy. CertAttn is the first work to say "compression should not be a gamble — it should be a computation with a receipt."
+
+* Source Map
+
+#+begin_example
+[2022] Dao et al. - FlashAttention
+  |
+  | Insight: the bottleneck in attention is not compute, it's memory traffic
+  | Fix: IO-aware tiled computation; online softmax that never materializes
+  |      the full N×N matrix to HBM
+  | Residual gap: during autoregressive decoding the KV cache must be re-read
+  |               every step; read volume ∝ N, and grows without bound
+  v
+[2023] Kwon et al. - PagedAttention (vLLM)
+  |
+  | Insight: KV cache is pre-allocated for worst-case length, causing severe
+  |          fragmentation and limiting concurrency
+  | Fix: slice KV into fixed-size pages, allocate on demand like OS virtual
+  |      memory, use a page table to stitch them together logically
+  | Residual gap: fragmentation is solved, but the raw KV volume of a single
+  |               long sequence is untouched
+  v
+[2023] Zhang et al. - H2O
+  |
+  | Insight: not all token KVs matter equally — attention distributions are
+  |          extremely skewed; a few "heavy hitter" tokens absorb most mass
+  | Fix: track cumulative attention scores, evict the lowest-scoring tokens
+  |      at each step to keep cache size constant
+  | Residual gap: evicting the wrong token loses information; who counts as
+  |               a heavy hitter is heuristic — no formal guarantee exists
+  v
+[2024] Liu et al. - KIVI
+  |
+  | Insight: instead of deleting tokens, keep all of them at lower precision
+  | Fix: K and V have asymmetric outlier structure — K outliers concentrate
+  |      along channel dimensions, V outliers along token dimensions;
+  |      quantize K per-channel, V per-token; tuning-free 2-bit KV cache
+  | Residual gap: validation is still empirical — "no average degradation"
+  |               does not imply "safe on every individual step"
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | Insight: KIVI's per-token K quantization is still corrupted by channel
+  |          outliers amplified by RoPE
+  | Fix: fully per-channel K quantization throughout; non-uniform quantization
+  |      (nuq4) to handle outliers; claims support for 10M-token inference
+  | Residual gap: compression ratio is now near its floor, yet per-step
+  |               certificates remain absent; quality is still assessed
+  |               post-hoc via perplexity
+  v
+[2026] Calver - CertAttn (this paper)
+
+  Insight: the blind spot shared by the entire KV-compression lineage —
+           "low average error" ≠ "safe on every step"
+  Fix: two-tier storage (compressed in VRAM + FP16 originals in RAM)
+       + two-term error decomposition
+       + per-step, per-head error upper bounds
+       + four-rung fallback ladder (worst case: full FP16 attention)
+  Paradigm shift: KV quantization redefined from "fixed approximation"
+                  to "runtime-verified computation"
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | FlashAttention: The Bottleneck Is Moving Data, Not Computing It
+
+*** What Problem It Saw
+
+After Transformers took off, everyone was piling compute onto optimizing softmax. But Tri Dao noticed something counter-intuitive: on an A100, measured attention latency is not compute-bound — it is memory-bandwidth-bound. The query × key product produces an N × N matrix that gets written to HBM, read back for softmax, written again, and read once more to multiply V. The round-trip data-movement cost dwarfs the actual arithmetic.
+
+*** Its Solution
+
+Never write the intermediate matrix. Tile Q, K, and V to fit in SRAM (the GPU's small, fast on-chip buffer), then run an online version of softmax — maintaining a running max and sum as new tiles arrive — so the full N × N result never lands in HBM.
+
+*** Why It Worked (and What New Hole It Left)
+
+It worked because it aligned an algorithmically equivalent rewrite with the hardware memory hierarchy. But this was a prefill victory (computing over the whole sequence at once). Switch to autoregressive decoding — emitting tokens one by one — and the picture changes: each new token requires reading the entire accumulated K and V cache from scratch. Read volume ∝ N. FlashAttention freed prefill from the N² wall but left a new monster behind: the KV cache during decoding.
+
+** 2023 | PagedAttention: Manage the KV Cache Like Virtual Memory
+
+*** What Problem It Saw
+
+The conventional approach to KV cache was "allocate for the worst case" — a request declares a maximum length of 2048 tokens, the framework reserves 2048 slots immediately, even if only 200 are used. With dozens of concurrent requests in production, each hoarding its reservation, GPU memory is exhausted by reservations rather than actual data, and concurrency collapses.
+
+*** Its Solution
+
+Borrow the OS virtual-memory playbook. Slice KV into equal-size pages (e.g., 16 tokens per page), hand pages to requests on demand, reclaim them when done. Physical storage need not be contiguous; a page table stitches the logical sequence together.
+
+*** Why It Worked (and What New Hole It Left)
+
+It shattered the implicit assumption that "the KV cache is one big contiguous array," turning KV into a first-class resource that can be allocated, migrated, shared, and reclaimed. vLLM achieves 2–4× throughput gains as a result. But PagedAttention solves "how do multiple requests share KV memory," not "a single long-context request's KV is just too large." A 128K-token sequence still carries 17 GB of KV — no amount of paging makes that go away.
+
+** 2023 | H2O: Does Every Token's KV Really Need to Stay?
+
+*** What Problem It Saw
+
+Researchers staring at attention weight matrices noticed something counter-intuitive: in long contexts, attention distributions are extraordinarily skewed. The vast majority of tokens are almost never attended to by future queries, while a handful of "heavy hitter" tokens absorb the lion's share of attention mass. If the distribution is that lopsided, isn't retaining virtually all KVs just hoarding dead weight?
+
+*** Its Solution
+
+Evict lazily during decoding. Maintain a cumulative attention score per token; at each step, evict the lowest-scoring tokens to make room for the newest ones. Cache capacity becomes a constant rather than growing with sequence length.
+
+*** Why It Worked (and What New Hole It Left)
+
+It worked because the sparsity of attention distributions is real. But it left two deep holes. First, evicting the wrong token loses information — a token that seems unimportant now may be retrieved by a retrieval-style query 20K tokens later. Second, and more critically: deciding who counts as a heavy hitter is entirely heuristic. No formal promise of "I guarantee no critical information is lost" exists anywhere. When things break, you only find out by watching a benchmark score drop afterward.
+
+That "no guarantee" tail — the entire next three generations of work never cut it off.
+
+** 2024 | KIVI: Keep Everything, But at Lower Precision
+
+*** What Problem It Saw
+
+The hard flaw in H2O-style thinking is the binary choice between "delete" and "keep." KIVI's authors asked: why choose at all? Keep every token but make each one occupy fewer bits — you get both no information loss and reduced memory. Weight quantization (GPTQ, AWQ) was already working; applying the same logic to the KV cache should be feasible.
+
+But the first attempt hit a wall immediately. Naively applying weight-quantization strategies — quantizing uniformly along the token dimension — caused K matrices to explode: error blew up and model performance collapsed.
+
+*** Its Solution
+
+Look carefully at the numerical distributions of K and V and notice a critical asymmetry:
+
+- In the K matrix, outliers concentrate in certain *channels* — e.g., dimension 47 persistently produces values in the thousands.
+- In the V matrix, outliers concentrate at certain *tokens* — some positions have globally large V vectors.
+
+Therefore: quantize K per-channel (one scale per channel dimension) and V per-token (one set of scales per token position). This isolates outliers within their own narrow range so they cannot corrupt neighboring channels or tokens. Paired with a sliding window that keeps the most recent R tokens in full precision, they achieve 2-bit, tuning-free KV compression — no retraining required.
+
+*** Why It Worked (and What New Hole It Left)
+
+K/V asymmetry is real, and matching quantization granularity to the outlier axis prevents the two from fighting each other. But KIVI's quality validation is the same old approach: run on PG-19, measure perplexity, run LongBench, check scores, publish if nothing looks broken. Hidden underneath is a question nobody dared ask: **if average perplexity does not degrade, can we guarantee no individual decode step goes haywire?** Nobody could answer it. A single specific prompt crashing on a specific step is invisible to benchmark averages but immediately visible to users.
+
+** 2024 | KVQuant: Full Per-Channel K Quantization, All the Way Down
+
+*** What Problem It Saw
+
+KIVI still used per-token K quantization in some layers. The KVQuant team found that in modern LLMs (especially the LLaMA family), applying RoPE (Rotary Position Embedding) to K further amplifies inter-channel magnitude differences — certain channels at certain positions have values far larger than any other channel. Quantizing per-token forces the scale to accommodate these large outliers, squeezing all normal values into a tiny integer range and letting quantization noise surge.
+
+*** Its Solution
+
+Per-channel K quantization, end-to-end. Not just grouped by channel, but each channel carrying its own independent scale and offset throughout the entire sequence. Combined with non-uniform quantization (nuq4) — finer grid near outliers, coarser grid elsewhere — the approach reaches below 4-bit and claims support for 10M-token inference.
+
+*** Why It Worked (and What New Hole It Left)
+
+Per-channel K quantization isolates the inter-channel variance introduced by RoPE; it is the natural technical continuation of KIVI. But it pushes the compression-ratio ceiling nearly to its floor — the next step would be binary quantization. And like everyone before it, the certification problem stays untouched. Across the entire lineage from H2O to KVQuant, every paper's "quality assurance" section follows the same script: pick some benchmarks, run them, if the numbers look fine, ship it.
+
+CertAttn is where that "looks fine, ship it" paradigm gets flipped over.
+
+** 2026 | CertAttn: Turn Compression Into Computation With a Receipt
+
+*** What Problem It Saw
+
+Author Dean Calver puts the entire field's blind spot in one sentence in the introduction:
+
+#+begin_quote
+"A system that achieves Δppl < 0.1 on average may still exhibit large step-wise deviations on individual decode steps—and there is no mechanism to detect when this happens, let alone recover from it."
+#+end_quote
+
+Translation: average perplexity not degrading does not mean this particular step did not crash. And if it crashes, you do not know. And even if you knew, you could not recover.
+
+The force of this observation is that it names a collective blind spot. KIVI, KVQuant, QServe, PQCache — the competition has been over compression ratio, throughput, and benchmark scores. Nobody ever asked: "Can you tell me, on each individual step, exactly how far this step's output has drifted from the true FP16 result?"
+
+*** Its Solution
+
+Three mechanisms twisted into one rope:
+
+1. *Two-tier storage.* VRAM holds compressed KV (per-channel INT8 keys + per-group INT4 values). System RAM retains the FP16 originals — they are *not deleted* after compression. The originals are the safety cord, paged back to the GPU on demand.
+
+2. *Two-term error decomposition.* The gap between compressed output and FP16 output is split into two independently bounded components:
+   - Key compression error → distorts the softmax distribution → upper-bounded by deriving the total-variation distance from |Δ logit| via tanh(Δ)
+   - Value compression error → shifts the attention output vector → upper-bounded by per-block value reconstruction error weighted by that block's attention mass
+   Both bounds are computable at runtime from quantities *the system is already tracking* (quantization scales, query norms).
+
+3. *Four-rung fallback ladder.*
+   - Rung 1: widen the FP16-key tile selection
+   - Rung 2: upgrade to FP16 values
+   - Rung 3: fall back to full FP16 KV for this head
+   - Rung 4: fall back to full FP16 KV for the entire layer
+   The final rung is an unconditional safety net — it calls PyTorch's =scaled_dot_product_attention= directly, following the exact same code path as the dense baseline.
+
+*** Why It Worked (and What New Hole It Left)
+
+Its power lies not in more aggressive compression but in changing the rules of the game. The prior art was "compress + pray." CertAttn is "compress + measure + fall back." Experiments on PG-19, NIAH, and RULER show that the gap from dense FP16 falls within noise; the catastrophic step-level failures of naive INT8/INT4 baselines (NIAH recall collapsing to zero) are caught by the fallback chain.
+
+The remaining gaps the author acknowledges openly: the guarantees are *per-head, per-step* and local — they are not end-to-end model quality guarantees. If the model would answer incorrectly in FP16, this system will not save you. Fallback also has a cost — paging from RAM to GPU is not free — so this is a quality-over-speed scheme. The paper is candid: the goal is not raw speedup but safely deploying aggressive KV compression under strict quality constraints.
+
+* Frontier Extensions
+
+The target paper appeared in May 2026, which is very recent; downstream citations have not yet accumulated. But a few contemporaneous works illuminate adjacent branches of the evolutionary tree:
+
+- *TurboQuant (Zandieh et al., ICLR 2026)*: online vector quantization with tighter theoretical bounds, applicable to KV cache. Still on the "compress harder" track; runtime certificates are untouched.
+- *JanusQuant (Sun et al., PPoPP 2026)*: production-quality 2-bit KV quantization. Likewise compression-ratio driven, no certificates.
+- *PackInfer (Ning et al., 2026)*: compute/IO-efficient kernels for compressed KV in batch serving. A systems-optimization direction, orthogonal to CertAttn.
+
+The picture in 2026 KV quantization research: two forks running in parallel — the mainstream still pushes "compress harder," while CertAttn opens a new fork of "compress more trustworthily." Which gets absorbed into production first is a question for the next year or two. My intuition is they will converge: new compression-ratio frontiers combined with CertAttn-style runtime certificates → safe deployment in serious production environments.
+
+* One Diagram
+
+#+begin_example
+                     KV Cache Evolution (2022 → 2026)
+              Axis: "the trust problem with compression"
+
+  Timeline ->
+  2022           2023            2023        2024        2024         2026
+  ----           ----            ----        ----        ----         ----
+  FlashAttn      PagedAttn       H2O         KIVI        KVQuant      CertAttn
+  IO-aware       paged           drop        quantize    per-channel  certified
+  attention      KV alloc        cold KV     all KV      K quant      + fallback
+   |             |               |           |           |             |
+   |             |               |           |           |             |
+   v             v               v           v           v             v
+  Problem:       Problem:        Problem:    Problem:    Problem:      Problem:
+  HBM traffic    fragmentation   KV full     deleting    per-token K   avg safety
+  explodes       burns memory    of idle     is risky    wrecked by    ≠ per-step
+                 budget          tokens                  RoPE          safety
+   |             |               |           |           |             |
+  Fix: SRAM     Fix: OS-style   Fix: evict  Fix: K per- Fix: K fully  Fix: dual-
+  tiled online  page-based      low-score   channel,    per-channel   tier store
+  softmax       KV alloc        tokens      V per-token quant         + error
+                                                                       bounds +
+                                                                       4-rung
+                                                                       fallback
+
+  ----------------------------- Turning Point ----------------------------
+                                                                       ^
+                                                                       |
+                                                                  Paradigm shift:
+                                                              compression moves
+                                                              from "pray" to
+                                                              "measure + recover"
+
+  Read vertically: each generation solves the "save more" problem left by the
+                   previous one
+                   (save traffic → save memory → save tokens → save bits → at limit)
+  CertAttn is the first to stop asking "can we save more?" and ask instead
+  "after we save, can we trust it?"
+#+end_example
+
+* Insights
+
+On the surface this evolutionary line is a technical iteration of "KV cache gets smaller and smaller." Underneath, three genuine cognitive shifts are taking place:
+
+1. *From model-level to system-level* (the FlashAttention step). Researchers realized that LLM bottlenecks live not in algorithms but in the memory hierarchy. After this, all serious optimizations began consulting the hardware.
+
+2. *From static structure to runtime observation* (the H2O step). Attention sparsity is dynamic and prompt-dependent; it must be observed at runtime to be exploited. This permanently couples "the model" to "the workload."
+
+3. *From empirical quality to certifiable quality* (the CertAttn step, just now). Everyone before it implicitly assumed "passing the benchmark means it's fine." CertAttn is the first to say "no — I need an upper bound on every individual step." This imports production reliability engineering thinking — observability, verification, graceful degradation — into LLM serving.
+
+Where does this go next? Two directions I would bet on:
+- *Certificates propagating upward.* CertAttn's certificates are per-head, per-step. Downstream work will aggregate them into per-token and per-response end-to-end certificates.
+- *Co-design of certificates and compression.* Today CertAttn bolts certificates onto existing INT8/INT4 schemes. The next generation will produce quantization methods *designed for certifiability* — perhaps structured quantization that makes upper bounds naturally tighter.
+
+* Takeaways
+
+When you read a paper, do not just read "what are the results" — read "what assumption everyone else accepted without question is this paper challenging." The heart of CertAttn is not its equations; it is that it noticed a blind spot everyone had normalized: "publish if benchmark doesn't drop." Once that blind spot is named, the engineering world cannot go back — which is exactly why papers that interrogate a paradigm repay your time far more than papers that merely push a score.
+
+Practical landing points:
+
+- If you are working on LLM serving, consider adding "runtime quality certificates" to your observability stack — even if you do not use CertAttn itself, at minimum monitor per-step deviation between your compressed output and some reference.
+- If you are choosing a research topic, look for other areas that share the "benchmark didn't drop so ship it" assumption — that is where the next CertAttn is sitting.
+- If you are making product decisions, remember: good average metrics do not mean stable user experience. Tail failures are what users remember, so "P99 quality" deserves more attention than "average quality."

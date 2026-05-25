@@ -1,0 +1,261 @@
+#+title:      Measuring Maximum Activations in Open Large Language Models
+#+date:       [2026-05-25 Mon 06:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T065428-en
+#+source:     https://arxiv.org/abs/2605.15572
+#+authors:    Luxuan Chen, Han Tian, Xinran Chen, Rui Kong, Fang Wang, Jiamin Chen, Yuchen Li, Jiashu Zhao, Shuaiqiang Wang, Haoyi Xiong, Dawei Yin
+#+venue:      arXiv 2026 (Baidu / SJTU / Nankai)
+
+* The Problem River
+
+Squeezing a large model into INT8, FP8, or even INT4 deployment is blocked not by how large the average values are, but by how large the *maximum* values are. When a single token's activation in one dimension shoots a thousand times higher than its neighbors, that one number monopolizes the entire tensor's quantization scale, crushing everything else into noise.
+
+The core of this problem line in one sentence: *What are those "absurdly large" activations in large models, where do they come from, how do we tame them, and are they still there?* From 2022 when they were first named "emergent outlier features," to 2024 when they were precisely characterized as "massive activations," to 2026 when it was discovered that modern open-source models had long since scrambled this picture — four years, one full loop, from "must patch around them" back to "let's first measure how large they actually are."
+
+Why is this hard? Because it *straddles two communities* — interpretability researchers treat it as a mystery about transformer internals, while deployment engineers treat it as numerical engineering drudgework — both sides iterate independently and each assumes the other side's "facts" still hold. When model architectures change (MoE, SwiGLU, different norm stacks), both sides' facts expire simultaneously.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Discovery: models above 6.7B parameters suddenly develop "emergent outlier features"
+  |            certain dimensions are systematically large across all tokens (6-sigma rule)
+  | Consequence: naive INT8 quantization collapses; mixed-precision is required
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Observation: outliers live in activations, not in weights
+  | Solution: migrate the outlier "difficulty" from activations to weights (per-channel scaling)
+  |           activations become smooth, weights become rough — but weights are easier to quantize
+  v
+[2023] Bondarenko et al. - Quantizable Transformers (Do Nothing)
+  |
+  | Question: why do outliers exist at all? Not a bug — a feature
+  | Explanation: attention heads sometimes need to "output nothing"
+  |              to concentrate softmax almost entirely on an irrelevant token,
+  |              some value-side component must be extremely large
+  v
+[2024] Sun et al. - Massive Activations (LLaMA)
+  |
+  | Distinction: cut "emergent outlier features" one level finer
+  |              a tiny handful of activations with |x|>100 and >1000x their neighbors
+  |              called "massive activations," often landing on sentence-start tokens
+  | Limitation: only studied on LLaMA / Mistral family, using hard thresholds
+  v
+[2026] Chen et al. - Measuring Maximum Activations  <<< this paper
+  |
+  | Question: in the post-LLaMA era (Qwen2.5/3/3.5, Gemma2/3, MoE, VLM,
+  |           gpt-oss), does this portrait still hold?
+  | Approach: drop hard thresholds; directly measure max|a| across 8 families, 27 checkpoints
+  | Findings: equal parameter count → up to 4 orders-of-magnitude spread across families
+  |           MoE 14–23× lower than dense
+  |           non-monotonic across generations (Qwen3 higher than 2.5; Qwen3.5 drops back)
+  v
+[2026+] Sun-Canziani-LeCun et al. - Spike vs Sink anatomy
+        Queipo-de-Llano et al. - Sinks ↔ compression valleys
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): "Turns out large models have outrageous values — and the bigger the model, the more of them"
+
+*** What problem it saw
+
+Before 2022, everyone assumed transformer quantization worked the same as CNN quantization — collect a calibration set, profile each layer's activation distribution, set INT8 scales, tolerate a few percentage points of accuracy drop, and ship. At the OPT/BLOOM scale of 6.7B+, this entire pipeline collapsed. The same PTQ procedure that cost BERT 0.5 points cost OPT-13B more than 30 points — completely unusable.
+
+The Dettmers team dug into the data and found something counterintuitive: larger models don't distribute the problem more evenly — instead, *certain dimensions are systematically large across every single token* — not an occasional spike in a few tokens, but an entire column of features that is more than six standard deviations above the rest, consistently. They named this phenomenon: emergent outlier features.
+
+*** Its solution
+
+Since these dimensions cannot fit within normal INT8, simply *pull them out and compute them in FP16*, while the remaining 99.x% of dimensions proceed as normal INT8. This is the mixed-precision scheme of LLM.int8(). The result: OPT-175B INT8 inference with almost no accuracy loss.
+
+*** Why it works (and what pit it dug)
+
+It works because the outlier dimensions are few — out of one or two hundred channels, only a dozen or so — isolating them immediately brings the dynamic range of the rest back within what INT8 can accommodate.
+
+But the pit it dug is obvious: *mixed-precision inference kernels require two code paths*, and hardware throughput can never be fully utilized. The next paper would ask: can we prevent activations from having outliers in the first place?
+
+** 2023 | SmoothQuant: "If you can't eliminate outliers, migrate them onto someone else"
+
+*** What problem it saw
+
+LLM.int8() made INT8 inference viable, but at the cost of rewriting all SOTA kernels. Worse, the number of outlier dimensions kept growing as models got larger — barely manageable at 175B, but what about beyond that?
+
+The Xiao team stared at the same observation and saw something new: outliers *appear almost exclusively on the activation side; the weight side is actually quite uniform*. That is, in the weight × activation product, the hard part is not weight — it is activation.
+
+*** Its solution
+
+So *migrate some of the difficulty from activations onto the weights*. Concretely: find a per-channel scaling factor s; for each channel, divide the activation by s and multiply the corresponding weight by s. Mathematically (A/s)(sW) = AW — fully equivalent — but after the transform the activation's dynamic range is compressed while the weight's dynamic range widens.
+
+Activations become smooth, so the entire tensor can use standard INT8; weights become rougher, but weights were already well-behaved and can absorb the extra strain.
+
+*** Why it works (and what pit it dug)
+
+This is a brilliant accounting trick — total difficulty is conserved, but quantization error has different sensitivity on the two sides, so the transfer is profitable.
+
+But it never answers *why activations have outliers in the first place*. That "why" was left for the next person.
+
+** 2023 | Quantizable Transformers: "Outliers aren't a bug — they're a necessary escape hatch for the attention mechanism"
+
+*** What problem it saw
+
+SmoothQuant, AWQ, GPTQ, and similar schemes all do the same thing: *treat the symptom*. Wait for outliers to appear, then shift, transform, or rotate around them. But as models grow larger and outliers grow more extreme, treating symptoms always means running behind. The Bondarenko team asked a more foundational question: *Why do these numbers need to be so large in the first place?*
+
+*** Its solution
+
+They didn't propose a new scheme — they dissected the model first. They found an interesting mechanism: attention heads in a transformer sometimes *want to "do nothing"* — after processing a stretch of context they judge "this block has nothing to do with me; downstream layers, please ignore my output."
+
+But softmax forces every head's attention weights to sum to 1; there is no "assign nothing" option. The only escape route is to concentrate almost all weight onto a "garbage-bin" token (typically the BOS token or the first ordinary token at the start of the sequence). To make softmax output nearly 1.0 for that token, the corresponding query·key score must be far larger than the others — *which requires some component on the value side to be extremely large*.
+
+And so outliers appear. They are not numerical noise; they are attention using large numbers to implement "no-op" semantics.
+
+*** Why it works (and what pit it dug)
+
+This explanation is elegant because it makes a prediction: if you give the attention mechanism a clean no-op exit (e.g., allow softmax to be unnormalized, or add a constant sink token), outliers should disappear automatically. Later experiments confirmed this.
+
+But the new pit it dug is: *How "massive" is massive, exactly? Are all apparent outliers products of the no-op mechanism?* Sun et al. would soon discover: no. There is a class of "massive" values three further orders of magnitude beyond ordinary outliers, whose origin is subtler than no-op.
+
+** 2024 | Massive Activations: "Cut one level finer — carve 'massive' out of 'outlier'"
+
+*** What problem it saw
+
+Bondarenko's "do nothing" explanation clarified the origin of outliers, but when the Sun team examined hidden states in LLaMA-2 and Mistral, they found: *a tiny handful of activations are 100–1000× larger than even the "emergent outliers"* — not on the 6σ scale but |x|>100 while neighboring values are only 0.1. These activations appear on only a very few tokens (typically BOS or common low-information tokens), but once they appear, *a single entry determines the maximum of the entire layer*.
+
+If they were still treated under the Dettmers framework as "systematic column-level elevation in certain dimensions," these "single-point spikes" would be missed — because they are not uniformly elevated across a column; they are a single (token, channel) cell that blows up.
+
+*** Its solution
+
+Sun et al. coined a new name — *massive activations* — and provided a hard-threshold definition: |x| > 100 and ≥ 1000× the median within the same token. Under this definition they did three things:
+
+1. Survey: confirmed the phenomenon is widespread across LLaMA-2, Mistral, Phi-2, and several other models;
+2. Intervention: zeroing out these massive activations immediately crashed the model, demonstrating they carry real function;
+3. Association: the positions of these massive activations strongly co-locate with attention sinks, reinforcing Bondarenko's no-op hypothesis.
+
+*** Why it works (and what pit it dug)
+
+Distinguishing "emergent outlier features" from "massive activations" matters — their origins, spatial locations, and impact on quantization all differ. This extra cut allows subsequent work to aim precisely.
+
+But the pit it dug is well-hidden: *all conclusions rest on the LLaMA family and on hard thresholds*. If a future model has "massive" activations that land at |x|=50 — large enough to cause trouble, but short of 100 — this definition would declare it "free of massive activations," even though its deployment difficulty might be identical to LLaMA's.
+
+More critically: after 2024 the open-source wave completely changed model architectures — SwiGLU replacing GeLU, RMSNorm placed at different positions, MoE replacing dense, VLMs adding vision adapters. Does Sun's "LLaMA landscape photo" still apply? Nobody had checked.
+
+** 2026 | Measuring Maximum Activations: "Drop the hard threshold — measure directly, and measure across families"
+
+*** What problem it saw
+
+By 2026, the deployment side had pushed from INT8 to FP8 and even MXFP4. Every new open-source model release triggered the same first step: estimate the activation dynamic range to determine quantization scales. But the "reference portrait" engineers had on hand was still LLaMA's — the accumulated picture from the four papers above: 6σ outlier features + massive activations on sink tokens + remediation via SmoothQuant or rotation.
+
+The Chen team identified three uncomfortable facts:
+
+1. *Hard thresholds are stale*: Sun's |x|>100 was calibrated on LLaMA; nobody knew whether 100 counts as large or small for Qwen3.5 or Gemma3.
+2. *Categorical thinking is stale*: bucketing activations into "normal / outlier / massive" is convenient, but what actually matters for deployment is the *continuous number* max|a| — it directly determines the quantization scale.
+3. *Single-family measurement is stale*: modern open-source models have diverged simultaneously along normalization, gated MLP, MoE routing, VLM adaptation, intermediate checkpoints, and instruction tuning axes. Extrapolating from one or two LLaMA checkpoints to the whole landscape is no longer honest.
+
+*** Its solution
+
+No new method is proposed — just one thing: *run every modern open-source LLM through a unified protocol and record its maximum activation values*.
+
+- A 5,000-sample multi-domain corpus + each family's own tokenizer;
+- 8 families, 27 checkpoints (Qwen2.5/3/3.5, Qwen2.5-VL, Gemma2/3, Ling-mini at multiple training stages, gpt-oss, etc.);
+- The same set of hooks attached to embedding, hidden states, attention, MLP/MoE, SwiGLU gate, and final norm;
+- Record global max and layer-wise max;
+- As a sanity check, perform INT8 quantization and verify the measured max directly predicts quantization error.
+
+*** Why it works (and what pit it dug)
+
+Three core findings puncture the picture built up over the previous four years:
+
+1. *Same parameter count, max spans 4 orders of magnitude* — Qwen3.5 sits at 10²–10³, Gemma3-27B-it reaches ~7×10⁵. This kills the implicit assumption that "model size determines outlier severity."
+2. *MoE is 14–23× lower than dense at the same scale* — sparse routing significantly suppresses activation peaks. This had only been mentioned in passing in Ling's scaling-law paper; here it is independently verified.
+3. *Generations are non-monotonic* — Qwen2.5 → Qwen3 goes up; Qwen3 → Qwen3.5 comes back down. The peak is a product of *training recipe*, not of scale.
+
+New pit: if peaks are recipe-determined, *can we reverse-engineer a recipe to suppress them*? That is the open question for post-2026. The paper's interim answer: treat max|a| as a model-card field reported alongside parameter count every time a new open-source model is released.
+
+* Frontier Extensions
+
+** 2026 | The Spike, the Sparse, and the Sink (Sun, Canziani, LeCun, Zhu)
+
+Cuts "massive activations" and "attention sinks" one level finer to separate them clearly. Prior work (including Sun 2024) bundled the two phenomena together — massive activations live on sink tokens; sinks exist because of massive activations. This paper uses careful dissection of the early-layer step-up block in pre-norm transformers to *decouple spike from sink*: a spike can exist without a sink, and a sink can exist without a spike; they are two independent mechanisms that happen to coincide on sink tokens.
+
+Relevance to the Chen line: explains why some families (e.g., Qwen3.5) have low max values yet exhibit normal attention-sink behavior — sink and max are not the same thing.
+
+** 2026 | Attention Sinks and Compression Valleys (Queipo-de-Llano et al.)
+
+Goes further and connects attention sinks to "compression valleys" in hidden-state dimensions — layers that suddenly collapse representations to very low rank — arguing the two are two observational faces of the same underlying phenomenon. This line is still iterating rapidly.
+
+As of the time of writing (2026-05), the Chen et al. paper represents the most recent progress on this line from the *cross-family empirical measurement* dimension.
+
+* One Figure to Understand It All
+
+#+begin_example
+                    Cognitive map of outlier activations (2022 -> 2026)
+
+  Year   Paper             Core action                               Portrait change
+  ----   --------------    ----------------------------------------  --------------------
+  2022   LLM.int8          Discovers "emergent outlier features"     Outlier = certain dims
+                                                                     systematically large
+                                                                     (6-sigma rule)
+                              |
+                              v
+  2023   SmoothQuant       Migrates outlier difficulty from          Outliers are treatable,
+                           activations to weights                    but treating symptoms
+                              |                                      not causes
+                              v
+  2023   Do Nothing        Outliers are a byproduct of              Outlier = mechanistically
+                           attention no-op                           necessary
+                                                                     (BOS carries the sink)
+                              |
+                              v
+  2024   Massive Acts      Cuts finer: massive = |x|>100            Outliers have two tiers:
+                           and >1000x median                         ordinary outliers +
+                              |                                      massive activations
+                              v                                      (LLaMA-based, hard threshold)
+  2026   Measuring         Drop hard threshold; directly            Portrait shatters:
+         Max Acts          measure max|a|; 8 families,              - spans 4 orders of magnitude
+                           27 checkpoints                           - MoE 14–23x below dense
+                                                                    - non-monotonic across gens
+                                                                    - max is a family/recipe
+                                                                      property, not a size property
+                              |
+                              v
+  2026+  Spike vs Sink     Decouple spike / sparse / sink           "sink = max" is also wrong —
+         Compression                                                 they merely often coincide
+         Valleys
+
+  +----------------------------------------------------------------------+
+  | Main thread: one phenomenon (LLM activations can blow up) is         |
+  | repeatedly renamed and subdivided:                                   |
+  | outlier features -> massive activations -> continuous peak ->        |
+  | spike/sink decoupled                                                 |
+  |                                                                      |
+  | Each subdivision is accompanied by "the previous generation's        |
+  | portrait no longer holds on new models"                              |
+  +----------------------------------------------------------------------+
+#+end_example
+
+* Insights
+
+On the surface this line looks like incremental technical progress in "outlier quantization." What is actually happening underneath is *two cognitive shifts: from categorical to continuous, and from single-architecture to cross-architecture*.
+
+The first shift (2022→2024): from the binary judgment "does this model have outliers?" to the graded characterization "how many tiers of outliers, and how large is each?" Each round of subdivision is more precise, but the cost is that *definitions become increasingly tied to specific model families*. Dettmers's 6σ was calibrated on OPT; Sun's |x|>100 was calibrated on LLaMA — thresholds are implicit assumptions.
+
+The second shift (2024→2026): the Chen paper throws out graded thresholds entirely and returns to the most primitive measure, max|a|. This looks like a step backward — no more tiers? But it is really *an acknowledgment of the hidden cost of categorical thinking*: the moment you draw categories, you implicitly assume all models "look roughly similar" within them. When 27 checkpoints' maxima span four orders of magnitude, asking "does it have massive activations?" is no longer meaningful — *which order of magnitude is it in* is the question.
+
+*One layer deeper*: the interpretability community and the deployment community had each been iterating independently for four years, citing each other's "established facts." It took someone who understood both sides and measured everything with a deployment lens (max scale) to discover that the categorical portrait from interpretability had gone stale — and crucially, *nobody had thought to verify whether it was still current*. This is a blind spot in how scientific communities divide labor: everyone assumes someone else will verify whether foundational facts still hold.
+
+Where is this most likely to go next? Three directions:
+1. *Reverse-engineer training recipes* — since MoE, normalization stack, and SwiGLU gate design directly determine the max, it should be possible to design "low-peak-friendly" recipes by working backward;
+2. *Quantization protocols that follow the model* — going forward, whenever a new open-source model is released, max reporting should be a model-card mandatory field alongside parameter count and context length;
+3. *From maximum to distribution* — max is a one-dimensional number; the next step is measuring the full tail (distribution of top-K activations), which matters even more for ultra-low-bit formats like FP4/FP6.
+
+* Takeaways
+
+The lesson this evolutionary history offers for "how to do research" is *not "keep subdividing" — it is "periodically go back and re-measure the earliest facts."*
+
+The default academic workflow is: A proposes a phenomenon → B explains the mechanism → C treats it → D improves the treatment → E improves D's improvement. Every step assumes the upstream fact definition still holds. But when the input distribution (here, model families) changes dramatically, the upstream facts can fail entirely — and *nobody downstream has an incentive to go back and check*.
+
+This means you can:
+- *Treat "re-measuring foundational facts" as a standalone paper type* — no new method required, just the honest work of laying out "what does it actually look like now?" Such measurement papers are extremely valuable in fast-moving fields, because the entire stack is built on stale implicit assumptions;
+- *Be suspicious of hard-threshold definitions* — any X>100, X<0.01, or >6σ threshold you encounter was calibrated on some model at some point in time; before applying it to a new context, always ask "is this threshold still reasonable in my setting?";
+- *"Shared facts" across communities are the most dangerous kind* — the interpretability and deployment communities shared LLaMA's outlier portrait for four years, until someone who understood both sides at once noticed the crack. If you see two adjacent fields both citing the same set of numbers with no recent re-measurement, that is an opportunity.

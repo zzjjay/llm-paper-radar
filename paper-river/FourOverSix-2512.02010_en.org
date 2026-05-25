@@ -1,0 +1,302 @@
+#+title:      Four Over Six: More Accurate NVFP4 Quantization with Adaptive Block Scaling
+#+date:       [2026-05-25 Mon 06:17]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T061753-en
+#+source:     https://arxiv.org/abs/2512.02010
+#+authors:    Jack Cook, Junxian Guo, Guangxuan Xiao, Yujun Lin, Keith Wyss, Mahdi Nazemi, Asit Mishra, Carlo del Mundo, Tijmen Blankevoort, Song Han
+#+venue:      arXiv preprint, Dec 2025 (MIT + NVIDIA)
+
+* The River of the Problem
+
+A simple question: we want to squeeze a large model's weights and activations into 4 bits — save memory, gain speed. But 4 bits can only represent 16 numbers, and once a model is actually trained or served at that precision, accuracy drops.
+
+Why has each generation kept pushing down this path? Because every bit you shave off makes the problem exponentially harder. 8 bits holds 256 values — basically workable; 4 bits leaves only 16 — so sparse that you have to redesign how numbers are "laid out" in the first place. Every generation ends up solving the same sub-problem: a small number of large outlier values stretch the entire quantization range so wide that the "normal" values in between get compressed to almost no resolution. Over a decade, from clipping outliers, to smoothing them out, to giving each small block its own scale, to NVIDIA supporting block-level floating point directly in hardware — every step is fighting the same enemy: dynamic range.
+
+Four Over Six is the latest step on this line. It finds that even after block-level FP4 has solved seven or eight tenths of the range problem, *values near the "block maximum" are still being rounded hard* — because FP4's step size becomes very coarse at the large-value end (0→2 moves in steps of 0.5, while 4→6 jumps by 2). So it does something lightweight: let each block choose for itself whether to scale its maximum to 6 or to 4.
+
+* Source Map
+
+#+begin_example
+[2016] Han et al. - Deep Compression
+  |
+  | Problem: Neural networks are too large to fit on edge devices
+  | Solution: Pruning + quantization + Huffman coding
+  |           (first time quantization was brought to the table seriously)
+  v
+[2018] Micikevicius et al. - Mixed Precision Training (FP16)
+  |
+  | Problem: FP32 training is too slow and too memory-hungry
+  | Solution: Use FP16 for most computation, keep FP32 for sensitive parts
+  v
+[2022] Dettmers et al. - LLM.int8()  +  Frantar et al. - GPTQ
+  |
+  | Problem: Once LLMs are quantized to INT8/INT4, performance collapses
+  | Finding: The culprit is a small number of outlier channels —
+  |           their values are tens of times larger than everything else
+  | Solution A (LLM.int8): keep outliers in FP16
+  | Solution B (GPTQ): use second-order Hessian info to correct column by column
+  v
+[2023] Xiao et al. - SmoothQuant  +  [2024] Lin et al. - AWQ
+  |
+  | Problem: Keeping outliers in high precision wastes space;
+  |           hard-quantizing them kills accuracy
+  | Solution: Migrate the "hardness" of activations onto the "ease" of weights —
+  |           per-channel scaling to smooth away outliers
+  v
+[2023] Rouhani et al. - MXFP4 (Microscaling)
+  |
+  | Problem: One scale per tensor gives far too little dynamic range
+  | Solution: Every 32 FP4 values share an E8M0 (power-of-two) scale factor
+  v
+[2025] NVIDIA et al. - NVFP4 (Blackwell hardware support)
+  |
+  | Problem: MXFP4 scale can only be a power of two — too coarse;
+  |           groups of 32 are also too large
+  | Solution: Shrink to groups of 16; upgrade scale to FP8 E4M3
+  |           (finer granularity between powers of two)
+  v
+[2025] NVIDIA/Castro/Chmiel - NVFP4 training recipe
+  |
+  | Problem: Quantizing weights/activations/gradients all to NVFP4
+  |           during training gives worse loss than BF16
+  | Solution: Stochastic Rounding (SR) + Random Hadamard Transform (RHT)
+  |           + late-stage healing
+  | Cost: Adding all these operations eats up FP4's speed advantage
+  v
+[2025] Cook et al. - Four Over Six  <-- this paper
+  |
+  | Problem: Even with the full recipe above, values near the block maximum
+  |           are still rounded hard
+  |           Root cause: FP4 step size in [4, 6] is 2 — it simply cannot
+  |           represent 4.62, 5, or 5.5
+  | Solution: Try each block twice — once scaled to 6, once scaled to 4 —
+  |           keep whichever gives lower MSE.
+  |           Overhead < 15%; pulls loss 13% closer to BF16
+  v
+[2025-2026] Frontier extensions
+   Egiazarian et al. - Bridging the Gap (revisiting the potential of MXFP4)
+   Chen et al.       - INT vs FP comprehensive comparison
+                       (asking: do we actually need FP4 at all?)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2016 | Deep Compression: Taking Quantization Seriously for the First Time
+
+*** What problem did it see?
+
+By 2015, convolutional networks had broken through on ImageNet accuracy, but models routinely ran into the hundreds of megabytes — impossible to fit on a phone. Han's observation was direct: floating-point parameters are expensive on two fronts — storage and compute. If a weight's actual "information content" is very low, why insist on storing it with 32 bits?
+
+*** Its solution
+
+Three steps: pruning (remove near-zero connections) → quantization (cluster remaining weights into 256 shared values, replace 32-bit floats with 8-bit indices) → Huffman coding (compress once more). AlexNet went from 240 MB to 6.9 MB — a 35× reduction.
+
+*** Why it worked (and where it buried new problems)
+
+It demonstrated that neural networks are surprisingly tolerant of reduced precision, and that weight distributions are naturally redundant. But it operated in a *post-training* mode — take an already trained full-precision model and compress it. Once model scale reached GPT-3 levels, this "train first, compress later" paradigm started to strain: not only did models grow larger, but *inference* also needed to consume quantized weights directly, and that quantization step cost accuracy. The next problem to solve was: how do you perform lossless quantization on LLMs?
+
+** 2022 | LLM.int8() & GPTQ: Outliers Revealed
+
+*** What problem did it see?
+
+Quantizing LLMs from FP16 to INT8 should, in theory, be tolerable. But Dettmers found that once models exceeded 6.7B parameters, naive per-tensor quantization caused performance to fall off a cliff. Digging deeper revealed the culprit: *a tiny fraction of feature channels* had activation values 20 or 50 times larger than everything else. These outliers blew out the entire INT8 range, crushing the resolution available to the other 99% of "normal" values.
+
+*** Its solution
+
+LLM.int8() simply pulled those outlier channels out and computed them in FP16, leaving the rest in INT8. GPTQ took a different approach: using second-order Hessian information, quantize one column at a time, and after each column is quantized, compensate the error back into the remaining unquantized columns — essentially "diffusing" the damage from quantization.
+
+*** Why it worked (and where it buried new problems)
+
+Both paths acknowledged that outliers are the central obstacle in LLM quantization. But — LLM.int8()'s mixed precision makes kernels hard to write and limits speed; GPTQ avoids accuracy loss but optimizes "how best to quantize given a fixed dataset," which doesn't generalize reliably to unseen data. The problem shifted: could you handle the "trouble" of outliers *before* quantization even begins?
+
+** 2023–2024 | SmoothQuant & AWQ: Distributing the Hardship
+
+*** What problem did it see?
+
+GPTQ spreads the error around, but fails when the input distribution changes. SmoothQuant observed: *activations* contain outliers that are hard to quantize, but weights are comparatively well-behaved. If you rewrite a matrix multiply ~Y = X @ W~ as ~Y = (X/s) @ (s*W)~ — dividing X by a vector makes it easier to quantize, while multiplying W by the same vector keeps it in a controllable range — you trade "weights slightly harder" for "activations dramatically easier."
+
+*** Its solution
+
+Find a set of per-*channel* scaling factors s specifically designed to shave down outlier channels in the activations. AWQ went further: rather than scaling uniformly, *protect only the 1% of weight channels that matter most*, giving those channels a larger corresponding scale factor. Both tricks are: offline calibration → mathematically equivalent transformation → quantization becomes easier.
+
+*** Why it worked (and where it buried new problems)
+
+They achieved good results at INT4. But there is a fundamental assumption: scales are shared *per channel* — all tokens' value at the same feature position use one scale. What if outliers appear in atypical positions? More critically, hardware support for INT4 is limited, and FP4 is better suited than INT4 for the heavy-tailed distributions found in neural networks. The next generation needed to move toward FP4, but FP4 has only 16 values, and per-channel scaling is no longer fine enough — the scale granularity had to shrink further.
+
+** 2023 | MXFP4 (Microscaling): Scale Follows the Block
+
+*** What problem did it see?
+
+FP4 has only 16 values: a maximum of 6 and a smallest nonzero of 0.5 — a dynamic range of just 12. One scale shared across an entire tensor means that if the tensor contains both a tiny value like 0.001 and an outlier like 100, then 0.001 quantizes straight to zero. Per-channel scaling doesn't save you either: variation between tokens within the same channel can easily exceed this range.
+
+*** Its solution
+
+Push scale granularity to the extreme — give every *32 values* their own scale factor. An 8K-dimensional vector then has 256 independent scales, each block adapting to its own neighborhood. Scales use 8-bit E8M0 (pure power-of-two exponent).
+
+*** Why it worked (and where it buried new problems)
+
+With smaller blocks, each scale only has to serve 32 values, so outliers are almost automatically "isolated" — their block uses a large scale while neighboring blocks use small ones, with no mutual interference. This was a revolutionary turn: from that point on, outliers were no longer the enemy — they became a block-level internal concern.
+
+But the E8M0 scale is too coarse — it can only be a power of two (1, 2, 4, 8, ...), with jumps that are far too large. If a block's true maximum is 5.3, E8M0 can only choose 4 or 8: either overflow or waste. To do anything finer, the scale itself needed to be freed from this constraint.
+
+** 2025 | NVFP4: Smaller Blocks + Finer Scales
+
+*** What problem did it see?
+
+MXFP4's two key limitations: a block size of 32 is still too large, and an E8M0 scale is still too coarse.
+
+*** Its solution
+
+NVIDIA's Blackwell GPUs support a new format directly in hardware: block size shrinks to 16, and the scale is upgraded to FP8 E4M3 (4-bit exponent + 3-bit mantissa, capable of expressing values between powers of two much more precisely). A tensor-level FP32 scale α provides a further safety net.
+
+*** Why it worked (and where it buried new problems)
+
+Smaller blocks mean each scale fits more tightly to its small cluster of values; the E4M3 scale can land precisely on something like 5.3 without wasting representational capacity. In theory, NVFP4 on B200 is 4× faster than BF16 and is the "hardware admission ticket" for end-to-end FP4 training.
+
+But training turned out not to be as smooth as hoped — the next step ran straight into a "training collapse" problem.
+
+** 2025 | NVFP4 Training Recipe: SR + RHT + Healing
+
+*** What problem did it see?
+
+NVIDIA, Castro (Quartet), and Chmiel (FP4 All the Way) all discovered almost simultaneously in 2025 that quantizing weights, activations, and gradients all to NVFP4 during training causes loss to lag noticeably behind BF16 — or even diverge. The problems concentrated in:
+- Gradient quantization introducing *systematic bias* — always rounding in one direction;
+- Certain activations in back-propagation landing precisely in FP4's "blind spots."
+
+*** Its solution
+
+Apply patches:
+- *Stochastic Rounding (SR)*: gradients are no longer rounded to nearest; instead they are rounded probabilistically based on proximity — eliminating bias.
+- *Random Hadamard Transform (RHT)*: apply an orthogonal transform before each matrix multiply to "scatter" the distribution and spread outliers across all dimensions — an evolution of SmoothQuant.
+- *Late-stage healing*: near the end of training, switch back to BF16 for a stretch to recover model quality.
+
+*** Why it worked (and where it buried new problems)
+
+These tricks can pull loss close to BF16. But the cost is high: RHT must be applied before every matrix multiply, SR requires extra random numbers, and healing outright abandons the goal of "getting a native FP4 model." When tallied up, FP4 turns out little or no faster than FP8 — or even slower. *This effectively sends the effort back to square one.* So the next question became: can we add something *lighter* that simply makes NVFP4 more accurate on its own?
+
+** 2025 | Four Over Six: Let Each Block Choose Its Own Scale Target
+
+*** What problem did it see?
+
+The Cook team went back and examined NVFP4's error sources through a clean set of diagnostic experiments:
+- Keep scale factors at high precision — performance *barely changes*;
+- Keep values at high precision — performance *fully recovers* to BF16.
+
+So all of NVFP4's pain comes from rounding in the *value* step. Looking more closely: use a threshold x to quantize only positions where the absolute value is ≥ x, then observe that performance collapses in the range x ≈ 4–5 — meaning *the values that cause the most damage are those close to the block maximum*.
+
+Why? Look at FP4's step sizes: in [0, 2] the step is 0.5; in [2, 4] it is 1; in [4, 6] it jumps to 2. Once a block's maximum is scaled to 6, a value of 4.62 must be rounded to either 4 or 6 — a relative error that can reach 13%; a value of 3.5 can only be assigned 3 or 4.
+
+*** Its solution
+
+Stop always scaling the block maximum to 6. Give it two choices: scale to 6 (preserve the full range but represent large values coarsely), or scale to 4 (give up the ability to represent 5 and 6, but represent large values more finely). Each block is quantized twice, both MSEs are compared, and the lower-error one is kept.
+
+Quantizing [10, 20, 30, 40] into NVFP4:
+- Scale to 6: scale=6.5, quantized → [9.75, 19.5, 26, 39], MSE=4.33
+- Scale to 4: scale=10,  quantized → [10, 20, 30, 40],      MSE=0   → choose this
+
+But for [15, 30, 120, 180] the outcome reverses — scaling to 6 is perfect, scaling to 4 increases error. So *the choice must be adaptive*; a single fixed rule won't work.
+
+The implementation cleverness lies in hardware: Blackwell's ~cvt~ instruction family can perform FP4 quantize-dequantize-compare directly in registers, and the entire decision logic fits inside one CUDA kernel, never leaving the registers. Overhead is less than 15%.
+
+*** Why it worked (and where it buried new problems)
+
+It targets the exact pain point: NVFP4's error comes from the unrepresentable "gap" in ~[4, 6]~, and 4/6 uses a *local decision* to relocate that gap to the ~[2.67, 4]~ segment (values that formerly had to be expressed in the 4–6 band are now squeezed into 2.67–4, but because the step size there is finer, overall accuracy still improves).
+
+Remaining new problems:
+1. MXFP4 uses E8M0 (power-of-two) scales and *cannot* do this — the scale must be capable of multiplying by 1.5. So 4/6 is a benefit exclusive to NVFP4.
+2. GPTQ's internal optimization logic never considered a choice of scale target — naively layering 4/6 on top of GPTQ actually hurts accuracy. To fully capture the gain, the next generation of PTQ algorithms needs to incorporate "scale target selection" into its optimization objective.
+3. Why only the choices 4 and 6? Could a third option — say 3 or 5 — be added? In principle yes, but each additional option requires one more quantize-compare pass, and the overhead grows linearly.
+
+* Frontier Extensions
+
+** 2025 | Egiazarian et al. - Bridging the Gap: Can MXFP4 Still Be Rescued?
+
+After NVFP4 gained traction, someone in October 2025 looked back at MXFP4: given how coarse its E8M0 scale is, could a smarter PTQ algorithm salvage it? The Egiazarian team proposed GPTQ-style optimization applied to MXFP4, pulling MXFP4's quality up to near-NVFP4 levels. This is an alternative path to 4/6: *don't change the format, change the algorithm*.
+
+** 2025 | Chen et al. - INT vs FP: Do We Actually Need FP4?
+
+A more disruptive paper. Chen's team systematically compared INT4 and FP4 across different block sizes, finding that when a model has few outliers (for example, one trained with outlier-suppression techniques), INT4 is *actually more accurate than FP4* — because INT4's step sizes are uniform and it has no "blind zone" at the large-value end the way FP4 does. This in turn provides a theoretical explanation for 4/6: the reason it works is that it is essentially *making FP4 behave more like INT4* (finer steps near large values).
+
+** Where Things Stand
+
+This line has not converged. NVFP4 + 4/6 with hardware support is the most practical solution today, but INT4 with robust outlier suppression may be another direction worth exploring. Nobody has fully eliminated the "healing" phase in FP4 training.
+
+* One Diagram
+
+#+begin_example
+                A Decade of Tension: Dynamic Range vs. Representational Precision
+                ==================================================================
+
+Year   |  Method                |  How it addresses "range vs. precision"
+-------+------------------------+--------------------------------------------------
+2016   |  Deep Compression      |  Shared clustering: 256 values represent everything
+       |                        |  Range: tensor-level    Precision: 8-bit index
+       |                        |                                        |
+2018   |  FP16 training         |  Non-uniform step sizes of floats enter the picture
+       |                        |                                        |
+2022   |  LLM.int8 / GPTQ       |  Outliers discovered; isolate or diffuse the error
+       |                        |  Range: channel-level   Precision: INT8
+       |                        |                                        |
+2023   |  SmoothQuant / AWQ     |  Math transform: migrate activation hardness to weights
+       |                        |  Range: channel-level   Precision: INT4
+       |                        |                                        |
+2023   |  MXFP4                 |  Block scaling enters the scene
+       |                        |  Range: per 32 values   Precision: FP4 + E8M0 scale
+       |                        |                                        |
+2025   |  NVFP4                 |  Block shrinks to 16; scale upgraded to FP8
+       |                        |  Range: per 16 values   Precision: FP4 + E4M3 scale
+       |                        |                                        |
+2025   |  NVFP4 training recipe |  Patches: SR + RHT + healing
+       |                        |  Cost: FP4 speed advantage is eaten up
+       |                        |                                        |
+2025   |  Four Over Six         |  On top of NVFP4, let each block pick M=4 or M=6
+       |                        |  Range: per 16 values   Precision: FP4 (but step
+       |                        |  size near large values is /1.5)
+       |                        |  Overhead: <15%, pulls 13% closer to BF16
+       |                        |                                        |
+2025-26|  Bridging-the-Gap      |  Alternative path: keep format, change algorithm
+       |  INT vs FP             |  (MXFP4 + PTQ)
+       |                        |  Deeper question: without outliers, INT4 wins
+
+
+Core pattern: every additional bit you compress away → must refine the
+              "scale granularity" by roughly one order of magnitude in parallel
+  16-bit: tensor-level scale is sufficient
+   8-bit: channel-level scale
+   4-bit: block-level scale (16–32 values)
+   4-bit + 4/6: block-level scale + intra-block scale binary choice  <-- here
+   Future?: block-level scale + intra-block multi-choice? adaptive step sizes?
+#+end_example
+
+* Insights
+
+Reading through the full arc, I see three things:
+
+*1. Quantization is fundamentally a "war over scale granularity," not a "war over bit count."*
+From 32-bit to 4-bit, the bit count shrinks only 8×; but the coverage of a single scale goes from "one shared across the entire tensor" to "one per 16 values" — granularity has improved by thousands of times. What each generation actually innovated was not "finding a new 4-bit format" but "thinking of a new level at which to place a scale." Four Over Six pushes this to its logical extreme — *even within a single block, the scale target can be chosen from two options*. This is a very clear trend: scale degrees of freedom will keep increasing.
+
+*2. Outliers went from "enemy" to "terrain."*
+In 2022, LLM.int8 treated outliers as hazards to be isolated. By SmoothQuant they became "a burden that can be redistributed." By MXFP4/NVFP4 they were neutralized at the block level — a single outlier can only "contaminate" the 16 values in its block. Then Four Over Six arrived, and *outliers are no longer a problem at all* — the paper says it directly: "block-scaled formats can already represent outliers perfectly; the real problem now is *values near the block maximum.*" This is a subtle but important pivot: once the external enemy disappears, the small internal tensions become the main battlefield.
+
+*3. The boundary between hardware and algorithm is dissolving.*
+Four Over Six's implementation depends on Blackwell's ~cvt~ PTX instructions — without them, the overhead of trying two quantizations per block would explode. The NVFP4 format itself was designed for hardware (the E4M3 scale with group size 16 is because 16 is the minimum tile unit of the Tensor Core). The next generation of quantization methods will probably not emerge from a researcher's intuition alone — *they will be the joint product of GPU architecture and quantization algorithm co-design*. It is no coincidence that MIT and NVIDIA co-authored this paper.
+
+Where will things go next? My predictions:
+- *Multi-option intra-block scale*: today it is a binary choice between 4 and 6; tomorrow it could be a choice from {2, 3, 4, 6}; later still, a continuously tunable scale (a Pareto frontier of overhead vs. precision).
+- *Natively FP4-trained models*: eliminating healing. This will require new optimizers, and will probably need to extend the 4/6 idea into the statistics of gradients.
+- *Learned step sizes for FP4*: abandon "6 fixed values" entirely and let the positions of the 16 FP4 representable values themselves be learned.
+
+* Lessons for Research Practice
+
+If you treat this entire arc as a case study in doing research, it tells you:
+
+*1. Find the constant that everyone under current conditions simply accepts without questioning.*
+The "scale to 6" convention in the NVFP4 standard had gone unchallenged for years — because 6 is FP4's maximum value, and "of course you should use it fully." All of the Cook team's innovation came from asking one question: "Why does it have to be fully used?" That question produced a 10-page paper.
+
+*2. Use diagnostic experiments instead of intuition.*
+The most elegant thing in this paper is not the 4/6 idea — it is the two plots in Figure 2, where the *threshold-stripping method* precisely demonstrates that the error originates in the [4, 6] interval. Diagnosis first, surgery second. Without those two figures, "adaptive scale target selection" would just be "a plausible-sounding small trick" — not publishable at a top venue.
+
+*3. The closer your work is to the hardware substrate, the larger the moat in the LLM era.*
+Four Over Six's speed benefit comes entirely from fitting inside a single PTX kernel. At 80% overhead, nobody would use it. This means that in the domain of LLM inference and training, people who understand PTX and CUDA kernel programming are scarce and strongly in demand. This is not "the dirty engineering work" — *it is a genuine research barrier*.
+
+*This means you can*: the next time you encounter a design constant that is accepted by default ("why is batch size 256?", "why does the KV cache use FP16?", "why does the router use top-2?"), don't just accept it. Ask first: "What happens if I change it?" Run a threshold-stripping diagnostic. If you find that error or loss concentrates in a specific segment, *that segment is your paper*.

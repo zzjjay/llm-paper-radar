@@ -1,0 +1,293 @@
+#+title:      OScaR: The Occam's Razor for Extreme KV Cache Quantization in LLMs and Beyond
+#+date:       [2026-05-25 Mon 07:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T070915-en
+#+source:     https://arxiv.org/abs/2605.19660
+#+authors:    Zunhai Su, Rui Yang, Chao Zhang, et al. (Tsinghua, Meituan LongCat, HKU)
+#+venue:      arXiv 2605.19660 (Under review, 2026-05)
+
+* The Problem River
+
+Fitting a long-context LLM into GPU memory: KV cache is now the number-one killer. It grows linearly with sequence length — tens of thousands of tokens arrive and immediately devour HBM, batch sizes stay small, throughput never takes off.
+
+Can we compress KV cache down to 2 bits, the way we compress images? It sounds simple, but five years of effort haven't produced a clean solution. The difficulty is this: certain "channels" in the Key tensor naturally carry values dozens of times larger than others (channel-wise outliers). Quantizing along the token dimension gets blown up by these channels; quantizing along the channel dimension avoids that pitfall, but at extreme compression ratios like 2 bits another pitfall emerges — within the same channel, the "magnitudes" of different tokens vary wildly (Token Norm Imbalance, TNI), and a shared scale cannot cover all tokens.
+
+Generation after generation of researchers has been jumping back and forth between these two pitfalls: quantize along tokens or along channels? Apply a rotation first to smooth out outliers? Add a residual correction on top? The pipeline grows ever more complex, and runtime grows ever slower. OScaR says: first diagnose the root cause (TNI), then fix it with the fewest possible parts.
+
+* The Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem observed: Once an LLM exceeds 6.7B parameters, "emergent outliers"
+  |   appear — a small number of feature dimensions carry values tens of times
+  |   larger than the rest; naive INT8 quantization collapses immediately.
+  | Solution: Isolate those outlier channels and compute them in FP16;
+  |   process the remaining channels in INT8.
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Problem observed: LLM.int8() requires mixed-precision, which is
+  |   hardware-unfriendly. Outliers live exclusively in activations;
+  |   weights are already flat and easy to quantize.
+  | Solution: Use a per-channel scale factor to "smooth" part of the
+  |   activation difficulty onto the weights, so both sides become
+  |   INT8-quantizable.
+  v
+[2024] Liu et al. - KIVI
+  |
+  | Problem observed: Both prior works target weight + activation quantization;
+  |   KV cache is ignored. Yet in long-context inference KV cache dominates.
+  |   Applying per-token quantization directly is destroyed by Key channel outliers.
+  | Solution: Quantize Keys per-channel, Values per-token — the first work to
+  |   establish a per-channel paradigm for KV cache.
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Problem observed: KIVI's per-channel quantization works at 4 bits but
+  |   collapses at 2 bits; the root cause is that outlier channels still exist.
+  | Solution: Apply a Hadamard rotation before quantization, spreading the
+  |   energy of outliers across all channels — flattening the spikes.
+  v
+[2025] Zandieh et al. - TurboQuant
+  |
+  | Problem observed: per-token + rotation still cannot approach the
+  |   theoretical lower bound at extreme bit widths; a formal guarantee is needed.
+  | Solution: per-element quantization + random rotation + residual error
+  |   correction, forming a multi-stage pipeline. Mathematically elegant,
+  |   but computationally expensive.
+  v
+[2026] Su et al. - OScaR  (this paper)
+  |
+  | Problem observed: TurboQuant is too heavy; KIVI/KVQuant with per-channel
+  |   quantization still breaks at extreme compression. But prior work never
+  |   clearly explained *where* the failure originates.
+  | Diagnosis: Token Norm Imbalance (TNI) — token norms within the same channel
+  |   diverge so widely that a per-channel scale cannot contain them.
+  | Solution: Canalized Rotation (guards against scaling-induced outlier artifacts)
+  |   + Omni-Token Scaling (normalizes along the sequence dimension).
+  |   Two components, no training required, runs efficiently in CUDA.
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering "emergent outliers" in LLMs — naive quantization is doomed
+
+*** What problem did it see
+
+Before LLM.int8(), quantizing CNNs and small transformers was mostly painless — cutting FP16 down to INT8 barely hurt accuracy. But when Dettmers scaled models up to 6.7B parameters, something strange appeared: a small number of feature dimensions (channels) carried values that were frighteningly large, often more than 100× the rest. The limited dynamic range of INT8 simply cannot contain them — you either set the scale large enough to preserve the outliers (everything else collapses to zero) or small enough to preserve everything else (outliers overflow). No setting works.
+
+These outliers are not bugs; they emerge naturally once the model reaches a certain scale, appearing in almost every layer and triggered by almost every token.
+
+*** Its solution
+
+Since these outlier channels are a minority (under 1%), just pull them out and handle them separately: compute outlier channels in FP16 at full precision, run the remaining 99% in INT8, then sum the two streams.
+
+*** Why it works (and what new pitfall it buries)
+
+The intuition is direct: separate "the hard-to-treat minority" from "the easy-to-treat majority" and handle each appropriately. But the engineering cost is steep — mixed-precision computation means splicing two kernels together, which is extremely hardware-unfriendly and makes GPU execution choppy. The positions of outlier channels also vary with input, preventing static optimization. This pitfall was inherited by the next paper.
+
+** 2023 | SmoothQuant: Shifting outlier difficulty from activations to weights
+
+*** What problem did it see
+
+Xiao studied the tensor structure of LLMs carefully: outliers appear exclusively in activations (intermediate values flowing through the forward pass); weights are flat and easy to quantize. The reason LLM.int8() needs mixed-precision is that it accepts "these activation outliers cannot be cured." But the weight side is idle — one hand doing two jobs while the other does nothing.
+
+*** Its solution
+
+Introduce a per-channel scale factor s. Divide activations by s (suppressing the outliers) and multiply the adjacent weights by s (transferring the difficulty to the weights). Mathematically the output is unchanged (s and 1/s cancel), but the quantization difficulty is "smoothly" distributed across both sides — making both INT8-quantizable.
+
+*** Why it works (and what new pitfall it buries)
+
+Think of a seesaw: one side is heavy, the other light. Adjust s to balance them and the whole thing quantizes cleanly. SmoothQuant became the standard baseline for all subsequent LLM quantization work. But its view was still limited to the matrix-multiply scenario of "weight × activation." In long-context inference, the dominant memory consumer is neither weights nor activations — it is the KV cache: as the decoder computes new tokens it caches K and V, and that cache grows linearly with context length. SmoothQuant does not specifically address this.
+
+** 2024 | KIVI: First applying "per-channel quantization" to KV cache
+
+*** What problem did it see
+
+Liu turned the lens to KV cache and noticed that Key and Value behave very differently:
+
+- Key tensors have channel-wise outliers similar to activations — a few channels are inherently large;
+- Value tensors lack this structure and are relatively uniform.
+
+If you follow conventional practice and quantize per-token (one scale group per token), then any outlier token in a given Key channel blows up the scale for that entire token.
+
+*** Its solution
+
+Treat them differently:
+- Keys: per-channel quantization (channels share a scale; outlier channels get their own large scale);
+- Values: per-token quantization (preserving incremental-update friendliness for autoregressive decoding).
+
+Together these two choices define the KIVI paradigm — the foundational work in KV cache quantization.
+
+*** Why it works (and what new pitfall it buries)
+
+The intuition: wherever outliers concentrate, slice along that dimension. Key outliers concentrate in the channel dimension, so per-channel naturally solves it. Values have no outlier structure, so per-token is the natural fit. This paradigm runs well at 4 bits.
+
+But at extreme compression — 2 or 3 bits — KIVI starts to collapse. The reason is that per-channel solves "imbalance across channels," but no one handles the variation within each channel across different tokens (token 100's norm in a given channel might be 10× that of token 500). KIVI never clearly diagnosed this; it only noted "accuracy drops sharply at extreme compression."
+
+** 2024 | QuaRot: Using Hadamard rotation to spread outliers flat
+
+*** What problem did it see
+
+Ashkboos followed up on KIVI with a thought: per-channel quantization was forced upon us by outlier channels. What if there simply were no outlier channels? Wouldn't per-token work then?
+
+Outliers are "concentrated in a few channels" — the problem is uneven distribution.
+
+*** Its solution
+
+Borrow an ancient mathematical tool: the Hadamard matrix — an orthogonal matrix filled entirely with +1 and −1. Multiplying Keys by a Hadamard matrix randomly adds and subtracts all channels together, spreading the outlier energy across every channel. After mixing, every channel is roughly the same size, and per-token quantization can proceed.
+
+*** Why it works (and what new pitfall it buries)
+
+Intuition: imagine a bag of flour with all the pebbles clumped in one corner. Shake the bag until the pebbles distribute evenly — the whole bag "looks uniform." The Hadamard is orthogonal, so multiplying by its inverse at the end of the attention computation recovers the original result exactly, preserving mathematical equivalence.
+
+QuaRot was primarily a weight + activation quantization tool; when applied to KV cache it mainly followed a per-token approach. The cost: the rotation must run on-the-fly at inference time, adding an extra operator. More importantly, rotation only redistributes imbalance along the channel dimension; imbalance along the token dimension — precisely what OScaR later calls TNI — remains untreated.
+
+** 2025 | TurboQuant: Going to the extreme — per-element + random rotation + residual correction
+
+*** What problem did it see
+
+QuaRot and KIVI still show substantial loss at 2 bits. Zandieh and collaborators reasoned: the direction is right, but not extreme enough. Can a finer granularity (per-element, one scale per scalar) combined with theoretically guaranteed random rotations push the error down toward the information-theoretic lower bound?
+
+*** Its solution
+
+TurboQuant extends the pipeline to its maximum length:
+1. Multiple random rotations (not a single Hadamard, but a sequence of random orthogonal transforms);
+2. Quantization;
+3. Residual error correction (the quantization error is separately encoded and appended);
+4. Corresponding inverse operations at the decode side.
+
+The cost: more parameters, more kernels, additional structures packed into memory, significant extra computation at every step. But the theory is beautiful: it can be shown to approach the optimal rate-distortion curve.
+
+*** Why it works (and what new pitfall it buries)
+
+Intuition: take "things that are hard to compress" and dilute them round after round with statistical tricks (randomization + residual compensation) until every piece is a small, easy-to-quantize slice.
+
+But the problem with this approach became increasingly apparent: in engineering practice, "longer pipeline = slower inference" is nearly an iron law. TurboQuant is SOTA on paper benchmarks, but at deployment its own complexity drags it down; combined with the unavoidable on-the-fly quantization overhead, measured throughput is not always better than KIVI's. It also left a more fundamental question unanswered: at extreme compression, exactly which structural property creates the error? Everyone was piling on methods; no one was clearly identifying the lesion.
+
+** 2026 | OScaR: First name the lesion (TNI), then cure it with the fewest parts
+
+*** What problem did it see
+
+The OScaR authors, having worked through KIVI, QuaRot, and TurboQuant, stepped back and asked: why does per-channel quantization break at extreme compression?
+
+They analyzed token-wise norm distributions across multiple models and modalities, and observed a universal phenomenon: within a single Key channel, the norms of different tokens can vary enormously — some tokens at the 0.1 scale, others at the 10 scale. Per-channel quantization shares one scale across all tokens; that scale must either accommodate the large-norm tokens (crushing small-norm tokens to zero) or the small-norm tokens (overflowing the large-norm ones). Neither choice works.
+
+They named this phenomenon *Token Norm Imbalance (TNI)* and provided a theoretical derivation showing that under the per-channel framework, TNI systematically amplifies quantization error in an unavoidable way.
+
+This is the true reason KIVI collapses at 2 bits. It is also why QuaRot — which flattened the channel dimension — still couldn't save things: TNI lives along the token dimension, and a rotation along the channel dimension cannot cure it.
+
+*** Its solution
+
+With TNI clearly diagnosed, the fix targets token-dimension imbalance directly:
+
+1. *Canalized Rotation*: Apply a Hadamard rotation first. This step is not meant to cure TNI; it prevents the subsequent token scaling from being contaminated by a side effect called "Scaling-Induced Outlier Artifact" — if you scale the raw Key directly along the token dimension, the scale factors interact with existing channel-dimension outliers and generate new spurious outliers. Rotating first flattens the channels so the scaling step remains clean.
+
+2. *Omni-Token Scaling*: Normalize along the sequence (token) dimension so that all token norms land in the same range. This step directly eliminates TNI — since the per-channel scale is shared, first bring all tokens to comparable magnitudes so the shared scale can contain them.
+
+The two steps together are layered on top of KIVI's per-channel paradigm. No additional training, no residual correction, no repeated random rotations. Ablation studies confirm both are necessary: rotation alone or scaling alone both lose accuracy.
+
+Combined with a carefully optimized CUDA kernel (a fused Hadamard-Norm kernel), the system is genuinely deployable:
+
+- INT2 quantization with near-lossless accuracy;
+- 3.0× decode speedup over BF16 FlashDecoding-v2;
+- 1/5.3 memory footprint;
+- 4.1× throughput.
+
+*** Why it works (and what new pitfall it buries)
+
+The intuition laid out as a table:
+
+| Dimension | Imbalance name | Treatment |
+|-----------|---------------|-----------|
+| Channel dimension | Channel-wise outlier | Hadamard rotation (QuaRot's original move) |
+| Token dimension | Token Norm Imbalance (TNI) | Sequence-level normalization (OScaR's new move) |
+
+OScaR does not invent new tools; it pairs two straightforward operations — "rotate then scale" — and clearly diagnoses what each one cures. This is Occam's Razor in practice: prior work kept adding things; OScaR subtracted.
+
+What new pitfalls remain? The paper is honest:
+
+- The TNI diagnosis focuses primarily on the Key tensor; TNI handling for the Value tensor is still relatively simple.
+- Omni-Token Scaling normalizes along the sequence dimension; the prefill-phase implementation requires careful engineering (hence the custom CUDA kernel design).
+- TNI distribution characteristics across modalities (multi-modal / omni-modal) are only in their early stages.
+
+* Frontier Extensions
+
+OScaR is a preprint posted in 2026-05 ("Under review"), so there is as yet no subsequent work explicitly critiquing or improving upon it. But the directions most likely to follow are already visible in OScaR's own references:
+
+- *TurboQuant+ (Pope, 2026)*: A continuation of TurboQuant, pushing the per-element direction further and seeking to reduce engineering overhead. OScaR's Appendix K provides a dedicated complexity comparison — TurboQuant+ retains a theoretical advantage in certain settings, but its measured cost is far higher than OScaR's. These two lines (minimal per-channel vs. maximal per-element) will coexist in the near term.
+
+- *OTT (Su et al., 2025a)*: An earlier work from the same lab, representing a different optimization direction within the per-channel paradigm. OScaR is its spiritual successor.
+
+- *Multi-modal / omni-modal quantization*: OScaR is the first work to evaluate X-LLMs (text + multi-modal + omni-modal) as a unified framework. The next wave of work will likely refine the TNI diagnosis for visual tokens and audio tokens — the token norm distributions of different modalities are potentially far more divergent from each other, an unexplored corner.
+
+* One Diagram
+
+#+begin_example
+              Timeline ----->
+              2022     2023     2024              2025         2026
+              ----     ----     ----              ----         ----
+
+Whose         activation    KV cache enters the picture
+imbalance?    outlier  ->   (Key channels, Value uniform)  ->  token dimension
+                                                                (TNI)
+              LLM.int8  SmoothQuant   KIVI            TurboQuant   OScaR
+              [mixed    [scale        [per-channel    [per-element  [per-channel
+              precision] shifted to   Key,           + random rot   + Canalized
+                        weight]       per-token V]   + residual]    Rotation
+                                                                   + Omni-Token
+                                                                     Scaling]
+
+Slice         per-tensor  per-tensor  per-channel    per-element   per-channel
+granularity   (mix FP16)                                            (back to lean)
+
+Toolbox       FP16       per-channel  divide & conquer  Hadamard +   Hadamard +
+              hot list   scale        K/V separate      random rot + sequence-level
+                         smoothing    slicing           residual     normalization
+
+Complexity    medium     low          low            high          low
+Accuracy      4-8 bit    8 bit        4 bit          2 bit         2 bit
+ceiling                                              (theory)      (measured)
+
+Main thread:
+  From "pick out outliers" → "spread outliers flat" → "diagnose the structural
+  property behind outliers."
+  Earlier generations worked at the tool level; OScaR steps back one level to
+  the lesion first.
+
+#+end_example
+
+* Insights
+
+Reading the full arc, three things surface:
+
+1. *Diagnosis is more valuable than tools.* From KIVI to TurboQuant, five years of increasingly elaborate tools: rotation, random rotation, residual correction, per-element scale. But no one stopped to ask "where exactly does per-channel quantization break at extreme compression?" OScaR's only genuinely new contribution is giving a name to a phenomenon that already existed (TNI) and providing a theoretical analysis. Once the diagnosis is right, the cure is naturally short — Canalized Rotation is an old tool, Omni-Token Scaling is a textbook normalization. The scarcest resource in research is not new methods; it is new perspectives.
+
+2. *Occam's Razor is especially sharp in engineering.* TurboQuant is mathematically beautiful but collapsed under its own complexity at deployment. A solution like OScaR that "gets it done in two steps" wins because every step corresponds to a clear diagnosis rather than a stack of insurance policies. Simplicity is not an aesthetic preference; it is a cheaper source of engineering robustness — one fewer component means one fewer bug source and one fewer kernel optimization burden.
+
+3. *The essence of imbalance problems is the choice of slice dimension.* Slice along channels or along tokens? This binary framing misses the right question: "which dimension's imbalance is more structural — that one should be treated first." KIVI chose channels because channel imbalance was more visible. OScaR found that once channel-dimension imbalance was cured, token-dimension imbalance (TNI) was the next wall. Research progress often amounts to "looking at the same problem along a different dimension."
+
+Where is the frontier most likely to move next:
+
+- TNI distribution patterns in multi-modal / omni-modal settings (visual and text tokens mixed together, with potentially far more dramatic norm divergence);
+- Migrating the "diagnose first, then apply a minimal cure" paradigm from KV cache quantization to other LLM inference bottlenecks (attention sinks, weight outliers, activation outliers);
+- The per-element and per-channel lines will not produce a clear winner in the near term, but per-channel — because of its simplicity — will capture the engineering landscape first.
+
+* Takeaways
+
+The most direct lesson this evolutionary arc offers for doing research is: *in a domain where a tool race is at full heat, stepping back to look at the lesion is usually the highest-ROI move.*
+
+In the five years from KIVI to TurboQuant, everyone was adding things — rotation, random rotation, residual correction, per-element scale. OScaR added no genuinely new tool. What it did was:
+
+1. Run extensive experiments examining distributions, and find that "token norms within the same channel vary dramatically" is a universal phenomenon;
+2. Give that phenomenon a name (TNI);
+3. Derive a theory showing that "per-channel + TNI necessarily explodes";
+4. Use the most primitive tools available (Hadamard + normalization) to fix it.
+
+This suggests you can:
+
+- In any domain you care about, stop and ask: "What disease exactly are the tools everyone uses treating? Has that disease ever been defined? Does it have a name?" — if not, defining it is itself a contribution;
+- When you see "methods growing ever more complex while gains approach a ceiling," resist the urge to pile in and instead ask "are we treating the wrong disease?";
+- Simplicity is not aesthetics; it is the source of engineering robustness. Two components, each with a clear job description, beats five components stacked together to claim SOTA;
+- In contexts related to long-context / multi-modal large model deployment, KV cache quantization will continue to evolve rapidly in the near term; tracking TNI follow-up work and quantization benchmarks on X-LLMs is a worthwhile investment.

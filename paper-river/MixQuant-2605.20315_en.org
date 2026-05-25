@@ -1,0 +1,258 @@
+#+title:      Mix-Quant: Quantized Prefilling, Precise Decoding for Agentic LLMs
+#+date:       [2026-05-25 Mon 07:15]
+#+filetags:   :paper:river:quantization:llm:agent:en:
+#+identifier: 20260525T071524-en
+#+source:     https://arxiv.org/abs/2605.20315
+#+authors:    Haiquan Lu, Zigeng Chen, Gongfan Fang, Xinyin Ma, Xinchao Wang
+#+venue:      arXiv 2605.20315 (cs.CL), 2026-05
+
+* The Problem River
+
+The most direct way to run a model with tens of billions of parameters cheaply and fast is to *compress each number from 16-bit floating point down to 4 bits*. But models are exquisitely sensitive to precision — push too hard and they start hallucinating.
+
+For over a decade this river has fought the same battle: *which numbers can be coarse, which must stay fine, and can hardware directly consume the "coarse" format*. From the 2022 discovery that "a handful of outlier channels carry the whole model on their shoulders," through NVIDIA's native 4-bit floating-point support in a new GPU generation in 2024, to the 2026 finding that "applying the same compression blade all the way through actually breaks agent behavior" — each step revealed something the previous generation had missed.
+
+Mix-Quant (2026.05) marks a new inflection point: it stops asking "how do we quantize more aggressively" and instead asks "should we really apply the same scheme everywhere?" The defining shape of an LLM agent workload is *extremely long inputs, short outputs, and many rounds of inference* — the prefill phase is compute-bound, while a single error in the decode phase cascades into total failure. The answer: compress prefill with NVFP4, leave decode at BF16. This reframes "where to quantize" as a question about *workload shape* rather than about *numerical precision*.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+   |
+   | Gives everyone a shared "object to compress": Transformer
+   v
+[2022] Dettmers et al. - LLM.int8()
+   |
+   | Finding: models ≥ 6.7B contain "outlier feature channels"
+   |          naive INT8 quantization destroys them, model collapses
+   | Fix:     keep outlier channels in FP16, run the rest in INT8
+   |          (mixed-precision matmul)
+   v
+[2022] Xiao et al. - SmoothQuant
+   |
+   | Problem: the mixed-precision path is awkward inside GPU kernels
+   |          (alternating FP16 / INT8 breaks the pipeline)
+   | Fix:     migrate the "hardness" from activations to weights —
+   |          activation /= s, weight *= s
+   |          now everything runs as pure W8A8
+   v
+[2022] Frantar et al. - GPTQ
+   |
+   | Problem: 8 bits still isn't small enough; want to go to 4 bits
+   |          but direct RTN on 4-bit weights causes large accuracy drops
+   | Fix:     frame quantization as a per-column optimization problem,
+   |          use Hessian information to compensate error column by column
+   v
+[2023] Lin et al. - AWQ
+   |
+   | Problem: GPTQ looks at weights alone, but a weight's importance
+   |          is determined by the activation magnitude passing through it,
+   |          not by the weight's own magnitude
+   | Fix:     use activation magnitudes to find the 1% critical channels,
+   |          give them higher effective precision (per-channel scale)
+   v
+[2025] NVIDIA Blackwell - NVFP4 (Microscaling FP4)
+   |
+   | Problem: all of the above are software tricks; the GPU still computes
+   |          in FP16/INT8. Real "4-bit compute" requires native hardware
+   |          support for an FP4 format
+   | Fix:     E2M1 4-bit values + one FP8 block-scale per 16 elements
+   |          + a tensor-level global scale; two levels of scaling,
+   |          computed natively on Blackwell tensor cores
+   v
+[2026.05] >>> Lu et al. - Mix-Quant (this paper) <<<
+   |
+   | Problem: every prior work assumes "one quantization scheme end-to-end"
+   |          but in agent workflows prefill is compute-bound and decode
+   |          is error-sensitive; running full NVFP4 degrades long-trajectory tasks
+   | Fix:     prefill → NVFP4 (saves 2–3× compute),
+   |          decode → BF16 (prevents error snowballing),
+   |          deployed naturally via prefill-decode disaggregation
+   v
+[Concurrent] Quartet (FP4 training), KIVI (KV cache quantization)
+             Extending "inference quantization" to training and cache quantization
+#+end_example
+
+Note: arrows indicate "the later work explicitly built upon the earlier one." NVFP4 is a hardware format rather than a single paper; references [24] and [6] are NVIDIA's microscaling specification and scale-optimization work related to SVDQuant.
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8() (Dettmers et al.): Outlier Channels Can Blow Everything Up
+
+*** What problem did it see?
+
+Before LLM.int8(), quantization had mainly been validated on CNNs. Everyone assumed large language models would work the same way — just scale each weight from FP16 to INT8 proportionally. Dettmers tried it: below 6.7B it held up, but *above 6.7B, naive INT8 quantization caused the model to produce gibberish*.
+
+Looking inside, they found a counterintuitive fact: *a small number of "outlier channels" in Transformers have activations roughly 100× larger than everything else*. When you compress all values with a single scale factor into INT8, those giant values consume the entire quantization range and the remaining fine-grained detail is crushed into noise. Those outlier channels happen to carry most of the information flow — destroy them and the model collapses.
+
+*** The fix
+
+Don't force them to comply. Split the matrix multiplication into two paths: *outlier channels stay in FP16*, *all other channels go through INT8*, and sum the results. This is the mixed-precision matmul.
+
+*** Why it worked, and what new problem it buried
+
+It was the first method to make "nearly lossless 8-bit inference for large LLMs" a practical reality, and the BitsAndBytes library became famous overnight. But it left two issues: (1) the mixed path interrupted GPU kernel pipelines, so real-world speedups fell short of the theoretical gain; (2) 8-bit is still not aggressive enough — it cannot fit a 70B model on a single GPU.
+
+** 2022 | SmoothQuant (Xiao et al.): Move the "Hardness" from Activations to Weights
+
+*** What problem did it see?
+
+LLM.int8() dodged outlier channels by splitting the matmul, but GPU tensor cores are happiest when *the entire matrix* is INT8. The alternating FP16/INT8 mixed path caused tensor cores to switch modes frequently, eroding the speedup.
+
+The deeper issue: *why must the outliers remain in FP16?* Because the outliers live in the activations, while the weights themselves have a well-behaved distribution. The problem is asymmetric — if you can move "activation hardness" away, the whole operation can run as pure W8A8.
+
+*** The fix
+
+Mathematically elegant: the matmul \(Y = XW\) is equivalent to \(Y = (X/s)(sW)\). Choose a per-channel scale factor \(s\), divide the activations by it (flattening the activations) and multiply the weights by it (making the weights slightly more "peaky").
+
+Because the weights were originally easy to quantize, they can absorb some extra steepness and still quantize cleanly; and once the activations are smoothed, the outliers are suppressed and also quantize cleanly. Both sides now run as pure INT8. *"Migrate the difficulty from activations to weights" — that is the soul of this paper.*
+
+*** Why it worked, and what new problem it buried
+
+It made end-to-end W8A8 feasible with real throughput gains. But 8 bits is still not frugal enough for inference. The next step was inevitably toward 4 bits — but quantizing activations to 4 bits is even harder, so most efforts attacked the weight side first.
+
+** 2022 | GPTQ (Frantar et al.): Frame Quantization as an Optimization Problem
+
+*** What problem did it see?
+
+Directly rounding weights to 4 bits (RTN — round to nearest) causes severe accuracy degradation. The reason: 4 bits can represent only 16 distinct values, so stuffing a continuous distribution into 16 bins means every weight is "displaced" by a non-trivial amount on average. If this displacement were *random* it might average out, but it is *systematic* — all weights snap to the nearest bin, and the entire layer's output is biased.
+
+*** The fix
+
+Draws on Optimal Brain Surgeon from the 1990s. The core idea: *when quantizing weight i introduces an error, distribute that error — guided by Hessian information — to the not-yet-quantized weights i+1, i+2, …*, letting them adjust to compensate. The layer is processed column by column; each time a column is quantized, part of the error is absorbed before moving on.
+
+*** Why it worked, and what new problem it buried
+
+This was the first method to achieve "nearly lossless INT4," allowing a 70B model to fit on a single GPU. But it left a gap: *GPTQ looks only at the weights and the layer-wise Hessian, never asking "how important is this weight in the forward pass?"* The next paper would point out that a weight's importance is determined not by its own magnitude, but by the magnitude of the activations flowing through it.
+
+** 2023 | AWQ (Lin et al.): Importance Is Determined by Activations, Not by Weights
+
+*** What problem did it see?
+
+GPTQ minimizes "reconstruction error after compression," but *minimum reconstruction error* does not equal *best task performance*. If a weight is almost never activated, compressing it badly doesn't matter much; but if a weight lies on a path frequently traversed by large activations, even a tiny compression error cascades downstream.
+
+GPTQ ignores this information. It treats all columns equally.
+
+*** The fix
+
+Simple — *run a few calibration samples and observe how large the activations corresponding to each weight are*. Keep the top 1% of weights (those with the largest corresponding activation magnitudes) at higher effective precision (per-channel scale), and aggressively compress the remaining 99%.
+
+The implementation follows the same spirit as SmoothQuant: a scaling transformation boosts the effective quantization precision of "important weights" while the full matrix is still stored and computed at a uniform 4 bits on hardware.
+
+*** Why it worked, and what new problem it buried
+
+It delivers better accuracy-to-simplicity than GPTQ and has become one of the de-facto standards for INT4 weight quantization. But it still only touches the weights — *activations remain at full precision*. During the prefill phase the GPU performs a large X @ W matmul; if X stays at full precision, there is no compute saving to be had. This leads naturally to the next question: how do we also quantize the *activations* to 4 bits?
+
+** 2025 | NVFP4 / Microscaling FP4 (NVIDIA Blackwell): Let Hardware Compute Natively in 4-Bit Float
+
+*** What problem did it see?
+
+Up through AWQ, 4-bit was still a *software sleight of hand* — store at INT4, dequantize back to FP16 before the tensor core does the actual arithmetic. This means *no compute savings, only memory-bandwidth savings*. Since prefill is compute-bound, these methods provide limited prefill acceleration.
+
+Saving compute requires a *hardware-natively supported 4-bit numerical format*. INT4 is too coarse (only uniformly spaced integers); FP4 has dynamic range, but a single FP4 number alone has too little representational capacity.
+
+*** The fix
+
+*Microscaling FP4*: each value is represented as an E2M1 4-bit float, then every 16 elements share a single FP8 E4M3 "block scale," and the entire tensor carries a global scale on top. Three levels of scaling, effectively giving FP4 a different dynamic range in each small neighborhood.
+
+NVIDIA Blackwell tensor cores support this format natively, performing *W4A4 GEMM with both X and W in NVFP4*. Compute throughput is several times higher than FP16.
+
+*** Why it worked, and what new problem it buried
+
+For the first time 4-bit becomes not just a storage optimization but a *true compute optimization*. But it left a hidden assumption unchecked — *can this format really be applied uniformly to every step of inference?* Everyone assumed "just replace BF16 with W4A4 and you're done," and nobody specifically validated whether, in long-sequence multi-turn agent scenarios, quantization error might explode in a different way. Mix-Quant is here to lift that lid.
+
+** 2026.05 | Mix-Quant (Lu et al.): Uniform Quantization Collapses on Agent Workloads
+
+*** What problem did it see?
+
+Every previous generation made one implicit assumption: *the same quantization scheme should be applied uniformly throughout the entire inference process*. Mix-Quant is the first to say: "Wait — LLM inference doesn't have just one shape."
+
+The defining characteristics of an LLM agent workload are: extremely long inputs (system prompt + tool descriptions + conversation history + retrieval results + execution trajectory), short outputs (a tool call, a reasoning step, an action), and *dozens of rounds per task*. Two consequences follow:
+
+1. *Prefill is overwhelmingly compute-intensive* — input length is tens to hundreds of times the output length, so nearly all FLOPs are spent in prefill;
+2. *Decode is extremely sensitive to errors* — a single wrong token can call the wrong tool, write buggy code, or take the wrong branch; every subsequent step is built on top of that mistake, and errors snowball.
+
+Running NVFP4 end-to-end does save compute in prefill, but decode becomes unstable, and long-trajectory agent benchmarks (BFCL, LongMemEval, τ²-bench) show substantial overall degradation.
+
+The sharper observation is: *quantization error in prefill does not snowball*. The input tokens are fixed — quantization only perturbs the hidden states; and in long contexts, only a small number of "heavy hitter" tokens capture 95% of the attention quality (in a 128K context, the top 4,096 tokens account for 95.8% of attention), so quantization error on low-attention tokens is automatically attenuated. Prefill is therefore *naturally suited* to aggressive quantization.
+
+*** The fix
+
+*Phase-aware quantization* — assign quantization strategy by inference phase:
+
+- *Prefill*: NVFP4 W4A4, saving 2–3× compute
+- *Decode*: BF16, untouched
+
+Deployment is clean via *prefill-decode disaggregation*: prefill workers run the NVFP4 path, ship the completed KV cache over NIXL to decode workers, and decode workers generate tokens entirely in BF16. The two worker pools use different model paths, their hardware configurations can be tuned independently, and the engineering is straightforward.
+
+*** Why it worked, and what new problem it buried
+
+This reframes what looked like a "the lower the better" optimization problem into a question of *where* to save. That is a cognitive leap — *the choice of quantization should vary with workload shape*, not be a single global numerical precision dial.
+
+Remaining gaps: (1) only a coarse prefill / decode split is explored; finer granularity (different precision per layer, per head) is untouched; (2) the KV cache itself remains at BF16, so memory pressure for long-context agents is unresolved — that is the entry point for the next wave of work.
+
+* Frontier Extensions
+
+Mix-Quant is a fresh paper from 2026.05, so forward extensions are still sparse, but several parallel threads are visibly growing:
+
+** Concurrent: FP4 Training (Quartet, etc.)
+
+Pushing NVFP4 from inference into the *training* phase. Quartet and related works explore whether end-to-end FP4 training is viable — the inverse of Mix-Quant's direction: Mix-Quant says "quantize less," Quartet says "quantize more." Together they confirm the same underlying truth: *FP4 is not a universal solution; what matters is at which phase and on which tensors it is applied*.
+
+** Concurrent: KV Cache Quantization (KIVI, etc.)
+
+Mix-Quant resolves the compute pressure in prefill but leaves the KV cache entirely in BF16, creating memory pressure. Methods like KIVI quantize the KV cache itself down to 2–4 bits. This is *orthogonal* to Mix-Quant and can be stacked on top of it.
+
+** Foreseeable next step: Finer-grained phase-awareness
+
+Mix-Quant makes the *first cut* along the phase dimension: prefill vs. decode. Subsequent work will likely cut finer — different precision at different layers within prefill, different precision at different attention heads during decode, tiered treatment for "heavy hitter" tokens vs. ordinary tokens in long contexts.
+
+* One Diagram
+
+#+begin_example
+          Layer 1 (2022) ----------- Layer 2 (2022) ----------- Layer 3 (2022)
+          LLM.int8()                 SmoothQuant               GPTQ
+          ----------                 -----------               ----
+Insight:  Outlier channels exist     Hardness can be migrated  Quantization = optimization
+Method:   Mixed-precision W8A8       Pure W8A8                 W4 weight compensation
+Solves:   INT8 now feasible          Clean kernels             Weights reach 4 bits
+Leaves:   Awkward kernel paths       Activations still 8-bit   Only weights considered,
+                                                               activations ignored
+
+          Layer 4 (2023) ----------- Layer 5 (2025) ----------- Layer 6 (2026.05)
+          AWQ                        NVFP4 / MX-FP4             Mix-Quant  ← this paper
+          ---                        --------------             ----------
+Insight:  Activations decide         Hardware needs native FP4  Workload shape determines
+          importance                                            quantization strategy
+Method:   Find top-1% critical       Blackwell native compute   Prefill → NVFP4
+          weights by activation      E2M1 + block scale         Decode → BF16
+          magnitude; keep high-prec
+Solves:   INT4 nearly lossless       W4A4 true compute savings  Long-trajectory agents stable
+Leaves:   Activations at full prec   Assumes uniform precision   KV cache unquantized;
+                                     without per-phase check     phase split too coarse
+
+Timeline: 2022 ------- 2022 ------- 2022 ------- 2023 ------- 2025 ------- 2026.05
+Main arc: [Who needs high precision] → [W8A8] → [W4A4] → [When to quantize]
+          (exploring the content dimension)                    (exploring the time dimension)
+#+end_example
+
+* Insights
+
+This river ran from 2022 to 2026, and on the surface it looks like a story of *ever-more-aggressive compression*: 8 bit → 4 bit. But what actually changed is *how the problem was posed*:
+
+- The first five layers (int8 → AWQ → NVFP4) all answered the same question — *how to make the numbers smaller*. They assumed quantization is a *global, time-independent* setting.
+- Mix-Quant is the first to say: *quantization should not be a global setting — it should be a schedule*. The same model uses one precision for prefill and another for decode, and the decision is no longer driven by "which math is more elegant" but by *"what does this segment of computation look like, and how do errors propagate through it?"*
+
+From a *numerical perspective* to a *systems perspective*, from *how to compress* to *when to compress* — this is the first genuine paradigm shift in the entire river.
+
+This shift is *coupled* to the maturation of prefill-decode disaggregation as a serving-infrastructure pattern. Without DistServe / Splitwise physically separating prefill and decode, phase-aware quantization would have no natural deployment vehicle; conversely, once prefill and decode are physically separated, "why would both sides use the same precision?" becomes an obvious question to ask. Algorithm and system co-evolved to produce each other here.
+
+Where is the next step most likely to go? The answer lies in the gaps Mix-Quant left open: (1) finer-grained phase splits (per-layer, per-head, per-token-importance); (2) extending the same "phase-aware" thinking to sparsification, pruning, and speculative decoding — all of which share the same underlying assumption: "a one-size-fits-all optimization is rarely optimal; workloads have shape, and optimizations should have shape too."
+
+* Takeaways
+
+- *Your optimization strategy should look like its workload.* The core of Mix-Quant is not "find a better quantization algorithm" — it is *recognizing the asymmetry in the workload*: prefill is compute-bound, decode is error-sensitive. Once you identify the asymmetry, the solution almost suggests itself. The next time you face a scenario where an optimization is applied uniformly, ask first: *should different parts of this system really be treated the same way?*
+
+- *Old problems in new shapes deserve a fresh look.* The "shape" of quantization was about the model dimension in 2022 (which channels), the activation dimension in 2023 (which weights matter), and the time dimension in 2026 (which phase). Each new dimension emerged because *the workload itself changed* — Mix-Quant exists because LLMs entered the agent era, where inputs became enormous. *The technique doesn't change, but when the shape it is deployed into changes, the previously optimal solution is no longer optimal.*
+
+- *Algorithms and systems pull each other forward.* Phase-aware quantization can be deployed in practice only because the prefill-decode disaggregation line of serving-system work had already matured. When evaluating whether any optimization technique can make it to production, check whether the infrastructure it depends on is *also* maturing — often the infrastructure grows first and only then creates space for the algorithmic innovation.

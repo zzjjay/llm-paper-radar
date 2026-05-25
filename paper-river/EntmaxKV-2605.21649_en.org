@@ -1,0 +1,317 @@
+#+title:      EntmaxKV: Support-Aware Decoding for Entmax Attention
+#+date:       [2026-05-25 Mon 07:29]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T072936-en
+#+source:     https://arxiv.org/abs/2605.21649
+#+authors:    Gonçalo Duarte, Miguel Couceiro, Marcos V. Treviso
+#+venue:      arXiv preprint, May 2026
+
+* The River of the Problem
+
+A language model reads a million-word novel and you ask it a question. Every time it generates a single token, it must scan the entire book again — that is the price of the KV cache: the longer the context, the higher the per-token latency, and the increase is proportional with no way to bargain it down.
+
+Where the problem truly jams: attention mathematically requires looking at every token, yet empirically it only truly attends to a few dozen. Most memory reads are wasteful, yet they cannot be skipped — because you have to read to know what can be skipped.
+
+This is the battle that a wave of researchers has been fighting for the past decade: *how to know which KV entries to read before actually reading them*. One camp modifies the decoding algorithm (read fewer, but which ones?); the other camp modifies the attention formula itself (make it output exact zeros, so there is nothing to agonize over). The two paths ran in parallel — until EntmaxKV connected them.
+
+* Source Map
+
+#+begin_example
+                    [2017] Softmax Attention (Transformer)
+                            |
+                            | Problem: attention distributions are always dense —
+                            | even if only a few tokens truly matter, every other
+                            | token still receives a positive probability
+                            |
+        +-------------------+-------------------+
+        |                                       |
+        | Path A: fix decoding                  | Path B: fix the formula
+        | (pretend softmax is sparse)           | (make it output true zeros)
+        v                                       v
+   [2023] H2O                              [2016] Sparsemax
+   Score tokens by cumulative attention,   First softmax alternative capable
+   permanently evict low-scoring tokens    of outputting exact zeros
+        |                                       |
+        | Problem: wrong evictions can          | Problem: α=2 is hard-coded;
+        | never be recovered                    | sparsity degree is not tunable
+        v                                       v
+   [2023] PagedAttention / vLLM            [2019] α-entmax
+   Page the KV cache; lay the foundation   A family of functions with tunable α
+   for "select by page"                    that can output exact zeros
+        |                                       |
+        | Problem: no one yet selects           | Problem: too slow on GPU for
+        | pages "dynamically"                   | large-model training
+        v                                       v
+   [2024] Quest                             [2025] AdaSplash
+   Per-query upper bounds via per-page      GPU kernel making α-entmax
+   min/max; read only the top-k pages      training feasible
+        |                                       |
+        | Problem: softmax tail is never        v
+        | exactly zero; even perfect       [2026] AdaSplash-2
+        | page selection loses probability  histogram init + block skipping;
+        | mass                              ready for inference
+        |                                       |
+        +-------------------+-------------------+
+                            |
+                            | Where the two paths meet:
+                            | Because entmax outputs true zeros, Quest-style
+                            | page selection is no longer an "approximation" —
+                            | hitting the support set exactly makes it equivalent
+                            v
+                    [2026] EntmaxKV  <--- target paper
+                    Rewrites "sparse decoding = tail approximation"
+                    as "sparse decoding = support recovery"
+                            |
+                            | Concurrent work (softmax camp keeps patching):
+                            +--- [2024] SnapKV
+                            +--- [2024] MagicPIG (LSH token selection)
+                            +--- [2025] Twilight (top-k then top-p)
+                            +--- [2025] Tactic (clustering + distribution fitting)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2016 | Sparsemax: Making Softmax Output True Zeros for the First Time
+
+*** What Problem It Saw
+
+Softmax has an irritating property: feed it ten thousand numbers and it returns ten thousand positive numbers. Even if 9,990 of them are vanishingly small and contribute nothing to the result, softmax must still assign them a tiny sliver of probability — because exp(x) is always greater than zero.
+
+In classification tasks this is merely inelegant. In attention mechanisms it is genuinely painful: the "long tail" of the attention distribution might collectively account for 30% of the probability mass, yet there is no way to know in advance which tokens are in that tail. Want to be lazy and only compute the top few? Sorry — the rest of the tail cannot simply be discarded.
+
+*** Its Solution
+
+Martins and Astudillo wrote a new formula: compare each score against a threshold τ, distribute probability proportionally among scores that exceed it, and assign exact zero to everything below. The threshold τ is not hand-tuned — it is derived automatically from the constraint that all outputs sum to 1.
+
+Intuitively: softmax "exponentially amplifies all scores"; sparsemax "subtracts a threshold, clips negatives to zero, then normalizes."
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It works because, for many tasks, *only a handful of entries are truly relevant*. Forcing the model to produce a sparse distribution often approximates reality better than softmax's dense smear.
+
+But sparsemax has a fixed "sparsity curve" — it corresponds to the special case α=2. Some tasks want more sparsity, some want less, and sparsemax offers no knob. The next researcher would have to add one.
+
+** 2019 | α-entmax: Putting a Knob on Sparsity
+
+*** What Problem It Saw
+
+Sparsemax is too extreme. Softmax is fully dense; sparsemax is an abrupt cutoff. Nothing exists in between. But in practice "degree of sparsity" is a continuous concept — a particular word in translation might need to attend to 3 context tokens, another to 10. Ideally the model should decide for itself how sparse to be.
+
+*** Its Solution
+
+Peters, Niculae, and Martins introduced α-entmax: a parameter α added to the formula. At α=1 it degenerates to softmax (fully dense); at α=2 it degenerates to sparsemax (the most aggressive reasonable version); between 1 and 2 it interpolates continuously.
+
+The mechanics replace the clipping function with a power: [(α-1)·s − τ]₊^{1/(α-1)}. It sounds intimidating, but the idea is simply "scores above the threshold are allocated probability along some curve; scores below are zero." The steepness of the curve is controlled by α.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It works because each attention head can now learn its own α, running at whatever sparsity level suits it. Theoretically elegant.
+
+In practice, however — computing this efficiently on a GPU is exceedingly difficult. Softmax needs one exp and one division; α-entmax must solve a root-finding equation to locate τ. Result: the theory was validated on small models, but nobody dared use it to train a 70B language model. That blockage persisted for six years.
+
+** 2023 | H2O: The Other Path Opens — Attention Is Sparse in Practice, So Stop Keeping Everything
+
+*** What Problem It Saw
+
+The H2O authors did not touch the formula; they stared at *what softmax actually produces at runtime*. Their observation was simple: even though softmax assigns every token a nonzero probability, the vast majority of tokens receive probability close to zero — roughly 10% of tokens capture 90% of the attention mass.
+
+If "you never really look at them anyway," why keep them in the KV cache and re-read them on every decoding step? That is an enormous waste.
+
+*** Its Solution
+
+H2O maintains a cumulative attention score during decoding. Tokens that have historically been attended to are retained; tokens that have consistently been ignored are *permanently evicted* from the KV cache.
+
+This prevents the KV cache from growing linearly with context; instead it is capped at a fixed size.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It works for short-horizon tasks. But there is a fundamental gamble: the assumption that "tokens not attended to in the past will not be attended to in the future."
+
+This assumption fails in many settings. In long-document QA, for example, the question appears at the end and redefines which tokens matter. H2O has already evicted potentially relevant tokens, with no way to recover them. This is the endemic flaw of *query-agnostic* methods.
+
+The logical next step: don't evict — just select dynamically.
+
+** 2023 | PagedAttention / vLLM: Laying the Foundation for Page-Based Selection
+
+*** What Problem It Saw
+
+H2O wanted dynamic KV management, but the KV cache lives in one large contiguous GPU buffer — flexible manipulation causes memory fragmentation.
+
+*** Its Solution
+
+vLLM borrowed the operating system's virtual memory idea: slice the KV cache into fixed-size *pages* (e.g., 16 tokens per page), indexed via a page table. Read a page or skip it cleanly.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+By itself it does not answer "which pages matter" — it only builds the infrastructure. But once the foundation exists, sophisticated strategies can be built on top. Quest was the first obvious one.
+
+** 2024 | Quest: Keep the Full Cache, but Select Pages Dynamically per Query
+
+*** What Problem It Saw
+
+H2O's fundamental flaw is *permanent eviction*. But keeping everything and reading everything on every step returns to the starting point. Can we "keep everything but read only what is relevant"?
+
+And there is a chicken-and-egg problem: to know which page is relevant, you need to compute the dot product of the query against that page's keys; but computing the dot product requires loading the page. Wasn't that the whole point?
+
+*** Its Solution
+
+Quest precomputes and stores, for each page, the *minimum and maximum value along each key dimension*. Given a query, without loading the real keys, it can compute an upper bound on the highest possible attention score for that page using only these min/max statistics.
+
+Pages whose upper bound is high are loaded and used; pages whose upper bound is low are skipped. The top-k pages are loaded and softmax attention is computed normally.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It works: memory traffic drops from the full cache to the top-k pages — roughly a tenfold reduction or more.
+
+But *it still computes softmax*. The dense tail is still there. No matter how accurately you select the top-k pages, there will always be *some* probability mass in the dropped pages. In theory you are always making an approximation and always incurring error.
+
+This raises the key question: if the dropped pages *should be exactly zero*, does the error vanish?
+
+** 2025 | AdaSplash: Making Entmax Finally Fast Enough for Large-Model GPU Training
+
+*** What Problem It Saw
+
+Back to the "fix the formula" path. α-entmax was theoretically beautiful but had been blocked by engineering for six years — the root-finding equation for τ was too slow on GPU to fuse into a training loop.
+
+*** Its Solution
+
+Gonçalves et al. bucket scores with a histogram to give the root-finding equation an excellent initial guess, then converge with a few steps of Halley's method. They also exploit entmax's sparsity to *skip entire blocks* — if a block can be proven to be all zeros, it is not computed at all.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It works: a 1B-parameter entmax model matches or beats its softmax counterpart on long-context benchmarks such as RULER and HELMET.
+
+But AdaSplash solves the *training* problem. During *autoregressive decoding* — one token at a time — it still needs to load the entire KV cache into SRAM to compute entmax and "discover" which tokens received zero. The pipeline's bottleneck is now: the result is sparse, but the read process is still dense. This sets up all the conditions EntmaxKV needs.
+
+** 2026 | AdaSplash-2: A Little Faster, Ready for Inference
+
+*** What Problem It Saw
+
+AdaSplash was primarily aimed at training. Inference needed an *even smaller, faster* kernel — one that would let users drop entmax attention into existing inference frameworks as a direct replacement for softmax attention.
+
+*** Its Solution
+
+Finer-grained block skipping, smarter histogram initialization. All of AdaSplash's tricks pushed to the limit.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+At this point entmax *can both be trained and deployed*. But the KV cache waste problem has still not been touched — AdaSplash-2 handles the internal computation of a single attention step, not cross-step memory management.
+
+The stage is fully set. Both lines converge in 2026.
+
+** 2026 | EntmaxKV: Rewriting "Approximation" as "Exact Recovery"
+
+*** What Problem It Saw
+
+EntmaxKV does not see a technical problem; it sees a *framing mismatch*.
+
+Every paper in the Quest lineage implicitly assumes: sparse decoding = approximating a dense distribution. This follows from softmax — its tail is never zero, so you always discard probability mass, and the question is always "how much do we lose."
+
+Switch to entmax, and the conclusion changes. The support set S of entmax is finite — most tokens receive *exactly zero*. Sparse decoding is no longer an approximation; it becomes *support recovery*: if the pages you select contain S, then the output of sparse decoding is *exactly equal* to full-cache decoding — not approximately equal, exactly equal.
+
+Once the framing shifts, all of Quest's machinery (page scoring, top-k selection) instantly transforms from "approximate algorithm" to "exact algorithm."
+
+*** Its Solution
+
+EntmaxKV wraps Quest's page scoring around entmax:
+1. Still uses Quest-style per-page min/max upper bounds.
+2. Additionally maintains statistics per page (mean and second moment of the keys) and uses a Gaussian approximation to estimate entmax's threshold τ.
+3. Selects all pages whose "estimated maximum score > τ" (not necessarily a fixed top-k; the count adapts to the distribution).
+4. Runs entmax attention only on the selected pages.
+
+Theoretical guarantee: the truncation output error is ≤ 2B·δ, where δ is the discarded probability mass. If the selected pages contain the entire support set, δ=0 and the error is exactly zero.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+Empirically: at 1M context, it is 3.36× faster than full-cache softmax and 5.43× faster than full-cache entmax. On RULER, sparse entmax decoding loses almost no accuracy; sparse softmax decoding under the same budget degrades severely.
+
+New pitfall: *whether the right pages are selected* is now critical — missing a single support-set token introduces error. The Gaussian-approximation selector is fast but is an estimate, not an upper bound, and may miss pages. EntmaxKV also proposes a conservative "deterministic box upper bound" as a safety net, but conservatism means selecting more pages and sacrificing efficiency.
+
+A deeper open question: what should α be? Larger α means higher sparsity, less decoding cost, but potentially reduced representation power. This knob has not yet been systematically studied.
+
+* Frontier Extensions
+
+EntmaxKV was posted as a preprint in May 2026, so "frontier extensions" are largely the paper itself.
+
+But several concurrent works from the *softmax camp continuing to patch* are worth noting by contrast:
+
+- *Twilight (2025)*: top-k followed by top-p second-pass filtering over the selected pool. Acknowledges that top-k alone is insufficient, but remains locked to softmax.
+- *MagicPIG (2024)*: LSH hashing for token-level sampling. Theoretical guarantees are based on unbiased estimation, not support recovery.
+- *Tactic (2025)*: clustering plus distribution fitting for adaptive token selection. Philosophically closest to EntmaxKV's "use distribution information to estimate the threshold," but because the underlying attention is still softmax, it is fundamentally still an approximation.
+
+Predictable directions for the next wave:
+1. Extending EntmaxKV's ideas to GQA, MoE, and other more complex attention variants.
+2. Jointly optimizing α and the KV budget — different layers and different heads may want different sparsity levels.
+3. On-device inference: entmax's small support set means not only less memory bandwidth but potentially less cache capacity as well.
+
+* One Diagram
+
+#+begin_example
+       Problem: KV memory-bandwidth explosion in long-context decoding
+
+  Time          Path A: fix decoding              Path B: fix the formula
+  ----          --------------------              -----------------------
+  2016          (softmax rules everything)        Sparsemax
+                                                  "a softmax that outputs true zeros"
+                                                         |
+  2017-2019     (softmax improvements)            α-entmax
+                                                  "tunable sparsity degree"
+                                                         |
+                                                  (stuck: too slow on GPU)
+                                                         |
+  2023          H2O                                (theory shelved)
+                "evict tokens by history"
+                  -> query-agnostic, wrong evictions lose information
+                       |
+                PagedAttention pages the KV cache
+                       |
+  2024          Quest
+                "per-page min/max upper bound; select top-k pages"
+                  -> even perfect selection still loses softmax tail mass
+                       |
+  2025                                              AdaSplash
+                                                    "can now train entmax large models on GPU"
+                                                         |
+  2026                                              AdaSplash-2
+                                                    "inference is also feasible"
+                                                         |
+                                                         v
+  2026 ===============================>  EntmaxKV
+                Both paths merge here. Take Quest's "page scoring + top-k"
+                + entmax's "true-zero support set"
+                = sparse decoding rewritten from "approximation problem"
+                  to "support recovery problem"
+
+                Key cognitive shift:
+                    softmax world: argmin ||sparse - dense||      (always > 0)
+                    entmax  world: 1[support ⊆ selected_pages]    (can = 0)
+#+end_example
+
+* Insight
+
+Reading through the entire timeline, what is really happening is not "decoding keeps getting faster." It is that *the problem has been redefined*.
+
+The Quest lineage worked for five years solving a problem that can never equal zero: the dense tail of softmax guarantees that any sparsification is lossy. The best they could do was reduce the loss to an acceptable level. That path has a ceiling.
+
+EntmaxKV's insight is not "I have a better algorithm." It is *"you are solving the wrong problem."* You should not be asking "how best to approximate a dense distribution" — you should be asking "why does the distribution have to be dense in the first place."
+
+Step one level upstream — replace softmax — and all the downstream "approximations" disappear. This is a textbook case of *elevating an engineering problem into a definitional one*.
+
+A broader pattern: when a field accumulates a large number of "approximately achieve X" papers, each marginally improving approximation quality, that is often a signal that *X itself may not be the right object of study*. Real progress frequently comes from a less-traveled branch that changes X directly.
+
+Where will the next step most likely go? Two directions:
+
+1. *Joint training*: α is no longer a fixed hyperparameter but is optimized during training together with the KV budget. Each head learns "how sparse should I be, how much KV should I own."
+2. *Diffusion to other "approximated" components*: MoE routing (softmax), contrastive similarity (softmax), RL policy (softmax). All of these have historically been coerced into sparsity through temperature annealing; they may all eventually be replaced by exact entmax-style alternatives.
+
+* Lessons
+
+Methodological lessons from this line of research:
+
+1. *Don't overinvest in the wrong problem.* Everyone in the Quest lineage was smart, and they were working on a real problem — it just has no optimal solution under softmax. If you find yourself repeatedly making "marginal approximation improvements" in a field, stop and ask: is there an upstream assumption that can be dismantled?
+
+2. *Theory and engineering must wait for each other.* α-entmax existed in 2019 but was blocked by GPU kernel engineering for six years. Once AdaSplash arrived, all the downstream work (including EntmaxKV) emerged within two years. *When a foundational engineering barrier breaks, the layers above it explode.* If you see a field where theory has been beautiful for years but nobody uses it, the problem is probably not the theory — the engineering has not caught up. That is an opportunity.
+
+3. *Differentiation is not "I have a new trick" — it is "I am solving a differently shaped problem."* The most powerful sentence in EntmaxKV is: "turning sparse decoding from dense-tail approximation into support recovery." That single sentence lifts the entire paper from "yet another KV compression paper" to "redefining sparse decoding."
+
+Takeaway: the next time you set out to write an improvement paper, first ask yourself — *can I rewrite the form of this problem?* If rewriting it instantly makes a large body of prior work obsolete or reduces it to a special case of yours, you have found the real problem. If you cannot rewrite it, then go ahead and make the marginal improvement.

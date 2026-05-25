@@ -1,0 +1,236 @@
+#+title:      MatGPTQ: Accurate and Efficient Post-Training Matryoshka Quantization
+#+date:       [2026-05-25 Mon 14:00]
+#+filetags:   :paper:river:quantization:llm:
+#+identifier: 20260525T140000
+#+source:     https://arxiv.org/abs/2602.03537
+#+authors:    Maximilian Kleinegger, Elvir Crnčević, Dan Alistarh (IST-DASLab)
+#+venue:      arXiv preprint, Feb 2026
+
+* 一句话
+
+一个想法走到这里——"一份模型权重，跑出多种精度"。
+最先在 embedding 里玩成（嵌套表征），然后被搬到量化里（但要昂贵的训练），最后压成一次性的 PTQ 算法，
+带上 CUDA kernel，可以真上 vLLM。MatGPTQ 是这条线上让"多精度切片"从研究玩具变成工程默认的那一刀。
+
+* 这条线的核心问题
+
+部署 LLM 时，你永远在做精度-显存-延迟的三角权衡。
+4-bit、3-bit、2-bit，不同设备要不同 checkpoint，存储和维护都是麻烦事。
+
+那一个很自然的问题：
+*能不能一份权重，运行时按需"切"出 3-bit / 4-bit / 8-bit ？*
+
+这条线就是在回答这个问题，一步步把它从概念落地到 GPU 上。
+
+* 溯源地图
+
+#+begin_src
+                            [问题: 一份权重多精度部署]
+                                       |
+                                       v
+   (2022) Matryoshka Representation Learning  (Kusupati et al.)
+           "embedding 里嵌套不同维度子向量"
+                                       |
+                  ......................................
+                  |                                    |
+                  v                                    v
+   (2022) GPTQ  (Frantar, Alistarh)         (2025) MatQuant  (Nair et al.)
+   "用 Hessian 做层级误差补偿的 PTQ"        "把嵌套思想搬到 weight 整数量化"
+                  |                                    |
+                  |    +-------------------------------+
+                  |    |
+                  v    v
+            (2026) MatGPTQ  <-- 目标论文
+            "把 Matryoshka 量化做成一次性 PTQ + 异构搜索 + CUDA kernel"
+                  |
+                  |    旁支:
+                  |     - Any-Precision LLM (Park 2024) 反向: 从低位往上加
+                  |     - D^2 MoE (Wang 2025) 只在 MoE 里玩嵌套位宽
+#+end_src
+
+(确认的引用关系：MatGPTQ 明确 cite 了 MatQuant、GPTQ、EvoPress、Any-Precision、D^2MoE；
+MatQuant→Matryoshka Repr Learning 的概念继承关系明确但论文没有 cite chain，是同一个 "嵌套" 词族。)
+
+* 一步步往回挖
+
+** 起点：Matryoshka Representation Learning (2022)
+
+最早提出 "嵌套表征" 的不是量化论文，是 embedding 论文。
+Kusupati 等人观察到：训练一个 1024 维的 embedding，下游任务不一定要用全部维度。
+但常规做法是为每个目标维度单独训一个模型，太贵。
+
+他们的解法：训练时让 *前 k 维子向量本身就是一个可用的 embedding*，对多个 k 同时优化。
+就像俄罗斯套娃，大的里面装着小的，每一层都是完整的玩偶。
+
+这个想法的关键不是技术——是 *视角*：
+*"低精度版本不应该是高精度版本的损坏，而应该是它的子集。"*
+
+** MatQuant (2025) 把套娃搬进量化
+
+Nair 等人盯上这个想法在量化里的对应：
+如果我有一个 8-bit 量化的权重 q，那它的二进制表示前 4 位本身就是一个数。
+能不能让这"前 4 位"也是一个有效的 4-bit 模型？
+
+朴素地切，肯定不行——8-bit 训练时根本没考虑高 4 位独立要好用。
+所以 MatQuant 改了训练目标：
+*对每个目标位宽 r ∈ {2, 4, 8} 同时算 loss，加权平均后反传。*
+
+这样训出来的模型，运行时一个右移操作就能得到 4-bit 版本，不需要任何额外计算。
+一份 checkpoint，三种精度，硬件按需取用。
+
+但这条路的代价：
+
+- 用的是 QAT 或 block-wise QAT (OmniQuant)，都很贵
+- 只 paper、不开源、没 kernel
+- 只支持固定三档 {8,4,2}
+- 异构位宽（每层不同 bit）只是 "可能"，没真做
+
+换句话说：*概念成立，但落不到地。*
+
+** 同时段的另一条路：GPTQ (2022)
+
+要理解 MatGPTQ 为什么是 GPTQ 的延伸，得先看 GPTQ 解决了什么。
+
+PTQ（post-training quantization）的核心问题：
+量化一层权重 W，要让量化后的 Q 与原 W 在校准数据 X 上的输出尽量像：
+
+  argmin ||QX - WX||²
+
+最早的 PTQ 是直接四舍五入（RTN），到 4-bit 就崩。
+GPTQ 的招：*量化第 i 个权重时，把它造成的误差摊给后面还没量化的权重。*
+这个误差怎么算？用 X X^T 的逆（Hessian 的近似）作为权重，能解出最优补偿方向。
+
+这是一个"贪心 + 误差转移"的算法，效率高，4-bit 几乎无损。
+
+但 GPTQ 一次只为一个位宽优化。8-bit 模型和 3-bit 模型是两次独立的量化运行。
+没有"嵌套"的概念。
+
+* 转折：MatGPTQ 把两条线焊起来
+
+到 2026 年，问题已经清楚了：
+
+- MatQuant 思路对，但工程上不能用（QAT 贵、无 kernel）
+- GPTQ 工程上漂亮，但只能单精度
+
+MatGPTQ 做的就是 *把 MatQuant 的目标函数塞进 GPTQ 的算法骨架*。
+听起来像合并 PR，实际有三个非平凡的难点：
+
+** 难点 1：单步量化选值，要同时让多个位宽都好
+
+原 GPTQ 量化一个权重，就是把它 round 到 8-bit 网格上最近的点。
+MatGPTQ 不能这样——它要选的 q 必须满足：
+
+- 切到 8 位时, ||W - dequant(S(q, 8))||² 小
+- 切到 4 位时, ||W - dequant(S(q, 4))||² 小
+- 切到 3 位时, ||W - dequant(S(q, 3))||² 小
+
+办法：*暴力把所有可能的 q ∈ [0, 2^c - 1] 都算一遍误差，加权求和，挑总误差最小的。*
+看起来粗暴，但每个权重独立、可以全部向量化，GPU 上飞快。
+
+** 难点 2：误差传给后面的权重时，传哪一个误差？
+
+GPTQ 的核心是把单次量化误差 (W_i - Q_i) 摊到后续未量化的权重上。
+现在有三种位宽，三个误差。
+
+MatGPTQ 的选择：*算三个位宽的误差平均值，传这个。*
+不带 λ 加权——因为 λ 影响"挑哪个 q"，但补偿应该一视同仁。
+
+这个看似随意的设计，是 paper 默默做的关键工程决定。
+
+** 难点 3：异构位宽的搜索
+
+如果不同层用不同 bit (Mix-and-Match)，理论上可以 Pareto-superior，但搜索空间巨大。
+MatGPTQ 套用 EvoPress（同一组 IST-DASLab 的进化算法）：
+保留一个 parent 配置，每代生成几个 children（某层降位 + 另一层升位以保总预算），评估、保留最好的。
+
+针对 Matryoshka 的特殊性，他们改了一处：原 EvoPress 用固定 step size 切换位宽，
+但 Matryoshka 的搜索空间不均匀（位宽集合是离散的），所以引入 *动态 budget 追踪*，
+允许一次调整多层来凑出合法配置。
+
+** 难点 4：kernel 没人写过
+
+光算法 work 没用，要真在 GPU 上跑出端到端加速，得有支持运行时切片的 CUDA kernel。
+MatGPTQ 写了一套 Ampere 上的 mma.m16n8k16 kernel，把 2-4 bit 范围内的批量解包用 3 个独立缓冲区（一个 2-bit 主体 + 两个 1-bit 增量）实现，
+配合离线权重 reorder 来匹配 TensorCore 的寄存器布局。
+
+结果：LLaMA 3.1 8B 3-bit 推理对比 FP16 拿到接近 *3x* 端到端加速。
+
+* 这之后的事
+
+** Any-Precision LLM (Park 2024) — 反方向
+
+不是从高位切到低位，而是 *从最低位往上加*。
+存一个 2-bit 基础模型，加上若干 "增量 bit"，运行时拼出想要的精度。
+
+优势：低位是 first-class。
+劣势：永远要把所有 bit 都加载进显存，没法只跑想要的位宽；mix-and-match 受限；
+而且它基于 SqueezeLLM 的非均匀聚类量化，不能直接套到 GPTQ/AWQ。
+
+MatGPTQ 在 related work 里把它列为 *正交* 方向：思想路线不同。
+
+** D²MoE (Wang 2025) — 同构想，但只在 MoE 上
+
+把 MatQuant 的嵌套思想用到 MoE 的 expert weights，做不对称 GPTQ：
+每个增量位宽有自己的 scale。
+但局限：只测了 2/3/4 bit，且强绑 MoE 结构。
+
+MatGPTQ 通用，且不限于 MoE。
+
+* 压缩总览
+
+#+begin_src
+论文           | 时间  | 看到的问题                       | 解法                            | 留下的问题
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+Matryoshka Repr| 2022  | 多维度 embedding 要训 N 次       | 训练目标里把多个 prefix         | 只在 embedding，
+Learning       |       |                                  | 同时优化                        | 没人想到搬到权重上
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+GPTQ           | 2022  | RTN 在 4-bit 以下就崩            | Hessian 引导的层级误差补偿      | 只能为单个位宽优化，
+               |       |                                  |                                 | 一份模型一个位宽
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+MatQuant       | 2025  | 部署多种精度要存多份 checkpoint  | 训练时多位宽联合 loss，         | QAT 太贵；闭源；没
+               |       |                                  | 高位切片即低位模型              | kernel；只 {8,4,2}
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+MatGPTQ        | 2026  | MatQuant 的 QAT 落不到地         | 把多位宽目标塞进 GPTQ 骨架      | 浮点 (FP) 嵌套还做
+(target)       |       |                                  | + EvoPress 搜异构 + CUDA kernel | 不了；位宽集合仍受限
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+Any-Precision  | 2024  | 想动态调整精度，从低位升级       | 存 2-bit + 增量，运行时拼装     | 全部 bit 必须在显存
+LLM            |       |                                  |                                 | 里；不兼容 GPTQ/AWQ
+---------------+-------+----------------------------------+---------------------------------+-----------------------
+D^2 MoE        | 2025  | MoE 的 expert 各异，应该按需切   | 不对称 GPTQ，每位宽独立 scale   | 只 MoE，只 2/3/4 bit
+#+end_src
+
+* 这条线背后真正在发生什么
+
+表面：量化算法越做越精细。
+深一层：*模型的"精度"正在从一个静态属性，变成一个运行时维度。*
+
+最早，模型是 FP16，部署也是 FP16。后来 INT8 出现，但它是一份独立的 checkpoint。
+4-bit、3-bit 各做各的，每个精度一份权重，运维负担线性增长。
+
+Matryoshka 这条线在说：*精度不应该是"做哪个版本"的问题，应该是"读多少位"的问题。*
+一份权重，运行时按设备、按负载、按延迟预算切片。
+这是一个 *存储模型的方式* 上的根本转变——从离散版本到连续频谱。
+
+MatGPTQ 做的事是把这个思想从概念（MatQuant）推到默认（PTQ + 开源 + kernel + vLLM）。
+一旦 vLLM 集成进去，一份 8-bit checkpoint 就可以同时服务 3-bit edge 和 8-bit data center，
+这不只是优化，是 *部署架构的重构*。
+
+* 下一步最可能往哪走
+
+1. *FP 的嵌套量化*：当前都是 INT。FP 切位会指数级影响数值（因为 exponent 在 bit 串里），
+   还没人解决。但 FP8、FP4 是趋势，谁先把 Matryoshka 搬到 FP 上谁吃下下一波红利。
+   MatGPTQ 自己在 Discussion 里点了这个方向。
+
+2. *训练-推理协同的 bit 选择*：现在 EvoPress 是离线找异构配置。
+   下一步可能是 runtime adaptive——根据当前负载实时选每层位宽。
+
+3. *嵌套量化 + 嵌套 KV cache*：MatQuant 只解决 weight，但推理瓶颈越来越在 KV cache。
+   类似思路可以套到 KV cache 上，做"按需精度的 attention 内存"。
+
+4. *kernel 生态收编*：MatGPTQ 写了 Ampere kernel，但 Hopper、Blackwell、AMD MI300 都要适配。
+   这是接下来 6-12 个月最容易吃下的工程化坑。
+
+* 一句话回响
+
+一份权重，按需取位——量化从"产物"变"光谱"。
+MatGPTQ 是把这件事做到能上生产线的那一刀。

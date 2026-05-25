@@ -1,0 +1,364 @@
+#+title:      OSCAR: Offline Spectral Covariance-Aware Rotation for 2-bit KV Cache Quantization
+#+date:       [2026-05-25 Mon 06:57]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T065753-en
+#+source:     https://arxiv.org/abs/2605.17757
+#+authors:    Zhongzhu Zhou, Donglin Zhuang, Jisen Li, Ziyan Chen, Shuaiwen Leon Song, Ben Athiwaratkun, Xiaoxia Wu
+#+venue:      arXiv 2026-05 (Together AI / U. Sydney / UIUC)
+
+* The Problem River
+
+The bottleneck for running large-model inference cheaply has long ceased to be
+the model weights — it is the *KV cache*, which grows fatter with every exchange.
+Long conversations, long reasoning chains, long contexts: each additional token
+adds another row to the cache, and generating every new token requires the GPU
+to read the entire cache back from VRAM. Compressing the KV cache is the most
+direct path to cutting costs.
+
+But pushing KV down to *2-bit* (only 4 distinct values per number) is hard.
+The trouble is that KV tensors contain "spikes" — a handful of channels whose
+values are wildly larger than their neighbors, blowing up the entire
+quantization ruler so that every normal value gets crammed into the same few
+bins, and the model collapses. This river is the story of successive researchers
+wrestling with those spikes — first *dodging* them, then *smoothing* them, and
+finally *understanding what attention actually cares about*.
+
+* Source Map
+
+#+begin_example
+[2024-02] KIVI                 First to compress KV to 2-bit
+   |                             Observation: K has per-channel spikes; V does not
+   |                             Fix: quantize K per-channel, V per-token
+   |   Unresolved: spikes not eliminated, only isolated
+   v
+[2024-04] QuaRot               Introduced Hadamard rotation
+   |                             Observation: channel spikes cause INT4 whole-model quantization to fail
+   |                             Fix: rotation matrix spreads spike energy across all channels
+   |   Unresolved: rotation is data-oblivious; no knowledge of which directions matter
+   v
+[2024-05] SpinQuant            Rotation should be learned
+   |                             Observation: fixed Hadamard is suboptimal
+   |                             Fix: treat the rotation matrix as a learnable parameter
+   |   Unresolved: high learning cost, end-to-end fine-tuning; targets 4-bit setting
+   v
+[2025-01] RotateKV             Brings rotation back to 2-bit KV
+   |                             Observation: Hadamard still collapses under INT2 KV
+   |                             Fix: outlier-aware adaptive rotation
+   |   Unresolved: still targets "smoothing KV itself"
+   v
+[2026-05] OSCAR (this paper)   Rotation should align with attention, not with KV
+                                 Observation: attention does not consume K and V directly;
+                                              it consumes QK^T and SV results
+                                 Fix: use Q's covariance to find the rotation for K;
+                                      use SV's covariance to find the rotation for V
+                                 + end-to-end SGLang system integration
+
+    (concurrent / follow-up) HaPPI · KVLinC · Kitty · TurboQuant
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2024-02 | KIVI: The First to Compress KV Cache to 2-bit — and the First to See the Spikes
+
+*** What Problem It Saw
+
+Before KIVI, KV cache quantization used a single scale for the entire tensor —
+either per-token or per-channel. The discovery was that *a few channels of K
+can be tens of times larger than their neighbors*. A single scale means that
+ruler gets blown out by those few channels, and the remaining 99% of values are
+squeezed into only a handful of quantization bins, destroying the information.
+
+*** Its Solution
+
+Treat K and V differently:
+- *K quantized per-channel* — since spikes cluster in particular channels,
+  give each channel its own scale; a large spike stays within its own channel
+  and does not contaminate its neighbors.
+- *V quantized per-token* — V has no such channel-level clustering, so
+  per-row handling is simpler and sufficient.
+
+This was the first time anyone articulated clearly that "K and V are not
+homogeneous": K's trouble lives in the channel dimension; V's does not.
+No training required — applying the scheme directly keeps most accuracy
+at 2-bit.
+
+*** Why It Works (and What Pit It Left)
+
+Per-channel quantization prevents spikes from polluting neighbors. But it
+carries two latent problems:
+
+1. *The spikes themselves are untouched* — they are merely given their own
+   room. Pushing further to 1.x-bit, or performing operations that mix
+   channels, becomes awkward.
+2. *It conflicts with efficient attention kernels* — per-channel quantization
+   disrupts the memory layout that fused kernels like FlashAttention expect.
+
+These two pits became the starting point for QuaRot.
+
+** 2024-04 | QuaRot: Stop Dodging the Spikes — Spread Them Out
+
+*** What Problem It Saw
+
+KIVI's per-channel was a *defensive* strategy, giving spikes their own
+isolation cell. But every layer has KV, every head has its own spike pattern,
+and engineering complexity compounds. More fundamentally, *even per-channel
+cannot save 4-bit or lower* — the ruler for the isolated cell is already too
+coarse.
+
+QuaRot's real insight was: spikes look like spikes only *in a particular basis*.
+Could one change the basis so they no longer stand out?
+
+*** Its Solution
+
+Introduce a *Hadamard rotation* — an orthogonal matrix made of +1 and −1.
+Multiplying K by this matrix is equivalent to "scattering" each K vector
+across all channels. A value of 100 on a single channel becomes
+100/sqrt(128) spread across all 128 channels. *The spike is smeared away
+uniformly.*
+
+The key property: the rotation is orthogonal, so it can be "multiplied back"
+before the attention computation, leaving the math completely equivalent.
+At inference time the only overhead is one matrix multiply; *model behavior
+is unchanged*.
+
+*** Why It Works (and What Pit It Left)
+
+The statistical properties of Hadamard matrices guarantee that no matter how
+skewed the original distribution, after the transform it approaches Gaussian,
+and quantization error is spread evenly. Whole-model 4-bit inference
+(weights + activations + KV) ran successfully for the first time.
+
+But a fundamental question remained: *Hadamard is data-oblivious* — it
+ignores what K looks like, ignores which model you are running, and just
+applies a fixed ±1 pattern. It guarantees "uniform," but not "uniformly
+in the right directions." If some directions are never read by attention,
+spreading error there is wasteful; if some directions are read heavily,
+those should carry higher precision.
+
+** 2024-05 | SpinQuant: If the Rotation Matters, Learn It
+
+*** What Problem It Saw
+
+QuaRot settled the question of "rotation or no rotation." SpinQuant asked
+"which rotation is best?" Hadamard is a clever initialization, but applying
+the same ±1 pattern to every model, every layer, every head is *obviously
+suboptimal*.
+
+*** Its Solution
+
+Treat the rotation matrix as a *learnable parameter* — optimize it on the
+Stiefel manifold (the set of orthogonal matrices) using a small calibration
+dataset, with the objective of making quantized outputs as close as possible
+to the original. The learned rotation beats Hadamard by several points on
+average.
+
+*** Why It Works (and What Pit It Left)
+
+A learned rotation adapts to the actual distribution of each layer and
+naturally outperforms a fixed matrix. The cost, however, is:
+
+1. *Training overhead* — Stiefel manifold optimization is not cheap; every
+   model requires a fresh run.
+2. *The objective is "reconstruct KV"* — the loss measures how far quant(K)
+   is from K. But is that really what attention cares about?
+
+SpinQuant was mainly applied to 4-bit weight quantization. Porting it
+directly to 2-bit KV causes it to break down.
+
+** 2025-01 | RotateKV: Bringing Rotation Back to the 2-bit KV Front
+
+*** What Problem It Saw
+
+SpinQuant's optimization pipeline was too heavy, and 4-bit KV was already
+adequate for most uses, so the rotation line drifted away from the 2-bit
+battlefield for a while. But the hard nut of 2-bit KV remained —
+*KIVI's per-channel begins to shake at INT2, and Hadamard at INT2 KV
+simply collapses*.
+
+RotateKV returned to 2-bit KV: at this extreme compression, Hadamard's
+"mindless spreading" is insufficient, because INT2 has only 4 bins and
+any waste is fatal.
+
+*** Its Solution
+
+*Outlier-aware adaptive rotations* — based on the per-layer distribution of
+outliers, locally adjust the Hadamard rotation. Rather than learning a single
+matrix for the whole model, it *fine-tunes per layer and per head*, applying
+more pressure in the directions where spikes concentrate.
+
+*** Why It Works (and What Pit It Left)
+
+Accuracy at 2-bit KV improves noticeably over QuaRot. But the underlying
+worldview is still that of KIVI and QuaRot: *the goal remains smoothing the
+distribution of KV itself*. RotateKV pushes "eliminating spikes" to the limit
+without asking: *after smoothing, is attention actually more accurate?*
+
+That is precisely OSCAR's entry point.
+
+** 2026-05 | OSCAR: Never Mind What KV Looks Like — Look at What Attention Is Reading
+
+*** What Problem It Saw
+
+OSCAR's table-thumping insight:
+
+#+begin_quote
+"attention does not consume K and V through their Euclidean reconstruction errors"
+#+end_quote
+
+Attention never directly consumes K and V. It consumes ~Q · K^T~
+(attention scores) and ~S · V~ (the weighted-sum output). Every preceding
+method minimized ~||K - quant(K)||~, but that error and the attention output
+error are *two different things*.
+
+Specifically, the downstream error caused by K is
+~tr((K - K_hat) · Q^T·Q · (K - K_hat)^T)~.
+*The key factor is Q^T·Q* — not K^T·K. This means: wherever Q repeatedly
+reads, K must be precise in those directions; wherever Q never reads, K can
+afford to be coarser there. The error on V is analogously weighted by
+~S^T·S~.
+
+*** Its Solution
+
+Encode this insight directly into the rotation matrices:
+
+1. *Rotation for Key*: collect a small calibration batch, compute Q's
+   covariance ~C_Q = (1/N) Σ q^T·q~, perform the eigen-decomposition
+   ~C_Q = U_Q · Λ · U_Q^T~, and use *U_Q as the rotation for K*.
+   The rotated coordinate axes then align with the directions Q cares about.
+
+2. *Rotation for Value*: compute ~C_S = (1/N) V^T·S^T·S·V~,
+   eigen-decompose to obtain ~U_S~, and use it as the rotation for V.
+
+3. Finally stack a Hadamard and a bit-reversal permutation on top to
+   further uniformize: ~R_K = U_Q · H · P_br~, ~R_V = U_S · H · P_br~.
+
+The paper proves theoretically that, under the assumption of diagonal
+residual covariance, this choice is *optimal* (minimizes the lower bound on
+attention output error).
+
+And crucially — all of this is computed *offline*. At inference time, KV
+simply incurs one extra multiply by a fixed matrix before quantization.
+The method is fully compatible with paged attention, SGLang, and
+FlashAttention, and is genuinely deployable.
+
+*** Why It Works (and What Pit It Left)
+
+The results are striking: on Qwen3-4B-Thinking, Qwen3-8B, Qwen3-32B, and
+GLM-4.7 (358B), INT2 KV loses almost nothing (gaps of 1–4 points), while
+naïve rotated INT2 collapses to near zero. Long-context RULER-NIAH at 128K
+also holds steady. On the system side, *KV memory is reduced by 8×, and
+throughput improves by up to 7×*.
+
+Open questions left behind:
+
+1. *Calibration data dependence* — computing ~C_Q~ and ~C_S~ requires a
+   representative batch; query patterns that lie outside that distribution
+   may degrade the rotation.
+2. *New architectures such as MoE / MLA* — OSCAR assumes standard MHA / GQA;
+   adapting to MLA and other novel attention designs remains to be done.
+3. *1-bit or lower?* — 2-bit is close to the ceiling of scalar quantization;
+   going further may require vector quantization, low-rank decomposition,
+   or abandoning quantization altogether.
+
+* Frontier Extensions
+
+While OSCAR was appearing, the river kept branching:
+
+- *HaPPI* (Kim 2025b): Very close in spirit to OSCAR — Hadamard PCA via power
+  iteration, also a "covariance-driven rotation." Best understood as an
+  independent arrival at the same insight during the same period.
+- *KVLinC* (Saxena 2025): Hadamard rotation plus linear error correction.
+  An alternative path: after rotation, acknowledge that residual error remains
+  and add a lightweight correction layer to recover it.
+- *Kitty* (Xia 2025): A sister work from the same team (Together AI).
+  *Dynamic per-channel precision boosting* — temporarily raising precision
+  for important channels. Complementary to OSCAR: Kitty cuts along the
+  precision dimension, OSCAR cuts along the rotation dimension.
+- *TurboQuant* (Zandieh 2025): Online vector quantization, stepping outside
+  the scalar quantization framework and pushing in a deeper direction.
+
+* One Diagram
+
+#+begin_example
+              "What do we do about the spikes?"
+                  |
+                  v
+   +-------------------+----------------+----------------+
+   |    Dodge them     |   Spread them  |  Be strategic  |
+   |                   |                |                |
+[KIVI]            [QuaRot]         [SpinQuant]      [OSCAR]
+2024-02            2024-04           2024-05         2026-05
+per-channel K      Hadamard          learned R       attention-aware R
+per-token V        (data-oblivious)  (target: recon. KV) (Q covariance / SV covariance)
+                       |
+                       v
+                  [RotateKV]
+                   2025-01
+                  outlier-aware
+                  adaptive rotation
+                  (still targets KV reconstruction)
+
+Time ---------------------------------------------------------->
+
+Evolution of the precision objective:
+  KV reconstruction              attention output
+  ||K - quant(K)||  ---------->  ||QK - Q·quant(K)||
+  (KIVI / QuaRot / RotateKV)     (OSCAR)
+
+Evolution of the rotation:
+  none -> Hadamard (fixed) -> learned (fine-tuned) -> spectral (covariance eigenvectors)
+
+Bit-width:
+  4-bit (QuaRot) ----> 2-bit whole-model (RotateKV / OSCAR)
+#+end_example
+
+* Insight
+
+The deepest punch from reading this line is: *for two full years, everyone
+was optimizing the wrong objective function*.
+
+KIVI, QuaRot, SpinQuant, RotateKV — every method's loss looked the same:
+"make the quantized KV close to the original KV." This sounds obvious —
+quantization means reconstruction, right?
+
+But OSCAR points out: the model never sees KV directly; it sees the
+*attention output*. KV reconstruction error ≠ attention output error. At
+4-bit, the slack is wide enough that the two are highly correlated and nobody
+noticed the gap. At 2-bit, with only 4 quantization bins and an extremely
+tight error budget, the cost of "targeting the wrong objective" becomes visible.
+
+This is a story about *task alignment*. It is not a technical leap —
+nothing between KIVI and OSCAR required new mathematics; eigen-decomposition,
+Hadamard transforms, and PCA are all decades-old tools. The shift was a
+*change in perspective*: from "quantize KV" to "quantize the directions that
+attention actually consumes."
+
+Where does the river go next? Three branches:
+
+1. *Finer task alignment* — not just attention output, but logits, loss, and
+   downstream task metrics. Can the rotation be derived directly by
+   back-propagating through the task loss?
+2. *Dynamic rather than static* — OSCAR's rotation is fixed offline. If
+   different prompts induce different ~C_Q~ distributions, is an *online
+   adaptive* rotation needed? (TurboQuant is already exploring this.)
+3. *Beyond scalar quantization* — 2-bit is close to the ceiling of scalar
+   quantization; going lower requires vector quantization, product
+   quantization, or abandoning quantization in favor of low-rank methods.
+
+* Takeaway
+
+What this river teaches about *how to find problems*:
+
+*Watch the loss, not the metric*. Everyone reports "quantization error
+reduced by 30%," but that number does not determine how well the model
+actually works. OSCAR's entire story begins from a single line of algebra:
+~||QK - Q·K_hat||^2 = tr((K-K_hat)·Q^T·Q·(K-K_hat)^T)~. Once you see
+that ~Q^T·Q~ sitting there, you cannot unsee it — it is telling you plainly
+that "K's error should be weighted by Q's covariance." Yet for two years
+nobody wrote it down, because everyone was blocked by the inertia of
+"quantization means reconstruction."
+
+The implication: *in any field where a proxy objective has become standard,
+you can expand the downstream loss and look at who is weighting whom inside
+it*. The gap between the proxy objective and the true objective is,
+more often than not, a paper.

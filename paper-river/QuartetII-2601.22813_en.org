@@ -1,0 +1,354 @@
+#+title:      Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+#+date:       [2026-05-25 Mon 06:27]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T062701-en
+#+source:     https://arxiv.org/abs/2601.22813
+#+authors:    Andrei Panferov, Erik Schultheis, Soroush Tabesh, Dan Alistarh
+#+venue:      arXiv preprint, Jan 2026 (IST Austria, ICML submission)
+
+* The River of the Problem
+
+To compress a large model's forward pass, backward pass, and gradients all the way down to 4-bit training, you must solve two independent hard problems:
+1. *Forward pass*: how to lose as little as possible — minimizing the quantization error (MSE) of weights and activations
+2. *Backward pass*: how to avoid divergence — making the gradient estimate *unbiased* (a biased gradient will slowly steer training off course over thousands of steps)
+
+This river is about the evolution of *the second problem*. The forward-pass story lives in a separate river (see the FourOverSix entry).
+
+Why has "unbiased gradients" drawn generation after generation of researchers? Because *unbiased* and *low variance* are natural enemies. Rounding a floating-point number to 4 bits gives you two choices: round-to-nearest (RTN, low variance but biased), or stochastic rounding (SR, unbiased but high variance). At the extreme precision of 4 bits, SR's variance is large enough to drown the training signal; yet RTN's systematic bias accumulates into catastrophe over long training runs. A decade of work — from BinaryConnect first introducing SR into neural-network training, to the distributed-SGD community discovering that a rotation matrix can halve the variance of an unbiased estimator (QSGD, EDEN), to the LLM quantization-training community importing these weapons — has been a sustained campaign against the same enemy: *how to squeeze out variance while preserving unbiasedness*.
+
+Quartet II is the latest step in this river. It uncovers a surprising fact: the *element-wise stochastic rounding (SR)* that everyone has used for ten years — placing randomness on each individual FP4 value — is not the ceiling for unbiased estimation. If you move the randomness *from the value to the scale*, variance drops by more than half.
+
+* Source Map
+
+#+begin_example
+[2015] Courbariaux et al. - BinaryConnect
+  |
+  | Problem: 1-bit training collapses with straight rounding
+  | Solution: Introduce stochastic rounding (SR) — round probabilistically
+  |           by distance; expectation is unbiased
+  v
+[2017] Alistarh et al. - QSGD  &  Suresh et al. - Stochastic Rotated Quantization
+  |
+  | Problem: Distributed SGD chokes on communication bandwidth;
+  |           how to preserve convergence after quantizing gradients
+  | Insight: A formally unbiased quantizer is the key to guaranteed SGD convergence
+  | Solution: SR gives unbiasedness but high variance; Suresh finds RHT
+  |           rotation before quantization reduces variance
+  v
+[2022] Vargaftik et al. - EDEN
+  |
+  | Problem: SR variance explodes at low bit-width; Suresh's rotation
+  |           has low variance but is biased
+  | Solution: Rotation + a "scale correction factor S" to restore unbiasedness
+  |           S = <x,x> / <Rx, Q(Rx)>, a single floating-point number
+  |           Result: variance halved vs. SR, strictly unbiased (as dim → ∞)
+  v
+[2023] Xi et al. - INT4 Training (Jetfire)
+  |
+  | Problem: How to actually push LLM training to 4 bits end-to-end
+  | Solution: INT4 + per-tensor SR + Hadamard rotation preprocessing
+  | Open issue: INT4's uniform step size is ill-suited for neural networks'
+  |             heavy-tailed distributions
+  v
+[2024] Chmiel et al. - INT4 training continued
+  |
+  | Problem: Large-model INT4 training still unstable
+  | Solution: Finer scaling + more careful outlier handling
+  v
+[2025] Tseng et al. - Backward pass only in MXFP4
+  |
+  | Problem: Going fully FP4 from the start is too aggressive; test waters
+  |           in the backward pass first
+  | Solution: Use MXFP4 only in the backward pass, paired with element-wise SR
+  | Finding: Microscaling format + SR stabilises the backward pass,
+  |           but accuracy still trails BF16
+  v
+[2025] Castro et al. - Quartet (MXFP4)  +  Chmiel et al. - FP4 All the Way
+  |
+  | Problem: Forward + backward both in FP4 simultaneously — how to avoid divergence
+  | Solution: SR + Hadamard rotation + MSE-optimal clipping (Castro, MXFP4)
+  |           SR + selective SR (Chmiel, NVFP4)
+  | Consensus: SR is "the only choice for unbiased estimation" — later
+  |            overturned by Quartet II
+  v
+[2025] NVIDIA et al. - Large-scale NVFP4 training recipe
+  |
+  | Problem: Industrialise the above ideas; run a 12B model for 12T tokens
+  | Solution: Square-block quantization + backward RHT + some layers kept
+  |           at high precision
+  | Open issue: Still relies on element-wise SR; visible gap vs. BF16
+  v
+[2025] Chen et al. - TetraJet-v2  +  Cook et al. - FourOverSix
+  |
+  | TetraJet-v2: Stability patches on the NVIDIA recipe (outlier control,
+  |              oscillation suppression)
+  | FourOverSix: Adaptively choose a scale of 4 or 6 per block in the
+  |              forward pass, dramatically reducing forward MSE
+  | Common thread: Both still use element-wise SR in the backward pass —
+  |                nobody had thought to question SR
+  v
+[2026] Panferov et al. - Quartet II  <-- this paper
+  |
+  | Core question: Is element-wise SR really the only option for the backward pass?
+  | Key finding: Moving randomness from the FP4 *value* to the FP8 *scale*
+  |              cuts variance by more than half
+  | Solution: MS-EDEN — a microscaling adaptation of EDEN
+  |           i.e., apply EDEN's "scale correction" idea, but absorb the
+  |           correction directly into the FP8 scale itself
+  | Combined: Forward pass uses FourOverSix; backward uses MS-EDEN → Quartet II
+#+end_example
+
+* Evolutionary Narrative
+
+** 2015 | BinaryConnect: Stochastic Rounding Takes the Stage
+
+*** What Problem It Saw
+
+Courbariaux wanted to compress neural-network weights to *1 bit* — only +1 and −1. With the conventional round-to-nearest approach (RTN), the backpropagation gradient signal almost entirely vanishes: 0.3 and 0.29 both round to +1, making them indistinguishable. The update direction collapses to a handful of fixed vectors, and training grinds to a halt.
+
+*** Its Solution
+
+Introduce *Stochastic Rounding (SR)*. Instead of deterministically rounding 0.3 to +1, flip a weighted coin: 70% probability of −1, 30% of +1. The expectation is still 0.3, *but each draw is random*. Feeding this randomness into the gradient lets the backward pass distinguish 0.3 from 0.29, and training can proceed.
+
+*** Why It Worked (and What Hole It Left)
+
+SR was the first systematic introduction of *unbiasedness* into low-precision training. Its essence: *trade variance for information*. RTN is biased but deterministic; SR is unbiased but jittery on every step.
+
+The hole it left: how large is that variance? BinaryConnect worked at small scale, but as the bit-width climbed (1 → 4 → 8), the variance–precision trade-off curve started to deform. Nobody asked systematically: *can we keep the unbiasedness while compressing the variance further?*
+
+** 2017 | QSGD & Rotated Quantization: Distributed Optimization Formalises the Problem
+
+*** What Problem It Saw
+
+The story now branches into another direction — *distributed SGD*. When a model is split across hundreds of machines, every gradient must be transmitted between them at each step, and communication bandwidth becomes the bottleneck. Could gradients be quantized to a few bits before transmission?
+
+Alistarh et al. formalised this mathematically: if the quantized gradient estimate is *unbiased* and has bounded variance, SGD convergence slows but does not break. If it is biased, divergence is possible. This insight later flowed back into quantization-aware training — the equation *unbiased = safe* was established right here.
+
+*** Its Solution
+
+QSGD: stochastic rounding onto a discrete set of levels, with a proven convergence bound tied directly to variance.
+
+Suresh's concurrent work went further: before quantizing, apply a *random orthogonal transform* (e.g., a Hadamard matrix) to rotate the vector. After rotation, energy is spread evenly across all dimensions, *outliers vanish automatically*, and quantization variance drops.
+
+*** Why It Worked (and What Hole It Left)
+
+This was the first recognition that *the variance of a quantizer can be controlled by rearranging the input before quantization*. Hadamard rotation and quantization became a two-punch combination.
+
+The hole: Suresh's rotated quantization scheme *is biased*. Its variance is small, but the expectation drifts slightly. The distributed-SGD community spent the next five years on the same question: can we construct an estimator that is *both unbiased and low-variance*?
+
+** 2022 | EDEN: Rotation + Correction Factor, First to Have Both
+
+*** What Problem It Saw
+
+Vargaftik saw that Suresh's route (rotate then quantize) genuinely reduces variance — but introduces genuine bias. How do you correct that bias back out?
+
+More precisely: the quantized vector ~Q(Rx)~ after rotation has an expectation that does not strictly equal ~Rx~; it is off by a scalar factor. If that factor can be *computed exactly*, multiplying it back in restores unbiasedness.
+
+*** Its Solution
+
+EDEN derived the closed form of the correction factor S:
+
+#+begin_example
+       <x, x>
+S = -----------------
+    <Rx, Q(Rx)>
+#+end_example
+
+The geometric meaning: project ~Q(Rx)~ onto the direction of ~Rx~ so that the projected length equals the norm of ~x~ itself. After multiplication by S, the expectation of ~S * Q(Rx)~ along ~x~ is exactly ~x~ (exact in high dimensions, asymptotically exact in low dimensions).
+
+Numerically: at block size d=64, S already stably falls in [0.94, 1.06] — virtually indistinguishable from the d→∞ limit.
+
+*** Why It Worked (and What Hole It Left)
+
+EDEN did two things:
+1. Used Hadamard rotation to compress variance (inherited from Suresh)
+2. Used the analytic S to eliminate bias (its own contribution)
+
+Net result: variance halved relative to SR, strictly unbiased. For a time it was the gold standard in distributed optimisation.
+
+The hole (the most critical foreshadowing): S is a *plain floating-point number*, requiring FP16 or FP32 storage. In distributed SGD this is no issue — sending a few extra bytes of S per worker is trivial. But if you want to transplant EDEN into a *hardware-constrained microscaling format* (NVFP4's scale is FP8 E4M3, whose minimum relative adjustment step is ×1.0625), S simply cannot fit. The discrete grid of FP8 is coarser than S's actual fluctuation range [0.94, 1.06].
+
+This foreshadowing would wait four years before anyone punctured it.
+
+** 2023–2024 | Xi & Chmiel: SR Enters LLM Training
+
+*** What Problem It Saw
+
+LLM training costs exploded, and the two earlier threads — BinaryConnect's SR and EDEN's rotation-plus-correction — were finally taken seriously for LLM training. Xi et al.'s Jetfire was among the first attempts to train LLMs end-to-end in INT4.
+
+*** Its Solution
+
+INT4 quantization + per-tensor SR + Hadamard rotation preprocessing. SR preserves backward-pass unbiasedness; Hadamard disperses outliers and reduces the dynamic range before quantization. EDEN's "correction factor" trick *was not imported* — the focus was on forward-pass MSE, and SR alone seemed sufficient for stable gradients.
+
+Chmiel then extended INT4 training to larger scales with more refined outlier handling.
+
+*** Why It Worked (and What Hole It Left)
+
+It proved that 4-bit backward training is in principle feasible for LLMs. But INT4's uniform step size is poorly suited to the *heavy-tailed distributions* of neural-network weights and activations — with only 16 levels, uniform spacing wastes representational capacity on rarely-occurring large values. The next generation would shift to FP4 (E2M1), with denser steps near zero and coarser steps near 6.
+
+** 2025 | Tseng & Castro & Chmiel: The Microscaling FP4 Era Opens
+
+*** What Problem It Saw
+
+Hardware arrived: NVIDIA Blackwell natively supports MXFP4 and NVFP4 — one FP8 scale shared across every 16 or 32 FP4 values. But fully compressing training to FP4 all at once remained unstable.
+
+*** Its Solution
+
+Three groups converged on "safe recipes" almost simultaneously:
+- *Tseng et al.* first isolated the backward pass in MXFP4, proving that microscaling + SR could be stable.
+- *Castro et al. (Quartet I)* went fully MXFP4: SR + Hadamard + MSE-optimal clipping.
+- *Chmiel et al.* went fully NVFP4: SR + selective SR + cautious RTN.
+
+*An emerging consensus*: to keep the backward pass stable, *element-wise SR is required*. Every one of these methods tacitly assumed this was the only viable unbiased estimator.
+
+*** Why It Worked (and What Hole It Left)
+
+They solved the "can it run at all" question; loss could be brought close to BF16. But a *visible gap vs. BF16 remained*. Where did this gap come from? Nobody dug deep — the default assumption was that 4-bit representational capacity was to blame, nothing to do with SR.
+
+The hole: *"Element-wise SR is the only choice for unbiased estimation" became an untested consensus.* The next four papers all added patches within this framework; nobody went back to challenge the premise.
+
+** 2025 | NVIDIA NVFP4 Recipe + TetraJet-v2 + FourOverSix: Patching Inside the Consensus
+
+*** What Problem It Saw
+
+- *NVIDIA large-scale recipe*: industrialise the above ideas to run a 12B model for 12T tokens. They used square-block quantization, backward RHT, and left some layers at high precision. But they still relied on element-wise SR.
+- *TetraJet-v2 (Chen)*: the NVIDIA recipe still exhibited numerical oscillations, requiring outlier control and oscillation suppression as stability patches.
+- *FourOverSix (Cook)*: should the forward-pass scale contract to 6 or to 4? Choose adaptively per block; forward-pass MSE drops dramatically.
+
+*** Its Solution
+
+Each group applied its own patch, but *all continued to use element-wise SR in the backward pass*. FourOverSix only touched the forward pass; TetraJet-v2 addressed numerical stability without touching SR's variance.
+
+*** Why It Worked (and What Hole It Left)
+
+The forward pass kept improving, but *the gap to BF16 did not close*. This pushed the tension onto the backward pass — since forward MSE had been driven very low, the remaining gap almost certainly came from the variance of the backward gradient.
+
+That is exactly where Quartet II picks up.
+
+** 2026 | Quartet II: Moving Randomness from Values to Scale
+
+*** What Problem It Saw
+
+Panferov's team went back and scrutinised element-wise SR: each FP4 value is independently rounded with some probability — seemingly reasonable, since each value is unbiased and the whole is therefore unbiased. But *what about the variance*? SR's per-value rounding variance is (Δ/2)², where Δ is the gap between adjacent FP4 levels. In the high-value end of FP4, Δ=2, giving variance 1. Summed across a block of 16 values, the variance is substantial.
+
+The more critical insight: *the EDEN route could actually come to the rescue*. EDEN's Hadamard rotation plus correction factor S halves the variance while remaining unbiased — exactly what is needed. But *EDEN's S is a plain floating-point number that cannot fit into NVFP4's FP8 scale* — the minimum adjustable step is ×1.0625, coarser than S's actual fluctuation range [0.94, 1.06].
+
+Castro had noticed this exact point in his MXFP4 paper — and then abandoned the EDEN route.
+
+*** Its Solution
+
+The core trick of Quartet II: *do not treat S as a separate correction factor; absorb S's effect directly into the FP8 scale itself*.
+
+How MS-EDEN works concretely:
+1. Given input vector x, first apply a Hadamard rotation Rx
+2. When computing the FP8 scale, *do not use the deterministic max/range formula*; instead, stochastically draw from two adjacent FP8 values such that the sampled scale is *itself unbiased*
+3. Given this random scale, quantize the FP4 values with *deterministic RTN* (no more SR on the values)
+4. Mathematically proven: this combination is strictly unbiased within the microscaling framework (exact asymptotically in high dimension), with variance more than half that of element-wise SR
+
+The key is step 2: *the location of the randomness has changed*. Before, every value jittered independently (variances accumulate); now, 16 values share one jittered scale (variance is amortised).
+
+An additional small modification: adding a randomized block rotation along the "inner dimension" (reduction dimension) of the backward pass further reduces variance.
+
+Combining the forward pass (FourOverSix's "choose 4 or 6") with the backward pass (MS-EDEN) yields the complete computation graph of Quartet II.
+
+*** Why It Worked (and What New Questions It Leaves)
+
+Intuitive explanation: SR's variance comes from each value jittering independently, then summing. MS-EDEN uses one shared random scale — swapping 16 independent jitters for 1 shared jitter. Variance collapses from √n-scaling to a constant (statistically speaking: 16 independent quantization errors vs. one correlated error shared by all 16 through the scale).
+
+Empirically:
+- MSE is less than half that of SR
+- In end-to-end training of a 1.9B model over 38B tokens, loss visibly improves over the NVIDIA NVFP4 recipe
+- On a Blackwell custom kernel, runs 4.2× faster than BF16
+
+New open questions:
+1. MS-EDEN's unbiasedness is *asymptotic* (exact in high dimension, approximate in low). Is block size = 16 truly "high enough"? The paper validates this, but what about smaller blocks?
+2. Can the idea of "randomizing the scale" generalise to other microscaling formats (MXFP4, MXFP8)? In principle yes, but MXFP4's E8M0 scale has even worse discretisation — can that be remedied?
+3. The forward pass continues to use FourOverSix's "4 or 6", which is itself biased (it optimises MSE, not unbiasedness). Will a biased forward pass combined with an unbiased backward pass cause problems in long training runs? The paper argues no, but the argument rests on the assumption that forward-pass bias and the backward pass are independent.
+
+* Frontier Extensions
+
+** 2026 (anticipated) | Bringing MS-EDEN to Inference Quantization
+
+EDEN was originally designed for communication optimisation; Quartet II is the first to bring it into *training*. The natural next step: can it be transplanted into *inference* quantization? The bottleneck in inference quantization differs from training — unbiased gradients are irrelevant, but forward-pass MSE must be minimised. The "random scale + deterministic RTN" combination in MS-EDEN actually introduces noise if applied naively to inference, so *the approach would have to be inverted* — but nobody has written down how yet.
+
+** 2026 (anticipated) | The Limiting Case of Block Size = 1
+
+If block size shrinks to 1 (one scale per value), MS-EDEN degenerates to element-wise SR. At block size 16 (NVFP4), variance drops by half. What about block size 64? 128? There should be a "variance vs. bit-cost" trade-off curve along this axis — nobody has plotted it.
+
+** Current Assessment
+
+This river now has its first non-SR unbiased low-variance estimator; *the consensus has been overturned*. The years 2026–27 will most likely see a wave of work "re-examining backward-pass microscaling quantization," applying the new MS-EDEN tool to MXFP4, INT4, mixed-granularity, and other settings.
+
+* One Diagram to Understand It All
+
+#+begin_example
+              A Decade of Struggle over Unbiased Backward Gradient Estimation
+              =================================================================
+
+Year   |  Representative Method   |  Key technique for the unbiased estimator
+-------+-------------------------+------------------------------------------
+2015   |  BinaryConnect          |  SR (each value rounded probabilistically)
+       |                         |    Unbiased: yes    Variance: large but
+       |                         |    1-bit training can tolerate it
+       |                         |                              |
+2017   |  QSGD / Suresh          |  Formalise unbiased SGD; rotated quantization
+       |                         |    QSGD: SR over k levels, unbiased bounded var
+       |                         |    Suresh: RHT + quantization, low var but biased
+       |                         |                              |
+2022   |  EDEN                   |  RHT + correction factor S
+       |                         |    Unbiased: yes (asymptotic)  Var: halved vs SR
+       |                         |    Fatal constraint: S requires high-precision storage
+       |                         |                              |
+2023   |  Xi / Jetfire INT4      |  per-tensor SR + Hadamard
+       |                         |    EDEN not imported (nobody thought to)
+       |                         |                              |
+2025   |  Tseng / Castro /       |  Microscaling FP4 + element-wise SR
+       |  Chmiel                 |    "SR is the only unbiased choice" becomes consensus
+       |                         |    Castro: noticed S won't fit NVFP4 scale; dropped it
+       |                         |                              |
+2025   |  NVIDIA NVFP4 +         |  Patches on top of the SR consensus
+       |  TetraJet-v2 +          |    NVIDIA: industrialise + RHT
+       |  FourOverSix            |    TetraJet-v2: outlier control
+       |                         |    FourOverSix: forward scale 4 or 6
+       |                         |    Nobody questioned backward SR
+       |                         |                              |
+2026   |  Quartet II             |  MS-EDEN: move randomness from value to scale
+       |   (this paper)          |    Unbiased: yes (asymptotic)  Var: < SR/2
+       |                         |    Key insight: absorb EDEN's S into the FP8 scale
+       |                         |    Engineering: Blackwell kernel 4.2× vs BF16
+
+
+Core pattern: every generation does the same thing — squeeze out variance
+              under the "unbiased" constraint
+        BinaryConnect gave the paradigm "unbiased = SR"
+        EDEN showed "unbiased = SR" is not the only answer
+              (but couldn't be mapped onto hardware formats)
+        Quartet II is the first to truly land EDEN's idea on microscaling hardware
+        Mechanism: let the *scale itself* carry the randomness,
+                   rather than the *values*
+
+Future ?: Joint optimisation of scale randomisation + value randomisation?
+          Cross-block correlated randomness?
+#+end_example
+
+* Insights
+
+Reading this river from source to front, three things stand out:
+
+1. *Consensus may be the biggest blind spot*. From 2023 to 2025 the entire NVFP4 training community assumed "element-wise SR is the only unbiased option." Castro even explicitly noted in 2025 that EDEN's correction factor cannot fit into NVFP4's FP8 scale — and everyone took that as the end of the road. Quartet II's entire contribution is not a new tool (EDEN had been sitting there for four years) but rather *going back to interrogate that consensus*: does the randomness have to live on the values? Why not on the scale? And placing it on the scale *happens to exploit* the discrete nature of the FP8 scale itself.
+
+2. *Hardware constraints force cleverer algorithms*. EDEN's S is a plain float — convenient in distributed optimisation but incompatible with NVFP4's FP8 scale. In an earlier era this would simply mean "the algorithm can't work here." Quartet II inverts the framing: since the discreteness of the scale is a constraint, *thread the randomness through that constraint* — randomise the scale itself, and the constraint becomes the carrier of unbiasedness. This is an elegant reversal: the constraint is not the enemy; it is an information bottleneck that forces you to place randomness in the most economical position.
+
+3. *Cross-field knowledge transfer has a five-to-ten-year lag*. EDEN was published in 2022 in the distributed-optimisation literature; it was not transplanted into LLM training until 2026. In between, the LLM quantization-training community kept using the more primitive element-wise SR. The two communities use identical mathematics (unbiased estimation, variance analysis) but publish in different venues and use different terminology — neither could see the other. Quartet II's lead author, Alistarh, is himself the first author of QSGD in 2017 — *he is one of the rare people who straddle both communities*. This "cross-community translation" role is often rarer and more valuable than pure algorithmic novelty.
+
+* Takeaways
+
+This river offers three concrete lessons for how to do research:
+
+1. *Whenever a paper uses a "prior solution" phrase, look at exactly what it defines as the prior solution.* All of Quartet II rests on observing that everyone treats "element-wise SR" as the prior solution. If you can produce a *different* prior solution, you immediately have a new paper. This kind of "consensus archaeology" is often more valuable than continued optimisation within the consensus.
+
+2. *Constraint-driven innovation outperforms unconstrained invention.* Quartet II did not invent a new quantization principle; it took EDEN — a ten-year-old tool — and forced it into the new NVFP4 hardware format. It didn't fit, so the authors found the trick of "absorbing S into the scale." Almost every interesting engineering breakthrough follows this pattern: *take an old tool, cram it into a new constraint, and see what gets squeezed out*.
+
+3. *Straddling two adjacent but isolated communities makes your perspective valuable.* Distributed optimisation and LLM quantization training share the same mathematics but are entirely separate groups of people. Because Alistarh publishes actively in both, he could see the connection between EDEN and NVFP4. *If you feel you have exhausted a sub-field you have lived in for a long time, spend six months in the neighbouring field*; when you return you will find a pile of "obvious" connections that nobody else can see.
+
+In practice this means: pick a sub-field you follow closely, list its "default assumptions," then go to the neighbouring field and search for tools that break each of those assumptions — that is where the next Quartet II is waiting.

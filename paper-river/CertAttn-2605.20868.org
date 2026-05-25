@@ -1,0 +1,247 @@
+#+title:      Runtime-Certified Bounded-Error Quantized Attention
+#+date:       [2026-05-25 Mon 07:23]
+#+filetags:   :paper:river:
+#+identifier: 20260525T072316
+#+source:     https://arxiv.org/abs/2605.20868
+#+authors:    Dean Calver
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* 问题之河
+
+长上下文推理时，KV cache 把 GPU 显存和带宽吃光了——128K 上下文的 LLaMA-3.1-8B，KV 占 17GB，每解一个 token 都要把整个 cache 重新读一遍。把它压缩（INT8、INT4）能把成本砍掉一半到四分之三，但压缩会引入误差，没人能在运行时告诉你"这一步出问题了"。
+
+这条线上的所有人一直在做同一件事：把 KV 压得更小。从来没人做过另一件事：在运行时给出一个"这一步我能保证误差在某个范围内"的凭据，并且在凭据出问题时能拉一根保险绳把精度找回来。CertAttn 是第一个说"压缩不该是赌博，应该是带回执的计算"的工作。
+
+* 溯源地图
+
+#+begin_example
+[2022] Dao et al. - FlashAttention
+  |
+  | 看到了什么: 注意力的瓶颈不在算力，在显存读写
+  | 怎么办: 用 IO-aware 的方式分块算，softmax 不落地
+  | 留了什么坑: 自回归解码时 KV cache 还是要被反复读，N 越长越炸
+  v
+[2023] Kwon et al. - PagedAttention (vLLM)
+  |
+  | 看到了什么: KV cache 被预分配成大块，碎片严重，并发上不去
+  | 怎么办: 把 KV 切成等大 page，按需分配，像 OS 管内存一样管它
+  | 留了什么坑: 内存能省下来，但单条序列的 KV 体积本身没动
+  v
+[2023] Zhang et al. - H2O
+  |
+  | 看到了什么: 每个 token 的 KV 都同等重要吗？不是。注意力分布极不均
+  | 怎么办: 找出 heavy-hitter tokens，把其余的从 cache 里赶走
+  | 留了什么坑: 赶错了就丢信息；选谁留谁靠启发式，没人能给保证
+  v
+[2024] Liu et al. - KIVI
+  |
+  | 看到了什么: 与其全删掉，不如全留下但压低精度
+  | 怎么办: 发现 K 和 V 的数值分布不一样——K 的离群点在通道维度，V 在 token 维度
+  |         所以 K 按通道量化，V 按 token 量化，tuning-free 做到 2-bit
+  | 留了什么坑: 仍然是经验性验证——平均不出事不等于每一步都不出事
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | 看到了什么: KIVI 的 per-token K 量化在 RoPE 之后还是会被通道异常值毁掉
+  | 怎么办: 把 K 的量化彻底搬到 per-channel；配合非均匀量化做到 4-bit 以下
+  | 留了什么坑: 已经把 KV 压到接近极限了，但仍然没人能在单步上给凭证；
+  |             出错了只能事后看 perplexity
+  v
+[2026] Calver - CertAttn (本文)
+
+  看到了什么: 整个 KV 压缩流派的盲点——"平均误差小" != "每一步都安全"
+  怎么办: 双层存储（VRAM 压缩版 + RAM FP16 原件）+ 两项误差分解
+          + 每步、每头计算误差上界 + 四级 fallback 阶梯（最坏退回 FP16 算）
+  本质转向: 把 KV 量化从"固定近似"重定义为"运行时已验证的计算"
+#+end_example
+
+* 演化叙事
+
+** 2022 | FlashAttention: 注意力的瓶颈不在算，在搬
+
+*** 它看到了什么问题
+
+Transformer 流行起来之后，所有人都在堆算力优化 softmax。但 Tri Dao 注意到一件反直觉的事：在 A100 上，注意力的实测时间根本不是被 FLOPs 卡住的，是被显存带宽卡住的。query × key 算出来一个 N × N 的矩阵，写回 HBM 再读回来做 softmax，再写一次，再读出来乘 V——这一来回的搬运成本远超过计算本身。
+
+*** 它的解法
+
+不写中间矩阵。把 Q、K、V 分块塞进 SRAM（GPU 上的小高速缓存），在 SRAM 里把 softmax 拆成"在线"版本——一边读新块，一边维护一个跑动的 max 和 sum，永远不把完整的 N × N 落到 HBM。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为它把"算法层面的等价变换"和"硬件层面的内存层次"对齐了。但这是 prefill 阶段（一次性算整个序列）的胜利。换到自回归解码——一个 token 一个 token 地往外吐——情况变了：每解一个 token，都要把整个已经存下来的 K、V 重新读一遍。N 是序列长度，读量 ∝ N。FlashAttention 让 prefill 不再被 N² 困住，但留下了一个新的怪兽：decoding 时的 KV cache。
+
+** 2023 | PagedAttention: 让 KV cache 像虚拟内存一样被管理
+
+*** 它看到了什么问题
+
+KV cache 的传统做法是"按最坏情况预分配"——一个请求声明它最长 2048 tokens，框架就一口气切出 2048 个槽，哪怕这次只用了 200。生产环境里同时跑几十个请求，每个都吃满，结果显存被预留烧光，并发上不去。
+
+*** 它的解法
+
+抄 OS 的虚拟内存。把 KV 切成等大的小 page（比如 16 个 token 一块），每个请求按需要拿 page，用完再还。物理上不用连续，逻辑上靠 page table 串起来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"KV cache 是一坨连续大数组"这个隐含假设打破了，让 KV 变成一等公民——可以被分配、迁移、共享、回收。vLLM 因此能把吞吐拉高 2-4 倍。但 PagedAttention 解决的是"多个请求之间怎么分 KV"，没解决"单个长上下文请求的 KV 本身就太大"。一条 128K 序列的 KV 还是 17GB——再怎么 paging 也省不下来。
+
+** 2023 | H2O: 每个 token 的 KV 真的都要留吗？
+
+*** 它看到了什么问题
+
+研究人员盯着注意力权重看，发现一个反直觉的事：在长上下文里，注意力分布极度不均。绝大多数 token 几乎从来不会被未来的 query 注意到，而少数"heavy hitter" token（高频被注意的 token）独占了大头。如果分布这么倾斜，那把绝大多数 KV 留在 cache 里是不是在养闲人？
+
+*** 它的解法
+
+边解码边淘汰。维护一个累计注意力分数，每步把分数最低的 token 从 cache 里赶走，给新 token 腾位置。cache 容量从此变成常数，不再随序列长度增长。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为注意力分布的稀疏性是真的。但它留了两个深坑：第一，赶错了就丢信息——某个 token 现在不重要，不代表 20K token 之后突然被一个 retrieval-style 的 query 召回的时候还不重要。第二，更要命的是：到底谁是 heavy hitter，全靠启发式判断，没人能给出"我保证不丢关键信息"的形式化承诺。出了事只能事后看 benchmark 掉了多少分。
+
+这个"没保证"的尾巴，下面三代人都没解决。
+
+** 2024 | KIVI: 与其删掉，不如全留下但压低精度
+
+*** 它看到了什么问题
+
+H2O 思路的硬伤是"删 vs 留"的二元选择。KIVI 的作者问：为什么非要二选一？保留所有 token 但每个 token 占更少的位——不就既不丢信息又省显存了吗？已经有人在做权重量化（GPTQ、AWQ），把同样思路搬到 KV cache 应该可行。
+
+但他们一动手就撞墙了。直接套用权重量化的策略——按 token 维度统一量化——K 矩阵会炸：误差爆掉，模型表现急剧下降。
+
+*** 它的解法
+
+仔细对着 K 和 V 的数值分布看一眼，发现一个关键不对称：
+
+- 在 K 矩阵里，离群点集中在某些*通道*——比如第 47 维老是出 1000 量级的怪值
+- 在 V 矩阵里，离群点集中在某些*token*——某些位置的 V 整个偏大
+
+所以 K 要按通道量化（每个通道一个 scale），V 要按 token 量化（每个 token 一组 scale）。这样离群点被隔离在它们各自的小范围里，不会污染其他通道/token。配合一个"最近的 R 个 token 不量化"的滑动窗口，他们做到 2-bit tuning-free——不需要重新训练任何东西。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+K/V 异质性是真的，按维度对齐就能不打架。但 KIVI 验证质量的方式还是老办法：跑 PG-19 看 perplexity，跑 LongBench 看分数，平均不掉就发布。这背后藏着一个谁都没敢问的问题：**平均 perplexity 不掉，能不能保证每一步解码不出鬼？** 没人答得了。某个特定 prompt 的某一步突然崩掉，benchmark 看不到，用户看得到。
+
+** 2024 | KVQuant: 把 per-channel K 量化做到底
+
+*** 它看到了什么问题
+
+KIVI 还是混着 per-token 的 K 量化在一些层用。KVQuant 团队发现：现代 LLM（特别是 LLaMA 家族）在 K 上应用 RoPE（旋转位置编码）之后，通道之间的数值差异会被进一步放大——某些通道在某些位置上的幅值远超其他通道。如果还按 token 量化，单步的 scale 必须迁就这些大值，所有正常值就被压缩到一个很窄的整数范围里，量化噪声就上来了。
+
+*** 它的解法
+
+K 全程 per-channel 量化。不只是分组按通道，而是每个通道有自己独立的 scale 和 offset，从头算到尾。配合非均匀量化（nuq4）——离群点附近用更细的格子，常规值用粗的——做到 4-bit 以下，号称能撑到 10M context 推理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+per-channel K 把 RoPE 引入的通道间差异隔离掉了，技术上是 KIVI 的自然延伸。但它把 KV 压缩的"压缩比天花板"几乎推到了极限——再压就是 binary 了。然而它和前面所有人一样，凭据问题继续无人接手。整个流派从 H2O 到 KVQuant 三年里，所有论文的"质量保证"段落都是同一个套路：选几个 benchmark，跑一遍，分数看着 OK 就完事。
+
+到 CertAttn 这里，这个"看着 OK 就完事"的范式被掀桌子了。
+
+** 2026 | CertAttn: 把压缩变成有回执的计算
+
+*** 它看到了什么问题
+
+作者 Dean Calver 在引言里一句话点破整个流派的盲区：
+
+#+begin_quote
+"A system that achieves Δppl < 0.1 on average may still exhibit large step-wise deviations on individual decode steps—and there is no mechanism to detect when this happens, let alone recover from it."
+#+end_quote
+
+翻译：平均 perplexity 没掉，不代表你这一步没崩。崩了你也不知道。知道了也救不回来。
+
+这个观察的力量在于它指出了一个集体盲点。KIVI、KVQuant、QServe、PQCache——一直在卷压缩比、卷吞吐量、卷 benchmark 分数。从来没人问："能不能在每一步告诉我，这一步的输出到底偏离了真值多远？"
+
+*** 它的解法
+
+三件事拧成一根绳：
+
+1. *双层存储*。VRAM 里放压缩版（per-channel INT8 keys + per-group INT4 values），系统 RAM 里把 FP16 原件保留——压完*不删*。原件是保险绳，需要时按 page 调回 GPU。
+
+2. *两项误差分解*。把"压缩输出 vs FP16 输出"的差分解成两部分独立计算上界：
+   - Key 压缩误差 → 影响 softmax 分布扭曲 → 上界由 |Δ logit| 通过 tanh(Δ) 推出 TV 距离
+   - Value 压缩误差 → 影响 attention 输出向量 → 上界由 per-block value reconstruction 误差 × 该 block 的 attention mass 推出
+   两个上界都能用系统*已经在记账的量*（量化 scale、query 范数）在运行时算出来。
+
+3. *四级 fallback 阶梯*。
+   - Rung 1: 扩大 FP16-key 选块
+   - Rung 2: 升级到 FP16 values
+   - Rung 3: 这个 head 退回 FP16 KV 算
+   - Rung 4: 整层退回 FP16 KV 算
+   最后一级是 unconditional 兜底——它直接调 torch 的 scaled_dot_product_attention，跟 dense baseline 走完全同一份代码路径。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它的力量不在更激进的压缩，而在改变了游戏规则。前人是"压缩 + 祈祷"，CertAttn 是"压缩 + 测量 + 兜底"。论文实验显示：在 PG-19、NIAH、RULER 上，跟 dense FP16 跑出的分差在噪声范围内；naive INT8/INT4 baseline 偶发的灾难性失败（NIAH 召回掉到 0）被这条 fallback 链兜住了。
+
+它留的坑作者自己说了：保证是 *per-head, per-step* 局部的，不是端到端模型质量的。如果模型本身在 FP16 下就会回答错，那这套保证不会帮你。Fallback 也有成本——RAM→GPU 的 page-in 不是免费的，所以这是一套"质量优先于速度"的方案，论文很坦诚地说目标不是 raw speedup，而是在严格质量约束下安全地用 aggressive KV compression。
+
+* 前沿延伸
+
+目标论文 2026 年 5 月才出来，时间上离现在很近，引用它的后续工作还没积累出来。但同期的几个工作可以放进来看演化的旁支：
+
+- *TurboQuant (Zandieh et al, ICLR 2026)*：理论上界更紧的在线向量量化，可用于 KV cache。它仍然是"压得更狠"的路线，没碰运行时凭证。
+- *JanusQuant (Sun et al, PPoPP 2026)*：把 2-bit KV 量化做到生产级精度。同样是压缩比驱动，无证书。
+- *PackInfer (Ning et al, 2026)*：批量服务下压缩 KV 的计算/IO-efficient kernel。系统优化方向，跟 CertAttn 正交。
+
+可以这么看：2026 年的 KV 量化研究还在两条岔路上同时跑——主流仍是"压得更狠"，CertAttn 开了一条"压得更可信"的新岔。哪条最终被生产环境吸收，要看下一两年。我的直觉是会合流：压缩比新极限 + CertAttn 风格的运行时凭证 → 安全地部署在严肃业务场景里。
+
+* 一张图看懂
+
+#+begin_example
+                          KV cache 演化主线 (2022 -> 2026)
+                          以"对压缩的信任问题"为轴
+
+  时间轴 ->
+  2022           2023            2023        2024        2024         2026
+  ----           ----            ----        ----        ----         ----
+  FlashAttn      PagedAttn       H2O         KIVI        KVQuant      CertAttn
+  IO-aware       paged           drop        quantize    per-channel  certified
+  attention      KV alloc        cold KV     all KV      K quant      + fallback
+   |             |               |           |           |             |
+   |             |               |           |           |             |
+   v             v               v           v           v             v
+  问题: HBM      问题: 显存       问题: KV     问题: 删了   问题: per-   问题: 平均
+  搬运炸了      碎片烧光         里养闲人     太冒险       token K     不出事不代
+   |             |               |           |           被 RoPE 毁    表每步安全
+   |             |               |           |           |             |
+  解法: SRAM    解法: 像 OS 那   解法: 淘汰   解法: K 按   解法: K 全   解法: 双层
+  分块在线       样按 page 分    低分 token   通道 V 按    程 per-      存储 + 误差
+  softmax       配 KV cache                  token 量化   channel      上界 + 4级
+                                                          量化         fallback
+
+  -------------------------------- 转折点 --------------------------------
+                                                                       ^
+                                                                       |
+                                                                  范式转移:
+                                                              压缩从"祈祷"
+                                                              变成"测量+兜底"
+
+  纵向看: 每一代解决的都是上一代留下的"省"的问题
+          (省搬运 -> 省显存 -> 省 token -> 省 bit -> 省到极限)
+  CertAttn 第一次不问"还能再省吗"，而问"省了之后我能不能信"
+#+end_example
+
+* 洞见
+
+这条演化线表面是"KV cache 越压越小"的技术迭代，但底下真正在发生的是认知的三次转变：
+
+1. *从"模型层面"下沉到"系统层面"*（FlashAttention 那一步）。研究者意识到 LLM 的瓶颈不在算法，在内存层次。这之后，所有优化都开始向硬件看齐。
+
+2. *从"静态结构"转向"运行时观察"*（H2O 那一步）。注意力分布的稀疏性是动态的、prompt-依赖的，必须在运行时观察才能利用——这把"模型"和"工作负载"耦合了起来。
+
+3. *从"经验质量"转向"可证质量"*（CertAttn 这一步，刚刚发生）。前面所有人都默认"benchmark 跑得过就算 OK"，CertAttn 第一个说"不行，我要每一步都有上界"。这是把生产可靠性工程的思维（observability、verification、graceful degradation）注入到 LLM serving 里。
+
+下一步往哪走？我赌两个方向：
+- *证书向上传播*。CertAttn 的证书是"per-head, per-step"，但下游会有人把它聚合成"per-token"、"per-response"的端到端证书。
+- *证书+压缩协同设计*。现在 CertAttn 把证书加到现成的 INT8/INT4 方案上。下一代会出现"为可证性而设计"的量化方案——也许是某种结构化量化，让上界天然更紧。
+
+* 启发
+
+读论文别只读"结果是什么"，要读"它在挑战什么前人都默认的东西"。CertAttn 整篇论文的精华不在公式，在它注意到了一个所有人都习以为常的盲点："benchmark 没掉就发布"。一旦这个盲点被指出来，工程界就回不去了——这就是为什么这类"质问范式"的论文比"刷分"的论文更值得花时间。
+
+落点在能用：
+
+- 如果你在做 LLM serving，可以把"运行时质量证书"加到你的可观测性栈里——哪怕没用 CertAttn 本身，至少要监控每步输出和某个 reference 的偏离。
+- 如果你在做研究选题，找一找其他流派里类似的"我们都默认 benchmark 没掉就 OK"的地方——那里就是下一篇 CertAttn 的位置。
+- 如果你在做产品决策，记住一件事：平均指标好不代表用户体验稳定。尾部失败往往是用户记住你的地方，所以"P99 质量"比"平均质量"更值得做。

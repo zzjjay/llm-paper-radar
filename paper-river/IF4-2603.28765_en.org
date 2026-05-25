@@ -1,0 +1,283 @@
+#+title:      Adaptive Block-Scaled Data Types
+#+date:       [2026-05-25 Mon 06:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T063853-en
+#+source:     https://arxiv.org/abs/2603.28765
+#+authors:    Jack Cook, Hyemin S. Lee, Kathryn Le, Junxian Guo, Giovanni Traverso, Anantha P. Chandrakasan, Song Han
+#+venue:      arXiv preprint, Mar 2026 (MIT + NVIDIA)
+
+* The Problem River
+
+One question: how do you squeeze the fp16/bf16 weights and activations in a neural network into 4 bits — without losing accuracy?
+
+Why is this hard? Four bits can only hold 16 distinct values. Any tensor has the shape of "most values clustered near zero, a few values very large" — the moment you try to represent both 0.001 and 30 with the same 16 steps, one end inevitably gets truncated. For over a decade, generation after generation has wrestled with the same tension: *how do you simultaneously honor large and small values in a tensor with an extremely limited bit budget?* From the earliest "one global scale ruler," to "one ruler per channel," to "one ruler per small block of 16 or 32 elements," to NVIDIA baking block-level scaling directly into Blackwell hardware — each generation slices the scale ever finer.
+
+IF4 is the newest step on this path. It stops debating "should the scale be coarse or fine?" and asks a cleverer question: *should the tick marks on this ruler be uniform (INT) or non-uniform (FP)?* Its answer: let every 16 elements decide for themselves — if this group looks Gaussian with outliers, use the FP ruler whose ticks are dense in the middle and sparse at the tails; if this group has been flattened to near-uniform, use the INT ruler with evenly spaced ticks. One choice per group, paid for by repurposing the sign bit of the NVFP4 scale field that was always sitting idle.
+
+* Source Map
+
+#+begin_example
+[2016] Han et al. - Deep Compression
+   |
+   | Problem: neural networks are too large to fit on mobile devices
+   | Solution: pruning + quantization + Huffman coding;
+   |           first proof that "cutting precision is viable"
+   v
+[2022/23] Frantar et al. - GPTQ / Lin et al. - AWQ
+   |
+   | Problem: quantizing an entire tensor with one scale;
+   |          outlier channels blow up the quantization range
+   | Solution: per-channel / per-group scales; weight-side 4-bit achieved
+   v
+[2023] Rouhani et al. - MXFP4 (OCP Microscaling)
+   |
+   | Problem: one scale per tensor has insufficient dynamic range,
+   |          but one scale per value is too expensive
+   | Solution: every 32 FP4 values share a UE8M0 power-of-2 scale
+   v
+[2026] NVIDIA et al. - NVFP4 (Blackwell)
+   |
+   | Problem: MXFP4's power-of-2 scale is coarse; 32-element groups too large
+   | Solution: 16-element groups + E4M3 scale (with mantissa bits);
+   |           native hardware support
+   v
+[2025] Cook et al. - Four Over Six (4/6)
+   |
+   | Problem: NVFP4 accumulates large quantization error near each block's
+   |          maximum — because FP4 steps are size 2 at the high end
+   | Solution: each block chooses whether to map its max to 6 or to 4
+   v
+[2026] Cook et al. - IF4 (this paper)
+   |
+   | Problem: 4/6 fixed "large error at the high end" — but at the cost of
+   |          (1) losing the values ±6 when mapping to 4
+   |          (2) compressing the whole tensor's dynamic range
+   |          Root cause: still trapped inside the non-uniform FP4 ruler
+   | Solution: each 16-element block chooses — FP4 or INT4
+   |           repurpose the unused sign bit of the NVFP4 scale as the switch;
+   |           INT4's uniform ruler is naturally better for Hadamard-flattened tensors
+   v
+[2026+] (frontier)
+   - WUSH (Chen et al., 2512.00956): block-wise Hadamard, PTQ route
+   - MR-GPTQ (Egiazarian et al., 2603.11021): block-rotation + GPTQ
+   - Both attacking the same W4A4 problem simultaneously, but differently:
+     they reshape the input distribution to fit NVFP4;
+     IF4 reshapes the format to fit the input distribution
+#+end_example
+
+* Evolutionary Narrative
+
+** 2016 | Deep Compression: Cutting Precision and Still Running
+
+*** What Problem It Saw
+
+Models like VGG and AlexNet weighed hundreds of megabytes. Just storing them on a phone or an in-car chip was a challenge, let alone running inference dozens of times per second. The default assumption was that neural-network weights had to be fp32 — single-precision float.
+
+*** Its Solution
+
+Release a complete compression toolkit all at once: first prune (zero out unimportant connections), then apply weight sharing / k-means quantization, and finally Huffman coding. AlexNet shrank from 240 MB to 6.9 MB with no accuracy loss.
+
+*** Why It Worked — and What New Pit It Dug
+
+It was the first large-scale proof that "neural-network accuracy is redundant" — you can forcibly map thousands of distinct floats in a single layer onto a codebook of only 256 or even 16 entries, and the model keeps working. That gave everyone confidence: 4-bit might actually be viable.
+
+But this generation carried a hidden assumption: *the entire tensor uses the same quantization parameters*. That was tolerable for CNNs; for LLMs it was fatal. LLMs have "outliers" — a handful of activation channels can be 100× larger than the rest, and a single global ruler simply cannot cover them.
+
+** 2022–23 | GPTQ / AWQ: Hand Each Group Its Own Ruler
+
+*** What Problem They Saw
+
+After GPT-3 appeared, everyone wanted to compress it to 4-bit and run it on a single GPU. Applying the Deep Compression recipe directly caused catastrophic accuracy drops — especially on OPT-175B, where INT4 quantization was nearly unusable. Investigation revealed the culprit: a handful of "outlier channels" were stretching the quantization range so far that all normal values collapsed to the same bucket.
+
+*** Their Solutions
+
+Two parallel ideas:
+- GPTQ: use second-order information (Hessian) to quantize column by column, updating the remaining columns after each to compensate for accumulated error.
+- AWQ: observe that "salient channels cannot afford to lose precision," then pre-scale those channels up before quantization and divide back afterward.
+
+Common thread: *abandon "one scale per tensor," move to "separate scales per group or per channel."*
+
+*** Why It Worked — and What New Pit It Dug
+
+Spatial isolation solved the dynamic-range problem — outliers stay confined to their own small region and no longer contaminate the whole tensor. W4A16 (weights 4-bit, activations 16-bit) became the standard PTQ recipe from this point on.
+
+But this generation's "groups" were purely a software concept, invisible to hardware. Actually running on a GPU still required manual dequantization inside INT4 matrix-multiply kernels — significant overhead. And activations were still fp16, untouched — *the real throughput bottleneck remained unsolved.*
+
+** 2023 | MXFP4 (OCP Microscaling): Block-Level Floating Point in an Open Standard
+
+*** What Problem It Saw
+
+GPTQ/AWQ implemented grouping in software — but GPU matrix-multiply units had no concept of "groups." For 4-bit to deliver a genuine 2× speedup, hardware had to natively understand a format where each small block carries its own scale. At the same time, pure INT4 had too little expressive power, and FP4 had no block-level scale — the two needed to be combined.
+
+*** Its Solution
+
+The OCP consortium proposed the *Microscaling (MX) format family*: every 32 FP4/FP6/FP8 values share a single UE8M0 scale (an 8-bit power-of-2 exponent). FP4 is encoded as E2M1 — representing ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}. Each block's maximum value is mapped to 6; all other values are scaled proportionally.
+
+*** Why It Worked — and What New Pit It Dug
+
+For the first time, "block-level scaling" was enshrined as a hardware standard. FP4 plus a 32-element power-of-2 scale adds only 0.25 bits of overhead per value, yet immediately delivers adequate dynamic range.
+
+But *32 values sharing one scale is still too coarse* — a single outlier in a block collapses the remaining 31 values. And UE8M0 can only represent powers of 2, not intermediate values like 1.5 or 3, so scale steps are large. There was also an unpleasant detail: FP4's step size near its maximum is 2 (jumping from 4 to 6 in one stride), leaving large quantization error at the high end of each block — a pit that 4/6 would later excavate.
+
+** 2026 | NVFP4 (Blackwell): Halve the Block, Add Mantissa Bits to the Scale
+
+*** What Problem It Saw
+
+MXFP4 underperformed on NVIDIA's own hardware experiments. NVIDIA wanted finer block-level scaling without letting the scale eat too many bits. They identified two rough edges in MXFP4: (1) 32-element blocks are still too large; (2) the UE8M0 "powers-of-two-only" scale is too discrete.
+
+*** Its Solution
+
+*Cut the block in half*: 16 elements per group. *Upgrade the scale*: replace UE8M0 with *E4M3* (FP8 with 3 mantissa bits) — capable of representing non-power-of-2 values like 1.5 or 1.75. Together, the overhead per value rises from 0.25 bits to 0.5 bits, but precision improves dramatically.
+
+It was also baked into Blackwell GPU hardware matrix-multiply units — a single instruction consuming NVFP4 and producing FP32 accumulation. AMD MI355X followed suit.
+
+*** Why It Worked — and What New Pit It Dug
+
+Smaller blocks → outliers can be contained in a narrower range, polluting fewer normal values; finer scales → scale selection has finer granularity. W4A4 training had hardware acceleration for the first time.
+
+But the *shape of the FP4 tick marks themselves* was never changed — still ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}: dense in the middle, sparse at the extremes. That means: *if your data has been flattened to a near-uniform distribution by a Hadamard transform or similar operation, FP4 will repeatedly stumble at the high end.* NVINT4 (same 16-element groups + E4M3 scale, but replacing FP4 with INT4) actually outperforms NVFP4 on uniform data — a contradiction that holds the key to the next generation.
+
+** 2025 | Four Over Six (4/6): Let Each Block Choose "Map to 4 or to 6"
+
+*** What Problem It Saw
+
+The Cook team carefully measured NVFP4's quantization error and found a peculiar phenomenon: *the error is not uniformly distributed — it piles up conspicuously near each block's maximum value.* The physical reason: FP4 packs its tick-mark density near zero (0, 0.5, 1, 1.5, 2 in steps of 0.5), then grows sparse at the high end (2→3, 3→4, 4→6). Values in a block that are close to the maximum end up rounded to either 4 or 6, with an average error that can reach ±1.
+
+*** Its Solution
+
+Elegantly simple: quantize each 16-element group twice. Once mapping the block maximum to 6 (standard approach), once mapping it to 4. Compute which choice yields lower MSE, and take that one.
+
+Why does "mapping to 4" sometimes win? Because doing so pushes most values in the group into the 0–4 "dense tick zone," reserving the sparse 4→6 segment for the rare outliers.
+
+*** Why It Worked — and What New Pit It Dug
+
+At its core, this is "dynamic scale selection" partially offsetting the non-uniform-tick defect of FP4. Each block's scale factor now gets multiplied by either 1 or 1.5 — a tiny free indicator bit that delivers a noticeable accuracy gain.
+
+But the cost comes in two forms:
+1. When mapping to 4, the FP4 values ±6 become unreachable — the already slim 16-value codebook shrinks to 14.
+2. To prevent overflow after multiplying the scale by 1.5, the tensor-wide global scale must be pre-shrunk — *dynamic range is compressed to 57%.*
+
+The deeper issue: *it is still wrestling inside the non-uniform FP4 ruler.* If your data has already been flattened to near-uniform by a Hadamard transform, FP as a ruler shape is suboptimal from first principles — INT's uniform ticks are actually the right tool. That tension is the entrance to the next generation.
+
+** 2026 | IF4 (This Paper): Let Each Block Choose "FP or INT"
+
+*** What Problem It Saw
+
+4/6 revealed something important: *no single tick-mark shape is optimal for every block.* But 4/6 was still maneuvering within FP4. This time the Cook team asked more radically: *if a block's data is uniformly distributed, why not just use INT4?* INT4's ticks are perfectly uniform — naturally better for flattened data; FP4's ticks are dense near zero — naturally better for Gaussian data with outliers.
+
+So why not let each block choose?
+
+The engineering obstacle standing in the way: how do you tell the hardware "this block is FP, that block is INT"? Adding one extra bit sounds trivial, but 16 four-bit values total only 64 bits — one extra bit is 1.5% overhead, and it also requires rearranging hardware pipelines.
+
+*** Its Solution
+
+A beautiful observation: NVFP4's scale is E4M3, which includes a 1-bit sign field. But scales are always positive — *the scale's sign bit has never been used.*
+
+So repurpose that bit as the FP/INT switch:
+- Scale sign bit = positive → this block stores 16 FP4 values
+- Scale sign bit = negative → this block stores 16 scaled INT4 values
+
+At quantization time, compute the MSE for both representations for each block and pick the lower one. At decode time, hardware reads that one bit first, then decides how to dequantize.
+
+Zero additional storage overhead. All of NVFP4's dynamic range, global scale, and E4M3 sub-scale remain exactly as before — only the *shape of the tick marks* can now switch group by group.
+
+The same idea extends naturally to 3 bits (IF3: E2M0 vs. INT3) and 6 bits (IF6: E2M3 vs. INT6).
+
+*** Why It Works — and What New Pits Remain
+
+Technically: in W4A4G4 pretraining, IF4 achieves lower loss than both NVFP4(4/6) and NVINT4; in PTQ, combining it with WUSH or MR-GPTQ yields significant downstream accuracy gains. The MAC-unit hardware implementation adds only ~8% area over NVFP4 and a small latency increase — well within acceptable bounds.
+
+At a deeper level: it achieves Pareto dominance without conceding anything — *no dynamic range sacrificed, no representable value lost, no storage added.* This is possible precisely because it harvests a wasted bit from NVFP4's original design.
+
+Remaining open pits:
+1. Each block's FP-or-INT choice is *made offline* — you only see the data at quantization time. Should the choice be made dynamically during training? The training dynamics have not been studied.
+2. Hardware requires a new generation of accelerators for native support (current Blackwell/MI355X only supports NVFP4), so near-term validation is limited to simulation or Verilog-level prototypes.
+3. Once you open the door to "borrowing unused bits," the natural next question is whether *the mantissa bits of the E4M3 scale* could also be repurposed. There is still a great deal of design freedom in the scale's bit layout.
+
+* Frontier Extensions
+
+IF4 is from March 2026 — too new to have direct follow-on critiques. But several parallel lines of work attacking the same W4A4 problem are worth noting:
+
+- *WUSH (Chen et al., 2025.12)*: PTQ route, using block-wise Hadamard to flatten activations so NVFP4 can digest them cleanly. This is the *dual* of IF4's approach — WUSH reshapes the input distribution to fit the format; IF4 reshapes the format to fit the input distribution.
+- *MR-GPTQ (Egiazarian et al., 2026.03)*: adds block rotation inside the GPTQ framework. Also a PTQ route for fitting NVFP4.
+- *Quartet II (Panferov et al., 2026.01)*: addresses training dynamics, specifically the bias in the backward pass under W4A4G4 training. Complementary to IF4 — one changes the format, the other changes the training algorithm.
+
+Foreseeable directions:
+1. *Hardware validation*: watch whether NVIDIA/AMD's next GPU generation natively supports IF4. If so, IF4 becomes the new baseline.
+2. *Adaptive generalization*: IF4 has proven "per-block data-type switching works"; the next step may be "per-block group-size switching" or "per-block scale-format switching."
+3. *Training-time dynamic selection*: push the FP-vs-INT choice from PTQ into training — dynamically switching based on gradient signals.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  Dynamic Range
+                          ^
+                          |
+   Han'16 ----------------|----------------> One scale for the whole tensor
+   Deep Compression       |  Global INT; outliers ruin everything
+                          |
+                          |
+   GPTQ/AWQ '22-'23 ------|----------------> One scale per group / per channel
+   per-channel INT4       |  Software grouping; hardware unaware
+                          |
+                          |
+   MXFP4 '23 -------------|----------------> 32-group FP4 + UE8M0 scale
+   Microscaling           |  Hardware-level blocks; but scale is coarse
+                          |
+                          |
+   NVFP4 '26 -------------|----------------> 16-group FP4 + E4M3 scale
+   Blackwell              |  Smaller blocks; finer scale
+                          |
+                          |   |--- Same tick shape; different scale magnitude
+                          |   v
+   4/6 '25 ---------------|----------------> 16-group; max maps to 4 or 6
+   Four Over Six          |  Discovers FP4 error pileup at the high end
+                          |  Cost: loses ±6; dynamic range shrinks to 57%
+                          |
+                          |   |--- Same format parameters; different tick shape
+                          |   v
+   IF4 '26 ---------------|----------------> 16-group; FP4 or INT4 per block
+   This paper             |  Borrows unused scale sign bit as switch
+                          |  Zero extra storage; no lost values; no range loss
+                          |
+                          +----------------> Time
+                       2016                 2026
+
+   Underlying cognitive shift:
+     [2016-2023] "How do we squeeze values into 4 bits?"    — attacking dynamic range
+     [2023-2026] "How do we get hardware to support blocks?" — attacking hardware fit
+     [2025-]     "What is the optimal tick shape per block?" — attacking tick-mark shape
+                                                               ^
+                                                               both 4/6 and IF4 belong here
+#+end_example
+
+* Core Insight
+
+Compress the past decade into one sentence: *the evolution of quantization accuracy is the process of unlocking "scale degrees of freedom" one layer at a time.*
+
+- Deep Compression unlocked "the scale need not be fp32"
+- GPTQ/AWQ unlocked "the scale can differ per channel"
+- MXFP4 unlocked "the scale can be baked into hardware"
+- NVFP4 unlocked "the scale's granularity can be made fine (E4M3)"
+- 4/6 unlocked "the scale's *magnitude* can be chosen per block"
+- IF4 unlocked "the scale's *shape* can be chosen per block"
+
+Each generation grants one additional degree of freedom over the previous, at nearly zero cost in storage or hardware complexity. What is really happening beneath this trajectory is not "how does 4-bit compare to 8-bit?" — it is *the gradual replacement of fixed formats with adaptive formats.*
+
+Where is the next step most likely to go?
+
+I would bet on two directions:
+1. *Per-block group-size switching*: every block is currently 16 elements, but some blocks might need only 8 while others need 32.
+2. *Training-time adaptation*: the FP/INT choice is currently offline, but a network's distribution shifts during training — dynamic switching may offer more free lunch.
+
+At a broader level: the design pattern of *"borrowing an unused bit"* (IF4 borrowing the scale sign bit) is severely underappreciated. That bit was unused because no one imagined block-level adaptation when NVFP4 was first designed. Next-generation formats almost certainly still hide similar "unused bits" waiting to be found.
+
+* Takeaways
+
+On how to do research:
+
+1. *The Pareto frontier is deceptive.* A format that looks "impossible to improve" usually just means no one has gone looking for unused bits in the design. Go back and examine every bit and every field of the baseline — ask "does this have to be used this way?"
+2. *The source of differentiation is distribution.* IF4 works because it acknowledges that different blocks have different data distributions. Whenever you are building a one-size-fits-all design, ask: "If I accept that inputs come in multiple shapes, can my solution also take multiple shapes?"
+3. *Hardware fit is life or death.* Deep Compression's Huffman coding is theoretically more compressive, but what runs on mainstream hardware a decade later is NVFP4, not Deep Compression. Any quantization scheme must ultimately answer the question: "Can it be fed directly into a tensor core?"
+
+For anyone currently working in this area: *building IF4-aware PTQ algorithms is a clear and open window of opportunity right now.* Hadamard / WUSH / MR-GPTQ all exist to "flatten the distribution so NVFP4 can swallow it" — but IF4 does not need flattening, because it will switch to INT mode on its own. An entire PTQ toolchain built around NVFP4 could in principle be rebuilt around IF4, and should yield better results across the board.

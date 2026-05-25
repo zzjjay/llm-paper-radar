@@ -1,0 +1,250 @@
+#+title:      OCTOPUS: Optimized KV Cache for Transformers via Octahedral Parametrization Under optimal Squared error quantization
+#+date:       [2026-05-25 Mon 07:26]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T072639-en
+#+source:     https://arxiv.org/abs/2605.21226
+#+authors:    Mark Boss, Vikram Voleti, Simon Donné, Shimon Vainer (Stability AI)
+#+venue:      arXiv preprint, 2026-05
+
+* The River of Problems
+
+During long-context inference, every time the model generates a token it must read the entire *KV cache* of all previous tokens from GPU memory.
+When the cache grows too large to stream efficiently, the entire decoding pipeline stalls on memory bandwidth — not because compute is lacking, but because data movement cannot keep up.
+
+The problem sounds simple: can we compress this data and reduce the transfer? In practice it turns out to be hard:
+KV tensors contain abundant *outliers* — a handful of extreme values in a single channel stretch the quantization range wide open,
+while the remaining values cluster near zero and are almost entirely destroyed at 2-bit precision. Generation after generation of researchers has wrestled with "how to flatten the distribution,"
+and over the last five years this line of work has undergone a paradigm shift — from *reshaping distributions* to *changing the coordinate system*.
+OCTOPUS is the most aggressive compression point currently reached within this new paradigm.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ
+  |
+  | Problem: want to compress weights to 4-bit, but outlier channels collapse under quantization
+  | Solution: use Hessian information for error compensation, quantize column by column greedily
+  v
+[2023] QuIP
+  |
+  | Problem: error compensation is clever, but the outlier distribution itself is untouched; 2-bit still collapses
+  | Solution: apply a random orthogonal rotation before quantization to make weights "incoherent";
+  |           outliers are scattered across all directions, so the quantization box is sufficient
+  v
+[2024] QuaRot / KIVI / QJL
+  |
+  | Problem: rotation works for weights — can we carry it over to KV cache?
+  | QuaRot: rotate the entire model so activations + KV jointly have no outliers
+  | KIVI:   per-channel quantization of KV only; simple and tuning-free
+  | QJL:    random rotation + sign (1-bit); inner-product estimation is statistically unbiased
+  v
+[2025] TurboQuant
+  |
+  | Problem: rotation is good, but the quantizer is tuned empirically; no one proves it is optimal
+  | Solution: prove that after random rotation each coordinate's marginal distribution is symmetric-Beta;
+  |           1-D Lloyd-Max quantizer is therefore near-optimal in MSE,
+  |           and the codebook depends only on (dimension d, bits b) — no calibration needed
+  v
+[2025] PolarQuant
+  |
+  | Problem: quantizing coordinates independently shatters the sphere, wasting angular information
+  | Solution: parameterize the rotated vector with recursive polar coordinates; quantize the angles
+  v
+[2026-05] OCTOPUS  <-- target paper
+  |
+  | Problem: recursive polar coordinates are slow to decode; scalar quantization ignores
+  |           correlations among neighboring coordinates
+  | Solution: jointly quantize coordinates in groups of 3:
+  |           - direction of each triplet -> octahedral map to [-1,1]^2
+  |           - norm of each triplet      -> 1-D Lloyd-Max
+  |           - MSE optimum says: give direction 1 extra bit, give norm 1 fewer bit
+  v
+[? ] No direct follow-up yet — current frontier of the rotation-based line
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: First to Compress LLM Weights to 4-bit Without Collapse
+
+*** What Problem It Saw
+Neural network quantization had existed for years, but it targeted INT8, symmetric-distribution, small models. Once LLMs arrived, weight matrices contained billions of parameters and a small number of *extreme outlier values* — naively rounding every weight to 4-bit lets those outliers inflate the quantization step size by a factor of ten or more, causing 99% of the remaining weights to round to zero.
+
+*** Its Solution
+Quantize column by column. After each column is quantized, use the inverse Hessian to estimate how that column's error propagates into the remaining columns, then subtract the error from those columns. The essence is expanding a locally greedy mistake into a globally second-order optimal correction.
+
+*** Why It Worked (and Where It Left a New Problem)
+Error compensation makes 4-bit nearly lossless. But compensation is *after-the-fact correction* — the outlier distribution itself is never touched.
+The moment you push toward 3-bit or 2-bit, single-step quantization error is too large for compensation to absorb, and decoding degrades into noise.
+New problem: to compress further, you must *fix the distribution at its source*.
+
+** 2023 | QuIP: Don't Fix the Error — Fix the Distribution via Random Orthogonal Rotation
+
+*** What Problem It Saw
+GPTQ's bottleneck is the outlier channel. Compensation is treating the symptom. The cure requires a distribution that has no outliers to begin with.
+But weights cannot be arbitrarily modified — that destroys the model. The transformation must be *invertible*, with the inverse applied again at inference time.
+
+*** Its Solution
+Before quantization, left-multiply the weight by a *random orthogonal matrix R*. An orthogonal matrix preserves the L2 norm, so no information is lost;
+the randomness *spreads* energy that was concentrated in a few channels *uniformly across all directions*, so no single coordinate exhibits the "a few extreme values plus a mass near zero" spike any more. Then quantize.
+The cost is one extra R^T multiplication at inference time — but with a structured Walsh-Hadamard transform this costs only O(d log d) and is virtually free.
+
+*** Why It Worked (and Where It Left a New Problem)
+The key insight is that *the choice of coordinate system is not free*. The same set of numbers looks completely different in a rotated coordinate frame.
+QuIP gave the first proof that "random rotation + quantization" still provides guarantees at 2-bit.
+New problem: this only handles *weights*. The inference bottleneck had already shifted from weights to KV cache — can the same idea migrate there?
+
+** 2024 | KIVI / QuaRot / QJL: Three Simultaneous Attempts to Move the Idea to KV Cache
+
+*** What Problem They Saw
+KV cache is harder than weights: it is *online* — decoding generates one new key/value at every step, with no offline calibration possible; distribution differences across heads and channels are even larger than for weights; and worse, quantization error is amplified by the softmax in attention.
+
+*** Their Solutions (Three Different Paths)
+- *KIVI*: no rotation; straightforward asymmetric 2-bit quantization per channel, keys by channel and values by token.
+  Pros: simple and tuning-free. Cons: still faces channel-level outliers.
+- *QuaRot*: extends QuIP's rotation idea to the full model — weights, activations, and KV all run in the rotated coordinate frame,
+  clearing outliers in one pass. But "rotate the entire model" requires substantial modification and is not plug-and-play.
+- *QJL*: the cleverest angle. Rather than trying to reconstruct the original key after quantization, it only requires that the *inner product is statistically unbiased*.
+  After a random orthogonal rotation, retain only the sign (1-bit), then invoke the Johnson-Lindenstrauss lemma
+  to prove that the expectation of ⟨q, k⟩ is unbiased. Extreme compression — one bit per channel.
+
+*** Why They Worked (and Where They Left New Problems)
+All three confirmed that "rotation helps" also holds for KV. But KIVI never exploits rotation, QuaRot requires invasive changes, and QJL delivers only variance estimates, not per-point reconstruction.
+A shared new problem: after rotation, *what quantizer should you actually use?* Picking a uniform quantizer by intuition is unsatisfying.
+Is there a theoretically optimal answer?
+
+** 2025 | TurboQuant: Turning the Quantizer from Intuition into a Theorem
+
+*** What Problem It Saw
+QuIP and QuaRot used empirically tuned quantizers, with no one explaining what the optimal quantizer looks like after random rotation.
+Both under- and over-design were possible, and the only arbiter was experiment.
+
+*** Its Solution
+TurboQuant delivers a clean result: for a unit vector, after applying a structured random rotation
+(sign-flipped Walsh-Hadamard), *the marginal distribution of each coordinate is analytically a symmetric-Beta* —
+a distribution that depends only on the dimension d, not on the specific data.
+Since the distribution is known, the 1-D Lloyd-Max quantizer (a 1950s algorithm)
+yields an MSE-optimal codebook in *closed form*, and that codebook is a function of (d, b) alone — computed once, reused forever, no calibration data required.
+At KV cache time: normalize each key online, rotate it, look it up in this analytic codebook. Done.
+
+*** Why It Worked (and Where It Left a New Problem)
+This is a paradigm shift: from "try to flatten the distribution before quantizing" to "choose a coordinate system where the distribution is naturally well-behaved, then apply the classical optimal quantizer."
+But TurboQuant still quantizes *each coordinate independently* — it splinters the sphere into d independent axes, wasting the geometric constraint that "these coordinates all live on a sphere."
+PolarQuant, published the same year, approached this from a polar-coordinate angle, but recursive polar-angle decoding is expensive.
+New problem: since the rotated vector lives on a *sphere*, can we exploit the *surface* geometry rather than treating each scalar in isolation?
+
+** 2026-05 | OCTOPUS: Jointly Quantize Three Coordinates at Once, Bringing in Sphere Geometry
+
+*** What Problem It Saw
+Coordinate-by-coordinate quantization wastes information in two ways:
+1. The coordinates of a unit vector are not independent — given the others, the current one's range is constrained; quantizing each alone ignores this.
+2. After rotation, the *norm of each small sub-block* concentrates more and more tightly as dimension d grows; its information entropy is low.
+   Spending the same number of bits on the norm as on the direction is wasteful — direction deserves more bits.
+
+*** Its Solution
+Partition the rotated vector into *triplets of 3 coordinates*. For each triplet (x, y, z):
+1. Compute the norm ρ = ||·|| and reduce the direction to a unit vector n.
+2. Map the unit vector n to two scalars (ξ, η) in the square [-1,1]² via the *octahedral map* (a classical trick from computer graphics for compressing normal vectors). The map is piecewise-linear and area-preserving; decoding requires only a handful of additions.
+3. Quantize ρ, ξ, and η separately with 1-D Lloyd-Max, but with *different bit budgets* — solving the Lagrangian yields a clean conclusion: direction gets 1 extra bit and norm gets 1 fewer bit, i.e., (b_dir, b_nrm) = (b+1, b-1).
+
+Finally, a fused Triton kernel is written so that at decode time keys are reconstructed directly from compressed indices — *the full uncompressed key tensor is never written back to memory* — so the compression adds no extra bandwidth overhead during decoding.
+
+*** Why It Worked (and Where It Leaves New Problems)
+Two victories:
+- *Geometric victory*: three coordinates together form a point on S², the octahedral map is area-preserving, and the quantization error approximates the true spherical distance.
+- *Bit-allocation victory*: the MSE optimum tells you "the norm is already concentrated — don't give it too many bits," something TurboQuant cannot say because it has no concept of a "block" and therefore no intra-block bit allocation.
+
+More importantly: OCTOPUS validates the same approach across *language, video, and audio*, demonstrating that the "rotation + geometry + classical optimal quantization" paradigm is modality-agnostic.
+Open problems for successors: what is the optimal encoding for groups of four or five? Can bit budgets be adjusted dynamically per head or per layer? How do you handle manifolds other than the sphere?
+
+* Frontier Extensions
+
+OCTOPUS was posted in May 2026 and as of 2026-05-25 has no direct follow-up work.
+Several probable directions can be anticipated:
+- *Higher-dimensional joint quantization*: extend triplets to groups of 4 or 8. The octahedron is gone, but other area-preserving parameterizations exist (HEALPix, Fibonacci sphere).
+- *Adaptive bit allocation*: the current (b+1, b-1) split is a constant calibrated for d=128; since head distributions differ, should this be tuned per head?
+- *Learned codebooks*: Lloyd-Max is analytically optimal for the marginal distribution, but the joint distribution's optimum may require learning. This merges with the product quantization line of work.
+
+* A Single Diagram
+
+#+begin_example
+              Evolution of KV Cache Quantization Paradigms (2022 -> 2026)
+
+  Year    Core Idea                                         Representative Work
+  ----    ---------------------------------------------     -----------------
+  2022    "Fix the error": compensate post-quantization     GPTQ
+            with Hessian
+            |
+            | Finding: outlier channels are the root cause; compensation treats symptoms
+            v
+  2023    "Change the coordinate system": random rotation   QuIP
+            scatters outliers
+            |
+            | Finding: rotation idea can be extended to KV cache
+            v
+  2024    "Move to KV": three parallel attempts             KIVI (per-channel)
+                                                            QuaRot (full-model rotation)
+                                                            QJL (1-bit JL sketch)
+            |
+            | Finding: after rotation, what should the quantizer look like?
+            v
+  2025    "From intuition to theorem": post-rotation        TurboQuant
+            distribution is analytically known;             PolarQuant (polar-coordinate variant)
+            1-D Lloyd-Max is MSE-optimal
+            |
+            | Finding: but "per-coordinate" wastes sphere geometry
+            v
+  2026    "Joint + geometry": group 3 coordinates,          OCTOPUS  <--
+            octahedral map, MSE-optimal bit allocation
+
+
+  Compression frontier over time:
+    GPTQ  2022 : 4-bit nearly lossless
+    QuIP  2023 : 2-bit usable
+    KIVI  2024 : 2-bit KV cache usable
+    QJL   2024 : 1-bit (inner-product estimation only, not point reconstruction)
+    Turbo 2025 : 2-bit approaching MSE lower bound
+    OCTO  2026 : 2-bit significantly beats Turbo, cross-modal (text / video / audio)
+#+end_example
+
+* Insights
+
+Reading this entire lineage, the strongest impression is that *a paradigm shift matters ten times more than a new algorithm*:
+
+1. *From resistance to alignment*. In the GPTQ era everyone was *fighting outliers* — when an outlier appeared, patch it.
+   QuIP began *routing around outliers* — choose a coordinate system where outliers don't appear.
+   By TurboQuant and OCTOPUS, the stance is *enjoy a beautiful distribution* — choose a coordinate system where the distribution is analytically a Beta, then invoke Lloyd-Max from 1950.
+   The algorithms didn't become smarter; the problem was *transformed into a form that already had a known solution*.
+
+2. *Old theorems reactivated in new settings*. Lloyd-Max (1957/1960), Walsh-Hadamard, Johnson-Lindenstrauss —
+   the core components of this entire line are classical results from the 1950s through the 1980s.
+   The real breakthrough in LLM quantization was not inventing new mathematics but *finding the entry point through which old mathematics could be applied*.
+   That entry point is random orthogonal rotation.
+
+3. *Geometry is increasingly central*. From scalars → sphere → triplet directions → octahedral map,
+   each step shows greater respect for the intrinsic geometry of the data.
+   The next step will likely import manifold / lattice / lattice-code ideas from classical signal processing —
+   product quantization and lattice quantization are already mature there; it is now their turn to enter LLM research.
+
+4. *Hardware intuition is at least as decisive as theory*. OCTOPUS's decisive advantage is not that MSE dropped a little more,
+   but that the fused kernel means the uncompressed key is *never instantiated* during decoding.
+   No matter how elegant the theory, one extra round-trip to GPU memory kills it.
+   The next paper to beat OCTOPUS will likely win half its margin on the kernel, not the proof.
+
+* Implications
+
+This suggests:
+
+- *If you want to do quantization research, first dig through 1960s signal-processing textbooks*.
+  Lloyd-Max, Zador-Gersho, PCM quantization, vector quantization — these are gold mines.
+  Most people on the LLM side have never read them; whoever excavates first eats well.
+
+- *A method for finding problems: look at what people are currently "resisting," and ask whether changing coordinates could make the resistance vanish*.
+  QuIP did this for outliers; OCTOPUS did it for the "independence of individual coordinates." Persistent resistance is a signal that the paradigm has not yet switched.
+
+- *Cross-modal validation is becoming a new competitive moat*. TurboQuant and PolarQuant only ran on LLMs.
+  OCTOPUS ran on video and audio as well, immediately occupying the position of "general-purpose KV cache codec."
+  For infrastructure-class research, cross-modal = cross-domain = harder to displace.
+
+- *The leverage from implementation now rivals the leverage from theory*. If you can write fused CUDA/Triton kernels,
+  your impact on this line exceeds that of writing proofs.
+  The next paper to surpass OCTOPUS will most likely be a combination of "a small theoretical refinement + one fewer memory round-trip in the kernel."

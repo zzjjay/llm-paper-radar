@@ -1,0 +1,300 @@
+#+title:      Dissecting Quantization Error: A Concentration-Alignment Perspective
+#+date:       [2026-05-25 Mon 06:32]
+#+filetags:   :paper:river:quantization:llm:transforms:
+#+identifier: 20260525T063244
+#+source:     https://arxiv.org/abs/2603.04359
+#+authors:    Marco Federici, Boris van Breugel, Paul Whatmough, Markus Nagel (Qualcomm AI Research)
+#+venue:      arXiv preprint, Mar 2026 (ICML submission)
+
+* 一句话
+
+四年了，大家都在治"权重和激活里的离群值"，但谁都没说清楚为什么转一下、scale 一下就管用。
+CAT 把量化误差掰成两个独立的量——*concentration*（数据散得有多开）和 *alignment*（权重和激活的主方向对不对齐）——
+然后发现之前所有 rotation/Hadamard 方法都只在动第一个，第二个一直没人碰。把第二个也优化掉，
+W4A4 的精度直接逼近 W6A6。
+
+* 这条线的核心问题
+
+量化 LLM 时绕不过的事实：拿 4 bit 去近似一个浮点矩阵乘 =Wx=，误差不是均匀分布的。
+个别 channel 的极端值（outlier）会把量化区间撑得巨大，剩下 99% 的数值挤在底部几个格子里，
+精度全靠这些"被噪声淹没的小数"撑着——结果一推理就崩。
+
+整个领域过去四年都在回答一个问题：
+*怎么改造 W 和 x，让它们对量化器更"友好"，同时不改变 Wx 的结果？*
+
+每一代方法都看到了前一代的一个盲点。CAT 看到的盲点最深——它说前人连"误差到底由什么决定"都没说清。
+
+* 溯源地图
+
+#+begin_example
+[2022.08] LLM.int8()                              Dettmers et al.
+          "8-bit 还行，但 6.7B+ 模型崩了，因为有少数 outlier feature"
+          解法: 混合精度——outlier 用 fp16，其余用 int8
+                   |
+                   | 问题: 混合精度是工程苦活，硬件不友好；
+                   |       而且只是"绕开"了 outlier，没"消灭"
+                   v
+[2022.11] SmoothQuant                             Xiao et al.
+          "outlier 全在激活里，权重很平。把激活除以 s, 权重乘以 s"
+          解法: 离线 per-channel 缩放，把 activation outlier 迁到 weight
+                   |
+                   | 问题: outlier 不会消失，只是从 x 挪到 W；
+                   |       极端 layer 上 weight 反而被搞砸了
+                   v
+                   |    (旁支: GPTQ, Frantar 2022)
+                   |     用 Hessian 做层内误差补偿，
+                   |     和"变换"是正交方向，后来被一起用
+                   v
+[2024.04] QuaRot / SpinQuant                      Ashkboos / Liu et al.
+          "outlier 是因为权重/激活有特殊方向。乘一个 Hadamard 旋转，
+           把所有 channel 打散成近高斯分布——outlier 就被'稀释'了"
+          解法: function-preserving 正交变换 (W -> W R^T, x -> R x)
+                   |
+                   | 问题: 旋转能把分布打圆，但 Wx 的"配合方式"没变；
+                   |       一些 layer (down_proj, o_proj) 量化误差还是大,
+                   |       理论上为什么管用、什么时候不够，说不清
+                   v
+[2026.03] CAT  <-- 目标论文                       Federici et al.
+          "SQNR 拆开就是 (bit width) x (concentration) x (alignment)。
+           Hadamard 只动前者；alignment 一直被忽视"
+          解法: 用 calibration set 估协方差, 构造 block-diagonal 变换 M,
+                同时把 concentration 和 alignment 都优化掉
+#+end_example
+
+* 演化叙事
+
+** 2022.08 | LLM.int8(): 发现 outlier 是个"特征"不是"噪声"
+
+*** 它看到了什么问题
+
+在 LLM.int8() 之前，大家以为低 bit 量化的精度损失就是个连续过程——
+模型越大，量化越激进，掉点越多，仅此而已。
+
+Dettmers 跑了系统实验发现：不对，存在一个 *相变*。
+6.7B 以下的模型，int8 几乎无损；6.7B 以上，int8 突然就崩了。
+
+原因是 LLM 里有少数 "outlier feature dimension"——就那么几个 channel，
+数值比其他 channel 大几十倍。它们承担了模型推理时不成比例的信息量。
+量化器要照顾这几个巨人，剩下的小不点全被压扁。
+
+*** 它的解法
+
+简单粗暴的混合精度：
+- 把含 outlier 的几个 channel 拎出来，用 fp16 算；
+- 剩下的"平民" channel 用 int8 算；
+- 加起来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为它承认了 outlier 的存在，而不是当成噪声压平。
+但代价是：混合精度路径在 GPU 上写起来很恶心——不同精度的 kernel、
+不同的内存布局、不同的 dispatch；而且更激进的 W4A4 / W4A8 完全不能这么搞。
+
+*真正的盲点*: 它绕开了 outlier，没解决"为什么 outlier 会出现"以及
+"能不能让 outlier 自己消失"。这两个问题，被下一代接走。
+
+** 2022.11 | SmoothQuant: 既然 W 平、x 尖，把 x 的尖搬给 W
+
+*** 它看到了什么问题
+
+SmoothQuant 的关键观察是：outlier 几乎全在 *激活* x 里，*权重* W 本身非常平。
+这是个不对称问题——但量化算法对 W 和 x 一视同仁，搞得激活量化器永远是瓶颈。
+
+*** 它的解法
+
+利用矩阵乘法的代数恒等式：
+
+#+begin_example
+W x = (W * diag(s)) * (diag(s)^-1 * x) = W' x'
+#+end_example
+
+挑一个对角缩放矩阵 s，把激活里偏大的 channel 缩小，权重对应行放大。
+缩放因子 s 可以离线算好，*完全融进* 权重里，推理时零额外开销。
+
+激活量化变容易了，权重量化稍微难一点——但综合算下来，整体 SQNR 涨了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它第一次把"变换 + 量化"作为一个 *联合优化问题* 提出来。
+变换是函数保持的（数学上 Wx 完全不变），但量化器看到的数值分布变了。
+这是一个范式转换。
+
+*真正的盲点*: outlier 没被消灭，只是搬家——从 x 搬到 W。
+论文里也承认：极端层上 weight 那边崩了。
+而且 per-channel scaling 是 *对角* 变换，自由度太低。
+能不能用更"立体"的变换？这个问题被 QuaRot 接走。
+
+** 2024.04 | QuaRot / SpinQuant: 旋转一下，outlier 就成了高斯
+
+*** 它看到了什么问题
+
+QuaRot 看 SmoothQuant 的方式：你的变换 T 只有对角自由度——
+所以你只能"按 channel 缩放"。如果 outlier 不正好对齐 channel 轴呢？
+你做不了。
+
+那把 T 变成 *任意正交矩阵* 呢？特别是 Hadamard 矩阵——
+它把每个输出 channel 写成所有输入 channel 的 ±1 加权和，
+完美混合所有维度。
+
+数学上 R R^T = I，所以 W R^T R x = W x，仍然是函数保持。
+
+*** 它的解法
+
+在每个线性层前后插入 Hadamard 旋转（一部分融进权重，一部分留作推理时的 fast Walsh-Hadamard 变换，
+代价极小）。旋转后，活动 outlier 被"摊"到所有 channel 上，分布近似高斯。
+高斯分布对均匀量化器特别友好——kurtosis 低，没有长尾。
+
+W4A4 在 LLaMA 上一下子能跑通了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+旋转把 outlier 这个具体现象，化解到了 *分布形状* 这个抽象层面。
+不再是"哪个 channel 大"，而是"整体分布尖不尖"。
+
+但 QuaRot/SpinQuant 论文给的解释一直含糊：为什么 Hadamard 行，
+其他正交矩阵呢？什么时候够，什么时候不够？没人能从第一性原理回答。
+
+而且，CAT 后面会指出来：旋转能把分布打圆，但有些层（down_proj, o_proj, v_proj）
+量化误差还是巨大。Hadamard 在这些层上没辙——它已经把分布打到接近高斯了，
+为什么还是不行？
+
+*真正的盲点*: 大家在动的是 W 和 x *各自* 的形状，但 *量化误差* 是
+W 和 x *联合* 决定的——它们的相互配合方式（alignment），从来没被纳入视野。
+
+** 2026.03 | CAT: 误差不只来自分布形状，还来自 W 和 x 的方向对不对齐
+
+*** 它看到了什么问题
+
+CAT 干了一件之前没人认真做过的事：把量化误差的 SQNR 公式 *推开*。
+
+它证明（在均匀整数量化、clipping error 可忽略时）：
+
+#+begin_example
+SQNR(Wx̃) ≈ 12 · N(b)^2 · C(x) · A(x, W)
+                       ^^^^^   ^^^^^^^^^
+                  concentration  alignment
+#+end_example
+
+- =C(x)=: 衡量 x 散得有多开（≈ kurtosis 的倒数），分布越接近高斯越大；
+- =A(x, W) = E‖Wx‖² / (‖W‖_F² · E‖x‖²)=: 衡量 W 的主方向和 x 的主变化方向有多吻合。
+
+关键洞察：*正交变换不改变 A*。
+对任意旋转 R: A(Rx, WR^T) = A(x, W)。
+所以 Hadamard、QuaRot、SpinQuant 这一整系，无论怎么旋转，
+*完全不动 alignment 这一项*。它们只在 C 上做文章。
+
+而 CAT 的实验显示，对很多 layer，alignment 项的潜在改进空间高达 10 dB
+（绿色 achievable region）——这相当于免费多给了你 1-2 bit。
+
+*** 它的解法
+
+放弃"正交"这个约束，用任意可逆线性变换 T。
+基于 calibration set 估计 W 和 x 的协方差，构造最优的 M：
+让 M x 和 W M^{-1} 的主方向对齐。
+
+完整 M 太贵（密集矩阵的 inverse 推理时挡不住），所以退化成
+*block-diagonal* 近似——把 channels 分块，每块 16/32 维度，
+块内做最优变换，块间不混。
+
+代价：和 Hadamard 同量级（甚至更便宜）。收益：concentration 和 alignment 一起涨。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+为什么管用：因为它给了量化误差一个 *分析框架*，而不是又一个启发式。
+之前所有方法都可以套进这个框架来解释——SmoothQuant 是 block-size = 1
+的对角变换；Hadamard 是只优化 C 的正交变换；CAT 是同时优化 C 和 A 的块对角变换。
+
+可能的新坑：
+- block size 是一个手调超参，没有理论指导怎么选；
+- "calibration set"的代表性问题——CAT 假设 x 的分布在校准时和部署时一致，
+  对极端 distribution shift 会怎样未知；
+- 框架基于"clipping error 可忽略"假设，极低 bit (W2A4 之类) 时
+  这个假设会破，整个分析需要重做。
+
+* 前沿延伸
+
+目标论文是 2026 年 3 月的预印本，截至本文写作（2026 年 5 月）属于这条线的最新进展。
+可能的下一步方向（基于 CAT 自己留下的口子）：
+
+- *学到的 block 划分*: 把 block-diagonal 的分块方式从手设改成可学习；
+- *联合 transform + GPTQ 优化*: CAT 是 calibration-only 的，
+  和 GPTQ 这种 Hessian-based 误差补偿正交，组合空间还没人系统跑过；
+- *clipping-aware 推广*: 把 clipping error 纳入 SQNR 分解，
+  覆盖 W2/W3 这种 ultra-low bit 区间；
+- *硬件 co-design*: block-diagonal 变换天然适合 tile-based 加速器，
+  这是 Qualcomm 这组人的本行——很可能很快有硬件 paper 出来。
+
+* 一张图看懂
+
+#+begin_example
+                    "怎么让 W 和 x 对量化器更友好？"
+                                  |
+   时间 ---->        概念抽象度从"现象"升到"分布"再升到"几何"
+                                  |
+   --------+----------+----------+----------+----------+--------
+   2022    | 2022.11  | 2024     | 2026                |
+   LLM.    | Smooth-  | QuaRot/  | CAT                 |
+   int8()  | Quant    | SpinQuant|                     |
+   --------+----------+----------+---------------------+--------
+           |          |          |                     |
+   看到的: |          |          |                     |
+   outlier | outlier  | outlier  | 误差 = C · A        |
+   是相变  | 在 x 不  | 是分布   | rotation 只动 C     |
+           | 在 W     | 的尖    | A 一直没人碰        |
+           |          |          |                     |
+   动作:   |          |          |                     |
+   绕开    | 平移     | 抹平     | 重对齐              |
+   (混合   | (对角    | (正交    | (块对角             |
+    精度)  | scale)   | rotate)  |  reshape)           |
+           |          |          |                     |
+   自由度: |          |          |                     |
+   外挂    | n        | O(n^2)   | O(b · n)            |
+           |          | 但只在   | 既动 C 又动 A       |
+           |          | 正交群   |                     |
+           |          | 内      |                     |
+   --------+----------+----------+---------------------+--------
+                                  |
+   底层假设的演化:
+   "outlier 是要回避的" -> "outlier 是要搬走的" ->
+   "outlier 是分布尖的副产品" -> "误差是 W 和 x 的几何关系"
+#+end_example
+
+* 洞见
+
+四年线，表面是"四种治 outlier 的方法"，往里看是
+*量化误差被理解的层级在升高*：
+
+1. *现象层*: LLM.int8() 把 outlier 当孤立现象，绕过它。
+2. *分布层*: SmoothQuant、QuaRot 把 outlier 当成分布形状的属性，改变形状。
+3. *几何层*: CAT 把 outlier 抛在脑后，直接看 SQNR 公式怎么分解——
+   "形状"只是误差的一半，"W 和 x 的方向关系"是另一半。
+
+每一代都不是"换个 trick"，而是 *看问题的颗粒度变细了一档*。
+这是好领域的标志——抽象能力在累积，不是 trick 在堆。
+
+往前看：CAT 给出的 SQNR 分解是个 *理论框架*，不只是一个方法。
+框架的价值远超方法本身——之后所有 PTQ 工作都会被问"你的方法在 C 和 A 上分别贡献了多少？"。
+这是 paradigm 起来的标志。
+
+另一个隐含趋势：从"启发式 trick"到"calibration + 协方差估计"。
+后者本质上是 *用一点数据成本*换 *分析可解释性*。
+PTQ 正在从工艺走向工程学。
+
+* 启发
+
+这意味着你可以：
+
+- *做研究时*: 在选问题前，先看这个领域现有的最强方法能否被 *统一进一个分析框架*。
+  如果不能，可能就有 CAT 这种"原来大家都漏看了一项"的机会。
+  能写出 SQNR 这种闭式公式的领域，往往还没被开采到底。
+
+- *做工程时*: 量化部署不要只跑现成的 QuaRot/SmoothQuant，
+  先测一下你的模型在 alignment 项上有多少 headroom。
+  如果某些 layer 的 A 远低于 achievable region，
+  那个 layer 就是值得花精力的——其他 layer 再优化也是边际收益。
+
+- *看论文时*: 当一个领域有 N 个并行的 "trick" 都声称改进了同一个指标，
+  但谁都说不清根因——这个领域离一篇 framework paper 不远了。
+  CAT 就是 quantization transforms 这个子领域的 framework paper。
+  下次看到类似态势的领域（KV cache compression？speculative decoding 的接受率？），
+  抢着写那篇 framework paper。

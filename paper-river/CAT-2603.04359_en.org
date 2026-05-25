@@ -1,0 +1,304 @@
+#+title:      Dissecting Quantization Error: A Concentration-Alignment Perspective
+#+date:       [2026-05-25 Mon 06:32]
+#+filetags:   :paper:river:quantization:llm:transforms:en:
+#+identifier: 20260525T063244-en
+#+source:     https://arxiv.org/abs/2603.04359
+#+authors:    Marco Federici, Boris van Breugel, Paul Whatmough, Markus Nagel (Qualcomm AI Research)
+#+venue:      arXiv preprint, Mar 2026 (ICML submission)
+
+* One-Liner
+
+Four years in, everyone has been treating "outliers in weights and activations," yet nobody has clearly explained why a rotation or a rescaling actually helps.
+CAT decomposes quantization error into two independent quantities — *concentration* (how spread out the data is) and *alignment* (whether the principal directions of weights and activations line up) —
+and then shows that every prior rotation/Hadamard method only ever touched the first term; the second was never addressed.
+Optimizing both simultaneously pushes W4A4 accuracy to nearly match W6A6.
+
+* The Core Question on This Line of Research
+
+One inescapable fact when quantizing LLMs: approximating a floating-point matrix multiplication =Wx= at 4 bits produces non-uniform error.
+A handful of channels with extreme values (outliers) stretch the quantization range enormously, cramming 99% of the values into a tiny slice of grid points,
+where the signal is effectively buried in quantization noise — causing inference quality to collapse.
+
+The entire field has spent four years answering a single question:
+*How do we reshape W and x so they are more "quantization-friendly," without changing the result of Wx?*
+
+Each generation of methods spotted a blind spot in the previous one. CAT spots the deepest blind spot yet — it argues that predecessors never even properly characterized what determines the error.
+
+* Lineage Map
+
+#+begin_example
+[2022.08] LLM.int8()                              Dettmers et al.
+          "INT8 is fine, but models ≥6.7B collapse due to a small number of outlier features"
+          Fix: mixed-precision — outliers in fp16, the rest in int8
+                   |
+                   | Problem: mixed-precision is engineering pain, hardware-unfriendly;
+                   |          it *routes around* outliers rather than eliminating them
+                   v
+[2022.11] SmoothQuant                             Xiao et al.
+          "Outliers live in activations; weights are flat. Divide activations by s, multiply weights by s"
+          Fix: offline per-channel scaling, migrating activation outliers into weights
+                   |
+                   | Problem: outliers don't disappear, they just move from x to W;
+                   |          on extreme layers the weight side breaks instead
+                   v
+                   |    (Side branch: GPTQ, Frantar 2022)
+                   |     Uses Hessian for intra-layer error compensation —
+                   |     orthogonal to the "transform" direction; later combined with it
+                   v
+[2024.04] QuaRot / SpinQuant                      Ashkboos / Liu et al.
+          "Outliers arise from special directions in weights/activations.
+           Apply a Hadamard rotation to spread all channels into a near-Gaussian
+           distribution — outliers are 'diluted'"
+          Fix: function-preserving orthogonal transforms (W -> W R^T, x -> R x)
+                   |
+                   | Problem: rotation can round out the distribution, but the
+                   |          "coordination" between W and x is unchanged;
+                   |          some layers (down_proj, o_proj) still have large error;
+                   |          no theoretical account of why it works or when it falls short
+                   v
+[2026.03] CAT  <-- target paper                   Federici et al.
+          "SQNR factors into (bit width) × (concentration) × (alignment).
+           Hadamard only touches the first; alignment has been ignored all along."
+          Fix: estimate covariance from a calibration set, construct a block-diagonal
+               transform M that optimizes both concentration and alignment simultaneously
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022.08 | LLM.int8(): Discovering That Outliers Are a "Feature," Not Noise
+
+*** What Problem Did It See
+
+Before LLM.int8(), the conventional wisdom was that accuracy loss from low-bit quantization was a smooth, continuous process —
+larger model, more aggressive quantization, more degradation, nothing more.
+
+Dettmers ran systematic experiments and found otherwise: there is a *phase transition*.
+Below 6.7B parameters, INT8 is nearly lossless; above 6.7B, INT8 suddenly collapses.
+
+The culprit is a small number of "outlier feature dimensions" in LLMs — just a few channels
+whose magnitudes dwarf all other channels by tens of times. These channels carry a disproportionate share of the model's representational capacity.
+The quantizer has to accommodate these giants, flattening all the smaller values in the process.
+
+*** Its Fix
+
+A straightforward mixed-precision approach:
+- Extract the few channels containing outliers and compute them in fp16;
+- Compute the remaining "ordinary" channels in INT8;
+- Sum the results.
+
+*** Why It Works (and What New Pitfalls It Buries)
+
+It works because it acknowledges the existence of outliers rather than suppressing them as noise.
+But the cost is real: mixed-precision execution paths are painful to write for GPUs — different-precision kernels,
+different memory layouts, different dispatch logic; and for more aggressive W4A4 / W4A8 settings, this approach simply doesn't scale.
+
+*The real blind spot*: it routes around outliers without answering why they appear or
+whether they can be made to disappear on their own. Both questions were inherited by the next generation.
+
+** 2022.11 | SmoothQuant: Since W Is Flat and x Is Spiky, Move the Spikes from x to W
+
+*** What Problem Did It See
+
+SmoothQuant's key observation: outliers live almost exclusively in the *activations* x; the *weights* W are well-behaved by comparison.
+This is an asymmetric problem — yet quantization algorithms treat W and x identically, making the activation quantizer the perpetual bottleneck.
+
+*** Its Fix
+
+Exploit an algebraic identity in matrix multiplication:
+
+#+begin_example
+W x = (W * diag(s)) * (diag(s)^-1 * x) = W' x'
+#+end_example
+
+Choose a diagonal scaling matrix s to shrink the oversized activation channels and correspondingly enlarge the matching weight rows.
+The scale factors can be computed offline and *folded directly* into the weights — zero overhead at inference time.
+
+Quantizing the activations becomes easier; quantizing the weights becomes slightly harder —
+but on balance, the overall SQNR improves.
+
+*** Why It Works (and What New Pitfalls It Buries)
+
+It is the first method to frame "transform + quantize" as a *joint optimization problem*.
+The transform is function-preserving (Wx is mathematically identical), yet the distribution seen by the quantizer has changed.
+This is a paradigm shift.
+
+*The real blind spot*: outliers are not eliminated — they are relocated from x to W.
+The paper itself acknowledges that on extreme layers the weight side breaks.
+Moreover, per-channel scaling is a *diagonal* transform with very limited degrees of freedom.
+Could a more "three-dimensional" transform do better? That question was picked up by QuaRot.
+
+** 2024.04 | QuaRot / SpinQuant: One Rotation and Outliers Become Gaussian
+
+*** What Problem Did It See
+
+QuaRot's view of SmoothQuant: your transform T has only diagonal degrees of freedom —
+you can only "scale per channel." What if outliers don't happen to align with the channel axes?
+You're stuck.
+
+What if T is allowed to be an *arbitrary orthogonal matrix*? In particular, a Hadamard matrix —
+which writes each output channel as a ±1-weighted sum of all input channels,
+perfectly mixing every dimension.
+
+Mathematically R R^T = I, so W R^T R x = W x; the transform remains function-preserving.
+
+*** Its Fix
+
+Insert Hadamard rotations before and after each linear layer (some folded into the weights offline, some applied at inference as a fast Walsh-Hadamard transform with negligible cost).
+After rotation, activation outliers are "smeared" across all channels and the distribution approximates a Gaussian.
+Gaussian distributions are especially friendly to uniform quantizers — low kurtosis, no heavy tails.
+
+W4A4 on LLaMA suddenly became viable.
+
+*** Why It Works (and What New Pitfalls It Buries)
+
+Rotation abstracts away the specific phenomenon of outliers and re-frames it at the level of *distributional shape*.
+The question is no longer "which channel is large" but "how heavy-tailed is the overall distribution."
+
+But the explanations in QuaRot/SpinQuant were always somewhat vague: why does Hadamard specifically work?
+What about other orthogonal matrices? When is rotation enough, and when is it not?
+Nobody could answer from first principles.
+
+Moreover, as CAT would later point out, certain layers (down_proj, o_proj, v_proj) still exhibit enormous quantization error even after rotation.
+Hadamard has already driven the distribution close to Gaussian on these layers — so why does large error persist?
+
+*The real blind spot*: the community has been reshaping the *individual* distributions of W and x,
+but *quantization error* is determined *jointly* by W and x together —
+specifically, how their principal directions relate to each other (alignment). That has never entered the picture.
+
+** 2026.03 | CAT: Error Comes Not Just from Distributional Shape, But from W–x Directional Misalignment
+
+*** What Problem Did It See
+
+CAT does something nobody had seriously attempted before: it *works out the SQNR formula analytically*.
+
+It proves that (under uniform integer quantization with negligible clipping error):
+
+#+begin_example
+SQNR(Wx̃) ≈ 12 · N(b)^2 · C(x) · A(x, W)
+                       ^^^^^   ^^^^^^^^^
+                  concentration  alignment
+#+end_example
+
+- =C(x)=: measures how spread out x is (≈ inverse kurtosis); larger when the distribution is closer to Gaussian;
+- =A(x, W) = E‖Wx‖² / (‖W‖_F² · E‖x‖²)=: measures how well the principal directions of W align with the principal directions of variation in x.
+
+The critical insight: *orthogonal transforms do not change A*.
+For any rotation R: A(Rx, WR^T) = A(x, W).
+Therefore the entire family of Hadamard, QuaRot, and SpinQuant methods,
+no matter how they rotate, *leaves the alignment term completely untouched*.
+They operate exclusively on C.
+
+CAT's experiments show that for many layers the potential improvement available in the alignment term is as large as 10 dB
+(the green "achievable region") — equivalent to getting 1–2 extra bits for free.
+
+*** Its Fix
+
+Drop the "orthogonal" constraint and allow any invertible linear transform T.
+Estimate the covariances of W and x from a calibration set and construct the optimal M:
+arrange for the principal directions of M x and W M^{-1} to be aligned.
+
+A full, dense M is too expensive — its inverse would dominate inference cost — so CAT approximates it as a
+*block-diagonal* matrix: partition channels into blocks of 16 or 32 dimensions, apply the optimal transform within each block, and leave inter-block mixing to zero.
+
+Cost: comparable to Hadamard (or even cheaper). Benefit: both concentration and alignment improve simultaneously.
+
+*** Why It Works (and What New Pitfalls It Leaves
+
+Why it works: it provides an *analytical framework* for quantization error rather than yet another heuristic.
+Every prior method can be re-expressed within this framework — SmoothQuant is a block-size-1 diagonal transform;
+Hadamard is an orthogonal transform that optimizes C only; CAT is a block-diagonal transform that optimizes both C and A.
+
+Potential new pitfalls:
+- Block size is a manually tuned hyperparameter with no theoretical guidance for selection;
+- The "calibration set" representativeness problem — CAT assumes the distribution of x at calibration time matches deployment; behavior under severe distribution shift is unknown;
+- The framework rests on the assumption that clipping error is negligible; at ultra-low bit widths (W2A4, etc.) this breaks and the entire analysis needs to be revisited.
+
+* Extensions to the Frontier
+
+The target paper is a March 2026 preprint; as of the time of writing (May 2026) it represents the latest advance on this line.
+Likely next directions, based on the openings CAT leaves:
+
+- *Learned block partitioning*: replace the fixed block-diagonal structure with a learnable grouping of channels;
+- *Joint transform + GPTQ optimization*: CAT is calibration-only and is orthogonal to Hessian-based error compensation (GPTQ); the combination has not been systematically explored;
+- *Clipping-aware generalization*: incorporate clipping error into the SQNR decomposition to cover ultra-low-bit regimes like W2/W3;
+- *Hardware co-design*: block-diagonal transforms map naturally onto tile-based accelerators — this is the home turf of the Qualcomm group, so a hardware paper seems likely soon.
+
+* The Big Picture at a Glance
+
+#+begin_example
+                    "How do we make W and x more quantization-friendly?"
+                                  |
+   Time ---->    Conceptual abstraction rises: phenomenon -> distribution -> geometry
+                                  |
+   --------+----------+----------+----------+----------+--------
+   2022    | 2022.11  | 2024     | 2026                |
+   LLM.    | Smooth-  | QuaRot/  | CAT                 |
+   int8()  | Quant    | SpinQuant|                     |
+   --------+----------+----------+---------------------+--------
+           |          |          |                     |
+   Insight:|          |          |                     |
+   outlier | outlier  | outlier  | error = C · A       |
+   is a    | is in x, | is a     | rotation only       |
+   phase   | not W    | heavy    | touches C;          |
+   trans-  |          | tail     | A never addressed   |
+   ition   |          |          |                     |
+           |          |          |                     |
+   Action: |          |          |                     |
+   route   | shift    | smooth   | re-align            |
+   around  | (diag    | out      | (block-diag         |
+   (mixed  | scale)   | (ortho   |  reshape)           |
+    prec.) |          | rotate)  |                     |
+           |          |          |                     |
+   Degrees:|          |          |                     |
+   of      | n        | O(n^2)   | O(b · n)            |
+   freedom:|          | but only | moves both C and A  |
+   external|          | within   |                     |
+           |          | the      |                     |
+           |          | orthog.  |                     |
+           |          | group    |                     |
+   --------+----------+----------+---------------------+--------
+                                  |
+   Evolution of underlying assumptions:
+   "Outliers are to be avoided" -> "Outliers are to be relocated" ->
+   "Outliers are a symptom of heavy tails" -> "Error is a geometric relationship between W and x"
+#+end_example
+
+* Insight
+
+Four years, four methods — on the surface a story about "four ways to treat outliers."
+Look deeper and you see *the level at which quantization error is understood climbing steadily*:
+
+1. *Phenomenon level*: LLM.int8() treats outliers as isolated anomalies and routes around them.
+2. *Distribution level*: SmoothQuant and QuaRot treat outliers as a property of distributional shape and change the shape.
+3. *Geometric level*: CAT sets outliers aside entirely and asks directly how the SQNR formula decomposes —
+   "shape" is only half the story; "the directional relationship between W and x" is the other half.
+
+Each generation is not just a new trick — it is *one level finer in its granularity of understanding*.
+That is the hallmark of a healthy research field: accumulated abstraction, not accumulated tricks.
+
+Looking forward: the SQNR decomposition CAT provides is a *theoretical framework*, not merely a method.
+A framework is worth far more than any single technique — every future PTQ paper will face the question
+"how much does your method contribute to C, and how much to A?" That is the signature of a nascent paradigm.
+
+There is also a subtler trend: the shift from "heuristic tricks" to "calibration + covariance estimation."
+The latter trades a small data cost for analytical interpretability.
+PTQ is graduating from craft to engineering.
+
+* Takeaways
+
+This suggests you can:
+
+- *When doing research*: before choosing a problem, check whether the strongest existing methods in that field can be *unified into a single analytical framework*.
+  If they cannot, there may be a CAT-style opportunity — "it turns out everyone was missing one term."
+  Fields that admit closed-form expressions like SQNR are often not yet fully mined.
+
+- *When doing engineering*: don't just run off-the-shelf QuaRot or SmoothQuant on your model —
+  first measure how much headroom your model has in the alignment term.
+  If certain layers have A far below the achievable region, those are the layers worth spending effort on;
+  further optimizing other layers will yield diminishing returns.
+
+- *When reading papers*: when a field has N parallel tricks all claiming to improve the same metric
+  but none of them can explain the root cause — that field is close to needing a framework paper.
+  CAT is precisely that framework paper for the quantization-transforms subfield.
+  Next time you spot a similar situation (KV cache compression? speculative decoding acceptance rates?),
+  be the one to write that framework paper.

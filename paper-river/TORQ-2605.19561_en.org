@@ -1,0 +1,257 @@
+#+title:      TORQ: Two-Level Orthogonal Rotation for MXFP4 Quantization
+#+date:       [2026-05-25 Mon 07:03]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T070330-en
+#+source:     https://arxiv.org/abs/2605.19561
+#+authors:    Zukang Xu, Xing Hu, Dawei Yang
+#+venue:      arXiv 2026-05 (cs.LG)
+
+* The River of the Problem
+
+Can a large model stay smart once its activations are squeezed to 4 bits?
+
+Everyone working on this line has been wrestling with the same thing, generation after generation: during LLM inference, the intermediate values produced at each layer always contain a few "giants" — numbers whose absolute values dwarf their neighbors by tens of times. If you try to represent these in 4 bits, you either accommodate the giants and crush everyone else to zero, or you accommodate the ordinary values and let the giants overflow. Either way you lose. So what do you do? Over the past decade the answers have kept being rewritten: first "clip the giants," then "spread the giants flat," then "change coordinates so the giants disappear," and the latest wave is redefining what a "giant" even means — because the next generation of hardware (NVIDIA Blackwell, AMD Ryzen AI) natively supports MXFP4, and the rules have changed entirely.
+
+* The Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  |
+  | Problem: LLM weights need to fit in 4 bits, but direct round-to-nearest
+  |          collapses accuracy
+  | Solution: Use Hessian to compensate weights; quantize column by column
+  v
+[2022] LLM.int8 / [2023] SmoothQuant (Xiao et al.)
+  |
+  | Problem: GPTQ only fixes weights; massive outliers in activations remain
+  | Solution: "Migrate" some activation difficulty to weights
+  |           (per-channel scaling)
+  v
+[2024] QuaRot / QuIP# (Ashkboos / Tseng et al.)
+  |
+  | Problem: Migration isn't enough; outliers still dominate the error
+  | Solution: Use Hadamard orthogonal rotation to "spread" the distribution;
+  |           outliers are scattered into uniform noise
+  v
+[2024-2025] FlatQuant / OSTQuant (Sun / Hu et al.)
+  |
+  | Problem: Fixed Hadamard isn't optimal; the rotation should be learned
+  | Solution: Learn an orthogonal matrix; objective: compress dynamic range
+  |           (clip-ratio optimization)
+  v
+[2025] SingleQuant / DARTQuant (Xiao / Shao et al.)
+  |
+  | Problem: The above were designed for INT4;
+  |          new hardware supports MXFP4 (block-shared exponent, e2m1 codebook),
+  |          the rules changed -- INT-era optimization targets no longer apply
+  | Solution: Port the rotation idea, but still limited to generic outlier suppression
+  v
+[2025] BRQ (Shao et al.)
+  |
+  | Problem: MXFP4 is block floating-point; within-block distribution must
+  |          align with the codebook
+  | Solution: Intra-block rotation to match the within-block distribution
+  |           to the FP4 codebook (but ignores inter-block energy imbalance)
+  v
+[2026] TORQ (this paper) <-- target paper
+  |
+  | Problem: BRQ only looks within blocks, not across them; yet the shared
+  |          exponent in MXFP4 breaks precisely because inter-block variance
+  |          is uneven
+  | Solution: Two-level orthogonal rotation
+  |   - Inter-block (macro): Schur-Horn theorem, equalize variance across blocks
+  |   - Intra-block (micro): Maximum entropy, fully utilize the codebook
+  v
+[?] Next: Bake the rotation structure into weights at training time?
+          Extend TORQ to joint W4A4 + KV cache?
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Quantize Weights, Compensate Error via Hessian
+
+*** What Problem It Saw
+
+At the time, the goal was to compress LLM weights to 4 bits for direct inference, but direct round-to-nearest (RTN) immediately collapsed accuracy — for a 7B model, perplexity would jump from around 5 to dozens. The reason is that weights are not independent: quantizing the first column disturbs the next columns badly, and errors accumulate.
+
+*** Its Solution
+
+Inspired by Optimal Brain Surgeon: after quantizing each column of weights, use the Hessian matrix to estimate the "damage" done to the remaining columns, then apply a small floating-point correction to the as-yet-unquantized columns. Proceeding column by column, the error is absorbed along the way.
+
+*** Why It Worked (and What New Problem It Buried)
+
+It tamed the weight side. But the other half of LLM inference — activations — remained in floating point. When people wanted to quantize activations too (W4A4, weight 4-bit + activation 4-bit), GPTQ couldn't reach there: you cannot apply Hessian compensation to dynamically generated activations. Activations contain so-called outlier channels — a few fixed channels whose values are tens or even hundreds of times larger than the rest. Quantize them and they either overflow or crush everything else to zero. This outlier problem became the protagonist of every subsequent paper.
+
+** 2023 | SmoothQuant: Migrate Some Activation Difficulty to Weights
+
+*** What Problem It Saw
+
+Activation outliers concentrate in a small number of channels. To accommodate them, the entire quantization range is stretched, destroying the precision of ordinary values.
+
+*** Its Solution
+
+Elegantly simple: since outliers concentrate in certain channels, divide those activation channels by a scale factor s, then multiply the corresponding weight rows by s. Mathematically X·W is unchanged, but the activations become gentler and the weights become slightly harder — and weights are already easy to quantize, so they can handle it.
+
+*** Why It Worked (and What New Problem It Buried)
+
+It redistributed "activations hard, weights easy" into "both sides moderate." But the scale is a per-channel scalar: it can only *migrate* difficulty, not *scatter* it. If outliers jump across different channels across samples, or if even within one channel the distribution is erratic, the scale cannot save things. What was needed was a tool capable of reshaping the entire distribution.
+
+** 2024 | QuaRot / QuIP#: Hadamard Rotation, Spreading Outliers into Uniform Noise
+
+*** What Problem It Saw
+
+SmoothQuant shuffled difficulty around, but outliers were still outliers — just under different ownership. To eradicate them, the concentration had to be broken: transform the distribution from "a few sharp spikes" into "a gentle slope."
+
+*** Its Solution
+
+Introduce the Hadamard matrix H: it is orthogonal (H·Hᵀ=I, so multiplying by it and back changes nothing), and it is dense — each output element is a weighted sum of all input elements. A single outlier, after passing through Hadamard, is spread uniformly across all dimensions. Activation · weight = (XH)·(HᵀW), mathematically equivalent but now approximately Gaussian distributed — very easy to quantize.
+
+*** Why It Worked (and What New Problem It Buried)
+
+The Central Limit Theorem does the work for you: summing many weighted elements pushes the result toward Gaussian, and Gaussian has no heavy tails. Hadamard is the cheapest dense orthogonal matrix (only ±1 and addition/subtraction), making it essentially free at inference time.
+
+New problem buried: Hadamard is fixed, agnostic to both model and layer. Different layers have very different activation statistics, so the optimal rotation should differ too. A fixed matrix is one-size-fits-all, which is guaranteed to be suboptimal.
+
+** 2024-2025 | FlatQuant / OSTQuant: Learn a Rotation, Target: Compress Dynamic Range
+
+*** What Problem It Saw
+
+If Hadamard is not optimal, learn a rotation matrix R. But how? What should the objective function be?
+
+*** Its Solution
+
+Define a clip-ratio loss: minimize the truncation error when the rotated activations are quantized. That is, learn R such that XR has the smallest possible maximum value and the narrowest possible dynamic range, so that the INT4 grid can accommodate more data.
+
+*** Why It Worked (and What New Problem It Buried)
+
+Given the geometry of the INT4 grid, this objective makes sense: INT4 is a uniform grid, so the narrower the dynamic range, the smaller the quantization step, and the higher the precision. FlatQuant and OSTQuant achieved SOTA on W4A4 INT.
+
+But — hardware was changing. The generation of NVIDIA Blackwell and AMD Ryzen AI natively supports not INT4 but MXFP4: every 32 numbers share a power-of-two exponent sb, and each number is represented in e2m1 (2-bit exponent + 1-bit mantissa). MXFP4 is *block floating-point*, not a uniform grid. What it demands is *fully utilizing the dynamic range* (unused exponent range is wasted), not *compressing the dynamic range*. FlatQuant's optimization target points in the *opposite direction* from MXFP4's geometry.
+
+** 2025 | SingleQuant / DARTQuant: Port the Rotation Idea to MXFP4, But the Target Is Still Outlier Suppression
+
+*** What Problem It Saw
+
+New hardware arrived; MXFP4 was the trend. Directly transplanting the INT4-era rotation methods worked, but the results were underwhelming — the objective function hadn't changed, but the geometry had.
+
+*** Its Solution
+
+Continue using Hadamard or learned rotations, but tune hyperparameters more toward MXFP4. The essential thinking is still "suppress outliers," without touching MXFP4's true weakness.
+
+*** Why It Worked (and What New Problem It Buried)
+
+It ran, and it was much better than direct RTN, but the gap to BF16 remained large. On Qwen3-32B, direct RTN sits at 38.4%; these methods could pull it up to around 60%, but BF16 is 74.8%. The wrong problem was being targeted: MXFP4 failures are not ordinary outlier failures.
+
+** 2025 | BRQ: The First Rotation Designed for MXFP4, But Only Looks Within Blocks
+
+*** What Problem It Saw
+
+MXFP4 is block floating-point: every 32 numbers share an exponent. If the within-block distribution does not align with the logarithmic-geometric codebook of e2m1 (±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6), a large fraction of values pile into the first bin while the remaining codewords sit idle — "codebook collapse." This is an entirely new problem that did not exist in the INT4 era.
+
+*** Its Solution
+
+Apply an orthogonal rotation R_intra within each block, so that the within-block distribution spreads more uniformly across the FP4 codebook space.
+
+*** Why It Worked (and What New Problem It Buried)
+
+It got half of it right. Within-block alignment genuinely matters and can "activate" previously idle codewords.
+
+But *inter-block energy* was completely ignored. If a single block contains even one outlier, the shared exponent sb is immediately inflated by it, the quantization step of the other 31 numbers in the block coarsens accordingly, and 90% of the small values get rounded to zero. No matter how well BRQ does within a block, if inter-block variance is uneven, the overall error is still dominated by a handful of high-variance blocks.
+
+** 2026 | TORQ: Two-Level Rotation, Treating Both Inter-Block and Intra-Block
+
+*** What Problem It Saw
+
+Breaking down the root cause of MXFP4 failure reveals two *orthogonal* structural imbalances:
+
+1. *Uneven inter-block variance* — a few high-variance blocks consume the majority of the error budget
+2. *Uneven intra-block codebook utilization* — heavy-tailed distributions mismatch the e2m1 geometry
+
+Every prior method addressed at most one of these (BRQ addressed 2), or used a blended objective that handled neither well (INT4-era methods). The problem had never been seen in full.
+
+*** Its Solution
+
+Decompose the full-space rotation R as a Kronecker product: R = R_inter ⊗ R_intra.
+
+- *Macro (inter-block)*: Invoke the Schur-Horn theorem — for any symmetric matrix, the diagonal entries can be transformed via orthogonal change of basis into any vector that is majorized by its eigenvalues, including the *uniform vector*. Therefore, there theoretically exists an orthogonal rotation that equalizes the variance of all blocks. It is constructed iteratively using Givens rotations, converging in O(B²) steps. Once inter-block variance is equalized, the maximum block variance drops, the shared exponent sb drops with it, and the precision of small numbers within every block recovers globally.
+- *Micro (intra-block)*: Maximum-entropy principle — make the usage frequency of each codeword as close to 1/8 as possible. Define a Codebook Occupancy Equilibrium Loss and optimize it with alternating S-step / R-step updates: the S-step updates block scaling, and the R-step minimizes codebook imbalance through Givens rotations.
+
+Both rotations are orthogonal matrices and can be *fused* into the weights of adjacent Linear layers, adding zero overhead at inference time.
+
+*** Why It Worked (and What New Problems Remain)
+
+This is the first work to align the structure of the problem so precisely with the structure of the hardware format. The optimization target of the INT4 era (compress dynamic range) and the optimization target of the MXFP4 era (equalize inter-block variance + fully utilize the codebook) *point in opposite directions* — TORQ is the first work to fully recognize this. The result: on Qwen3-32B, accuracy rises from RTN's 38.4% to 73.63%, approaching BF16's 74.82%.
+
+Remaining open problems:
+
+1. Only activation rotation is addressed; does an isomorphic problem exist on the weight side (W4 also shares exponents)?
+2. This is training-free PTQ; if the rotation were baked into weights during training, could results improve further?
+3. KV cache quantization (another major cost at inference time) has not been touched.
+
+* Frontier Extensions
+
+As of 2026-05, TORQ is the latest publicly available work on the MXFP4 activation quantization line. Several directional signals are visible on arXiv around the same period (concurrent or slightly later):
+
+- *Hardware direction*: NVIDIA Blackwell (released 2025) and AMD Ryzen AI are driving real-world MXFP4 deployment. Over the next 6–12 months, expect a wave of "training-time MXFP4-aware" work (QAT for MXFP4), rather than PTQ applied only at inference.
+- *Format direction*: MXFP6, NVFP4, BFP16, and other block floating-point formats are already in OCP drafts. TORQ's two-level rotation framework is theoretically portable — the Schur-Horn argument for inter-block variance equalization is independent of the specific codebook, and the intra-block maximum-entropy objective only requires swapping out the codeword set.
+- *Joint direction*: Extending the R_inter ⊗ R_intra design to W4A4, and incorporating KV cache quantization. The OSTQuant team (which shares co-author Xing Hu with TORQ) is likely to be a key player in follow-up work — worth tracking.
+
+(Note: the frontier extensions above are trend-based inferences, not confirmed by specific papers.)
+
+* One Diagram to Understand It All
+
+#+begin_example
+              GPTQ        SmoothQuant     QuaRot       FlatQuant      BRQ          TORQ
+              (2022)      (2023)          (2024)       (2024)         (2025)       (2026)
+              |           |               |            |              |            |
+Weight side   ===compensate===  --migrate difficulty->  --multiply H-->  --multiply R-->  --multiply R-->  --multiply R (two-level)-->
+              |           |               |            |              |            |
+Activation    (untouched)  <-receive diff--  <--multiply H--  <--multiply R--  <--multiply R--  <--multiply R (two-level)--
+              |           |               |            |              |            |
+Target format  INT4 (W)   INT8 (W+A)      INT4 (W+A)   INT4 (W+A)     MXFP4 (A)   MXFP4 (A)
+              |           |               |            |              |            |
+Quant grid    uniform     uniform         uniform      uniform        block float  block float
+              |           |               |            |              |            |
+Objective     Hessian     channel         approx.      compress       intra-block  equalize inter-block
+              error comp. scale           Gaussian     dynamic range  codebook     variance + max-entropy
+              |           |               |            |              | alignment   intra-block
+              |           |               |            |              |            |
+Problem seen  weight      activation      outlier      Hadamard not   INT4 ideas   BRQ misses
+              chain error  outlier        concentration  optimal       mismatch     inter-block energy
+                                                                       MXFP4
+
+  +-----------------------------------------------------------------------------------+
+  | Main thread: "migrate difficulty" -> "spread difficulty" -> "learn to spread"     |
+  |              -> "spread for the correct geometry"                                 |
+  | Key turning point: hardware shifts from INT grid to BFP; optimization target     |
+  |   must flip from "compress tight" to "spread evenly + utilize fully"             |
+  +-----------------------------------------------------------------------------------+
+#+end_example
+
+* Insight
+
+On the surface, this line is about "how to raise quantization accuracy." What is actually happening underneath is *software optimization targets recalibrating to match hardware geometry*.
+
+- INT4 era: hardware is a uniform grid → software target is "compress dynamic range" (FlatQuant lineage) → narrower is better.
+- MXFP4 era: hardware is block floating-point + logarithmic codebook → software target becomes "equalize inter-block variance + spread codebook utilization" → the goal is not narrower but *more uniform*.
+
+Many practitioners missed that this is a *directional reversal*. SingleQuant and DARTQuant ported the INT4 machinery to MXFP4: it ran, but the ceiling was low, because the optimization target and the hardware structure were pointing in different directions. BRQ got halfway there (it saw the codebook). TORQ saw the complete structure (inter-block + intra-block = the full geometry of MXFP4).
+
+The more universal pattern: every time the underlying hardware changes generations (INT → FP → BFP → some future adaptive format), all the optimization wisdom accumulated for the prior generation needs to be *reexamined at the level of the objective itself*, not merely ported algorithmically. Porting algorithms is free; *questioning objectives costs something* — many teams did only the former and not the latter, which is why their results fell short.
+
+Where might the next steps lead?
+- Push the "rotation–hardware-geometry alignment" idea into training (QAT for MXFP4), so that weights converge from the start in the rotated space.
+- Apply the R_inter ⊗ R_intra structure to KV cache quantization — the KV cache also stores values with block-shared exponents, so the problem is isomorphic.
+- When hardware evolves again (NVIDIA's NVFP4 is already on the horizon), this line will force the community to do another round of objective reflection.
+
+* Takeaways
+
+What this line teaches about *how to find good problems*:
+
+*The most worthwhile problems tend to hide in mismatches between the structure of two systems.* TORQ's insight was not inventing a new algorithm; it was seeing that the *optimization target of the INT4 era points in the opposite direction from the hardware geometry of MXFP4*. That sense of dissonance — "these two things clearly should be aligned, but they aren't" — is the highest-value signal there is.
+
+Practical implications:
+
+- When a field's underlying substrate changes (hardware generation, data scale, task paradigm), resist the urge to immediately port old algorithms. First ask: *does the old objective still point in the right direction in the new world?*
+- When a method performs "decent but with a low ceiling" on benchmarks, the problem is usually not that the algorithm is too weak — it's that the objective is wrong. A strong algorithm with a wrong objective means working hard on the wrong hillside.
+- TORQ uses the Schur-Horn theorem to prove that variance equalization is the optimal solution — a result from pure mathematics in the 1950s. *New hardware + old mathematics = new method* is more reliable than *new hardware + new heuristics*. When you see an engineering problem that a classical theorem addresses head-on, do not hesitate — that is your answer.

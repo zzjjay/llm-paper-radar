@@ -1,0 +1,309 @@
+#+title:      Decomposing MXFP4 quantization error for LLM reinforcement learning: reducible bias, recoverable deadzone, and an irreducible floor
+#+date:       [2026-05-25 Mon 07:19]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T071930-en
+#+source:     https://arxiv.org/abs/2605.20402
+#+authors:    Xiaocan Li, Shiliang Wu, Zheng Shen (Huawei Canada)
+#+venue:      arXiv preprint, May 2026
+
+* The Problem River
+
+Taking a large model's RL post-training — the step that teaches the model to reason — from BF16 all the way down to MXFP4 promises a 4× speedup and 4× memory reduction in hardware. The cost: a substantial accuracy drop. Problems the model once solved correctly it now gets wrong.
+
+A decade of quantization literature has treated this "accuracy drop" as a *single* noise term — add some noise, watch the loss change, tune it a little. In the SFT era that was fine; but with RL, things get strange:
+
+- Sometimes quantization actually *boosts* exploration (the QeRL paper at ICLR rode that observation)
+- Sometimes quantization flatlines the reward growth curve entirely
+- Sometimes LoRA quantization matches full-parameter training; sometimes it falls far behind
+
+Why does the same "noise term" sometimes act as a friend and sometimes as an enemy inside RL? The answer is almost certainly that it is *not* one term. It is three distinct error sources bundled together, each sabotaging RL through a different channel — but because we have always looked at them as a lump, we cannot see clearly.
+
+MX3 does something simple that nobody had done before: it *decomposes* MXFP4 quantization error into three mathematically distinct parts, proves they are orthogonal (non-interfering), and then traces each one to exactly which RL pipeline it damages. Three error components, three RL failure modes, three targeted fixes — assembled together, they close the gap with BF16 to within 1 percentage point, and on MoE models they even surpass BF16.
+
+This river is the story of how the habit of treating "noise" as a single variable gradually broke down — and why RL was the turning point that forced everyone to confront that fact.
+
+* The Source Map
+
+#+begin_example
+[2023] Rouhani et al. - OCP MX format (MXFP4 spec)
+  |
+  | Hardware gift: 32 elements share one E8M0 scale + per-element E2M1 (4-bit)
+  | The 4x speed promise buried three independent error sources, but nobody
+  | decomposed them at the time
+  v
+[2023-2024] GPTQ (Frantar), AWQ (Lin), SmoothQuant (Xiao)
+  |
+  | PTQ for the inference era: treat quantization error as a single MSE term to minimize
+  | Second-order Hessian / activation-aware scaling / outlier redistribution —
+  | all of it is "find a way to shrink that single ||e||^2"
+  | Nobody asked "what structure lives inside ||e||^2?"
+  v
+[2025] Zhang et al. - Outlier Fallback (OF)
+  |
+  | First work to pull the deadzone (small values rounded to 0) out as a
+  | separate concern and handle it on its own
+  | Recognized "small values getting swallowed" as a specific error type and
+  | provided a remedy
+  | Still in the inference era: never asked whether it is orthogonal to the
+  | other errors, never touched RL
+  v
+[2025] Huang et al. - QeRL (ICLR 2026)
+  |
+  | First work to bring quantization into RL post-training
+  | Surprising finding: quantization *noise* actually helps RL explore
+  |   (policy entropy is pushed up)
+  | Invented AQN (Adaptive Quantization Noise): anneal noise magnitude
+  |   on an exponential schedule during training — explore early, converge late
+  | But: (a) only ran LoRA, not full-parameter; (b) treated "noise" as a
+  |   single scalar
+  | Open questions: is noise really one variable? Why does LoRA work but
+  |   full-parameter doesn't?
+  v
+[2026] Li, Wu, Shen - MX3  <-- target paper
+  |
+  | Proves MXFP4 error = scale bias + deadzone + grid noise (strictly additive)
+  | Proves deadzone is *strictly orthogonal* to the other two; scale and grid
+  |   have a stable correlation of -0.66
+  | One-to-one mapping onto three RL pipelines:
+  |   scale  -> gradient fidelity in backprop (multiplicative accumulation)
+  |   DZ     -> rollout quality in forward pass (rank collapse)
+  |   grid   -> policy entropy (exploration–exploitation balance)
+  | Assembles MBS + OF + AQN, full-parameter RL:
+  |   -0.7 pp vs BF16 on dense models; +1.0 pp vs BF16 on MoE
+  v
+[Future] Natural extensions
+  |
+  | The grid noise term is proven *irreducible* — improving scale precision
+  |   cannot reduce it at all
+  | Any real breakthrough requires changing the E2M1 grid itself —
+  |   a hard constraint for the next hardware generation
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2023 | OCP MX Format (Rouhani et al.): Gave Us the Hardware, and Buried Three Independent Errors
+
+*** What problem did it see?
+
+INT8 / FP16 is still too heavy for large-model inference. Chip makers wanted to compress every number to 4 bits, but pure INT4 is too narrow to capture the tails of activation distributions, and pure FP4 has too little precision. A compromise was needed.
+
+*** Its solution
+
+Pack 32 elements into a *block* that shares a single *power-of-two* scale (E8M0, no mantissa), with each element encoded in *E2M1* floating point (1 sign + 2 exponent + 1 mantissa bits — only 8 representable values: ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6).
+
+The design is clever: the block scale handles dynamic range; the element encoding handles precision. NVIDIA Blackwell and AMD MI350 support it natively. But it *simultaneously* introduces three independent error sources — which nobody noticed at the time:
+
+1. *Scale rounding* — E8M0 can only store integer powers of 2, but the ideal scale is almost never a power of 2, so the scale is always rounded *up* (ceiling), averaging 44% larger than the ideal value.
+2. *Deadzone* — because the scale is inflated, any element whose absolute value is below max/24 within the block gets swallowed to 0 (roughly 9% of weights).
+3. *Grid noise* — remaining elements are rounded to one of the 8 representable points; each carries a rounding residual.
+
+All three error types were folded into a single reported MSE figure. That sloppy accounting would take three years to untangle.
+
+*** Why it worked (and where the new trap was set)
+
+The hardware efficiency is genuine (intra-block parallelism). But *E8M0 scale is immutable* — it is baked into the specification. This means any later work trying to reduce "scale error" must add a patch outside the spec (that is exactly what MBS does). Likewise the E2M1 grid is fixed — which is the root of MX3's later finding that "grid noise cannot be eliminated." The moment the spec was finalized, it already determined which errors could be fixed and which were a permanent fact of life.
+
+** 2023–2024 | GPTQ / AWQ / SmoothQuant: Minimize the Error as a Single Number
+
+*** What problem did they see?
+
+Rounding-to-nearest in INT4 drops accuracy. Smarter selection of quantization points was needed.
+
+*** Their solutions
+
+- *GPTQ* (Frantar 2023): Uses second-order Hessian information to adjust weights column by column, minimizing post-quantization output error.
+- *AWQ* (Lin 2024): Observes that not all weights are equally important — weights hit by large activations matter more. A per-channel scale protects them.
+- *SmoothQuant* (Xiao 2023): Goes the other way: "migrates" activation outliers onto the weights so both sides become easier to quantize.
+
+These three papers differ in style but share one implicit assumption: *quantization error is a scalar* `‖e‖²`, and the job is to make it smaller.
+
+*** Why it worked (and where the new trap was set)
+
+In the static setting of INT4 inference, the assumption causes no major trouble — if total error is small, downstream perplexity is good. But it planted a cognitive blind spot: *nobody asked what structure lives inside ‖e‖²*. If one kind of error is harmless in the forward pass but lethal in the backward pass, or harmless for SFT but lethal for RL, the "minimize a single scalar" paradigm cannot catch it.
+
+That blind spot would not fully collapse until the MXFP4 + RL combination appeared — because at that point, three error types affect three pipelines in completely different ways, and no single number can summarize them.
+
+** 2025 | Outlier Fallback (Zhang et al.): The First Time "Swallowed Small Values" Was Treated as a Separate Problem
+
+*** What problem did it see?
+
+MXFP4's deadzone zeros out 9% of weights outright — this is not "slightly noisier rounding," it is *hard information loss*. In small-batch inference, this loss can cause the effective rank of certain layers to drop a notch, visibly degrading output quality.
+
+*** Its solution
+
+Alongside quantization, maintain a sparse "outlier" channel: elements that fall into the deadzone are not zeroed out but stored in a high-precision fallback path and added back at inference time.
+
+Cost: tiny sparse storage overhead (after all, the deadzone is only 9%). Benefit: those small values stop disappearing.
+
+*** Why it worked (and where the new trap was set)
+
+OF is the first paper in this river to implicitly concede that "MXFP4 error is not one thing" — by treating the deadzone separately it quietly acknowledges that the error has internal structure. But it never makes that explicit: it does not prove deadzone is orthogonal to the other errors (MX3 does that later), and it only patches the inference scenario without asking what role this component plays in RL or training.
+
+The remaining gap: OF fixes only one of the three error types. The other two (scale bias and grid noise) continue to be bundled as a single "residual noise" — until someone in the RL setting discovers that residual noise is *surprisingly useful*.
+
+** 2025 | QeRL (Huang et al., ICLR 2026): Quantization Noise Actually Helps RL Explore
+
+*** What problem did it see?
+
+RL post-training is expensive because of rollout (generating large numbers of trajectories). If the model can be quantized to NVFP4 (another FP4 variant), rollout speeds up by more than 1.5× and a single H100 can run RL on a 32B model. That is the engineering value.
+
+But QeRL's real *scientific* finding is something else: the authors expected quantization to destabilize RL training, and instead found the *opposite* — quantized-model RL converges *faster* than BF16 LoRA and reaches higher final reward.
+
+Why? Their explanation: the noise introduced by quantization is equivalent to "parameter noise" (a technique from the RL exploration literature), which raises policy entropy and encourages the model to try more diverse trajectories, thus hitting correct solutions faster.
+
+*** Its solution
+
+- Quantize the base model + LoRA adapter with NVFP4 (FP4 with finer scale granularity)
+- Invent *AQN (Adaptive Quantization Noise)*: exponential decay schedule during training — large noise early for exploration, small noise late for convergence
+- The full method runs on 7B/32B models: GSM8K 90.8%, MATH 500 77.4%
+
+*** Why it worked (and where the new trap was set)
+
+The "quantization = exploration boost" framing explains why RL reacts differently from SFT. SFT fits a fixed distribution — extra noise is just contamination. RL searches an unknown policy space — just the right amount of noise is fuel.
+
+But QeRL treats "noise" as a *single* scalar. It knows there is noise, it knows noise helps exploration, but it does not know *which kind* of noise helps exploration or *which kind* is dragging gradients backward. Two consequences:
+
+1. It must rely on LoRA. *Why must it use LoRA?* Because in full-parameter training, the fraction of noise that "hurts gradients" is amplified across a dozen backprop layers and training diverges. LoRA routes most gradient paths around the quantized layers, which is enough to survive — but that is a workaround, not an understanding.
+2. The AQN schedule is tuned empirically. How fast should the noise anneal? Only trial-and-error can tell, because it is unknown whether "the part that helps exploration" and "the part that harms gradients" should be annealed on the same schedule.
+
+These two limitations are the starting point for the next paper: can QeRL's monolithic "quantization noise" be cut open so that every incision knows exactly what it is cutting?
+
+** 2026 | MX3 (Li, Wu, Shen): Three Cuts, Each Mapped to One RL Pipeline
+
+*** What problem did it see?
+
+QeRL sidestepped gradient divergence with LoRA. But industry needs *full-parameter* MXFP4 RL — the quality ceiling is higher, yet full-parameter + MXFP4 training collapses immediately.
+
+Why does LoRA work but full-parameter doesn't? Why is the AQN schedule so brittle — right and it helps, wrong and it collapses? Why does OF give modest gains on dense models but large gains on MoE?
+
+These *seemingly unrelated* questions all share the same root: *treating quantization error as one term* makes it impossible to explain why the same noise behaves differently in different scenarios.
+
+*** Its solution (three steps)
+
+*Step 1: Prove that MXFP4 error decomposes strictly into three terms*
+
+Introduce an "ideal-scale quantizer" `Q*` — a hypothetical quantizer that uses the *exact* scale (not rounded to E8M0). Three error components emerge naturally:
+
+- `e_scale = Q(x) - Q*(x)`: the part attributable entirely to scale rounding
+- `e_DZ = (Q*(x) - x) · 1[deadzone]`: the part swallowed to zero even by the ideal quantizer
+- `e_grid = (Q*(x) - x) · 1[not deadzone]`: the rounding residual from the E2M1 grid
+
+The total error `e = e_scale + e_DZ + e_grid` is an *element-wise* identity — not an approximation.
+
+More critically: the paper proves `<e_DZ, e_scale> = <e_DZ, e_grid> = 0` *exactly* (deadzone elements are zeroed out by both sides, so the inner products vanish). One pair of the three terms is perfectly orthogonal. The remaining pair `<e_scale, e_grid>` consistently measures around −0.66 in practice — because an inflated scale makes the grid tend to round in the opposite direction, creating a systematic anti-correlation.
+
+*Step 2: Map each term to one RL pipeline*
+
+| Error term | Mathematical character | RL failure mode |
+|------------|------------------------|-----------------|
+| e_scale | Multiplicative, accumulates across layers | Gradient direction corrupted (amplified over many backprop layers) |
+| e_DZ | Hard information loss | Forward rollout quality degrades; advantage variance explodes |
+| e_grid | Zero-mean bounded; equivalent to noise | Policy entropy rises; exploration–exploitation balance disrupted |
+
+This table explains every previously mysterious phenomenon: QeRL must use LoRA because LoRA bypasses the multi-layer accumulation of `e_scale`; QeRL's AQN schedule is hard to tune because it uses the grid-noise knob (beneficial) to indirectly control scale bias (harmful); OF works better on MoE because expert routing is more sensitive to rank loss.
+
+*Step 3: Assemble three targeted fixes*
+
+- *MBS (Macro Block Scaling)*: Group 32 blocks into a larger macro-block and replace the E8M0 scale with a higher-precision scale — cuts `e_scale`
+- *OF (Outlier Fallback)*: Borrowed from Zhang 2025's sparse fallback — cuts `e_DZ`
+- *AQN (Adaptive Quantization Noise)*: Borrowed from QeRL, adapted to support full-parameter training — governs `e_grid`'s effect on policy entropy
+
+The three together close the gap with BF16 to 0.7 pp on Qwen2.5-3B dense and *exceed* BF16 by +1.0 pp on Qwen3-30B-A3B MoE.
+
+*** Why it worked (and where the new trap was set)
+
+It works because it is *not* tuning one scalar but instead applying the most appropriate tool in each of three *orthogonal* directions. That is why MBS alone or OF alone is insufficient — each fixes its own slice, but RL training needs all three pipelines to be clean simultaneously.
+
+The new trap (flagged by the paper itself): `e_grid` is *irreducible* — improving scale precision only suppresses `e_scale`; it has no effect on `e_grid` whatsoever. Grid noise is the *structural lower bound* of MXFP4. To break through this floor, the only option is to change the E2M1 grid itself. That passes the ball to the next hardware generation: NVFP4 added a mantissa to the scale but the grid is still the same 8 points — so NVFP4 can suppress two terms but not the third. The real next step requires a finer-grid FP4 variant (or a different format entirely).
+
+* Frontier Extensions
+
+MX3 is a May 2026 paper and no publication has specifically critiqued or improved it yet. But *parallel work* in the same direction is already advancing along the "FP4 training" thread:
+
+** 2025 | Quartet (Castro et al.) & Quartet II (Panferov et al. 2026)
+
+These take the *FP4 pre-training* route — not post-training but training from scratch in 4 bits. The focus is *unbiased gradient estimation*: apply stochastic rounding to the scale as well, preventing the multiplicative accumulation of `e_scale`. Quartet II further demonstrates that scale-level stochasticity has lower variance than element-level stochastic rounding.
+
+Relationship to MX3: the Quartet line is a *pre-training* perspective; MX3 is a *post-training RL* perspective. The two threads will eventually converge — because the longer RL post-training runs and the more steps it takes, the more the gradient-bias problems studied in pre-training literature become relevant.
+
+** 2026 | MR-GPTQ (Egiazarian et al.)
+
+Fuses *micro-rotation* (a small variant of the Hadamard transform) with GPTQ-style PTQ, optimized specifically for MXFP4/NVFP4 with a custom CUTLASS kernel.
+
+In MX3's language: rotation reshapes the weight distribution to be more quantization-friendly — primarily reducing `e_grid` and `e_DZ` (because a more concentrated distribution has fewer small values and grid-landing points are more accurate). This is *complementary* to MX3's fixes rather than competing with them: MR-GPTQ transforms the inputs *before* quantization; MX3 patches the outputs *after* quantization. In principle, they can be stacked.
+
+As of now, MX3 remains the latest step along the *"decompose MXFP4 error to understand RL behavior"* evolutionary line. It upgrades quantization research from "tuning one number" to "seeing the structure" — a conceptual turning point that finally provides a principled basis for deciding what to fix, what to leave alone, and how.
+
+* One Diagram to See It All
+
+#+begin_example
+          Evolution of How We Understand MXFP4 Error
+
+   Time --->
+
+   2023            2023-24        2025           2025          2026
+   ┌──────┐       ┌────────┐    ┌────────┐    ┌──────┐      ┌────────┐
+   │ MX   │       │ GPTQ   │    │ Outlier│    │ QeRL │      │  MX3   │
+   │ spec │  -->  │ AWQ    │ -> │Fallback│ -> │      │  ->  │        │
+   │      │       │Smooth- │    │  (OF)  │    │      │      │        │
+   │      │       │ Quant  │    │        │    │      │      │        │
+   └──────┘       └────────┘    └────────┘    └──────┘      └────────┘
+
+   Error perspective:
+   "one number"  -> "one number,  -> "two things:  -> "one number, -> "three orthogonal
+                    minimize it"     deadzone +        but in RL it    terms, each mapped
+                                     the rest"         helps"          to one RL pipeline"
+
+   What gets fixed:
+   everything       global MSE    -> e_DZ             e_grid          e_scale (MBS)
+   (nothing fine)                    (static)          (dynamic,       e_DZ    (OF)
+                                                        LoRA-only)      e_grid  (AQN)
+                                                                       full-param, all fixed
+
+   Untouched:                                                          e_grid is an
+                                                                       irreducible floor
+                                                                       (next-gen format's job)
+
+
+        Three error terms vs. three RL pipelines (MX3's core matrix)
+
+                        Gradient fidelity    Rollout quality     Policy entropy
+                         (backward)            (forward)         (exploration)
+
+   e_scale (44% bias)   *dominant*            secondary           secondary
+   (multiplicative)     fixed by MBS
+
+   e_DZ    (9% zeroed)  secondary             *dominant*          secondary
+   (hard info loss)     fixed by OF
+
+   e_grid  (rounding)   secondary             secondary           *dominant*
+   (irreducible)        managed by AQN
+#+end_example
+
+* Insights
+
+Reading the full river, what stands out is not "MXFP4 got another incremental improvement." What stands out is that *RL is forcing quantization research to upgrade its entire way of thinking*.
+
+*Insight 1: The collapse point for scalar thinking is RL, not SFT.* The entire PTQ era (the GPTQ/AWQ wave) was about "how to shrink ‖e‖²." That paradigm holds up in SFT — because SFT fits a fixed target and all errors ultimately act through the same loss, so summing them into one number is harmless. RL is different: rollout, advantage estimation, and the policy gradient are three *parallel* pipelines with completely different error sensitivities. The same noise is fuel in one pipeline and poison in another. Without decomposing it, you are flying blind.
+
+*Insight 2: QeRL is a textbook case of "phenomenon without mechanism"; MX3 is a textbook case of "mechanism that absorbs the phenomenon."* QeRL found that quantization noise boosts RL exploration and found it remarkable, but could not explain which part of the noise was helping and which was hurting. Within a year, MX3 mathematized the story: grid noise helps exploration (zero-mean, bounded — equivalent to a temperature increase); scale bias hurts gradients (multiplicative accumulation across layers). The same phenomenon, upgraded from "engineering observation" to "mechanistic understanding," opening up principled next steps. This is the classic *phenomenon → mechanism → control* arc in ML research.
+
+*Insight 3: Hardware specifications determine which errors can be fixed.* The most striking sentence in MX3 is "e_grid is an irreducible floor" — because the E2M1 grid is the fixed set of 8 points written into the OCP standard. In other words, *when that committee finalized the spec in 2023*, they already determined that no matter how clever the algorithm in 2026, it cannot reduce grid noise. This means: no matter how much the algorithm improves, the ceiling was locked the moment the hardware spec was ratified. The next genuine breakthrough requires either a new format (NVFP4, MXFP6, …) or native hardware support for a finer grid. What algorithm researchers can do is push every *reducible* term to its minimum and then wait for the next hardware generation.
+
+*Insight 4: Every "borrowed component" is an implicit admission that prior work left something unfinished.* MX3 uses MBS (Chhugani 2026), OF (Zhang 2025), and AQN (Huang 2025) — all three are others' inventions. What MX3 genuinely contributes is the *framework* that assembles those three pieces according to RL pathway theory. Good research does not always mean building new wheels; it can mean *correctly assembling other people's wheels together* — provided you understand why the assembly has to be exactly that way.
+
+* Takeaways
+
+Three landing points for "how to do research, how to find problems" from this evolutionary line:
+
+*Takeaway 1: An "it works but I can't explain why" result is the entry point for the next paper.* QeRL found that quantization aids RL but could not articulate the mechanism. Within a year, MX3 came along and absorbed it mechanistically. If you produce a result that works but whose mechanism eludes you — don't hide it, announce it openly. Someone else will fill the mechanism gap, but you hold the "phenomenon priority" position. Conversely, if you see someone else's work that is "effective but unexplained," that is your opportunity — the hole is usually shallower than it looks.
+
+*Takeaway 2: When a single variable behaves inconsistently across different settings, it is almost certainly not a single variable.* "Quantization noise" is poison in SFT and medicine in RL — that contradiction is not a contradiction; it means multiple independent factors are bundled inside. When you encounter this kind of contradiction, resist the urge to build a model for it first; ask "should I decompose it?" That is exactly how MX3 opened. The pattern is highly reusable in ML — "regularization helps in some tasks but not others," "data scaling yields high returns in some settings but not others" — both may conceal internally decomposable structure waiting to be found.
+
+*Takeaway 3: Hardware specifications are the ceiling of algorithms; they are worth a close look.* MX3's verdict that "e_grid cannot be eliminated" is fundamentally *a consequence of a choice an OCP committee made three years earlier* — no algorithm, however clever today, can overcome it. Algorithm researchers easily forget that hardware is a *constraint*, not a *backdrop*. For anyone doing quantization, low-precision training, or the broader domain of system–algorithm co-design, the first thing to clarify is which errors can be reduced by algorithms and which are locked in IEEE/OCP standards and immovable. See the ceiling clearly, and you know where to push — and where effort is wasted.
+
+This means you can —
+
+- Flag any "phenomenon described + mechanism missing" paper (not just quantization — RL, LLM, data papers all count) and put it in your reading queue as a seed
+- When "the same variable behaves contradictorily across settings" is your observation, let your first instinct be *decompose* rather than *model*
+- When doing low-precision work, read the hardware specification first, mark which errors are "structurally reducible" and which are "hardware-locked," and then decide which side to attack

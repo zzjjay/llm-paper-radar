@@ -1,0 +1,266 @@
+#+title:      Efficient Memory Management for Large Language Model Serving with PagedAttention
+#+date:       [2026-05-25 Mon 06:11]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T061108-en
+#+source:     https://arxiv.org/abs/2309.06180
+#+authors:    Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, Ion Stoica
+#+venue:      SOSP 2023
+
+* The River of the Problem
+
+A large model is deployed and online — how do you make a single GPU serve dozens or hundreds of users simultaneously, rather than processing them one by one?
+
+This has always been stuck at the same bottleneck: every time the model generates a token, it must look back at the "impressions" of all preceding tokens — these impressions are called the KV cache, and they are both large and volatile. When a request arrives, you don't know how long it will run; halfway through, you still don't know how much further it will go. Reserve too little and you run out; reserve too much and you waste vast swaths of space. GPU memory is finite — waste half of it and throughput drops by half.
+
+For seven years, generation after generation has been gnawing on the same bone: how to let a crowd of requests — each a different size, each with a different lifespan, each of a different output length — coexist peacefully on a single GPU.
+
+* Map of Origins
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Observed: RNNs must compute token by token — painfully slow
+  | Solution: Replace recurrence with attention; fully parallel during training
+  | Left behind: Inference still generates token by token;
+  |              each token must attend to all prior tokens -> KV cache is born
+  v
+[~2021] NVIDIA FasterTransformer (era of static batching)
+  |
+  | Observed: A single request barely feeds the GPU; need batching
+  | Solution: Pad a batch of requests to equal length; run them together
+  | Left behind: One slow request stalls the whole batch; output length unknown,
+  |              so reserve max length for each request -> massive padding waste
+  v
+[2022] Yu et al. - Orca (OSDI)
+  |
+  | Observed: Request-level batching is too rigid; a finished request
+  |           must idle in the batch waiting for everyone else to finish
+  | Solution: Reschedule the batch after every single generated token
+  |           (iteration-level scheduling / continuous batching)
+  | Left behind: Compute scheduling is now flexible, but KV cache is still
+  |              pre-allocated as one contiguous block per max length ->
+  |              memory waste; actual KV memory utilization: 20%–38%
+  v
+[2023] Kwon et al. - vLLM / PagedAttention (SOSP)  *this paper*
+  |
+  | Observed: KV cache management is exactly the same class of problem
+  |           as OS virtual memory — dynamic size, unknown endpoint, sharing
+  | Solution: Slice KV cache into fixed-size blocks; allocate on demand
+  |           like OS virtual memory; physical blocks need not be contiguous
+  | Left behind: Sharing is coarse-grained (block level); prefill and decode
+  |              phases are forced to share the same GPU
+  v
+[2024+] Three downstream currents
+  +-- SGLang / RadixAttention: uses a radix tree to automatically detect
+  |       common prefixes across requests; lifts vLLM's sharing by a level
+  +-- DistServe (OSDI'24): separates prefill and decode onto different GPUs,
+  |       letting each phase optimize for its own bottleneck
+  +-- Mooncake (Kimi, 2024): treats the KV cache as a cluster-wide storage
+          resource, pooling and reusing it across GPU/CPU/SSD tiers
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: Faster Training, a Slow Seed Buried Inside
+
+*** What Problem Did It See
+
+The workhorse for translation and dialogue at the time was the RNN. The RNN's flaw was intuitive: it had to read like a novel — one word at a time — and the state of word 100 depended on the state of word 99. GPUs, which thrive on computing ten thousand numbers simultaneously, were essentially fighting with one hand tied behind their back. Training a model could take a week or two.
+
+*** Its Solution
+
+The Vaswani team's move was decisive: throw out RNNs entirely and keep only the attention mechanism. Each token attends directly to every other token, no queuing required. A sentence of 100 tokens — the GPU computes all 100 relationships at once. Training sped up by an order of magnitude.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Parallel computation is possible because during training the entire sentence is already known. But once deployed, when a user asks a question, the model must write the answer token by token — that part is still inherently serial. For each new token, the model must compute its attention over everything that came before. So engineers devised a shortcut: cache the Key and Value vectors already computed, and reuse them next time — this is the KV cache.
+
+The KV cache eliminates redundant computation, but it introduces something new: *every request carries a growing blob of state that expands over time*. That blob would become the root of all subsequent trouble.
+
+** Around 2021 | FasterTransformer: Batch It Up — at a Cost
+
+*** What Problem Did It See
+
+A single inference request occupied only a few percent of GPU compute — deeply wasteful. The way to make a GPU economical is to merge the same matrix multiplications from multiple requests and execute them in one shot — this is batching. A time-honored trick in deep learning.
+
+*** Its Solution
+
+Systems like NVIDIA's FasterTransformer did exactly this: collect a batch of requests, pad their inputs to equal length, and run them through the Transformer together. This is *static batching* — once the batch is formed, it runs until every request in it has finished generating.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+GPU utilization shot up immediately. But problems followed close behind:
+
+- Within the same batch, some requests finish after 50 tokens while others need 500. The early finishers must sit idle waiting for the stragglers — 450 wasted steps per slot.
+- Output length is unknown in advance. To be safe, reserve a contiguous block of memory sized for the *maximum possible length* (e.g., 2048 tokens) per request. A request that generates only 50 tokens still holds 2048 tokens of space — catastrophic internal fragmentation.
+- While a batch runs, new arrivals can only queue — head-of-line latency skyrockets.
+
+The vLLM paper calls this "existing systems" and skewers it with red bars in Figure 2: actual KV memory utilization is barely above 20%.
+
+** 2022 | Orca: Schedule by Token, Not by Request
+
+*** What Problem Did It See
+
+The Orca team zeroed in on static batching's "wait for everyone before clocking out" waste. The problem isn't batching itself — it's that *the granularity of batching is too coarse*: form a group, lock it in until everyone finishes.
+
+*** Its Solution
+
+Cut the scheduling granularity from "entire request" down to "one iteration (one token)." After each token is generated, the scheduler takes a fresh look: who finished? Who just arrived? Kick out the finished ones immediately, slot in the newcomers. This mechanism came to be called *continuous batching*, and it is now the baseline of every modern LLM serving system.
+
+A useful reframe: FasterTransformer is "group dungeon run — everyone enters and exits together"; Orca is "group dungeon run — people come and go at any time."
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Head-of-line latency collapsed — a new request waits at most one token's time before being admitted. GPU compute slots are always full. Orca pushed throughput up by a significant step.
+
+But Orca didn't touch *memory*. Each incoming request still received a single contiguous KV memory block pre-allocated to the maximum length. This is exactly where vLLM picks up the relay — compute scheduling became flexible, but memory was still being allocated the 2017 way.
+
+Think of Orca as a restaurant: food arrives quickly, table turnover is high — but every table is still reserved for 12 even when only 2 people show up. The other 10 seats stay blocked until those 2 finish their meal.
+
+** 2023 | PagedAttention / vLLM: Manage the KV Cache Like an OS Manages Memory
+
+*** What Problem Did It See
+
+The Kwon team's insight was razor-sharp: the troubles with KV cache management are *the same class of problem* as what an operating system faces when managing program memory —
+
+- How much memory a program needs is unknown in advance (KV cache length is unknown)
+- A program's memory must grow dynamically (the KV cache grows token by token)
+- Programs have sharing requirements (beam search, parallel sampling, shared prompt prefixes)
+- Physical memory is limited and waste must be avoided (GPU VRAM is the bottleneck)
+
+How did operating systems solve this? *Virtual memory + paging* — solved fifty years ago. Slice memory into fixed-size pages; programs see a contiguous virtual address space, but physical placement is arbitrary; pages are allocated on demand; multiple processes can share the same page.
+
+*** Its Solution
+
+Transplant the same idea onto the GPU:
+
+- Slice each request's KV cache into fixed-size blocks (e.g., 16 tokens per block)
+- Each block may land anywhere in physical VRAM — no contiguity required
+- A logical layer maintains a *block table* (analogous to an OS page table) that maps a request's logical sequence to physical blocks
+- Blocks are allocated on demand; no space is held hostage for "the maximum length that might possibly be needed"
+- Multiple sequences can share the same physical block (e.g., beam search siblings share the common prefix, and copy-on-write handles divergence)
+
+The name PagedAttention reflects this: the attention kernel now accesses KV blocks scattered across memory rather than assuming a single contiguous matrix. The authors rewrote the attention kernel to support this "paged access."
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+The immediate result: KV cache memory utilization jumped from ~30% to ~96%. The same GPU can host 3–4× as many concurrent requests; throughput rises 2–4×.
+
+The deeper payoff: once the KV cache is abstracted into "addressable, shareable, pageable memory," every downstream trick becomes available — beam search, prompt sharing, prefix caching — all are applications of this abstraction.
+
+Remaining gaps (the starting points for what came next):
+
+- Sharing operates only at block granularity and requires requests to explicitly declare their relationship (e.g., multiple samples from the same prompt); *automatic, cross-request prefix sharing* is not natively supported
+- vLLM runs prefill (processing the prompt — compute-intensive) and decode (generating tokens — memory-bandwidth-intensive) on the same GPU in rotation; the two workloads have very different characteristics and interfere with each other
+
+* Frontier Extensions
+
+After vLLM, the river did not stop. It continued cutting downward in three directions:
+
+** 2024 | SGLang / RadixAttention: Make Sharing the Default
+
+vLLM's sharing is *passive*: you tell the system "these requests share the same prompt," and it lets them share. But in the real world, vast numbers of requests share a common prefix — the same system prompt, the same few-shot examples, the same chat history — and the caller often cannot tell the serving system about it.
+
+SGLang's approach: organize all active KV blocks into a *radix tree* (a prefix-compressed tree). When a new request arrives, first search the tree for a matching prefix; any matched prefix is immediately backed by the already-computed physical blocks — sharing becomes something the system identifies automatically, without any cooperation from the user.
+
+On certain workloads, throughput rises another 5–6×. This pushes vLLM's "KV cache is memory" metaphor one step further: not just memory, but *indexed memory* — queryable like a database.
+
+** 2024 | DistServe: Stop Letting Two Workloads Fight Each Other
+
+Prefill (reading the user's prompt and producing the first token) is compute-intensive; it determines *time-to-first-token (TTFT)*, the metric users feel most acutely. Decode (generating every subsequent token one at a time) is memory-bandwidth-intensive; it determines *total throughput* — how much revenue the service generates per second.
+
+Pack both onto one GPU, and a long-prompt prefill stalls all ongoing decodes; user experience crumbles. DistServe (OSDI'24) simply splits them: prefill runs on a dedicated set of GPUs, decode on another, and KV caches are transferred between the two sides via high-speed interconnect.
+
+This reflects the recognition that LLM serving is not a single uniform workload, but *two workloads with fundamentally different personalities* sharing the same data structure. Once separated, each side can be tuned for its own objective.
+
+** 2024 | Mooncake: The KV Cache Is a Cluster-Wide Resource
+
+Moonshot's (Kimi) Mooncake stretches vLLM's metaphor to its logical conclusion: if the KV cache is truly "memory," it shouldn't belong to a single GPU.
+
+They aggregate the GPU VRAM, CPU DRAM, and even SSDs of every node in the cluster into a *tiered KV cache pool*, shared across requests and across machines. A long conversation history might reside on SSD and be paged up to GPU on demand. A popular prompt's KV blocks are replicated across multiple machines.
+
+This is a jump from "OS memory management" to "distributed storage system." The metaphor keeps deepening.
+
+* One Diagram
+
+#+begin_example
+              How Compute Is Scheduled             How Memory Is Managed
+              ----------------------             ----------------------
+[2017]
+Transformer    Parallel training,                 KV cache concept born
+               serial inference                   (one monolithic blob, unmanaged)
+               (attention replaces RNN)
+
+                        |                                  |
+                        v                                  v
+[~2021]
+FasterTransformer  Static batching                 Pre-allocate contiguous VRAM
+                   (batch starts and ends          at max-length per request
+                    together)                      (massive waste)
+                   --> severe head-of-line         --> utilization ~20–38%
+                       latency
+
+                        |                                  |
+                        v  (Orca fixes this)               | (nobody has touched this yet)
+[2022]
+Orca               Iteration-level scheduling      Memory policy unchanged
+                   (continuous batching at         (still contiguous, max-length)
+                    token granularity)
+                   --> scheduling waste removed    --> memory is still the bottleneck
+
+                        |                                  |
+                        v                                  v  (vLLM takes over)
+[2023]
+vLLM/PagedAttn     Scheduling inherited            OS-style paging
+                   from Orca                       (fixed-size blocks, on-demand
+                                                   allocation, sharing supported)
+                                                   --> utilization ~96%
+                                                   --> throughput x2–4
+
+                        |                                  |
+                        v                                  v
+[2024+]
+SGLang             Prefix-aware scheduling         KV = indexed memory
+                   (Radix Tree)                    (automatic cross-request sharing)
+
+DistServe          Prefill/decode disaggregation   KV flows across GPUs
+
+Mooncake           Cluster-level request routing   KV = distributed storage
+                                                   (GPU / CPU / SSD three tiers)
+
+              [Scheduling grows ever finer]    [Memory evolves toward a storage system]
+#+end_example
+
+* Insight
+
+Seven years of work, which on the surface looks like a sequence of engineering optimizations — batching, scheduling, memory. But what is actually happening underneath is a *migration of perspective* —
+
+*Reframing generative LLM serving from a "model problem" into a "systems problem."*
+
+Concretely, this migration unfolded in stages:
+
+1. 2017 — framed as a *model problem*: how to design an architecture that learns well (Transformer replaces RNN)
+2. 2021 — framed as a *compute problem*: how to keep the GPU fed (static batching)
+3. 2022 — framed as a *scheduling problem*: how to let requests share the GPU efficiently (Orca's iteration-level scheduling)
+4. 2023 — framed as a *memory problem*: how to manage the KV cache — a vast, dynamic, shared store (vLLM introduces OS abstractions)
+5. 2024+ — framed as a *storage problem*: the KV cache is a data system worth designing independently, spanning nodes, queryable (SGLang / Mooncake)
+
+Each step transplants expertise from a familiar field (OS, databases, distributed storage) into this new setting. The most striking leap is vLLM's: it invented nothing new; it simply *recognized* that "KV cache management == virtual memory management" is an *isomorphism*. Once recognized, fifty years of OS wisdom became immediately applicable.
+
+Where is the next step most likely to go? Probably toward further *assetization* of the KV cache:
+
+- A KV cache distribution network resembling a CDN (edge-cached KV for popular prompts)
+- A standard cross-model, cross-vendor format for KV caches (analogous to container images)
+- Treating attention state as a persistent, versionable data object — perhaps the next paper will call it a "KV database"
+
+* Takeaways
+
+This river offers three clear signals to anyone doing research:
+
+1. *Find the isomorphism; don't invent.* vLLM did not invent paging, did not invent virtual memory — it only spotted an *isomorphism that nobody else had spotted*. The best research is often not "invent something new" but "recognize that X and the well-known Y are the same class of problem." Ask yourself: does that thorny engineering problem in front of you have a structural twin lurking in OS, databases, compilers, networking, or file systems?
+
+2. *Follow the bottleneck, not the buzz.* From 2017 to 2023, every breakthrough happened because the previous step eliminated the previous bottleneck and exposed the next one. Transformer fixed slow training, exposing slow inference. FasterTransformer fixed compute waste, exposing scheduling waste. Orca fixed scheduling waste, exposing memory waste. *Always ask: once this generation's solution is in place, where is the next largest source of waste?* That is the title of the next paper.
+
+3. *Borrow the metaphor from a familiar domain and use it as a lever.* The single sentence "the KV cache is like OS pages" is worth half a PhD. If you have deep expertise in some domain — OS, databases, compilers, networking, scheduling — actively look at the emerging problems in LLM systems. Odds are good you can contribute a lever-grade metaphor.
+
+The takeaway for practice: look at your engineering system and find every resource that is "messy, dynamic, shared, and constrained." That resource is the next KV cache. It is waiting for its own vLLM.

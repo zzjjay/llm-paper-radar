@@ -1,0 +1,306 @@
+#+title:      OSCAR: Offline Spectral Covariance-Aware Rotation for 2-bit KV Cache Quantization
+#+date:       [2026-05-25 Mon 06:57]
+#+filetags:   :paper:river:
+#+identifier: 20260525T065753
+#+source:     https://arxiv.org/abs/2605.17757
+#+authors:    Zhongzhu Zhou, Donglin Zhuang, Jisen Li, Ziyan Chen, Shuaiwen Leon Song, Ben Athiwaratkun, Xiaoxia Wu
+#+venue:      arXiv 2026-05 (Together AI / U. Sydney / UIUC)
+
+* 问题之河
+
+把大模型推理跑得便宜的瓶颈，早就不是模型权重了——是那个越聊越胖的 *KV cache*。
+长对话、长推理、长上下文，每多一个 token，缓存就多一行；每生成一个新 token，
+GPU 又得把整本缓存从显存里读一遍。压缩 KV cache，是最直接的省钱路径。
+
+但是把 KV 压到 *2-bit*（每个数字只有 4 种取值）就难了。因为 KV 里有"刺头"——
+少数几个通道的数值大得离谱，把整个量化的尺子撑爆了，剩下的正常数值全挤进同一格，
+模型就废了。这条河，就是一代代研究者跟这些"刺头"周旋的故事——从 *躲* 它、
+*抹平* 它，一路走到 *理解 attention 到底在意什么*。
+
+* 溯源地图
+
+#+begin_example
+[2024-02] KIVI                 第一次把 KV 压到 2-bit
+   |                             看到: K 有通道级刺头, V 没有
+   |                             解法: K 按通道量化, V 按 token 量化
+   |   留坑: 没解决刺头本身, 只是绕开
+   v
+[2024-04] QuaRot               引入 Hadamard 旋转
+   |                             看到: 通道刺头让 INT4 全模型量化失败
+   |                             解法: 旋转矩阵把刺头能量摊到所有通道
+   |   留坑: 旋转是数据无关的, 不知道哪些方向重要
+   v
+[2024-05] SpinQuant            旋转应该学出来
+   |                             看到: 固定 Hadamard 不是最优
+   |                             解法: 把旋转矩阵作为参数学习
+   |   留坑: 学习成本高, 端到端微调; 4-bit 场景
+   v
+[2025-01] RotateKV             把旋转推到 2-bit KV
+   |                             看到: Hadamard 在 INT2 KV 下还是塌
+   |                             解法: 离群点感知的自适应旋转
+   |   留坑: 仍然以"抹平 KV 本身"为目标
+   v
+[2026-05] OSCAR (本篇)         旋转应该对齐 attention, 不是对齐 KV
+                                 看到: attention 不直接消费 K 和 V,
+                                       它消费 QK^T 和 SV 的结果
+                                 解法: 用 Q 的协方差给 K 找旋转,
+                                       用 SV 的协方差给 V 找旋转
+                                 + 端到端 SGLang 系统集成
+
+    (并行/后续) HaPPI · KVLinC · Kitty · TurboQuant
+#+end_example
+
+* 演化叙事
+
+** 2024-02 | KIVI: 第一个把 KV cache 压到 2-bit 的人，看见了"刺头"
+
+*** 它看到了什么问题
+
+在 KIVI 之前，量化 KV cache 大家都用一刀切——整个张量一个 scale，要么按 token，
+要么按通道。结果发现 *Key 的某几个通道，数值能比邻居大几十倍*。一刀切就意味着
+那个尺子被这几个通道撑爆，剩下 99% 的数值全挤进很少几个量化格子，信息全丢。
+
+*** 它的解法
+
+把 K 和 V 分开对待：
+- *K 按通道量化*（per-channel）——既然刺头集中在某些通道，那就让每个通道有
+  自己的 scale，刺头大就大，跟邻居无关
+- *V 按 token 量化*（per-token）——V 没有这种通道级聚集，按行处理更省事
+
+这是第一次把"KV 不是同质的"这件事讲明白：K 的麻烦在通道维度，V 的不在。
+不需要训练，直接套上就能在 2-bit 下保住大部分精度。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+per-channel 量化让刺头不再污染邻居。但它有两个隐患：
+
+1. *没有解决刺头本身*——只是给它单独建了个房间。如果想再压到 1.x bit，
+   或者通道之间需要做某些操作，per-channel 反而麻烦
+2. *和高效的 attention kernel 打架*——per-channel 量化打乱了原有的内存布局，
+   FlashAttention 这种融合 kernel 没法直接用
+
+这两个坑，恰好就是下一篇 QuaRot 的起点。
+
+** 2024-04 | QuaRot: 不躲刺头，直接把它摊平
+
+*** 它看到了什么问题
+
+KIVI 的 per-channel 是"防御"，给刺头隔离单间。但模型每一层都有 KV，
+每个 head 都有自己的刺头分布，工程实现越来越乱。更关键的是，*想压到 4-bit
+甚至更低，per-channel 也救不了*——隔离单间的尺子本身就太粗。
+
+QuaRot 看到的真正问题是：刺头之所以是刺头，是因为它在 *某个基底下* 显得突兀。
+能不能换个基底，让它不突兀？
+
+*** 它的解法
+
+引入 *Hadamard 旋转*——一个由 +1 和 -1 组成的正交矩阵。把 K 乘上这个矩阵，
+等价于把每个 K 向量"打散"到所有通道上。原来一个通道扛 100 的数值，
+现在变成 128 个通道各扛 100/sqrt(128) 的数值。*刺头被均匀地涂抹掉了*。
+
+关键性质：旋转是正交变换，attention 计算前可以把这个旋转"乘回去"，
+数学上完全等价。所以推理时只是多了一次矩阵乘，*没有改变模型行为*。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+Hadamard 矩阵的统计性质保证了：不管原始分布多偏，乘完之后都接近高斯，
+量化误差就均匀分摊。整个 4-bit 全模型推理（权重 + 激活 + KV）第一次跑通了。
+
+但留下了一个根本性的疑问：*Hadamard 是"数据无关"的*——它不看你的 K 长什么样，
+甚至不看你跑什么模型，就是个固定的 ±1 矩阵。它能保证"均匀"，
+但保证不了"对的方向上均匀"。如果某些方向 attention 根本不读，
+你把误差摊到那里反而浪费；如果某些方向 attention 重读，你应该让那里精度高。
+
+** 2024-05 | SpinQuant: 既然旋转重要，那就把它学出来
+
+*** 它看到了什么问题
+
+QuaRot 解决了"有没有旋转"，但 SpinQuant 问的是"什么旋转最好"。
+Hadamard 是个聪明的初值，但它对所有模型、所有层、所有 head 都用同一个
+±1 模式——*这显然不是最优*。
+
+*** 它的解法
+
+把旋转矩阵 *作为可学习参数*——在 Stiefel 流形上（正交矩阵的集合）做优化，
+用少量校准数据，目标函数就是"量化后的输出尽量接近原始输出"。学出来的旋转，
+比 Hadamard 平均好几个点。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+学习到的旋转能根据每层的实际分布调整，自然比固定矩阵好。但代价是：
+
+1. *训练成本*——Stiefel 流形优化不便宜，每个模型都要跑一遍
+2. *目标是"重建 KV"*——loss 函数衡量的是 quant(K) 离 K 多远，
+   但这真的是 attention 关心的指标吗？
+
+SpinQuant 主要落地在 4-bit 权重量化。把它直接搬到 2-bit KV，效果就崩。
+
+** 2025-01 | RotateKV: 把旋转拉回 2-bit KV 战场
+
+*** 它看到了什么问题
+
+SpinQuant 的优化路径太重，而 4-bit KV 已经基本够用了，所以旋转那条线
+一度走偏到了别的方向。但 2-bit KV 这块硬骨头还在——*KIVI 的 per-channel
+在 2-bit 下也开始抖，Hadamard 在 2-bit KV 下直接塌*。
+
+RotateKV 把战场拉回 2-bit KV：在这个极限压缩下，Hadamard 的"无脑摊平"
+不够，因为 2-bit 只有 4 个格子，任何浪费都致命。
+
+*** 它的解法
+
+*Outlier-aware adaptive rotations*——根据每层的离群点分布，
+对 Hadamard 做局部调整。不是全模型学一个矩阵，而是 *按层、按 head 微调*，
+让旋转在刺头集中的方向上更"用力"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度上比 QuaRot 在 2-bit KV 下好一截。但它的世界观还是 KIVI/QuaRot 的世界观：
+*目标依然是抹平 KV 本身的分布*。RotateKV 把"抹平刺头"这件事做到了极致，
+但没问：*抹平之后，attention 真的更准了吗？*
+
+这就是 OSCAR 的切入点。
+
+** 2026-05 | OSCAR: 别管 KV 长什么样，看 attention 在读什么
+
+*** 它看到了什么问题
+
+OSCAR 拍桌子的那个洞察：
+
+#+begin_quote
+"attention does not consume K and V through their Euclidean reconstruction errors"
+#+end_quote
+
+—— attention 根本不直接消费 K 和 V。它消费的是 ~Q · K^T~（attention 分数）
+和 ~S · V~（加权求和的输出）。前面所有方法都在最小化 ~||K - quant(K)||~，
+但这个误差和 attention 输出误差是 *两回事*。
+
+具体地：K 引起的下游误差是 ~tr((K - K_hat) · Q^T·Q · (K - K_hat)^T)~。
+*关键是 Q^T·Q*——不是 K^T·K。这意味着，*Q 反复读哪些方向，K 在那些方向就该精确；
+Q 不读的方向，K 在那里粗一点也没事*。同理 V 的误差被 ~S^T·S~ 加权。
+
+*** 它的解法
+
+把这个洞察直接固化到旋转矩阵里：
+
+1. *Key 的旋转*：用一小批校准数据，统计 Q 的协方差 ~C_Q = (1/N) Σ q^T·q~，
+   对它做特征分解 ~C_Q = U_Q · Λ · U_Q^T~，把 *U_Q 作为 K 的旋转*。
+   这样旋转后的坐标轴正好对齐 Q 重视的方向。
+
+2. *Value 的旋转*：统计 ~C_S = (1/N) V^T·S^T·S·V~，
+   做特征分解拿到 ~U_S~，作为 V 的旋转。
+
+3. 最后再叠一个 Hadamard 和 bit-reversal 置换，进一步均匀化。
+   ~R_K = U_Q · H · P_br~，~R_V = U_S · H · P_br~。
+
+理论上证明了：在"残差协方差对角"的假设下，这个选择是 *最优* 的
+（attention 输出误差的下界）。
+
+而且——这一切都是 *离线* 算的。在线推理时，KV 只是多乘一次固定矩阵，
+然后量化。和 paged attention、SGLang、FlashAttention 完全兼容，
+真的能部署。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+效果惊人：在 Qwen3-4B-Thinking、Qwen3-8B、Qwen3-32B、GLM-4.7（358B）上，
+INT2 KV 几乎不掉点（差距 1-4 个点），而朴素旋转 INT2 直接归零。
+长上下文 RULER-NIAH 128K 也稳。系统侧 *KV 显存省 8 倍，吞吐量提升最高 7 倍*。
+
+留下的问题：
+
+1. *校准数据依赖*——~C_Q~ 和 ~C_S~ 需要一批代表性数据，
+   分布外的 query 模式可能让旋转失效
+2. *MoE / MLA 等新结构*——OSCAR 假设标准 MHA / GQA，
+   对 MLA、新型 attention 的适配还要做
+3. *1-bit 或更低？*——2-bit 已经接近极限，再往下要不要换路线
+   （比如 vector quantization、低秩分解）？
+
+* 前沿延伸
+
+OSCAR 出现的同时，这条河还在分叉：
+
+- *HaPPI* (Kim 2025b)：和 OSCAR 思路非常近——用 Hadamard PCA 做幂迭代，
+  同样是"协方差驱动的旋转"。可以理解为同一时期对同一洞察的两个独立到达。
+- *KVLinC* (Saxena 2025)：Hadamard 旋转 + 线性误差矫正。
+  另一条路：旋转后承认还有误差，加一个轻量校正层补回来。
+- *Kitty* (Xia 2025)：来自 OSCAR 同一团队（Together AI）的姊妹工作，
+  *动态通道精度提升*——重要通道临时升精度。和 OSCAR 是互补的两条路：
+  Kitty 在精度维度切，OSCAR 在旋转维度切。
+- *TurboQuant* (Zandieh 2025)：在线 vector quantization，
+  跳出 scalar quantization 框架，往更深的方向走。
+
+* 一张图看懂
+
+#+begin_example
+              "刺头怎么办?"
+                  |
+                  v
+   +-------------------+----------------+----------------+
+   |    躲它           |    抹平        |    精打细算    |
+   |                   |                |                |
+[KIVI]            [QuaRot]         [SpinQuant]      [OSCAR]
+2024-02            2024-04           2024-05         2026-05
+per-channel K      Hadamard          learned R       attention-aware R
+per-token V        (data-oblivious)  (重建KV为目标)  (Q协方差/SV协方差)
+                       |
+                       v
+                  [RotateKV]
+                   2025-01
+                  outlier-aware
+                  adaptive rotation
+                  (still 重建KV)
+
+时间 ---------------------------------------------------------->
+
+精度目标的演化:
+  KV reconstruction           attention output
+  ||K - quant(K)||  --------->  ||QK - Q·quant(K)||
+  (KIVI/QuaRot/RotateKV)        (OSCAR)
+
+旋转的演化:
+  none -> Hadamard (固定) -> learned (微调) -> spectral (协方差特征向量)
+
+bit 数:
+  4-bit (QuaRot) ----> 2-bit 全模型 (RotateKV/OSCAR)
+#+end_example
+
+* 洞见
+
+读完这条线，最深的一击是：*整整两年，大家都在优化错的目标函数*。
+
+KIVI、QuaRot、SpinQuant、RotateKV，所有方法的 loss 都长这样：
+"让量化后的 KV 离原始 KV 近一些"。这听起来理所当然——量化嘛，
+不就是要重建吗？
+
+但 OSCAR 指出：模型最后看的不是 KV，是 *attention 输出*。
+KV 重建误差 ≠ attention 输出误差。在 4-bit 这种宽松场景，
+两者高度相关，谁也没察觉差距。一到 2-bit，只有 4 个量化格子，
+误差预算极其紧张，"对齐错目标"的代价就显形了。
+
+这是一个 *任务对齐* 的故事。不是技术上的迭代——KIVI 到 OSCAR
+没用什么新数学，特征分解、Hadamard、PCA 都是几十年的工具——
+而是 *看待问题的视角转换*：从"量化 KV"变成"量化 attention 消费的方向"。
+
+下一步往哪走？三条线：
+
+1. *更细的任务对齐*——不只是 attention 输出，还有 logits、loss、
+   下游任务指标，能不能直接拿任务 loss 反推旋转？
+2. *动态而非静态*——OSCAR 是离线固定旋转。如果不同 prompt
+   触发不同的 ~C_Q~ 分布，需要 *在线自适应* 的旋转吗？
+   （TurboQuant 已经在试）
+3. *跨越 scalar 量化*——2-bit 已经接近 scalar 量化的极限，
+   再往下必须用 vector quantization、product quantization、
+   或者干脆放弃量化走低秩。
+
+* 启发
+
+这条河给"怎么找问题"的启发：
+
+*盯着 loss 看，不要盯着指标看*。大家都报"量化误差降了 30%"，
+但真正决定模型好不好用的不是这个数字。OSCAR 的整个故事是从一行公式开始的：
+~||QK - Q·K_hat||^2 = tr((K-K_hat)·Q^T·Q·(K-K_hat)^T)~。看见这个 ~Q^T·Q~
+没人能装看不见——它明摆着告诉你"K 的误差应该被 Q 的协方差加权"。
+但两年里没人写出来，因为大家被"量化就要重建"的惯性挡住了。
+
+这意味着你可以——*在任何"代理目标"流行的领域，
+直接展开下游 loss 看里面到底是谁加权了谁*。代理目标和真目标之间的鸿沟，
+往往就是你的论文。

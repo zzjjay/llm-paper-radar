@@ -1,0 +1,237 @@
+#+title:      MatGPTQ: Accurate and Efficient Post-Training Matryoshka Quantization
+#+date:       [2026-05-25 Mon 14:00]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260525T140000-en
+#+source:     https://arxiv.org/abs/2602.03537
+#+authors:    Maximilian Kleinegger, Elvir Crnčević, Dan Alistarh (IST-DASLab)
+#+venue:      arXiv preprint, Feb 2026
+
+* One-Line Summary
+
+One idea, carried to its conclusion — "one set of model weights, deployed at multiple precisions."
+It first succeeded in embeddings (nested representations), was then transplanted into quantization (but at the cost of expensive training), and was finally compressed into a one-shot PTQ algorithm with a CUDA kernel ready for vLLM.
+MatGPTQ is the cut on this line that turns "multi-precision slicing" from a research toy into an engineering default.
+
+* The Core Problem on This Line
+
+Deploying an LLM always means navigating a triangle of precision, memory, and latency.
+4-bit, 3-bit, 2-bit — different devices need different checkpoints, and storing and maintaining them all is a headache.
+
+So one very natural question arises:
+*Can a single set of weights be "sliced" at runtime into 3-bit / 4-bit / 8-bit as needed?*
+
+This line of work is an answer to that question, bringing it step by step from concept to GPU.
+
+* Provenance Map
+
+#+begin_src
+                   [Problem: deploy one weight set at multiple precisions]
+                                          |
+                                          v
+   (2022) Matryoshka Representation Learning  (Kusupati et al.)
+           "nest sub-vectors of different dimensions inside one embedding"
+                                          |
+                     ......................................
+                     |                                    |
+                     v                                    v
+   (2022) GPTQ  (Frantar, Alistarh)            (2025) MatQuant  (Nair et al.)
+   "PTQ with Hessian-guided layer-wise           "transplant nesting idea into
+    error compensation"                           integer weight quantization"
+                     |                                    |
+                     |    +---------------------------------+
+                     |    |
+                     v    v
+               (2026) MatGPTQ  <-- target paper
+               "Matryoshka quantization as one-shot PTQ +
+                heterogeneous search + CUDA kernel"
+                     |
+                     |    Side branches:
+                     |     - Any-Precision LLM (Park 2024): reverse direction, build up from low bits
+                     |     - D^2 MoE (Wang 2025): nested bit-widths only inside MoE
+#+end_src
+
+(Confirmed citation relationships: MatGPTQ explicitly cites MatQuant, GPTQ, EvoPress, Any-Precision, and D²MoE.
+The conceptual inheritance from Matryoshka Representation Learning to MatQuant is clear via shared "nesting" vocabulary, though there is no direct cite chain between those two papers.)
+
+* Digging Back, Step by Step
+
+** Starting Point: Matryoshka Representation Learning (2022)
+
+The first paper to propose "nested representations" was not a quantization paper — it was an embedding paper.
+Kusupati et al. observed that a 1024-dimensional embedding does not need all its dimensions for every downstream task.
+But the conventional approach trains a separate model for each target dimensionality, which is prohibitively expensive.
+
+Their solution: during training, force the *first k dimensions to themselves constitute a usable embedding*, optimizing jointly for multiple values of k at once.
+Like Russian nesting dolls — the larger one contains the smaller, and every layer is a complete doll in its own right.
+
+The key insight here is not technical — it is a *shift in perspective*:
+*"A lower-precision version should not be a corrupted form of the higher-precision one; it should be a subset of it."*
+
+** MatQuant (2025) Transplants the Nesting Idea into Quantization
+
+Nair et al. identified the quantization analogue:
+if a weight q is quantized to 8 bits, its binary representation's top 4 bits are themselves a number.
+Could those "top 4 bits" also constitute a valid 4-bit model?
+
+Naively slicing them does not work — the 8-bit training objective never required the high 4 bits to be independently useful.
+So MatQuant changes the training objective:
+*compute losses for each target bit-width r ∈ {2, 4, 8} simultaneously, then backpropagate through a weighted average.*
+
+The resulting model allows a right-shift operation at runtime to yield the 4-bit version — no extra computation needed.
+One checkpoint, three precisions, each hardware platform takes what it needs.
+
+But the cost of this approach:
+
+- Requires QAT or block-wise QAT (OmniQuant) — both expensive
+- Paper only, no open-source code, no kernel
+- Only supports the fixed three tiers {8, 4, 2}
+- Heterogeneous bit-widths (different bits per layer) are merely gestured at, never actually done
+
+In short: *the concept is sound, but it cannot be shipped.*
+
+** A Parallel Thread: GPTQ (2022)
+
+To understand why MatGPTQ is an extension of GPTQ, we need to see what GPTQ actually solved.
+
+The central problem of PTQ:
+quantizing a layer's weights W means finding Q such that the output on calibration data X stays close to the original:
+
+  argmin ||QX - WX||²
+
+The earliest PTQ approach was simple rounding (RTN), which collapses below 4 bits.
+GPTQ's trick: *when quantizing weight i, redistribute the error it introduces to the weights that have not yet been quantized.*
+How is that error computed? Using the inverse of X X^T (an approximation of the Hessian) as a weighting — this yields the optimal compensation direction in closed form.
+
+It is a greedy, error-propagation algorithm: efficient, and nearly lossless at 4 bits.
+
+But GPTQ optimizes for exactly one bit-width per run. An 8-bit model and a 3-bit model require two entirely separate quantization passes.
+There is no notion of nesting.
+
+* The Pivot: MatGPTQ Welds the Two Lines Together
+
+By 2026 the situation is clear:
+
+- MatQuant's direction is right, but it is not production-ready (expensive QAT, no kernel)
+- GPTQ is engineeringly elegant, but only handles one precision at a time
+
+What MatGPTQ does is *insert MatQuant's objective into GPTQ's algorithmic skeleton*.
+It sounds like merging two pull requests, but there are three non-trivial difficulties:
+
+** Difficulty 1: Choosing a Single Quantized Value That Is Good at Multiple Bit-Widths
+
+Vanilla GPTQ quantizes one weight by rounding it to the nearest point on an 8-bit grid.
+MatGPTQ cannot do this — the chosen q must satisfy:
+
+- sliced to 8 bits: ||W − dequant(S(q, 8))||² is small
+- sliced to 4 bits: ||W − dequant(S(q, 4))||² is small
+- sliced to 3 bits: ||W − dequant(S(q, 3))||² is small
+
+The solution: *enumerate every possible q ∈ [0, 2^c − 1], compute the error for each, take a weighted sum, and pick the q with the smallest total error.*
+It looks brute-force, but each weight is independent and fully vectorizable — on a GPU it is fast.
+
+** Difficulty 2: When Propagating Error to Subsequent Weights, Which Error Do You Propagate?
+
+GPTQ's core mechanism spreads the single-weight quantization error (W_i − Q_i) forward to all not-yet-quantized weights.
+With three bit-widths, there are three errors.
+
+MatGPTQ's choice: *average the errors across the three bit-widths and propagate that average.*
+No λ weighting — because λ influences which q is selected, but the compensation should treat all bit-widths equally.
+
+This apparently casual design choice is a key engineering decision that the paper makes quietly.
+
+** Difficulty 3: Searching for Heterogeneous Bit-Width Assignments
+
+If different layers use different bit-widths (Mix-and-Match), the result can be Pareto-superior in theory — but the search space is enormous.
+MatGPTQ borrows EvoPress (an evolutionary algorithm from the same IST-DASLab group):
+maintain a parent configuration, generate children each generation (drop one layer's bit-width, raise another's to keep the total budget), evaluate, and keep the best.
+
+One modification specific to Matryoshka quantization: the original EvoPress uses a fixed step size to switch bit-widths,
+but the Matryoshka search space is non-uniform (the set of valid bit-widths is discrete), so MatGPTQ introduces *dynamic budget tracking*,
+allowing multi-layer adjustments in a single step to land on a legal configuration.
+
+** Difficulty 4: Nobody Had Written This Kernel Before
+
+A working algorithm is not enough — to achieve real end-to-end GPU speedup, you need a CUDA kernel that supports runtime bit-width slicing.
+MatGPTQ implements a set of Ampere mma.m16n8k16 kernels that handle 2–4 bit range batch dequantization via three separate buffers (one 2-bit body and two 1-bit increments),
+combined with offline weight reordering to match TensorCore register layout.
+
+Result: on LLaMA 3.1 8B at 3-bit, the kernel delivers close to *3× end-to-end speedup* over FP16 inference.
+
+* What Came After
+
+** Any-Precision LLM (Park 2024) — The Opposite Direction
+
+Instead of slicing down from high bits, this work *builds up from the lowest bit*.
+Store a 2-bit base model plus a series of "increment bits"; assemble the desired precision at runtime.
+
+Advantage: the low-bit version is first-class.
+Disadvantage: all bits must always be resident in memory, so you can never run only the desired bit-width; mix-and-match is constrained;
+and it is built on SqueezeLLM's non-uniform clustering quantization, making it incompatible with GPTQ/AWQ pipelines.
+
+MatGPTQ's related-work section classifies it as an *orthogonal* direction: the conceptual route is simply different.
+
+** D²MoE (Wang 2025) — Same Idea, MoE-Only
+
+Applies MatQuant's nesting concept to MoE expert weights, using asymmetric GPTQ where each incremental bit-width has its own scale.
+Limitation: only tested on 2/3/4 bits and tightly bound to the MoE architecture.
+
+MatGPTQ is general and not restricted to MoE.
+
+* Summary Table
+
+#+begin_src
+Paper              | Year  | Problem Identified                        | Solution                                 | Remaining Gap
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+Matryoshka Repr    | 2022  | Training N separate models for N          | Jointly optimize multiple prefix         | Only for embeddings;
+Learning           |       | embedding sizes                           | sub-vectors in the training objective    | nobody thought to apply to weights
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+GPTQ               | 2022  | RTN collapses below 4 bits                | Hessian-guided layer-wise error          | Optimizes for a single
+                   |       |                                           | compensation                             | bit-width; one model per precision
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+MatQuant           | 2025  | Multiple precisions require multiple      | Joint multi-bit-width loss during        | QAT too expensive; closed-source;
+                   |       | stored checkpoints                        | training; high-bit slice = low-bit model | no kernel; only {8, 4, 2}
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+MatGPTQ            | 2026  | MatQuant's QAT cannot be shipped          | Multi-bit-width objective inside GPTQ    | Floating-point (FP) nesting
+(target)           |       |                                           | skeleton + EvoPress search + CUDA kernel | unsolved; bit-width set still limited
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+Any-Precision      | 2024  | Want dynamic precision, building upward   | Store 2-bit + increments, assemble       | All bits must be in memory;
+LLM                |       | from lowest bits                          | at runtime                               | incompatible with GPTQ/AWQ
+-------------------+-------+-------------------------------------------+------------------------------------------+-----------------------------
+D^2 MoE            | 2025  | MoE experts differ; should slice on       | Asymmetric GPTQ, independent scale       | MoE-only; only 2/3/4 bits
+                   |       | demand                                    | per bit-width                            |
+#+end_src
+
+* What Is Really Happening on This Line
+
+On the surface: quantization algorithms grow steadily more refined.
+One level deeper: *a model's "precision" is shifting from a static attribute to a runtime dimension.*
+
+In the beginning, a model was FP16 and was deployed as FP16. Then INT8 appeared, but as a separate checkpoint.
+4-bit and 3-bit were each their own artifact; every precision meant another copy of the weights, and operational burden grew linearly.
+
+The Matryoshka line is saying: *precision should not be a question of "which version did you build?" — it should be a question of "how many bits do you read?"*
+One set of weights, sliced at runtime according to device, load, and latency budget.
+This is a fundamental shift in *how models are stored* — from discrete versioned artifacts to a continuous spectrum.
+
+What MatGPTQ does is push this idea from concept (MatQuant) to default (PTQ + open-source + kernel + vLLM).
+Once it is integrated into vLLM, a single 8-bit checkpoint can simultaneously serve a 3-bit edge device and an 8-bit data center deployment.
+That is not just an optimization — it is a *restructuring of the deployment architecture*.
+
+* Where This Line Most Likely Goes Next
+
+1. *Nested quantization in floating-point formats*: everything so far is INT. Slicing FP formats at bit level has an exponential impact on numerical values (because the exponent bits sit inside the bit string), and nobody has solved it yet. But FP8 and FP4 are on the rise — whoever gets Matryoshka working on FP formats first captures the next wave.
+   MatGPTQ's own Discussion section flags this direction.
+
+2. *Training–inference co-design for bit-width selection*: EvoPress currently finds heterogeneous configurations offline.
+   The natural next step is runtime adaptivity — selecting each layer's bit-width on the fly based on current load.
+
+3. *Nested quantization + nested KV cache*: MatQuant addresses only weights, but the inference bottleneck is increasingly the KV cache.
+   The same nesting idea can be applied to KV cache, yielding "on-demand-precision attention memory."
+
+4. *Kernel ecosystem expansion*: MatGPTQ provides Ampere kernels, but Hopper, Blackwell, and AMD MI300 all need their own.
+   This is the most straightforward engineering work to pick up in the next 6–12 months.
+
+* Closing Echo
+
+One set of weights, read at whatever precision you need — quantization shifts from "artifact" to "spectrum."
+MatGPTQ is the cut that makes this production-ready.

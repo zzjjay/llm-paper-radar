@@ -1,0 +1,256 @@
+#+title:      Grid Games: The Power of Multiple Grids for Quantizing Large Language Models
+#+date:       [2026-05-25 Mon 06:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T065048-en
+#+source:     https://arxiv.org/abs/2605.12327
+#+authors:    Vage Egiazarian, Erik Schultheis, Andrei Panferov, Earl Killian, Torsten Hoefler, Dan Alistarh
+#+venue:      arXiv preprint, May 2026 (ISTA + ETH + Red Hat AI + Aril Computer)
+
+* The River of the Problem
+
+A problem that appeared already solved: stuffing weights into 4 bits, with every 16–32 values sharing a single scale. Today's hardware (Blackwell's NVFP4 / OCP's MXFP4) already does this. But there is a question that has never been seriously asked — *why must every block use the same ruler?*
+
+More concretely: FP4 has only 16 scale points, and where exactly to place those 16 points on [−1, 1] has long been debated. INT4 spaces them uniformly; FP4 (E2M1) places them "dense near zero, sparse at the far end"; NF4 assumes weights follow a normal distribution and places them at normal quantiles. Each camp is betting on "what weights look like." But the reality is: *different groups of 16 values within the same layer can have completely different distributions* — some blocks are nearly flat (values of similar magnitude), others are highly peaked (one outlier plus 15 tiny values). Applying the same ruler to both kinds of blocks always loses something.
+
+Grid Games poses an extremely simple question: *if each block is allowed to choose the best fit from two or even three pre-prepared rulers, will the result be more accurate?* Using 1–2 extra bits in the scale field to record "which ruler was used" costs almost nothing in hardware. This line of work advances "grid design" from "pick one grid for the whole model" to "pick one grid per small block."
+
+* Source Map
+
+#+begin_example
+[1957/1960] Lloyd & Max - Scalar Quantization (Lloyd-Max)
+  |
+  | Problem: given a signal distribution, where should N scale points be placed
+  |          to minimize total error?
+  | Solution: EM-style iteration — fix points → find intervals,
+  |           fix intervals → find points — converges to MSE optimum
+  v
+[2022] Frantar et al. - GPTQ                 [2023] Lin et al. - AWQ
+  |                                                  |
+  | Problem: compressing weights to INT4/INT3        | Problem: outliers in activations force weights
+  |          causes model collapse                   |          to handle large values too
+  | Idea: don't touch the grid itself; instead       | Idea: scale "important" weight channels
+  |       choose "which weights to protect"          |       individually
+  |   (Hessian-weighted rounding)                    |   (importance judged by activation magnitude)
+  | Gap left: the grid itself is still fixed         |
+  |           (INT4 uniform)                         |
+  v                                                  v
+[2023] Dettmers et al. - QLoRA / NF4
+  |
+  | Problem: uniform spacing (INT4) is wasteful — most weights cluster near zero,
+  |          the far end is nearly empty
+  | Solution: assume weights ~ N(0,1); place scale points at normal quantiles
+  |           (dense near zero, sparse at the far end)
+  | Gap left: this is one fixed grid chosen "for the whole model";
+  |           it cannot adapt to within-block variation
+  v
+[2023~2024] OCP MXFP4 / NVIDIA NVFP4 (Blackwell)
+  |
+  | Problem: sharing one scale across the whole tensor blows up the dynamic range
+  | Solution: split weights into blocks of length g (g=32 for MXFP4, g=16 for NVFP4),
+  |           each block carries its own scale (FP8 E4M3)
+  | Key: the hardware fixes the grid shape (E2M1); scale only adjusts the "ruler size"
+  | Gap left: scale controls the block's magnification factor, but the grid shape
+  |           is permanently identical for every block
+  v
+[2026 concurrent] Egiazarian/Wang et al. - IF4
+  |
+  | Problem: different blocks have very different "shapes" —
+  |          some are flat (suits INT4), some are peaked (suits FP4)
+  | Solution: each block quantizes with both INT4 and FP4 and picks the one with
+  |           lower error; 1 bit in the scale field records the choice
+  | Key: first per-block grid selection brought to a deployable 4-bit micro-format
+  | Gap left: only picks from INT4 / FP4, two "off-the-shelf" grids;
+  |           never asks "which two grids would be optimal"
+  v
+[2026] Egiazarian et al. - Grid Games (this paper)
+  |
+  | Problem: if blocks are allowed to choose a grid, then "which grids to offer"
+  |          is itself a genuine optimization problem
+  | Solution: formalize PO2 (Power-of-Two-grids), full stack from theory to kernel
+  |   - Theory: prove PO2 gives no benefit when block size g → ∞;
+  |             for g=16~32 micro-formats the gain is substantial;
+  |             competitive bound is derived
+  |   - Algorithm: four grid families (PO2(NF4), PO2(Split87), MPO2, SFP4)
+  |   - Hardware: SFP4 runs directly on Blackwell TensorCores
+#+end_example
+
+* Evolutionary Narrative
+
+** 1957/1960 | Lloyd-Max: How to "represent" a set of numbers best with N points
+
+*** What problem it saw
+
+The most fundamental question in communication engineering: to represent a continuous signal with N discrete values, which N values minimize the average error? For example, is it sensible to space 16 points uniformly when encoding speech with 4 bits?
+
+*** Its solution
+
+Cast the problem as an optimization: given signal distribution p(x), find N representative points b₁, …, bN that minimize ∫ p(x) · min_j (x − bj)² dx. Lloyd gave a simple iteration: (1) fix the points, assign each value to its nearest point (partition into intervals); (2) fix the intervals, move each representative point to the conditional mean within its interval. Repeat until convergence.
+
+*** Why it works (and where it plants a new seed)
+
+As long as you know the distribution, you can place scale points where they are needed — dense where the distribution is dense, sparse where it is thin. This is the ancestor of all "non-uniform quantization." But it leaves behind an implicit assumption: *you choose one set of scale points for the entire distribution* — it assumes all data share a single unified probability distribution. When different blocks have very different "shapes," a single grid starts to lose.
+
+** 2022–2023 | GPTQ / AWQ: Don't touch the grid — change "which weights we care about more"
+
+*** What problem it saw
+
+Naively cutting LLM weights to INT4 collapses performance. But on closer inspection, it is not "all weights" that collapse — it is a small number of critical weights that have been rounded too aggressively.
+
+*** Its solution
+
+GPTQ uses second-order Hessian information to measure "how much loss rounding this weight costs," then does column-wise error compensation — the rounding error of a quantized column is redistributed to subsequent unquantized columns. AWQ takes a different route: use a small batch of activations to identify "important channels," then scale those channels' weights up individually so they occupy "higher-precision" grid slots after quantization.
+
+*** Why it works (and where it plants a new seed)
+
+Both methods acknowledge that 4-bit grid points are a scarce resource, so they work hard to distribute "weights that need to be accurate" near grid points. This is very clever "error redistribution." But neither questions the grid itself — *INT4's 16 uniformly spaced points are never touched*. This leaves a complete research space for those who follow: can the grid itself be changed?
+
+** 2023 | NF4 (QLoRA): Weights are approximately normal, so the grid should match
+
+*** What problem it saw
+
+LLM weights are not uniformly distributed — they roughly follow a zero-mean, small-variance normal distribution. This means most weights cluster near zero, yet INT4 spaces its 16 points uniformly, leaving many points near the tails with almost nothing to represent.
+
+*** Its solution
+
+Set the 16 scale points at the 16 equal-probability quantiles of the standard normal distribution. The result is a grid dense near zero and sparse at the far ends. Combined with QLoRA's LoRA fine-tuning, "NF4 + double quantization" made it possible to fine-tune large models on a single GPU.
+
+*** Why it works (and where it plants a new seed)
+
+The grid finally "knows what weights look like." But NF4 is still *one global grid* — the same normal quantiles are used for every layer and every block. In reality, some layers have very peaked weights (one outlier stretches the range, pushing everything else toward the origin), while others are flat. NF4 wastes far-end points for the former and wastes near-zero points for the latter. One size always fits imperfectly.
+
+** 2023–2024 | MXFP4 / NVFP4: Stop using a global scale — let every 16–32 values share their own
+
+*** What problem it saw
+
+Not only does the weight distribution shape vary — so does its *magnitude*: some blocks in the same layer may be globally large while others are globally small. If the entire tensor shares one scale, that scale must accommodate the largest value, flattening all other blocks.
+
+*** Its solution
+
+Split weights into blocks of length g (g=32 for MXFP4, g=16 for NVFP4), each carrying its own scale. MXFP4 uses an E8M0 scale (power-of-two), NVFP4 upgrades to E4M3 (finer FP8). Values within a block are divided by their scale, normalized to [−1, 1], then quantized to the fixed E2M1 (4-bit FP) grid. Blackwell hardware natively supports this format.
+
+*** Why it works (and where it plants a new seed)
+
+The dynamic-range problem is finally solved — each block picks its own scale and is no longer held hostage by the tensor's maximum value. But this only adjusts the *size* of the ruler (scale), not its *shape*: every block still uses the same E2M1 grid (4 dense points near zero + 4 sparse points at the far end). If a block's normalized values all crowd into [0.7, 1.0] (one outlier compresses all others), E2M1 offers only 2–3 usable points in that interval, yielding large quantization error.
+
+** 2026 concurrent | IF4: Let each block choose between INT4 and FP4
+
+*** What problem it saw
+
+Plotting the distributions of normalized blocks from NVFP4 quantization reveals wildly different "shapes." Some blocks are flat (all |x|/M near 0.5 — clearly suited to INT4's uniform grid); others are strongly peaked (one value at 1.0, fifteen near 0.1 — clearly suited to FP4's "dense near zero" grid). Yet NVFP4 forces all blocks to use FP4.
+
+*** Its solution
+
+When quantizing each block, try both INT4 and FP4, then keep whichever has lower error. The 1-bit flag recording "which grid was chosen" is hidden inside the scale field (the E4M3 scale in NVFP4 doesn't need all its bits, so one can be repurposed). At run time the hardware decodes according to the flag.
+
+*** Why it works (and where it plants a new seed)
+
+This is the first time "per-block grid selection" is delivered as a truly deployable 4-bit format. But a fundamental question remains: *are INT4 and FP4 really the best two grids to offer?* Both are historical accidents — INT4 from the fixed-point arithmetic tradition, FP4 from the IEEE floating-point tradition. From a signal-processing standpoint, there is no reason they should be "the two best complementary 4-bit grids." IF4 never asks this question — it accepts the two off-the-shelf grids.
+
+** 2026 | Grid Games / SFP4: Turn "which grids to offer for blocks to choose from" into a real optimization problem
+
+*** What problem it saw
+
+IF4 proved the direction of "per-block grid selection" is correct, but it accepted the accidental INT4/FP4 pairing. Grid Games asks something more fundamental:
+
+1. *When is grid selection useful?* Intuitively, the smaller the block and the greater the shape variation across blocks, the more selection helps. A theory is needed to say "at which g is it worth doing."
+2. *How many grids should be offered? Is two enough?* Three is better but doubles the cost.
+3. *Which grids should be offered?* Should the pair be INT4 + FP4, NF4 + a residual grid, or grids learned from scratch?
+4. *Can it run on hardware?* Selecting a grid requires a conditional branch in the TensorCore decode path; done wrong, it kills throughput.
+
+*** Its solution
+
+Four things done in parallel:
+
+1. *Theory*: formalize the PO2 (Power-of-Two-grids) problem. Prove that *as block size g → ∞, PO2 gives no advantage* — large blocks all look alike, so one grid suffices. But at g=16–32 of micro-formats, block shapes differ significantly and PO2 gains are substantial. A competitive analysis shows: PO2 error is never worse than the best single grid by more than a constant factor.
+2. *Four grid families*:
+   - *PO2(NF4)*: pair NF4 (normal prior) with a "residual grid" designed specifically for shapes that NF4 misses.
+   - *PO2(Split87)*: an explicit-zero, asymmetric, MSE-optimal grid paired with its residual.
+   - *MPO2*: fully data-driven — learn two grids jointly on real weights and activations.
+   - *SFP4 (Shifted NVFP4)*: the most important entry — keep standard NVFP4 (E2M1) unchanged and add two "shifted" versions of NVFP4, giving three selectable grids.
+3. *Hardware deployment*: SFP4's three grids are all "shifts" of NVFP4 — meaning hardware decoding can reuse the NVFP4 TensorCore path and only needs a shift-and-add at load time according to the flag. Almost zero extra overhead on Blackwell.
+4. *Validation*: full experiments on synthetic distributions, PTQ (Llama series), and Llama-like pretraining. Finding: PO2(NF4) frequently *outperforms* the "best single grid learned specifically for that model/layer" — because its "NF4 + residual" structure combines prior knowledge with adaptability.
+
+*** Why it works (and where it plants new seeds)
+
+It turns "grid design" from a craft into a science: theory first circles "at which g is it worth doing," competitive analysis bounds the gain, data-driven learning produces the actual grids, and SFP4 squeezes the result into existing TensorCores. No gap in the stack.
+
+Remaining open questions (each a starting point for the next paper):
+1. Does offering 3+ grids keep improving accuracy? Theory says "yes, but with diminishing returns," and hardware cost rises steeply beyond 3.
+2. Should different layers use different "grid families"? Currently one family is shared across the entire network.
+3. The joint optimization space of PO2 with GPTQ/AWQ-style error redistribution has not been fully explored.
+
+* Frontier Extensions
+
+As of May 2026, Grid Games is the most recent formalized work on this line. The paper was just published (2026-05-12) and no public follow-up has appeared yet.
+
+Likely directions:
+- *Four-Over-Six (2025-12, arXiv:2512.02010)*: concurrent work doing "per-block scale selection" along a different axis — not changing the grid shape, but offering multiple divisor candidates for the scale. Orthogonal to PO2: one changes the scale *magnitude*, the other changes the *grid shape* the scale points to. Combining both is a natural next step.
+- *PV-Tuning / QuIP# family*: follows the "error redistribution" line, orthogonal to PO2. The Grid Games paper explicitly notes "PO2 is compatible with GPTQ," but joint optimization has not been attempted.
+- *Hardware layer*: SFP4 squeezes "per-block grid selection" into TensorCores; the next hardware generation will likely natively support multi-grid scale encoding — currently packed into FP8 E4M3 scale fields, but eventually likely enshrined directly in the ISA.
+
+* A Diagram
+
+#+begin_example
+            Grid shape                        Number of grids
+           (where to put points)    (how many sets to choose from)
+                |                              |
+                v                              v
+   1957  Lloyd-Max ----.                       |
+                       |                       |  One global set
+                       v                       |  (1 grid for all)
+   2022  GPTQ/AWQ ----+-- don't touch grid;    |
+                       |   change "how to      |
+                       |   round"              |
+                       v                       |
+   2023  NF4 --------+ assume normal;          |
+                       |   push points         |
+                       |   toward zero         |
+                       v                       |
+   2023  MXFP4/NVFP4 +---------------          | Block-level scale
+                       |    (hardware          | (per-block scale,
+                       v     support)          |  but grid still global)
+                                               |
+                                          ============================
+                                               v
+   2026  IF4 ----------------------- Each block picks INT4 or FP4
+                                     (per-block grid choice,
+                                      but only between two off-the-shelf grids)
+                                               |
+                                               v
+   2026  Grid Games ---------------- Turn "which grids to offer"
+   (this paper)                       into a real optimization problem
+                                     - Theory gives g lower bound +
+                                       competitive bound
+                                     - MPO2 / PO2(NF4) / Split87 / SFP4
+                                     - SFP4 = 3 shifted NVFP4 grids,
+                                       runs directly on Blackwell TensorCores
+#+end_example
+
+* Insights
+
+The real change behind this line of work is that *the "granularity" of quantization research has been steadily refined*:
+
+- 1957: one distribution, one grid.
+- 2023 (NF4): one model, one grid.
+- 2023–2024 (MXFP4/NVFP4): one block, one scale (but grid still global).
+- 2026 (IF4): one block, one grid (but limited to two off-the-shelf grids).
+- 2026 (Grid Games): one block, one grid, *and the grids themselves are optimized*.
+
+The next step is almost predetermined: *per-channel grid families* or *per-layer grid families* — different layers/channels within the same network use different "two-grid pairings." Further out: *learned routing* — the network learns for itself "which data uses which grid combination."
+
+A deeper thread: *explicitly baking hardware cost into algorithm design*. SFP4 is not the "theoretically optimal grid combination" — it is the "theoretically good enough + hardware-runnable" compromise. This kind of algorithm–hardware co-design is already the default paradigm for 4-bit quantization research. Nobody publishes formats that are "theoretically beautiful but cannot run on TensorCores" anymore.
+
+* Lessons
+
+What this evolutionary line teaches about finding problems:
+
+1. *Don't just read the latest paper — look at the premises it accepts.* IF4 appears to be a natural extension of NVFP4, but it accepts the accidental premise that "INT4/FP4 are the natural two grids." Pry that premise open and you have the entire research space of Grid Games. Every SOTA paper has one or two "questions it never asked" — those are the starting points for the next SOTA.
+
+2. *The greatest value of theory is not proving "I'm right" but delineating "the useless region."* The most valuable theorem in Grid Games is not "PO2 is useful" but "PO2 is useless when block size is large" — this tells everyone: don't try this above g=128. A clear negative result is more useful than a positive claim.
+
+3. *Hardware compatibility is a first-order constraint.* MPO2 is one of the most accurate schemes in the paper, yet it is not the star — SFP4 is. Because SFP4 runs on today's hardware. The "reach" of a piece of research is determined by its hardware barrier, not its accuracy ceiling.
+
+Practical takeaways:
+- If you are doing 4-bit quantization, *per-block grid selection* now has a complete theoretical and practical foundation. Start with PO2(NF4) (lowest-cost entry point), and consider SFP4 once you've confirmed the gain.
+- If you are doing quantized training, PO2 and Four-Over-Six can be *enabled simultaneously* — one changes scale magnitude, the other changes grid shape; they are orthogonal.
+- If you are designing new hardware or new formats, *reserving 1–2 bits in the scale field as a grid flag* should become the new standard — the cost is ~3% of scale bit-width, and the payoff is nearly "free" accuracy.

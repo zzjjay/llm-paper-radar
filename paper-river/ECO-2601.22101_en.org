@@ -1,0 +1,259 @@
+#+title:      ECO: Quantized Training without Full-Precision Master Weights
+#+date:       [2026-05-25 Mon 06:23]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T062355-en
+#+source:     https://arxiv.org/abs/2601.22101
+#+authors:    Mahdi Nikdan, Amir Zandieh, Dan Alistarh, Vahab Mirrokni
+#+venue:      arXiv 2026 (Google Research / ISTA)
+
+* The River of the Problem
+
+Training a trillion-parameter model, the most expensive thing is not GPU compute — it is memory. Fitting model weights onto GPUs is just the beginning: the optimizer must open two to three additional copies (gradients, momentum, master weights), and the whole bag together is three to four times larger than the model itself. This river chases a single question: *Can we deflate that bag without ruining training?*
+
+Where is the difficulty? Low-precision training carries a curse: you want to store weights in 8 bits to save memory, but 8-bit "bins" are too coarse — many gradient updates are smaller than a single bin, so adding them is equivalent to adding zero, and the model just sits there unable to learn. The long-standing industry compromise is therefore: run forward and backward passes in FP8 (saving compute), but secretly accumulate updates into a FP32 "master weight," then quantize back when enough has accumulated. The moment the master weight is opened, half the saved memory is returned. Every generation on this river has tried to route around that master weight — from applying error feedback to gradients, to reducing optimizer-state precision, to compressing the weight copy's bit-width. ECO is the cleanest single blow the river has seen so far: the master weight is deleted entirely, the quantization error is stuffed into the momentum buffer as error feedback, and convergence can still be proved in theory.
+
+* Source Map
+
+#+begin_example
+[2014] Seide et al. - 1-bit SGD with Error Feedback
+  |
+  | Problem seen: compressing gradients to 1 bit saves distributed-training
+  |   bandwidth, but the model can no longer learn
+  | Solution: don't discard the quantized remainder — store it locally and
+  |   add it back in the next step (error feedback)
+  v
+[2017] Micikevicius et al. - Mixed Precision Training (MPT)
+  |
+  | Problem seen: FP16 forward/backward is fast but unstable; small
+  |   gradients vanish entirely
+  | Solution: compute in FP16, store weights and updates in a FP32 master
+  |   weight (the master-weight paradigm is established here)
+  v
+[2021] Dettmers et al. - 8-bit Optimizers
+  |
+  | Problem seen: Adam's first- and second-moment buffers each cost a full
+  |   FP32 copy — larger than the model itself
+  | Solution: quantize optimizer states to 8 bits, leaving the master
+  |   weight untouched
+  v
+[2021] Richtarik et al. - EF21
+  |
+  | Problem seen: Seide's error feedback is an engineering heuristic with
+  |   no convergence proof
+  | Solution: give EF a principled framework and prove it matches full-
+  |   precision SGD's convergence rate
+  v
+[2023] Peng et al. - FP8-LM
+  |
+  | Problem seen: MPT uses FP16; the FP8 training era should arrive
+  | Solution: full FP8 forward/backward, but an explicit FP32 master weight
+  |   is retained ("FP8 accumulation fails at large LLM scales")
+  v
+[2025] Zhang et al. - ELMO
+  |
+  | Problem seen: the master weight is still frozen in place; can we at
+  |   least lower accumulator precision too?
+  | Solution: use stochastic rounding to drop the accumulator of the LLM
+  |   head layer to BF16/FP8 (local relaxation, master weight still present)
+  v
+[2026] Nikdan et al. - ECO  <-- target paper
+        The master weight is deleted entirely. Quantization error is injected
+        into the momentum buffer as error feedback — zero extra memory, and
+        theory shows convergence radius is only 1/(1-beta^2) worse than
+        training with a master weight.
+#+end_example
+
+Note: this is an "problem-axis" evolution line, not a strict citation tree. Seide 2014 → EF21 → ECO is the error-feedback idea stream; MPT → Dettmers → FP8-LM → ELMO → ECO is the low-precision training / memory engineering stream. ECO's key contribution is cleanly merging these two streams for the first time.
+
+* Evolutionary Narrative
+
+** 2014 | 1-bit SGD: Don't Discard the Remainder — Save It for the Next Step
+
+*** What Problem Did It See?
+
+At the time, people were doing distributed deep learning, and the bottleneck was not compute but network bandwidth: thousands of GPUs exchanging gradients caused bandwidth explosion. The most aggressive way to save bandwidth was to compress each gradient to 1 bit (transmit only the sign), but doing so made models unable to learn. The reason is straightforward: compressing a 32-bit float to 1 bit discards not a little but 31 bits of information. Accumulating those discarded bits step after step causes the direction to drift.
+
+*** Its Solution
+
+Seide's idea is simple to the point of elegance: if you can only transmit 1 bit this step, don't discard the remaining 31 bits of remainder — store it locally. When computing the new gradient next step, first add back last step's remainder, then compress, transmit, and store the new remainder. Over time the remainder will accumulate until it crosses the 1-bit threshold and gets transmitted.
+
+An analogy: you can only wire a friend whole dollars, so 1.4 dollars becomes 1 dollar sent with 0.4 kept in a ledger. Next time you owe another 0.4, the two add up to 0.8; the time after that you can send 1 dollar (actually owe 1.2, carry 0.2). In the long run, no money is swallowed.
+
+*** Why It Works — and What New Pit It Digs
+
+Intuitively it preserves the "sum" — no update is truly lost, only delayed. But it was pure engineering practice; nobody could state precisely where it converges. And the "remainder" requires an extra buffer — a small cost in the distributed gradient-communication setting, but later, when people wanted to apply the same idea to weight quantization, that buffer becomes a large problem.
+
+** 2017 | MPT: Compute in FP16, Store in FP32 — The Master Weight Era Begins
+
+*** What Problem Did It See?
+
+GPUs gained Tensor Cores; FP16 became blazing fast, but training large models in FP16 was unstable — many gradient values were too small and collapsed to zero in FP16; gradients through deep networks shrank multiplicatively until all of them underflowed.
+
+*** Its Solution
+
+Micikevicius proposed a compromise: run forward and backward passes in FP16 (fast), but maintain a FP32 "master weight." Each step, quantize the master weight to FP16, run forward and backward, convert the FP16 gradients back to FP32, and add them to the master weight. Pair this with loss scaling (multiply the loss by a large factor before backward to prevent underflow, then divide back) and training stabilizes.
+
+*** Why It Works — and What New Pit It Digs
+
+It works because the "small update" problem is caught by the FP32 master weight — even the tiniest gradient leaves a trace in FP32. But the cost is: you thought you halved memory (FP16 vs FP32), yet in practice you only saved the activation memory of the forward pass; weights and the optimizer are still full FP32. The "master weight" paradigm has pressed down on every low-precision training design since.
+
+** 2021 | 8-bit Optimizers: Too Afraid to Touch the Master Weight, So Trim the Optimizer States First
+
+*** What Problem Did It See?
+
+After MPT, it became clear that the real memory hog in LLM training is not the weights but Adam's two FP32 momentum buffers — together larger than the model. The master weight seemed untouchable (touching it causes instability), so attention turned to what sat beside it.
+
+*** Its Solution
+
+Dettmers applied block-wise quantization with a dynamic exponent technique to compress Adam's first and second moments to 8 bits. Key finding: the first moment tolerates quantization well; the second moment needs careful handling.
+
+*** Why It Works — and What New Pit It Digs
+
+It works because optimizer states are "smoothed statistical quantities" that are already noisy — a little extra quantization noise is not fatal. But this maneuver sidesteps the real hard problem: the master weight is still sitting there. After optimizer states are compressed, the FP32 master weight becomes even more conspicuous in the memory budget — especially in MoE models where total parameter count explodes and every expert needs its own master weight. This becomes the bone the next generation must gnaw.
+
+** 2021 | EF21: Putting a Mathematical Armor on Error Feedback
+
+*** What Problem Did It See?
+
+Seide's error feedback from 2014 was used widely, but for a decade nobody could rigorously prove where it converges. Theory and practice were disconnected — you trained with it and it worked, but nobody knew whether that was luck or necessity.
+
+*** Its Solution
+
+The Richtárik team gave error feedback a clean mathematical framework (EF21) and proved that under standard non-convex assumptions it matches the convergence rate of full-precision SGD (up to a constant factor).
+
+*** Why It Works — and What New Pit It Digs
+
+The significance is not engineering but a "certificate of legitimacy" — EF can now be cited squarely inside algorithm design arguments, not merely justified as "works in practice." But EF21 itself still focuses on the gradient-compression setting. Moving it to the "weight quantization" setting requires one more step: in the weight setting, the buffer used to store the remainder is the same size as the memory you are trying to save. That gap is left for later workers to close.
+
+** 2023 | FP8-LM: The FP8 Training Era Arrives, but Nobody Dares Remove the Master Weight
+
+*** What Problem Did It See?
+
+H100 arrived; FP8 Tensor Cores took off; upgrading MPT from FP16 to FP8 was the natural move. But naïve upgrading collapsed: FP8 accumulation fails at large LLM scales — Peng's paper states this explicitly.
+
+*** Its Solution
+
+Carefully choreograph quantization: all forward and backward computation in FP8 (saving compute), but all accumulation (weight updates, Adam state) keeps FP32 master weights. FP8 is used where throughput is high and error tolerance is high; FP32 is reserved where throughput is low and sensitivity is high.
+
+*** Why It Works — and What New Pit It Digs
+
+It works because it recognizes FP8's limits — running a forward pass in FP8 does not mean accumulation in FP8 is safe. But FP8-LM's price is that the master weight is now nailed down permanently. DeepSeek-V3 and Kimi-K2 both follow this paradigm. MoE models suffer especially: during a forward pass only a few experts are activated, yet every expert's master weight must reside in GPU memory at all times.
+
+** 2025 | ELMO: Trying to Drop Accumulator Precision by One More Step
+
+*** What Problem Did It See?
+
+In the FP8-LM paradigm the master weight is fixed at FP32/BF16. ELMO asked: can we at least lower the accumulator precision in certain layers?
+
+*** Its Solution
+
+Apply stochastic rounding to the LLM head layer to drop the accumulator to BF16 or even FP8. The advantage of stochastic rounding is "unbiasedness" — on average it does not systematically lean one direction, preserving convergence.
+
+*** Why It Works — and What New Pit It Digs
+
+It works because it finds a sweet spot: gradient statistics in the head layer have special properties that tolerate this. But ELMO is a local fix; the master weight paradigm for the whole model remains untouched. The question is pushed to its limit: should we delete the master weight entirely? That is where ECO takes over.
+
+** 2026 | ECO: Stuff the Remainder into Momentum, Delete the Master Weight Entirely (Target Paper)
+
+*** What Problem Did It See?
+
+Looking back at the two streams on this river:
+
+- Engineering stream (MPT → 8-bit Opt → FP8-LM → ELMO): continuously squeezing peripheral memory (activations, optimizer states, accumulators), but the core master weight block was never touched. In the MoE era this block dominates.
+- Idea stream (Seide → EF21): error feedback was actually designed for "keeping low-precision updates on track," but it was only ever applied to gradient-communication compression, never to weight quantization — because in the weight setting the "remainder buffer" is as large as the memory you want to save, which is equivalent to reopening a master weight.
+
+The key gap ECO sees: *What if no extra buffer is needed?* You already have a momentum buffer — can you just stuff the remainder into that?
+
+*** Its Solution
+
+Naïve "no-master-weight" training simply dies: you add an update to a FP8 weight, quantize, and the discarded remainder is gone forever. The smaller the learning rate, the more severe the relative loss — one can show the error is inversely proportional to the learning rate, so the closer to convergence the worse it gets.
+
+ECO proceeds in two steps:
+
+1. Exact rule: first prove that if at every step you stuff "the current quantization error e_{t+1}" and "the residual from the previous step e_t" into the momentum buffer in a specific way, the training trajectory is *identical* to SGDM with a master weight. But this requires storing e_t — back to the original problem.
+
+2. Heuristic approximation: observe that when momentum dominates the update, the weights change only a tiny bit each step, so e_t ≈ e_{t+1}. Replace e_t with e_{t+1} in the exact rule, and it simplifies to:
+
+   m ← m + (1/η)(1 - 1/β) e_{t+1}
+
+   Zero extra buffer — only the momentum buffer that already exists is reused.
+
+Analogy: you owe a friend 1.4 dollars and can only give 1 dollar; the 0.4 remainder gets noted. But instead of keeping a separate ledger you directly convert that 0.4 into "extra drive for tomorrow" stored inside your existing "drive account."
+
+*** Why It Works — and What New Pit It Digs
+
+In theory ECO converges to a neighborhood of the optimum whose radius is determined by the quantization grid itself; the radius is only 1/(1-β²) times larger than training with a master weight — with the common momentum coefficient β = 0.9 that is just over five times. Compared with naïve no-master-weight training where "error ∝ 1/learning rate" diverges without bound, this bound is clean.
+
+Empirically, FP8 training of 30M–800M small Transformers, Gemma-3 1B, a 2.1B MoE, plus INT4 fine-tuning of DeepSeek-MoE-16B all match the loss of the master-weight baseline while reducing static memory by 25%.
+
+New pits dug:
+
+- The heuristic substitution e_t ≈ e_{t+1} may not hold when the learning rate changes abruptly — there is theoretical analysis but the experimental coverage is limited.
+- In INT4 training the quantization grid is inherently coarse; ECO's convergence radius floor still depends on grid granularity. Whether this approach holds at INT2/INT1 is unknown.
+
+* Frontier Extensions
+
+ECO is a January 2026 paper; as of the writing date (2026-05-25) it is the latest public advance on this line. Foreseeable follow-on directions:
+
+- *Stacking with optimizer-state quantization*: ECO already eliminates the master weight; the next step is combining ECO + 4-bit optimizer states (Li et al. 2023 already compressed Adam states to 4 bits) to push total "model + optimizer" memory close to the model size alone.
+- *More aggressive weight quantization*: ECO experiments reach INT4; the next step is whether INT2 / ternary / binary can hold up. This would approach a "train-equals-deploy" regime — the trained model is already the deployment artifact, with no post-processing needed.
+- *MoE specialization*: MoE is the scenario where ECO's gain is largest (master weight share is highest); follow-on work may craft more precise error injection tailored to MoE's sparse activation patterns.
+
+* One Figure to Understand It All
+
+#+begin_example
+
+Time ----> 2014    2017      2021       2021    2023      2025    2026
+         Seide    MPT     8-bit Opt   EF21   FP8-LM    ELMO    ECO
+                                                                 |
+[Error-Feedback Idea Stream]                                     |
+Compress gradients, keep remainder locally -> give EF a         |
+convergence proof --------------------------------------------- +
+                                                                 |
+[Low-Precision Training Engineering Stream]                      |
+FP16 compute +             Compress optimizer   FP8 forward     Master
+FP32 master weight ------> states (master  ---> (master    --+-> weight
+as safety net              weight still)        weight still) |   deleted
+                                                              |   zero extra
+                                           Drop head-layer   |   memory
+                                           accumulator  -----+
+                                           (local fix)
+
+----------------------------------------------------
+Solution dimension       | Seide MPT  Dett EF21 FP8L ELMO ECO
+----------------------------------------------------
+Reduce fwd/bwd compute   |  -    +    -    -    ++   ++   ++
+Compress optimizer state |  -    -    ++   -     -    -    -
+Compress master weight   |  -    -    -    -     -   -+   +++
+Error-compensation mech. |  +    -    -    ++    -    -   +++
+Convergence proof        |  -    -    -    ++    -    -   +++
+----------------------------------------------------
+(+ = increasing degree, - = not addressed)
+
+#+end_example
+
+* Insight
+
+What looks on the surface like "a progression of memory-optimization techniques" is, at its core, *the confluence of two independent idea streams*:
+
+1. *Error feedback* — born from a distributed-training bandwidth problem (2014), slowly acquiring mathematical armor (2021), yet for over a decade applied only in the "gradient communication" setting.
+2. *Low-precision training* — born from hardware capability (FP16 Tensor Cores → FP8), steadily squeezing out high-precision copies on the periphery, but never able to eliminate the master weight at its core.
+
+The two streams were unaware of each other, because one addressed "transmission precision loss" and the other addressed "storage precision loss." ECO's true insight is recognizing that *storage precision loss is fundamentally a form of transmission precision loss* — when you "transmit" a high-precision update into a low-precision weight, the discarded remainder is the error. Once the perspective flips, decades of error-feedback technology can be applied directly.
+
+Going one level deeper: the most expensive thing in research is not a new algorithm but a *new perspective*. Seide's algorithm existed in 2014; EF21's theory existed in 2021; ECO uses exactly those two ready-made bricks. What mattered was seeing them as two faces of the same problem.
+
+Where might things go next? *Unifying "storage" and "transmission" in an information-theoretic framework* — quantization error, communication compression, sparse updates, checkpoint compression, KV-cache compression are all the same problem at heart: how to preserve the cumulative sum of information under precision loss. Whoever can write that down as a clean framework will own the next generation of training systems.
+
+* Takeaways
+
+For people building ML systems:
+
+- *Don't only read papers in your own lane.* Those working on optimizer-state compression missed error feedback because they didn't read distributed-communication papers; those working on distributed systems missed the master-weight setting because they didn't read LLM training papers. Read across streams; find the gaps nobody has bridged.
+- *"Zero extra memory" is an exceptionally strong design constraint.* ECO doesn't reduce the error buffer from X bytes to Y bytes — it reduces it to 0. That forces you to reuse an existing buffer, which in turn forces the elegant insight e_t ≈ e_{t+1}. Next time you do memory optimization, first ask whether you can reuse rather than allocate.
+- *A heuristic observation can be deployed first and proved later.* ECO first uses e_t ≈ e_{t+1} to derive a clean rule, then separately proves a convergence radius. If strict proof were required before design, the work would never escape the EF21 framework.
+
+For researchers more broadly:
+
+- *Old problems hide new answers* — "error feedback" was already 12 years old, and nobody thought to move it from "gradients" to "weights." Don't treat classic techniques as mere history; they are tools waiting in a drawer.
+- *The trend of an evolutionary line tells you where the next step is* — in this river every generation "deletes one more high-precision copy." The next generation will inevitably either "delete the last high-precision copy" or "make the mechanism hold at lower bit-widths (2-bit, ternary)." Those who can anticipate the trend can start building two years before the paper appears.

@@ -1,0 +1,255 @@
+#+title:      Measuring Maximum Activations in Open Large Language Models
+#+date:       [2026-05-25 Mon 06:54]
+#+filetags:   :paper:river:
+#+identifier: 20260525T065428
+#+source:     https://arxiv.org/abs/2605.15572
+#+authors:    Luxuan Chen, Han Tian, Xinran Chen, Rui Kong, Fang Wang, Jiamin Chen, Yuchen Li, Jiashu Zhao, Shuaiqiang Wang, Haoyi Xiong, Dawei Yin
+#+venue:      arXiv 2026 (Baidu / SJTU / Nankai)
+
+* 问题之河
+
+把一个大模型塞进 INT8、FP8、甚至 INT4 部署，最大的拦路虎不是平均值有多大，而是 *最大值有多大*。一个 token 的某一维冒出一个比邻居大一千倍的数，整张 tensor 的量化刻度就被它一个人吃光了，其它所有数字都被压成噪声。
+
+这条问题线的核心一句话：*大模型里那些"离谱大"的激活值是什么、从哪来、怎么治、还在不在？* 从 2022 年第一次被命名为"涌现的离群特征"，到 2024 年被精确刻画成"超大激活"，再到 2026 年发现现代开源模型早就把这条线打乱——四年走了一圈，从"必须打补丁"绕回了"先去测一下到底有多大"。
+
+这个问题为什么难？因为它*跨着两个圈子*——做可解释性的人把它当 transformer 内部机制的谜，做部署的人把它当数值工程的脏活——两边各自迭代，都默认对方那边的"事实"还成立。直到模型架构（MoE、SwiGLU、不同 norm 栈）一变，两边的事实同时过期。
+
+* 溯源地图
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | 发现: >6.7B 参数的模型突然冒出"涌现的离群特征"
+  |       某些维度上所有 token 都偏大 (6 sigma 规则)
+  | 后果: 朴素 INT8 量化崩盘, 必须做混合精度
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | 看到: 离群值都在激活, 不在权重
+  | 解法: 把离群"难度"从激活搬到权重 (per-channel 缩放)
+  |       activation 变光滑, weight 变粗糙, 但 weight 好量化
+  v
+[2023] Bondarenko et al. - Quantizable Transformers (Do Nothing)
+  |
+  | 追问: 离群值为什么会存在? 不是 bug 是 feature
+  | 解法: 注意力头有时需要"什么都不输出"
+  |       为了让 softmax 几乎全押到无关 token,
+  |       它必须让 value 那侧的某个分量极大
+  v
+[2024] Sun et al. - Massive Activations (LLaMA)
+  |
+  | 区分: 把"涌现离群特征"再切一刀
+  |       极少数激活 |x|>100 且比邻居大 1000+ 倍
+  |       叫"超大激活", 经常落在 sentence-start token 上
+  | 局限: 只在 LLaMA / Mistral 系上看, 用硬阈值
+  v
+[2026] Chen et al. - Measuring Maximum Activations  <<< 本文
+  |
+  | 反问: 后 LLaMA 时代 (Qwen2.5/3/3.5, Gemma2/3, MoE, VLM,
+  |       gpt-oss) 这套画像还成立吗?
+  | 做法: 不再用硬阈值, 直接量 max|a|, 跨 8 家 27 个 checkpoint
+  | 发现: 同等参数量跨家差近 4 个数量级
+  |       MoE 比 dense 低 14-23 倍
+  |       generation 之间非单调 (Qwen3 比 2.5 高, 3.5 又降回去)
+  v
+[2026+] Sun-Canziani-LeCun et al. - Spike vs Sink anatomy
+        Queipo-de-Llano et al. - Sinks ↔ compression valleys
+#+end_example
+
+* 演化叙事
+
+** 2022 | LLM.int8(): "原来大模型有离谱大的数, 而且越大越多"
+
+*** 它看到了什么问题
+
+2022 年之前，大家以为 transformer 量化和 CNN 量化是一回事——找个 calibration set，统计一下每层激活的分布，划好 INT8 的刻度，掉点几个百分点就交差。到 OPT/BLOOM 这种 6.7B+ 量级，这套全崩。同样的 PTQ 流程，BERT 上掉 0.5 个点，OPT-13B 上直接掉 30+ 个点，完全不可用。
+
+Dettmers 团队去翻数据，发现一个反直觉的事：模型越大不是问题越平均，而是 *某些维度上每个 token 都偏大*——不是少数 token 的偶发，是整列特征系统性地比别人大六个标准差以上。他们给这种现象起了个名字：emergent outlier features，涌现的离群特征。
+
+*** 它的解法
+
+既然这些维度无法被普通 INT8 容纳，就把它们 *单独拿出来用 FP16 算*，剩下的 99.x% 维度照常 INT8。这就是 LLM.int8() 的混合精度方案。结果是 OPT-175B 的 INT8 推理几乎无损。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为离群维度数量很少——一两百个 channel 里也就十几个——把它们隔离掉，其余部分的动态范围立刻回到 INT8 能装下的水平。
+
+但它埋的坑也很明显：*混合精度推理 kernel 要写两条路*，硬件吞吐没法跑满。下一篇人会问：能不能根本不让激活有离群值？
+
+** 2023 | SmoothQuant: "如果不能消灭离群值, 就把它搬到别人头上"
+
+*** 它看到了什么问题
+
+LLM.int8() 让模型能跑 INT8 了，但代价是 SOTA kernel 都得重写。更糟的是，离群维度的数量随模型变大还在涨——175B 上能勉强 hold 住，更大的呢？
+
+Xiao 团队盯着同一个观察看出了新东西：离群值 *几乎只出现在激活那一侧，权重一侧反而很均匀*。也就是说，量化 weight×activation 这件事里，难的不是 weight，是 activation。
+
+*** 它的解法
+
+那就 *把难度从激活搬一部分到权重上*。具体做法：找一个 per-channel 的缩放因子 s，对每个 channel 把 activation 除以 s、把对应 weight 乘以 s。数学上 (A/s)(sW) = AW 完全等价，但变换后激活的动态范围被压扁了，权重的动态范围被拉宽了。
+
+激活变光滑，整张 tensor 就能用普通 INT8；权重虽然变粗糙了，但权重本来分布就规整，多扛点不要紧。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是个绝妙的会计技巧——总难度守恒，但量化误差对两边的敏感度不一样，所以转移就赚到了。
+
+但它没回答 *为什么激活那一侧本来就有离群值*。这个"为什么"留给了下一个人。
+
+** 2023 | Quantizable Transformers: "离群值不是 bug, 是注意力机制必须的 escape hatch"
+
+*** 它看到了什么问题
+
+SmoothQuant、AWQ、GPTQ 之类的方案都在做同一件事：*治症状*。等离群值出现了再去搬、去转、去转 basis。但模型一代比一代大，离群值一代比一代极端，治标永远在追跑。Bondarenko 团队问了一个更根上的问题：*这些数为什么非要这么大不可？*
+
+*** 它的解法
+
+他们没改方案，先去拆模型。发现一个有趣的机制：transformer 里的注意力头有时候 *想"什么都不做"*——它处理完一段上下文之后判断"这块没我什么事，下一层别用我的输出"。
+
+但 softmax 的设计逼着每个头的注意力权重必须加起来等于 1，没有"全不分配"这个选项。唯一的逃路是：把所有权重几乎全押到某个"垃圾桶"token 上（通常是序列开头的 BOS 或第一个普通 token）。要让 softmax 几乎 1.0 落在那个 token 上，对应 query·key 必须远大于其它——*这就需要 value 那侧的某个分量极大*。
+
+于是离群值出现了。它不是数值噪声，是 attention 在用大数字实现"no-op"语义。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这套解释很优雅，因为它能预测：如果给 attention 一个干净的 no-op 出口（比如允许 softmax 不归一化、或者加一个常数 sink token），离群值应该自动消失。后来的实验确实印证了这点。
+
+但它留下的新坑是：*"超大"到底有多超大？是不是所有看着像离群的都是 no-op 的副产物？* Sun 等人很快会发现：不是。有一类"超大"比普通离群还要再大三个数量级，它的成因比 no-op 更微妙。
+
+** 2024 | Massive Activations: "再切一刀, 把'超大'从'离群'里分出来"
+
+*** 它看到了什么问题
+
+Bondarenko 的"do nothing"解释把离群值的成因讲清楚了，但 Sun 团队在 LLaMA-2、Mistral 上看 hidden state 的时候发现：*有一小撮激活比"涌现离群"还要再大 100-1000 倍*——不是 6σ 那个量级，是 |x|>100 而周围邻居只有 0.1。这种激活只出现在极少数 token（通常是 BOS 或常见低信息 token）上，但一旦出现就*一个人决定整层的最大值*。
+
+如果还是按 Dettmers 那套把它们当成"某些维度上的系统偏大"处理，会漏掉这种"单点尖刺"——因为它不是某列普遍偏高，是某个 (token, channel) 单元格暴击。
+
+*** 它的解法
+
+Sun 等人给这种现象起了新名字 *massive activations*，并给出硬阈值定义：|x| > 100 且 ≥ 1000× 同 token 内中位数。在这个定义下，他们做了三件事：
+
+1. 统计：在 LLaMA-2、Mistral、Phi-2 等几个模型上确认这种激活普遍存在；
+2. 干预：把这些 massive activation 强行清零，模型立刻崩溃，说明它们承担实际功能；
+3. 关联：这些激活的位置和 attention sink 高度重合，强化了 Bondarenko 的 no-op 假说。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"涌现离群"和"超大激活"分清楚很重要——它们的成因、出现位置、对量化的影响都不同。这一刀让后续工作能精确瞄准。
+
+但它埋的坑藏得很深：*所有结论都建立在 LLaMA 家族上，用了硬阈值*。如果未来出现一种模型，它的"超大"激活恰好落在 |x|=50（够大但够不到 100），这套定义就会判它"没有超大激活"——尽管它的部署难度可能和 LLaMA 一模一样。
+
+更要命的是：2024 年之后的开源浪潮里，模型架构已经全面变样——SwiGLU 替代 GeLU，RMSNorm 加在不同位置，MoE 取代 dense，VLM 加视觉 adapter。Sun 那张"LLaMA 风景照"还能用吗？没人测过。
+
+** 2026 | Measuring Maximum Activations: "别再用硬阈值, 直接量, 而且要跨家量"
+
+*** 它看到了什么问题
+
+到 2026 年，部署侧已经从 INT8 推进到 FP8 甚至 MXFP4。每出一个新开源模型，第一件事就是估它的激活动态范围以确定量化 scale。但工程师手头的"参考画像"还是 LLaMA 的——前述四篇论文积累下来的那套：6σ 离群特征 + 超大激活落在 sink token 上 + 治理用 SmoothQuant 或 rotation。
+
+Chen 团队抓住三个尴尬事实：
+
+1. *硬阈值过时*：Sun 的 |x|>100 是用 LLaMA 校准的，没人知道 Qwen3.5、Gemma3 上 100 算大还是算小；
+2. *categorical 思维过时*：把 activation 分成"普通 / 离群 / 超大"三档很方便，但对部署来说真正重要的是 *max|a| 这个连续数字*——它直接决定量化 scale；
+3. *单家族测量过时*：现代开源模型在 normalization、gated MLP、MoE 路由、VLM 适配、intermediate checkpoint、instruction tuning 上同时分化，再用一两个 LLaMA checkpoint 推全场已经不诚实。
+
+*** 它的解法
+
+不提新方法，只做一件事：*在统一协议下，把现代开源 LLM 的最大激活值全量过一遍*。
+
+- 一个 5,000 样本多领域语料 + 各家自己的 tokenizer；
+- 8 个家族 27 个 checkpoint（Qwen2.5/3/3.5、Qwen2.5-VL、Gemma2/3、Ling-mini 多个训练阶段、gpt-oss 等）；
+- 同一套 hook 挂在 embedding、hidden state、attention、MLP/MoE、SwiGLU gate、final norm 上；
+- 记录 global max 和 layer-wise max；
+- 顺手做了 INT8 sanity check：测出来的 max 直接预测量化误差。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+三个核心发现把过去四年的"事实"打了个对穿：
+
+1. *同等参数量, max 跨 4 个数量级*——Qwen3.5 在 10²~10³，Gemma3-27B-it 到了 ~7×10⁵。这意味着"模型尺寸决定离群严重程度"这个 implicit assumption 是错的。
+2. *MoE 比同规模 dense 低 14-23 倍*——稀疏路由把激活峰值显著压低，这一点之前只在 Ling 团队的 scaling-law 论文里被提过，现在被独立验证。
+3. *世代非单调*——Qwen2.5 → Qwen3 升高，Qwen3 → Qwen3.5 又降回去。说明峰值是 *训练配方* 的产物，不是规模的产物。
+
+新坑：既然峰值是配方决定的，那 *能不能反过来设计配方去压低峰值*？这是 2026 年之后的开放问题。论文给的暂时答案是：每次开源新模型，把 max|a| 当成模型卡里和参数量并列的字段报出来。
+
+* 前沿延伸
+
+** 2026 | The Spike, the Sparse, and the Sink (Sun, Canziani, LeCun, Zhu)
+
+把"超大激活"和"attention sink"再切一刀分清楚。之前的工作（包括 Sun 2024）把这两个现象绑在一起讲——超大激活就在 sink token 上、sink 就是因为超大激活产生的。这篇用 pre-norm transformer 的 early-layer step-up block 做精细解剖，*把 spike 和 sink 解耦*：spike 可能没有 sink、sink 也可以没有 spike，它们是两个独立机制偶然在 sink token 上重合。
+
+对 Chen 这条线的意义：解释了为什么有些家族（如 Qwen3.5）max 很低但仍然 attention sink 行为正常——sink 和 max 不是一回事。
+
+** 2026 | Attention Sinks and Compression Valleys (Queipo-de-Llano et al.)
+
+更进一步，把 attention sink 和 hidden-state 维度上的 "compression valley"（某些层突然把表示压扁到极低秩）联系起来，论证两者是同一现象的两个观察面。这条线还在快速迭代。
+
+截至目前（2026-05），Chen 等人这篇是这条线上 *跨家族实测* 维度的最新进展。
+
+* 一张图看懂
+
+#+begin_example
+                       离群激活的认知地图 (2022 -> 2026)
+
+  时间   论文              核心动作                          画像变化
+  ----   --------------    ------------------------------    --------------------
+  2022   LLM.int8          发现"涌现离群特征"                离群 = 某些维度系统偏大
+                                                            (6 sigma 规则)
+                              |
+                              v
+  2023   SmoothQuant       把离群难度从激活搬到权重          离群可治, 但治标不治本
+                              |
+                              v
+  2023   Do Nothing        离群是 attention no-op 的副产物   离群 = 机制必需品
+                                                            (BOS 上挂 sink)
+                              |
+                              v
+  2024   Massive Acts      再切一刀: 超大 = |x|>100          离群分两层:
+                           且 >1000x 中位数                  普通离群 + 超大激活
+                              |                              (基于 LLaMA, 硬阈值)
+                              v
+  2026   Measuring         不用硬阈值, 直接量 max|a|         画像碎裂:
+         Max Acts          跨 8 家 27 个 checkpoint          - 跨 4 个数量级
+                                                            - MoE 比 dense 低 14-23x
+                                                            - generation 非单调
+                                                            - max 是 family/recipe 属性
+                                                              不是 size 属性
+                              |
+                              v
+  2026+  Spike vs Sink     把 spike / sparse / sink 解耦     "sink = max" 也不对了
+         Compression                                         它们只是常常重合
+         Valleys
+
+  +-----------------------------------------------------------------+
+  | 主线: 一个现象 (大模型激活值会爆) 被反复重新命名和细分          |
+  | 离群特征 -> 超大激活 -> 连续峰值 -> spike/sink 解耦              |
+  |                                                                 |
+  | 每一次细分都伴随着 "前一代的画像 在新模型上不再成立"            |
+  +-----------------------------------------------------------------+
+#+end_example
+
+* 洞见
+
+这条线表面看是"离群值量化"的技术迭代，背后真正发生的是 *从 categorical 到 continuous, 从单架构到跨架构* 的两次认知转变。
+
+第一次转变（2022→2024）：从"是不是有离群值"的二元判断，到"离群值分几层、每层多大"的分级刻画。每一轮细分都更精准，但代价是 *定义越来越绑死特定模型家族*。Dettmers 的 6σ 是按 OPT 校的，Sun 的 |x|>100 是按 LLaMA 校的——阈值即默认假设。
+
+第二次转变（2024→2026）：这篇 Chen 的工作把分级阈值整个扔掉，回到最朴素的 max|a|。看上去是退步——不分层了？但其实是 *承认了 categorical 思维的隐藏成本*：一旦你画了类别，就默认所有模型在这些类别下"长得差不多"。当 27 个 checkpoint 的 max 横跨 4 个数量级时，再说"它有/没有超大激活"已经没意义——*它在哪个数量级*才是问题。
+
+*更深一层*：可解释性圈子和部署圈子之前各自迭代了四年，互相引用对方的"既定事实"。直到这篇用部署视角（max scale）重新测了一遍，才发现可解释性给的 categorical 画像已经过时——而且 *过时这件事本身没人去检验*。这是科学社区分工的盲区：所有人都假设别人会去验证基础事实是否还成立。
+
+下一步最可能往哪走？三个方向：
+1. *训练配方反推*——既然 MoE、normalization stack、SwiGLU gate 设计这些 recipe 选择直接决定 max，应该能逆向设计出"低峰值友好"的 recipe；
+2. *量化协议跟着模型走*——以后开源新模型，max 报告应该和参数量、context length 一样是 model card 必备字段；
+3. *从最大值到分布*——max 是一维数字，下一步是测整个 tail（top-K 激活的分布），那对 FP4/FP6 这种低位宽更要紧。
+
+* 启发
+
+这套演化史对"怎么做研究"的启发，*不是"要不断细分"，而是要定期"回去重新测一遍最早的事实"*。
+
+学界默认的工作流是：A 提出现象 → B 解释机制 → C 治理 → D 改进治理 → E 改进 D 的改进。每一步都假设上游的事实定义还成立。但当输入分布（这里是模型家族）大幅变化时，上游事实可能整个失效——而*下游没人有动机回头去查*。
+
+这意味着你可以：
+- *把"重新测量基础事实"当成一类独立的论文*——不需要新方法，只需要诚实地把"现在到底是什么样子"摆出来。这种 measurement paper 在快速变化的领域价值极高，因为整个 stack 都建立在过时的 implicit assumption 上；
+- *警惕"硬阈值定义"*——你看到的任何 X>100 / X<0.01 / >6σ 这类阈值，都是某个时代某个模型上校准出来的，迁移到新环境前必须问"这个阈值在我的场景下还合理吗"；
+- *跨圈子的"共同事实"是最危险的东西*——可解释性和部署共用 LLaMA 的离群画像四年，直到有人同时懂两边才发现已经裂开。如果你看到两个相邻领域都引用同一组数字而没有人最近重测，那就是机会。

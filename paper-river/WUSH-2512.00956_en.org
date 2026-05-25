@@ -1,0 +1,302 @@
+#+title:      WUSH: Near-Optimal Adaptive Transforms for LLM Quantization
+#+date:       [2026-05-25 Mon 06:14]
+#+filetags:   :paper:river:en:
+#+identifier: 20260525T061411-en
+#+source:     https://arxiv.org/abs/2512.00956
+#+authors:    Jiale Chen, Vage Egiazarian, Roberto L. Castro, Torsten Hoefler, Dan Alistarh
+#+venue:      arXiv 2025-11 (v1) / 2026-02 (v2), IST-DASLab / ETH Zürich
+
+* The River of the Problem
+
+Compressing a large model to 4-bit sounds straightforward: each weight takes fewer bits, so it fits in memory and runs faster.
+
+But there is a devilish detail that has blocked everyone for four years: a small cluster of "outliers" lurks inside every model — certain channels, certain tokens — whose values are 100× larger than their neighbors. When you define the quantization range, you must include these monsters, which squeezes the remaining 99.99 % of normal values into one or two quantization bins. Everything blurs together.
+
+Every paper in this line is answering the same question: *how do you deal with outliers?* Do you pull them aside separately? Slide them somewhere else? Or find a way to flatten the entire distribution? Tracing six papers in sequence, you will see this problem travel the full arc from "acknowledging its existence," through "engineering around it," to "eliminating it with mathematics."
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8() - Dettmers et al.
+  |
+  | Discovery: large models contain "emergent outlier features";
+  |            naive INT8 causes accuracy collapse
+  | Solution:  extract outlier channels, keep them in FP16;
+  |            quantize the rest to INT8
+  v
+[2023] SmoothQuant - Xiao et al.
+  |
+  | Problem: mixed precision requires custom kernels, hard to deploy
+  | Solution: transfer the "difficulty" of activations channel-wise
+  |           to the weights via a scale factor
+  v
+[2023] QuIP - Chee et al.
+  |
+  | Problem: scaling just relocates outliers, doesn't eliminate them;
+  |          weights remain "incoherent"
+  | Solution: multiply by a random orthogonal matrix to make weights
+  |           "incoherent" in QuIP's sense
+  v
+[2024] QuaRot - Ashkboos et al.
+  |
+  | Problem: QuIP only touches weights; activations must also be
+  |          smoothed for W4A4
+  | Solution: Hadamard rotation applied end-to-end to flatten both
+  |           weights and activations together
+  v
+[2024/25] SpinQuant - Liu et al.
+  |
+  | Problem: Hadamard is fixed, data-agnostic, not necessarily optimal
+  |          for every model
+  | Solution: learn the rotation matrix as a parameter (optimized on
+  |           the Stiefel manifold)
+  v
+[2025] WUSH - Chen et al.  <--- target paper
+  |
+  | Problem: learning is expensive, has no optimality guarantee;
+  |          is Hadamard even optimal?
+  | Solution: given an RTN AbsMax quantizer, derive the optimal
+  |           transform in closed form
+  |           Structure = Hadamard skeleton × data-driven second-order
+  |           correction (non-orthogonal)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): The First Paper to Admit "There Are Monsters in Large Models"
+
+*** What Problem It Saw
+
+The prevailing assumption was: larger models tolerate quantization better, because they have more redundancy. Dettmers ran experiments and found the opposite — once a model exceeds 6.7 B parameters, applying INT8 naively to both weights and activations causes a cliff-edge accuracy drop. Tracing the root cause, he found this was not a general model degradation but rather that *a few specific feature channels* produced extreme activation values, and once those channels were quantized badly, everything downstream broke.
+
+In other words: you are not facing a uniform crowd of numbers. You are facing a pond of minnows with two whales swimming through it. Set your scale to accommodate the whales, and the minnows become invisible.
+
+*** Its Solution
+
+Simply don't stuff the whales into INT8. Before each matrix multiplication, scan the activations, extract the ~0.1 % of channels that show extreme values, and compute those in FP16; run the remaining 99.9 % through INT8. Sum the two results back together.
+
+This is formally called *mixed-precision decomposition*.
+
+*** Why It Works (and What New Pit It Digs)
+
+It works because it acknowledges the *phenomenon* of outliers directly, abandoning the illusion that model distributions are Gaussian. That step is a genuine cognitive breakthrough.
+
+But the pit is large: it requires writing two separate kernels — an FP16 path and an INT8 path — plus on-the-fly detection of which channels are outliers. In production deployment this means bespoke hardware support; it does not generalize. And it only reaches INT8. Push further toward 4-bit and the value spread among the remaining 99.9 % of "minnows" is still too large, requiring yet another split.
+
+The starting point for the next paper is: *can we fit the whales and the minnows into the same precision?*
+
+** 2023 | SmoothQuant: Transfer the Activation Difficulty to the Weights
+
+*** What Problem It Saw
+
+LLM.int8() let the outliers escape by using mixed precision. Xiao noticed an asymmetry: activations have outliers, but *weight distributions are comparatively smooth*. If forced to choose, quantizing weights is far easier than quantizing activations.
+
+So why not transfer the activation difficulty to the weights?
+
+*** Its Solution
+
+Introduce a diagonal scaling matrix s. In each linear layer Y = X·W:
+
+#+begin_example
+Y = X·W = (X · diag(s)^-1) · (diag(s) · W)
+        =   X_smooth        ·     W_scaled
+#+end_example
+
+Activations are divided channel-wise by s (s is large on outlier channels, suppressing them); weights are multiplied by the same s (becoming slightly less uniform, but still manageable). Both sides are "smoother," and the matrix product is bit-exact.
+
+How is s chosen? From calibration-set statistics, balancing the maximum values on the activation and weight sides.
+
+*** Why It Works (and What New Pit It Digs)
+
+It exploits a conservation law: difficulty can be shifted between the two operands. Result: W8A8 no longer needs mixed precision; a single data type carries the computation end to end.
+
+But shifting is not the same as eliminating. s merely distributes the whale's height channel-by-channel, half to the weight side. If you want to push further to 4-bit, splitting in half is not enough — the whale is still a big fish. Moreover s is diagonal (per-channel), so it can only address "channel-dimension" outliers; it cannot handle the case where several tokens are simultaneously large.
+
+The next question to ask is: *is there a more aggressive transform that can disperse the whales into sand?*
+
+** 2023 | QuIP: Disperse Weights into an "Incoherent" Distribution
+
+*** What Problem It Saw
+
+Chee and De Sa stepped outside the per-channel-scaling mindset and looked at the weight matrix from an information-theoretic angle: why is quantization error large? Because the weight matrix is *incoherent* — certain elements or certain singular directions are far larger than others. Those large directions dominate the error when you quantize.
+
+If a matrix W is "coherent" (their definition roughly means: elements are spread uniformly, no dominant singular directions), then the AbsMax quantization error is naturally small.
+
+*** Its Solution
+
+Introduce *Incoherence Processing*: apply a random orthogonal transform W → U·W·V, where U and V are drawn from a family of orthogonal matrices. This is theoretically provable: after random orthogonalization, W is sufficiently coherent by their metric.
+
+At inference time, multiply by U^T and V^T to cancel the transformation. Because these are orthogonal matrices, their product is the identity, so the model's semantics are preserved exactly.
+
+*** Why It Works (and What New Pit It Digs)
+
+It reframes "outliers" as a *geometric property (incoherence) of the matrix* and gives a principled recipe for *reshaping that geometry*. This is an upgrade from engineering trick to mathematical operation. It theoretically supports pushing down to 2-bit weight quantization.
+
+But two gaps remain: (1) storing and transmitting the random orthogonal matrices is impractical; (2) QuIP only touches the weights — *activations are untouched*. For W4A4 (weights and activations both at 4-bit), the outlier whales on the activation side still destroy everything.
+
+The next step is: *can we find a "cheap" orthogonal matrix and handle weights and activations together?*
+
+** 2024 | QuaRot: Hadamard Rotation, End-to-End W4A4
+
+*** What Problem It Saw
+
+QuIP provides the theoretical framework, but random orthogonal matrices cannot be stored or transmitted. Ashkboos et al. fixed on a special class of orthogonal matrices: *Hadamard matrices* H. Their entries are all ±1/√n, the structure is completely determined, and nothing needs to be stored — you only need to know the matrix size to reconstruct it on the fly.
+
+Even better: the Hadamard transform has an O(n log n) fast algorithm, on par with the FFT. The overhead is nearly negligible.
+
+A second insight: the Transformer architecture allows a Hadamard rotation to be *absorbed into the surrounding weight matrices*. Insert H in the residual stream, then insert H^T downstream to cancel — but H can be pre-fused into W. No extra kernel at runtime.
+
+*** Its Solution
+
+Insert Hadamard rotations at all key positions in the Transformer (QKV projections, down projections, residual stream, etc.). Activations are flattened by H before quantization; weights are rotated by H after training. The result is that *both weights and activations* become near-Gaussian, outlier-free distributions before quantization.
+
+This achieves end-to-end W4A4 KV4 inference for the first time, with no mixed precision and no online outlier detection.
+
+*** Why It Works (and What New Pit It Digs)
+
+Hadamard is a "universal flattener." Its power comes from: (a) fully determined, zero storage; (b) fast algorithm; (c) mathematical guarantee that it spreads any signal's energy across all channels. It bridges from the 2-bit weight era into the 4-bit activation era.
+
+But Hadamard has a fundamental limitation: *it does not look at your data*. The same H is applied to Llama and to Mistral identically. If a particular model's weights have special structure — say, a few directions are intrinsically more important — Hadamard may scatter those too, actually losing information.
+
+The next question: *can the rotation matrix adapt to the specific distribution of each model?*
+
+** 2024/25 | SpinQuant: A Learned Rotation
+
+*** What Problem It Saw
+
+Liu et al. directly challenged QuaRot: your H is *chosen arbitrarily*. Theoretically any orthogonal matrix preserves the result of the matrix multiplication, so why must it be Hadamard? Why not *search among all orthogonal matrices for the one best suited to the current model?*
+
+*** Its Solution
+
+Treat the rotation matrix R as a learnable parameter, constrain it to the *Stiefel manifold* (the set of orthogonal matrices), and run gradient descent on that manifold using Cayley parameterization. The objective is the end-to-end loss after quantization, measured on a small calibration set. After a few hours of training, R converges to a rotation better adapted to the model than Hadamard.
+
+*FlatQuant* (Sun et al. 2025) follows the same road but allows more flexible transforms (including affine transforms, per-block independent transforms).
+
+*** Why It Works (and What New Pit It Digs)
+
+Data-driven is of course better than data-agnostic. On most benchmarks SpinQuant > QuaRot. This line of work demonstrates that *learning the transform* is effective.
+
+But the costs are real: (1) a separate training run is required for each model, taking hours to days; (2) the learned R is a dense matrix with no fast algorithm like Hadamard's, making the transform itself a *performance bottleneck* at inference time — especially in per-token activation quantization scenarios; (3) nobody can prove the learned R is globally optimal; it may be only a local optimum.
+
+The most damaging challenge left open is: *is Hadamard actually optimal? If not, what does the optimal solution look like? Can we write it down directly without learning?*
+
+** 2025 | WUSH: Derive the Optimal Transform in Closed Form
+
+*** What Problem It Saw
+
+The WUSH team posed a single question to all predecessors: you have been *trying* different transforms — fixed Hadamard, random orthogonal, learned rotations — but nobody has gone back to *first principles*: for RTN AbsMax quantization of weights and activations jointly, what does the *optimal linear transform* actually look like?
+
+If you can write down that optimal solution, you can quantitatively answer whether Hadamard is optimal and how far the learned R is from optimal. More importantly: you get the optimal solution directly, with no training required.
+
+*** Its Solution
+
+Let W be a weight block and X be the calibration activations. WUSH derives the closed-form optimal transform for this family of quantizers (FP block quantizers, including MXFP4/NVFP4; INT behaves similarly):
+
+#+begin_example
+T_wush = H · S^(-1/2) · U^T · W'^T
+
+where:
+  W·W^T = W'·W'^T      (Cholesky decomposition)
+  W'^T · X = U·S·V^T   (SVD)
+  H is the Hadamard matrix
+#+end_example
+
+Reading the formula: first apply Cholesky to obtain the second-order structure W' of the weights; then SVD W'^T·X to obtain the singular basis (U, S); stretch by the -1/2 power of the singular values (this step is *non-orthogonal* and data-dependent); finally multiply by Hadamard for a last flattening pass.
+
+The name WUSH is a mnemonic for the four matrices W·U·S·H in that order.
+
+The theorem guarantees: *exactly optimal* for FP block quantizers; *asymptotically optimal* for INT block quantizers (under mild assumptions).
+
+On the engineering side: although each block uses a different transform, the authors fuse the entire T_wush into a single GPU kernel, achieving throughput on par with native Hadamard and 6.6× faster than BF16 (courtesy of FP4 MatMul).
+
+*** Why It Works (and What New Pit It Digs)
+
+It accomplishes three things no previous paper achieved:
+1. *Upgrades "empirically effective" to "mathematically optimal"* — provides the optimization objective and its closed-form solution.
+2. *Rehabilitates non-orthogonal transforms* — the prior intuition that "orthogonal = invertible = semantics preserved" was taken for granted by everyone; WUSH proves that what you actually want is *minimum quantization error after the forward transform*, which is not equivalent. Once "orthogonal" is released as a constraint, the optimal solution gains a data-dependent non-orthogonal component S^(-1/2).
+3. *Closed form + production engineering* — no training required, yet not as rigid as Hadamard; no performance penalty.
+
+Experimentally: on Llama-3.1-8B + MXFP4, WUSH improves average accuracy by +2.8 points over the strongest Hadamard-based RTN baseline, and adds +0.7 when combined with GPTQ. It effectively brings MXFP4 quality close to the NVFP4 level.
+
+Remaining open problems: (1) the derivation assumes RTN AbsMax quantizers; new quantizers (non-linear codebooks, vector quantization) would require re-deriving; (2) the second-order statistics S can be noisy when the W·X dimension is small; (3) the optimal solution has not yet been validated at 2-bit.
+
+* Frontier Extensions
+
+WUSH was posted in 2025-11 and revised in 2026-02, too recent for clear public follow-up papers that explicitly critique or improve it. Honestly: as of this writing (2026-05-25), this is the latest public progress on this line.
+
+Observable concurrent and likely follow-on directions:
+
+- *FlatQuant* (Sun et al. 2025) and *SpinQuant* are parallel competitors to WUSH, still iterating; they may absorb WUSH's optimality-analysis framework as guidance for loss design.
+- *MXFP / NVFP block quantization formats* are themselves evolving on the hardware side; new formats may change the specific form of the optimal transform — WUSH's derivation methodology can be reused, but the closed-form expression will change.
+- *2-bit weights + 4-bit activations* is the next obvious step up in difficulty; whether WUSH's non-orthogonal correction retains optimality at more aggressive bit-widths has not been verified.
+- *Vector quantization / lookup quantization* (QTIP, GPTQ-v and related directions) are a separate fork and not on this main line, but may converge after the 2-bit frontier is reached.
+
+* One Diagram to Understand It All
+
+#+begin_example
+              How outliers have been tamed, step by step
+              -------------------------------------------
+
+  Year    Paper           Attitude toward outliers    Transform              Data-aware?  Optimality
+  ----    -----------     ------------------------    ---------------        -----------  ----------
+  2022    LLM.int8()      Isolate them                None (mixed prec.)     Activations  Heuristic
+  2023    SmoothQuant     Relocate them               Diagonal scale s       Activations  Heuristic
+  2023    QuIP            Disperse (weights)           Random orthogonal      No           Theoretical bound
+  2024    QuaRot          Disperse (W+A)              Fixed Hadamard         No           No proof
+  2024/5  SpinQuant       Learn to disperse           Learned orthogonal     Yes (learn)  Local optimum
+  2025    WUSH            Disperse optimally in        H·S^(-1/2)·U^T·W'     Yes (closed) Provably optimal
+                          closed form
+
+
+  Reading vertically, the understanding keeps upgrading:
+    "Outliers are a nuisance"  ->  "Outliers are a geometric property"
+                               ->  "Geometric properties have optimal solutions"
+
+  Reading horizontally, engineering cost:
+    Custom kernels  ->  Unified precision  ->  Zero-overhead rotation
+    ->  Small-overhead learning  ->  Zero-overhead closed form
+                          ^
+                          |
+           Hadamard is the pivotal support of this line:
+           it turned "theoretically appealing random orthogonal"
+           into "practically free fixed matrix."
+           WUSH does not discard it — it embeds Hadamard
+           as the "skeleton" inside the optimal solution.
+#+end_example
+
+* Insights
+
+Reading the full river, three layers of evolution are visible simultaneously:
+
+*1. Understanding of the outlier phenomenon keeps being upgraded.*
+LLM.int8() treated it as "a nuisance to be quarantined." QuIP reframed it as "a geometric property of the matrix." WUSH reframed it as "an optimizable object given a quantizer and a data distribution." This is the *standard upgrade path from engineering phenomenon to mathematical object* — every field reaches this moment eventually; the key is that someone is willing to work out the formula.
+
+*2. The constraint of "orthogonality" was broken.*
+From QuIP through QuaRot through SpinQuant, every transform was orthogonal — because the intuition "orthogonal = invertible = semantics preserved" was too strong to question. But WUSH proves: what you need is not an invertible forward transform, but a *forward transform that minimizes quantization error after it is applied*. These two goals are not equivalent. Once "orthogonal" is released as a constraint, the optimal solution gains a data-dependent non-orthogonal component S^(-1/2).
+*This is the most instructive single blow in the whole line* — what we call a "necessary invariant" is often just a habit that no one before dared to challenge.
+
+*3. The tension between "learn it" and "solve it."*
+SpinQuant represents the learning school: hand the problem to gradient descent, trust the optimizer. WUSH represents the analytical school: hand the problem to mathematics, trust the closed form. These two approaches recur throughout the history of deep learning (attention vs. RNN is another instance). When a problem is stated precisely enough, *the analytical school abruptly returns and defeats the learning school* — because a closed-form solution has no training cost, no local-optimum traps, and comes with theoretical guarantees. WUSH is one more such return.
+
+*Where might the next steps go?*
+- *Continue relaxing "non-orthogonal"*: WUSH still uses a linear transform. The next step might allow *piecewise-linear* (different transforms per block adaptively), or even *mild non-linearity* (e.g., with clipping).
+- *Extend the derivation framework to new quantizers*: vector quantization, codebook quantization, and log quantization each have their own optimal transform waiting to be derived. WUSH's methodology applies directly.
+- *Synergy with error-feedback methods like GPTQ*: experiments already show that WUSH+GPTQ continues to improve. This indicates that "forward-transform flattening" and "backward error compensation" are *orthogonal operations* — both legs can keep walking.
+
+* Takeaways
+
+This river offers three landing points for researchers:
+
+*1. First acknowledge the phenomenon, then upgrade it to a concept, then derive the closed form.*
+LLM.int8()'s "oh, there are outliers" is *acknowledgment*; QuIP's "this is an incoherence problem" is *elevation to a concept*; WUSH's "the optimal transform for this quantizer is this expression" is *the closed-form derivation*. Any engineering field can follow this three-stage path — identifying which stage you are currently stuck on tells you exactly where to invest your next resources.
+
+*2. Find the "default constraints" that nobody has questioned.*
+Orthogonality went unquestioned in this line for seven years. WUSH's core contribution is not mathematical sophistication; it is the courage to ask "why must it be orthogonal?" Every field has such silent assumptions — constant learning rates, fixed batch sizes, symmetric loss functions. The high-value papers are often the ones that loosen exactly one such constraint.
+
+*3. Keep both the learning track and the analytical track alive.*
+Do not see SpinQuant gain points and conclude that "learning it" is the only way forward. When your field has a clearly stated optimization objective, spend a day or two asking *whether a closed-form solution exists*. If it does, what you save is not just a few hours of training time — it is the entire complexity of the deployment pipeline.
+
+Practical implications:
+- If you are doing quantization, *stop using bare Hadamard*. WUSH code is at https://github.com/IST-DASLab/WUSH — closed-form solution plus a fused kernel, zero migration cost.
+- If you are working on other "transform-then-quantize" domains (image compression, speech coding, vector databases), WUSH's derivation methodology can be transplanted directly to find the optimal transform for your quantizer.
+- If you are mentoring students in research, this line of papers is a *model specimen showing how to travel from engineering trick to theoretical optimum* — five papers, read chronologically, with a completely coherent causal chain from start to finish.

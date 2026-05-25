@@ -1,0 +1,284 @@
+#+title:      OScaR: The Occam's Razor for Extreme KV Cache Quantization in LLMs and Beyond
+#+date:       [2026-05-25 Mon 07:09]
+#+filetags:   :paper:river:
+#+identifier: 20260525T070915
+#+source:     https://arxiv.org/abs/2605.19660
+#+authors:    Zunhai Su, Rui Yang, Chao Zhang, et al. (Tsinghua, Meituan LongCat, HKU)
+#+venue:      arXiv 2605.19660 (Under review, 2026-05)
+
+* 问题之河
+
+把一个跑长上下文的 LLM 塞进 GPU 显存，KV cache 现在是头号杀手——它跟着序列长度线性涨，几万 token 一上来就吃光 HBM，批次开不大，吞吐起不来。
+
+那能不能像压图片一样把 KV cache 压成 2 bit？听上去简单，做了五年都没做漂亮。难点是：Key tensor 里某些"通道"的数值天生比别人大几十倍（叫 channel-wise outlier）；按 token 切片量化会被这些通道炸飞；按 channel 切片量化能避开这个坑，但到了 2 bit 这种极致压缩，又冒出另一个坑——同一通道里不同 token 的"长度"差得太远（Token Norm Imbalance, TNI），共享的 scale 包不住所有 token。
+
+一代一代人前赴后继，就是在这两个坑之间反复横跳：按 token 切还是按 channel 切？要不要先做个旋转把 outlier 摊平？要不要再加个残差修正？管线越加越复杂，跑起来越来越慢。OScaR 这篇说：先把根诊断清楚（就是 TNI），然后用最少的零件把它治了。
+
+* 溯源地图
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | 看到的问题: LLM 一过 6.7B 参数就长出"涌现 outlier"——少数特征
+  |             维度数值大几十倍，朴素 INT8 一量化就崩
+  | 解法: 把这些 outlier 通道单独拎出来用 FP16 算，其余走 INT8
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | 看到的问题: LLM.int8() 要做 mixed-precision，硬件不友好；
+  |             outlier 一直只在 activation 里，weight 是平的
+  | 解法: 用一个 per-channel scale 把 activation 的难度
+  |       "smooth" 一部分转给 weight，两边都能量化
+  v
+[2024] Liu et al. - KIVI
+  |
+  | 看到的问题: 上面两位都是 weight + activation 量化，KV cache
+  |             被忽略。但长上下文场景里 KV cache 才是大头。
+  |             直接套 per-token 量化会被 Key 的 channel outlier 炸飞
+  | 解法: Key 按 channel 切，Value 按 token 切——首次为 KV cache
+  |       建立 per-channel paradigm
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | 看到的问题: KIVI 的 per-channel 量化在 4 bit 还行，到 2 bit
+  |             就崩；根源是 outlier 通道仍然存在
+  | 解法: 在量化之前做一个 Hadamard 旋转，把 outlier 的能量摊到
+  |       所有通道上去，等于把"尖刺"打平
+  v
+[2025] Zandieh et al. - TurboQuant
+  |
+  | 看到的问题: QuaRot 那种 per-token + rotation 还是没办法逼近
+  |             极低 bit 的理论下界；想要有理论保证
+  | 解法: 走 per-element + 随机旋转 + 残差误差修正，多段流水线，
+  |       数学上漂亮，工程上贵
+  v
+[2026] Su et al. - OScaR  (本文)
+  |
+  | 看到的问题: TurboQuant 太重，per-channel 的 KIVI/KVQuant 在
+  |             极致压缩下还是垮；但前人都没说清楚"垮在哪"
+  | 诊断: Token Norm Imbalance (TNI) ——同一通道里 token norm
+  |       差得太远，per-channel scale 包不住
+  | 解法: Canalized Rotation（防 scaling-induced outlier）
+  |       + Omni-Token Scaling（沿 sequence 维度归一化）
+  |       两个零件，训练免，CUDA 跑得动
+#+end_example
+
+* 演化叙事
+
+** 2022 | LLM.int8(): 发现 LLM 有"涌现 outlier"，朴素量化必死
+
+*** 它看到了什么问题
+
+在 LLM.int8() 之前，大家做 CNN 量化、做小 transformer 量化都挺顺。把 FP16 直接砍成 INT8 几乎不掉精度。但 Dettmers 一把模型放大到 6.7B，怪事来了：少数几个特征维度（channel）数值大到吓人，普通的 100 倍以上。INT8 那点动态范围根本包不住——你要么 scale 调大保住 outlier（其他值都被压成 0），要么 scale 调小保住其他值（outlier 被截断）。怎么调都崩。
+
+这种 outlier 不是 bug，是模型规模到一定程度自然涌现的，几乎每层都有，每个 token 都触发。
+
+*** 它的解法
+
+既然这些 outlier 通道是少数（不到 1%），那就把它们拎出来单独伺候：outlier 通道用 FP16 全精度计算，剩下 99% 通道走 INT8。最后两条线相加就是输出。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+intuition 很直接：把"少数难治的"和"多数好治的"分开处理，各得其所。但工程代价很大——mixed-precision 计算意味着两套 kernel 拼接，对硬件极不友好，GPU 跑得磕磕绊绊。而且 outlier 通道的位置随输入变，不能静态优化。这个坑就被下一篇接走。
+
+** 2023 | SmoothQuant: 把 outlier 的难度从 activation 平摊给 weight
+
+*** 它看到了什么问题
+
+Xiao 仔细看了 LLM 的张量结构：outlier 全部出现在 activation（前向流过的中间值）里，weight 本身是平的、好量化的。LLM.int8() 之所以要 mixed-precision，是因为它认了"activation 这个 outlier 治不了"。但 weight 那边一直闲着——一个手干两份活，另一个手没事做。
+
+*** 它的解法
+
+引入一个 per-channel 的 scale 因子 s。对 activation 除以 s（把 outlier 压低），对相邻的 weight 乘以 s（把难度转给 weight）。数学上输出不变（s 和 1/s 相乘抵消），但量化的难度被"smooth"地分摊给了两边——两边都变成 INT8 可吃。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+像跷跷板：原本一边重一边轻，调一下 scale 让两边平衡，整体就好量化了。SmoothQuant 直接成了之后所有 LLM 量化的标配。但它的视野还停留在"weight × activation"这种矩阵乘场景。到了长上下文推理，最大头的不是 weight 也不是 activation，是 KV cache——decoder 一边算新 token 一边把 K、V 缓存下来，这堆缓存随着上下文长度线性涨。SmoothQuant 不专门治这个。
+
+** 2024 | KIVI: 第一次把"按 channel 切"用到 KV cache 上
+
+*** 它看到了什么问题
+
+Liu 把镜头转到 KV cache。注意到 Key 和 Value 行为很不一样：
+
+- Key tensor 有跟 activation 类似的 channel-wise outlier——少数通道天生大；
+- Value tensor 没有这种结构，比较均匀。
+
+如果照着传统做法 per-token 量化（每个 token 一组 scale），那 Key 的某个通道里只要混进一个 outlier token，整个 token 的 scale 就被拉爆。
+
+*** 它的解法
+
+差别对待：
+- Key 用 per-channel 量化（同一个通道共享 scale，outlier 通道单独有自己的大 scale）；
+- Value 用 per-token 量化（保留自回归的增量友好性）。
+
+这两件事拼起来就叫 KIVI 范式，是 KV cache 量化的开山之作。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+intuition：哪个维度上 outlier 集中，就沿着那个维度切。Key 的 outlier 集中在 channel，per-channel 自然解决；Value 没有 outlier 结构，per-token 顺势而为。这个范式在 4 bit 跑得很好。
+
+但到 2 bit、3 bit 这种极致压缩，KIVI 开始崩。原因是 per-channel 解决了"channel 之间不平衡"，但每个 channel 内部、不同 token 之间的差异（同一通道里第 100 个 token 的 norm 是第 500 个 token 的 10 倍）没人管。KIVI 自己没把这个诊断清楚，只是说"极致压缩下精度掉得厉害"。
+
+** 2024 | QuaRot: 用 Hadamard 旋转把 outlier 摊平
+
+*** 它看到了什么问题
+
+Ashkboos 接着 KIVI 想：你 per-channel 量化是被 outlier 通道逼出来的，那如果根本就没有 outlier 通道呢？是不是 per-token 就能用了？
+
+outlier 是"集中在少数通道"，问题就是分布不均。
+
+*** 它的解法
+
+借数学里一个古老工具：Hadamard 矩阵——一个全是 +1/-1 的正交矩阵。对 Key 乘上 Hadamard，等于把所有通道随机加加减减混在一起，outlier 的能量就摊到所有通道。混完以后每个通道大小差不多，per-token 量化就能跑了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+intuition：本来一袋面粉里全是石子集中在角落，摇一摇让石子均匀混进去，整袋东西就"看起来均匀了"。Hadamard 是正交的，所以 attention 计算最后再乘 Hadamard 的逆就能还原，等价性保住。
+
+但 QuaRot 自己其实是 weight + activation 量化的工具，应用到 KV cache 时主要是 per-token 思路。代价是：rotation 这一步要在推理时实时跑（on-the-fly），增加额外算子。而且 rotation 只搬运了通道维度的不均匀，token 维度的不均匀（也就是后来 OScaR 说的 TNI）仍然没治。
+
+** 2025 | TurboQuant: 走极致——per-element + 随机旋转 + 残差修正
+
+*** 它看到了什么问题
+
+QuaRot 和 KIVI 这条线在 2-bit 处仍有可观损失。Zandieh 一帮人觉得：方向都对，但还不够"极致"。能不能用更细的粒度（per-element，每个元素一组 scale）配上理论上有保证的随机旋转，把误差压到信息论下界附近？
+
+*** 它的解法
+
+TurboQuant 把流水线拉到最长：
+1. 多次随机旋转（不是一次 Hadamard，而是一组随机正交变换）；
+2. 量化；
+3. 残差误差修正（把量化误差再单独编码一份附在后面）；
+4. 解码端再做对应反操作。
+
+代价：参数多、kernel 多、显存里要塞额外结构，每个 step 都要做不少额外算。但理论上漂亮：可以证明逼近最优率失真曲线。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+intuition：把"难压缩的东西"用统计学技巧（随机化 + 残差补偿）一遍遍稀释，最后每一份都是小份额、好量化的。
+
+但这条路的问题暴露得越来越明显：在工程现场，"流水线越长 = 推理越慢"几乎是铁律。TurboQuant 在论文 benchmark 上是 SOTA，部署时却被自己的复杂度拖累，加上不可避免的 on-the-fly 量化开销，实测吞吐反而不一定比 KIVI 强。而且它没回答一个更基础的问题：极致压缩下到底是"哪个具体的结构性属性"在制造误差？大家都在堆方法，没人把病灶讲清楚。
+
+** 2026 | OScaR: 先把病灶讲清楚（TNI），再用最少零件治它
+
+*** 它看到了什么问题
+
+OScaR 这帮作者站到 KIVI、QuaRot、TurboQuant 全部都试过一遍之后，反过来问：per-channel 在极致压缩下为啥垮？
+
+他们在多个模型、多个模态上做 token-wise norm 分布分析，看到一个普遍现象：同一个 Key 通道里，不同 token 的 norm 差异可以非常大——有的 token norm 在 0.1 量级，有的在 10 量级。per-channel 量化共享一个 scale，那这个 scale 要么照顾大 norm token（小 norm token 全被压成 0），要么照顾小 norm token（大 norm token 全溢出）。
+
+他们给这个现象起了名字：*Token Norm Imbalance (TNI)*，并且给出了理论推导：在 per-channel 框架下，TNI 系统性地放大量化误差，且不可避免。
+
+这才是 KIVI 在 2-bit 处崩掉的真正原因。也是 QuaRot 摊平了 channel 维度后仍然没救的原因——TNI 是沿 token 维度的，channel 维度的旋转治不了它。
+
+*** 它的解法
+
+既然诊断清楚了 TNI，那就直接治 token 维度上的不平衡：
+
+1. *Canalized Rotation*：先做 Hadamard 旋转。这一步不是为了治 TNI，是为了防止下一步的 token scaling 被一种叫"Scaling-Induced Outlier Artifact"的副作用污染——如果直接对原始 Key 做 token scaling，scale 因子会和原本通道维度的 outlier 互相作用，长出新的伪 outlier。先 rotate 把通道摊平，scaling 这一步就干净了。
+
+2. *Omni-Token Scaling*：沿 sequence（token）维度做归一化，让所有 token 的 norm 落到同一量级。这一步直接打掉 TNI——既然 scale 是 per-channel 共享的，那就先把 token 调整到差不多大小，让共享 scale 装得下。
+
+两步合起来加在 KIVI 的 per-channel paradigm 之上，没引入额外的训练，没残差修正，没多次随机旋转。两步缺一不可（消融实验里只做 rotation 不做 scaling、或者只做 scaling 不做 rotation 都掉精度）。
+
+加上专门优化过的 CUDA kernel（fused Hadamard-Norm kernel），整个东西真的跑得动：
+
+- INT2 量化下几乎无损；
+- 对比 BF16 FlashDecoding-v2，decode 速度 3.0×；
+- 显存占用 1/5.3；
+- 吞吐 4.1×。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+intuition 像这样：
+
+| 方向 | 不平衡叫什么 | 谁来治 |
+|------|--------------|--------|
+| channel 维度 | channel-wise outlier | Hadamard rotation（QuaRot 起家的招） |
+| token 维度 | Token Norm Imbalance (TNI) | sequence-level normalization（OScaR 的新招） |
+
+OScaR 不是发明了新工具，是把"先 rotate 再 scale"这两个朴素操作配在一起、并诊断清楚了它们各自治什么病。这是典型的 Occam's Razor——前人都在加东西，他们减东西。
+
+新坑是什么？论文里诚实说了：
+
+- TNI 的诊断目前主要在 Key tensor 上，Value tensor 的 TNI 处理还相对简单；
+- Omni-Token Scaling 沿 sequence 维度做归一化，prefill 阶段的实现需要小心（这也是 CUDA kernel 要专门设计的原因）；
+- 跨模态（multi-modal / omni-modal）的 TNI 分布特性还在初步阶段。
+
+* 前沿延伸
+
+OScaR 是 2026-05 刚挂出来的预印本（"Under review"），现在还没有明确"批判改进 OScaR"的后续工作。但顺着这条线最可能往下走的方向，已经在 OScaR 自己的引文里露出端倪：
+
+- *TurboQuant+ (Pope, 2026)*：TurboQuant 的延续，往更极致的 per-element 方向继续打磨，工程上想办法减开销。OScaR 在 Appendix K 里专门对比了它的复杂度——TurboQuant+ 在某些场景仍有理论优势，但实测开销远高于 OScaR。这两条路（极简 per-channel vs. 极致 per-element）短期内会并存。
+
+- *OTT (Su et al., 2025a)*：和 OScaR 同实验室更早的工作，per-channel paradigm 下的另一种优化方向。OScaR 是它的精神继承者。
+
+- *多模态/全模态量化*：OScaR 第一次把 X-LLM（text + multi-modal + omni-modal）作为统一框架来评估。下一波工作很可能就是把 TNI 的诊断细化到视觉 token、音频 token 上——不同模态的 token norm 分布很可能差异更大，这是个还没开垦的角落。
+
+* 一张图看懂
+
+#+begin_example
+              时间轴 ----->
+              2022     2023     2024              2025         2026
+              ----     ----     ----              ----         ----
+
+解决谁的       activation    KV cache 进入视野
+不平衡？      outlier  ->    (Key 通道, Value 平均)        ->   token 维度
+                                                                 (TNI)
+              LLM.int8  SmoothQuant   KIVI            TurboQuant   OScaR
+              [混精度] [scale 摊给   [per-channel    [per-element  [per-channel
+                       weight]        Key,           + 随机 rot     + Canalized
+                                      per-token V]   + 残差修正]    Rotation
+                                                                   + Omni-Token
+                                                                     Scaling]
+
+切片粒度        per-tensor  per-tensor  per-channel    per-element   per-channel
+              (混 FP16)                                              (回归简洁)
+
+工具箱          拎 FP16    per-channel  分而治之       Hadamard +    Hadamard +
+              hot list   scale 平滑    K/V 不同切片   随机旋转 +    sequence-level
+                                                       残差         normalization
+
+复杂度          中        低           低             高            低
+精度上限        4-8 bit   8 bit        4 bit          2 bit (理论)  2 bit (实测)
+
+主旋律:
+  从"挑出 outlier"到"摊平 outlier"再到"诊断 outlier 背后的结构性属性"。
+  前几代都在工具层面打转, OScaR 把工具往后退一步, 先回到病灶。
+
+#+end_example
+
+* 洞见
+
+读完整条线，有三件事浮出水面：
+
+1. *诊断比工具贵*。KIVI 到 TurboQuant 这五年，工具一个比一个花哨：rotation、随机旋转、残差修正、per-element scale。但没人停下来问"per-channel 在极致压缩下到底坏在哪里"。OScaR 唯一的"新东西"其实是给一个早就存在的现象起了名字（TNI）并给出理论分析。一旦诊断对了，治法自然短——Canalized Rotation 是旧工具，Omni-Token Scaling 是 normalization 的常识。研究里最稀缺的不是新方法，是新视角。
+
+2. *Occam's Razor 在工程领域格外锋利*。TurboQuant 数学上漂亮，部署时被自己的复杂度拖垮。OScaR 这种"两步走完事"的方案，胜在每一步都对应一个明确的诊断，而不是堆叠保险。简洁不是审美偏好，是工程上更便宜的鲁棒性——少一个组件就少一个 bug 源、少一份 kernel 优化负担。
+
+3. *不平衡问题的本质是"切片维度的选择"*。沿 channel 切还是沿 token 切？这个二选一其实漏掉了正确的问法——"哪个维度上的不均匀更结构化，哪个就该被首先治"。KIVI 选 channel 是因为 channel 不均匀更显眼；OScaR 在 channel 维度治好之后，发现 token 维度的不均匀（TNI）才是下一道墙。研究的进展常常是"把同一个问题在不同维度上看一遍"。
+
+下一步最可能往哪走：
+
+- 多模态/全模态里 TNI 的分布模式（视觉 token 和文本 token 混在一起，norm 差异可能更夸张）；
+- 把"诊断 + 简洁治法"的范式从 KV cache 量化迁移到其他 LLM 推理瓶颈（attention sink、weight outlier、激活离群）；
+- per-element 和 per-channel 这两条路线短期内不会有赢家，但 per-channel 因为简单会先占领工程现场。
+
+* 启发
+
+这条演化线对"怎么做研究"最直接的启发是：*在工具竞赛白热化的领域，回头去看病灶往往是最高 ROI 的动作*。
+
+KIVI 到 TurboQuant 的五年里，所有人都在加东西——加 rotation，加 random rotation，加 residual correction，加 per-element scale。OScaR 没加任何全新工具，它做的只是：
+
+1. 大量跑实验看分布，发现"同一通道里不同 token 的 norm 差很多"是普遍现象；
+2. 给这个现象起名字（TNI）；
+3. 推导出"per-channel + TNI 必然爆"的理论；
+4. 反过来用最朴素的工具（Hadamard + normalization）把它治了。
+
+这意味着你可以：
+
+- 在自己关心的领域里，停下来问一句"大家都在用的工具，到底治的是什么病？这个病有没有被定义过、有没有名字？"——如果没有，定义它本身就是贡献；
+- 看到"方法越来越复杂、效果越来越接近极限"时不要急着往里挤，而是退一步问"我们是不是在治错的病"；
+- 简洁不是审美，是工程鲁棒性的来源。两个组件解释清楚每个治什么病，胜过五个组件叠在一起拿 SOTA；
+- 在长上下文 / 多模态大模型部署相关的场景里，KV cache 量化这条线短期内还会快速演化，跟踪 TNI 后续工作和 X-LLM 上的量化基准是值得的投资。
