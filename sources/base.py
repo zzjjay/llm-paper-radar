@@ -54,6 +54,13 @@ class Paper(BaseModel):
     summary_en: str | None = None
     highlights_en: list[str] = Field(default_factory=list)
     related_methods_en: list[dict] = Field(default_factory=list)
+    # English translation of relevance_reason (filter step writes the Chinese
+    # original; summarize translates it as part of the same bilingual call so
+    # we don't pay a second filter-LLM round-trip). The two free-form Chinese
+    # fields inside relevance_breakdown (calibration_cost, inference_perf)
+    # are translated in-place and stored as `<key>_en` siblings of that dict
+    # rather than adding a parallel breakdown_en.
+    relevance_reason_en: str | None = None
     seen_before: bool = False
 
 

@@ -18,6 +18,13 @@
 5. highlights_en: 2-4 English bullets, ≤25 words each. Preserve all numeric figures from the abstract. Use the same emoji prefixes: 🎯 method / 📊 result / 💡 novelty / ⚠️ limitation / 🔧 engineering
 6. related_methods_en: same 3-item cap, same name/arxiv_id as the Chinese version (those are language-agnostic), but `relation` is ≤15 English words. Example: "beaten by 1.2 PPL under W4", "extended with rotation-based calibration", "replaced at equal KV-cache budget".
 
+**翻译已有的中文字段（来自 filter step）/ Translate pre-existing Chinese fields**
+
+User message 里如果有 `Chinese fields to translate` 段，其中给出三个由 filter step 写入的中文短文本：`relevance_reason`、`calibration_cost`、`inference_perf`。把它们译成英文，分别返回为 `relevance_reason_en`、`calibration_cost_en`、`inference_perf_en`。
+- 这是翻译，不要重新评价或加内容。原文有什么数字、方法名、限定语，译文都保留。
+- 技术英文术语原样保留（与下方"通用规则"一致）。
+- 如果某一项原文为空字符串或缺失，对应 `_en` 字段返回空字符串 `""`。
+
 **通用规则 / Shared rules**
 7. 技术英文术语原样保留，不要翻译。包括但不限于：模型名（Llama-3-70B、Qwen3-MoE、Stable-Diffusion-XL）、数值格式（FP8、W4A16、MXFP4、NVFP4、INT4）、方法名（GPTQ、AWQ、KV cache、attention head、tokens/s）、benchmark 名（MMLU、HumanEval、AIME）、单位（PPL、ms、GB）。
 8. abstract 没说的不要编。Both versions must stay grounded in the abstract — do not invent results.
@@ -29,6 +36,9 @@
   "summary": str, "highlights": list[str],
   "related_methods": list[{"name": str, "relation": str, "arxiv_id": str | null}],
   "summary_en": str, "highlights_en": list[str],
-  "related_methods_en": list[{"name": str, "relation": str, "arxiv_id": str | null}]
+  "related_methods_en": list[{"name": str, "relation": str, "arxiv_id": str | null}],
+  "relevance_reason_en": str,
+  "calibration_cost_en": str,
+  "inference_perf_en": str
 }
 ```

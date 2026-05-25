@@ -262,6 +262,13 @@ def test_render_daily_writes_en_digest_when_summary_en_present(tmp_path: Path):
     p.summary_en = "English summary body"
     p.highlights_en = ["🎯 method"]
     p.related_methods_en = [{"name": "GPTQ", "relation": "beaten by 1pt", "arxiv_id": "2210.17323"}]
+    # Translations of filter-step Chinese fields: rationale + cal/perf.
+    p.relevance_reason = "中文理由"
+    p.relevance_reason_en = "english rationale"
+    p.relevance_breakdown["calibration_cost"] = "一次性PTQ"
+    p.relevance_breakdown["calibration_cost_en"] = "one-shot PTQ"
+    p.relevance_breakdown["inference_perf"] = "加速2倍"
+    p.relevance_breakdown["inference_perf_en"] = "2x speedup"
     summarized_path.write_text(json.dumps([p.model_dump(mode="json")]))
 
     digests_dir = tmp_path / "digests"
@@ -276,11 +283,16 @@ def test_render_daily_writes_en_digest_when_summary_en_present(tmp_path: Path):
     zh = (digests_dir / "2026-05-11.md").read_text()
     en = (digests_dir / "2026-05-11_en.md").read_text()
     assert "LLM 推理优化日报" in zh and "#### 摘要" in zh
+    assert "中文理由" in zh and "cal: 一次性PTQ" in zh and "perf: 加速2倍" in zh
     assert "LLM Inference Optimization Daily" in en
     assert "#### Summary" in en and "English summary body" in en
     assert "PTQ (post-training quantization)" in en  # EN bucket header
     assert "Why this paper" in en
     assert "Related methods / baselines" in en
+    # Translated rationale + signal line — no Chinese leaks into EN file.
+    assert "english rationale" in en
+    assert "cal: one-shot PTQ" in en and "perf: 2x speedup" in en
+    assert "中文理由" not in en and "一次性PTQ" not in en and "加速2倍" not in en
 
 
 def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_path: Path):

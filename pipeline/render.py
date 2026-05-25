@@ -322,7 +322,10 @@ def _why_selected_line(p: Paper, lang: str = "zh") -> str:
     bucket = _bucket_title_for(lang, _bucket_of(p)) if _bucket_of(p) in BUCKET_TITLES else s["unbucketed_label"]
     topic = bd.get("topic_relevance")
     pract = bd.get("practicality")
-    reason = (p.relevance_reason or "").strip()
+    if lang == "en" and p.relevance_reason_en:
+        reason = p.relevance_reason_en.strip()
+    else:
+        reason = (p.relevance_reason or "").strip()
     pieces = [f"**{bucket}**"]
     if topic is not None and pract is not None:
         pieces.append(f"topic {topic}/5 · practicality {pract}/5")
@@ -334,7 +337,7 @@ def _why_selected_line(p: Paper, lang: str = "zh") -> str:
     return f"{s['why_header']}\n" + " · ".join(pieces) + "\n"
 
 
-def _signal_line(p: Paper) -> str:
+def _signal_line(p: Paper, lang: str = "zh") -> str:
     bd = p.relevance_breakdown or {}
     parts = []
     ctype = bd.get("compression_type")
@@ -346,10 +349,15 @@ def _signal_line(p: Paper) -> str:
     largest = bd.get("largest_model_tested")
     if largest and largest != "unknown":
         parts.append(str(largest))
-    cal = bd.get("calibration_cost")
+    # cal/perf are free-form Chinese from filter; summarize writes `_en`
+    # siblings. Use the translation when available, fall back to Chinese
+    # (older days summarized before translation landed).
+    cal_key = "calibration_cost_en" if lang == "en" and bd.get("calibration_cost_en") else "calibration_cost"
+    cal = bd.get(cal_key)
     if cal and cal != "unknown":
         parts.append(f"cal: {cal}")
-    perf = bd.get("inference_perf")
+    perf_key = "inference_perf_en" if lang == "en" and bd.get("inference_perf_en") else "inference_perf"
+    perf = bd.get(perf_key)
     if perf and perf != "unknown":
         parts.append(f"perf: {perf}")
     return f"🧪 {' · '.join(parts)}\n" if parts else ""
@@ -405,7 +413,7 @@ def _full_block(rank: int, p: Paper, lang: str = "zh") -> str:
         highlights = p.highlights
         related_list = p.related_methods
     summary_block = _summary_block(summary, highlights, lang)
-    signal_line = _signal_line(p)
+    signal_line = _signal_line(p, lang)
     why_line = _why_selected_line(p, lang)
     related = _related_methods_block(related_list, lang)
     anchor = f'<a id="{_paper_anchor(p)}"></a>\n'

@@ -12,7 +12,18 @@ from sources.base import Paper
 async def _summarize_one(
     paper: Paper, prompt: str, client: LLMClient, sem: asyncio.Semaphore
 ) -> Paper:
-    user = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
+    bd = paper.relevance_breakdown or {}
+    cal_zh = str(bd.get("calibration_cost") or "")
+    perf_zh = str(bd.get("inference_perf") or "")
+    reason_zh = (paper.relevance_reason or "").strip()
+    user = (
+        f"Title: {paper.title}\n\n"
+        f"Abstract: {paper.abstract}\n\n"
+        "Chinese fields to translate (write English siblings, do not re-evaluate):\n"
+        f"- relevance_reason: {reason_zh}\n"
+        f"- calibration_cost: {cal_zh}\n"
+        f"- inference_perf: {perf_zh}"
+    )
 
     def _clean_related(related: list) -> list[dict]:
         return [
@@ -27,15 +38,31 @@ async def _summarize_one(
 
     async with sem:
         try:
-            # ~2000 tokens budgets both summaries plus highlights & related lists
-            # without spilling on dense abstracts. Bumped from 1100 (CN-only).
-            r = await client.call_json(prompt, user, max_tokens=2000)
+            # 3000 token budget covers both summaries + translations of the
+            # filter-step Chinese fields (reason / cal / perf). Bumped from
+            # 2000 (bilingual summary only) and 1100 (CN-only original).
+            r = await client.call_json(prompt, user, max_tokens=3000)
             paper.summary = r.get("summary")
             paper.highlights = r.get("highlights") or []
             paper.related_methods = _clean_related(r.get("related_methods") or [])
             paper.summary_en = r.get("summary_en")
             paper.highlights_en = r.get("highlights_en") or []
             paper.related_methods_en = _clean_related(r.get("related_methods_en") or [])
+            # Translations of filter-step Chinese fields. Empty string = the
+            # original was empty / missing; render falls back to the CN value
+            # only when the _en string is missing (None), not when it's "".
+            paper.relevance_reason_en = r.get("relevance_reason_en")
+            cal_en = r.get("calibration_cost_en")
+            perf_en = r.get("inference_perf_en")
+            if cal_en is not None or perf_en is not None:
+                # Mutate breakdown in place so render's _signal_line can read
+                # `<key>_en` siblings; avoids adding a parallel dict field.
+                if paper.relevance_breakdown is None:
+                    paper.relevance_breakdown = {}
+                if cal_en is not None:
+                    paper.relevance_breakdown["calibration_cost_en"] = cal_en
+                if perf_en is not None:
+                    paper.relevance_breakdown["inference_perf_en"] = perf_en
         except Exception as e:
             print(f"summarize: paper {paper.id} failed: {e}")
     return paper
