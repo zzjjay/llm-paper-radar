@@ -99,26 +99,26 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 ### Topic buckets and per-bucket caps
 
-Eight LLM-pickable buckets — the first seven are strict compression buckets, `trending` is a soft catch-all for compression-adjacent decoding-acceleration work. Papers that don't fit any bucket are hard-gated rather than forced into a catch-all (no `other`). Current caps (from [`config.yaml`](config.yaml) under `render.topic_caps`):
+Eight LLM-pickable buckets (first seven strict compression, `trending` is the soft catch-all). No `other` — papers that fit none get hard-gated. Caps in [`config.yaml`](config.yaml) → `render.topic_caps`:
 
 | bucket | cap | what goes here |
 |---|---|---|
-| **`ptq`** | 8 | Post-training quantization, weight-only / weight-activation / KV-quant when PTQ recipe is the primary contribution. Bit-width ≥ 3. Examples: GPTQ, AWQ, SmoothQuant, QuaRot, SpinQuant, MXFP4 PTQ, NVFP4 |
-| **`low_bits`** | 5 | Sub-3-bit (≤ 2-bit) quantization, regardless of training method. Examples: BitNet b1.58, AQLM, VPTQ, QuIP#, ternary, binary |
-| **`qat`** | 5 | Quantization-aware training or PTQ + full-network fine-tune. Bit-width ≥ 3. Examples: LLM-QAT, EfficientQAT, PB-LLM |
-| **`kv_cache`** | 5 | KV cache compression where the layout / eviction is the main contribution. Examples: KIVI, KVQuant, H2O, StreamingLLM |
-| **`pruning_distill`** | 3 | Pruning, sparsity, distillation **with a credible deployment path on existing kernels** (N:M structured, MoE expert pruning, layer drop, SFT-style KD). Unstructured-sparsity methods that depend on speculative GPU kernels → hard_gate. Examples: Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
-| **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Examples: Q-Diffusion, SVDQuant |
-| **`survey`** | 3 | Methodology / measurement / cross-method comparison that doesn't propose a new algorithm but gives actionable guidance. Examples: empirical PTQ comparisons, activation/outlier bottleneck studies, LLM-evaluation methodology for compression. Pure review-article surveys still hard_gate. |
-| **`trending`** | 3 | Compression-adjacent **decoding-acceleration** work without a direct compression algorithm — parallel/dual-view drafters, spec-decoding frameworks that don't fit the seven strict buckets. Soft catch-all; use sparingly. Routine EAGLE/Medusa variants still hard_gate. Examples: Orthrus, DFlash. |
+| **`ptq`** | 8 | Post-training quantization (W-only / W+A / KV-quant when PTQ is the primary contribution), bit-width ≥ 3. GPTQ, AWQ, SmoothQuant, QuaRot, SpinQuant, MXFP4, NVFP4 |
+| **`low_bits`** | 5 | Sub-3-bit (≤ 2-bit) quantization, regardless of training method. BitNet b1.58, AQLM, VPTQ, QuIP#, ternary, binary |
+| **`qat`** | 5 | Quantization-aware training or PTQ + full-network fine-tune, bit-width ≥ 3. LLM-QAT, EfficientQAT, PB-LLM |
+| **`kv_cache`** | 5 | KV cache compression where layout / eviction is the main contribution. KIVI, KVQuant, H2O, StreamingLLM |
+| **`pruning_distill`** | 3 | Pruning / sparsity / distillation with a deployable kernel path (N:M, MoE expert pruning, layer drop, SFT KD). Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
+| **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Q-Diffusion, SVDQuant |
+| **`survey`** | 3 | Methodology / measurement / cross-method comparison giving actionable guidance — empirical PTQ comparisons, outlier-bottleneck studies, eval methodology. Pure review surveys still hard_gate. |
+| **`trending`** | 3 | Compression-adjacent decoding-acceleration without a direct compression algorithm — parallel/dual-view drafters, spec-decoding frameworks. Use sparingly; routine EAGLE/Medusa still hard_gate. Orthrus, DFlash |
 
-Bit-width tie-break: a 2-bit PTQ paper goes to `low_bits`, not `ptq`. A 1.58-bit pretrained model goes to `low_bits`, not `qat`. The rule wins over "natural" categorization.
+**Tie-breaks**
+- Bit-width wins: 2-bit PTQ → `low_bits` (not `ptq`); 1.58-bit pretrained → `low_bits` (not `qat`)
+- Algorithm beats survey: new loss / rotation / datatype / calibration recipe → bucket by the algorithm even if the paper also benchmarks broadly. `survey` is only when measurement/methodology is *itself* the contribution.
 
-Survey-vs-algorithm tie-break: if the primary contribution is a new algorithm (new loss / rotation / datatype / calibration recipe), bucket by the algorithm even if the paper also contains broad benchmarking. `survey` is only for work whose primary contribution is the measurement / comparison / methodology itself.
+**Caps scope:** the README compact table lists every surviving paper (no cap). Caps only gate which papers get a full detail block on the per-day digest page.
 
-In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
-
-A separate `arxiv_authors` source ([`config.yaml`](config.yaml) → `sources.arxiv_authors.authors`, curated list: Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) feeds a dedicated **👤 Watched authors** block on each detail page that bypasses per-bucket caps and shows *all* of their papers — out-of-scope ones too. The main compact table still gates them by `hard_gate`, so off-topic watched-author work stays in the detail page only.
+**Watched authors:** `sources.arxiv_authors.authors` in [`config.yaml`](config.yaml) (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) gets a dedicated **👤 Watched authors** block on each detail page that bypasses caps and shows *all* of their papers. The compact table still applies `hard_gate`, so off-topic watched-author work stays detail-page-only.
 
 ### Table ordering
 
