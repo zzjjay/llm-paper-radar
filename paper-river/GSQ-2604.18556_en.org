@@ -10,58 +10,268 @@
 
 A 70B-parameter model in full precision occupies 140GB of GPU memory — too large for a single card, and entirely out of reach for consumer-grade hardware. Squeezing each weight down to 2-3 bits would let the model fit on a single 24GB consumer GPU.
 
-But low-precision compression has a peculiar split. The field is divided into two camps. *Scalar quantization* rounds each weight independently to an entry in a tiny number table — simple, supported by existing inference kernels, and the foundation of GGUF / llama.cpp / a whole shipping ecosystem. *Vector / trellis quantization* packs groups of weights into a codebook — higher accuracy, but requires new lookup-table kernels and rewriting the deployment stack.
+But low-precision compression has a peculiar split. The field has two camps. *Scalar quantization* rounds each weight independently to an entry in a small number table — simple, supported by existing inference kernels, and the foundation of the GGUF / llama.cpp / shipping ecosystem. *Vector / trellis quantization* packs groups of weights into a codebook — higher accuracy, but requires new lookup-table kernels and rewriting the deployment stack.
 
-The tension: at 2-3 bpp, the scalar camp's accuracy collapses while the vector camp leads by a wide margin. Yet nobody wants to rewrite their inference stack just for that accuracy bump.
+The tension: at 2-3 bpp the scalar camp's accuracy collapses while the vector camp leads by a wide margin. Yet the vector camp's kernels are sparsely maintained, the ecosystem is fragmented, and nobody wants to rewrite their entire inference stack just for that accuracy bump.
+
+*Can scalar quantization catch up at 2-3 bpp?* That's where GSQ enters. Trace this line backward and you'll find: deciding which weight should take which value is fundamentally the same problem LeCun was thinking about 35 years ago.
 
 * Lineage Map
 
-(TODO: translate the lineage diagram from the Chinese version)
+#+begin_example
+[1989] LeCun et al. — Optimal Brain Damage (OBD)
+  |
+  | Problem: Which weight, if pruned, hurts the loss least? Exhaustive search is impossible.
+  | Approach: Second-order Taylor expansion of loss w.r.t. weights; "importance" from Hessian diagonal.
+  v
+[1992] Hassibi & Stork — Optimal Brain Surgeon (OBS)
+  |
+  | Problem: OBD assumes weights are independent — they aren't; pruning one perturbs the others.
+  | Approach: Use the *full* inverse Hessian H^{-1}; when pruning weight w_i, update the rest to compensate.
+  v
+[2022-08] Frantar & Alistarh — Optimal Brain Quantization (OBQ)
+  |
+  | Problem: OBS is designed for pruning (w → 0), but quantization is "move to the nearest grid point".
+  | Approach: Reshape OBS — pick the weight with smallest quantization-error contribution, snap it to the grid,
+  |           compensate the rest via Hessian inverse, repeat.
+  v
+[2022-10] Frantar et al. — GPTQ
+  |
+  | Problem: OBQ runs on 100M models but LLMs are 100B-scale — O(n^3) inverse Hessian blows up.
+  | Approach: Block-wise processing, lazy updates, Cholesky decomposition to avoid recomputing the inverse —
+  |           quantization time goes from days to hours.
+  v
+[2026-04] Dadgarnia et al. — GSQ
+  |
+  | Problem: GPTQ is fine at 4-bit but lags badly behind vector methods (QTIP / AQLM) at 2-3 bit.
+  | Approach: Stop picking each weight's nearest grid point independently — jointly optimize via Gumbel-Softmax
+  |           (which grid point each weight picks + each group's scale; continuous relaxation → differentiable
+  |           → learn together).
+  v
+[????]  Next paper hasn't appeared yet (as of writing)
+#+end_example
 
 * Evolution Narrative
 
 ** 1989 | OBD: lifting pruning from "look at weight magnitude" to "look at impact"
 
 *** What it saw
+
+Pruning back then went like this: train a network, look at the absolute weight values, remove the small ones. Intuitively reasonable — if a weight is near zero, deleting it shouldn't matter much.
+
+But LeCun didn't buy it. He gave a counterexample: a weight with small value but on a critical path, whose removal cascades deactivation downstream; versus a weight with large value but redundant with others, where removal is easily compensated. Magnitude alone can't distinguish the two.
+
+*The real question is: how much does the loss rise if you prune this weight?*
+
 *** Its approach
+
+Treat the loss as a function of weights, L(w). On a trained network the first-order gradient is nearly zero (otherwise it hasn't converged). So the second-order Taylor expansion reduces to:
+
+#+begin_example
+ΔL ≈ (1/2) * Δw^T * H * Δw
+#+end_example
+
+where H is the Hessian. Pruning weight w_i means Δw_i = -w_i. The "importance" of each weight — the loss rise from removing it — falls out analytically.
+
+OBD added a simplifying assumption: *diagonal Hessian* — weights treated as mutually independent. This drops computation from O(n^3) to O(n), making it runnable on 1989-era hardware.
+
 *** Why this worked (and what new pitfalls it introduced)
+
+"Look at impact, not magnitude" was the right move — 30 years of subsequent saliency-based work stands on this foundation. But *the diagonal-Hessian assumption was a trap*: neural network weights are highly coupled; pruning one perturbs the rest. OBS came along three years later to puncture it.
 
 ** 1992 | OBS: since weights are correlated, compensate when you prune
 
 *** What it saw
+
+Hassibi ran the head-to-head: pruning with OBD to some ratio breaks the model fast; pruning with a correlation-aware method to the same ratio holds up. The "importance" scores OBD gave under the diagonal assumption were just wrong.
+
+More fundamentally: *OBD did nothing to the remaining network after a removal*. Deleting one weight shifts the optimal operating point — the surviving weights were trained to "cooperate with that pruned one," and suddenly one is missing, leaving all of them slightly off.
+
 *** Its approach
+
+Two changes:
+
+1. Use the *full inverse Hessian* H^{-1}, no diagonal assumption. The loss impact of pruning w_i comes out precisely as w_i^2 / (2 * [H^{-1}]_ii).
+
+2. When w_i is pruned, update all remaining weights:
+
+#+begin_example
+Δw_remaining = -(w_i / [H^{-1}]_ii) * H^{-1}_{:,i}
+#+end_example
+
+This is the "prune one, compensate the rest" rule.
+
 *** Why this worked (and what new pitfalls it introduced)
+
+OBS was validated in the 90s: at the same prune ratio, loss rise dropped by an order of magnitude compared to OBD.
+
+Two pitfalls remained:
+
+1. *Scale problem*: H is n × n where n = number of weights. For 100M-parameter models, H^{-1} simply doesn't fit.
+2. *Pruning ≠ quantization*: OBS sets weights to 0. Quantization moves them to "the nearest discrete grid point" — not removal, but approximation.
+
+The first pitfall waited 30 years (hardware + algorithms catching up together); the second waited 30 years (deep learning waiting for LLMs to make quantization a hard requirement).
 
 ** 2022-08 | OBQ: rework OBS from "prune" to "quantize"
 
 *** What it saw
+
+OBS solved a binary decision — keep a weight or remove it. Quantization solves *which grid point to pick*: at W4, each weight picks one of 16 values.
+
+Frantar noticed: the OBS math doesn't actually require Δw = -w_i. Change it to Δw_i = (quantized(w_i) - w_i) — move the weight to its nearest grid point — and you can still use the Hessian to compute "loss impact of this move" and compensate the rest.
+
 *** Its approach
+
+OBQ's core loop:
+
+1. For each row of weights, compute "loss rise from moving each weight to its nearest grid point"
+2. Pick the smallest-rise one and snap it to the grid
+3. Apply a Hessian-inverse compensation update to the remaining unquantized weights
+4. Strike the corresponding row/column from the Hessian, update H^{-1}
+5. Go to 1
+
+Each weight quantized triggers an adjustment of the rest. By the time all weights are quantized, the cumulative loss rise has been minimized as much as the loop allows.
+
 *** Why this worked (and what new pitfalls it introduced)
+
+OBQ validated W4 with near-zero loss on 100M-scale models. But *it can't run LLMs*: each H^{-1} update is O(n^2) memory, O(n^3) time. What takes a night at 100M takes years at 100B.
 
 ** 2022-10 | GPTQ: make OBQ feasible at billion-parameter scale
 
 *** What it saw
+
+The OBQ algorithm itself was right; the bottleneck was raw compute. To run OPT-175B you had to slash the redundancy without breaking the algorithm's core.
+
+Frantar et al. spotted three exploitable properties:
+
+1. *Column order doesn't change the final result* — OBQ greedily picks "smallest-rise" but any fixed order is equivalent in expectation.
+2. *Compensation updates are highly redundant* — most of each H^{-1} update isn't actually consumed by the next step.
+3. *Cholesky decomposition pre-stages everything* — the full evolution path of H^{-1} can be computed once up front.
+
 *** Its approach
+
+GPTQ's three-punch combo:
+
+1. *Fix the column order*: quantize left-to-right, no greedy "smallest-rise" selection.
+2. *Lazy block update*: cut each row into 128-column blocks, accumulate compensation within a block, apply one big update between blocks.
+3. *Cholesky-based inverse Hessian*: H = LL^T decomposition lets you read off H^{-1} columns directly without recomputation.
+
+Time complexity drops from OBQ's O(n^3) per row to GPTQ's O(n^2) per row. OPT-175B-scale goes from "years" to "4 GPU-hours".
+
 *** Why this worked (and what new pitfalls it introduced)
+
+GPTQ became the starting point for 3 years of subsequent PTQ work: AWQ, SmoothQuant, SqueezeLLM, Marlin kernel all build on its algorithm or its quantized outputs.
+
+Pitfall remaining: *GPTQ treats quantization as a per-weight independent decision*. Each weight looks at its own nearest grid point, picks it, and freezes. The grid itself is round-to-nearest uniform, pre-determined, not part of the optimization.
+
+At 4-bit this barely matters — 16 grid points is dense enough. But at 2-bit (4 points) or 3-bit (8 points), "independent decision + fixed grid" leaves money on the table. You can sense it: at such sparse grids, each weight's best assignment depends on its neighbors (they share a per-group scale), but GPTQ can't go back and jointly optimize.
+
+The vector-quantization camp (QuIP#, AQLM, QTIP) capitalized on this gap: codebook-based joint decisions over multiple weights, beating GPTQ substantially at 2-3 bpp. The cost: inference kernels have to be rewritten.
 
 ** 2026-04 | GSQ: bring joint optimization to scalar quantization at 2-3 bpp
 
 *** What it saw
+
+The landscape GSQ's authors saw:
+
+- *Scalar camp*: GPTQ / AWQ dominate at 4-bit, fall noticeably behind at 2-3 bit.
+- *Vector camp*: QTIP / AQLM lead at 2-3 bit, but kernel ecosystem is fragmented, deployment cost is high.
+- *Middle ground*: can you do joint optimization *within* the scalar framework, capture the vector camp's accuracy gains, and keep the scalar camp's ecosystem?
+
+GPTQ's specific limitations: (1) each weight picks a grid point independently; (2) the grid itself is fixed (per-group scales exist, but the scales aren't jointly learned). Together these are suboptimal at low bit-widths — but both are fundamentally argmin discrete decisions, not amenable to direct gradient descent.
+
 *** Its approach
+
+Bring in *Gumbel-Softmax relaxation* — an old trick (Jang/Maddison 2016): relax "pick one of K discrete options" into a continuous distribution over the K-simplex, controlled by a temperature parameter, making the whole decision process differentiable.
+
+What GSQ does:
+
+1. Each weight w_i isn't quantized directly — instead it outputs a length-K logits vector (K = number of grid levels, e.g. K=8 at W3)
+2. Use Gumbel-Softmax sampling to get a soft assignment
+3. Parameterize the per-group scale and learn it jointly
+4. Differentiate the whole objective (reconstruction error or task loss) w.r.t. logits + scale, optimize end-to-end
+5. Anneal the temperature → 0 after training, soft assignment collapses to a hard discrete choice
+6. Project the result back to the symmetric scalar grid of GGUF K-Quant, dropping seamlessly into existing kernels
+
 *** Why this worked (and what new pitfalls it introduced)
+
+Result: at W2/W3, most of the gap to QTIP is closed, *and* the output is GGUF-compatible — meaning every existing llama.cpp deployment pipeline runs it without code changes. It also scales successfully to Kimi-K2.5 trillion-parameter MoE, validating scalability.
+
+Potential new pitfalls:
+
+1. *Moderate calibration cost*: per-coordinate logits optimization is more expensive than GPTQ's one-shot closed-form solve, requiring gradient optimization. The paper says cost is acceptable, but it's a tier higher than AWQ.
+2. *Grid shape is still constrained*: projection back to GGUF K-Quant means the final grid must be symmetric scalar, losing some of the non-uniform grids Gumbel-Softmax could theoretically have learned.
+3. *Local optima from joint optimization*: Gumbel-Softmax training instability is a known issue, lacking the closed-form stability guarantees of GPTQ.
 
 * Frontier Extensions
 
-(TODO: translate from Chinese version)
+As of writing (2026-05), GSQ is a 2026-04-20 preprint with a v2 released on 2026-05-15. Within this short window no published work has explicitly critiqued or extended GSQ.
+
+Plausible next directions (speculative, no papers yet):
+
+- *End-to-end vs grid-projection gap*: can you skip the GGUF projection and ship custom kernels that consume GSQ's learned non-uniform grid? How much more accuracy is available?
+- *Gumbel-Softmax annealing stability*: can you replace the continuous relaxation with a straight-through estimator or other discretization trick, cutting calibration cost?
+- *Joint learning across MoE experts*: GSQ already scales to Kimi-K2.5, but each expert is quantized independently. Can you jointly learn the grid across experts?
 
 * One Picture to Understand
 
-(TODO: ASCII diagram or layout)
+#+begin_example
+                  pruning            quantization
+                    |                      |
+1989   OBD   ------+                  +-------
+       (diagonal Hessian)             |       |
+                    \\                |       |
+1992   OBS   ----------+              |       |
+       (full H^{-1})    \\            |       |
+                          \\          |       |
+                            \\        v       |
+2022   OBQ   ----------------+-> reshape OBS into quantization
+                                  | (per-weight independent grid choice)
+                                  v
+2022   GPTQ  ----------------> make OBQ feasible on LLMs
+                                  | (fixed column order + lazy block + Cholesky)
+                                  v
+2024   AWQ / SmoothQuant ---> improve GPTQ's scale handling
+                                  | (still per-weight independent + fixed grid)
+                                  v
+                          ┌───────┴───────┐
+                          |               |
+                      scalar camp     vector camp
+                      stuck at 4-bit     QTIP / AQLM
+                      loses at 2-3 bit   codebook-pack at 2-3 bit
+                      but kernel-ready   accurate but kernel-hostile
+                          |
+                          v
+2026   GSQ -------> scalar-camp joint optimization:
+                       per-coordinate grid + per-group scale
+                       learned end-to-end via Gumbel-Softmax
+                       project back to GGUF — capture vector-camp accuracy
+                       without losing scalar-camp ecosystem
+
+
+Core tension: accuracy vs deployment friendliness
+1989-2022: the second-order saliency line keeps getting more refined
+2022:      GPTQ engineers it into reality, making LLM quantization possible
+2024-2025: scalar / vector split, each owning one end
+2026:      GSQ uses differentiable relaxation to stitch the two together
+#+end_example
 
 * Insights
 
-(TODO: bullet list of takeaways)
+A few patterns that emerge from reading this lineage:
+
+1. *Discrete-decision optimization has been quietly "softening" generation by generation* — OBD is hard-threshold pruning, OBS adds compensation, OBQ becomes "pick the nearest grid point + compensate," GPTQ adds block-internal compensation, GSQ goes fully continuous relaxation. Each generation makes a previously non-differentiable decision smoother, opening more optimization headroom.
+
+2. *Accuracy and deployment ecosystem are a perpetual tension* — QTIP / AQLM picked "accuracy first + rewrite kernels"; GSQ picked "find accuracy in the cracks + keep existing kernels". GSQ may not be theoretically optimal, but it picked a position that's *shippable*. This "find the algorithmic sweet spot under system constraints" is the typical shape of production-oriented work.
+
+3. *Old tricks get reactivated* — Gumbel-Softmax was designed in 2016 for categorical VAE; 10 years later it's brought over to solve PTQ's discrete-decision bottleneck. Many research breakthroughs aren't "invent new method" but "transplant a mature method from elsewhere because that domain's problem matches".
+
+4. *5 layers of lineage isn't the bottom* — this line can be traced further: OBD itself stands on 1980s Taylor expansion + Hessian analysis traditions. Any "weight-impact scoring" work can be traced here. But further back gets more general and less quantization-specific; stopping at OBD is a reasonable "contextual boundary".
 
 * What This Inspires
 
-(TODO: forward-looking observations / follow-up questions)
+This means you can:
+
+- When doing PTQ engineering, first ask "am I on GSQ's left (scalar accuracy limited) or right (vector deployment hard)" — picking the wrong quadrant means you shouldn't be using the corresponding method.
+- When you see any "argmin discrete decision + non-differentiable" bottleneck, instinctively reach for Gumbel-Softmax / Straight-Through-style relaxation tools. GSQ did it for PTQ; similar bottlenecks exist in MoE routing, sparse attention, codebook learning.
+- When evaluating a PTQ paper's real value: check whether it *can be projected back into mainstream inference stacks*. If it can't, no matter how impressive the accuracy numbers, the paper-to-production gap requires another round of kernel engineering investment.
