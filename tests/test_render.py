@@ -283,6 +283,43 @@ def test_render_daily_writes_en_digest_when_summary_en_present(tmp_path: Path):
     assert "Related methods / baselines" in en
 
 
+def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_path: Path):
+    """README compact table's Why column should append `· [en](..._en.md#p-X)`
+    when the EN digest exists for the same day, and stay single-link otherwise."""
+    summarized_path = tmp_path / "summarized.json"
+    p_en = _mk("withen", 9, trending_rank=1)
+    p_en.summary_en = "english"
+    p_en.highlights_en = ["🎯 m"]
+    summarized_path.write_text(json.dumps([p_en.model_dump(mode="json")]))
+
+    digests_dir = tmp_path / "digests"
+    readme = tmp_path / "README.md"
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=summarized_path,
+        digests_dir=digests_dir,
+        readme_path=readme,
+        index_path=tmp_path / "INDEX.md",
+    )
+    text = readme.read_text()
+    assert "[📄](digests/2026-05-11.md#p-withen) · [en](digests/2026-05-11_en.md#p-withen)" in text
+
+    # Second day with no EN data: single-link, no `· [en]` suffix.
+    p_zh = _mk("zhonly", 9, trending_rank=1)
+    summarized_path2 = tmp_path / "summarized2.json"
+    summarized_path2.write_text(json.dumps([p_zh.model_dump(mode="json")]))
+    render_daily(
+        date=datetime(2026, 5, 12, tzinfo=UTC),
+        summarized_path=summarized_path2,
+        digests_dir=digests_dir,
+        readme_path=readme,
+        index_path=tmp_path / "INDEX.md",
+    )
+    text2 = readme.read_text()
+    assert "[📄](digests/2026-05-12.md#p-zhonly)" in text2
+    assert "2026-05-12_en.md#p-zhonly" not in text2
+
+
 def test_render_daily_skips_en_digest_when_no_summary_en(tmp_path: Path):
     """Back-compat: days summarized before bilingual output have summary_en=None
     on every paper. The _en file must NOT be written in that case."""

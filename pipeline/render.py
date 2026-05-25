@@ -433,8 +433,14 @@ def _authors_short(p: Paper, limit: int = 3) -> str:
     return head + (" et al." if len(p.authors) > limit else "")
 
 
-def _details_link(p: Paper, digest_filename: str) -> str:
-    return f"[📄]({digest_filename}#{_paper_anchor(p)})"
+def _details_link(p: Paper, digest_filename: str, en_filename: str | None = None) -> str:
+    """Why-column link. Append a sibling `[en](...)` when an English digest
+    file exists for the same day; older days (no _en file) stay single-link."""
+    anchor = _paper_anchor(p)
+    main = f"[📄]({digest_filename}#{anchor})"
+    if en_filename:
+        return f"{main} · [en]({en_filename}#{anchor})"
+    return main
 
 
 def _bucket_cell(p: Paper) -> str:
@@ -450,14 +456,16 @@ def _bucket_cell(p: Paper) -> str:
     return BUCKET_TITLES[b]
 
 
-def _compact_row(rank: int, p: Paper, digest_filename: str) -> str:
+def _compact_row(
+    rank: int, p: Paper, digest_filename: str, en_filename: str | None = None
+) -> str:
     """README/compact view: # | Bucket | Paper | Authors | Date | Why."""
     revisited = " 🔁" if p.seen_before else ""
     title_cell = f"[{p.title}]({p.url}){revisited}"
     date_str = p.published_at.strftime("%Y-%m-%d")
     return (
         f"| {rank} | {_bucket_cell(p)} | {title_cell} | {_authors_short(p)}"
-        f" | {date_str} | {_details_link(p, digest_filename)} |"
+        f" | {date_str} | {_details_link(p, digest_filename, en_filename)} |"
     )
 
 
@@ -588,6 +596,7 @@ def _render_compact_md(
     watched_papers: list[Paper],
     surviving: list[Paper],
     digest_filename: str,
+    en_digest_filename: str | None = None,
 ) -> str:
     """Compact README view: header + one bucketed table covering everything
     that passed hard_gate. Watched-author papers sort into their topic bucket
@@ -620,7 +629,7 @@ def _render_compact_md(
     if combined:
         body.append(MAIN_TABLE_HEADER)
         for i, p in enumerate(combined, start=1):
-            body.append(_compact_row(i, p, digest_filename))
+            body.append(_compact_row(i, p, digest_filename, en_digest_filename))
         body.append("")
     else:
         body.append("_Nothing surfaced today (everything was hard-gated)._\n")
@@ -705,13 +714,17 @@ def render_daily(
     scanned, watched_papers, surviving = _load_day(
         date, summarized_path, digests_dir, topic_caps
     )
-    digest_filename = f"{date.strftime('%Y-%m-%d')}.md"
+    date_str = date.strftime("%Y-%m-%d")
+    digest_filename = f"{digests_dir.name}/{date_str}.md"
+    en_path = digests_dir / f"{date_str}_en.md"
+    en_filename = f"{digests_dir.name}/{date_str}_en.md" if en_path.exists() else None
     compact_text = _render_compact_md(
         date,
         scanned,
         watched_papers,
         surviving,
-        digest_filename=f"{digests_dir.name}/{digest_filename}",
+        digest_filename=digest_filename,
+        en_digest_filename=en_filename,
     )
     _splice_into_readme(readme_path, compact_text)
     _update_index(date, index_path, scanned, surviving)
@@ -719,11 +732,13 @@ def render_daily(
 
 def _render_aggregated_compact_md(
     days: list[tuple[datetime, int, list[Paper], list[Paper]]],
-    digests_dir_name: str,
+    digests_dir: Path,
 ) -> str:
     """N-day rollup compact view: one merged table sorted by bucket (then the
     per-bucket sort key). Watched-author papers sort into their topic bucket
-    alongside everyone else. Each row links to its own day's digest page."""
+    alongside everyone else. Each row links to its own day's digest page;
+    when an _en sibling exists for that day, an extra `· [en](...)` is appended."""
+    digests_dir_name = digests_dir.name
     days_sorted = sorted(days, key=lambda x: x[0], reverse=True)  # newest first
     start_date = min(d[0] for d in days)
     end_date = max(d[0] for d in days)
@@ -763,8 +778,11 @@ def _render_aggregated_compact_md(
     if pairs:
         body.append(MAIN_TABLE_HEADER)
         for i, (date, p) in enumerate(pairs, start=1):
-            digest_filename = f"{digests_dir_name}/{date.strftime('%Y-%m-%d')}.md"
-            body.append(_compact_row(i, p, digest_filename))
+            date_str = date.strftime("%Y-%m-%d")
+            digest_filename = f"{digests_dir_name}/{date_str}.md"
+            en_path = digests_dir / f"{date_str}_en.md"
+            en_filename = f"{digests_dir_name}/{date_str}_en.md" if en_path.exists() else None
+            body.append(_compact_row(i, p, digest_filename, en_filename))
         body.append("")
     else:
         body.append("_Nothing surfaced in this window._\n")
@@ -790,7 +808,7 @@ def render_aggregated(
         print(f"render: wrote digest for {date.date()}")
     if not days:
         return
-    aggregated = _render_aggregated_compact_md(days, digests_dir.name)
+    aggregated = _render_aggregated_compact_md(days, digests_dir)
     _splice_into_readme(readme_path, aggregated)
 
 

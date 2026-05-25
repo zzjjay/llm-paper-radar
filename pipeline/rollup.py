@@ -111,7 +111,7 @@ def main(
             "_No summarized data found in this window._\n"
         )
     else:
-        text = _render_aggregated_compact_md(window, digests_dir.name)
+        text = _render_aggregated_compact_md(window, digests_dir)
 
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
