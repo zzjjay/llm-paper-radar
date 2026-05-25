@@ -48,7 +48,9 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 - Topic completely unrelated to compression: RAG, agents, alignment, multimodal-without-compression, pure training algorithms
 - **Pure speculative decoding** with no compression angle (coupled spec + quant is in scope, routed by primary contribution)
 - **Pure review-article surveys** that only enumerate prior methods with no new measurement — hard_gate. Empirical comparison studies, bottleneck analyses, and evaluation-methodology papers now go to the `survey` bucket instead.
-- Anything compression-adjacent that doesn't fit one of the seven topic buckets
+- Anything compression-adjacent that doesn't fit one of the eight topic buckets
+- **`practicality = 2`** (only one favorable practicality signal) — the deployment-cost-to-gain ratio is wrong. PR ≥ 3 stays in scope.
+- **No benchmark validation AND would otherwise score ≤ 7**: `accuracy_benchmarks` ∈ {none, unknown} AND `topic_relevance + practicality ≤ 7` → hard_gate, unless the paper explicitly compares against an established compression baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …). A high-relevance + high-practicality paper (TR ≥ 4 AND PR ≥ 4) can still surface without a benchmark.
 - Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
 - **`ptq` bucket — stricter scale rule**: any PTQ paper whose largest experiment is < 7B parameters → hard_gate. Sub-7B PTQ (FLAN-T5-base, CLIP-ViT, GPT-2, OPT-1.3B, Pythia-1.4B) does not predict large-scale behavior — accuracy gaps at 1B routinely flip at 7B+. Modern LLM family + unknown size → default trust. Other buckets keep the < 1B threshold.
 - **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / TensorRT-LLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
@@ -96,7 +98,7 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
 ## 🛠 Pipeline
 
 ```
-   ┌────────────┐     fetchers (one per source, all in parallel via daily.sh)
+   ┌────────────┐     fetchers (one per source, run sequentially in daily.sh)
    │  sources   │ ─── arxiv + arxiv_authors + hf_daily + openreview
    └─────┬──────┘            ↓
          │            data/raw/YYYY-MM-DD/{source}.json
@@ -115,34 +117,37 @@ A separate `arxiv_authors` source queries arXiv directly for a curated list of a
          │            data/scored/YYYY-MM-DD.json
          ↓
    ┌────────────┐     pipeline/summarize.py  (Claude Opus 4.7, prompts/summary.md)
-   │ summarize  │ ─── every non-hard-gated paper → 中文 summary + highlights
-   │            │                                  + up to 3 related/compared methods
+   │ summarize  │ ─── every non-hard-gated paper → bilingual (zh + en) summary
+   │            │                                  + highlights + up to 3 related/compared methods
    └─────┬──────┘            ↓
          │            data/summarized/YYYY-MM-DD.json
          ↓
    ┌────────────┐     pipeline/render.py
    │   render   │ ─── compact README table (bucket-ordered) +
-   │            │     detail page (grouped by bucket, capped per-bucket)
+   │            │     per-day zh detail page (+ _en sibling when bilingual
+   │            │     summaries exist), grouped by bucket, capped per-bucket
    └────────────┘            ↓
-                      digests/YYYY-MM-DD.md  +  README.md  +  INDEX.md
+                      digests/YYYY-MM-DD.md (+ _en.md)  +  README.md  +  INDEX.md
 ```
 
-Each stage is independently runnable from the CLI:
+Each stage is independently runnable from the CLI. Per-day sources take `--backfill-days`; windowed sources (`arxiv_authors`, `openreview`) take `--window-days` and fetch once:
 
 ```bash
-uv run python -m sources.hf_daily   --backfill-days 0
-uv run python -m sources.arxiv      --backfill-days 0
-uv run python -m pipeline.dedupe    --backfill-days 0
-uv run python -m pipeline.filter    --backfill-days 0
-uv run python -m pipeline.summarize --backfill-days 0
-uv run python -m pipeline.render    --backfill-days 0
+uv run python -m sources.hf_daily       --backfill-days 0
+uv run python -m sources.arxiv          --backfill-days 0
+uv run python -m sources.arxiv_authors  --backfill-days 0 --window-days 7
+uv run python -m sources.openreview     --backfill-days 0 --window-days 7
+uv run python -m pipeline.dedupe        --backfill-days 0
+uv run python -m pipeline.filter        --backfill-days 0
+uv run python -m pipeline.summarize     --backfill-days 0
+uv run python -m pipeline.render        --backfill-days 0
 ```
 
-`scripts/daily.sh` chains all of these, then `git commit && git push` if anything changed.
+`scripts/daily.sh` chains the fetch → dedupe → filter → summarize sequence, then runs three optional wrappers (`auto_paper_river` → `translate_paper_river` → `render` → `snapshot`) and finally `git commit && git push` if anything changed. The wrappers are governed by env vars: set `PAPER_RIVER_SKIP=1` to skip auto-generation of paper-river `.org` files, and `PAPER_RIVER_MAX=N` to cap how many get generated per run.
 
 ### 🌊 Paper River (optional companion analyses)
 
-The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<id-slug>.org` file exists (`<id-slug>` = arXiv id with dots → dashes, e.g. `2604.18556` → `2604-18556`). Those `.org` files are manual deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the `ljg-paper-river` Claude Code skill. No cron hook; generation is on-demand. Render works fine without it (no file → no link).
+The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<arxiv-id>.org` file exists (e.g. `GSQ-2604.18556.org` for arXiv `2604.18556`). The zh digest (`digests/<date>.md`) links to the zh `.org`; the en digest (`digests/<date>_en.md`) links to the `_en.org` sibling — each language keeps its own link. The render step also accepts a legacy dash form (`*<id-with-dashes>.org`, e.g. `2604-18556`) for old files. Those `.org` files are deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the `ljg-paper-river` Claude Code skill. By default `scripts/daily.sh` auto-generates them via `scripts/auto_paper_river.py` (set `PAPER_RIVER_SKIP=1` to disable) and auto-translates zh → `_en.org` via `scripts/translate_paper_river.py`. Render works fine without any `.org` file — no file → no link.
 
 **Install the skill.** It ships in the [`lijigang/ljg-skills`](https://github.com/lijigang/ljg-skills) Claude Code plugin marketplace — install in two slash commands, no clone needed (`master` branch = org-mode output, which is what `pipeline/render.py` expects):
 
@@ -216,11 +221,12 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 | `filter.model` | `claude-sonnet-4-6` | scoring model; drop to `claude-haiku-4-5` if cost matters more than judgement quality |
 | `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
 | `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
+| `summarize.model` | `claude-opus-4-7` | bilingual (zh + en) summary model |
 | `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, trending: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
-| `render.truncate_after` | 10 | hard cap on the full-list table |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.arxiv_authors.window_days` | 7 | default fetch window for watched-authors source (CLI `--window-days` overrides) |
-| `dedupe.source_priority` | hf_daily → … → arxiv | tie-breaker order when the same paper shows up from multiple sources |
+| `sources.openreview.venues` | `[ICLR.cc/2026/Conference]` | OpenReview venue IDs to scrape; append `/-/Submission` is handled internally. Add NeurIPS / ICML / COLM entries as they open. |
+| `dedupe.source_priority` | hf_daily → openreview → arxiv_authors → arxiv | tie-breaker order when the same paper shows up from multiple sources |
 
 ### 6. Smoke-test the chain
 
@@ -243,7 +249,7 @@ crontab -e
 
 `scripts/daily.sh` sources `~/.bashrc` for the Anthropic env vars, runs the full pipeline (`fetch → dedupe → filter → summarize → render`), and only commits + pushes when something actually changed. Logs land in `scripts/log/YYYY-MM-DD.log`.
 
-**Option B — GitHub Actions (forks with a public sk-ant key).** The `.github/workflows/daily.yml` workflow has the schedule commented out, but everything else is wired up. To use it, set repo secrets and re-enable the schedule line:
+**Option B — GitHub Actions (forks with a public sk-ant key).** Three workflows are wired up under `.github/workflows/`: `daily.yml` (schedule commented out — fetch → render → push), `weekly.yml` (Mondays 23:00 UTC — 7-day rollup), and `cleanup.yml` (Sundays 22:00 UTC — prune old raw data). To use them, set repo secrets and (for `daily.yml`) re-enable the schedule line:
 
 | secret | required | what for |
 |---|---|---|
@@ -270,7 +276,7 @@ llm-paper-radar/
 ├── seeds.yaml                   # curated index of important papers per bucket (used by paper-triage skill)
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
-│   └── summarize.md             # summary format prompt
+│   └── summary.md               # bilingual (zh + en) summary format prompt
 ├── sources/                     # one fetcher per upstream
 │   ├── arxiv.py
 │   ├── arxiv_authors.py
@@ -281,28 +287,35 @@ llm-paper-radar/
 │   ├── llm_client.py            # async Anthropic wrapper with prompt cache
 │   ├── dedupe.py
 │   ├── filter.py                # two-axis scoring
-│   ├── summarize.py
-│   ├── render.py                # bucket grouping + README splicing
+│   ├── summarize.py             # bilingual zh + en summaries
+│   ├── render.py                # bucket grouping + README splicing + Paper River link
 │   ├── readme_template.md       # static doc template (this file's source)
+│   ├── rollup.py                # N-day rollup compact view used by render
 │   └── weekly.py                # 7-day roll-up as a compact table
 ├── scripts/
 │   ├── daily.sh                 # cron entrypoint: fetch → ... → push (--no-fetch skips fetch)
-│   └── snapshot.sh              # captures the current README paper-list into snapshots/
+│   ├── snapshot.sh              # captures the current README paper-list into snapshots/
+│   ├── auto_paper_river.py      # scan summarized/, invoke ljg-paper-river per missing paper
+│   ├── gen_paper_river.sh       # headless wrapper that runs the ljg-paper-river skill
+│   ├── translate_paper_river.py # auto-translate zh paper-river/*.org → _en.org
+│   ├── seed_add.py              # add a paper to seeds.yaml
+│   └── seed_reject.py           # log a paper into data/curation/rejected.jsonl
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
-├── weekly/
-│   └── YYYYMMDD-YYYYMMDD.md     # weekly digest (full table, # | Bucket | Paper | …)
 ├── snapshots/
 │   └── YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot for tracking history
 ├── paper-river/                 # optional: ljg-paper-river deep-lineage analyses (see Pipeline)
-│   └── <acronym>-<id-slug>.org  # render auto-links if present; absent = no link
-├── data/                        # mostly gitignored; seen.json + summarized/ kept
+│   ├── <acronym>-<arxiv-id>.org # zh; render auto-links if present
+│   └── <acronym>-<arxiv-id>_en.org  # en sibling; auto-translated by daily.sh
+├── data/                        # mostly gitignored; seen.json + summarized/ + curation/ kept
 │   ├── raw/                     # gitignored
 │   ├── deduped/                 # gitignored
 │   ├── scored/                  # gitignored
 │   ├── summarized/              # tracked
+│   ├── curation/                # tracked: rejected.jsonl + seed-curation logs
 │   └── seen.json                # tracked: papers seen across days for 🔁 marker
+├── .github/workflows/           # daily.yml + weekly.yml + cleanup.yml
 ├── tests/
 └── pyproject.toml + uv.lock
 ```
