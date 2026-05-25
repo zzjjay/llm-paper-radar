@@ -140,6 +140,8 @@ uv run python -m pipeline.render    --backfill-days 0
 
 `scripts/daily.sh` chains all of these, then `git commit && git push` if anything changed.
 
+> **Optional · 🌊 Paper River.** The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<id-slug>.org` file exists (`<id-slug>` = arXiv id with dots → dashes, e.g. `2604.18556` → `2604-18556`). Those `.org` files are manual deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the personal-collection `ljg-paper-river` Claude Code skill (not bundled with this repo). Write `.org` files by hand if you don't have the skill; no cron hook, generation is on-demand.
+
 ---
 
 ## 🚀 Setup your own radar
@@ -280,7 +282,7 @@ llm-paper-radar/
 │   └── YYYYMMDD-YYYYMMDD.md     # weekly digest (full table, # | Bucket | Paper | …)
 ├── snapshots/
 │   └── YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot for tracking history
-├── paper-river/                 # optional: ljg-paper-river analyses (see below)
+├── paper-river/                 # optional: ljg-paper-river deep-lineage analyses (see Pipeline)
 │   └── <acronym>-<id-slug>.org  # render auto-links if present; absent = no link
 ├── data/                        # mostly gitignored; seen.json + summarized/ kept
 │   ├── raw/                     # gitignored
@@ -291,21 +293,6 @@ llm-paper-radar/
 ├── tests/
 └── pyproject.toml + uv.lock
 ```
-
----
-
-## 🌊 Paper River (optional companion analyses)
-
-Each digest detail page (`digests/<date>.md`, `digests/<date>_en.md`) auto-renders a `#### 🌊 Paper River` link for any paper that has a matching `.org` file at `paper-river/*<id-slug>.org`. `<id-slug>` is the arXiv ID with dots replaced by dashes (e.g. `2604.18556` → `2604-18556`); the human-readable prefix (e.g. `gsq-`) is up to you. No file → no link. The compact README table is intentionally untouched.
-
-The intended workflow for producing those `.org` files is the `ljg-paper-river` Claude Code skill — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward, Feynman-style. The skill is a personal-collection skill, not bundled with this repo. To use it:
-
-1. Obtain the `ljg-paper-river` skill (its SKILL.md + references/template.org). The repo lays no claim on this skill; if you don't have access to it, write `.org` files by hand following the template — the methodology is what matters, not the framing.
-2. Make Claude Code load the skill. If it lives loose under `~/.claude/skills/ljg-paper-river/`, wrap it in a local plugin (marketplace manifest + plugin manifest pointing at the skill folder) and add the plugin name to `enabledPlugins` in `~/.claude/settings.json`, then restart Claude Code.
-3. Invoke per paper (e.g. `/ljg-paper-river https://arxiv.org/abs/<id>`), and save the output as `paper-river/<acronym>-<id-slug>.org` from the repo root.
-4. Re-run `uv run python -m pipeline.render --date <date>` (or the next `daily.sh` run) — the link appears automatically.
-
-There is no automation hook for this yet: generation is manual, on demand. A cron-driven auto-generation step would add ~5-10 minutes per paper of deep web research and is intentionally not wired up.
 
 ---
 
