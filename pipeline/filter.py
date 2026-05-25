@@ -3,11 +3,84 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
+
+import yaml
 
 from pipeline.config import PrefilterConfig, load_config
 from pipeline.llm_client import LLMClient, load_prompt
 from sources.base import Paper
+
+# Milestone-override thresholds. A paper in seeds.yaml under category=trending
+# bypasses any LLM hard_gate verdict when EITHER heat signal fires.
+MILESTONE_TRENDING_RANK_MAX = 20
+MILESTONE_STARS_MIN = 5000
+
+
+@lru_cache(maxsize=1)
+def _milestone_trending_ids() -> frozenset[str]:
+    """Load arxiv IDs flagged for the trending milestone override from
+    seeds.yaml. Cached so we don't re-parse on every paper."""
+    seeds_path = Path("seeds.yaml")
+    if not seeds_path.exists():
+        return frozenset()
+    try:
+        cfg = yaml.safe_load(seeds_path.read_text()) or {}
+    except yaml.YAMLError:
+        return frozenset()
+    out = set()
+    for s in cfg.get("seeds", []) or []:
+        if not isinstance(s, dict) or s.get("category") != "trending":
+            continue
+        sid = (s.get("id") or "").strip()
+        if not sid:
+            continue
+        # seeds.yaml uses "arXiv:2309.06180"; Paper.id is the bare "2309.06180"
+        # for arxiv-sourced papers — normalize both ends.
+        out.add(sid.split(":")[-1])
+    return frozenset(out)
+
+
+def _milestone_override(paper: Paper) -> dict | None:
+    """If the paper is on the milestone-trending whitelist AND meets either
+    heat threshold (HF trending rank ≤ 20, or code_meta.stars ≥ 5000),
+    return a breakdown dict that bypasses the LLM verdict and routes the
+    paper to the `trending` bucket. Otherwise return None."""
+    arxiv_id = paper.id.split(":")[-1]
+    if arxiv_id not in _milestone_trending_ids():
+        return None
+    has_hot_trending = any(
+        s.name == "hf_daily"
+        and isinstance(s.extras.get("trending_rank"), int)
+        and s.extras["trending_rank"] <= MILESTONE_TRENDING_RANK_MAX
+        for s in paper.sources
+    )
+    meta = paper.code_meta or {}
+    stars = meta.get("stars")
+    has_hot_stars = isinstance(stars, int) and stars >= MILESTONE_STARS_MIN
+    if not (has_hot_trending or has_hot_stars):
+        return None
+    return {
+        "hard_gate": False,
+        "topic_relevance": 4,
+        "practicality": 4,
+        "compression_type": "trending",
+        "topic_bucket": "trending",
+        "model_domain": "language",
+        "format_or_method": "milestone framework",
+        "largest_model_tested": "production-deployed",
+        "accuracy_benchmarks": "n/a (infra paper)",
+        "accuracy_summary": "milestone framework, no compression accuracy metric",
+        "inference_perf": "real-world deployed at scale",
+        "calibration_cost": "n/a",
+        "peak_memory": "n/a",
+        "reason": (
+            "milestone-override: seeds.yaml-curated trending milestone "
+            "(vLLM/FlashAttention/EAGLE/Medusa/Lookahead/SGLang class) "
+            "with HF trending rank ≤ 20 or code_meta.stars ≥ 5000"
+        ),
+    }
 
 _BREAKDOWN_FIELDS = (
     "hard_gate",
@@ -173,6 +246,17 @@ async def _score_one(
             paper.relevance_score = _composite(result)
             paper.relevance_reason = result["reason"]
             paper.relevance_breakdown = {k: result.get(k) for k in _BREAKDOWN_FIELDS}
+
+    # Post-LLM milestone override: seeds.yaml-curated framework papers
+    # (vLLM, FlashAttention, EAGLE/Medusa/Lookahead, SGLang, …) with strong
+    # HF heat or GitHub stars get routed to `trending` regardless of what
+    # the LLM said. The LLM doesn't see heat signals so it can't make this
+    # decision; the override is deterministic and easy to audit.
+    override = _milestone_override(paper)
+    if override is not None:
+        paper.relevance_score = _composite(override)
+        paper.relevance_reason = override["reason"]
+        paper.relevance_breakdown = {k: override.get(k) for k in _BREAKDOWN_FIELDS}
     return paper
 
 

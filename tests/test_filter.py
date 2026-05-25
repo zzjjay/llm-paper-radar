@@ -237,3 +237,100 @@ async def test_filter_handles_per_paper_failure(tmp_path: Path, monkeypatch):
     assert failed["relevance_score"] == 0
     assert failed["relevance_breakdown"]["hard_gate"] is True
     assert "judge unavailable" in failed["relevance_reason"]
+
+
+# -------- milestone trending override --------
+
+
+@pytest.mark.asyncio
+async def test_milestone_override_routes_hot_paper_to_trending(tmp_path, monkeypatch):
+    """A paper in seeds.yaml under trending category with HF trending rank ≤ 20
+    should bypass any LLM hard_gate verdict and land in the trending bucket."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    # 2309.06180 is PagedAttention, listed in seeds.yaml under trending.
+    paged = Paper(
+        id="2309.06180",
+        title="Efficient Memory Management for Large Language Model Serving with PagedAttention",
+        authors=["Woosuk Kwon"],
+        abstract="vLLM serving engine paper, KV cache paging.",
+        url="https://x",
+        pdf_url=None,
+        published_at=datetime(2023, 9, 12, tzinfo=UTC),
+        primary_category="cs.LG",
+        categories=["cs.LG"],
+        sources=[
+            SourceRecord(
+                name="hf_daily",
+                fetched_at=datetime.now(UTC),
+                extras={"trending_rank": 16},
+            ),
+        ],
+    )
+    in_path = tmp_path / "in.json"
+    in_path.write_text(json.dumps([paged.model_dump(mode="json")]))
+    out_path = tmp_path / "scored.json"
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("p")
+
+    fake = AsyncMock()
+    fake.call_json.return_value = {
+        "hard_gate": True,
+        "topic_relevance": 0,
+        "practicality": 0,
+        "topic_bucket": "unknown",
+        "reason": "serving engine, not a compression algorithm",
+    }
+    # Force seeds.yaml lookup to refresh (the lru_cache may have been seeded
+    # by other tests with a different cwd).
+    from pipeline.filter import _milestone_trending_ids
+    _milestone_trending_ids.cache_clear()
+
+    await filter_papers(in_path, out_path, prompt_path, fake, concurrency=1)
+    out = json.loads(out_path.read_text())[0]
+    # Override fires: hard_gate flipped, bucket forced to trending.
+    assert out["relevance_breakdown"]["hard_gate"] is False
+    assert out["relevance_breakdown"]["topic_bucket"] == "trending"
+    assert out["relevance_score"] == 8  # topic_relevance=4 + practicality=4
+    assert "milestone-override" in out["relevance_reason"]
+
+
+@pytest.mark.asyncio
+async def test_milestone_override_skips_without_heat_signal(tmp_path, monkeypatch):
+    """Same arxiv ID but no trending rank and no stars → override does NOT fire,
+    LLM hard_gate verdict stands."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    paged_cold = Paper(
+        id="2309.06180",
+        title="Efficient Memory Management for Large Language Model Serving with PagedAttention",
+        authors=[],
+        abstract="vLLM serving engine paper.",
+        url="https://x",
+        pdf_url=None,
+        published_at=datetime(2023, 9, 12, tzinfo=UTC),
+        primary_category="cs.LG",
+        categories=["cs.LG"],
+        # No hf_daily source → no trending_rank, no code_meta.stars
+        sources=[SourceRecord(name="arxiv", fetched_at=datetime.now(UTC))],
+    )
+    in_path = tmp_path / "in.json"
+    in_path.write_text(json.dumps([paged_cold.model_dump(mode="json")]))
+    out_path = tmp_path / "scored.json"
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("p")
+
+    fake = AsyncMock()
+    fake.call_json.return_value = {
+        "hard_gate": True,
+        "topic_relevance": 0,
+        "practicality": 0,
+        "topic_bucket": "unknown",
+        "reason": "serving engine, not a compression algorithm",
+    }
+    from pipeline.filter import _milestone_trending_ids
+    _milestone_trending_ids.cache_clear()
+
+    await filter_papers(in_path, out_path, prompt_path, fake, concurrency=1)
+    out = json.loads(out_path.read_text())[0]
+    # No heat → LLM verdict stands, paper stays hard_gated.
+    assert out["relevance_breakdown"]["hard_gate"] is True
+    assert out["relevance_score"] == 0

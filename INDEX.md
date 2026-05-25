@@ -1,193 +1,193 @@
 # Digest History Index
 
-- [05-11](digests/2026-05-11.md) — 550 scanned, 7 passed, top: ADMM-Q: An Improved Hessian-based Weight Quantizer
-- [05-12](digests/2026-05-12.md) — 519 scanned, 5 passed, top: Search Your Block Floating Point Scales!
-- [05-13](digests/2026-05-13.md) — 498 scanned, 4 passed, top: SPHERICAL KV: Angle-Domain Attention and Rate-Dist
-- [05-14](digests/2026-05-14.md) — 432 scanned, 2 passed, top: Minimal-Intervention KV Retention via Set-Conditio
+- [05-11](digests/2026-05-11.md) — 550 scanned, 8 passed, top: ADMM-Q: An Improved Hessian-based Weight Quantizer
+- [05-12](digests/2026-05-12.md) — 519 scanned, 6 passed, top: Search Your Block Floating Point Scales!
+- [05-13](digests/2026-05-13.md) — 498 scanned, 5 passed, top: Efficient Memory Management for Large Language Mod
+- [05-14](digests/2026-05-14.md) — 432 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-17](digests/2026-05-17.md) — 203 scanned, 2 passed, top: WinQ: Accelerating Quantization-Aware Training of 
+- [05-17](digests/2026-05-17.md) — 203 scanned, 3 passed, top: WinQ: Accelerating Quantization-Aware Training of 
 
-- [05-18](digests/2026-05-18.md) — 429 scanned, 5 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-18](digests/2026-05-18.md) — 429 scanned, 6 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [05-19](digests/2026-05-19.md) — 402 scanned, 9 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-19](digests/2026-05-19.md) — 402 scanned, 10 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [05-16](digests/2026-05-16.md) — 186 scanned, 1 passed, top: DiRotQ: Rotation-Aware Quantization for 4-bit Diff
+- [05-16](digests/2026-05-16.md) — 186 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-15](digests/2026-05-15.md) — 357 scanned, 3 passed, top: Measuring Maximum Activations in Open Large Langua
+- [05-15](digests/2026-05-15.md) — 357 scanned, 4 passed, top: Measuring Maximum Activations in Open Large Langua
 
-- [05-10](digests/2026-05-10.md) — 246 scanned, 2 passed, top: Not All Thoughts Need HBM: Semantics-Aware Memory 
+- [05-10](digests/2026-05-10.md) — 246 scanned, 3 passed, top: Not All Thoughts Need HBM: Semantics-Aware Memory 
 
-- [05-09](digests/2026-05-09.md) — 294 scanned, 6 passed, top: AAAC: Activation-Aware Adaptive Codebooks for 4-bi
+- [05-09](digests/2026-05-09.md) — 294 scanned, 7 passed, top: AAAC: Activation-Aware Adaptive Codebooks for 4-bi
 
-- [05-08](digests/2026-05-08.md) — 556 scanned, 4 passed, top: Finer is Better (with the Right Scaling)
+- [05-08](digests/2026-05-08.md) — 556 scanned, 5 passed, top: Finer is Better (with the Right Scaling)
 
-- [05-07](digests/2026-05-07.md) — 574 scanned, 6 passed, top: Layer Collapse in Diffusion Language Models
+- [05-07](digests/2026-05-07.md) — 574 scanned, 7 passed, top: Layer Collapse in Diffusion Language Models
 
-- [05-06](digests/2026-05-06.md) — 352 scanned, 1 passed, top: OSAQ: Outlier Self-Absorption for Accurate Low-bit
+- [05-06](digests/2026-05-06.md) — 352 scanned, 2 passed, top: OSAQ: Outlier Self-Absorption for Accurate Low-bit
 
-- [05-05](digests/2026-05-05.md) — 342 scanned, 1 passed, top: Budgeted LoRA: Distillation as Structured Compute 
+- [05-05](digests/2026-05-05.md) — 342 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-04](digests/2026-05-04.md) — 293 scanned, 1 passed, top: Statistically-Lossless Quantization of Large Langu
+- [05-04](digests/2026-05-04.md) — 293 scanned, 2 passed, top: Statistically-Lossless Quantization of Large Langu
 
-- [05-03](digests/2026-05-03.md) — 179 scanned, 1 passed, top: What Single-Prompt Accuracy Misses: A Multi-Varian
+- [05-03](digests/2026-05-03.md) — 179 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-02](digests/2026-05-02.md) — 173 scanned, 1 passed, top: MTA: Multi-Granular Trajectory Alignment for Large
+- [05-02](digests/2026-05-02.md) — 173 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-01](digests/2026-05-01.md) — 302 scanned, 3 passed, top: BWLA: Breaking the Barrier of W1AX Post-Training Q
+- [05-01](digests/2026-05-01.md) — 302 scanned, 4 passed, top: BWLA: Breaking the Barrier of W1AX Post-Training Q
 
-- [04-30](digests/2026-04-30.md) — 310 scanned, 0 passed, top: (no papers passed)
+- [04-30](digests/2026-04-30.md) — 310 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-29](digests/2026-04-29.md) — 273 scanned, 1 passed, top: CoQuant: Joint Weight-Activation Subspace Projecti
+- [04-29](digests/2026-04-29.md) — 273 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-28](digests/2026-04-28.md) — 285 scanned, 3 passed, top: Rethinking KV Cache Eviction via a Unified Informa
+- [04-28](digests/2026-04-28.md) — 285 scanned, 4 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-27](digests/2026-04-27.md) — 304 scanned, 2 passed, top: Coverage-Based Calibration for Post-Training Quant
+- [04-27](digests/2026-04-27.md) — 304 scanned, 3 passed, top: Coverage-Based Calibration for Post-Training Quant
 
-- [04-26](digests/2026-04-26.md) — 144 scanned, 0 passed, top: (no papers passed)
+- [04-26](digests/2026-04-26.md) — 144 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-25](digests/2026-04-25.md) — 146 scanned, 0 passed, top: (no papers passed)
+- [04-25](digests/2026-04-25.md) — 146 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-24](digests/2026-04-24.md) — 248 scanned, 1 passed, top: Hybrid Policy Distillation for LLMs
+- [04-24](digests/2026-04-24.md) — 248 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-23](digests/2026-04-23.md) — 273 scanned, 1 passed, top: Sub-Token Routing in LoRA for Adaptation and Query
+- [04-23](digests/2026-04-23.md) — 273 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-22](digests/2026-04-22.md) — 330 scanned, 6 passed, top: RateQuant: Optimal Mixed-Precision KV Cache Quanti
+- [04-22](digests/2026-04-22.md) — 330 scanned, 7 passed, top: RateQuant: Optimal Mixed-Precision KV Cache Quanti
 
-- [04-21](digests/2026-04-21.md) — 309 scanned, 3 passed, top: SAW-INT4: System-Aware 4-Bit KV-Cache Quantization
+- [04-21](digests/2026-04-21.md) — 309 scanned, 4 passed, top: SAW-INT4: System-Aware 4-Bit KV-Cache Quantization
 
-- [04-20](digests/2026-04-20.md) — 382 scanned, 6 passed, top: GSQ: Highly-Accurate Low-Precision Scalar Quantiza
+- [04-20](digests/2026-04-20.md) — 382 scanned, 7 passed, top: GSQ: Highly-Accurate Low-Precision Scalar Quantiza
 
-- [04-19](digests/2026-04-19.md) — 180 scanned, 0 passed, top: (no papers passed)
+- [04-19](digests/2026-04-19.md) — 180 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-18](digests/2026-04-18.md) — 171 scanned, 3 passed, top: Open-TQ-Metal: Fused Compressed-Domain Attention f
+- [04-18](digests/2026-04-18.md) — 171 scanned, 4 passed, top: Open-TQ-Metal: Fused Compressed-Domain Attention f
 
-- [04-17](digests/2026-04-17.md) — 297 scanned, 2 passed, top: Optimizing Korean-Centric LLMs via Token Pruning
+- [04-17](digests/2026-04-17.md) — 297 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-16](digests/2026-04-16.md) — 301 scanned, 1 passed, top: The Illusion of Equivalence: Systematic FP16 Diver
+- [04-16](digests/2026-04-16.md) — 301 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-15](digests/2026-04-15.md) — 331 scanned, 2 passed, top: A KL Lens on Quantization: Fast, Forward-Only Sens
+- [04-15](digests/2026-04-15.md) — 331 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-14](digests/2026-04-14.md) — 331 scanned, 5 passed, top: OSC: Hardware Efficient W4A4 Quantization via Outl
+- [04-14](digests/2026-04-14.md) — 331 scanned, 6 passed, top: OSC: Hardware Efficient W4A4 Quantization via Outl
 
-- [04-13](digests/2026-04-13.md) — 362 scanned, 4 passed, top: Quantization Dominates Rank Reduction for KV-Cache
+- [04-13](digests/2026-04-13.md) — 362 scanned, 5 passed, top: Quantization Dominates Rank Reduction for KV-Cache
 
-- [04-12](digests/2026-04-12.md) — 169 scanned, 3 passed, top: CodeQuant: Unified Clustering and Quantization for
+- [04-12](digests/2026-04-12.md) — 169 scanned, 4 passed, top: CodeQuant: Unified Clustering and Quantization for
 
-- [04-11](digests/2026-04-11.md) — 140 scanned, 2 passed, top: CodeComp: Structural KV Cache Compression for Agen
+- [04-11](digests/2026-04-11.md) — 140 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-10](digests/2026-04-10.md) — 300 scanned, 1 passed, top: MEMENTO: Teaching LLMs to Manage Their Own Context
+- [04-10](digests/2026-04-10.md) — 300 scanned, 2 passed, top: MEMENTO: Teaching LLMs to Manage Their Own Context
 
-- [04-09](digests/2026-04-09.md) — 327 scanned, 6 passed, top: Rethinking Residual Errors in Compensation-based L
+- [04-09](digests/2026-04-09.md) — 327 scanned, 7 passed, top: Rethinking Residual Errors in Compensation-based L
 
-- [04-08](digests/2026-04-08.md) — 365 scanned, 5 passed, top: REAM: Merging Improves Pruning of Experts in LLMs
+- [04-08](digests/2026-04-08.md) — 365 scanned, 6 passed, top: REAM: Merging Improves Pruning of Experts in LLMs
 
-- [04-07](digests/2026-04-07.md) — 336 scanned, 2 passed, top: TriAttention: Efficient Long Reasoning with Trigon
+- [04-07](digests/2026-04-07.md) — 336 scanned, 3 passed, top: TriAttention: Efficient Long Reasoning with Trigon
 
-- [04-06](digests/2026-04-06.md) — 291 scanned, 5 passed, top: TriAttention: Efficient Long Reasoning with Trigon
+- [04-06](digests/2026-04-06.md) — 291 scanned, 6 passed, top: TriAttention: Efficient Long Reasoning with Trigon
 
-- [04-05](digests/2026-04-05.md) — 161 scanned, 3 passed, top: RUQuant: Towards Refining Uniform Quantization for
+- [04-05](digests/2026-04-05.md) — 161 scanned, 4 passed, top: RUQuant: Towards Refining Uniform Quantization for
 
-- [04-04](digests/2026-04-04.md) — 141 scanned, 1 passed, top: SODA: Semi On-Policy Black-Box Distillation for La
+- [04-04](digests/2026-04-04.md) — 141 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-03](digests/2026-04-03.md) — 281 scanned, 0 passed, top: (no papers passed)
+- [04-03](digests/2026-04-03.md) — 281 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [04-02](digests/2026-04-02.md) — 306 scanned, 2 passed, top: Fast NF4 Dequantization Kernels for Large Language
+- [04-02](digests/2026-04-02.md) — 306 scanned, 3 passed, top: Fast NF4 Dequantization Kernels for Large Language
 
-- [04-01](digests/2026-04-01.md) — 337 scanned, 1 passed, top: MF-QAT: Multi-Format Quantization-Aware Training f
+- [04-01](digests/2026-04-01.md) — 337 scanned, 2 passed, top: MF-QAT: Multi-Format Quantization-Aware Training f
 
-- [03-31](digests/2026-03-31.md) — 301 scanned, 0 passed, top: (no papers passed)
+- [03-31](digests/2026-03-31.md) — 301 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-30](digests/2026-03-30.md) — 274 scanned, 5 passed, top: PolarQuant: Optimal Gaussian Weight Quantization v
+- [03-30](digests/2026-03-30.md) — 274 scanned, 6 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-29](digests/2026-03-29.md) — 136 scanned, 2 passed, top: TurboAngle: Near-Lossless KV Cache Compression via
+- [03-29](digests/2026-03-29.md) — 136 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-28](digests/2026-03-28.md) — 137 scanned, 1 passed, top: ScoutAttention: Efficient KV Cache Offloading via 
+- [03-28](digests/2026-03-28.md) — 137 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-27](digests/2026-03-27.md) — 282 scanned, 1 passed, top: When Perplexity Lies: Generation-Focused Distillat
+- [03-27](digests/2026-03-27.md) — 282 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-26](digests/2026-03-26.md) — 272 scanned, 1 passed, top: GlowQ: Group-Shared LOw-Rank Approximation for Qua
+- [03-26](digests/2026-03-26.md) — 272 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-25](digests/2026-03-25.md) — 310 scanned, 0 passed, top: (no papers passed)
+- [03-25](digests/2026-03-25.md) — 310 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-24](digests/2026-03-24.md) — 301 scanned, 1 passed, top: EchoKV: Efficient KV Cache Compression via Similar
+- [03-24](digests/2026-03-24.md) — 301 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-23](digests/2026-03-23.md) — 303 scanned, 0 passed, top: (no papers passed)
+- [03-23](digests/2026-03-23.md) — 303 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-22](digests/2026-03-22.md) — 163 scanned, 1 passed, top: Structural Sensitivity in Compressed Transformers:
+- [03-22](digests/2026-03-22.md) — 163 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-21](digests/2026-03-21.md) — 153 scanned, 1 passed, top: Beyond Token Eviction: Mixed-Dimension Budget Allo
+- [03-21](digests/2026-03-21.md) — 153 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-20](digests/2026-03-20.md) — 302 scanned, 0 passed, top: (no papers passed)
+- [03-20](digests/2026-03-20.md) — 302 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-19](digests/2026-03-19.md) — 309 scanned, 1 passed, top: AIMER: Calibration-Free Task-Agnostic MoE Pruning
+- [03-19](digests/2026-03-19.md) — 309 scanned, 2 passed, top: AIMER: Calibration-Free Task-Agnostic MoE Pruning
 
-- [03-18](digests/2026-03-18.md) — 334 scanned, 4 passed, top: Q-Drift: Quantization-Aware Drift Correction for D
+- [03-18](digests/2026-03-18.md) — 334 scanned, 5 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-17](digests/2026-03-17.md) — 340 scanned, 4 passed, top: Frequency Matters: Fast Model-Agnostic Data Curati
+- [03-17](digests/2026-03-17.md) — 340 scanned, 5 passed, top: Frequency Matters: Fast Model-Agnostic Data Curati
 
-- [03-16](digests/2026-03-16.md) — 377 scanned, 1 passed, top: LookaheadKV: Fast and Accurate KV Cache Eviction b
+- [03-16](digests/2026-03-16.md) — 377 scanned, 2 passed, top: LookaheadKV: Fast and Accurate KV Cache Eviction b
 
-- [03-15](digests/2026-03-15.md) — 181 scanned, 3 passed, top: FlashHead: Efficient Drop-In Replacement for the C
+- [03-15](digests/2026-03-15.md) — 181 scanned, 4 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-14](digests/2026-03-14.md) — 178 scanned, 2 passed, top: SVD Contextual Sparsity Predictors for Fast LLM In
+- [03-14](digests/2026-03-14.md) — 178 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-13](digests/2026-03-13.md) — 308 scanned, 4 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
+- [03-13](digests/2026-03-13.md) — 308 scanned, 5 passed, top: The Curse and Blessing of Mean Bias in FP4-Quantiz
 
-- [03-12](digests/2026-03-12.md) — 313 scanned, 4 passed, top: LongFlow: Efficient KV Cache Compression for Reaso
+- [03-12](digests/2026-03-12.md) — 313 scanned, 5 passed, top: LongFlow: Efficient KV Cache Compression for Reaso
 
-- [03-11](digests/2026-03-11.md) — 333 scanned, 4 passed, top: LookaheadKV: Fast and Accurate KV Cache Eviction b
+- [03-11](digests/2026-03-11.md) — 333 scanned, 5 passed, top: LookaheadKV: Fast and Accurate KV Cache Eviction b
 
-- [03-10](digests/2026-03-10.md) — 336 scanned, 1 passed, top: Sparse-BitNet: 1.58-bit LLMs are Naturally Friendl
+- [03-10](digests/2026-03-10.md) — 336 scanned, 2 passed, top: Sparse-BitNet: 1.58-bit LLMs are Naturally Friendl
 
-- [03-09](digests/2026-03-09.md) — 335 scanned, 5 passed, top: SERQ: Saliency-Aware Low-Rank Error Reconstruction
+- [03-09](digests/2026-03-09.md) — 335 scanned, 6 passed, top: SERQ: Saliency-Aware Low-Rank Error Reconstruction
 
-- [03-08](digests/2026-03-08.md) — 174 scanned, 0 passed, top: (no papers passed)
+- [03-08](digests/2026-03-08.md) — 174 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-07](digests/2026-03-07.md) — 146 scanned, 0 passed, top: (no papers passed)
+- [03-07](digests/2026-03-07.md) — 146 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-06](digests/2026-03-06.md) — 287 scanned, 4 passed, top: MASQuant: Modality-Aware Smoothing Quantization fo
+- [03-06](digests/2026-03-06.md) — 287 scanned, 5 passed, top: MASQuant: Modality-Aware Smoothing Quantization fo
 
-- [03-05](digests/2026-03-05.md) — 325 scanned, 4 passed, top: SlideSparse: Fast and Flexible (2N-2):2N Structure
+- [03-05](digests/2026-03-05.md) — 325 scanned, 5 passed, top: SlideSparse: Fast and Flexible (2N-2):2N Structure
 
-- [03-04](digests/2026-03-04.md) — 329 scanned, 3 passed, top: Dissecting Quantization Error: A Concentration-Ali
+- [03-04](digests/2026-03-04.md) — 329 scanned, 4 passed, top: Dissecting Quantization Error: A Concentration-Ali
 
-- [03-03](digests/2026-03-03.md) — 339 scanned, 1 passed, top: Practical FP4 Training for Large-Scale MoE Models 
+- [03-03](digests/2026-03-03.md) — 339 scanned, 2 passed, top: Practical FP4 Training for Large-Scale MoE Models 
 
-- [03-02](digests/2026-03-02.md) — 338 scanned, 4 passed, top: Quasar: Quantized Self-Speculative Acceleration fo
+- [03-02](digests/2026-03-02.md) — 338 scanned, 5 passed, top: Efficient Memory Management for Large Language Mod
 
-- [03-01](digests/2026-03-01.md) — 174 scanned, 1 passed, top: KVSlimmer: Theoretical Insights and Practical Opti
+- [03-01](digests/2026-03-01.md) — 174 scanned, 2 passed, top: KVSlimmer: Theoretical Insights and Practical Opti
 
-- [02-28](digests/2026-02-28.md) — 169 scanned, 0 passed, top: (no papers passed)
+- [02-28](digests/2026-02-28.md) — 169 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-27](digests/2026-02-27.md) — 295 scanned, 2 passed, top: GRAIL: Post-hoc Compensation by Linear Reconstruct
+- [02-27](digests/2026-02-27.md) — 295 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-26](digests/2026-02-26.md) — 318 scanned, 2 passed, top: InnerQ: Hardware-Aware Tuning-Free Quantization of
+- [02-26](digests/2026-02-26.md) — 318 scanned, 3 passed, top: InnerQ: Hardware-Aware Tuning-Free Quantization of
 
-- [02-25](digests/2026-02-25.md) — 318 scanned, 3 passed, top: D-COT: Disciplined Chain-of-Thought Learning for E
+- [02-25](digests/2026-02-25.md) — 318 scanned, 4 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-24](digests/2026-02-24.md) — 293 scanned, 1 passed, top: Don't Ignore the Tail: Decoupling top-K Probabilit
+- [02-24](digests/2026-02-24.md) — 293 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-23](digests/2026-02-23.md) — 274 scanned, 1 passed, top: A Replicate-and-Quantize Strategy for Plug-and-Pla
+- [02-23](digests/2026-02-23.md) — 274 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-22](digests/2026-02-22.md) — 152 scanned, 0 passed, top: (no papers passed)
+- [02-22](digests/2026-02-22.md) — 152 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-21](digests/2026-02-21.md) — 129 scanned, 2 passed, top: MoBiQuant: Mixture-of-Bits Quantization for Token-
+- [02-21](digests/2026-02-21.md) — 129 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-20](digests/2026-02-20.md) — 235 scanned, 0 passed, top: (no papers passed)
+- [02-20](digests/2026-02-20.md) — 235 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-19](digests/2026-02-19.md) — 279 scanned, 1 passed, top: ARKV: Adaptive and Resource-Efficient KV Cache Man
+- [02-19](digests/2026-02-19.md) — 279 scanned, 2 passed, top: ARKV: Adaptive and Resource-Efficient KV Cache Man
 
-- [02-18](digests/2026-02-18.md) — 296 scanned, 1 passed, top: Fast KV Compaction via Attention Matching
+- [02-18](digests/2026-02-18.md) — 296 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-17](digests/2026-02-17.md) — 288 scanned, 2 passed, top: 1-Bit Wonder: Improving QAT Performance in the Low
+- [02-17](digests/2026-02-17.md) — 288 scanned, 3 passed, top: 1-Bit Wonder: Improving QAT Performance in the Low
 
-- [02-16](digests/2026-02-16.md) — 288 scanned, 5 passed, top: BPDQ: Bit-Plane Decomposition Quantization on a Va
+- [02-16](digests/2026-02-16.md) — 288 scanned, 6 passed, top: BPDQ: Bit-Plane Decomposition Quantization on a Va
 
-- [02-15](digests/2026-02-15.md) — 158 scanned, 1 passed, top: QuRL: Efficient Reinforcement Learning with Quanti
+- [02-15](digests/2026-02-15.md) — 158 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-14](digests/2026-02-14.md) — 146 scanned, 0 passed, top: (no papers passed)
+- [02-14](digests/2026-02-14.md) — 146 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [02-13](digests/2026-02-13.md) — 301 scanned, 2 passed, top: LCSB: Layer-Cyclic Selective Backpropagation for M
+- [02-13](digests/2026-02-13.md) — 301 scanned, 3 passed, top: Efficient Memory Management for Large Language Mod
 
 - [02-12](digests/2026-02-12.md) — 315 scanned, 2 passed, top: Extending Puzzle for Mixture-of-Experts Reasoning 
 
@@ -357,12 +357,12 @@
 
 - [11-21](digests/2025-11-21.md) — 192 scanned, 5 passed, top: Nemotron Elastic: Towards Efficient Many-in-One Re
 
-- [05-20](digests/2026-05-20.md) — 400 scanned, 6 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
+- [05-20](digests/2026-05-20.md) — 400 scanned, 7 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
 
-- [05-21](digests/2026-05-21.md) — 405 scanned, 5 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
+- [05-21](digests/2026-05-21.md) — 405 scanned, 6 passed, top: Mix-Quant: Quantized Prefilling, Precise Decoding 
 
-- [05-22](digests/2026-05-22.md) — 332 scanned, 0 passed, top: (no papers passed)
+- [05-22](digests/2026-05-22.md) — 332 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-23](digests/2026-05-23.md) — 101 scanned, 14 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
+- [05-23](digests/2026-05-23.md) — 101 scanned, 15 passed, top: MatGPTQ: Accurate and Efficient Post-Training Matr
 
-- [05-24](digests/2026-05-24.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [05-24](digests/2026-05-24.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
