@@ -1,3 +1,5 @@
+"""Bilingual (zh + en) per-paper summaries via Claude Opus; emits data/summarized/<date>.json."""
+
 from __future__ import annotations
 
 import asyncio

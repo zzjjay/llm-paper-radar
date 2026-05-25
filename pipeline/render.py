@@ -1,3 +1,5 @@
+"""Render the compact README table + per-day digest pages (zh + en); handles bucket grouping, watched-author section, and Paper River link injection."""
+
 from __future__ import annotations
 
 import json

@@ -1,3 +1,5 @@
+"""7-day rollup digest as a single compact table; emits weekly/YYYYMMDD-YYYYMMDD.md (GitHub Actions weekly.yml only)."""
+
 from __future__ import annotations
 
 import json

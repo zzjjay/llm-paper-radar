@@ -1,3 +1,5 @@
+"""Keyword prefilter + Claude Sonnet two-axis scoring + milestone trending override; emits data/scored/<date>.json."""
+
 from __future__ import annotations
 
 import asyncio

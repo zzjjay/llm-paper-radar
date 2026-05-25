@@ -1,3 +1,5 @@
+"""Merge per-source raw fetches by arXiv id; emits data/deduped/<date>.json."""
+
 from __future__ import annotations
 
 import json

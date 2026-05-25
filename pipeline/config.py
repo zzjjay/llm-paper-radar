@@ -1,3 +1,5 @@
+"""Pydantic config model loaded from config.yaml; consumed by every pipeline stage."""
+
 from pathlib import Path
 from typing import Literal
 
