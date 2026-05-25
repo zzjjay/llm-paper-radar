@@ -46,11 +46,22 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 `hard_gate = true` zeros both axes. Triggered when any of:
 
-- **Out of scope**: unrelated topic (RAG, agents, alignment, pure training, multimodal-w/o-compression), pure speculative decoding (coupled spec + quant stays in), pure review-article survey with no new measurement, or no fit to any of the eight buckets
-- **`practicality = 2`** — only 1 favorable signal; deployment cost outweighs gain
-- **No benchmark AND composite ≤ 7**: `accuracy_benchmarks ∈ {none, unknown}` AND `topic_relevance + practicality ≤ 7` — unless the paper compares against an established baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …) or both axes ≥ 4
-- **Scale**: largest model < 1B (BERT-base, GPT-2-small); stricter for `ptq` only — < 7B → hard_gate (gaps at 1B routinely flip at 7B+; modern LLM family + unknown size = default trust)
-- **Unstructured sparsity** needing novel GPU kernels not in shipping stacks (vLLM / SGLang); N:M, MoE expert pruning, layer drop stay in scope
+**Scope:**
+- **Unrelated topic** — RAG, agents, alignment, pure training, multimodal-w/o-compression
+- **Pure speculative decoding** — coupled spec + quant stays in scope, routed by primary contribution
+- **Pure review-article survey** — only enumerates prior methods, no new measurement (empirical comparisons → `survey` bucket instead)
+- **No bucket fit** — compression-adjacent but doesn't match any of the eight buckets
+
+**Quality:**
+- **`practicality = 2`** — only 1 favorable practicality signal; deployment cost outweighs gain
+- **No benchmark AND composite ≤ 7** — `accuracy_benchmarks ∈ {none, unknown}` AND `topic_relevance + practicality ≤ 7`, unless the paper compares against an established baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …) or both axes ≥ 4
+
+**Scale:**
+- **Largest model < 1B** — BERT-base, GPT-2-small (modern LLM family + unknown size = default trust)
+- **`ptq` only, < 7B** — stricter PTQ rule: gaps at 1B-scale routinely flip at 7B+, so sub-7B PTQ (OPT-1.3B, Pythia-1.4B, FLAN-T5-base) hard-gates
+
+**Deployment:**
+- **Unstructured sparsity** needing novel GPU kernels not in shipping stacks (vLLM / SGLang); N:M structured, MoE expert pruning, layer drop stay in scope
 
 ### Topic buckets and per-bucket caps
 
@@ -79,7 +90,7 @@ Eight LLM-pickable buckets — seven strict compression buckets plus `trending` 
 
 ### Table ordering
 
-Bucket first (BUCKET_ORDER above), composite within bucket:
+**Bucket first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Trending → Survey), then composite within bucket:
 
 ```
 composite   = relevance_score × 30 + heat_score
@@ -88,7 +99,10 @@ trending_bonus = 100 / hf_daily_rank             (rank 1..30, else 0)
 star_bonus     = min(log(github_stars + 1) × 3, 25)
 ```
 
-`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but heat lets a viral paper (HF Daily #1 = +100) jump ahead of a same-bucket peer with marginally higher relevance. `star_bonus` reads HF's `githubStars` field (no API call); ~1k stars ≈ +21, capped at 25 so framework repos can't outweigh relevance, and missing-repo = 0 is never penalized. Tune the weights via `RELEVANCE_WEIGHT` / `STAR_WEIGHT` / `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py).
+- **Relevance dominates.** A 9/10 paper outweighs ~270 HF upvotes.
+- **Heat is the tiebreaker.** HF Daily #1 (+100 bonus) jumps ahead of a same-bucket peer with marginally higher relevance.
+- **`star_bonus`** reads HF's `githubStars` field (no API call); ~1k stars ≈ +21, capped at 25 so framework repos can't outweigh relevance. Missing repo = 0, never penalized.
+- **Tune** `RELEVANCE_WEIGHT` / `STAR_WEIGHT` / `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py).
 
 ---
 
