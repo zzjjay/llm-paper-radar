@@ -103,7 +103,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "related_header": "#### 📎 相关方法 / 对比基线",
         "why_header": "#### 🧭 为什么推送这篇",
         "paper_river_header": "#### 🌊 Paper River",
-        "paper_river_line": "倒读批判链 → [{path}](../{path})",
+        "paper_river_line": "倒读批判链 → {links}",
         "unbucketed_label": "其它",
         "caps_unit": "篇",
         "caps_join": "，",
@@ -138,7 +138,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "related_header": "#### 📎 Related methods / baselines",
         "why_header": "#### 🧭 Why this paper",
         "paper_river_header": "#### 🌊 Paper River",
-        "paper_river_line": "Back-read critique chain → [{path}](../{path})",
+        "paper_river_line": "Back-read critique chain → {links}",
         "unbucketed_label": "other",
         "caps_unit": "",
         "caps_join": ", ",
@@ -152,30 +152,45 @@ def _bucket_title_for(lang: str, bucket: str) -> str:
     return BUCKET_TITLES_CN[bucket]
 
 
-def _paper_river_file(p: Paper, paper_river_dir: Path | None) -> Path | None:
-    """Look up the optional paper-river file for this paper. We glob for
-    `paper-river/*<id-slug>.org` so files can be named with a human-readable
-    acronym prefix (e.g. gsq-2604-18556.org) but the lookup still keys on
-    the arxiv ID. Returns the first match or None."""
+def _paper_river_files(p: Paper, paper_river_dir: Path | None) -> dict[str, Path]:
+    """Return a {lang: Path} map for paper-river files matching this paper.
+    Glob keys on the arxiv id in either dot form (`*<id>.org`) or dash form
+    (`*<id-with-dashes>.org`, legacy) so old slug-style files still work.
+    Files ending in `_en.org` are mapped to lang='en'; others to 'zh'."""
     if paper_river_dir is None or not paper_river_dir.exists():
-        return None
-    id_slug = p.id.replace(".", "-")
-    matches = sorted(paper_river_dir.glob(f"*{id_slug}.org"))
-    return matches[0] if matches else None
+        return {}
+    id_dot = p.id
+    id_dash = p.id.replace(".", "-")
+    matches: list[Path] = []
+    for stem_id in (id_dot, id_dash):
+        matches.extend(paper_river_dir.glob(f"*{stem_id}.org"))
+        matches.extend(paper_river_dir.glob(f"*{stem_id}_en.org"))
+    out: dict[str, Path] = {}
+    for f in sorted(set(matches)):
+        lang = "en" if f.stem.endswith("_en") else "zh"
+        # First match wins per lang so a dot-form file shadows the dash-form.
+        out.setdefault(lang, f)
+    return out
 
 
 def _paper_river_block(p: Paper, paper_river_dir: Path | None, lang: str) -> str:
-    """One-section auto-link to the paper-river file, scoped to detail-page
+    """One-section auto-link to the paper-river file(s), scoped to detail-page
     `_full_block` callers (watched + topic highlights only — the compact
-    README table is intentionally untouched). Empty string when no file."""
-    f = _paper_river_file(p, paper_river_dir)
-    if f is None:
+    README table is intentionally untouched). Renders `[zh] · [en]` link
+    pills (in that fixed order) for whichever files exist. Empty string
+    when no file at all."""
+    files = _paper_river_files(p, paper_river_dir)
+    if not files:
         return ""
     s = STRINGS[lang]
-    # Path rendered relative to digests/<date>.md (which sits one level deep).
-    rel = f"paper-river/{f.name}"
-    # Trailing \n\n preserves the blank line before the next section header.
-    return f"{s['paper_river_header']}\n{s['paper_river_line'].format(path=rel)}\n\n"
+    # Fixed zh-then-en order so the layout stays predictable, matching the
+    # README Why-column `[zh] · [en]` convention.
+    pills: list[str] = []
+    for lang_key in ("zh", "en"):
+        f = files.get(lang_key)
+        if f is not None:
+            pills.append(f"[{lang_key}](../paper-river/{f.name})")
+    return f"{s['paper_river_header']}\n{s['paper_river_line'].format(links=' · '.join(pills))}\n\n"
 
 # Sentinel returned by `_bucket_of` for papers whose `topic_bucket` is not
 # one of the eight valid values in BUCKET_ORDER. These papers should have

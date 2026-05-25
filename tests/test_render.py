@@ -333,13 +333,13 @@ def test_render_daily_appends_en_link_to_readme_table_when_en_file_present(tmp_p
 
 
 def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Path):
-    """When paper-river/*<id-slug>.org exists, _full_block inserts a Paper
-    River section between Why and Summary. Compact README table is NOT
-    affected — the link only shows in the detail page (watched + topic
-    highlights)."""
+    """When paper-river/*<id>.org exists, _full_block inserts a Paper River
+    section between Why and Summary. Renders `[zh] · [en]` pills for whichever
+    language files exist. Compact README table is NOT affected — the link only
+    shows in the detail page (watched + topic highlights)."""
     summarized_path = tmp_path / "summarized.json"
-    p_river = _mk("2604.18556", 9, trending_rank=1)  # has org file
-    p_river.summary_en = "en"  # forces _en file too, for parity
+    p_river = _mk("2604.18556", 9, trending_rank=1)  # has org files
+    p_river.summary_en = "en"  # forces _en digest too
     p_no_river = _mk("9999.99999", 9, trending_rank=2)  # no org file
     summarized_path.write_text(
         json.dumps([p_river.model_dump(mode="json"), p_no_river.model_dump(mode="json")])
@@ -347,7 +347,10 @@ def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Pa
 
     pr_dir = tmp_path / "paper-river"
     pr_dir.mkdir()
-    (pr_dir / "gsq-2604-18556.org").write_text("dummy")
+    # Bilingual pair: zh default + _en sibling. Use the new dot-form arxiv id
+    # convention; old dash form still works via the legacy fallback in glob.
+    (pr_dir / "GSQ-2604.18556.org").write_text("dummy zh")
+    (pr_dir / "GSQ-2604.18556_en.org").write_text("dummy en")
 
     digests_dir = tmp_path / "digests"
     render_daily(
@@ -360,9 +363,14 @@ def test_render_daily_inserts_paper_river_link_when_org_file_exists(tmp_path: Pa
     )
 
     detail = (digests_dir / "2026-05-11.md").read_text()
-    # River link rendered for the paper with a matching org file.
+    # River section rendered with bilingual `[zh] · [en]` pills, fixed order.
     assert "#### 🌊 Paper River" in detail
-    assert "../paper-river/gsq-2604-18556.org" in detail
+    assert "[zh](../paper-river/GSQ-2604.18556.org)" in detail
+    assert "[en](../paper-river/GSQ-2604.18556_en.org)" in detail
+    # zh appears before en in the pill order.
+    zh_pos = detail.find("[zh](../paper-river/GSQ-2604.18556.org)")
+    en_pos = detail.find("[en](../paper-river/GSQ-2604.18556_en.org)")
+    assert zh_pos < en_pos
     # The other paper (no org file) does NOT get a river section.
     no_river_block = detail.split("p-9999-99999")[-1].split("---")[0]
     assert "Paper River" not in no_river_block
