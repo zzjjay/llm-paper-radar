@@ -184,20 +184,16 @@ uv run python -m pipeline.render        --backfill-days 0
 
 `scripts/daily.sh` chains the fetch → dedupe → filter → summarize sequence, then runs three optional wrappers (`auto_paper_river` → `translate_paper_river` → `render` → `snapshot`) and finally `git commit && git push` if anything changed. The wrappers are governed by env vars: set `PAPER_RIVER_SKIP=1` to skip auto-generation of paper-river `.org` files, and `PAPER_RIVER_MAX=N` to cap how many get generated per run.
 
-### 🌊 Paper River (optional companion analyses)
+### 🌊 Paper River (optional)
 
-The render step auto-injects a `🌊 Paper River` link on each detail page when a matching `paper-river/<acronym>-<arxiv-id>.org` file exists (e.g. `GSQ-2604.18556.org` for arXiv `2604.18556`). The zh digest (`digests/<date>.md`) links to the zh `.org`; the en digest (`digests/<date>_en.md`) links to the `_en.org` sibling — each language keeps its own link. The render step also accepts a legacy dash form (`*<id-with-dashes>.org`, e.g. `2604-18556`) for old files. Those `.org` files are deep-lineage analyses — "倒读法": recursively trace 5 layers of a paper's intellectual lineage, then walk forward Feynman-style — produced via the `ljg-paper-river` Claude Code skill. By default `scripts/daily.sh` auto-generates them via `scripts/auto_paper_river.py` (set `PAPER_RIVER_SKIP=1` to disable) and auto-translates zh → `_en.org` via `scripts/translate_paper_river.py`. Render works fine without any `.org` file — no file → no link.
+For each surfaced paper, `scripts/daily.sh` invokes the [`ljg-paper-river`](https://github.com/lijigang/ljg-skills) Claude Code skill to produce a deep-lineage analysis — "倒读法": recursively trace 5 layers of intellectual ancestry, then walk forward Feynman-style — saved as `paper-river/<acronym>-<arxiv-id>.org` and auto-translated to an `_en.org` sibling. Render links each digest to its own language. Disable with `PAPER_RIVER_SKIP=1`; render works fine without any `.org` file.
 
-**Install the skill.** It ships in the [`lijigang/ljg-skills`](https://github.com/lijigang/ljg-skills) Claude Code plugin marketplace — install in two slash commands, no clone needed (`master` branch = org-mode output, which is what `pipeline/render.py` expects):
+Install the skill once:
 
 ```
 /plugin marketplace add lijigang/ljg-skills
 /plugin install ljg-skills@ljg-skills
 ```
-
-The plugin bundles the whole `ljg-*` collection (all `ljg-*` skills become available); `ljg-paper-river` is the one this repo uses. Verify with `/skills | grep ljg-paper-river`.
-
-Then invoke per paper (e.g. `/ljg-paper-river https://arxiv.org/abs/<id>`), save the output as `paper-river/<acronym>-<id-slug>.org` from the radar repo root, and re-run `uv run python -m pipeline.render --date <date>` (or the next `daily.sh`).
 
 ---
 
