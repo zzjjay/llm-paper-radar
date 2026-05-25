@@ -85,16 +85,17 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 ### Hard gate
 
-`hard_gate = true` zeros both axes. Triggered when:
-- Topic completely unrelated to compression: RAG, agents, alignment, multimodal-without-compression, pure training algorithms
-- **Pure speculative decoding** with no compression angle (coupled spec + quant is in scope, routed by primary contribution)
-- **Pure review-article surveys** that only enumerate prior methods with no new measurement — hard_gate. Empirical comparison studies, bottleneck analyses, and evaluation-methodology papers now go to the `survey` bucket instead.
-- Anything compression-adjacent that doesn't fit one of the eight topic buckets
-- **`practicality = 2`** (only one favorable practicality signal) — the deployment-cost-to-gain ratio is wrong. PR ≥ 3 stays in scope.
-- **No benchmark validation AND would otherwise score ≤ 7**: `accuracy_benchmarks` ∈ {none, unknown} AND `topic_relevance + practicality ≤ 7` → hard_gate, unless the paper explicitly compares against an established compression baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …). A high-relevance + high-practicality paper (TR ≥ 4 AND PR ≥ 4) can still surface without a benchmark.
-- Largest model tested clearly < 1B parameters (BERT-base, GPT-2-small)
-- **`ptq` bucket — stricter scale rule**: any PTQ paper whose largest experiment is < 7B parameters → hard_gate. Sub-7B PTQ (FLAN-T5-base, CLIP-ViT, GPT-2, OPT-1.3B, Pythia-1.4B) does not predict large-scale behavior — accuracy gaps at 1B routinely flip at 7B+. Modern LLM family + unknown size → default trust. Other buckets keep the < 1B threshold.
-- **Unstructured sparsity** that requires novel GPU kernels not yet in shipping inference stacks (vLLM / TensorRT-LLM / SGLang). Pruning needs a credible deployment path on existing kernels — N:M structured sparsity, MoE expert pruning, layer drop are in scope; learnable unstructured-mask methods waiting on speculative hardware are not.
+`hard_gate = true` zeros both axes. Triggered when any of:
+
+- Topic unrelated to compression: RAG, agents, alignment, multimodal-w/o-compression, pure training
+- Pure speculative decoding (coupled spec + quant stays in scope)
+- Pure review-article survey with no new measurement (empirical comparisons → `survey`)
+- Doesn't fit any of the eight buckets
+- `practicality = 2` — only 1 favorable signal; deployment cost outweighs gain
+- `accuracy_benchmarks ∈ {none, unknown}` AND composite ≤ 7 — unless compared against an established baseline (GPTQ, AWQ, SmoothQuant, QuaRot, BitNet, KIVI, …) or TR ≥ 4 AND PR ≥ 4
+- Largest model < 1B parameters (BERT-base, GPT-2-small)
+- **`ptq` only**: largest model < 7B (gaps at 1B routinely flip at 7B+; modern LLM family + unknown size = default trust)
+- Unstructured sparsity needing novel GPU kernels not in shipping stacks (vLLM / TRT-LLM / SGLang); N:M, MoE expert pruning, layer drop stay in scope
 
 ### Topic buckets and per-bucket caps
 
