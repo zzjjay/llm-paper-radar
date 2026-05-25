@@ -165,10 +165,18 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
    └─────┬──────┘            ↓
          │            data/summarized/YYYY-MM-DD.json
          ↓
+   ┌────────────┐     scripts/auto_paper_river.py  +  translate_paper_river.py
+   │ paper-river│ ─── per surfaced paper: ljg-paper-river skill writes a
+   │ (optional) │     deep-lineage `.org` analysis, then auto-translates
+   │            │     zh → `_en.org`. Skip with PAPER_RIVER_SKIP=1.
+   └─────┬──────┘            ↓
+         │            paper-river/<acronym>-<id>.org (+ _en.org)
+         ↓
    ┌────────────┐     pipeline/render.py
    │   render   │ ─── compact README table (bucket-ordered) +
    │            │     per-day zh detail page (+ _en sibling when bilingual
-   │            │     summaries exist), grouped by bucket, capped per-bucket
+   │            │     summaries exist), grouped by bucket, capped per-bucket;
+   │            │     auto-links matching paper-river/*.org per language
    └────────────┘            ↓
                       digests/YYYY-MM-DD.md (+ _en.md)  +  README.md  +  INDEX.md
 ```
@@ -186,7 +194,7 @@ uv run python -m pipeline.summarize
 uv run python -m pipeline.render
 ```
 
-`scripts/daily.sh` chains the fetch → dedupe → filter → summarize sequence, then runs three optional wrappers (`auto_paper_river` → `translate_paper_river` → `render` → `snapshot`) and finally `git commit && git push` if anything changed. The wrappers are governed by env vars: set `PAPER_RIVER_SKIP=1` to skip auto-generation of paper-river `.org` files, and `PAPER_RIVER_MAX=N` to cap how many get generated per run.
+`scripts/daily.sh` chains all of the above end-to-end, runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. `PAPER_RIVER_MAX=N` caps how many paper-river `.org` files get generated per run (default: no cap).
 
 ### 🌊 Paper River (optional)
 
