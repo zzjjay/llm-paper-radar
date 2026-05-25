@@ -117,6 +117,8 @@ Survey-vs-algorithm tie-break: if the primary contribution is a new algorithm (n
 
 In the README compact view, *every* surviving paper appears in the main table (no cap). The per-bucket caps only control which papers get a full detail block on the per-day digest page.
 
+A separate `arxiv_authors` source ([`config.yaml`](config.yaml) → `sources.arxiv_authors.authors`, curated list: Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) feeds a dedicated **👤 Watched authors** block on each detail page that bypasses per-bucket caps and shows *all* of their papers — out-of-scope ones too. The main compact table still gates them by `hard_gate`, so off-topic watched-author work stays in the detail page only.
+
 ### Table ordering
 
 The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey → Trending), then within each bucket by a composite score:
@@ -129,10 +131,6 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
 ```
 
 `relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. `star_bonus` adds a soft signal when the paper has an official GitHub repo (read directly from HF's `githubStars` field, no API call): ~1k stars ≈ +21, capped at 25 so a popular framework repo can't outweigh a high-relevance paper. Papers without a known repo simply get 0 — never penalized. Tweak weights via `RELEVANCE_WEIGHT`, `STAR_WEIGHT`, `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py).
-
-### 👤 Watched authors
-
-A separate `arxiv_authors` source queries arXiv directly for a curated list of authors / groups (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) over a rolling window. Each per-day detail page has a dedicated **👤 Watched authors** section showing *all* of their papers, bypassing per-bucket caps. The compact README table still surfaces them inline alongside everyone else, but only when they pass `hard_gate` — out-of-scope work from a watched author (e.g. video / world-model papers) stays in the detail page and does not pollute the main table. Edit the list in [`config.yaml`](config.yaml) under `sources.arxiv_authors.authors`.
 
 ---
 
