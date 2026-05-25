@@ -122,7 +122,7 @@ Eight LLM-pickable buckets (first seven strict compression, `trending` is the so
 
 ### Table ordering
 
-The README table sorts **bucket-first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey → Trending), then within each bucket by a composite score:
+**Bucket first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey → Trending), then composite within bucket:
 
 ```
 composite   = relevance_score × 30 + heat_score
@@ -131,7 +131,10 @@ trending_bonus = 100 / hf_daily_rank             (rank 1..30, else 0)
 star_bonus     = min(log(github_stars + 1) × 3, 25)
 ```
 
-`relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes — but `heat_score` lets a viral paper (HF Daily #1 = +100 trending bonus) surface ahead of a same-bucket peer with slightly higher relevance. `star_bonus` adds a soft signal when the paper has an official GitHub repo (read directly from HF's `githubStars` field, no API call): ~1k stars ≈ +21, capped at 25 so a popular framework repo can't outweigh a high-relevance paper. Papers without a known repo simply get 0 — never penalized. Tweak weights via `RELEVANCE_WEIGHT`, `STAR_WEIGHT`, `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py).
+- `relevance_score` (0–10) dominates — a 9/10 paper outweighs ~270 HF upvotes
+- `heat_score` lets HF Daily #1 (+100 bonus) jump ahead of a same-bucket peer with marginally higher relevance
+- `star_bonus` reads HF's `githubStars` field (no API call); ~1k stars ≈ +21, capped at 25 so framework repos can't outweigh relevance. Missing repo = 0, never penalized.
+- Tune `RELEVANCE_WEIGHT`, `STAR_WEIGHT`, `STAR_BONUS_CAP` in [`pipeline/render.py`](pipeline/render.py)
 
 ---
 
