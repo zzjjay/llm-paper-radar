@@ -47,7 +47,7 @@ SCORED_DIR = REPO_ROOT / "data" / "scored"
 SUMMARIZED_DIR = REPO_ROOT / "data" / "summarized"
 
 VALID_BUCKETS = {
-    "ptq", "low_bits", "qat", "kv_cache", "pruning_distill", "diffusion", "survey", "trending",
+    "ptq", "low_bits", "qat", "kv_cache", "pruning_distill", "diffusion", "trending", "survey",
 }
 
 # Header comments mark the start of each bucket section in seeds.yaml.

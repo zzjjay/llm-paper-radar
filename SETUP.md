@@ -62,7 +62,7 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 | `filter.prefilter.max_blacklist_hits` | 2 | papers with ≥ N blacklist matches AND zero whitelist hits are hard-gated locally, no LLM call |
 | `filter.prefilter.whitelist` / `blacklist` | curated for LLM compression | per-pattern weights; word-boundary matched. Tune from rejected.jsonl over time |
 | `summarize.model` | `claude-opus-4-7` | bilingual (zh + en) summary model |
-| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, survey: 3, trending: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
+| `render.topic_caps` | `{ptq: 8, low_bits: 5, qat: 5, kv_cache: 5, pruning_distill: 3, diffusion: 3, trending: 3, survey: 3, _default: 2}` | max papers per bucket on the per-day detail page; README compact view is uncapped |
 | `sources.arxiv.categories` | `[cs.CL, cs.LG, cs.AR]` | arXiv categories pulled at fetch time |
 | `sources.arxiv_authors.window_days` | 7 | default fetch window for watched-authors source (CLI `--window-days` overrides) |
 | `sources.openreview.venues` | `[ICLR.cc/2026/Conference]` | OpenReview venue IDs to scrape; append `/-/Submission` is handled internally. Add NeurIPS / ICML / COLM entries as they open. |

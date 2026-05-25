@@ -2,7 +2,7 @@
 
 > Daily, automated digest of LLM compression and inference-optimization papers.
 
-A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of eight topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Survey & methodology / Trending), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
+A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watched authors, kills obvious off-topic locally with a keyword prefilter, scores the rest with Claude Sonnet 4.6 against a two-axis rubric (topic relevance × practicality), tags each survivor with one of eight topic buckets (PTQ / Low-bit / QAT / KV cache / Pruning & distillation / Diffusion / Trending / Survey & methodology), and renders two views: a compact **table-only README** for skimming and a **per-day detail page** with summaries, "why this paper" rationale, and related/compared methods. No numeric threshold — anything not hard-gated surfaces, with per-bucket caps controlling digest length. A single cron job keeps it running.
 
 [Today's digest](#-todays-digest) · [How papers are scored](#-how-papers-are-scored) · [Pipeline](#-pipeline) · [Setup your own radar](SETUP.md) · [Repo layout](#-repo-layout)
 
@@ -49,9 +49,9 @@ A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watche
 | 22 | KV cache | [EntmaxKV: Support-Aware Decoding for Entmax Attention](https://arxiv.org/abs/2605.21649) 🔁 | Gonçalo Duarte, Miguel Couceiro, Marcos V. Treviso | 2026-05-20 | [zh](digests/2026-05-21.md#p-2605-21649) · [en](digests/2026-05-21_en.md#p-2605-21649) |
 | 23 | KV cache | [Runtime-Certified Bounded-Error Quantized Attention](https://arxiv.org/abs/2605.20868) 🔁 | Dean Calver | 2026-05-20 | [zh](digests/2026-05-21.md#p-2605-20868) · [en](digests/2026-05-21_en.md#p-2605-20868) |
 | 24 | Pruning & distillation | [Post-Trained MoE Can Skip Half Experts via Self-Distillation](https://arxiv.org/abs/2605.18643) 🔁 | Xingtai Lv, Li Sheng, Kaiyan Zhang et al. | 2026-05-18 | [zh](digests/2026-05-19.md#p-2605-18643) · [en](digests/2026-05-19_en.md#p-2605-18643) |
-| 25 | Survey | [Measuring Maximum Activations in Open Large Language Models](https://arxiv.org/abs/2605.15572) 🔁 | Luxuan Chen, Han Tian, Xinran Chen et al. | 2026-05-15 | [zh](digests/2026-05-19.md#p-2605-15572) · [en](digests/2026-05-19_en.md#p-2605-15572) |
-| 26 | Survey | [K-Quantization and its Impact on Output Performance](https://arxiv.org/abs/2605.19645) 🔁 | Robin Baki Davidsson, Pierre Nugues | 2026-05-19 | [zh](digests/2026-05-20.md#p-2605-19645) · [en](digests/2026-05-20_en.md#p-2605-19645) |
-| 27 | Trending | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) 🔁 | Woosuk Kwon, Zhuohan Li, Siyuan Zhuang et al. | 2023-09-12 | [zh](digests/2026-05-24.md#p-2309-06180) · [en](digests/2026-05-24_en.md#p-2309-06180) |
+| 25 | Trending | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) 🔁 | Woosuk Kwon, Zhuohan Li, Siyuan Zhuang et al. | 2023-09-12 | [zh](digests/2026-05-24.md#p-2309-06180) · [en](digests/2026-05-24_en.md#p-2309-06180) |
+| 26 | Survey | [Measuring Maximum Activations in Open Large Language Models](https://arxiv.org/abs/2605.15572) 🔁 | Luxuan Chen, Han Tian, Xinran Chen et al. | 2026-05-15 | [zh](digests/2026-05-19.md#p-2605-15572) · [en](digests/2026-05-19_en.md#p-2605-15572) |
+| 27 | Survey | [K-Quantization and its Impact on Output Performance](https://arxiv.org/abs/2605.19645) 🔁 | Robin Baki Davidsson, Pierre Nugues | 2026-05-19 | [zh](digests/2026-05-20.md#p-2605-19645) · [en](digests/2026-05-20_en.md#p-2605-19645) |
 
 
 <!-- LATEST_END -->
@@ -99,7 +99,7 @@ Sonnet returns a structured JSON breakdown which the orchestrator combines into 
 
 ### Topic buckets and per-bucket caps
 
-Eight LLM-pickable buckets (first seven strict compression, `trending` is the soft catch-all). No `other` — papers that fit none get hard-gated. Caps in [`config.yaml`](config.yaml) → `render.topic_caps`:
+Eight LLM-pickable buckets — seven strict compression buckets plus `trending` as a soft catch-all for compression-adjacent decoding-acceleration work. No `other` — papers that fit none get hard-gated. Caps in [`config.yaml`](config.yaml) → `render.topic_caps`:
 
 | bucket | cap | what goes here |
 |---|---|---|
@@ -108,9 +108,9 @@ Eight LLM-pickable buckets (first seven strict compression, `trending` is the so
 | **`qat`** | 5 | Quantization-aware training or PTQ + full-network fine-tune, bit-width ≥ 3. LLM-QAT, EfficientQAT, PB-LLM |
 | **`kv_cache`** | 5 | KV cache compression where layout / eviction is the main contribution. KIVI, KVQuant, H2O, StreamingLLM |
 | **`pruning_distill`** | 3 | Pruning / sparsity / distillation with a deployable kernel path (N:M, MoE expert pruning, layer drop, SFT KD). Wanda, SparseGPT, Sheared LLaMA, MiniLLM |
-| **`diffusion`** | 3 | Quant / pruning / distillation / step-distillation on diffusion or flow-matching backbones. Q-Diffusion, SVDQuant |
-| **`survey`** | 3 | Methodology / measurement / cross-method comparison giving actionable guidance — empirical PTQ comparisons, outlier-bottleneck studies, eval methodology. Pure review surveys still hard_gate. |
-| **`trending`** | 3 | Compression-adjacent decoding-acceleration without a direct compression algorithm — parallel/dual-view drafters, spec-decoding frameworks. Use sparingly; routine EAGLE/Medusa still hard_gate. Orthrus, DFlash |
+| **`diffusion`** | 3 | **Quantization only** on diffusion or flow-matching backbones. Step-distillation / pruning / sampling-trajectory / guidance methods → hard_gate. Q-Diffusion, SVDQuant, DiRotQ |
+| **`trending`** | 3 | Compression-adjacent decoding-acceleration without a direct compression algorithm — parallel/dual-view drafters, spec-decoding frameworks. Use sparingly; routine EAGLE/Medusa still hard_gate. Orthrus, DFlash, PagedAttention (via milestone override) |
+| **`survey`** | 3 | Compression-method head-to-head OR compression-actionable measurement (empirical PTQ comparisons, outlier-bottleneck studies, calibration-data studies, eval methodology). Excludes infrastructure/energy benchmarks, downstream-property studies (bias/trust/CL), pure theory/position papers. Pure review surveys still hard_gate. |
 
 **Tie-breaks**
 - Bit-width wins: 2-bit PTQ → `low_bits` (not `ptq`); 1.58-bit pretrained → `low_bits` (not `qat`)
@@ -118,11 +118,13 @@ Eight LLM-pickable buckets (first seven strict compression, `trending` is the so
 
 **Caps scope:** the README compact table lists every surviving paper (no cap). Caps only gate which papers get a full detail block on the per-day digest page.
 
+**Milestone override:** papers in [`seeds.yaml`](seeds.yaml) under `category: trending` (vLLM, FlashAttention v1/v2/v3, EAGLE / Medusa / Lookahead, SGLang) get force-routed to the `trending` bucket — bypassing any LLM `hard_gate` — when HF trending rank ≤ 20 OR `code_meta.stars` ≥ 5000. Lets landmark serving / attention / spec-decoding papers surface even though they're "no new compression algorithm." See [`pipeline/filter.py`](pipeline/filter.py).
+
 **Watched authors:** `sources.arxiv_authors.authors` in [`config.yaml`](config.yaml) (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) gets a dedicated **👤 Watched authors** block on each detail page that bypasses caps and shows *all* of their papers. The compact table still applies `hard_gate`, so off-topic watched-author work stays detail-page-only.
 
 ### Table ordering
 
-**Bucket first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Survey → Trending), then composite within bucket:
+**Bucket first** (PTQ → Low-bit → QAT → KV cache → Pruning & distillation → Diffusion → Trending → Survey), then composite within bucket:
 
 ```
 composite   = relevance_score × 30 + heat_score

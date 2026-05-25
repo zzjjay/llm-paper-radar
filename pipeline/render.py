@@ -21,7 +21,7 @@ STAR_WEIGHT = 3.0
 STAR_BONUS_CAP = 25.0
 
 # Bucket enum. Kept in sync with prompts/relevance.md and tests/test_render_grouping.py.
-# `trending` is the soft 8th catch-all for compression-adjacent decoding-
+# `trending` is the soft catch-all for compression-adjacent decoding-
 # acceleration work (parallel/dual-view drafters, etc.) that doesn't fit
 # the seven strict compression buckets; the LLM can pick it directly, and
 # it's also the landing spot for manual overrides of hf_daily-popular papers.
@@ -32,8 +32,8 @@ BUCKET_ORDER = [
     "kv_cache",
     "pruning_distill",
     "diffusion",
-    "survey",
     "trending",
+    "survey",
 ]
 BUCKET_TITLES = {
     "ptq": "PTQ",
@@ -42,8 +42,8 @@ BUCKET_TITLES = {
     "kv_cache": "KV cache",
     "pruning_distill": "Pruning & distillation",
     "diffusion": "Diffusion",
-    "survey": "Survey",
     "trending": "Trending",
+    "survey": "Survey",
 }
 # Detail-page section headers — tech terms stay English, glue words Chinese.
 BUCKET_TITLES_CN = {
@@ -53,8 +53,8 @@ BUCKET_TITLES_CN = {
     "kv_cache": "KV cache 压缩",
     "pruning_distill": "Pruning / 蒸馏",
     "diffusion": "Diffusion",
-    "survey": "Survey / 方法论与对比",
     "trending": "Trending / 高热度但未归桶",
+    "survey": "Survey / 方法论与对比",
 }
 # English detail-page section headers. Slightly longer than the compact-table
 # BUCKET_TITLES so the section heading reads as a heading, not a tag.
@@ -65,8 +65,8 @@ BUCKET_TITLES_EN_DETAIL = {
     "kv_cache": "KV cache compression",
     "pruning_distill": "Pruning / distillation",
     "diffusion": "Diffusion",
-    "survey": "Survey / methodology & comparison",
     "trending": "Trending / high-heat, no bucket",
+    "survey": "Survey / methodology & comparison",
 }
 
 # All localised strings for the detail-page renderer live here so adding a
