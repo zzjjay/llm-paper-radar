@@ -210,10 +210,11 @@ Companion settings in [`config.yaml`](config.yaml) — change these without touc
 ### 6. Smoke-test the chain
 
 ```bash
-./scripts/daily.sh             # logs to scripts/log/YYYY-MM-DD.log
+./scripts/daily.sh                       # full run; logs to scripts/log/YYYY-MM-DD.log
+./scripts/daily.sh --days 7 --no-fetch   # re-run dedupe→render only, no external API calls
 ```
 
-If everything is wired up, you'll see `data/raw/`, `data/deduped/`, `data/scored/`, `data/summarized/` populate, then a fresh `digests/YYYY-MM-DD.md` plus an updated `README.md`.
+If everything is wired up, you'll see `data/raw/`, `data/deduped/`, `data/scored/`, `data/summarized/` populate, then a fresh `digests/YYYY-MM-DD.md` plus an updated `README.md`. `--no-fetch` is handy when you tweak the prompt or filter and want to re-process whatever is already on disk.
 
 ### 7. Schedule it
 
@@ -268,13 +269,16 @@ llm-paper-radar/
 │   ├── summarize.py
 │   ├── render.py                # bucket grouping + README splicing
 │   ├── readme_template.md       # static doc template (this file's source)
-│   └── weekly.py                # Monday weekly roll-up
+│   └── weekly.py                # 7-day roll-up as a compact table
 ├── scripts/
-│   └── daily.sh                 # cron entrypoint: fetch → ... → push
+│   ├── daily.sh                 # cron entrypoint: fetch → ... → push (--no-fetch skips fetch)
+│   └── snapshot.sh              # captures the current README paper-list into snapshots/
 ├── digests/
 │   └── YYYY-MM-DD.md            # daily digest archive
 ├── weekly/
-│   └── YYYY-Www.md              # weekly digest archive
+│   └── YYYYMMDD-YYYYMMDD.md     # weekly digest (full table, # | Bucket | Paper | …)
+├── snapshots/
+│   └── YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot for tracking history
 ├── data/                        # mostly gitignored; seen.json + summarized/ kept
 │   ├── raw/                     # gitignored
 │   ├── deduped/                 # gitignored

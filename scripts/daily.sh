@@ -5,15 +5,19 @@
 # Usage:
 #   daily.sh                 # default 7-day window (matches Tue/Fri cron cadence)
 #   daily.sh --days 60       # backfill last 60 days
+#   daily.sh --no-fetch      # skip the source fetch step; re-run dedupe→render
+#                              against whatever is already in data/raw/
 #   DAYS=14 daily.sh         # env var also works
 
 set -uo pipefail
 
 DAYS="${DAYS:-7}"
+NO_FETCH=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days) DAYS="$2"; shift 2 ;;
         --days=*) DAYS="${1#*=}"; shift ;;
+        --no-fetch) NO_FETCH=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
@@ -68,16 +72,22 @@ run_step() {
 # Fetch all sources over the requested window. Per-day sources loop via
 # --backfill-days; windowed sources (arxiv_authors, openreview) take
 # --window-days and fetch once. Source-level failures print and continue.
-for src in hf_daily arxiv; do
-    echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL})"
-    uv run python -m "sources.$src" --backfill-days "${BACKFILL}" \
-        || echo "  ($src returned non-zero, continuing)"
-done
-for src in arxiv_authors openreview; do
-    echo "[$(date -Is)] fetch: $src (--window-days ${DAYS})"
-    uv run python -m "sources.$src" --backfill-days 0 --window-days "${DAYS}" \
-        || echo "  ($src returned non-zero, continuing)"
-done
+# --no-fetch skips this section entirely so we can re-run dedupe→render
+# against whatever raw data is already on disk (no external API calls).
+if [[ "$NO_FETCH" -eq 1 ]]; then
+    echo "[$(date -Is)] fetch: skipped (--no-fetch)"
+else
+    for src in hf_daily arxiv; do
+        echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL})"
+        uv run python -m "sources.$src" --backfill-days "${BACKFILL}" \
+            || echo "  ($src returned non-zero, continuing)"
+    done
+    for src in arxiv_authors openreview; do
+        echo "[$(date -Is)] fetch: $src (--window-days ${DAYS})"
+        uv run python -m "sources.$src" --backfill-days 0 --window-days "${DAYS}" \
+            || echo "  ($src returned non-zero, continuing)"
+    done
+fi
 
 run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" || exit 4
 run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" || exit 5
