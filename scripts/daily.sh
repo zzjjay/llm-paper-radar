@@ -92,6 +92,16 @@ fi
 run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" || exit 4
 run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" || exit 5
 run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" || exit 6
+
+# Auto-translate any new paper-river/*.org that lacks an _en.org sibling
+# BEFORE render, so the resulting `_en.org` files get picked up by this
+# run's render step (which globs paper-river/ to inject `[zh] · [en]`
+# pills into digest detail pages). Files are produced manually by the
+# ljg-paper-river skill (Chinese only). Non-fatal: pipeline ships even
+# if translation fails or there's nothing to translate.
+run_step "translate_paper_river" uv run python scripts/translate_paper_river.py --all \
+    || echo "  (paper-river translation failed, continuing)"
+
 run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || exit 7
 
 # Snapshot the rendered paper list into snapshots/<start>-<end>-<N>days.md
@@ -106,7 +116,7 @@ DATE_STR=$(date -u +%Y-%m-%d)
 if [[ -z "$(git status --porcelain)" ]]; then
     echo "[$(date -Is)] no changes to commit"
 else
-    git add data/summarized digests/ README.md INDEX.md data/seen.json snapshots/ 2>/dev/null || true
+    git add data/summarized digests/ README.md INDEX.md data/seen.json snapshots/ paper-river/ 2>/dev/null || true
     if [[ -z "$(git diff --cached --name-only)" ]]; then
         echo "[$(date -Is)] nothing staged after add"
     else
