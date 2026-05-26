@@ -154,7 +154,7 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
          ↓
    ┌────────────┐     scripts/auto_paper_river.py  +  translate_paper_river.py
    │ paper-river│ ─── per paper surfaced in the current rollup window:
-   │ (optional) │     ljg-paper-river skill writes a deep-lineage `.org`
+   │            │     ljg-paper-river skill writes a deep-lineage `.org`
    │            │     analysis, then auto-translates zh → `_en.org`.
    └─────┬──────┘            ↓
          │            paper-river/<acronym>-<id>.org (+ _en.org)
@@ -183,7 +183,7 @@ uv run python -m pipeline.render
 
 `scripts/daily.sh` chains all of the above end-to-end, runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. The paper-river step is scoped to the same rollup window as the digest (`--window-days`, default 2) so it tracks what's in the README's latest table — typically a handful of papers per run. `PAPER_RIVER_MAX=N` caps further; `PAPER_RIVER_SKIP=1` disables; `--all-history` (on `auto_paper_river.py` directly) revisits every paper ever surfaced for one-off backfills.
 
-### 🌊 Paper River (optional)
+### 🌊 Paper River
 
 **What.** A deep-lineage analysis per surfaced paper — "倒读法": recursively trace 5 layers of intellectual ancestry, then walk forward Feynman-style. Written by Claude via the [`ljg-paper-river`](https://github.com/lijigang/ljg-skills) skill.
 
@@ -250,7 +250,7 @@ llm-paper-radar/
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
 ├── snapshots/
 │   └── YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot for tracking history
-├── paper-river/                 # optional: ljg-paper-river deep-lineage analyses (see Pipeline)
+├── paper-river/                 # ljg-paper-river deep-lineage analyses (see Pipeline)
 │   ├── <acronym>-<arxiv-id>.org # zh; render auto-links if present
 │   └── <acronym>-<arxiv-id>_en.org  # en sibling; auto-translated by daily.sh
 ├── data/                        # mostly gitignored; seen.json + summarized/ + curation/ kept
