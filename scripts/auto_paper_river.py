@@ -4,6 +4,12 @@ A "surfaced paper" is any paper in `data/summarized/*.json` whose
 `relevance_breakdown.hard_gate` is false — i.e. every paper that actually
 appears in some digest/<date>.md.
 
+By default the scan is scoped to the **current rollup window** (last
+`--window-days` days, default 2 to match daily.sh's default rollup), so
+the script's notion of "surfaced" matches what just got rendered into
+the README's latest table. Pass `--all-history` to revisit every
+summarized JSON ever written (useful for one-off backfills).
+
 Dedup: a paper is considered "done" if `paper-river/*<id>.org` exists in
 either dot form (`...2604.18556.org`) or legacy dash form
 (`...2604-18556.org`). The `_en.org` siblings are NOT counted as the
@@ -11,18 +17,20 @@ primary file — they are translations of the zh original (see
 scripts/translate_paper_river.py).
 
 Per-run cap: `PAPER_RIVER_MAX` env var. 0 (default) means unlimited.
-On first run with a large window this can easily be 300+ candidates ×
-5-10 minutes each = days of work; set the cap on first runs and lift
-it when you're ready for a backfill batch.
+In window mode the candidate set is usually small (single digits per
+day); in --all-history mode it can be 300+ candidates × 5-10 minutes
+each = days of work.
 
 The actual generation work is delegated to scripts/gen_paper_river.sh,
 which invokes the ljg-paper-river Claude Code skill in headless mode.
 Per-paper failure is logged and does not abort the batch.
 
 Usage:
-    uv run python scripts/auto_paper_river.py            # scan + gen all missing
+    uv run python scripts/auto_paper_river.py                 # current 2-day window
+    uv run python scripts/auto_paper_river.py --window-days 7 # current 7-day window
+    uv run python scripts/auto_paper_river.py --all-history   # legacy: every surfaced paper ever
     PAPER_RIVER_MAX=2 uv run python scripts/auto_paper_river.py   # cap at 2 this run
-    uv run python scripts/auto_paper_river.py --dry-run  # list what would run
+    uv run python scripts/auto_paper_river.py --dry-run       # list what would run
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import click
@@ -61,13 +70,34 @@ def existing_ids() -> set[str]:
     return out
 
 
-def surfaced_ids() -> set[str]:
-    """Return arxiv IDs of every paper in any summarized JSON that is not
-    hard_gated (i.e. would surface in a digest)."""
+def _window_paths(window_days: int, today: datetime | None = None) -> list[Path]:
+    """Return data/summarized/<date>.json paths for the last `window_days`
+    days (today inclusive), newest first. Missing files are skipped."""
+    today = today or datetime.now(UTC)
+    out: list[Path] = []
+    for d in range(window_days):
+        date = today - timedelta(days=d)
+        p = SUMMARIZED_DIR / f"{date.strftime('%Y-%m-%d')}.json"
+        if p.exists():
+            out.append(p)
+    return out
+
+
+def surfaced_ids(window_days: int | None = None) -> set[str]:
+    """Return arxiv IDs of non-hard-gated papers from summarized JSON.
+
+    `window_days=None` → scan every file in SUMMARIZED_DIR (legacy
+    behavior, used by --all-history backfills). Otherwise scope to the
+    last N days, matching the daily.sh rollup window.
+    """
     out: set[str] = set()
     if not SUMMARIZED_DIR.exists():
         return out
-    for f in sorted(SUMMARIZED_DIR.glob("*.json")):
+    if window_days is None:
+        targets = sorted(SUMMARIZED_DIR.glob("*.json"))
+    else:
+        targets = _window_paths(window_days)
+    for f in targets:
         try:
             data = json.loads(f.read_text())
         except Exception:
@@ -83,20 +113,34 @@ def surfaced_ids() -> set[str]:
 
 
 @click.command()
+@click.option(
+    "--window-days",
+    default=2,
+    type=int,
+    help="How many recent days of summarized JSON to scan. Default 2 to match"
+    " daily.sh's rollup. Ignored when --all-history is set.",
+)
+@click.option(
+    "--all-history",
+    is_flag=True,
+    help="Scan every summarized JSON ever written (legacy behavior). Use for"
+    " one-off backfills of historical surfaced papers.",
+)
 @click.option("--dry-run", is_flag=True, help="List candidates and exit without invoking the skill.")
 @click.option("--no-warn-sleep", is_flag=True, help="Skip the 10-second 'about to start' warning sleep.")
-def main(dry_run: bool, no_warn_sleep: bool) -> None:
+def main(window_days: int, all_history: bool, dry_run: bool, no_warn_sleep: bool) -> None:
     if not GEN_SCRIPT.exists():
         sys.exit(f"missing helper script: {GEN_SCRIPT}")
 
     cap = int(os.environ.get("PAPER_RIVER_MAX", "0"))
     done = existing_ids()
-    surf = surfaced_ids()
+    surf = surfaced_ids(window_days=None if all_history else window_days)
     todo = sorted(surf - done)
     if cap > 0 and len(todo) > cap:
         todo = todo[:cap]
 
-    print(f"auto_paper_river: surfaced={len(surf)}, already done={len(done)}, "
+    scope = "all history" if all_history else f"last {window_days}d"
+    print(f"auto_paper_river: scope={scope}, surfaced={len(surf)}, already done={len(done)}, "
           f"to generate={len(todo)}"
           + (f" (capped from {len(surf - done)} via PAPER_RIVER_MAX={cap})" if cap > 0 else ""))
 

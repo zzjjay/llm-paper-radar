@@ -145,7 +145,8 @@ run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACK
 if [[ "${PAPER_RIVER_SKIP:-0}" -eq 1 ]]; then
     echo "[$(date -Is)] auto_paper_river: skipped (PAPER_RIVER_SKIP=1)"
 else
-    run_step "auto_paper_river" uv run python scripts/auto_paper_river.py --no-warn-sleep \
+    run_step "auto_paper_river" uv run python scripts/auto_paper_river.py \
+        --window-days "${DAYS}" --no-warn-sleep \
         || echo "  (auto_paper_river failed, continuing)"
 fi
 
