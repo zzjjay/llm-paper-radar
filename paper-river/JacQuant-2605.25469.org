@@ -1,0 +1,265 @@
+#+title:      JacQuant: STE-Free Quantization-Aware Training via Learned Jacobian Surrogates
+#+date:       [2026-05-26 Tue 17:00]
+#+filetags:   :paper:river:quantization:qat:ste:
+#+identifier: 20260526T170000
+#+source:     https://arxiv.org/abs/2605.25469
+#+authors:    Kai Yi, Vignesh Vivekraja, Harshit Khaitan, Steven Li (Meta AI)
+#+venue:      arXiv 2026.05
+
+* 一句话引子
+
+QAT 这十几年都靠一句"反正梯度直接穿过去就行"在撑着。JacQuant 把这句话扯了——它说，那个我们一直假装是单位矩阵的 Jacobian，其实是可以学出来的。
+
+* 溯源地图
+
+#+begin_src
+                                       [2013]
+                                       Bengio
+                                  Straight-Through Estimator
+                                  "梯度穿过去，别问"
+                                          |
+                                          | "把它搬到多比特权重和激活"
+                                          v
+                                       [2016]
+                                       DoReFa-Net
+                                  Zhou et al.
+                                  低比特 W&A 端到端训练
+                                          |
+                                          | "梯度直传没问题，
+                                          |  但 clip 阈值得学"
+                                          v
+                                       [2018]
+                                       PACT
+                                       Choi et al.
+                                       (旁支：学激活 clip)
+                                          |
+                                          | "clip 阈值不够，
+                                          |  量化步长本身也要学"
+                                          v
+                                       [2020]
+                                       LSQ / LSQ+
+                                  Esser et al. / Bhalgat et al.
+                                  step size 当参数学，
+                                  对 round 还是 STE
+                                          |
+                                          | "STE 在 bin 边界本来就是错的，
+                                          |  不能只学步长，得换梯度路径"
+                                          v
+                                       [2025]
+                                       Rotation Trick
+                                  Fifty et al. (VQ-VAE)
+                                  把 STE 换成固定的旋转+缩放
+                                          |
+                                          | "固定旋转太死，
+                                          |  应该按数据学一个自适应的"
+                                          v
+                                  ==> [2026] JacQuant <==
+                                       Yi et al. (Meta)
+                                       block-diag B(W) 学出来当 Jacobian
+                                          |
+                                          | (同期并行的几条路：
+                                          |  PV-Tuning 走 proximal，
+                                          |  ZeroQAT 走零阶，
+                                          |  FOGZO 走一阶+零阶混合)
+                                          v
+                                       [2025-2026]
+                                       ParetoQ / WinQ
+                                       (把超低比特 QAT 推到 sub-2bit
+                                        的最新管线，JacQuant 可插)
+#+end_src
+
+注：Fifty et al. 2025 (Rotation Trick) 严格说是 VQ-VAE 上下文 (ICLR 2025 Oral, arXiv:2410.06424)，
+不是 LLM 权重量化。JacQuant 论文把它作为"departure from STE"的代表来类比，
+所以这条线是"概念上承接"，不是直接引用改进。这是论文自己 Fig.1 里的并列对比。
+
+* 正向叙事：问题怎么长出来的
+
+** 第一站：Bengio 2013 — "梯度别管，硬穿过去"
+
+最早的故事不是关于大模型，是关于伯努利神经元和量化激活。
+你想训练一个网络，但中间有一个非可导的操作——比如四舍五入、sign 函数、抽样。
+反向传播没法跑了。
+
+Bengio 拍了一个板：那就当它是 1。
+你前向算 round(x) 得到 0 或 1，反向你就当 d(round)/dx = 1，
+把后面的梯度原封不动塞给前面。这就是 Straight-Through Estimator，STE。
+
+它在数学上是错的，但是好用。它给了量化训练一个"能跑"的起点。
+所有后来的 quantization-aware training，都是默认装着这个错。
+
+留下的问题：这个错到底什么时候会爆？
+答案是——当量化的 bin 很少、参数恰好压在 bin 的边界上、或者被 clip 截断时，
+"假装单位矩阵"和"真实零梯度"之间的差距会变得巨大。
+但在 2013 年没人在乎，因为大家还在玩浮点。
+
+** 第二站：DoReFa-Net 2016 — "把 STE 搬到深网络里"
+
+DoReFa-Net 是把 STE 从激活推广到 *权重 + 激活 + 梯度* 三件套都低比特的第一批工作。
+他们证明了你确实可以一边训练一边量化，端到端没事，CIFAR 和 ImageNet 都能跑。
+
+但他们做的是 4-bit、8-bit。在这个精度下，STE 的错相对小，
+因为每个权重附近都有好几个 bin 备选，"假装单位矩阵"和真实行为差不太多。
+故事在 4-bit 精度上看起来是 happy ending。
+
+留下的问题：你想再压一压怎么办？
+往 3-bit、2-bit 压，开始出现 *clipping 边界* 这个新问题——
+有大量权重被截断在最大值或最小值上，它们的梯度本来应该是 0（被截了，没贡献），
+但 STE 还是一股脑往回传完整梯度，训练就开始抖。
+
+** 第三站：PACT 2018 — "那就把 clip 阈值学了"
+
+PACT 看清了上一站的痛点：clipping。
+它的回答是——别让 clip 阈值人手定，让它和别的参数一起反传学。
+你的 activation clip 在 6.0 还是 2.3，让数据决定。
+
+这缓解了截断的问题，2-bit 激活也能凑合用。
+但 round 这个操作本身的梯度，PACT 还是用 STE。
+
+留下的问题：clip 阈值学了，那 bin 的位置（step size）呢？
+为什么 step size 不能也是个参数？
+
+** 第四站：LSQ 2020 — "step size 也是参数"
+
+Esser 团队的 LSQ 顺着 PACT 的逻辑往前推了一步：
+不仅 clip 阈值要学，量化的 *step size*（每个 bin 多宽）也要学。
+而且它对 step size 怎么求导，给出了一个比 STE 更精细的估计——
+利用了"权重越靠近 bin 边界，对 step size 的变化越敏感"这个事实。
+
+LSQ 把 2-bit、3-bit ImageNet 推到了当时的 SOTA。
+之后 LSQ+ 又加了 offset、init 调整，成了标准基线。
+
+但仔细看会发现：LSQ 改了 *step size 的梯度*，
+没改 *round 本身的梯度* —— round 那一步还是 STE，
+也就是说"权重穿过 round"的那条路径上的 Jacobian 仍然是骗的。
+
+留下的问题：如果想再压到 2-bit 以下、想把 LLM 那种几十亿参数的模型也搞定，
+STE 在 round 上累积的偏差就压不住了。
+你得直接动 round 那条反传路径。
+
+** 第五站：Rotation Trick 2025 — "不当单位矩阵了，当一个旋转"
+
+Fifty 团队在 VQ-VAE 场景下迈出了关键一步。
+他们观察到：STE 把 quantize 当成"梯度直传"，
+等于完全无视了"原来的 x"和"量化后的 q"之间的相对几何关系。
+在 Voronoi 单元内的所有点，得到的梯度都是同一个，
+导致 codebook 利用率极低（VQGAN 上只有 2%）。
+
+他们的解法叫 *Rotation Trick*：
+把"x 到 q"这一步用一个 *旋转 + 缩放* 的固定变换来表示，
+反向传播时把这个变换的 Jacobian 当成常数代进去。
+这样 x 和 q 之间的角度、模长比，就被编码进了梯度。
+
+效果：VQGAN 的 codebook 利用率从 2% 涨到 27%，重建误差降两个数量级。
+
+留下的问题：旋转是 *固定的*，由当前 x 和 q 的几何关系几何地算出来。
+它没有"学"任何东西。如果数据分布变了、量化器变了、模型在训练中漂移了，
+这个固定变换是不是最优？
+而且 Rotation Trick 主要在 VQ-VAE 那种"向量量化到 codebook"的场景下成立，
+对 LLM 那种"标量逐元素 round 到 grid"的场景，它的几何 framing 不直接适用。
+
+** 第六站：JacQuant 2026 — "Jacobian 就直接学了"
+
+这就是这篇论文的核心一跳。
+
+JacQuant 说：你看 STE 是当 Jacobian = I，Rotation Trick 是当 Jacobian = 一个固定旋转，
+那既然都是在给"那个我们其实不知道的 Jacobian"拍一个替身，
+为什么不让数据告诉你这个 Jacobian 应该是什么？
+
+它的形式特别朴素：每个 quantization group（比如 128 个权重共享一个 scale）
+分配 *一个标量* b_g，把它当成这组权重那一段反传的"增益"。
+所有 b_g 拼起来就是一个 block-diagonal 的 B(W)，作为 STE 那个 identity 的替身。
+
+怎么学 b_g？两个估计器：
+- *Probe*：给这组权重加一个小扰动 δ，
+  看 quantizer 输出变化 Δq，做最小二乘拟合 b_g ≈ <Δq, δ>/||δ||²。
+  几何意义就是"局部看 quantizer 真实的斜率是多少"。
+- *Dither*：subtractive dithering，给权重加一个均匀噪声再减回去，
+  做出一个可微的代理量化器，对它估 Jacobian。
+
+关键设计：b_g 不是每步都更新，而是 *偶尔刷新*，
+中间几十上百个 QAT step 都复用，所以额外开销可以忽略。
+
+它捕获到了什么 STE 捕不到的事？
+- 在 bin 内部（远离边界），quantizer 行为近似线性，b_g ≈ 1，跟 STE 一样；
+- 在 *饱和/clip* 区域，真实 Jacobian ≈ 0，b_g 会被学到 ≈ 0，
+  自动 *阻尼* 掉那些被截断方向的梯度更新。
+
+这正是 ≤ 2-bit 时 STE 抖得最厉害的地方：
+大量权重压在 clip 边界，STE 还在拼命往回传梯度，训练就崩。
+JacQuant 在这些方向上把梯度乘以一个学到的小数，自然就稳了。
+
+理论上，作者证明了在"code-preserving"（也就是 quantization 离散输出不变）
+的训练窗口内，JacQuant 的更新可以归约到一个良定义的目标梯度上，
+非凸下有收敛保证，PŁ 条件下能拿到线性率。
+
+实验上：LLaMA3-1B/3B/8B、Qwen3-1.7B，2-bit 以下 QAT 全面比 STE 强。
+
+留下的问题（也就是 paper-river 的下一站）：
+- B(W) 是 block-diagonal，每组一个标量。如果 quantizer 在 group 内部有跨权重耦合
+  （比如更复杂的 codebook、混合精度），这种近似还够不够？
+- b_g 的"局部 + 偶尔刷新"假设，依赖于 W 不会在 refresh 之间漂移太远。
+  在很长的 QAT schedule 下、或者结合 LoRA / continuous pretraining 时，会不会失效？
+- 同期的 ZeroQAT (Tan 2025) 直接走零阶梯度估计，FOGZO 走一阶+零阶混合。
+  这些路线在 "牺牲多少额外算力换多少精度" 这个维度上是不同的 trade-off。
+  谁会在工业部署里活下来还不一定。
+
+* 压缩总览图：问题怎么演化
+
+#+begin_src
+精度档位      问题                          解法
+--------      ----                          ----
+[16/8 bit]    round 不可导                  STE: 当 Jacobian=I (Bengio 2013)
+                                            |
+[4 bit]       网络深，能否端到端低比特?     DoReFa: STE 推广到 W&A&G (Zhou 2016)
+                                            |
+[3 bit]       activation 大动态范围被截     PACT: clip 阈值可学 (Choi 2018)
+                                            |
+[2 bit]       step size 该多大?             LSQ: step size 可学 (Esser 2020)
+                                            |
+[VQ-VAE]      STE 丢弃 cell 内几何信息      Rotation Trick: 固定旋转替 I (Fifty 2025)
+                                            |
+[<=2 bit LLM] clip 饱和 + bin 边界双重崩塌  JacQuant: B(W) 学出来 (Yi 2026)
+                                            |
+[future]      group 内耦合 / schedule 漂移  ?
+#+end_src
+
+* 演化背后真正在发生什么
+
+表面上看是"梯度估计器越做越精细"。
+但深一层看，这条线在做一件更根本的事——
+
+*从"假装量化不存在"，到"把量化当成一个可以被学习的、有结构的物体"。*
+
+- STE：量化是噪声，能屏蔽就屏蔽。
+- LSQ：量化是有参数的算子（step size），参数可以学，但算子本身的导数还是 fake。
+- Rotation Trick：量化是一个几何变换，把它的 Jacobian 用变换的真实几何来表示。
+- JacQuant：量化是一个有局部线性近似的算子，那个局部斜率本身就是可以观测、可以学习的统计量。
+
+这是个从 *否认* → *参数化* → *几何化* → *统计化* 的演化轨迹。
+每一步都让"量化"这件事在优化器眼里变得更具体一点。
+
+下一步在哪？我赌两个方向：
+
+1. *把"sensitivity"做成一阶导以外的东西* —— JacQuant 学的是一阶 Jacobian，
+   下一个该来的应该是有人开始学 Hessian-vector product 的低秩近似，
+   把量化的二阶曲率也补回去。在 < 2bit 区，loss surface 已经不再光滑了，
+   只看一阶迟早撑不住。
+
+2. *Jacobian 学习从 group-scalar 扩到 group-内部低秩矩阵* ——
+   现在每个 group 共享一个标量 b_g。如果某些 group 内部权重高度相关
+   （比如 attention 的 head 维度），用一个 rank-k 矩阵替代标量，
+   会不会换来不成比例的精度增益？算力开销可能也还能接受。
+
+* 诚实标注
+
+- *直接引用关系*：STE←DoReFa←LSQ 这条线是 QAT 教科书共识，强可信。
+- *承接关系*：LSQ→Rotation Trick→JacQuant 不是字面引用链。
+  Rotation Trick 在 VQ-VAE 上下文，JacQuant 借它作为"departure from STE"的代表。
+  这是 *概念脉络*，不是 *引用脉络*。论文 Fig.1 把它们并排画在一起作对比。
+- *PACT/LSQ→JacQuant*：JacQuant 列了 PACT、LSQ 作为 classic STE-based QAT 的代表，
+  但没有把它们当作直接被推翻的 baseline。真正的对照是 STE 本身。
+- *并行路线*：PV-Tuning (proximal)、ZeroQAT (零阶)、FOGZO (混合) 都是 2024-2025
+  的"departure from STE"的不同尝试，JacQuant 在 Related Work 里明确点了它们，
+  把自己定位成"保留 forward hard quantizer + 替换 backward rule"这一种取法。
+- *找到了 5 层 + 根 + 1 后续层*。最老的根是 Bengio 2013，往后能追到 ParetoQ /
+  WinQ / ZeroQAT 这一批 2025-2026 的最新工作。

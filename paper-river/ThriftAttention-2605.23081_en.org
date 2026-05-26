@@ -1,0 +1,233 @@
+#+title:      ThriftAttention: Selective Mixed Precision for Long-Context FP4 Attention
+#+date:       [2026-05-26 Tue 10:25]
+#+filetags:   :paper:river:en:
+#+identifier: 20260526T102529-en
+#+source:     https://arxiv.org/abs/2605.23081
+#+authors:    Joe Sharratt
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* The Problem River
+
+Attention cost scales quadratically with sequence length — stretch the context far enough and the GPU is completely wrung dry. Everyone has been working on the same thing: making attention cheaper. FlashAttention swapped "compute" for "memory movement" and saved on IO; SageAttention dropped 16-bit floats to 8-bit; SageAttention3 pushed further to 4-bit and captured a 4× throughput bonus on Blackwell GPUs. It looked like we were approaching the limit — but 4-bit comes with a stubborn penalty: the longer the context, the more severe the quality collapse.
+
+The entire ThriftAttention lineage had been resting on one silent assumption: *same operator, same precision everywhere*. Either full FP16 or full FP4. This paper is the first to point out that assumption is wrong — FP4 error is not uniformly distributed; the vast majority of functional error is concentrated in the ~5% of query-key blocks that actually matter. In other words: you don't need to give every block equal precision — just give that 5% FP16, let everything else run in FP4, and quality mostly comes back.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | What it saw: RNN sequential dependencies prevent parallel training
+  | Solution: discard temporal recurrence, rely purely on Q-K-V matrix multiply
+  | Residual problem: N×N attention matrix blows up quadratically with sequence length
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | What it saw: it's not FLOPs that are slow — HBM can't move the N×N matrix
+  | Solution: tile into SRAM, online softmax, N×N intermediate never materializes
+  | Residual problem: IO fixed, but the matmul itself still runs in FP16
+  v
+[2024-25] Zhang et al. - SageAttention / SageAttention2
+  |
+  | What it saw: the precision of the matmul itself still has room to compress
+  | Solution: quantize Q/K to INT8/FP8, handle outliers with smoothing
+  | Residual problem: 8-bit has been milked; Blackwell arrived — next frontier is 4-bit
+  v
+[2025] Zhang et al. - SageAttention3
+  |
+  | What it saw: Blackwell FP4 Tensor Cores deliver 4× the throughput of FP16
+  | Solution: NVFP4 microscaling format + two-level scaling to push all of attention into FP4
+  | Residual problem: workable on short contexts, severe quality degradation for >32K tokens
+  v
+[2026] Sharratt - ThriftAttention (this paper)
+
+  What it saw: the entire lineage assumed "uniform precision" — that assumption is wrong.
+              FP4 error is not uniformly distributed; it is concentrated in <5% of
+              "important blocks," and this concentration is amplified in long contexts.
+  Solution: block-level importance scoring -> top-k blocks run FP16, rest run FP4;
+            both paths are merged into a single output via online softmax.
+  Core shift: attention acceleration moves from "uniform compression"
+              to "importance-weighted precision assignment."
+
+         (Side branch: Quest / SpargeAttn take the sparsity route —
+          they drop "unimportant blocks" entirely. ThriftAttention
+          instead *reduces their precision* without discarding them —
+          preserving all information while letting the bit budget
+          flow toward importance.)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Attention Is All You Need: from relay race to open plaza
+
+*** What problem did it see?
+
+Before Transformers, the dominant paradigm was RNN/LSTM — one token had to finish computing before the next could start, like a relay race. GPUs are designed for parallelism; forcing a sequential baton through them meant that even multi-GPU setups could not be fully utilized. Training long sequences under this bottleneck made scaling large models extremely difficult.
+
+*** Its solution
+
+Replace the relay with an open plaza — every token simultaneously attends to all other tokens, and a single set of Q-K-V matrix multiplications determines who attends to whom in one shot. With no temporal dependency, the entire sequence can be processed in parallel.
+
+*** Why it worked (and what new hole it dug)
+
+It worked because "fully connected" attention maps perfectly onto GPU dense matmul. But it carried a brutally simple cost: N tokens attending to each other means N×N attention scores to compute, store, and softmax. At N=128K that matrix is 16 billion elements — it simply does not fit in GPU memory. This is the starting point for every "efficient attention" paper that followed.
+
+** 2022 | FlashAttention: never let the N×N matrix land in memory
+
+*** What problem did it see?
+
+Tri Dao noticed a counterintuitive fact: on A100, measured attention time was not compute-bound — it was HBM bandwidth-bound. Computing Q*K produces an N×N matrix that must be written back to HBM, read again for softmax, written again, then read out to multiply with V — the cost of these round trips far exceeded the multiplications themselves.
+
+*** Its solution
+
+Never materialize the N×N matrix at all. Tile Q, K, and V into SRAM (the GPU's fast on-chip cache), and rewrite softmax into an "online" formulation — as each new tile is read, maintain running max and sum statistics, then directly accumulate the result into O. Only Q, K, V, and O ever touch HBM; the N×N intermediate vanishes entirely.
+
+*** Why it worked (and what new hole it dug)
+
+It worked because it aligned an algorithmically equivalent transformation with the hardware memory hierarchy. The amount *computed* did not change, but the amount *moved* dropped from O(N²) to O(N).
+
+But it left two things untouched: first, every matmul still runs in FP16 — no precision savings; second, attention FLOPs remain O(N²). FlashAttention solved the IO problem and handed the compute problem, unchanged, to the next generation.
+
+** 2024-25 | SageAttention: quantize attention matmuls to 8-bit
+
+*** What problem did it see?
+
+Quantizing linear layers (INT8, INT4 weights) had long been an industry standard, but the Q*K and P*V matmuls inside attention had always stayed at FP16. The reason: Q, K, and V contain stubborn outliers — channels tens of times larger than the rest — and naive quantization lets those outliers monopolize the integer representation range, crushing all other values and collapsing quality.
+
+*** Its solution
+
+*Smooth first, then quantize.* Apply a channel-wise invertible transformation to Q and K (transferring some of the outlier variance from one side to the other) so that both sides' dynamic ranges narrow into INT8/FP8-friendly territory. Then substitute quantized matmuls for the original FP16 ones.
+
+*** Why it worked (and what new hole it dug)
+
+8-bit matmul is ~2× faster and halves memory bandwidth. Smoothing is a mathematically lossless transformation, so quality is largely preserved.
+
+The hole it left: 8-bit is the comfortable ceiling for the outlier-smoothing approach. Dropping further to 4-bit means each number has only 16 representable values; the dynamic range adjustment from smoothing is no longer enough. At this moment Blackwell arrived with native 4-bit Tensor Core support. The key to the next stage became hardware plus microscaling formats.
+
+** 2025 | SageAttention3: 4-bit attention captures Blackwell's throughput dividend
+
+*** What problem did it see?
+
+On Blackwell, FP4 Tensor Core throughput is 4× that of FP16. But 4-bit has a dynamic range of only [−6, 6] — directly quantizing Q, K, V would squeeze all meaningful values into a handful of buckets. SageAttention's smoothing approach was no longer sufficient.
+
+*** Its solution
+
+Use the NVFP4 *microscaling format* with two-level scaling. Every 16 elements share an FP8 micro-scale; each tile then shares an FP32 outer-scale. Each group can thus "locally focus" on its own value range, and the FP4 representation only needs to express the relative magnitudes within those 16 elements. Both Q*K and P*V are moved entirely into FP4.
+
+*** Why it worked (and what new hole it dug)
+
+Quality holds on short contexts — within 4K tokens, FP4 stays within 1–2% of FP16.
+
+But *it collapses on long contexts*. Figure 3 of this paper explains why: FP4 error is not small, Gaussian white noise — it concentrates on a small number of query-key blocks, specifically near-diagonal blocks and blocks near attention sinks. These are precisely the blocks with the largest attention scores. On short contexts these blocks are few and their impact is limited; at 128K tokens the error accumulates, and the sparse distribution produced by softmax exponentially amplifies the cost of getting "important blocks" wrong.
+
+The entry point for the next paper is exactly this figure: if the error is non-uniform, why should every block get the same precision?
+
+** 2026 | ThriftAttention (this paper): assign precision by importance, not by averaging
+
+*** What problem did it see?
+
+SageAttention3's failure is not that FP4 is broken — it is that *using FP4 everywhere* is broken. If the error-concentrating minority of blocks (<5%) could be individually elevated to FP16 while the remaining 95% stayed in FP4, one should in theory capture FP4 speed while recovering FP16 quality. But there are two concrete obstacles:
+
+1. *How do you know which blocks are important without computing the full attention?* Computing it first defeats the purpose — block selection must be much cheaper than the computation itself.
+2. *How do you merge FP16-computed blocks and FP4-computed blocks into a single attention output?* Softmax is a global normalization; how does mixed precision avoid corrupting the distribution?
+
+*** Its solution
+
+For obstacle 1: score blocks using *block-mean dot products*. Take the token-mean of each query block to get q̄_i, and the token-mean of each key block to get k̄_j. The scoring function is Ŝ_ij = q̄_i · k̄_j. This requires only T_q × T_k operations (far fewer than the number of tokens) — essentially free. The top-k scoring blocks run FP16; the rest run FP4.
+
+For obstacle 2: reuse the *online softmax* mechanism from FlashAttention-2. The FP16 path and FP4 path each maintain their own running max, running sum, and partial output; at the end the two are merged into a single output using the standard online softmax combination rule. Online softmax was designed for streaming merges — mixed precision simply replaces "different tiles" with "tiles of different precision," and the logic is fully compatible.
+
+*** Why it works (and what holes remain)
+
+The theoretical error bound (paper Eq. 4) shows that each key's contribution to output error is |ε_j| · p_j · ‖v_j − o‖ — a product of three terms. p_j is highly concentrated due to the softmax exponential: high-scoring blocks have p_j values orders of magnitude larger than the rest. Switching those blocks to FP16 drives ε_j ≈ 0, which immediately suppresses overall error.
+
+Experimental results: with 5% of blocks in FP16, the method recovers 89.1% of the FP4→FP16 quality gap on average; at 25% it reaches 92.4%. End-to-end inference on long contexts is 2× faster than FP16. *The longer the context, the larger the advantage* — because uniform FP4 degrades more severely at longer contexts, and ThriftAttention precisely rescues the degraded portion.
+
+Remaining holes: block selection relies on the heuristic Ŝ_ij = q̄_i · k̄_j, with no theoretical guarantee that the selected blocks are truly the most important ones. Appendix A ablations show this simple heuristic is already close to oracle selection, but it may miss blocks when the attention distribution is highly irregular. A second hole: the kernel that fuses the FP16/FP4 dual paths on Blackwell has lower occupancy than a pure FP4 kernel; overhead comes primarily from the dequantization boundaries between the two streams.
+
+* Frontier Extensions
+
+ThriftAttention is a May 2026 paper — it is still at the frontier. But several parallel lines of exploration exist at the same moment and together sketch the shape of what comes next:
+
+- *SpargeAttn (Zhang et al., 2025e)*: the closest sibling. It combines block-sparsity and quantization — predicts which blocks are "essentially zero" and skips them entirely, running remaining blocks in INT8/FP8. The fundamental difference from ThriftAttention: SpargeAttn *deletes* unimportant blocks; ThriftAttention *demotes their precision*. Delete vs. demote: deletion requires certifying "what is dropped can truly be dropped"; demotion only requires "the error can be suppressed." The latter bound is looser and more robust.
+- *NSA / SLA (Yuan et al. / Zhang et al., 2025–26)*: let attention learn its sparse structure at training time. This requires modifying the training pipeline, raising the deployment barrier, but in principle the upside is larger — the sparse pattern is learned by the model itself rather than chosen post-hoc by a heuristic.
+- *Quest (Tang et al., 2024)*: use query-aware min-max bounds to select KV blocks online. An earlier sparse-selection work, sharing the same "block importance scoring" spirit as ThriftAttention, but Quest targets KV cache selection whereas ThriftAttention targets attention computation precision.
+
+A useful frame for 2026 efficient-attention research: two forks — *sparsification* (drop blocks) vs. *mixed precision* (vary block precision). ThriftAttention is the first paper to explicitly argue the latter is the more robust direction. My bet is that the next step will merge both — sparse + mixed-precision — further subdividing the 95% "unimportant" blocks into "run in FP4" and "skip entirely," pushing efficiency to its limit.
+
+* One Diagram
+
+#+begin_example
+                  Long-context attention acceleration main line (2017 -> 2026)
+                  Axis: how compute budget is allocated
+
+  Timeline ->
+  2017          2022          2024        2025          2026
+  ----          ----          ----        ----          ----
+  Vaswani       FlashAttn     Sage1/2     Sage3         ThriftAttn
+  full          IO-aware      INT8/FP8    FP4           FP4 + FP16
+  attention     tiling        attention   (uniform)     mixed
+   |             |             |           |             |
+   |             |             |           |             |
+   v             v             v           v             v
+  Bottleneck:   Bottleneck:   Bottleneck: Bottleneck:   Bottleneck:
+  N×N matrix    moving N×N    16-bit      FP4 quality   uniform
+  blows up      through HBM   matmul      collapse on   precision
+  memory        too costly    can go      long context  itself is
+                              lower                     the mistake
+   |             |             |           |             |
+  Solution:     Solution:     Solution:   Solution:     Solution:
+  parallel      tile into     quantize    microscaling  5% of blocks
+  Q-K-V         SRAM,         Q/K +       format +      run FP16,
+  matmul        online        outlier     two-level     rest FP4,
+                softmax       smoothing   scaling       online softmax
+                                                        merge
+
+  -------------------- Side branch (sparsity route) --------------------
+
+  Quest (2024)         -->        SpargeAttn (2025)    -->  NSA/SLA (2025-26)
+  query-aware                     block-sparse +              trained sparse
+  KV block selection              quantization                 structure
+       |                                |                           |
+       v                                v                           v
+  "unimportant blocks          "near-zero blocks           "let the model learn
+   simply not attended"         skipped entirely"           its own sparse pattern"
+
+  ====================== Inflection point (ThriftAttention) ======================
+
+  Everyone before assumed: one precision (or one sampling strategy) per attention op
+  ThriftAttention is first to say: wrong — precision itself should flow with importance;
+                                    5% of blocks determine 95% of quality;
+                                    give 95% of the compute budget to that 5%
+
+  Vertical view: each generation solves the "savings" problem the previous one left behind
+                 (save IO -> save precision -> push precision to limit -> save unevenly)
+  ThriftAttention is first to stop asking "can we save more?"
+                  and instead ask "can we save *unevenly*?"
+#+end_example
+
+* Core Insight
+
+On the surface this evolutionary line is a technical iteration of "attention gets cheaper each generation." What is actually happening underneath is three shifts in *how compute resources are allocated*:
+
+1. *From "compute" to "movement"* (the FlashAttention step). Researchers realized the LLM bottleneck is not FLOPs but the memory hierarchy. After this, all optimization began aligning with hardware — what goes in SRAM, what stays in HBM, how kernels are tiled — matters more than the algorithm itself.
+
+2. *From "full precision" to "low bit-width"* (the SageAttention / SageAttention3 steps). The recognition that attention math does not need 16-bit precision — 8-bit and 4-bit can work — and that the key is finding a format that expresses "local range." Microscaling turns the "global outlier" problem into a "local group" problem.
+
+3. *From "uniform allocation" to "importance-weighted allocation"* (the ThriftAttention step, just now). Everyone before treated attention as homogeneous — all query-key pairs on equal footing. This paper is the first to say: "No — attention is inherently highly non-uniform (softmax makes it that way), so the compute budget should follow that non-uniform distribution."
+
+The third shift is actually part of a much larger tide. The same reasoning has already swept through KV cache (H2O stopped treating all tokens as equally important), weight quantization (mixed-precision quantization), and MoE (experts are not uniformly activated). LLM systems optimization is broadly moving from *uniform* toward *importance-weighted*. ThriftAttention is the wave of that tide breaking on attention computation precision.
+
+Where does it go next? Two directions I would bet on:
+- *Sparsity and mixed precision converge.* Within the 95% "unimportant" blocks, make one more cut: truly near-zero blocks are skipped entirely, medium blocks run in FP4, important blocks run in FP16. Three-tier allocation.
+- *Importance estimation goes from heuristic to learned.* q̄·k̄ is a coarse proxy; future work will have a dedicated lightweight "router" trained to decide which blocks get high precision — analogous to MoE gating, but along the precision dimension.
+
+* Takeaways
+
+When reading papers, don't just read "what are the results" — read "what assumption, accepted by everyone before, is being challenged." The essence of ThriftAttention is not in the algorithm box; it is in noticing the blind spot everyone shared: "give the entire attention operator a single uniform precision." Once that blind spot is named, the boundary between the sparsity camp and the quantization camp starts to blur — they are actually the two extremes of the same thing (drop = precision of 0, full precision = no change), and the vast design space in between — "allocate bit budget by importance" — had always been empty.
+
+Practical implications:
+
+- If you are building an inference system, use "importance-weighted resource allocation" as a guiding thread to audit your stack — KV cache, attention precision, expert routing, prefill/decode allocation, kernel scheduling. Wherever the default is "uniform," ask: "Is this uniformity real, or just the easy choice?"
+- If you are choosing a research direction, look for analogous "everyone assumes X should be treated uniformly" assumptions in other sub-areas — that is likely where the next ThriftAttention-style paper lives. For instance: are all token positional encodings equally important? Does every layer's attention equally need long context? Does every attention head need the same precision?
+- If you do kernel or systems work, remember: uniformity is the most engineering-convenient design, but it is rarely performance-optimal. Each step toward non-uniform allocation raises the performance ceiling — provided you can estimate "who is more important" cheaply. That "cheap importance estimator" is itself a worthwhile sub-problem.

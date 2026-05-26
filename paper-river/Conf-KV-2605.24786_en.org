@@ -1,0 +1,208 @@
+#+title:      CONF-KV: Confidence-Aware KV Cache Eviction with Mixed-Precision Storage for Long-Horizon LLM
+#+date:       [2026-05-26 Tue 11:08]
+#+filetags:   :paper:river:en:
+#+identifier: 20260526T110800-en
+#+source:     https://arxiv.org/abs/2605.24786
+#+authors:    Yubo Li, Yidi Miao
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* The Problem River
+
+Long contexts arrive, and the KV cache promptly takes over GPU memory — Qwen-32B needs 15.8 GB of cache alone for a 4K-step generation. Everyone is working on the same question: which tokens stay in the cache, and which get evicted? Sliding-window simply discards old tokens; H2O ranks by "historical attention" and keeps the top scorers; Scissorhands looks at "persistence"; SnapKV selects tokens during the prompt phase and locks in the choice; PyramidKV lets deeper layers keep fewer tokens. Further along, Ada-KV, ZigZagKV, and UNComp start using "uncertainty" to allocate budgets across heads and layers.
+
+The default assumption running through the entire line is: *budgets are set globally, based on the past*. Either they are fixed once during the prompt phase, or once per head/layer, or ranked by historical attention scores. Conf-KV is the first to point out a gap in this default — every decoding step already produces a next-token distribution, and the shape of that distribution directly tells you "how uncertain the model is right now." This is a free signal that the entire field has ignored. At the very moment the model needs to look up an obscure fact, its confidence collapses. Conf-KV relaxes the budget when the model is uncertain and tightens it when confident — making the budget vary over time for the first time.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | What it saw: RNN sequential dependencies block parallel training
+  | What it did: discard temporal recurrence; rely purely on Q-K-V
+  |              matrix products; store historical K/V during decoder
+  |              inference to avoid recomputation -> KV cache is born
+  | What it left open: as sequences grow, KV cache exhausts memory;
+  |                    no mechanism decides "which tokens are still
+  |                    worth keeping"
+  v
+[2023] Xiao et al. - Streaming-LLM / Attention Sinks
+  |
+  | What it saw: KV grows linearly during long generation; naive
+  |              truncation causes PPL to explode immediately —
+  |              because the first few tokens (sinks) absorb most
+  |              attention
+  | What it did: keep the leading few sink tokens + the most recent
+  |              N tokens; discard everything in between
+  | What it left open: the only criterion is "position" — an old but
+  |                    critical fact (the needle in Needle-in-a-Haystack)
+  |                    is lost forever once it falls outside the window
+  v
+[2023] Zhang et al. - H2O (Heavy Hitter Oracle)
+  |
+  | What it saw: sliding window's wound — position is a poor retention
+  |              signal; some old tokens are accessed frequently
+  |              (heavy hitters)
+  | What it did: accumulate an attention score per token; rank by
+  |              score; keep top-K; evict the tail
+  | What it left open: "historical attention" is lagged — a rare entity
+  |                    may not be noticed until the very query step
+  |                    arrives, but by then it has already been evicted;
+  |                    and the budget K is still fixed
+  v
+[2024] Li et al. / Liu et al. / Cai et al. - SnapKV, Scissorhands, PyramidKV
+  |
+  | What it saw: H2O ranks by cumulative attention, but (a) importance
+  |              is not necessarily persistent (Scissorhands), (b) the
+  |              prompt phase already reveals which tokens will be
+  |              reused (SnapKV), (c) deep-layer attention is more
+  |              focused than shallow-layer; equal budgets per layer
+  |              are wasteful (PyramidKV)
+  | What it did: Scissorhands introduces a "persistence" metric;
+  |              SnapKV fixes the retention set in a single prompt-phase
+  |              pass; PyramidKV shrinks budgets toward deeper layers
+  | What it left open: budgets are still decided once — either at
+  |                    prompt time or per layer. No matter what content
+  |                    the model encounters during decoding, the budget
+  |                    curve never moves
+  v
+[2024-2025] Feng et al. / Liu et al. / Xiong et al. - Ada-KV, ZigZagKV, UNComp
+  |
+  | What it saw: a one-shot budget is too rigid. Can "uncertainty"
+  |              guide allocation? Ada-KV uses attention-output loss
+  |              to guide inter-head allocation; ZigZagKV uses layer
+  |              uncertainty to set per-layer budgets; UNComp uses
+  |              matrix entropy to expose sparse structure
+  | What it did: make budgets sensitive to internal signals along the
+  |              head or layer dimension
+  | What it left open: uncertainty is applied in "space" (which head,
+  |                    which layer) but not in "time" (the current step);
+  |                    and the uncertainty signals used are all
+  |                    intermediate by-products — nobody reads the most
+  |                    direct signal: the output distribution itself
+  v
+[2026] Li & Miao - Conf-KV (this paper)
+
+  What it saw: the entire line adjusts "budgets" along the head /
+               layer / global dimension, but the *next-token
+               distribution* is already computed every step; its
+               entropy / margin / top-p directly tells you "how
+               uncertain the model is right now" — this signal is
+               used by nobody
+  What it did: c = 0.4*(1-Ĥ) + 0.3*σ(margin) + 0.3*p(1)
+               c >= τ → tight budget N_high; c < τ → relaxed budget
+               N_low. Budget varies over time for the first time.
+               Paired with FP16/INT8 mixed precision + pyramid layer
+               budgets.
+  Core shift: KV management moves from "past signals set spatial
+              budgets" to "present signals set temporal budgets" —
+              decision granularity goes from one-shot / per-layer
+              down to per-step
+#+end_example
+
+* Reading the Papers in Order
+
+** The Starting Point: Transformers Leave KV Behind (2017)
+
+The story has to start with Vaswani et al. — not because of anything it said about attention, but because it quietly left behind something called the KV cache. During autoregressive generation, every time the decoder produces a new token, all previous tokens' Keys and Values must participate in attention. Recomputing them is too expensive, so the community agreed to store them.
+
+Nobody thought of it as a problem at the time. Generating 100 or 200 tokens, the cache stayed manageable. The trouble came later — when people started feeding entire books to models, running multi-turn agents, and doing long-document summarization. The cache grows linearly with context length and linearly with layer count. Qwen-32B with a 4K-step generation plus prefill needs 15.8 GB — more than everything else outside the model weights combined.
+
+The first paper to treat "how to manage the KV cache" as a genuine systems problem was Streaming-LLM.
+
+** The First Cut: Streaming-LLM Discards the Middle (2023)
+
+Streaming-LLM (Xiao et al.) wanted to support infinite-length generation. Their finding was counterintuitive: you might think keeping the most recent N tokens is enough, yet PPL explodes immediately. Closer inspection reveals why — the very first few tokens (which they call "attention sinks") absorb a large share of attention; cutting them removes the anchor for the softmax denominator.
+
+Their solution: keep the first 4 sink tokens plus the most recent N tokens, and discard everything in between. Simple, effective, and capable of handling unlimited lengths.
+
+But the only criterion is *position*. The method has no idea whether an old token is critical. If a key fact is introduced at step 1000 and needed at step 10000, it will have long since fallen out of the window.
+
+The Needle-in-a-Haystack benchmark was designed precisely to exploit this weakness — hide a "needle" somewhere in a long context and ask the model to retrieve it during generation. In Conf-KV's experiments, Sliding-512 achieves only 53.8% accuracy on a 32K haystack. Streaming's wound is clear: a better signal is needed to decide what to keep.
+
+** The Second Cut: H2O Scores by Cumulative Attention (2023)
+
+H2O (Zhang et al., NeurIPS 2023) saw Streaming's wound and offered the first content-based solution: accumulate the attention each cached token has received over its history. High-attention tokens — called *heavy hitters* — are kept; low-attention tokens are evicted.
+
+This is a simple but powerful idea. It replaces "position" with "frequency of use." An old token that is repeatedly accessed will not be dropped for being distant; a recent token that is never queried can still be evicted (outside a small protected recency window).
+
+But H2O leaves two problems open. First: cumulative attention is *lagged*. A rare entity — say, a person's name — may not receive attention until the very query step that needs it. Before that step, its cumulative score stays low, and under H2O's rules it will have been evicted long before it is needed.
+
+Second: the budget K is fixed. Regardless of whether the model is handling an easy or hard task at a given moment, the cache size stays the same. In Conf-KV's experiments, H2O reaches 80.6% on NIAH — much better than the sliding-window baseline, but still unable to recover nearly 20% of the needles.
+
+** The Third Cut: SnapKV / Scissorhands / PyramidKV Each Patch a Different H2O Wound (2024)
+
+A wave of targeted improvements followed H2O.
+
+Scissorhands (Liu et al.) observed that being attended to is not the same as being *persistently* attended to. They introduce a persistence metric — a token must be frequently accessed across multiple time windows to be considered important. This eliminates false positives that are noticed briefly and then forgotten.
+
+SnapKV (Li et al.) reasoned in the opposite direction: rather than making dynamic decisions during decoding, one can determine during the prompt phase — in a single pass — *which prompt tokens will be revisited repeatedly during generation*. The prompt phase is relatively cheap; one pass yields a fixed retention set.
+
+PyramidKV (Cai et al.) noticed a structural fact: deep-layer attention is more focused than shallow-layer attention, making equal budgets across layers wasteful. So they let the budget decrease with depth — larger budgets in early layers, smaller in late layers.
+
+All three improve on H2O, but what they improve is the *allocation scheme* — by temporal persistence, by prompt phase, or by layer. A shared characteristic: *the budget is still decided in one shot*. Scissorhands fixes it and never changes the curve; SnapKV locks it in after the prompt; PyramidKV's layer pyramid is a structural constant. No matter what the model encounters during decoding, the curve does not move.
+
+** The Fourth Cut: Ada-KV / ZigZagKV / UNComp Introduce Uncertainty (2024–2025)
+
+This wave recognized the problem with one-shot budgeting and began inserting *uncertainty* into the decision.
+
+Ada-KV (Feng et al.) uses attention-output loss as a signal to allocate budget across heads — heads with higher loss receive a larger share.
+
+ZigZagKV (Liu et al.) uses layer-level uncertainty to set per-layer budgets — more uncertain layers retain more.
+
+UNComp (Xiong et al.) uses matrix entropy to expose sparse structure and long-range dependency structure in the cache.
+
+This is a genuine shift: from "use past attention" to "use the model's internal uncertainty." For the first time, the budget responds to the model's own state.
+
+But there is still one step missing — *uncertainty is applied along the spatial dimension, not the temporal one*. Ada-KV adjusts the inter-head budget; ZigZagKV adjusts the inter-layer budget. Both distribute a spatial quota once before or during decoding. The model uses the same allocation rule at step 200 and at step 2000.
+
+More fundamentally, the uncertainty signals they use are all *intermediate by-products* (attention-output loss, layer entropy, matrix entropy). Yet every step the model already computes next-token logits and softmaxes a distribution — that distribution is the most direct "how uncertain am I right now" signal available, it is right there, it costs nothing extra, and nobody has read it.
+
+** The Destination: Conf-KV Makes the Budget Vary Over Time (2026)
+
+Conf-KV reads that free signal.
+
+The mechanism is almost too simple to explain: from the next-token distribution p, compute three quantities — normalized entropy Ĥ, log-prob margin, and top-token probability p(1) — then combine them into a confidence score c in [0, 1]:
+
+#+begin_example
+c = 0.4*(1 - Ĥ) + 0.3*σ(log p(1) - log p(2)) + 0.3*p(1)
+#+end_example
+
+When c is high (the model is confident about the next token), use the tight budget N_high; when c is low (the model is hesitating), use the relaxed budget N_low. Threshold τ = 0.7. Within-budget ranking uses a weighted combination of cumulative attention and recency — inheriting the spirit of H2O. A recency window P (the most recent 32 or 64 tokens are never evicted) protects local coherence.
+
+On top of this: *FP16/INT8 mixed precision* (the most recent W tokens stay in FP16; older tokens are quantized to INT8) and *pyramid layer budgets* (the Conf-KV-L variant, borrowing from PyramidKV).
+
+The most compelling result in the experiments is not the absolute numbers but the *ablation*: replacing Conf-KV's "confidence-gated budget" with "eviction at the same frequency but chosen randomly" causes PPL to degrade from 30.92 to 36.54 — worse than the sliding-window baseline. This shows that what Conf-KV actually contributes is not evicting less, but *evicting at the right moment*.
+
+Even more elegant is the *mechanistic validation*: the authors run a KL-shift experiment — mask the most recent 256 tokens and observe how the next-token distribution changes. The result is a strong negative Pearson correlation of r = −0.77 between confidence and KL shift. That is: when the model's confidence is high, discarding old context has little effect on its prediction; when confidence is low, discarding old context causes a large prediction shift — *which is precisely the premise on which the strategy rests*. The premise passes validation, so the method is not merely empirically effective; it has a mechanistic explanation.
+
+Results: NIAH 32K — Conf-KV 91.4% vs. sliding 53.8% vs. H2O 80.6%; on VWA, 95.3% of full-KV success rate is preserved with memory reduced below 2.8×; Qwen-32B 4K-generation cache memory drops from 15.8 GB to 2.6 GB.
+
+* What Is Really Changing Beneath This Line
+
+| Stage | Basis for deciding which tokens to keep | Decision granularity |
+|-------+-----------------------------------------+---------------------|
+| Sliding-window | Position | Globally fixed |
+| H2O / Scissorhands | Cumulative attention | Globally fixed budget |
+| SnapKV | Predictability from the prompt phase | One-shot at prompt time |
+| PyramidKV | Empirical rule (fewer in deep layers) | Per-layer (static) |
+| Ada-KV / ZigZagKV | Internal uncertainty (head/layer by-products) | Per-head / per-layer |
+| Conf-KV | Current output uncertainty | *Per decoding step* |
+
+On the surface this looks like technical iteration — more precise eviction, lower memory. But the deeper change is *decision granularity*: from "decided once" to "reconsidered every step."
+
+At a deeper level still: the *source of the signal* is converging. The earliest methods used token position (external, independent of model state); then historical attention (a model by-product, lagged); then internal uncertainty (a model by-product, spatial dimension); finally the output distribution (a direct model product, present moment, zero added cost). The trend is clear — *signals are becoming ever closer to the model's current true state; decisions are becoming finer-grained and, simultaneously, cheaper*.
+
+The next steps along this line are almost certain to go in two directions:
+
+1. *Stack Conf-KV's "temporal dimension" with Ada-KV/ZigZagKV's "spatial dimension"* — allocate per head/layer and also modulate per step. Conf-KV already validates that the two are orthogonal.
+2. *Treat next-token confidence as a general-purpose "system signal"* — it has already been used for early exit, speculative decoding, and now KV eviction. Nobody has yet applied it to prefetching, dynamic precision switching, or dynamic sparsity at the systems level. Once that happens, "the model telling the system how to schedule itself" could become a genuinely interesting paradigm.
+
+A more aggressive direction: let confidence not only *choose a budget* but *choose a behavior* — low confidence triggers context re-reading / high-precision pathways; high confidence enables layer skipping / low-precision paths. Conf-KV has already opened the door a crack.
+
+* Honest Annotations
+
+- All citation relationships come from explicit statements in the paper's Related Work section (H2O[26], Scissorhands[14], SnapKV[13], FastGen[8], PyramidKV[4], Ada-KV[7], ZigZagKV[27], UNComp[24], Sliding window/Streaming-LLM[23,1]); these are *confirmed*.
+- Treating Streaming-LLM[23] as the representative paper of the sliding-window line is *an inference* — it is also possible that Conf-KV's "sliding window baseline" refers to earlier work such as Longformer or naive truncation. However, the attention-sink concept is strongly associated with Streaming-LLM in the community, so the choice is reasonable.
+- The "next steps for Conf-KV" paragraph is entirely *speculation*, not paper content.
+- The first node (Transformer 2017) is a *narrative starting point*; the paper itself does not cite it — it is included to help readers unfamiliar with KV caches build intuition from the source. Readers may treat it as: "if you have no idea what a KV cache is, here is where it came from."
+- Author attributions for Ada-KV / ZigZagKV / UNComp are taken from implicit information in Conf-KV's reference list and have not been verified against the original papers' full author names.

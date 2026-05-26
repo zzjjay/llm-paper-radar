@@ -1,0 +1,187 @@
+#+title:      CONF-KV: Confidence-Aware KV Cache Eviction with Mixed-Precision Storage for Long-Horizon LLM
+#+date:       [2026-05-26 Tue 11:08]
+#+filetags:   :paper:river:
+#+identifier: 20260526T110800
+#+source:     https://arxiv.org/abs/2605.24786
+#+authors:    Yubo Li, Yidi Miao
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* 问题之河
+
+长上下文一来，KV 缓存就接管了 GPU 显存——Qwen-32B 跑 4K 生成步就要 15.8 GB 单缓存。所有人都在做同一件事：决定哪些 token 留在缓存里、哪些扔掉。Sliding-window 直接砍掉旧的，H2O 按"历史注意力"排个序留高分的，Scissorhands 看"持久性"，SnapKV 看 prompt 阶段就预先选好，PyramidKV 让深层少留一点。再往后 Ada-KV、ZigZagKV、UNComp 开始把"不确定性"用来分配 head/layer 之间的预算。
+
+整条线的默认假设是：*预算是全局拍板的，依据是过去*。要么 prompt 阶段拍一次，要么按 head/layer 拍一次，要么拿历史注意力分排序。Conf-KV 第一次指出这个默认有个洞——你每一步解码都会算一次 next-token 分布，那个分布的形状直接告诉你"模型这一步有多不确定"，这是免费信号，被整条线忽略了。模型当下要查冷门事实的瞬间，置信度会塌；不确定的时候放宽预算，确定的时候收紧，预算第一次随时间走。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 看到了什么: RNN 序列依赖让训练并行不了
+  | 怎么办: 扔掉时序递归，纯靠 Q-K-V 矩阵乘；decoder 推理时把
+  |        历史 K/V 存下来避免重算 -> KV cache 诞生
+  | 留了什么坑: 序列一长，KV cache 就吃光显存；没有任何机制
+  |             决定"哪些 token 还值得留"
+  v
+[2023] Xiao et al. - Streaming-LLM / Attention Sinks
+  |
+  | 看到了什么: 长生成下 KV 线性膨胀，朴素截断会让 PPL 立刻爆炸
+  |             ——因为前几个 token (sink) 吸收了大量注意力
+  | 怎么办: 留住最前面几个 sink + 最近 N 个 token，中间全扔
+  | 留了什么坑: 决策依据只有"位置"——一个旧但关键的事实
+  |             (Needle-in-a-Haystack 里的针) 一旦掉出窗口就永远丢了
+  v
+[2023] Zhang et al. - H2O (Heavy Hitter Oracle)
+  |
+  | 看到了什么: sliding window 的伤口——位置不是好的留存信号，
+  |             有些旧 token 一直被频繁访问 (heavy hitters)
+  | 怎么办: 给每个 token 累计一个注意力分数，按分数排序，
+  |         留 top-K，扔尾部
+  | 留了什么坑: "历史注意力"是滞后的——一个稀有实体可能要等到
+  |             查询到来那一步才被注意到，但那时它早被驱逐了；
+  |             而且预算 K 仍是固定的
+  v
+[2024] Li et al. / Liu et al. / Cai et al. - SnapKV, Scissorhands, PyramidKV
+  |
+  | 看到了什么: H2O 用累计注意力排序，但 (a) 重要性不一定持久
+  |             (Scissorhands), (b) prompt 阶段已经能看出哪些 token
+  |             会被反复用 (SnapKV), (c) 深层注意力比浅层更聚焦，
+  |             各层用同等预算是浪费 (PyramidKV)
+  | 怎么办: Scissorhands 引入"持久性"指标；SnapKV 在 prompt 阶段
+  |         一次性决定保留集；PyramidKV 让深层预算小、浅层预算大
+  | 留了什么坑: 预算仍然是一次性决定的——要么 prompt 阶段定，
+  |             要么按层定。解码过程中无论模型遇到什么内容，
+  |             预算曲线不动
+  v
+[2024-2025] Feng et al. / Liu et al. / Xiong et al. - Ada-KV, ZigZagKV, UNComp
+  |
+  | 看到了什么: 一次拍板的预算太死。能不能用"不确定性"来分配？
+  |             Ada-KV 用 attention-output 损失指导 head 间分配；
+  |             ZigZagKV 用层不确定性分配层预算；
+  |             UNComp 用矩阵熵暴露稀疏结构
+  | 怎么办: 让预算在 head 维度或 layer 维度上对内部信号敏感
+  | 留了什么坑: 不确定性用在了"空间"上 (哪个 head, 哪个 layer)，
+  |             但还没用在"时间"上 (当前这一步)；而且使用的不确定性
+  |             都是中间层的副产物，没人去读最直接的信号——
+  |             output distribution 本身
+  v
+[2026] Li & Miao - Conf-KV (本文)
+
+  看到了什么: 整条线把"预算"放在 head/layer/global 维度上调，
+              但 *next-token 分布* 每一步都现成的，它的熵/margin/top-p
+              直接告诉你"这一步模型有多没把握"——这个信号没人用
+  怎么办: c = 0.4*(1-Ĥ) + 0.3*σ(margin) + 0.3*p(1)
+          c >= τ 用紧预算 N_high, c < τ 用松预算 N_low
+          预算第一次随时间动；配 FP16/INT8 混精度 + 金字塔层预算
+  本质转向: KV 管理从"过去信号定空间预算"转向
+            "当下信号定时间预算"——决策粒度从一次性 / 每层
+            细到每一步
+#+end_example
+
+* 一篇一篇正向看
+
+** 起点：Transformer 把 KV 留了下来 (2017)
+
+故事得从 Vaswani 那篇说起，但不是因为它讲了什么注意力——而是因为它顺手留了个东西叫 KV cache。Decoder 在自回归生成时，每生成一个 token，前面所有 token 的 Key 和 Value 都要重新参与 attention。重算太贵，于是大家约定把它们存下来。
+
+那时候没人觉得这是问题。生成 100 个 token、200 个 token，cache 也就那么大。问题是后来——人们开始让模型读整本书、跑多轮 agent、做长文档总结。Cache 随上下文线性膨胀，随层数线性膨胀。Qwen-32B 跑 4K 生成步、配上 prefill 就要 15.8 GB——比模型权重之外的所有东西加起来还大。
+
+第一篇真正把"KV cache 该怎么管"当成系统问题的，是 Streaming-LLM。
+
+** 第一刀：Streaming-LLM 砍掉中间 (2023)
+
+Streaming-LLM (Xiao 等) 想做无限生成。他们的发现挺反直觉：你以为留最近 N 个 token 就够了，结果 PPL 立刻爆炸。仔细一查——是最前面几个 token (他们叫 "attention sink") 吸收了大量注意力，砍掉它们等于砍掉 softmax 的分母锚点。
+
+他们的方案是：留前 4 个 sink + 最近 N 个 token，中间全扔。简单、有效、能跑无限长。
+
+但这个方案的判定标准只有一个——*位置*。它不知道某个旧 token 是不是关键。如果你在第 1000 步埋了一个事实，第 10000 步才需要它，那这个事实早就掉出窗口了。
+
+Needle-in-a-Haystack 这个评测就是冲着 sliding window 的弱点设计的——把一根"针"藏在长上下文某个位置，让模型生成时去找它。Conf-KV 的实验里，Sliding-512 在 32K haystack 上只有 53.8% 的准确率。Streaming 的伤口很明显：得用别的信号决定留谁。
+
+** 第二刀：H2O 按累计注意力打分 (2023)
+
+H2O (Zhang 等, NeurIPS 2023) 看到了 Streaming 的伤口，给出第一个"基于内容"的方案：给每个 cache 中的 token 累计它历史上收到过的注意力。注意力高的——他们叫 *heavy hitter*——留下；低的扔掉。
+
+这是个简单但很有力的想法。它把"位置"换成了"使用频率"。一个被反复访问的旧 token 不会因为远而被丢，一个从不被访问的近 token 也可以被淘汰 (除了最近的 protected window)。
+
+但 H2O 留下两个坑。第一个：累计注意力是 *滞后* 的。一个稀有实体——比如某个人名——可能直到查询到来那一步才被注意到。那一步之前，它的累计分一直很低，按 H2O 的规则早被驱逐了，等到要用的时候没了。
+
+第二个：预算 K 是固定的。无论模型当下在做简单任务还是难任务，都用同样大小的缓存。Conf-KV 论文里 H2O 在 NIAH 上拿到 80.6%——比 sliding window 强很多，但还是有近 20% 的针找不回来。
+
+** 第三刀：SnapKV / Scissorhands / PyramidKV 分别补 H2O 的不同伤口 (2024)
+
+H2O 之后是一阵集中改进。
+
+Scissorhands (Liu 等) 看到："被注意"不等于"持续被注意"。他们引入持久性指标——一个 token 要在多个时间窗口都被频繁访问才算重要。这剔掉了那种"瞬间被关注一下就再无人问津"的假阳性。
+
+SnapKV (Li 等) 反过来想：与其在解码中动态决定，不如在 prompt 阶段就一次性看清楚——*哪些 prompt token 会被生成阶段反复访问*。Prompt 阶段相对廉价，看完一次就能给出一个固定的保留集。
+
+PyramidKV (Cai 等) 注意到一个结构性事实：深层注意力比浅层更聚焦，深层用同样大的预算是浪费。于是让预算沿层数递减——浅层留多，深层留少。
+
+这三篇都在改 H2O，但改的是 *分配方式*——按时间持久性 / 按 prompt / 按层。一个共同的特征：*预算还是一次拍板的*。Scissorhands 拍一次后预算曲线不动，SnapKV 在 prompt 后就锁死，PyramidKV 的层金字塔是结构常量。解码过程中不管模型遇到什么内容，曲线不变。
+
+** 第四刀：Ada-KV / ZigZagKV / UNComp 把"不确定性"引进来 (2024-2025)
+
+这一波看到了"一次拍板"的问题，开始往里塞 *不确定性*。
+
+Ada-KV (Feng 等) 用 attention-output 的损失作为信号，分配 head 之间的预算——损失大的 head 多给点。
+
+ZigZagKV (Liu 等) 用层不确定性来分配层预算——更不确定的层多留。
+
+UNComp (Xiong 等) 用矩阵熵暴露 cache 中的稀疏结构和长程依赖结构。
+
+这是真正的转向：从"用过去的注意力"到"用模型内部的不确定性"。预算第一次对模型自己的状态敏感了。
+
+但他们都还差一步——*不确定性用在了空间维度，没用在时间维度*。Ada-KV 调 head 间预算，ZigZagKV 调 layer 间预算。两者都是"在整个解码过程开始前/过程中分配一次空间份额"。模型生成第 200 步和第 2000 步用的还是同一个分配规则。
+
+更关键的——他们用的不确定性都是 *中间层副产物* (attention output loss, layer entropy, matrix entropy)。但模型每一步都会算 next-token logits 然后 softmax 出分布——这个分布本身就是最直接的"我现在多不确定"信号，它就在那儿、不用额外计算、还没人去读。
+
+** 终点：Conf-KV 让预算随时间动 (2026)
+
+Conf-KV 把这个免费信号读了出来。
+
+机制简单到几乎没什么可解释的：把 next-token 分布 p 算三个量——归一化熵 Ĥ、log-prob margin、top-token 概率 p(1)，加权得到一个 0-1 之间的置信度 c：
+
+#+begin_example
+c = 0.4*(1 - Ĥ) + 0.3*σ(log p(1) - log p(2)) + 0.3*p(1)
+#+end_example
+
+c 高的时候 (模型很确定下一个 token 是什么) 用紧预算 N_high；c 低的时候 (模型在犹豫) 用松预算 N_low。阈值 τ = 0.7。预算内部排序用累计注意力 + recency 的加权和——这个继承了 H2O 的精神。再保护一个最近的窗口 P (最近 32 或 64 个 token 不动)，避免局部连贯性被打断。
+
+加上 *FP16/INT8 混精度* (最近 W 个 token 留 FP16，旧的量化到 INT8) 和 *金字塔层预算* (Conf-KV-L 变体，借了 PyramidKV 的思路)。
+
+实验里最有说服力的不是绝对数字，而是 *消融*：把 Conf-KV 的"按置信度切预算"换成"同样频率但随机扔"，PPL 从 30.92 退到 36.54，比 sliding window 还差。这说明 Conf-KV 真正起作用的不是"扔得少"，是"在该扔的时候扔、该留的时候留"。
+
+更漂亮的是 *机制验证*：他们做了一个 KL 偏移实验——遮蔽最近 256 个 token，看 next-token 分布怎么变。结果置信度和 KL 偏移有 Pearson r = -0.77 的强负相关。也就是说，当模型置信度高的时候，扔掉旧上下文对它影响小；置信度低的时候，扔掉旧上下文会让它的预测大变——*这正是这个策略赖以成立的前提*。前提验证通过了，方法就不只是经验上有效，而是有机制上的解释。
+
+效果：NIAH 32K 上 Conf-KV 91.4% vs sliding 53.8% vs H2O 80.6%；VWA 上保留 95.3% 的 full-KV 成功率、内存降到 2.8x 以下；Qwen-32B 4K 生成显存从 15.8 GB 降到 2.6 GB。
+
+* 这条线背后真正在变化什么
+
+| 阶段 | 留谁的决策依据 | 决策粒度 |
+|------+---------------+---------|
+| Sliding-window | 位置 | 全局固定 |
+| H2O / Scissorhands | 累计注意力 | 全局固定预算 |
+| SnapKV | prompt 阶段的可预测性 | prompt 时一次性 |
+| PyramidKV | 经验规则 (深层少) | 按层 (静态) |
+| Ada-KV / ZigZagKV | 内部不确定性 (head/layer 副产物) | 按 head / 按 layer |
+| Conf-KV | 当下 output 不确定性 | *按解码步* |
+
+表面看是技术迭代——压得更准、内存更省。但底下真正的变化是 *决策粒度*：从"一次拍板"到"每一步重新看"。
+
+更深一层：使用的 *信号源* 在收敛。最早用 token 位置 (外部、与模型状态无关)，然后用历史注意力 (模型副产物、滞后)，然后用内部不确定性 (模型副产物、空间维度)，最后用 output 分布 (模型直接产物、当下、零成本)。这是个明显的趋势——*越来越贴近模型当下的真实状态，决策越来越细，且越来越免费*。
+
+这条线的下一步，几乎可以肯定会沿两个方向走：
+
+1. *把 Conf-KV 的"时间维度"和 Ada-KV/ZigZagKV 的"空间维度"叠起来*——既按 head/layer 分配，又按 step 调节。Conf-KV 已经验证两者正交。
+2. *把 next-token confidence 当成更一般的"系统信号"*——它已经被用过早退出 (early exit)、speculative decoding、现在被用于 KV eviction。但还没人把它用到 prefetching、动态精度切换、动态稀疏性这些更系统的层面。一旦做到，"模型自己告诉系统该怎么调度自己"会成为一个有意思的范式。
+
+更激进的方向：让置信度不只是 *选预算*，而是 *选行为*——置信度低就触发回看 / 复读上下文 / 切高精度路径，置信度高就跳层 / 走低精度。Conf-KV 已经把门开了一条缝。
+
+* 诚实标注
+
+- 引用关系都来自论文 Related Work 显式声明 (H2O[26], Scissorhands[14], SnapKV[13], FastGen[8], PyramidKV[4], Ada-KV[7], ZigZagKV[27], UNComp[24], Sliding window/Streaming-LLM[23,1])，是 *确认的*。
+- 把 Streaming-LLM[23] 视为 sliding-window 这条线的代表论文是 *推测*——也可能 Conf-KV 心里的"sliding window baseline"指的是更早期的 Longformer / 朴素截断。但 attention sink 这个概念在领域内已经和 Streaming-LLM 强绑定，作为代表合理。
+- "Conf-KV 的下一步" 这段全部是 *推断*，不是论文内容。
+- 第一层 (Transformer 2017) 是 *叙事起点*，论文本身没引用——是为了让外行读者从 KV cache 的起源开始建立直觉。读者可以理解为"如果你完全不懂 KV cache 是什么，这里是它的来历"。
+- Ada-KV / ZigZagKV / UNComp 的作者归属取自 Conf-KV 引用列表的隐含信息，没有逐一去原论文核对作者全名。

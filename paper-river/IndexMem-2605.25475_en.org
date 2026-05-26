@@ -1,0 +1,280 @@
+#+title:      IndexMem: Learned KV-Cache Eviction with Latent Memory for Long-Context LLM Inference
+#+date:       [2026-05-26 Tue 10:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260526T103346-en
+#+source:     https://arxiv.org/abs/2605.25475
+#+authors:    Xintong Yang, Hao Gu, Binxing Xu, Lujun Li, Bei Liu, Jiacheng Liu, Qiyuan Zhu, Sirui Han, Yike Guo (HKUST)
+#+venue:      arXiv 2026.05 (ICML 2026 submission)
+
+* The Problem River
+
+A large model tasked with reading a one-million-token codebase or video stream faces an immediate crisis: the moment decoding begins, every single step requires revisiting the K and V tensors of every preceding token. That cache grows linearly with length — a 70B model over one million tokens demands 320 GB of GPU memory. Compute is not the bottleneck; *memory and bandwidth are*.
+
+For nine years, successive generations of researchers have all been wrestling with the same question: *of all those preceding tokens, which ones must be kept and which can be discarded?* Evict too aggressively and the model cannot answer; keep too many and memory explodes. It sounds like an engineering problem, but it is really an epistemological one — how do you decide in advance whether a token will still be useful later?
+
+Each generation of papers answers this question, and each generation is criticized by the next for answering it poorly.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al.  -  Attention Is All You Need
+  |
+  | Inherited problem: every token must attend to all previous tokens,
+  |          so all historical K, V must be cached (KV cache).
+  |          As sequences grow longer, memory explodes.
+  v
+[2023] Xiao et al.  -  StreamingLLM
+  |
+  | Observation: keeping only "a few leading tokens + a recent window" keeps the model stable.
+  | Solution: sliding window + attention sink. Simple and blunt — position-only, content-blind.
+  | New problem: why are "middle" tokens necessarily unimportant? What about long-range dependencies?
+  v
+[2023] Zhang et al.  -  H2O (Heavy-Hitter Oracle)
+  |
+  | Insight: position is unreliable; track "who has been attended to most" (heavy hitters).
+  | Solution: accumulate historical attention scores per token; keep top-K + recent window.
+  | New problem: accumulated score measures "past importance," not "future importance."
+  |       Also, you can only score after computing attention — the causality is backwards.
+  v
+[2024] Li et al.  -  SnapKV
+  |
+  | Insight: H2O accumulates slowly during decoding, but the prompt already reveals intent —
+  |             e.g. "...please summarize the key conclusions above."
+  |             The tail of the prompt signals what the query cares about. Not using it is wasteful.
+  | Solution: treat the last few tokens of the prompt as an "observation window";
+  |             use its attention over past KVs to select which to keep.
+  | New problem: the window is local; long-range dependencies far from the query are easily killed.
+  |       Choosing the window location is still manual.
+  v
+[2025] Park et al. / Devoto et al.  -  KeyDiff / Expected Attention
+  |
+  | Insight: SnapKV still relies on real attention scores. Can we go cheaper? More general?
+  | KeyDiff:    use inter-key dissimilarity as an "information content" proxy — no attention needed.
+  | ExpAttn:    use a corpus-averaged "imagined query" to score keys — ignores the real query.
+  | New problem: all proxy metrics + strong assumptions. Guessing, not learning.
+  |       Generalization across tasks and query distributions is poor.
+  v
+[2026] Yang et al.  -  IndexMem  *(this paper)*
+  |
+  | Insight: if all of this is guesswork, why not simply *learn* a judge?
+  |             And even when the judge is right, evicted tokens are gone forever — irretrievably.
+  | Solution 1: Learnable Indexer. Train a small network to predict per-token importance directly.
+  | Solution 2: Latent Memory. Compress evicted tokens into a fixed-size latent state,
+  |         updated online during inference; attention output = sparse attention + residual readout from memory.
+  | Remaining problems: requires training (though lightweight); can the indexer be shared across layers?
+  |             (Authors already explore IndexCache in the appendix.)
+  v
+[2026] Bai et al. / Feng et al.  -  IndexCache / Ada-KV (follow-up work)
+  |
+  | Questions: now that the indexer is trained, can it be reused across layers?
+  |             Can the budget be allocated adaptively per head?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al.: Threw Out RNNs, but Left Behind a Memory Monster
+
+*** What problem did it see?
+
+RNNs are too slow — one token at a time, no parallelism. Training a model to read a long document meant the GPU spent most of its time waiting.
+
+*** Its solution
+
+The attention mechanism. Every position computes relevance directly against every other position in one step — perfect parallelism.
+
+*** Why it worked (and where it buried a new problem)
+
+Parallel training let this architecture swallow the entire NLP field. But one detail went unnoticed at the time: *during inference, generating each new token requires revisiting all previous K and V tensors*. Engineers cached them to avoid recomputation — this is the KV cache. During training it doesn't matter; during inference it grows linearly with context length. When context stretches from 2K to 1M tokens, this monster starts eating all available GPU memory.
+
+The next nine years of research are the story of fighting this monster.
+
+** 2023 | StreamingLLM: The First to Discover "Most of It Can Actually Be Discarded"
+
+*** What problem did it see?
+
+The KV cache that Vaswani left behind is completely untenable for long-context inference. But the authors noticed a counterintuitive phenomenon: simply dropping tokens outside a window crashes the model, but keeping *the first few tokens* plus *a recent window* lets the model generate stably for millions of tokens. Those opening tokens act as "anchors" that absorb the probability mass of softmax.
+
+*** Its solution
+
+Sliding window + attention sink. Always retain the first 4 tokens plus the most recent N tokens; discard everything in between.
+
+*** Why it worked (and where it buried a new problem)
+
+It proved one thing: *KV caches are massively redundant*. The cost was discarding all middle tokens — which means any long-range retrieval task like "please summarize Chapter 5" fails outright. It opened the door, but everything behind the door was positional heuristics with no content awareness.
+
+The next generation had to ask: why evict by position? Evict by *importance*.
+
+** 2023 | H2O: Let Historical Attention Scores Vote for Survival
+
+*** What problem did it see?
+
+StreamingLLM is too mechanical. Middle tokens can contain critical names and numbers; discarding them all is wasteful. The model should have a say in what matters.
+
+*** Its solution
+
+Heavy-Hitter Oracle. At each generation step, accumulate the attention scores received by each historical token. Keep the top-K scorers (heavy hitters) plus the recent window. In effect, the historical attention distribution votes on who survives.
+
+*** Why it worked (and where it buried a new problem)
+
+The first method to introduce *importance* into KV selection — a major improvement over pure positional heuristics. But two weaknesses remain:
+
+1. *Past importance ≠ future importance.* A token cited heavily in the first 100 steps may be irrelevant at step 101.
+2. *Causal inversion.* You need to finish computing attention before knowing who the heavy hitters are — by then the KVs are already in memory. The savings only apply to future steps.
+
+H2O shifted the lens from "position" to "historical usage frequency." The next generation had to push further: can we know *in advance*, rather than ratifying the fact after the event?
+
+** 2024 | SnapKV: Glance at the End of the Prompt and Know What the Query Wants
+
+*** What problem did it see?
+
+H2O accumulates scores slowly during decoding, yet *the prompt has already stated the intent* — for example, "...please summarize the core conclusions of the document above." That final sentence tells you the query cares about "conclusions," not fine-grained details. Ignoring it is a missed opportunity.
+
+*** Its solution
+
+Use the last segment of the prompt (e.g., the final 32 tokens) as an "observation window." Compute its attention over all preceding KVs to score them, then retain the top-K. Compression happens right after prefill; the decode phase only attends over the small compressed cache.
+
+*** Why it worked (and where it buried a new problem)
+
+The first method to bring *query-awareness* into the selection process — a major leap. But two problems remain:
+
+1. *Local bias.* The observation window only sees the end of the prompt. If the query concerns a detail near the beginning of a long document, the selected tokens cluster around the window and the truly needed content has already been evicted.
+2. *Still depends on real attention scores.* Compute is not saved, only decode-phase memory.
+
+After SnapKV, the field split into two camps: one trying to *bypass attention scores entirely*, the other trying to *learn a better judge*.
+
+** 2025 | KeyDiff / Expected Attention: Bypass Attention Computation with Proxy Metrics
+
+*** What problem did it see?
+
+SnapKV still requires computing one full attention pass. In ultra-long contexts, that single pass is itself a burden. Can we identify important tokens without computing attention at all?
+
+*** Its solution
+
+Two distinct proxy routes:
+
+- *KeyDiff* (Park 2025): if a token's key is very *dissimilar* to other keys, it encodes unique information and should be kept. Uses cosine distance between keys as an "information content" proxy — no attention scores touched.
+- *Expected Attention* (Devoto 2025): average a "typical query distribution" from a corpus and use it to score historical keys. Equivalent to positing an "imagined future query."
+
+*** Why it worked (and where it buried a new problem)
+
+Saves computation and removes dependence on the current query. But both rest on *strong prior assumptions*:
+
+- KeyDiff assumes "key uniqueness = importance," yet for retrieval tasks the important tokens are often the *similar* ones.
+- Expected Attention assumes "the average query represents the specific query," but long-tail tasks deviate greatly from typical corpora.
+
+This generation represents "clever guessing." But *no matter how clever, it is still guessing*. The next question becomes unavoidable: given that we have training data, why persist with hand-crafted proxies? Just learn an importance function.
+
+** 2026 | IndexMem: Learn the Judge Outright, and Give Evicted Tokens a Second Chance
+
+*** What problem did it see?
+
+Two gaps emerge simultaneously:
+
+1. *The era of guessing is over.* SnapKV / KeyDiff / Expected Attention are all training-free hand-crafted heuristics. Their assumed query distributions, key geometries, and attention patterns are inconsistent across tasks. If we can train, why not train an indexer directly?
+2. *Eviction = permanent amnesia.* Across the entire lineage from H2O to Expected Attention, every method makes a binary choice: "keep these, discard the rest." But a token that looks unimportant now may be desperately needed 50 steps later when the query shifts — and by then it is gone forever. This is *irreversible forgetting*.
+
+*** Its solution
+
+Two complementary modules:
+
+1. *Learnable Indexer.* A very lightweight network that takes K (and positional information) as input and outputs an importance score per token. Trained end-to-end once; at inference time it scores directly with no heuristics needed. Training objective: align with real attention scores + downstream task performance.
+
+2. *Latent Memory.* A fixed-size latent state M (e.g., a few hundred dimensions), updated online during inference. Each time a KV is evicted, its information is compressed into M. Attention output = primary sparse attention + residual readout from M. Even after a token's K, V are gone, its "imprint" remains in M and can be retrieved as a residual contribution.
+
+Analogy: the main KV cache is *fast memory* (high resolution, limited capacity); Latent Memory is *slow memory* (low resolution, fixed capacity but accumulating infinite history). This distinction is drawn directly from the Titans / fast-slow weight lineage.
+
+*** Why it worked (and where it buried new problems)
+
+In terms of results: RULER 4K/16K improves by up to 25 points on Qwen/Mistral/Llama; NIAH retrieval is more robust; LongBench improves overall.
+
+More importantly, there is a *shift in perspective*: the entire lineage evolves from "how to select" to "how to learn" + "how to preserve a trace of what was discarded." This reframes KV compression from a *hard selection* problem into a *soft compression* problem — you no longer need to get every token decision right, because even wrong decisions can be partially recovered from memory.
+
+Remaining problems:
+- The indexer requires training; deploying to a new model requires rerunning training (though the authors stress it is lightweight).
+- Can the indexer be shared across layers? The authors are already exploring this in the appendix (Running Mean / IndexCache direction).
+- The capacity ceiling of Latent Memory has no clear theoretical analysis of the capacity–fidelity trade-off, just as Titans left this open.
+
+* Frontier Extensions
+
+** 2026 | IndexCache (Bai et al.): Now That the Indexer Is Trained, Can It Be Reused Across Layers?
+
+IndexMem's appendix is already doing this — observations show that importance scores across layers are highly correlated, so computing once and reusing across multiple layers becomes attractive. This line has just begun. It pushes "learning an indexer" from per-layer toward per-model.
+
+** 2026 | Ada-KV (Feng et al.): Different Heads Deserve Different Budgets
+
+Previous methods distribute cache budget evenly across all heads. Ada-KV argues that some heads are "retrieval heads" and deserve more budget, while others are "local aggregation heads" and can operate with less. This is orthogonal to IndexMem — one addresses "who to select," the other "how much each head should select."
+
+As of 2026.05, the frontier is moving toward combining *learned indexers + adaptive budgets + cross-layer reuse*, but no single paper has fully unified all three.
+
+* One Figure to Understand It All
+
+#+begin_example
+
+                    How to prune KV-cache? Nine years at a glance
+                    ==============================================
+
+  Perspective               Selection criterion          Fate of evicted tokens
+  -----------               -------------------          ----------------------
+
+  2017                                                   (nobody thought about this)
+  Vaswani               Keep everything, no pruning
+    |                             |
+    v                             v
+
+  2023                  Prune by *position*
+  StreamingLLM         head tokens + recent window       Lost permanently
+    |                             |
+    v                             v
+
+  2023                  Prune by *historical usage frequency*
+  H2O                  heavy hitters                     Lost permanently
+    |                             |
+    v                             v
+
+  2024                  Prune by *query intent*
+  SnapKV               observation window scores past    Lost permanently
+    |                             |
+    v                             v
+
+  2025                  Prune by *proxy metrics* (save compute)
+  KeyDiff / ExpAttn    key uniqueness / average query    Lost permanently
+    |                             |
+    v                             v
+
+  2026                  Prune by *learned scores* + archive the discarded
+  IndexMem             learnable indexer                 Compressed into latent memory
+                                                         (residual readout — no longer permanent loss)
+
+
+  Trend (read top to bottom):
+    Selection criterion :  position -> historical frequency -> live query -> proxy metric -> learned
+    Fate of eviction    :  all die -> all die -> all die -> all die -> soft compression, leave a trace
+
+#+end_example
+
+* Insights
+
+On the surface this entire lineage is about "pruning KV caches ever more accurately," but underneath, *two paradigm shifts are happening simultaneously*:
+
+1. *From hard selection to soft compression.* The first five generations all made binary keep/discard decisions — one mistake meant permanent information loss. IndexMem is the first to acknowledge: any selector will make errors, so let the discarded tokens not truly die — compress them into a low-resolution state and keep it around. This slides the problem from a *classification problem* toward a *compression problem*, grounded in the admission that "perfect selection is impossible" and the pursuit of *fault tolerance* instead.
+
+2. *From heuristics to learnable methods.* The first five generations spent nine years competing over whose heuristics were cleverer (position → frequency → query → proxy). This is the classic pattern of "exhausting all hand-crafted options before reaching first principles." Once training costs proved acceptable, learning an indexer became inevitable. The trajectory is identical to the retrieval field's journey from BM25 to dense retrievers.
+
+Where does the field go next? Three directions have already sprouted:
+- *Cross-layer sharing* (IndexCache): train once, reuse across layers.
+- *Adaptive budgets* (Ada-KV): differentiated allocation across heads.
+- *Memory capacity theory* (TBD): how much history can Latent Memory actually compress? Titans didn't answer this either — it remains an open question.
+
+A more radical conjecture: this lineage will eventually merge with *training-time* sparse attention (NSA, MoBA) — not "compress after training the model" but "let the model learn to compress itself during training." The inference-phase indexer will be absorbed back into the training phase, and the entire attention module will natively be sparse + memory-augmented from the start.
+
+* Takeaways
+
+Lessons for researchers:
+
+1. *Heuristics are a transitional phase; learning is the endgame.* For any problem that looks like it requires "judgment," if training data exists, learned methods will eventually displace heuristics. But the heuristics are not wasted — they reveal *roughly what the right answer looks like*, giving the learned approach a target to optimize toward. The query-aware perspective of SnapKV / H2O became the supervision signal for training IndexMem's indexer.
+
+2. *When you see an entire field competing over whose proxy metric is cleverer, it is time to propose a learned solution.* That is the window for a paradigm shift.
+
+3. *When hard decisions face irreducible uncertainty, pivot to soft decisions.* When every mistake in your algorithm causes irreversible loss, adding a "residual channel" is usually far easier than making the judge more accurate. The Latent Memory trick in IndexMem has isomorphic applications in quantization (outlier handling), MoE (router decisions), and recommendation (candidate pruning) — all the same story.
+
+Landing point: you can apply the same lens (hard decision → soft compression + residual) to audit any system with a "discard" operation — outlier handling in quantization, the router in MoE, candidate pruning in recommendation. It is always the same underlying problem.

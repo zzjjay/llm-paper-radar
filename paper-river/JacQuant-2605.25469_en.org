@@ -1,0 +1,273 @@
+#+title:      JacQuant: STE-Free Quantization-Aware Training via Learned Jacobian Surrogates
+#+date:       [2026-05-26 Tue 17:00]
+#+filetags:   :paper:river:quantization:qat:ste:en:
+#+identifier: 20260526T170000-en
+#+source:     https://arxiv.org/abs/2605.25469
+#+authors:    Kai Yi, Vignesh Vivekraja, Harshit Khaitan, Steven Li (Meta AI)
+#+venue:      arXiv 2026.05
+
+* One-Line Hook
+
+QAT has coasted for a decade on "just let the gradient pass through." JacQuant tears that down — it argues that the Jacobian we have always pretended is the identity matrix can actually be learned.
+
+* Lineage Map
+
+#+begin_src
+                                       [2013]
+                                       Bengio
+                                  Straight-Through Estimator
+                                  "Pass the gradient through, no questions asked"
+                                          |
+                                          | "Bring it to multi-bit weights and activations"
+                                          v
+                                       [2016]
+                                       DoReFa-Net
+                                  Zhou et al.
+                                  End-to-end training with low-bit W&A
+                                          |
+                                          | "Straight-through is fine,
+                                          |  but the clip threshold should be learned"
+                                          v
+                                       [2018]
+                                       PACT
+                                       Choi et al.
+                                       (Branch: learn activation clip)
+                                          |
+                                          | "Clip threshold isn't enough;
+                                          |  the quantization step size itself must be learned"
+                                          v
+                                       [2020]
+                                       LSQ / LSQ+
+                                  Esser et al. / Bhalgat et al.
+                                  Step size as a learned parameter;
+                                  rounding still uses STE
+                                          |
+                                          | "STE is simply wrong at bin boundaries;
+                                          |  don't just learn the step size — change the gradient path"
+                                          v
+                                       [2025]
+                                       Rotation Trick
+                                  Fifty et al. (VQ-VAE)
+                                  Replace STE with a fixed rotation + scale
+                                          |
+                                          | "Fixed rotation is too rigid;
+                                          |  learn an adaptive one from data"
+                                          v
+                                  ==> [2026] JacQuant <==
+                                       Yi et al. (Meta)
+                                       block-diag B(W) learned as the Jacobian surrogate
+                                          |
+                                          | (Concurrent parallel threads:
+                                          |  PV-Tuning via proximal operators,
+                                          |  ZeroQAT via zeroth order,
+                                          |  FOGZO via first + zeroth order hybrid)
+                                          v
+                                       [2025-2026]
+                                       ParetoQ / WinQ
+                                       (Pushing sub-2-bit QAT pipelines
+                                        to the frontier; JacQuant can plug in)
+#+end_src
+
+Note: Fifty et al. 2025 (Rotation Trick) is strictly in the VQ-VAE context (ICLR 2025 Oral, arXiv:2410.06424),
+not LLM weight quantization. The JacQuant paper uses it as a representative "departure from STE"
+by analogy, so this connection is a *conceptual lineage*, not a direct citation chain.
+This is precisely how the paper's own Fig. 1 presents the comparison.
+
+* Forward Narrative: How the Problem Grew
+
+** Stop 1: Bengio 2013 — "Don't worry about the gradient, just push it through"
+
+The earliest story is not about large models — it is about Bernoulli neurons and quantized activations.
+You want to train a network, but somewhere in the middle sits a non-differentiable operation —
+rounding, the sign function, sampling.
+Back-propagation cannot proceed.
+
+Bengio's ruling: just treat it as 1.
+In the forward pass you compute round(x) and get 0 or 1; in the backward pass
+you pretend d(round)/dx = 1 and pipe the downstream gradient upstream unchanged.
+That is the Straight-Through Estimator, STE.
+
+It is mathematically wrong, but it works. It gave quantization training a "runnable" starting point.
+Every quantization-aware training method that followed inherited this lie by default.
+
+The problem it left behind: when exactly does this lie explode?
+The answer is — when there are very few quantization bins, when parameters sit right on bin boundaries,
+or when they are clipped, the gap between "pretend identity" and "true zero gradient"
+becomes enormous. But nobody cared in 2013, because everyone was still working in floating point.
+
+** Stop 2: DoReFa-Net 2016 — "Bring STE into deep networks"
+
+DoReFa-Net was among the first to push STE from activations to the full *weight + activation + gradient*
+triple in low-bit form. They demonstrated that you can indeed train and quantize simultaneously,
+end-to-end, on both CIFAR and ImageNet without disaster.
+
+But they operated at 4-bit and 8-bit. At those precisions, the error introduced by STE is relatively small,
+because each weight has several bins nearby and "pretending identity" does not diverge much from reality.
+The story looked like a happy ending at 4-bit precision.
+
+The problem it left behind: what if you want to compress further?
+Pushing to 3-bit or 2-bit introduces a new complication — *clipping boundaries*.
+A large fraction of weights get truncated to the maximum or minimum representable value;
+their gradients should be zero (they are clipped and cannot contribute),
+but STE still feeds the full gradient back, and training begins to oscillate.
+
+** Stop 3: PACT 2018 — "Then learn the clip threshold"
+
+PACT diagnosed the previous stop's pain point precisely: clipping.
+Its answer — do not let the clip threshold be set by hand; let it be learned together with the other parameters.
+Whether your activation clips at 6.0 or 2.3, let the data decide.
+
+This alleviated the truncation problem; 2-bit activations became usable.
+But the gradient of the rounding operation itself — PACT still handled that with STE.
+
+The problem it left behind: if the clip threshold can be learned, what about the bin width (step size)?
+Why can't the step size be a parameter too?
+
+** Stop 4: LSQ 2020 — "The step size is a parameter too"
+
+Esser's team pushed PACT's logic one step further with LSQ:
+not only should the clip threshold be learned, the quantization *step size* (bin width)
+should also be learned. And for how to differentiate through the step size,
+they offered a more careful estimate than raw STE —
+exploiting the fact that weights closer to bin boundaries are more sensitive to changes in step size.
+
+LSQ pushed 2-bit and 3-bit ImageNet to the state of the art at the time.
+LSQ+ subsequently added offset and initialization adjustments and became the standard baseline.
+
+But looking closely: LSQ changed the *gradient with respect to the step size*,
+not the *gradient through rounding itself* — the round operation still uses STE,
+meaning the Jacobian along the path through rounding is still a lie.
+
+The problem it left behind: if you want to go below 2-bit, or quantize LLMs with billions of parameters,
+the bias accumulated by STE through rounding can no longer be suppressed.
+You have to touch the backward path through round directly.
+
+** Stop 5: Rotation Trick 2025 — "Not identity anymore — a rotation"
+
+Fifty's team took a decisive step in the VQ-VAE setting.
+They observed that STE treats quantization as "gradient pass-through,"
+which completely ignores the relative geometry between the original x and the quantized q.
+Every point inside a Voronoi cell receives the same gradient,
+leading to catastrophically low codebook utilization (as low as 2% on VQGAN).
+
+Their solution, the *Rotation Trick*:
+express the mapping from x to q as a fixed *rotation + scale* transform,
+and substitute the Jacobian of that transform as a constant during back-propagation.
+This encodes the angle and magnitude ratio between x and q into the gradient.
+
+Effect: VQGAN codebook utilization rose from 2% to 27%, reconstruction error dropped by two orders of magnitude.
+
+The problem it left behind: the rotation is *fixed*, computed geometrically from the current x and q.
+Nothing is *learned*. If the data distribution shifts, the quantizer changes, or the model drifts during training,
+is this fixed transform still optimal?
+Moreover, the Rotation Trick is primarily formulated for VQ-VAE-style "vector quantization to a codebook";
+its geometric framing does not directly transfer to LLM-style "scalar element-wise rounding to a grid."
+
+** Stop 6: JacQuant 2026 — "Just learn the Jacobian directly"
+
+This is the paper's core leap.
+
+JacQuant argues: STE sets Jacobian = I; Rotation Trick sets Jacobian = a fixed rotation.
+Both are providing a stand-in for "the Jacobian we don't actually know."
+So why not let the data tell you what that Jacobian should be?
+
+The form is remarkably simple: each quantization group (e.g., 128 weights sharing one scale)
+is assigned *one scalar* b_g, which serves as the "gain" on that group's backward pass.
+Stacking all b_g values yields a block-diagonal B(W) that replaces the identity in STE.
+
+How is b_g learned? Two estimators:
+- *Probe*: add a small perturbation δ to the group's weights,
+  observe the quantizer output change Δq, and fit b_g ≈ <Δq, δ>/‖δ‖² by least squares.
+  Geometrically, this measures "what the local slope of the quantizer actually is."
+- *Dither*: subtractive dithering — add uniform noise and subtract it back,
+  constructing a differentiable proxy quantizer from which the Jacobian is estimated.
+
+Key design choice: b_g is not updated at every step but *refreshed periodically*,
+and reused across tens to hundreds of QAT steps in between, so the extra cost is negligible.
+
+What does it capture that STE cannot?
+- Deep inside a bin (far from boundaries), the quantizer behaves nearly linearly, b_g ≈ 1, matching STE;
+- In the *saturation/clip* region, the true Jacobian ≈ 0, and b_g is learned to be ≈ 0,
+  automatically *damping* gradient updates along those truncated directions.
+
+This is precisely where STE is most unstable at ≤ 2-bit:
+large numbers of weights are pressed against the clip boundary,
+yet STE keeps faithfully propagating full gradients back, destabilizing training.
+JacQuant multiplies gradients in those directions by a small learned number, and stability is restored naturally.
+
+On the theoretical side, the authors prove that within a "code-preserving" training window
+(i.e., when the discrete output of the quantizer does not change),
+JacQuant's updates can be reduced to a well-defined objective gradient,
+with convergence guarantees in the non-convex case and a linear rate under the Polyak–Łojasiewicz condition.
+
+Empirically: across LLaMA3-1B/3B/8B and Qwen3-1.7B, sub-2-bit QAT consistently outperforms STE.
+
+The problems it leaves behind (i.e., the next stops on the paper river):
+- B(W) is block-diagonal with one scalar per group. If the quantizer has cross-weight coupling
+  within a group (e.g., more complex codebooks, mixed precision), is this approximation sufficient?
+- The "local + periodic refresh" assumption requires that W does not drift too far between refreshes.
+  Could this fail under long QAT schedules, or when combined with LoRA or continued pretraining?
+- Concurrent ZeroQAT (Tan 2025) goes fully zeroth-order; FOGZO mixes first- and zeroth-order.
+  These represent different points on the "extra compute vs. accuracy" trade-off curve.
+  Which will survive in industrial deployment remains an open question.
+
+* Compression Overview: How the Problem Evolved
+
+#+begin_src
+Precision level   Problem                                  Solution
+---------------   -------                                  --------
+[16/8 bit]        round is non-differentiable              STE: treat Jacobian=I (Bengio 2013)
+                                                           |
+[4 bit]           Deep nets — can we go low-bit end-to-end? DoReFa: STE extended to W&A&G (Zhou 2016)
+                                                           |
+[3 bit]           Large activation dynamic range clipped   PACT: learnable clip threshold (Choi 2018)
+                                                           |
+[2 bit]           How wide should each bin be?             LSQ: learnable step size (Esser 2020)
+                                                           |
+[VQ-VAE]          STE discards within-cell geometry        Rotation Trick: fixed rotation replaces I (Fifty 2025)
+                                                           |
+[<=2 bit LLM]     Clip saturation + bin boundary collapse  JacQuant: B(W) learned (Yi 2026)
+                                                           |
+[future]          Intra-group coupling / schedule drift    ?
+#+end_src
+
+* What Is Really Happening Beneath the Evolution
+
+On the surface this looks like "gradient estimators getting progressively more refined."
+But at a deeper level, this entire line of work is doing something more fundamental —
+
+*Moving from "pretend quantization doesn't exist" to "treat quantization as a learnable, structured object."*
+
+- STE: quantization is noise; suppress it however you can.
+- LSQ: quantization is a parametric operator (step size); the parameter can be learned, but the operator's own derivative is still fake.
+- Rotation Trick: quantization is a geometric transformation; represent its Jacobian using the true geometry of the transform.
+- JacQuant: quantization is an operator with a local linear approximation; that local slope is an observable, learnable statistic.
+
+This is a trajectory from *denial* → *parametrization* → *geometrization* → *statisticization*.
+Each step makes "quantization" a more concrete entity in the optimizer's eyes.
+
+Where does the next step lie? I would bet on two directions:
+
+1. *Make "sensitivity" something beyond the first derivative* — JacQuant learns a first-order Jacobian.
+   The natural successor should be someone starting to learn a low-rank approximation to the
+   Hessian-vector product, recovering the second-order curvature of quantization as well.
+   At < 2-bit, the loss surface is no longer smooth, and first-order alone will eventually prove insufficient.
+
+2. *Expand Jacobian learning from group-scalar to intra-group low-rank matrix* —
+   Currently each group shares a single scalar b_g. If weights within certain groups are highly correlated
+   (e.g., along the head dimension of attention), replacing the scalar with a rank-k matrix
+   might yield disproportionate accuracy gains at still-acceptable computational cost.
+
+* Honest Annotations
+
+- *Direct citation relationships*: The STE←DoReFa←LSQ chain is textbook QAT consensus; highly reliable.
+- *Conceptual lineage*: The LSQ→Rotation Trick→JacQuant connection is not a literal citation chain.
+  Rotation Trick operates in the VQ-VAE context; JacQuant invokes it as a representative "departure from STE."
+  This is a *conceptual lineage*, not a *citation lineage*. The paper's own Fig. 1 places them side by side for comparison.
+- *PACT/LSQ→JacQuant*: JacQuant lists PACT and LSQ as canonical representatives of STE-based QAT,
+  but does not frame them as the direct baselines being overturned. The real foil is STE itself.
+- *Parallel threads*: PV-Tuning (proximal), ZeroQAT (zeroth-order), and FOGZO (hybrid) are all
+  2024–2025 "departure from STE" attempts. JacQuant explicitly names them in its Related Work,
+  positioning itself as the variant that "keeps the hard forward quantizer and replaces only the backward rule."
+- *Depth count*: 5 layers found + the root + 1 successor layer. The oldest root is Bengio 2013;
+  the successors extend forward to ParetoQ / WinQ / ZeroQAT, the most recent 2025–2026 work.

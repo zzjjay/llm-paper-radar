@@ -1,0 +1,227 @@
+#+title:      ThriftAttention: Selective Mixed Precision for Long-Context FP4 Attention
+#+date:       [2026-05-26 Tue 10:25]
+#+filetags:   :paper:river:
+#+identifier: 20260526T102529
+#+source:     https://arxiv.org/abs/2605.23081
+#+authors:    Joe Sharratt
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* 问题之河
+
+注意力的开销随序列长度二次增长——上下文一长，GPU 就被它榨干。所有人都在做同一件事：让注意力算得更便宜。FlashAttention 把"算"换成"搬"省下了 IO；SageAttention 把 16 位浮点降到 8 位；SageAttention3 接着冲到 4 位拿到 Blackwell GPU 上 4 倍的算力红利。看上去就快到极限了——但 4 位有个不肯让步的代价：上下文越长，质量塌得越凶。
+
+ThriftAttention 这条线一直默认的假设是：*同样的算子，同样的精度*。要么全 FP16，要么全 FP4。本文第一次指出这个默认是错的——FP4 的误差并不均匀分布，绝大部分功能性误差挤在那 5% 真正重要的 query-key 块里。换句话说：你不需要给所有块同等精度，只需要给那 5% 留 FP16，其余照 FP4 跑，质量基本就回来了。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 看到了什么: RNN 序列依赖让训练并行不了
+  | 怎么办: 扔掉时序递归，纯靠 Q-K-V 矩阵乘
+  | 留了什么坑: N x N 的注意力矩阵随序列长度二次膨胀，长上下文要崩
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | 看到了什么: 不是 FLOPs 慢，是 HBM 搬不动那个 N x N 矩阵
+  | 怎么办: 分块塞 SRAM，在线 softmax，N x N 永不落地
+  | 留了什么坑: IO 修好了，但 matmul 本身的算力开销还在 FP16
+  v
+[2024-25] Zhang et al. - SageAttention / SageAttention2
+  |
+  | 看到了什么: 矩阵乘本身的精度还有压缩空间——FP16 可能太奢侈
+  | 怎么办: Q/K 量化到 INT8/FP8，处理 outlier 用 smoothing
+  | 留了什么坑: 8 位已经吃过一轮红利，Blackwell 来了，下一关是 4 位
+  v
+[2025] Zhang et al. - SageAttention3
+  |
+  | 看到了什么: Blackwell 的 FP4 Tensor Core 算力是 FP16 的 4 倍
+  | 怎么办: 用 NVFP4 微缩格式 + 两级 scale 把 attention 整段塞进 FP4
+  | 留了什么坑: 短上下文还能用，长上下文 (>32K) 质量大幅退化
+  v
+[2026] Sharratt - ThriftAttention (本文)
+
+  看到了什么: 整条线默认"统一精度"——错了。FP4 误差不是均匀分布，
+              它集中在 < 5% 的"重要块"上，长上下文里这种集中效应被放大
+  怎么办: 块级重要性打分 -> top-k 块走 FP16，其余走 FP4
+          两路通过 online softmax 合并成单一输出
+  本质转向: 注意力加速从"统一压缩"转到"按重要性分配精度"
+
+         （旁支：Quest / SpargeAttn 走的是 sparsity——
+          把"不重要的块"整个丢掉。ThriftAttention 是
+          "不重要的块降精度，但不丢"——保留全部信息，
+          只让 bit 预算跟着重要性流动。）
+#+end_example
+
+* 演化叙事
+
+** 2017 | Attention Is All You Need: 把序列处理从"接力"变成"广场"
+
+*** 它看到了什么问题
+
+在 Transformer 之前的主流是 RNN/LSTM——一个 token 算完才能算下一个，像接力赛。GPU 是为并行设计的，硬塞一根接力棒进去，多卡也用不起来。训练长序列时这个 bottleneck 让大模型很难做大。
+
+*** 它的解法
+
+把"接力"换成"广场"——每个 token 同时看到所有其他 token，靠 Q-K-V 的矩阵乘一次性算出谁该关注谁。没有时序依赖，整个序列可以并行处理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为"全连接"恰好适合 GPU 的稠密 matmul。但它有一个朴素得过分的代价：N 个 token 互相看，就有 N x N 个 attention 分数要算、要存、要做 softmax。当 N=128K 时这个矩阵是 160 亿个元素——根本写不进显存。这就是后面所有"高效注意力"工作的起点。
+
+** 2022 | FlashAttention: 不让 N x N 矩阵落到显存里
+
+*** 它看到了什么问题
+
+Tri Dao 注意到一个反直觉的事实：在 A100 上，attention 的实测时间不是被算力卡住，是被 HBM 带宽卡住。Q*K 算出一个 N x N 矩阵要写回 HBM，再读回来过 softmax，再写一次，再读出来乘 V——往返搬运的成本远超过乘法本身。
+
+*** 它的解法
+
+整个 N x N 矩阵永远不写出来。把 Q、K、V 切成小块塞进 SRAM（GPU 上的高速缓存），在 SRAM 里把 softmax 改写成"在线"版本——边读新块，边维护跑动的 max 和 sum，最终输出一行算完就直接累加到 O 里。HBM 上只剩 Q、K、V、O，N x N 中间矩阵彻底消失。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为它把"算法等价变换"和"硬件内存层级"对齐了。"算的量"没变，但"搬的量"从 O(N²) 降到 O(N)。
+
+但它留下两件事没动：第一，每个 matmul 本身还是 FP16，精度上没省；第二，attention 的 FLOPs 仍然是 O(N²)。FlashAttention 把 IO 问题解决了，把"算"的问题原封不动留给了下一代。
+
+** 2024-25 | SageAttention: 把 attention 的矩阵乘量化到 8 位
+
+*** 它看到了什么问题
+
+线性层量化（INT8、INT4 权重）早就是工业标准，但 attention 的 Q*K 和 P*V 这两个 matmul 一直保留在 FP16。原因是 Q、K、V 里有顽固的 outlier——大几十倍的离群通道——直接量化会让 outlier 占满 INT 表征范围，其他值全被压扁，质量崩。
+
+*** 它的解法
+
+先 *smooth*，再量化。对 Q、K 做通道级的可逆变换（把 outlier 的方差挪一部分到对面的 K/Q），让两边的动态范围都收窄到 INT8/FP8 友好的程度。然后用量化后的 matmul 顶替原来的 FP16 matmul。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+8 位 matmul 比 16 位快 2 倍、显存带宽省一半。Smoothing 是数学等价变换，不丢信息，所以质量基本守住。
+
+留的坑是：8 位已经是 outlier-smoothing 这套思路的舒适区。再往下到 4 位，单个数只剩 16 个可表征值，smoothing 那点动态范围调整顶不住——必须有新的"格式"。Blackwell 架构这时候出来了，原生支持 4 位 Tensor Core。下一关的钥匙变成了硬件 + 微缩格式。
+
+** 2025 | SageAttention3: 4 位 attention 拿走 Blackwell 的算力红利
+
+*** 它看到了什么问题
+
+Blackwell 上 FP4 Tensor Core 的吞吐是 FP16 的 4 倍。但 4 位的动态范围只有 [-6, 6]——直接量化 Q、K、V 会把所有有意义的数值都挤到几个 bucket 里。SageAttention 那套 smoothing 不够用了。
+
+*** 它的解法
+
+用 NVFP4 *微缩格式* + 两级 scaling。每 16 个元素共享一个 FP8 的 micro-scale，每个 tile 再共享一个 FP32 的 outer-scale。这样每个 group 都能根据自己的数值范围"局部对焦"，FP4 表征只需要表达这 16 个相对数。整个 Q*K 和 P*V 都搬到 FP4 上跑。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+短上下文上质量基本守住——4096 token 以内，FP4 跟 FP16 差不超过 1-2%。
+
+但 *长上下文上塌了*。本文 Figure 3 给出原因：FP4 误差并不是"小而均匀"的高斯白噪声，而是集中在少数 query-key 块上——具体是近对角线块和 attention sink 附近的块。这些块恰好是 attention score 最大的地方。短上下文里这些块数量少，影响有限；上下文一长（128K），这种误差不断累加，softmax 的稀疏分布让"重要块出错"的代价被指数放大。
+
+下一篇的入口正是这张图：误差既然不均匀，凭什么所有块都用同样的精度？
+
+** 2026 | ThriftAttention (本文): 按重要性分配精度，不是均摊
+
+*** 它看到了什么问题
+
+SageAttention3 的失败不是 FP4 不行，是 *全用 FP4 不行*。如果能把误差集中的那少数块（< 5%）单独提到 FP16，剩下 95% 留在 FP4，理论上应该能拿走 FP4 的速度，同时把质量拉回 FP16。但有两个具体障碍：
+
+1. *怎么在不算完整 attention 的情况下知道哪些块重要*？真的算了就没意义了——选块要比计算便宜得多
+2. *怎么把 FP16 算的块和 FP4 算的块合并成一个 attention 输出*？softmax 是全局归一化的，混精度怎么不破坏分布
+
+*** 它的解法
+
+针对障碍 1：用 *块均值点积*打分。把每个 query 块取 token-mean 得到 q̄_i，每个 key 块取 token-mean 得到 k̄_j。打分函数 Ŝ_ij = q̄_i · k̄_j。这个分数只算 T_q × T_k 次（块数远小于 token 数），几乎免费。Top-k 高分块走 FP16，其余走 FP4。
+
+针对障碍 2：复用 FlashAttention-2 的 *online softmax* 机制。FP16 路径和 FP4 路径各自维护跑动的 max、sum、输出，最后用 online softmax 的合并规则把两路合成单一输出。online softmax 本来就是为流式合并设计的，混精度只是把"不同块"换成"不同精度的块"，逻辑完全兼容。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+理论上界（论文 Eq.4）给出每个 key 的输出误差贡献是 |ε_j| · p_j · ‖v_j - o‖——三项乘积。p_j 因 softmax 指数关系而高度集中：高分块的 p_j 大几个数量级。把这些块换成 FP16 让 ε_j ≈ 0，整体误差立刻被压住。
+
+实验结果：5% 块走 FP16，平均恢复 89.1% 的 FP4→FP16 质量差距；25% 块时达 92.4%。端到端推理在长上下文上比 FP16 快 2 倍。*越长的上下文，优势越大*——因为统一 FP4 在长上下文上塌得越凶，ThriftAttention 把塌掉的部分精准救回来。
+
+留的坑：选块靠启发式 Ŝ_ij = q̄_i · k̄_j，没有理论保证选中的就是最重要的。本文 Appendix A 的消融显示这个简单启发式已经很接近 oracle 选择，但在某些 attention 分布特别极端的情况下可能漏选。另一个坑是 FP16/FP4 两路融合的 kernel 在 Blackwell 上的占用率不如纯 FP4 kernel，开销主要来自两套量化/反量化的边界。
+
+* 前沿延伸
+
+ThriftAttention 是 2026 年 5 月的工作，还在最前沿。但同一时期已经有几条平行的探索路径，可以拼出未来的形状：
+
+- *SpargeAttn (Zhang et al, 2025e)*：本文最近的旁支。它走的是 block-sparsity + quantization 的组合——预测哪些块"基本是零"，直接跳过不算，剩下的块用 INT8/FP8 算。和 ThriftAttention 的根本区别：SpargeAttn 把不重要的块 *删掉*，ThriftAttention 把不重要的块 *降精度*。删 vs 降的差异在于：删需要保证"丢掉的真的可以丢"，降只需要保证"误差能压住"。后者上界更松，更鲁棒。
+- *NSA / SLA (Yuan et al / Zhang et al, 2025-26)*：训练时就让 attention 学出 sparse 结构。这条路要改训练流程，部署门槛高，但理论上潜力大——sparse pattern 是模型本身学出来的而不是事后启发式选的。
+- *Quest (Tang et al, 2024)*：用 query-aware 的 min-max bounds 在线选 KV 块。早一代的 sparse selection 工作，和 ThriftAttention 的"块重要性打分"思路同源，但 Quest 走的是 KV cache 选择路线，ThriftAttention 走的是 attention 计算精度路线。
+
+可以这么看：2026 年的"高效 attention"研究在两条岔路上：*稀疏化* (drop blocks) vs *混合精度* (vary block precision)。ThriftAttention 第一次明确指出后者是更鲁棒的方向。我赌下一步会有人把两者合流——sparse + mixed-precision——把那 95% 进一步切成"FP4 算"和"直接跳过"两档，把效率推到极致。
+
+* 一张图看懂
+
+#+begin_example
+                  长上下文 attention 加速主线 (2017 -> 2026)
+                  以"如何分配计算预算"为轴
+
+  时间轴 ->
+  2017          2022          2024        2025          2026
+  ----          ----          ----        ----          ----
+  Vaswani       FlashAttn     Sage1/2     Sage3         ThriftAttn
+  full          IO-aware      INT8/FP8    FP4 (uniform) FP4 + FP16
+  attention     tiling        attention   attention     mixed
+   |             |             |           |             |
+   |             |             |           |             |
+   v             v             v           v             v
+  瓶颈: N x N    瓶颈: HBM     瓶颈: 16    瓶颈: 4 位    瓶颈: 4 位
+  注意力矩阵    搬运 N x N     位 matmul   长上下文      均匀精度本
+  炸显存         成本太高      还能再降    上质量塌      身就是错的
+   |             |             |           |             |
+  解法: Q-K-V   解法: 分块     解法: 量化   解法: 微缩    解法: 5% 块
+  并行 matmul   塞 SRAM        Q/K + out   格式 + 两级   走 FP16,
+                online         lier smth   scaling       其余 FP4,
+                softmax                                  online softmax
+                                                         合并
+
+  -------------------- 旁支 (走 sparsity 路线) --------------------
+
+  Quest (2024)         -->        SpargeAttn (2025)    -->  NSA/SLA (2025-26)
+  query-aware                     block-sparse +              trained sparse
+  KV block 选择                   quantization                 structure
+       |                                |                           |
+       v                                v                           v
+   "不重要的块                    "近零的块               "让模型自己学
+    干脆别看"                     直接跳过"               出稀疏 pattern"
+
+  ====================== 转折点 (ThriftAttention 这步) ======================
+
+  前面所有人都默认: 一个 attention 用一种精度 / 一种采样策略
+  ThriftAttention 第一次说: 不对，精度本身应该跟着重要性流动
+                              5% 的块决定了 95% 的质量
+                              那就把 95% 的算力预算留给这 5%
+
+  纵向看: 每一代解决的都是上一代留下的"省"问题
+          (省搬运 -> 省精度 -> 再省精度到极限 -> 不均匀地省)
+  ThriftAttention 第一次不问"还能再省吗"，
+                  而问"省的方式可以不均匀吗"
+#+end_example
+
+* 洞见
+
+这条演化线表面是"attention 越算越便宜"的技术迭代，底下真正在发生的是 *计算资源分配方式*的三次转变：
+
+1. *从"算"转到"搬"*（FlashAttention 那一步）。研究者意识到 LLM 的瓶颈不在算力，在内存层级。这之后所有优化都开始向硬件看齐——什么进 SRAM、什么留 HBM、kernel 怎么切，比"算法本身"更重要。
+
+2. *从"全精度"转到"低位宽"*（SageAttention / SageAttention3 那两步）。意识到 attention 的数学并不需要 16 位精度——8 位、4 位都能跑，关键是用什么格式表达"局部范围"。Microscaling 把"全局 outlier"问题转成"局部 group 问题"。
+
+3. *从"均匀分配"转到"按重要性分配"*（ThriftAttention 这一步，刚刚发生）。前面所有人都把 attention 当成均质的——所有 query-key 对一视同仁。本文第一次说"不，attention 本身就是高度不均匀的（softmax 把它做成那样的），那计算预算就该跟着这个不均匀分布走"。
+
+第三次转变其实是个更大的"潮水"。同样的思路在 KV cache 领域已经发生过一次（H2O 把所有 token 不再视为同等重要），在权重量化里也发生过（mixed-precision quantization），在 MoE 里也发生过（专家不再均匀激活）。LLM 系统优化整体在从 *uniform* 走向 *importance-weighted*。ThriftAttention 是这个潮水拍到 attention 计算精度上的浪花。
+
+下一步往哪走？我赌两个方向：
+- *sparsity + mixed-precision 合流*。在那 95% 的"不重要块"里，再切一刀：真的近零的直接跳过，中等的 FP4，重要的 FP16。三档分配。
+- *importance 从启发式变成可学习*。q̄·k̄ 是一个粗糙的代理，未来会有专门训练的轻量"路由器"决定哪些块走高精度——类似 MoE 的 gating，但精度维度。
+
+* 启发
+
+读论文别只读"结果是什么"，要读"它在挑战什么前人都默认的东西"。ThriftAttention 整篇论文的精华不在 algorithm box，在它注意到了所有人都默认的盲点："给 attention 全用同一个精度"。一旦这个盲点被指出来，sparsity 派和 quantization 派的边界就开始模糊——它们其实在做同一件事的两个极端（删 = 精度=0，全精度=不动），中间那大片"按重要性分配 bit 预算"的设计空间，本来一直是空的。
+
+落点在能用：
+
+- 如果你在做推理系统，可以把"按重要性分配资源"作为一条主线去 audit 你的栈——KV cache、attention 精度、专家路由、prefill/decode 分配、kernel 调度，凡是默认"均匀"的地方都值得问"这个均匀是真的，还是偷懒"。
+- 如果你在做研究选题，找一找其他流派里类似的"所有人都默认 X 该一视同仁"的地方——很可能那里就是下一篇 ThriftAttention 的位置。比如：所有 token 的位置编码都同样重要吗？所有层的 attention 都同样需要长上下文吗？所有 head 都需要同样的精度吗？
+- 如果你在做 kernel/系统优化，记住一件事：unified 是工程上最省事的设计，但通常不是性能最优的设计。每一次往"不均匀分配"挪一步，性能上限就涨一截——前提是你能用便宜的方式知道"谁更重要"。这个"便宜的重要性估计器"本身就是一个值得做的子问题。
