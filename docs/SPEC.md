@@ -43,8 +43,8 @@ GitHub Actions (cron daily 23:00 UTC)
         │     data/raw/YYYY-MM-DD/{source}.json
         │
         ├── pipeline/dedupe.py       → data/deduped/YYYY-MM-DD.json
-        ├── pipeline/filter.py       → data/scored/YYYY-MM-DD.json   (Claude Haiku 4.5)
-        ├── pipeline/summarize.py    → data/summarized/YYYY-MM-DD.json (Claude Sonnet 4.6)
+        ├── pipeline/filter.py       → data/scored/YYYY-MM-DD.json   (Claude Sonnet 4.6)
+        ├── pipeline/summarize.py    → data/summarized/YYYY-MM-DD.json (Claude Opus 4.7)
         └── pipeline/render.py       → digests/YYYY-MM-DD.md + README.md + INDEX.md
               ↓
         git commit + push
@@ -202,12 +202,12 @@ For each field (title, abstract, authors, etc.), take the value from the highest
 
 ### `pipeline/filter.py` — Relevance Scoring
 
-- **Model**: Claude Haiku 4.5 (`claude-haiku-4-5-20251001`)
+- **Model**: Claude Sonnet 4.6 (`claude-sonnet-4-6`)
 - **Input**: title + abstract (~350 input tokens)
 - **Output**: JSON `{relevance_score: int, reason: str}`
 - **Concurrency**: `asyncio.gather` 50 parallel
 - **Prompt caching**: system prompt uses `cache_control: ephemeral` (~30% cost reduction)
-- **Threshold**: `relevance_score >= 7` proceeds to summarize
+- **Threshold**: no numeric gate; every paper with `hard_gate=false` surfaces (per-bucket caps control digest length)
 
 ### Relevance Prompt (`prompts/relevance.md`)
 
@@ -242,11 +242,11 @@ Return JSON only: {"relevance_score": int, "reason": str}
 
 ### `pipeline/summarize.py` — Summary + Highlights
 
-- **Model**: Claude Sonnet 4.6 (`claude-sonnet-4-6`)
+- **Model**: Claude Opus 4.7 (`claude-opus-4-7`)
 - **Input**: title + full abstract + (if present) HF comment excerpts
-- **Output**: JSON with `summary` and `highlights` (English only)
+- **Output**: JSON with bilingual (zh + en) `summary` and `highlights`
 - **Concurrency**: 20 parallel
-- **Triggered**: only on papers with `relevance_score >= 7` (~30–50/day)
+- **Triggered**: every paper with `hard_gate=false` (~50–300/day depending on volume)
 
 ### Summary Prompt (`prompts/summary.md`)
 
@@ -266,13 +266,7 @@ Return JSON only: {"summary": str, "highlights": list[str]}
 
 ### Cost Estimate
 
-| Stage | Daily Cost | Monthly |
-|-------|-----------|---------|
-| Filter (Haiku, ~500 papers, with cache) | $0.25 | ~$7.5 |
-| Summarize (Sonnet, ~50 papers, English only) | $0.30 | ~$9 |
-| **Total** | **~$0.55** | **~$16** |
-
-(Range $12–20 depending on daily volume.)
+Filter (Sonnet, ~500 papers/day, with prompt cache) + Summarize (Opus, ~50–300 papers/day, bilingual zh+en). The original Haiku/Sonnet design targeted ~$16/month; Sonnet+Opus is materially more expensive. Re-measure under current pricing before quoting.
 
 ---
 
@@ -545,8 +539,8 @@ jobs:
 |-------|----------|
 | Fetch (parallel matrix) | 2–3 min |
 | Dedupe | <30 sec |
-| Filter (Haiku, 50 concurrency) | 1–2 min |
-| Summarize (Sonnet, 20 concurrency) | 2–3 min |
+| Filter (Sonnet, 50 concurrency) | 1–2 min |
+| Summarize (Opus, 20 concurrency) | 2–3 min |
 | Render + commit | <30 sec |
 | **Total** | **~6–9 min/day** |
 
@@ -567,12 +561,11 @@ sources:
     enabled: true
 
 filter:
-  model: claude-haiku-4-5-20251001
-  threshold: 7
+  model: claude-sonnet-4-6
   concurrency: 50
 
 summarize:
-  model: claude-sonnet-4-6
+  model: claude-opus-4-7
   concurrency: 20
 
 render:

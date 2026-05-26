@@ -358,7 +358,7 @@ def _related_methods_block(related: list[dict], lang: str = "zh") -> str:
 
 
 def _why_selected_line(p: Paper, lang: str = "zh") -> str:
-    """One-line rationale derived from the Haiku rubric breakdown."""
+    """One-line rationale derived from the Sonnet rubric breakdown."""
     s = STRINGS[lang]
     bd = p.relevance_breakdown or {}
     bucket = _bucket_title_for(lang, _bucket_of(p)) if _bucket_of(p) in BUCKET_TITLES else s["unbucketed_label"]

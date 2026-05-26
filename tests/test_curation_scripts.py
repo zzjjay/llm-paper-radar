@@ -2,7 +2,7 @@
 
 These cover the deterministic paths only: name → arxiv id fuzzy lookup,
 bucket lookup from scored cache, idempotent dedup, blacklist append,
-log-line schema. The arXiv-API fetch and Haiku fallback are not exercised
+log-line schema. The arXiv-API fetch and Sonnet fallback are not exercised
 here (they need network + an API key); seed_add's main() guards those
 paths separately.
 """
@@ -175,7 +175,7 @@ def test_seed_add_name_ambiguous(isolated_repo: Path):
 
 
 def test_seed_add_bucket_override(isolated_repo: Path):
-    """--bucket flag overrides everything, skips Haiku fallback even if cache
+    """--bucket flag overrides everything, skips Sonnet fallback even if cache
     lookup would have worked."""
     r = _run(isolated_repo, "seed_add.py", "--arxiv-id", "2605.99001",
              "--bucket", "low_bits")

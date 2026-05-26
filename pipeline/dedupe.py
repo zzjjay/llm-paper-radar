@@ -93,7 +93,8 @@ if __name__ == "__main__":
     @click.option("--raw-root", default="data/raw", type=click.Path(path_type=Path))
     @click.option("--out-root", default="data/deduped", type=click.Path(path_type=Path))
     @click.option("--seen-path", default="data/seen.json", type=click.Path(path_type=Path))
-    def main(date, backfill_days, raw_root, out_root, seen_path):
+    @click.option("--force", is_flag=True, default=False, help="Re-run even if the day's digest already exists.")
+    def main(date, backfill_days, raw_root, out_root, seen_path, force):
         cfg = load_config()
         if date:
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
@@ -101,7 +102,7 @@ if __name__ == "__main__":
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = base - timedelta(days=delta)
-            if backfill_days > 0 and (
+            if not force and backfill_days > 0 and (
                 Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
             ).exists():
                 print(f"dedupe: skip {target.date()} (digest exists)")

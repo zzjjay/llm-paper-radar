@@ -114,7 +114,8 @@ if __name__ == "__main__":
     @click.option("--in-root", default="data/scored", type=click.Path(path_type=Path))
     @click.option("--out-root", default="data/summarized", type=click.Path(path_type=Path))
     @click.option("--prompt-path", default="prompts/summary.md", type=click.Path(path_type=Path))
-    def main(date, backfill_days, in_root, out_root, prompt_path):
+    @click.option("--force", is_flag=True, default=False, help="Re-run even if the day's digest already exists.")
+    def main(date, backfill_days, in_root, out_root, prompt_path, force):
         cfg = load_config()
         client = LLMClient(model=cfg.summarize.model)
         if date:
@@ -123,7 +124,7 @@ if __name__ == "__main__":
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = base - timedelta(days=delta)
-            if backfill_days > 0 and (
+            if not force and backfill_days > 0 and (
                 Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
             ).exists():
                 print(f"summarize: skip {target.date()} (digest exists)")

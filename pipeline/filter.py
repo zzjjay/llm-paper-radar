@@ -164,14 +164,14 @@ def prefilter_verdict(
 
 def _prefilter_hard_gate_result(blacklist_hits: list[str]) -> dict:
     """Build a `_BREAKDOWN_FIELDS`-shaped dict for papers killed by the
-    keyword prefilter. Looks indistinguishable from a Haiku hard_gate
+    keyword prefilter. Looks indistinguishable from a Sonnet hard_gate
     response so downstream stages don't special-case it."""
     reason = f"prefilter: 命中黑名单 {', '.join(blacklist_hits[:3])}"
     return _hard_gate_result(reason)
 
 
 def _judge_unavailable_result(error: Exception) -> dict:
-    """`_BREAKDOWN_FIELDS`-shaped dict for papers where the Haiku judge
+    """`_BREAKDOWN_FIELDS`-shaped dict for papers where the Sonnet judge
     failed every retry (empty response, persistent JSON parse error, API
     outage). Stored as hard_gate=True so the paper is preserved with a
     diagnosable reason rather than silently disappearing with score=None.
@@ -296,7 +296,8 @@ if __name__ == "__main__":
     @click.option("--in-root", default="data/deduped", type=click.Path(path_type=Path))
     @click.option("--out-root", default="data/scored", type=click.Path(path_type=Path))
     @click.option("--prompt-path", default="prompts/relevance.md", type=click.Path(path_type=Path))
-    def main(date, backfill_days, in_root, out_root, prompt_path):
+    @click.option("--force", is_flag=True, default=False, help="Re-run even if the day's digest already exists.")
+    def main(date, backfill_days, in_root, out_root, prompt_path, force):
         cfg = load_config()
         client = LLMClient(model=cfg.filter.model)
         if date:
@@ -305,7 +306,7 @@ if __name__ == "__main__":
             base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = base - timedelta(days=delta)
-            if backfill_days > 0 and (
+            if not force and backfill_days > 0 and (
                 Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
             ).exists():
                 print(f"filter: skip {target.date()} (digest exists)")

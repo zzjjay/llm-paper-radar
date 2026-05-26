@@ -132,7 +132,8 @@ if __name__ == "__main__":
     @click.command()
     @click.option("--backfill-days", default=0, type=int, help="Process today + N days back. Default 0 = today only. Each day is fetched/processed independently.")
     @click.option("--out-dir", default="data/raw", type=click.Path(path_type=Path))
-    def main(backfill_days: int, out_dir: Path):
+    @click.option("--force", is_flag=True, default=False, help="Re-fetch even if the day's digest already exists.")
+    def main(backfill_days: int, out_dir: Path, force: bool):
         cfg = load_config()
         if not cfg.sources.hf_daily.enabled:
             print("hf_daily source disabled")
@@ -141,7 +142,7 @@ if __name__ == "__main__":
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
-            if backfill_days > 0 and (
+            if not force and backfill_days > 0 and (
                 Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
             ).exists():
                 print(f"hf_daily: skip {target.date()} (digest exists)")

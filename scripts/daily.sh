@@ -3,24 +3,40 @@
 # Designed for cron. Sources ~/.bashrc so the AMD Anthropic proxy env vars are present.
 #
 # Usage:
-#   daily.sh                 # default 7-day window (matches Tue/Fri cron cadence)
-#   daily.sh --days 60       # backfill last 60 days
+#   daily.sh                 # default 2-day window (today + yesterday, force re-fetch)
+#   daily.sh --days 60       # backfill last 60 days (skips days whose digest exists)
+#   daily.sh --days 60 --force  # backfill last 60 days, re-fetch even if digest exists
 #   daily.sh --no-fetch      # skip the source fetch step; re-run dedupe→render
 #                              against whatever is already in data/raw/
 #   DAYS=14 daily.sh         # env var also works
+#
+# Defaults: cron runs `daily.sh` daily at Beijing 06:00 — a 2-day window
+# (today + yesterday) with --force so yesterday's slot gets re-rendered
+# even though its digest exists from yesterday's run.
 
 set -uo pipefail
 
-DAYS="${DAYS:-7}"
+DAYS="${DAYS:-2}"
 NO_FETCH=0
+FORCE=1   # default on: the daily cron's whole point is to re-render yesterday
+DAYS_EXPLICIT=0
+FORCE_EXPLICIT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --days) DAYS="$2"; shift 2 ;;
-        --days=*) DAYS="${1#*=}"; shift ;;
+        --days) DAYS="$2"; DAYS_EXPLICIT=1; shift 2 ;;
+        --days=*) DAYS="${1#*=}"; DAYS_EXPLICIT=1; shift ;;
         --no-fetch) NO_FETCH=1; shift ;;
+        --force) FORCE=1; FORCE_EXPLICIT=1; shift ;;
+        --no-force) FORCE=0; FORCE_EXPLICIT=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+# If the caller passed --days (backfill mode) without an explicit --force/--no-force,
+# fall back to the historical behavior of skipping days whose digest already exists.
+if [[ "$DAYS_EXPLICIT" -eq 1 && "$FORCE_EXPLICIT" -eq 0 ]]; then
+    FORCE=0
+fi
 
 if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || [[ "$DAYS" -lt 1 ]]; then
     echo "--days must be a positive integer, got: $DAYS" >&2
@@ -77,9 +93,15 @@ run_step() {
 if [[ "$NO_FETCH" -eq 1 ]]; then
     echo "[$(date -Is)] fetch: skipped (--no-fetch)"
 else
+    FORCE_FLAG=()
+    FORCE_DESC=""
+    if [[ "$FORCE" -eq 1 ]]; then
+        FORCE_FLAG=(--force)
+        FORCE_DESC=" --force"
+    fi
     for src in hf_daily arxiv; do
-        echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL})"
-        uv run python -m "sources.$src" --backfill-days "${BACKFILL}" \
+        echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL}${FORCE_DESC})"
+        uv run python -m "sources.$src" --backfill-days "${BACKFILL}" "${FORCE_FLAG[@]}" \
             || echo "  ($src returned non-zero, continuing)"
     done
     for src in arxiv_authors openreview; do
@@ -89,9 +111,11 @@ else
     done
 fi
 
-run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" || exit 4
-run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" || exit 5
-run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" || exit 6
+PIPELINE_FORCE_FLAG=()
+if [[ "$FORCE" -eq 1 ]]; then PIPELINE_FORCE_FLAG=(--force); fi
+run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 4
+run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 5
+run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 6
 
 # Auto-generate paper-river .org files for every surfaced paper that
 # doesn't have one yet. Delegates to scripts/auto_paper_river.py which

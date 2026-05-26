@@ -197,12 +197,14 @@ if __name__ == "__main__":
         help="Seconds to sleep between days within a batch. "
              "25s matches _backfill_6mo.py's polite pace.",
     )
+    @click.option("--force", is_flag=True, default=False, help="Re-fetch even if the day's digest already exists.")
     def main(
         backfill_days: int,
         out_dir: Path,
         batch_size: int,
         batch_pause: int,
         day_pause: int,
+        force: bool,
     ):
         cfg = load_config()
         if not cfg.sources.arxiv.enabled:
@@ -217,7 +219,7 @@ if __name__ == "__main__":
         targets: list[datetime] = []
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
-            if backfill_days > 0 and (
+            if not force and backfill_days > 0 and (
                 Path("digests") / f"{target.strftime('%Y-%m-%d')}.md"
             ).exists():
                 print(f"arxiv: skip {target.date()} (digest exists)")

@@ -11,9 +11,9 @@ Bucket is auto-detected in this order:
 
   1. If the paper appears in any data/scored/*.json with a real (non-hard-gated)
      topic_bucket, that value is used. This is the cheapest path and matches
-     whatever the daily Haiku judge decided.
-  2. Otherwise, fetch title+abstract from arXiv, call Haiku with the daily
-     filter rubric (prompts/relevance.md). If Haiku hard-gates, refuse to add
+     whatever the daily Sonnet judge decided.
+  2. Otherwise, fetch title+abstract from arXiv, call Sonnet with the daily
+     filter rubric (prompts/relevance.md). If Sonnet hard-gates, refuse to add
      (the paper does not belong in seeds.yaml) unless --bucket is given.
   3. If --bucket is given on the command line, it overrides everything.
 
@@ -173,13 +173,13 @@ def fetch_arxiv_metadata(arxiv_id: str) -> tuple[str, str]:
     return title, abstract
 
 
-def bucket_from_haiku(arxiv_id: str) -> tuple[str | None, str | None]:
-    """Fetch metadata + call Haiku with the daily filter rubric.
-    Returns (bucket, title). Bucket is None if Haiku hard-gates."""
+def bucket_from_sonnet(arxiv_id: str) -> tuple[str | None, str | None]:
+    """Fetch metadata + call Sonnet with the daily filter rubric.
+    Returns (bucket, title). Bucket is None if Sonnet hard-gates."""
     title, abstract = fetch_arxiv_metadata(arxiv_id)
     if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_BASE_URL"):
         sys.exit(
-            "Haiku fallback needs ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL. "
+            "Sonnet fallback needs ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL. "
             "Either set it, or pass --bucket on the command line."
         )
     # Import lazily so the script works without anthropic installed when only
@@ -277,7 +277,7 @@ def log_accept(arxiv_id: str, name: str, bucket: str, source: str, note: str | N
         "arxiv_id": arxiv_id,
         "name": name,
         "bucket": bucket,
-        "bucket_source": source,  # "scored_cache" | "haiku" | "cli"
+        "bucket_source": source,  # "scored_cache" | "sonnet" | "cli"
         "action": "seed_add",
     }
     if note:
@@ -351,11 +351,11 @@ def main() -> int:
 
     title_from_arxiv: str | None = None
     if not bucket:
-        bucket, title_from_arxiv = bucket_from_haiku(arxiv_id)
-        bucket_source = "haiku"
+        bucket, title_from_arxiv = bucket_from_sonnet(arxiv_id)
+        bucket_source = "sonnet"
         if bucket is None:
             sys.exit(
-                f"Haiku hard-gated arXiv:{arxiv_id} — it doesn't belong in seeds.yaml. "
+                f"Sonnet hard-gated arXiv:{arxiv_id} — it doesn't belong in seeds.yaml. "
                 "If you disagree, re-run with --bucket to override."
             )
 

@@ -53,7 +53,7 @@ class KeywordRule(BaseModel):
 class PrefilterConfig(BaseModel):
     """Cheap keyword prefilter that runs before the LLM judge. Papers with
     no whitelist hits AND >= `max_blacklist_hits` blacklist matches are
-    hard-gated locally without burning a Haiku call.
+    hard-gated locally without burning a Sonnet call.
 
     Word-boundary matching is applied — `QuIP` will not match inside
     `equipping`, `MIT` will not match inside `Amit`."""

@@ -177,7 +177,7 @@ async def test_filter_assigns_score_and_reason(tmp_path: Path, monkeypatch):
 async def test_filter_skips_papers_with_empty_metadata(tmp_path: Path, monkeypatch):
     """Trending-only stubs (e.g. hf_daily trending-rank-only entries) carry
     no title/abstract and must be skipped before reaching the LLM — otherwise
-    Haiku invents scores from nothing."""
+    Sonnet invents scores from nothing."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
     stub = _mk("stub", "", "")
     real = _mk("real", "BitNet b1.58", "1-bit LLM with FP4 quantization.")

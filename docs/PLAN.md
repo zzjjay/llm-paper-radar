@@ -10,14 +10,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a daily-running automated pipeline that fetches papers from 6 sources, dedupes, filters via Claude Haiku, summarizes via Claude Sonnet (Chinese + English), renders a Markdown digest, and publishes to a public GitHub repo via GitHub Actions.
+**Goal:** Build a daily-running automated pipeline that fetches papers from 6 sources, dedupes, filters via Claude Sonnet, summarizes via Claude Opus (Chinese + English), renders a Markdown digest, and publishes to a public GitHub repo via GitHub Actions.
 
 **Architecture:** Modular pipeline. Each data source is an independent module returning normalized `Paper` objects; pipeline stages (dedupe → filter → summarize → render) consume disk JSON between steps for traceability. Single-source failure does not block the digest. All scheduling and deployment via GitHub Actions; no external infrastructure beyond optional self-hosted RSSHub.
 
 **Tech Stack:**
 - Python 3.11+, dependency management via `uv`
 - `httpx` (async HTTP), `pydantic v2` (schemas), `pyyaml` (config), `feedparser` (arXiv/PwC/RSSHub feeds)
-- `anthropic` SDK for Claude Haiku 4.5 + Sonnet 4.6
+- `anthropic` SDK for Claude Sonnet 4.6 (filter) + Claude Opus 4.7 (summarize)
 - `pytest` + `pytest-asyncio` + `respx` (httpx mocking)
 - `ruff` for lint/format
 - `click` for CLI entrypoints
@@ -193,11 +193,10 @@ sources:
   hf_daily:
     enabled: true
 filter:
-  model: claude-haiku-4-5-20251001
-  threshold: 7
+  model: claude-sonnet-4-6
   concurrency: 50
 summarize:
-  model: claude-sonnet-4-6
+  model: claude-opus-4-7
   concurrency: 20
 render:
   full_top_n: 10
@@ -267,13 +266,12 @@ class SourcesConfig(BaseModel):
 
 
 class FilterConfig(BaseModel):
-    model: str = "claude-haiku-4-5-20251001"
-    threshold: int = Field(7, ge=0, le=10)
+    model: str = "claude-sonnet-4-6"
     concurrency: int = 50
 
 
 class SummarizeConfig(BaseModel):
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-opus-4-7"
     concurrency: int = 20
 
 

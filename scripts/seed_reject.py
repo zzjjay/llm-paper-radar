@@ -2,7 +2,7 @@
 """Log a paper rejection to data/curation/rejected.jsonl.
 
 Optionally also append blacklist patterns to config.yaml so the cheap
-prefilter kills similar papers next time without burning a Haiku call.
+prefilter kills similar papers next time without burning a Sonnet call.
 
 Usage:
 

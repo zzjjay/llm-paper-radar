@@ -146,11 +146,11 @@ and push. **Never auto-commit without asking.**
   `pruning_distill`, `diffusion`. Anything else is rejected by
   `seed_add.py`.
 
-## Handling Haiku hard-gate during seed_add
+## Handling Sonnet hard-gate during seed_add
 
 If a user wants to accept a paper that **was not in any recent `data/scored/*.json`**
 (e.g. they want to seed an old paper from a different domain), `seed_add.py`
-will call Haiku fresh. If Haiku hard-gates it, the script refuses to add
+will call Sonnet fresh. If Sonnet hard-gates it, the script refuses to add
 the paper. Two options:
 
 1. Ask the user to confirm the bucket and re-run with `--bucket <name>`.
