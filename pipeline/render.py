@@ -826,7 +826,14 @@ def _render_aggregated_compact_md(
 
     span = f"{start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
     body: list[str] = []
-    body.append(f"# LLM Inference Optimization Daily · {len(days)}-day · {span}\n")
+    # For the common 2-day fetch (today + yesterday), today's data is incomplete
+    # while yesterday's is full — title the rollup with yesterday's date.
+    # For >2 days, keep the explicit N-day span so the window is unambiguous.
+    if len(days) == 2:
+        title_suffix = start_date.strftime("%Y-%m-%d")
+    else:
+        title_suffix = f"{len(days)}-day · {span}"
+    body.append(f"# LLM Inference Optimization Daily · {title_suffix}\n")
     body.append(f"> 📅 Window: {span}")
     body.append(
         f"> 📊 Scanned {total_scanned} papers → surfaced {len(pairs)}"

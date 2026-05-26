@@ -14,7 +14,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watche
 
 <!-- LATEST_START -->
 
-# LLM Inference Optimization Daily · 2-day · 2026-05-25 → 2026-05-26
+# LLM Inference Optimization Daily · 2026-05-25
 
 > 📅 Window: 2026-05-25 → 2026-05-26
 > 📊 Scanned 426 papers → surfaced 5 · 👤 0 from watched authors
