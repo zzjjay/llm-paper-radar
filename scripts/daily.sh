@@ -99,15 +99,32 @@ else
         FORCE_FLAG=(--force)
         FORCE_DESC=" --force"
     fi
+    # Inter-source pause: hf_daily/arxiv/arxiv_authors all hit
+    # export.arxiv.org from the same IP within seconds, which reliably
+    # triggers arxiv's per-IP 429 throttle (observed 2026-05-26: lost
+    # ~half the trending IDs + skipped both arxiv day-fetches). 45s gives
+    # arxiv's counter time to cool. Cheap compared to a failed daily run.
+    SOURCE_PAUSE=45
+    fetch_idx=0
+    fetch_count=4  # hf_daily, arxiv, arxiv_authors, openreview
+    pause_between() {
+        fetch_idx=$((fetch_idx + 1))
+        if [[ "$fetch_idx" -lt "$fetch_count" ]]; then
+            echo "[$(date -Is)] inter-source pause ${SOURCE_PAUSE}s"
+            sleep "$SOURCE_PAUSE"
+        fi
+    }
     for src in hf_daily arxiv; do
         echo "[$(date -Is)] fetch: $src (--backfill-days ${BACKFILL}${FORCE_DESC})"
         uv run python -m "sources.$src" --backfill-days "${BACKFILL}" "${FORCE_FLAG[@]}" \
             || echo "  ($src returned non-zero, continuing)"
+        pause_between
     done
     for src in arxiv_authors openreview; do
         echo "[$(date -Is)] fetch: $src (--window-days ${DAYS})"
         uv run python -m "sources.$src" --backfill-days 0 --window-days "${DAYS}" \
             || echo "  ($src returned non-zero, continuing)"
+        pause_between
     done
 fi
 

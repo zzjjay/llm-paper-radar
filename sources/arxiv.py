@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import feedparser
 import httpx
 
+from sources._arxiv_lookup import arxiv_get_with_retry
 from sources.base import Paper, Source, SourceRecord
 
 ARXIV_ID_RE = re.compile(r"abs/([\d.]+)(?:v\d+)?$")
@@ -63,30 +64,9 @@ class ArxivSource(Source):
                     f"&max_results={self.page_size}"
                     f"&sortBy=submittedDate&sortOrder=descending"
                 )
-                # arXiv occasionally 429s shared CI IPs and intermittently times
-                # out / drops the connection. Back off and retry on both.
-                resp = None
-                last_exc: Exception | None = None
-                for attempt in range(4):
-                    try:
-                        resp = await client.get(url)
-                        if resp.status_code != 429:
-                            last_exc = None
-                            break
-                        wait = 5 * (2**attempt)  # 5s, 10s, 20s, 40s
-                        print(f"arxiv: 429 on page start={start}, sleeping {wait}s before retry")
-                    except (httpx.TimeoutException, httpx.TransportError) as e:
-                        last_exc = e
-                        wait = 5 * (2**attempt)
-                        print(
-                            f"arxiv: {type(e).__name__} on page start={start}, "
-                            f"sleeping {wait}s before retry"
-                        )
-                    await asyncio.sleep(wait)
-                if last_exc is not None:
-                    raise last_exc
-                assert resp is not None
-                resp.raise_for_status()
+                # arXiv 429s/503s shared CI IPs; back off + jitter and honor
+                # Retry-After. Shared helper handles 429/503/Timeout/TransportError.
+                resp = await arxiv_get_with_retry(client, url, context=f"arxiv(page {start})")
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:
                     break

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 from datetime import UTC, datetime
 
@@ -12,6 +13,61 @@ import httpx
 from sources.base import Paper, SourceName, SourceRecord
 
 ARXIV_LINK_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})")
+
+# Retry budget for arxiv.org/api/query. arXiv's per-IP throttle often
+# stays hot for several minutes once tripped, so 4 attempts at max 40s
+# (the old budget) was too short — a 429 storm would just exhaust retries
+# and the day's fetch would be dropped. New schedule: 5,10,20,40,80,160,300
+# (with ±20% jitter) = up to ~10 min total. Honor Retry-After header when
+# present.
+RETRY_WAITS = [5, 10, 20, 40, 80, 160, 300]
+
+
+def _backoff_wait(attempt: int, retry_after: str | None) -> float:
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    base = RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
+    return base * random.uniform(0.8, 1.2)
+
+
+async def arxiv_get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    context: str = "arxiv",
+) -> httpx.Response:
+    """GET against arxiv API with exponential backoff + jitter, honoring
+    Retry-After. Retries 429, 503, and connection-level errors. Raises
+    the last exception (or HTTPStatusError) if all attempts fail."""
+    last_exc: Exception | None = None
+    for attempt in range(len(RETRY_WAITS)):
+        try:
+            resp = await client.get(url, params=params)
+            if resp.status_code not in (429, 503):
+                resp.raise_for_status()
+                return resp
+            wait = _backoff_wait(attempt, resp.headers.get("Retry-After"))
+            print(
+                f"{context}: {resp.status_code} on attempt {attempt + 1}, "
+                f"sleeping {wait:.0f}s before retry"
+            )
+            last_exc = httpx.HTTPStatusError(
+                f"{resp.status_code}", request=resp.request, response=resp
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+            wait = _backoff_wait(attempt, None)
+            print(
+                f"{context}: {type(e).__name__} on attempt {attempt + 1}, "
+                f"sleeping {wait:.0f}s before retry"
+            )
+        await asyncio.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
 
 
 def extract_arxiv_ids(text: str) -> set[str]:
@@ -31,25 +87,9 @@ async def fetch_arxiv_by_ids(
     url = "http://export.arxiv.org/api/query"
     params = {"id_list": id_query, "max_results": len(ids)}
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        last_exc: Exception | None = None
-        resp = None
-        for attempt in range(4):
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                last_exc = None
-                break
-            except (httpx.TimeoutException, httpx.TransportError) as e:
-                last_exc = e
-                wait = 5 * (2**attempt)
-                print(
-                    f"_arxiv_lookup: {type(e).__name__} fetching {len(ids)} ids,"
-                    f" sleeping {wait}s before retry"
-                )
-                await asyncio.sleep(wait)
-        if last_exc is not None:
-            raise last_exc
-        assert resp is not None
+        resp = await arxiv_get_with_retry(
+            client, url, params=params, context=f"_arxiv_lookup({len(ids)} ids)"
+        )
     feed = feedparser.parse(resp.text)
     now = datetime.now(UTC)
     papers: list[Paper] = []

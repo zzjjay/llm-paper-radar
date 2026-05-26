@@ -27,7 +27,15 @@ class HFDailySource(Source):
     DAILY_URL = "https://huggingface.co/api/daily_papers"
     TRENDING_URL = "https://huggingface.co/papers/trending"
 
+    def __init__(self) -> None:
+        # Set True when the trending arxiv-lookup step couldn't complete
+        # (429/503/timeout after all retries). Caller may use this to
+        # avoid clobbering a previously-complete on-disk file with a
+        # silently-degraded one.
+        self.last_partial: bool = False
+
     async def fetch(self, target_date: datetime) -> list[Paper]:
+        self.last_partial = False
         date_str = target_date.strftime("%Y-%m-%d")
         async with httpx.AsyncClient(
             timeout=30.0, headers={"User-Agent": "Mozilla/5.0 llm-paper-radar"}
@@ -113,6 +121,7 @@ class HFDailySource(Source):
                     f" dropping those entries"
                 )
                 enriched = []
+                self.last_partial = True
             for p in enriched:
                 papers[p.id] = p
 
@@ -150,7 +159,25 @@ if __name__ == "__main__":
             papers = asyncio.run(src.fetch(target))
             day_dir = out_dir / target.strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
-            (day_dir / "hf_daily.json").write_text(
+            out_path = day_dir / "hf_daily.json"
+            # Clobber guard: if the trending lookup partially failed and
+            # the existing file has more papers than what we'd write,
+            # keep the existing file. Without this, a 429 storm during
+            # `--backfill-days N --force` silently truncates yesterday's
+            # complete data down to today's degraded subset.
+            if src.last_partial and out_path.exists():
+                try:
+                    existing = json.loads(out_path.read_text())
+                    if isinstance(existing, list) and len(existing) > len(papers):
+                        print(
+                            f"hf_daily: WARN partial failure, refusing to clobber "
+                            f"{out_path} ({len(existing)} → {len(papers)} papers). "
+                            f"Keeping existing file."
+                        )
+                        continue
+                except (OSError, json.JSONDecodeError):
+                    pass
+            out_path.write_text(
                 json.dumps([p.model_dump(mode="json") for p in papers], indent=2)
             )
             print(f"hf_daily: wrote {len(papers)} papers for {target.date()}")
