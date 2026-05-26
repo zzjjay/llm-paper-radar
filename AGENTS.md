@@ -10,8 +10,10 @@ other knob that disables/throttles work the user didn't ask to skip) on
 your own initiative — even when you think it'll take too long.
 
 The `auto_paper_river` step runs the `ljg-paper-river` skill in headless
-mode for every newly surfaced paper. It can take hours on a fresh digest.
-That's a deliberate cost the user chose when designing the pipeline; the
+mode for every paper surfaced in the current rollup window (default
+`--window-days 2`, matching `daily.sh`'s `--days`). Typical cron runs
+generate a handful of `.org` files — but a `--all-history` backfill or
+a long `--days` window can balloon to hundreds × 5-10 min each. The
 output `.org` files are the whole point of the run.
 
 If you're worried about runtime, **ask** before skipping:

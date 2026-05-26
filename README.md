@@ -153,9 +153,9 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
          │            data/summarized/YYYY-MM-DD.json
          ↓
    ┌────────────┐     scripts/auto_paper_river.py  +  translate_paper_river.py
-   │ paper-river│ ─── per surfaced paper: ljg-paper-river skill writes a
-   │ (optional) │     deep-lineage `.org` analysis, then auto-translates
-   │            │     zh → `_en.org`. Skip with PAPER_RIVER_SKIP=1.
+   │ paper-river│ ─── per paper surfaced in the current rollup window:
+   │ (optional) │     ljg-paper-river skill writes a deep-lineage `.org`
+   │            │     analysis, then auto-translates zh → `_en.org`.
    └─────┬──────┘            ↓
          │            paper-river/<acronym>-<id>.org (+ _en.org)
          ↓
@@ -181,13 +181,13 @@ uv run python -m pipeline.summarize
 uv run python -m pipeline.render
 ```
 
-`scripts/daily.sh` chains all of the above end-to-end, runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. `PAPER_RIVER_MAX=N` caps how many paper-river `.org` files get generated per run (default: no cap).
+`scripts/daily.sh` chains all of the above end-to-end, runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. The paper-river step is scoped to the same rollup window as the digest (`--window-days`, default 2) so it tracks what's in the README's latest table — typically a handful of papers per run. `PAPER_RIVER_MAX=N` caps further; `PAPER_RIVER_SKIP=1` disables; `--all-history` (on `auto_paper_river.py` directly) revisits every paper ever surfaced for one-off backfills.
 
 ### 🌊 Paper River (optional)
 
 **What.** A deep-lineage analysis per surfaced paper — "倒读法": recursively trace 5 layers of intellectual ancestry, then walk forward Feynman-style. Written by Claude via the [`ljg-paper-river`](https://github.com/lijigang/ljg-skills) skill.
 
-**How it plugs in.** `scripts/daily.sh` invokes the skill for each surfaced paper, saves the output as `paper-river/<acronym>-<arxiv-id>.org`, and auto-translates it into an `_en.org` sibling. Render links each digest to its own language (zh digest → `.org`, en digest → `_en.org`). Set `PAPER_RIVER_SKIP=1` to skip; render works fine without any `.org` file.
+**How it plugs in.** `scripts/daily.sh` invokes the skill for every paper surfaced in the current rollup window (the same set you see in the README's latest table), saves the output as `paper-river/<acronym>-<arxiv-id>.org`, and auto-translates it into an `_en.org` sibling. Render links each digest to its own language (zh digest → `.org`, en digest → `_en.org`). Run `auto_paper_river.py --all-history` to backfill paper-river for everything ever surfaced. Set `PAPER_RIVER_SKIP=1` to skip; render works fine without any `.org` file.
 
 **Install** (one-time, two slash commands):
 

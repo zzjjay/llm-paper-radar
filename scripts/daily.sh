@@ -134,13 +134,16 @@ run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACK
 run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 5
 run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 6
 
-# Auto-generate paper-river .org files for every surfaced paper that
-# doesn't have one yet. Delegates to scripts/auto_paper_river.py which
-# scans data/summarized/, dedupes against paper-river/, and invokes
+# Auto-generate paper-river .org files for papers surfaced in the
+# current rollup window (--window-days matches --days, default 2), so
+# the paper-river backlog tracks what's in the README's latest table
+# rather than every paper ever surfaced. Delegates to
+# scripts/auto_paper_river.py which scans the windowed
+# data/summarized/, dedupes against paper-river/, and invokes
 # scripts/gen_paper_river.sh per paper (which runs the ljg-paper-river
-# Claude Code skill in headless mode). Default has NO cap — set
-# PAPER_RIVER_MAX=N to cap per run (e.g. 2 in cron, unlimited for
-# weekend backfills). PAPER_RIVER_SKIP=1 disables this step entirely.
+# Claude Code skill in headless mode). PAPER_RIVER_MAX=N caps further;
+# PAPER_RIVER_SKIP=1 disables this step entirely. For historical
+# backfills, run auto_paper_river.py --all-history out-of-band.
 # Non-fatal: pipeline ships even if generation fails.
 if [[ "${PAPER_RIVER_SKIP:-0}" -eq 1 ]]; then
     echo "[$(date -Is)] auto_paper_river: skipped (PAPER_RIVER_SKIP=1)"
