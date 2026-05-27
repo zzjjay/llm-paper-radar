@@ -10,6 +10,7 @@ from pathlib import Path
 
 import click
 
+from pipeline._clock import today_utc
 from pipeline.config import load_config
 from sources.base import Paper
 
@@ -902,7 +903,7 @@ if __name__ == "__main__":
         if date:
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
         else:
-            base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            base = today_utc()
 
         targets: list[tuple[datetime, Path]] = []
         for delta in reversed(range(backfill_days + 1)):

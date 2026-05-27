@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from pipeline._clock import today_utc
 from pipeline.config import load_config
 from pipeline.render import _compact_row, sort_papers
 from sources.base import Paper
@@ -71,7 +72,7 @@ if __name__ == "__main__":
         end = (
             datetime.fromisoformat(end_date).replace(tzinfo=UTC)
             if end_date
-            else datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            else today_utc()
         )
         render_weekly(end, in_root, out_dir)
         start = end - timedelta(days=6)

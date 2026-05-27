@@ -44,9 +44,17 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+# Make the project's `pipeline` package importable when this script is
+# invoked directly (uv run python scripts/auto_paper_river.py only adds
+# scripts/ to sys.path).
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import click
 
-ROOT = Path(__file__).resolve().parent.parent
+from pipeline._clock import today_utc
+
 PAPER_RIVER_DIR = ROOT / "paper-river"
 SUMMARIZED_DIR = ROOT / "data" / "summarized"
 GEN_SCRIPT = ROOT / "scripts" / "gen_paper_river.sh"
@@ -72,8 +80,12 @@ def existing_ids() -> set[str]:
 
 def _window_paths(window_days: int, today: datetime | None = None) -> list[Path]:
     """Return data/summarized/<date>.json paths for the last `window_days`
-    days (today inclusive), newest first. Missing files are skipped."""
-    today = today or datetime.now(UTC)
+    days (today inclusive), newest first. Missing files are skipped.
+
+    "today" honors RADAR_DAY_OFFSET (set to 1 by daily.sh so the cron
+    treats yesterday-UTC as the canonical day)."""
+    if today is None:
+        today = today_utc()
     out: list[Path] = []
     for d in range(window_days):
         date = today - timedelta(days=d)

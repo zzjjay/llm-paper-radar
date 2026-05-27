@@ -136,6 +136,7 @@ if __name__ == "__main__":
 
     import click
 
+    from pipeline._clock import today_utc
     from pipeline.config import load_config
 
     @click.command()
@@ -148,7 +149,7 @@ if __name__ == "__main__":
             print("hf_daily source disabled")
             return
         src = HFDailySource()
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        today = today_utc()
         for delta in range(backfill_days + 1):
             target = today - timedelta(days=delta)
             if not force and backfill_days > 0 and (

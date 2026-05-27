@@ -3,20 +3,27 @@
 # Designed for cron. Sources ~/.bashrc so the AMD Anthropic proxy env vars are present.
 #
 # Usage:
-#   daily.sh                 # default 2-day window (today + yesterday, force re-fetch)
+#   daily.sh                 # default: yesterday only (UTC), force re-fetch
 #   daily.sh --days 60       # backfill last 60 days (skips days whose digest exists)
 #   daily.sh --days 60 --force  # backfill last 60 days, re-fetch even if digest exists
 #   daily.sh --no-fetch      # skip the source fetch step; re-run dedupe→render
 #                              against whatever is already in data/raw/
 #   DAYS=14 daily.sh         # env var also works
 #
-# Defaults: cron runs `daily.sh` daily at Beijing 06:00 — a 2-day window
-# (today + yesterday) with --force so yesterday's slot gets re-rendered
-# even though its digest exists from yesterday's run.
+# Defaults: cron runs `daily.sh` at Beijing 14:00 (= UTC 06:00). By that
+# hour arxiv has finished publishing the previous UTC day's batch, so the
+# pipeline treats yesterday-UTC as "today" (via RADAR_DAY_OFFSET=1) and
+# fetches that single complete day. README title therefore matches the
+# Beijing-yesterday calendar date the user expects.
 
 set -uo pipefail
 
-DAYS="${DAYS:-2}"
+DAYS="${DAYS:-1}"
+
+# Shift every "today" the pipeline computes back by one UTC day. The
+# cron fires at UTC 06:00 — UTC today is still mostly empty on arxiv,
+# while UTC yesterday is the freshly-complete batch. See pipeline/_clock.py.
+export RADAR_DAY_OFFSET=1
 NO_FETCH=0
 FORCE=1   # default on: the daily cron's whole point is to re-render yesterday
 DAYS_EXPLICIT=0

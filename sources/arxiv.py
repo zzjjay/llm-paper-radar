@@ -151,6 +151,7 @@ if __name__ == "__main__":
 
     import click
 
+    from pipeline._clock import today_utc
     from pipeline.config import load_config
 
     @click.command()
@@ -191,7 +192,7 @@ if __name__ == "__main__":
             print("arxiv source disabled")
             return
         src = ArxivSource(categories=cfg.sources.arxiv.categories)
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        today = today_utc()
 
         # Build the list of days to actually fetch (skipping those whose
         # digest already exists). Done up front so batching boundaries land

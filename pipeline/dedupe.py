@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from pipeline._clock import today_utc
 from pipeline.config import Config, load_config
 from sources.base import Paper
 
@@ -99,7 +100,7 @@ if __name__ == "__main__":
         if date:
             base = datetime.fromisoformat(date).replace(tzinfo=UTC)
         else:
-            base = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            base = today_utc()
         for delta in range(backfill_days + 1):
             target = base - timedelta(days=delta)
             if not force and backfill_days > 0 and (

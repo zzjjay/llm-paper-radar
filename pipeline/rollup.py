@@ -21,6 +21,7 @@ from pathlib import Path
 
 import click
 
+from pipeline._clock import today_utc
 from pipeline.render import _compute_day, _render_aggregated_compact_md
 from sources.base import Paper
 
@@ -83,9 +84,7 @@ def main(
     digests_dir: Path,
     output: Path | None,
 ) -> None:
-    end_dt = _parse_date(end) if end else datetime.now(UTC).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    end_dt = _parse_date(end) if end else today_utc()
 
     if start and days is not None:
         raise click.UsageError("Pass either --start or --days, not both.")
