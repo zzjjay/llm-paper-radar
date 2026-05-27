@@ -34,26 +34,36 @@ if [[ "${PAPER_RIVER_SKIP:-0}" -ne 1 ]]; then
         || echo "snapshot: translate_paper_river failed, continuing"
 fi
 
-# Parse window from the "> 📅 Window: YYYY-MM-DD → YYYY-MM-DD" line.
-WINDOW_LINE="$(grep -m1 -E "^> 📅 Window" README.md || true)"
+# Parse window from the header line. Two formats are supported:
+#   "> 📅 Publication date: YYYY-MM-DD (UTC)"          (single-day, current)
+#   "> 📅 Window: YYYY-MM-DD → YYYY-MM-DD"             (multi-day rollup, legacy)
+WINDOW_LINE="$(grep -m1 -E "^> 📅 (Publication date|Window)" README.md || true)"
 if [[ -z "$WINDOW_LINE" ]]; then
-    echo "snapshot: could not find '📅 Window' line in README.md" >&2
+    echo "snapshot: could not find '📅 Publication date' or '📅 Window' line in README.md" >&2
     exit 1
 fi
-# Extract the two YYYY-MM-DD dates in order.
-read -r START_DASH END_DASH < <(echo "$WINDOW_LINE" | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}" | head -2 | tr '\n' ' ')
-if [[ -z "${START_DASH:-}" || -z "${END_DASH:-}" ]]; then
-    echo "snapshot: failed to parse start/end from: $WINDOW_LINE" >&2
+# Extract all YYYY-MM-DD dates; 1 (single-day) or 2 (rollup) expected.
+DATES=( $(echo "$WINDOW_LINE" | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}") )
+if [[ "${#DATES[@]}" -eq 1 ]]; then
+    START_DASH="${DATES[0]}"
+    END_DASH="${DATES[0]}"
+elif [[ "${#DATES[@]}" -ge 2 ]]; then
+    START_DASH="${DATES[0]}"
+    END_DASH="${DATES[1]}"
+else
+    echo "snapshot: failed to parse date(s) from: $WINDOW_LINE" >&2
     exit 1
 fi
 START="${START_DASH//-/}"
 END="${END_DASH//-/}"
 
 # Window length N is always derived from the parsed window so the filename
-# never disagrees with the content. DAYS env is intentionally ignored here.
+# never disagrees with the content. Single-day → N=1. DAYS env is intentionally
+# ignored here.
 START_EPOCH="$(date -u -d "$START_DASH" +%s)"
 END_EPOCH="$(date -u -d "$END_DASH" +%s)"
-N=$(( (END_EPOCH - START_EPOCH) / 86400 ))
+DIFF=$(( (END_EPOCH - START_EPOCH) / 86400 ))
+N=$(( DIFF == 0 ? 1 : DIFF ))
 
 NAME="${START}-${END}-${N}days"
 [[ -n "${LABEL:-}" ]] && NAME="${NAME}-${LABEL}"
