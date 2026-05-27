@@ -827,7 +827,14 @@ def _render_aggregated_compact_md(
 
     span = f"{start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
     body: list[str] = []
-    body.append(f"# LLM Inference Optimization Daily · {len(days)}-day · {span}\n")
+    # If the rollup ended up covering a single day (e.g. --days 2 where one
+    # day had no summarized JSON), drop the "1-day · X → X" verbosity and
+    # just show the date — matches render_daily's single-day title style.
+    if len(days) == 1:
+        title_suffix = start_date.strftime("%Y-%m-%d")
+    else:
+        title_suffix = f"{len(days)}-day · {span}"
+    body.append(f"# LLM Inference Optimization Daily · {title_suffix}\n")
     body.append(f"> 📅 Window: {span}")
     body.append(
         f"> 📊 Scanned {total_scanned} papers → surfaced {len(pairs)}"
