@@ -32,8 +32,9 @@ class OpenReviewSource(Source):
         window_start = target_date - timedelta(days=self.window_days)
         window_end = target_date + timedelta(hours=1)
         out: list[Paper] = []
+        expanded = _expand_year_templates(self.venues, target_date.year)
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            for venue in self.venues:
+            for venue in expanded:
                 invitation = f"{venue}/-/Submission"
                 try:
                     notes = await self._fetch_venue(client, invitation, window_start)
@@ -96,6 +97,29 @@ class OpenReviewSource(Source):
             offset += self.PAGE_SIZE
             await asyncio.sleep(1.0)
         return all_notes
+
+
+def _expand_year_templates(venues: list[str], current_year: int) -> list[str]:
+    """Expand `{year}` placeholders against the current year and the next year.
+
+    A given conference's CFP window straddles two calendar years (e.g. in 2026
+    OpenReview has both ICLR 2026 papers being reviewed and ICLR 2027 papers
+    just opened). Templating means the config doesn't need a yearly edit.
+    Venues without `{year}` are passed through unchanged. Order is preserved;
+    duplicates are dropped. The fetcher silently skips venues that don't exist.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for tmpl in venues:
+        if "{year}" in tmpl:
+            candidates = [tmpl.format(year=current_year), tmpl.format(year=current_year + 1)]
+        else:
+            candidates = [tmpl]
+        for v in candidates:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    return out
 
 
 def _content_value(content: dict, field: str, default=None):

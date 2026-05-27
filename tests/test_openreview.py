@@ -4,7 +4,13 @@ import pytest
 import respx
 from httpx import Response
 
-from sources.openreview import OpenReviewSource, _content_value, _note_pub, _note_to_paper
+from sources.openreview import (
+    OpenReviewSource,
+    _content_value,
+    _expand_year_templates,
+    _note_pub,
+    _note_to_paper,
+)
 
 
 def _make_note(note_id: str, title: str, days_ago: int, *, v2_format: bool = True) -> dict:
@@ -86,3 +92,42 @@ def test_note_pub_prefers_cdate_then_pdate_then_mdate():
 def test_note_to_paper_skips_when_title_missing():
     note = {"id": "x", "content": {"abstract": {"value": "abs only"}}}
     assert _note_to_paper(note, "V.cc/2026/Conference", datetime.now(UTC)) is None
+
+
+def test_expand_year_templates_expands_to_current_and_next_year():
+    """`{year}` placeholder is filled with current year and current+1 so a venue
+    config survives the calendar rollover without manual edits."""
+    out = _expand_year_templates(
+        ["ICLR.cc/{year}/Conference", "MLSys.org/{year}/Conference"],
+        current_year=2026,
+    )
+    assert out == [
+        "ICLR.cc/2026/Conference",
+        "ICLR.cc/2027/Conference",
+        "MLSys.org/2026/Conference",
+        "MLSys.org/2027/Conference",
+    ]
+
+
+def test_expand_year_templates_passes_through_pinned_literals():
+    """Literal venue strings (no `{year}`) are kept verbatim so a user can pin
+    a specific past conference alongside templated current ones."""
+    out = _expand_year_templates(
+        ["NeurIPS.cc/2025/Conference", "ICLR.cc/{year}/Conference"],
+        current_year=2026,
+    )
+    assert out == [
+        "NeurIPS.cc/2025/Conference",
+        "ICLR.cc/2026/Conference",
+        "ICLR.cc/2027/Conference",
+    ]
+
+
+def test_expand_year_templates_dedups_overlap_preserving_order():
+    """A literal that happens to equal the template's expansion is dropped on
+    the second occurrence — first-seen wins so configured order is preserved."""
+    out = _expand_year_templates(
+        ["ICLR.cc/2026/Conference", "ICLR.cc/{year}/Conference"],
+        current_year=2026,
+    )
+    assert out == ["ICLR.cc/2026/Conference", "ICLR.cc/2027/Conference"]
