@@ -58,12 +58,12 @@ START="${START_DASH//-/}"
 END="${END_DASH//-/}"
 
 # Window length N is always derived from the parsed window so the filename
-# never disagrees with the content. Single-day → N=1. DAYS env is intentionally
-# ignored here.
+# never disagrees with the content. Inclusive count: a digest covering only
+# 2026-05-25 is 1 day, 2026-05-19 → 2026-05-25 is 7 days. DAYS env is
+# intentionally ignored here.
 START_EPOCH="$(date -u -d "$START_DASH" +%s)"
 END_EPOCH="$(date -u -d "$END_DASH" +%s)"
-DIFF=$(( (END_EPOCH - START_EPOCH) / 86400 ))
-N=$(( DIFF == 0 ? 1 : DIFF ))
+N=$(( (END_EPOCH - START_EPOCH) / 86400 + 1 ))
 
 NAME="${START}-${END}-${N}days"
 [[ -n "${LABEL:-}" ]] && NAME="${NAME}-${LABEL}"
