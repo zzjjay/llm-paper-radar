@@ -1,0 +1,266 @@
+#+title:      ReMoE: Boosting Expert Reuse through Router Fine-Tuning in Memory-Constrained MoE LLM Inference
+#+date:       [2026-05-26 Tue 22:45]
+#+filetags:   :paper:river:moe:edge:locality:en:
+#+identifier: 20260526T224520-en
+#+source:     https://arxiv.org/abs/2605.27081
+#+authors:    Xiongwei Zhu, Xiaojian Liao, Tianyang Jiang, Yusen Zhang, Liang Wang, Limin Xiao
+#+venue:      ICML 2026
+
+* The Problem River
+
+One sentence: *Can you run DeepSeek on a smartphone?*
+
+The difficulty is counterintuitive. MoE (Mixture-of-Experts) models activate only a small handful of "experts" per token — which sounds purpose-built for memory-constrained devices: large total parameter count, but only a fraction actually used at each step. Yet the moment you try to squeeze one onto a phone, you discover the catch: even though only a few experts are activated, each token picks a *different* few, so expert weights must be constantly dragged from slow storage (UFS / SSD) into RAM. Page-thrashing. Latency explodes.
+
+What makes this even more awkward is that *the very techniques that make MoE faster, more GPU-efficient, and better at scaled training are precisely what make it collapse on a phone*.
+One research thread, five years, five generations of researchers pushing "expert dispersion" to its logical extreme — and then edge deployment gutted the whole edifice. Everyone had to turn around and relearn one thing: how to *cluster* experts back together.
+
+The river's headwaters are Shazeer's 2017 brainstorm about "making models bigger without making them more expensive to run"; its mouth is ReMoE's 2026 minimal fix — *touch only the router, leave everything else alone, and make an already-trained model immediately usable on a phone*.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: make neural networks larger without paying full compute each step
+  | Solution: add a gating network; each token selects K experts;
+  |           add load-balancing auxiliary loss to ensure uniform expert utilization
+  v
+[2021] Lepikhin et al. - GShard
+  |
+  | Problem: Shazeer's MoE doesn't fit or run in distributed training
+  | Solution: top-K token-choice + strict auxiliary loss,
+  |           forcing tokens to spread evenly across experts for multi-machine parallelism
+  v
+[2022] Fedus et al. - Switch Transformer
+  |
+  | Problem: top-K is still expensive — each token computes K experts
+  | Solution: cut to top-1; refine aux loss; scalable to trillion parameters
+  v
+[2024] DeepSeek-AI - DeepSeek-V2 (Fine-Grained MoE)
+  |
+  | Problem: Switch-style "one token, one large expert" lacks specialization
+  | Solution: shatter experts into pieces — N_r=64~160 small experts per layer,
+  |           each token activates 6~8 -> more specialized, larger capacity
+  |           *Side effect*: expert switching between tokens becomes extremely frequent
+  v
+[2025] Zhou et al. - Oracle-MoE        [2025] Skliar et al. - Cache-Conditional MoE
+  |   (locality bottleneck formally named)      |
+  | Problem: fine-grained MoE thrashes pages    | Problem: same, but no retraining allowed
+  |          on edge devices                    |
+  | Solution: redesign routing architecture,   | Solution: at inference time, bias router
+  |           route in "oracle space" derived   |           logits toward experts already in
+  |           from attention; train from scratch|           cache; no weight changes, no retraining
+  \                                          /
+   \                                        /
+    \___________________ + ________________/
+                        |
+                        v
+[2026] Zhu et al. - ReMoE (this paper)
+  |
+  | Problem: Oracle-MoE requires retraining — too expensive;
+  |          Cache-Conditional tweaks logits at inference, but the aux loss baked
+  |          in during training keeps fighting it in the opposite direction
+  | Solution: don't touch the architecture, don't touch the inference graph,
+  |           don't retrain. Take a trained MoE and *fine-tune only the router gate*:
+  |           disable the aux load-balancing loss (the root cause of dispersion),
+  |           add a temporal-locality loss to encourage reuse, add a KL trust-region
+  |           to keep semantics anchored. Zero inference overhead; 1.77x~1.99x decoding speedup.
+#+end_example
+
+Confirmed citation relationships: all 2017–2025 papers are directly cited and compared in ReMoE's Related Work section. Oracle-MoE and Cache-Conditional MoE are the two most recent baselines explicitly named.
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al. - Sparsely-Gated MoE: Making Large Models Affordable
+
+*** What Problem It Saw
+
+The 2017 pain point was blunt: you want neural networks to be larger (more parameters, more capability), but compute cost scales linearly with parameter count. The mainstream approach was dense networks — every input passes through *all* parameters. Want ten times the size? You need ten times the compute.
+
+*** Its Solution
+
+Shazeer's insight: *capability lives in parameters, but you don't have to use all of them every time*.
+Add a small gating network; each token selects only K "experts" (a group of FFN sub-networks) to activate. 1,000 experts, activate 4 per step → capacity is 250× a dense model, but per-step computation is roughly the same.
+
+The catch: without constraints, the gate becomes biased — it always picks the same "favorite" experts, leaving the rest undertrained and unused. So a *load-balancing auxiliary loss* was added: penalize non-uniform selection distributions, forcing tokens to spread across all experts.
+
+*** Why It Worked (and What It Buried)
+
+It worked because it was the first time "conditional computation" — a long-standing idea — was actually made to work at scale on large RNNs. *But the pit it dug was deep*: the load-balancing loss, introduced purely to serve "training-time utilization," was from that point forward carried into every MoE training recipe. Nine years later, it would become the single largest internal contradiction in the entire research thread.
+
+** 2021 | Lepikhin et al. - GShard: Fitting MoE into 600B Multi-Machine Training
+
+*** What Problem It Saw
+
+Shazeer's MoE ran on single-machine RNNs. By 2021 the Transformer had taken over, and researchers wanted to bring MoE into Transformer training at 600B+ scale — only to find it was an engineering dead end: experts distributed across machines meant token routing became cross-machine communication, and if routing was severely imbalanced (machine A handles 80% of traffic, machine B handles 20%), the whole cluster stalled at the slowest node.
+
+*** Its Solution
+
+GShard turned the *load-balancing loss into a life-or-death hard constraint* — not "encourage uniformity" but "enforce uniformity." It introduced expert capacity ceilings: each expert processes a fixed number of tokens per batch; overflow is discarded. Combined with top-K token-choice and a strict aux loss, tokens were forcibly spread across all experts.
+
+*** Why It Worked (and What It Buried)
+
+This *"expert dispersion" logic, designed to exploit multi-machine parallelism*, was from this point cemented into all MoE training frameworks. DeepSpeed-MoE, Megablocks, Tutel — all built on this assumption. New pit: *dispersion* went from a trick to a *default belief* in MoE training, and nobody questioned whether it was correct for every deployment scenario.
+
+** 2022 | Fedus et al. - Switch Transformer: Minimal top-1 Routing
+
+*** What Problem It Saw
+
+GShard's top-K (K=2) still computed two experts per token. Could you cut that in half with K=1? The theoretical worry: top-1 is too "hard" and training would be unstable.
+
+*** Its Solution
+
+Switch committed: K=1. Paired with more refined aux losses (router z-loss and other stability terms), it proved that top-1 routing can be stably trained to trillion-parameter scale.
+
+*** Why It Worked (and What It Buried)
+
+Switch elevated MoE to "textbook status" — afterwards everyone assumed MoE training looked like this: top-K routing + auxiliary load-balancing loss + cross-machine expert parallelism. *What it buried*: top-1 means each token picks only one expert, so adjacent tokens almost inevitably pick *different* experts. In distributed training that is exactly what you want (fully utilizing all machines); but if you ever want to run this model with *a single machine and batch size 1*, these are the seeds of disaster.
+
+** 2024 | DeepSeek-V2 / Qwen-MoE: Shattering Experts, Amplifying the Disaster
+
+*** What Problem It Saw
+
+Switch-style "one token, one large expert" did not specialize enough — each expert still handled too broad a semantic range, capping capability.
+
+*** Its Solution
+
+*Fine-grained MoE*: explode the expert count from a dozen to 64–160, making each expert smaller and more specialized; each token activates 6–8 of them, plus a few "shared experts" to handle general-purpose capacity. More capacity, stronger specialization, benchmark scores up.
+
+*** Why It Worked (and What It Buried)
+
+It worked because the model now resembled "a committee of small, sharp specialists" rather than "a few generalists." *But inter-token expert switching was amplified by an order of magnitude*: with 12 experts choosing 1, adjacent tokens still had a 1/12 chance of overlap; with 160 experts choosing 8, the expert sets of adjacent tokens almost never overlap.
+
+On cloud GPUs this is not a problem — all experts live in VRAM and switching is free. But when anyone tried to fit DeepSeek-V2-Lite onto a smartphone in 2024–2025, the problem ignited immediately: expert weights thrashed back and forth between UFS and DRAM, every token waiting on I/O.
+
+*This is the inflection point of the entire river.* Every "make MoE better" advance of the preceding five years was simultaneously making *edge deployment* worse.
+
+** 2025 | Oracle-MoE & Cache-Conditional MoE: Two Counter-Attacks
+
+*** What Problem They Saw
+
+The same problem: fine-grained MoE page-thrashing on memory-constrained edge devices. But the two groups chose opposite directions.
+
+*** Their Solutions
+
+*Oracle-MoE (Zhou et al., ICML 2025)*: the architecture camp. "If the problem is in the routing architecture itself, redesign the routing architecture." They found that the space spanned by attention scores has natural "semantic locality" — adjacent tokens have similar attention patterns, so routing decisions can be made in that space. Cost: you must *train a new model from scratch*.
+
+*Cache-Conditional MoE (Skliar et al., 2024/2025)*: the inference camp. "Retraining is too expensive — intervene only at inference time." After seeing the router's output logits, boost the logits of experts already in cache, biasing top-K selection toward reuse. No weight changes, no retraining.
+
+*** Why Neither Was Enough (i.e., Where ReMoE Begins)
+
+Oracle-MoE confirmed that routing is the key, but *retraining cost is prohibitive* — nobody wants to retrain DeepSeek-V2 from scratch for a deployment optimization.
+
+Cache-Conditional MoE carries a subtler cost: it deviates from the router's trained decisions *at inference time*, yet the router was trained with Shazeer-era aux losses still baked in — *the training objective keeps pushing toward dispersion while the inference hack keeps pushing toward clustering*. These two forces fight each other, and quality drops. The perplexity loss of 0.1%–3% reported in Skliar's paper is exactly this tension.
+
+At this point the river makes the problem very clear: *what truly needs fixing is not the architecture, nor the inference logic, but the training objective itself — the one that was mindlessly inherited nine years ago.*
+
+** 2026 | ReMoE: One Needle, Straight into the Source of the Contradiction
+
+*** What Problem It Saw
+
+ReMoE's diagnosis is more precise than all its predecessors:
+
+1. Oracle-MoE's retraining is too expensive — *only the small set of router gate parameters actually needs to change*.
+2. Cache-Conditional MoE's inference hack fights its training objective — *the training objective itself should encourage reuse*.
+3. The standard MoE load-balancing aux loss — *has no business existing in a B=1 edge inference setting*; it serves load balancing in distributed training, not single-user inference.
+
+*** Its Solution
+
+ReMoE's intervention is almost startlingly small:
+- Take an already-trained MoE checkpoint (DeepSeek-V2-Lite, Qwen1.5-MoE).
+- *Freeze all parameters; fine-tune only the router gate* (a small matrix per layer).
+- *Disable the aux load-balancing loss* (the critical subtraction, not addition).
+- Add two new losses:
+  - *Temporal Locality loss*: encourages the router to place probability mass on "experts selected in the previous step."
+  - *Trust-KL loss*: compute KL divergence between the current router output and a frozen copy of the original router, forming a soft trust region to prevent semantic drift.
+
+After a few hours of training, the router learns: "if the previous token selected experts {3, 17, 42}, this token should preferentially pick from {3, 17, 42}" — *without meaningfully degrading quality*.
+
+*** Why It Works (and What It Opens Up)
+
+It works because it strikes the true source of the contradiction:
+- Prior work kept *adding things* to solve the problem (new architecture, new inference logic, logit corrections).
+- ReMoE *subtracts one thing and adds one thing*: remove the aux loss, add the locality loss.
+- The thing removed had been present for nine years and nobody questioned it — that is the most powerful part.
+
+Results: expert reuse rate on DeepSeek-V2-Lite up +26.4%; TPOT on Jetson Orin NX down 43.6–49.8%; 1.77×–1.99× decoding speedup; *benchmarks barely move*.
+
+What it opens up: *a training objective is not an intrinsic property of a model — it is a function of the deployment environment*. The same model needs one router for cloud inference and a different router for phone inference — and swapping the router takes only a few hours of fine-tuning, not a full retraining.
+
+* Frontier Extensions
+
+ReMoE is a May 2026 paper (ICML 2026) and represents the latest advance in this thread. Looking ahead, several natural directions are already visible:
+
+1. *Router multi-objective fine-tuning becomes a new paradigm.*
+   ReMoE demonstrated "fine-tune the router for edge deployment." Follow-on work will likely fine-tune different router checkpoints for different deployment scenarios (multi-user serving, streaming inference, long-context), much like today's ecosystem of different LoRA adapters.
+
+2. *Locality fine-tuning combined with quantization.*
+   ReMoE itself points this out: locality reduces the *number of fetches*; quantization reduces the *size of each fetch* — the two are orthogonal. Combining SmoothQuant/AWQ with ReMoE is an obvious next experiment.
+
+3. *Inference-time cache-aware routing as a second layer of defense.*
+   Cache-Conditional MoE is not dead — it can be stacked on top of ReMoE. ReMoE removes the trained bias toward dispersion; Cache-Conditional then does tie-breaking at inference time to handle residual long-tail cache misses.
+
+4. *Internalizing locality at pretraining.*
+   ReMoE is a post-training method. Will the next generation of MoE models list "B=1 edge deployment" as a training objective from the start? That would require redesigning the aux loss from scratch, rather than simply turning it off.
+
+* One Diagram
+
+#+begin_example
+            Expert Dispersion (training-driven)  <----->  Expert Clustering (inference-driven)
+                       |                                          |
+2017  Shazeer ........ * load-balancing aux loss born
+                       |                                          |
+2021  GShard ......... * aux loss becomes hard constraint (multi-machine parallelism)
+                       |                                          |
+2022  Switch ......... * top-1 + aux loss (T-scale)
+                       |                                          |
+2024  DeepSeek-V2 .... * fine-grained: N_r=160, K=8
+                       |  ^                                       |
+                       |  | tension reaches breaking point        |
+                       |  v                                       |
+2024  Cache-Cond MoE . *                                          *  inference-time logit hack
+                       |                                          |
+2025  Oracle-MoE ..... *                                          *  retrain architecture, attention space
+                       |                                          |
+2026  ReMoE .......... *  disable aux loss              <-------- *  fine-tune router only
+                                  +
+                            locality loss
+                                  +
+                            trust-KL anchor
+
+      Horizontal axis: tension between training-time and inference-time objectives
+      Vertical axis: time
+      *: key intervention point
+      Diagonal lines: tension line — contradiction between training objective and inference needs
+                      reaches breaking point in 2024
+      ReMoE's position: resolves the contradiction at the level of the training objective itself
+#+end_example
+
+* Insights
+
+Reading through this river, three observations surface.
+
+*First: every era's "best practice" is a local optimum for the deployment environment of that era.*
+From 2017 to 2023, the MoE deployment scenario was datacenter GPU clusters, and the load-balancing loss was the optimal solution for that environment. When the deployment environment shifts from "high-throughput multi-user cluster" to "single-user single-machine edge," the former "best practice" immediately becomes the worst anti-pattern. But because it had been written into textbooks and into every MoE training framework, *everyone carried it by default* — until 2026, when someone finally said explicitly: "turn it off."
+
+*Second: the "addition trap" in research.*
+Consider the Oracle-MoE → Cache-Conditional → ReMoE arc: the first two kept adding things (new architecture, new inference logic) and neither truly solved the problem. The actual fix in ReMoE is a *subtraction* — disabling the aux loss. *The more something resembles infrastructure-level default behavior, the more worth asking: "what would happen without it?"* Infrastructure is a fossil of past-era pain points; the pain points of a new era may be entirely incompatible with it.
+
+*Third: edge inference is back-propagating into training objectives.*
+The traditional assumption is that training determines the model and deployment just "ships the trained model over." After ReMoE, that assumption inverts: *the deployment environment is a constraint that flows back upstream into the training objective*. This means that over the next few years, MoE training recipes will fork by deployment scenario — cloud router, edge router, long-context router, multimodal router — all fine-tuned from the same base model, each with its own router loss function.
+
+Where things go next: *making router fine-tuning a standard operation like LoRA*. Today people say "which LoRA does this LLM use?"; next year people will say "which router fine-tune does this MoE use?"
+
+* Takeaways
+
+This river offers three direct lessons for how to find research problems.
+
+*1. Find contradictions by crossing deployment boundaries.*
+ReMoE's problem did not emerge at the algorithmic level — it emerged from *an algorithm (training aux loss) colliding with a system constraint (UFS I/O latency)*. The most fertile research problems rarely live inside a single layer; they live at the seam between two layers. When you see that the "training community" and the "systems community" are both solving the same symptom but with solutions that fight each other, the real problem is almost certainly buried in some unquestioned assumption one layer further down.
+
+*2. Archaeologize "default settings."*
+MoE training ships with an aux load-balancing loss by default — this default was inherited from 2017 to 2026 without anyone touching it. In any field, find the things "everyone uses but nobody explains why it must be this way," trace them back to their origin, and ask whether the current scenario still satisfies the original precondition. If it doesn't — that is a paper.
+
+*3. Invest in the minimum viable fix.*
+ReMoE was not the first to discover the locality problem (Oracle-MoE was a year earlier), nor the first to attempt a fix (Cache-Conditional MoE was a year and a half earlier). But it is the *cheapest fix* — fine-tune only the router, zero inference overhead, a few hours of training. Its landing point is "usable today" — meaning you can take any already-trained fine-grained MoE, run ReMoE fine-tuning tonight, and see 2× speedup on a Jetson tomorrow morning. *The minimum viable fix is more likely to be adopted by industry than the most elegant fix, and more likely to be compounded by the next wave of research.*

@@ -369,4 +369,4 @@
 
 - [05-25](digests/2026-05-25.md) — 220 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
-- [05-26](digests/2026-05-26.md) — 297 scanned, 5 passed, top: JacQuant: STE-Free Quantization-Aware Training via
+- [05-26](digests/2026-05-26.md) — 339 scanned, 5 passed, top: ThriftAttention: Selective Mixed Precision for Lon

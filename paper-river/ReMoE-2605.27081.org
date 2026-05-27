@@ -1,0 +1,346 @@
+#+title:      ReMoE: Boosting Expert Reuse through Router Fine-Tuning in Memory-Constrained MoE LLM Inference
+#+date:       [2026-05-26 Tue 22:45]
+#+filetags:   :paper:river:moe:edge:locality:
+#+identifier: 20260526T224520
+#+source:     https://arxiv.org/abs/2605.27081
+#+authors:    Xiongwei Zhu, Xiaojian Liao, Tianyang Jiang, Yusen Zhang, Liang Wang, Limin Xiao
+#+venue:      ICML 2026
+
+* 问题之河
+
+一句话：*你能不能在一台手机上跑 DeepSeek？*
+
+这个问题难在一个反直觉的地方。MoE（混合专家）模型每个 token 只激活一小撮"专家"，听上去就是为内存受限的设备准备的——总参数量大，但每步实际用的不多。可真把它塞进手机你会发现：哪怕只激活几个专家，每个 token 选的是 *不同* 的几个，专家权重要不停地从慢存储（UFS / SSD）拖进内存。换页风暴。延迟暴涨。
+
+更别扭的是，*让 MoE 跑得越快、越省 GPU、越善于规模化训练的那些技术，恰恰是让它在手机上跑崩的元凶*。
+一条研究线，五年时间，五代人接力把"专家分散"做到极致，最后被边缘部署捅穿了肚子——所有人不得不掉头，重新学习一件事：把专家 *聚拢* 起来。
+
+这条河的源头是 2017 年 Shazeer 提出的那个想"让模型变大但不变贵"的脑洞；下游是 2026 年 ReMoE 给出的最廉价的修复方案——*只动 router，别的什么都不碰，让训练好的模型在手机上立刻能用*。
+
+* 溯源地图
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | 问题: 想让神经网络变大，但每次计算只用一小部分参数
+  | 解法: 加个 gating 网络，每个 token 选 K 个专家；
+  |       同时加 load-balancing loss 保证专家利用率均衡
+  v
+[2021] Lepikhin et al. - GShard
+  |
+  | 问题: Shazeer 的 MoE 在分布式训练里塞不下、跑不动
+  | 解法: top-K token-choice + 严格的 auxiliary loss，
+  |       让 token 在专家间均匀分布，发挥多机并行
+  v
+[2022] Fedus et al. - Switch Transformer
+  |
+  | 问题: top-K 还是太贵，每个 token 算 K 个专家
+  | 解法: 砍到 top-1；精炼 aux loss；可扩展到万亿参数
+  v
+[2024] DeepSeek-AI - DeepSeek-V2 (Fine-Grained MoE)
+  |
+  | 问题: Switch 那种"一个 token 一个大专家"专家化程度不够
+  | 解法: 把专家切碎，每层 N_r=64~160 个小专家，
+  |       每 token 激活 6~8 个 -> 专家更专、容量更大
+  |       *副作用*: token 间专家切换变得极其频繁
+  v
+[2025] Zhou et al. - Oracle-MoE        [2025] Skliar et al. - Cache-Conditional MoE
+  |   (locality bottleneck 被正式命名)         |
+  | 问题: fine-grained MoE 在边缘端疯狂换页    | 问题: 同上，但不想重训
+  | 解法: 重新设计路由架构，在 attention      | 解法: 推理时把 router logit 偏向
+  |       导出的 "oracle space" 里路由，         缓存中的专家，不动权重
+  |       从头训练，让相邻 token 路由相似
+  \                                          /
+   \                                        /
+    \___________________ + ________________/
+                        |
+                        v
+[2026] Zhu et al. - ReMoE (本文)
+  |
+  | 问题: Oracle-MoE 要重训太贵；Cache-Conditional 在推理时改 logit，
+  |       但训练时埋下的 aux loss 还在跟它对着干
+  | 解法: 既不动架构、也不动推理图、更不重训。
+  |       拿一个已经训好的 MoE，*只 fine-tune router gate*：
+  |       关掉 aux load-balancing loss（它正是分散的元凶），
+  |       加一个时间局部性 loss 鼓励复用，加一个 KL trust-region
+  |       锚住语义不漂。零推理开销，1.77x~1.99x 解码加速。
+#+end_example
+
+确认的引用关系：所有 2017~2025 论文都在 ReMoE 的 Related Work 里被直接引用并比较。
+Oracle-MoE 和 Cache-Conditional MoE 是 ReMoE 明确点名的两个最近 baseline。
+
+* 演化叙事
+
+** 2017 | Shazeer et al. - Sparsely-Gated MoE: 让大模型不变贵
+
+*** 它看到了什么问题
+
+2017 年的痛点很直白：你想让神经网络变大（参数多、能力强），但计算成本和参数量是线性绑死的。
+当时主流是 dense 网络——每个 input 都要走过 *全部* 参数。想再大十倍？算力也得跟着十倍。
+
+*** 它的解法
+
+Shazeer 的洞见：*能力存在参数里，不一定每次都要全用*。
+加一个小小的 gating 网络，每个 token 只选 K 个 "专家"（一组 FFN 子网络）激活。
+1000 个专家，每次只激活 4 个 -> 容量是 dense 模型的 250 倍，但每步算的差不多。
+
+问题是：如果不约束，gating 会偏心——总是选那几个"宠儿"专家，其他专家学不到东西也用不上。
+所以加一个 *load-balancing auxiliary loss*：惩罚选择分布的不均匀，强迫 token 散开到所有专家上。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它把 "条件计算" 这个老想法第一次在大规模 RNN 上做对了。
+*但它埋的坑深得离谱*：load-balancing loss 这个为了"训练时利用率"而存在的辅助目标，
+从此在所有 MoE 训练 recipe 里待了下来。九年后，它会成为整条研究线最大的内部矛盾。
+
+** 2021 | Lepikhin et al. - GShard: 把 MoE 塞进 600B 多机训练
+
+*** 它看到了什么问题
+
+Shazeer 的 MoE 是在单机 RNN 上做的。但 2021 年 Transformer 已经称王，
+大家想把 MoE 思想搬到 Transformer 里训练 600B+ 模型，发现工程上做不出来：
+专家分散在不同的机器上，token 路由变成跨机通信，
+如果路由严重不均（A 机器 80% 流量、B 机器 20%），整个集群就被最慢的那台卡死。
+
+*** 它的解法
+
+GShard 把 *load-balancing loss 变成生死攸关的硬约束*——不是"鼓励均匀"，是"必须均匀"。
+设计了 expert capacity 上限：每个专家每个 batch 只能处理固定数量的 token，超过就溢出。
+搭配 top-K token-choice + 严格的 aux loss，让 token 在专家间被强行铺开。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这套 *为了发挥多机并行而存在的"专家分散"逻辑*，从此被钉死在所有 MoE 训练框架里。
+DeepSpeed-MoE、Megablocks、Tutel 全是按这个假设建的。
+新坑：*分散* 从一个 trick 变成了 MoE 训练的 *默认信仰*，没人质疑它在所有部署场景都对。
+
+** 2022 | Fedus et al. - Switch Transformer: top-1 极简路由
+
+*** 它看到了什么问题
+
+GShard 的 top-K（K=2）每个 token 还是要算两个专家。
+想再省一半计算，能不能 K=1？理论上担心：top-1 太"硬"，训练不稳。
+
+*** 它的解法
+
+Switch 拍板：就 K=1。配合更精细的 aux loss（router z-loss 等稳定项），
+证明 top-1 路由可以稳定训练到 T 级参数。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+Switch 把 MoE 推到了"教科书地位"——大家此后默认 MoE 训练流程长这样：
+top-K 路由 + auxiliary load-balancing loss + 跨机专家并行。
+*埋的坑*：top-1 让每个 token 只挑一个专家，意味着相邻 token 几乎必然挑 *不同的* 专家。
+在分布式训练里，这正是你想要的（充分利用所有机器）；
+但如果有一天你想在 *单机单 batch* 跑这个模型，这就是灾难的种子。
+
+** 2024 | DeepSeek-V2 / Qwen-MoE: 把专家切碎，把灾难放大
+
+*** 它看到了什么问题
+
+Switch 那种"一个 token 一个大专家"专家化程度不够——
+每个专家还是承担太多语义，能力上限被卡住。
+
+*** 它的解法
+
+*Fine-grained MoE*：把专家数从十几个炸到 64~160 个，每个专家变小变专；
+每个 token 激活 6~8 个，再加几个 "shared expert" 兜底通用能力。
+容量大了，特异化强了，benchmark 涨了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用，因为模型更像 "小而精的专家委员会" 而不是 "几个全才"。
+*但 token 间的专家切换被放大了一个数量级*——
+原来 12 个专家选 1 个，相邻 token 还有 1/12 的概率重合；
+现在 160 个专家选 8 个，相邻 token 的专家集合几乎不重叠。
+
+在云端 GPU 上这不是问题，专家全在显存里随便切。
+但 2024-2025 一旦有人尝试把 DeepSeek-V2-Lite 塞进手机，问题立刻引爆：
+专家权重在 UFS 和 DRAM 之间拼命换页，每个 token 都在等 I/O。
+
+*这是整条河的转折点*。前五年所有"让 MoE 更好"的努力，
+都在让 *边缘部署* 更糟。
+
+** 2025 | Oracle-MoE & Cache-Conditional MoE: 两个方向的反击
+
+*** 它们看到了什么问题
+
+同一个问题：fine-grained MoE 在内存受限的边缘设备上换页风暴。
+但两组人选择了相反的方向。
+
+*** 它们的解法
+
+*Oracle-MoE (Zhou et al., ICML 2025)*：架构派。
+"既然问题在路由架构本身，那就重新设计路由架构。"
+他们发现 attention 分数张成的空间天然具有"语义局部性"——
+相邻 token 的 attention pattern 相似，那就把路由决策搬到这个空间里做。
+代价：要 *从头训练* 一个新模型。
+
+*Cache-Conditional MoE (Skliar et al., 2024/2025)*：推理派。
+"重训太贵，那就只在推理时动手脚。"
+看到 router 输出的 logit 后，把缓存中已有的专家的 logit 抬高一点，
+让 top-K 选择倾向于复用缓存。不动权重，不重训。
+
+*** 为什么这两招都不够（也就是 ReMoE 的起点）
+
+Oracle-MoE 验证了路由是关键，但 *重训成本太高*——
+没人愿意为了一个部署优化把 DeepSeek-V2 重训一遍。
+
+Cache-Conditional MoE 的代价更隐蔽：它在 *推理时* 偏离 router 训练好的决策，
+而 router 训练时还埋着 Shazeer 时代留下的 aux loss——
+*训练目标在拼命让你分散，推理 hack 又在拼命让你聚拢*。
+两股力对着干，质量必然掉。Skliar 论文里报告 perplexity 损失 0.1%~3%，正是这股张力。
+
+整条河走到这里，问题变得很清楚：
+*真正需要修的不是架构、也不是推理逻辑，而是那个九年前被无脑继承下来的训练目标本身。*
+
+** 2026 | ReMoE: 一根针扎在矛盾的源头
+
+*** 它看到了什么问题
+
+ReMoE 的诊断比所有前人都更精确：
+
+1. Oracle-MoE 重训太贵——*真正需要改的只是 router 那一小撮 gate 参数*。
+2. Cache-Conditional MoE 推理 hack 与训练目标打架——*应该让训练目标本身就鼓励复用*。
+3. 标准 MoE 训练里那个 load-balancing aux loss——*在 B=1 边缘推理场景下根本不该存在*，
+   它服务的是分布式训练里的负载均衡，不是单用户推理。
+
+*** 它的解法
+
+ReMoE 的动作小得令人发指：
+- 拿一个已经训好的 MoE checkpoint（DeepSeek-V2-Lite、Qwen1.5-MoE）。
+- *冻结所有参数，只 fine-tune router gate*（每层就一个小矩阵）。
+- *关掉 aux load-balancing loss*（这是关键的"减法"，不是"加法"）。
+- 加两个新 loss：
+  - *Temporal Locality loss*：鼓励 router 把概率质量放在"上一步选过的专家"上。
+  - *Trust-KL loss*：把当前 router 输出和一个冻结的原始 router 的输出做 KL，
+    形成 soft trust-region，防止语义漂太远。
+
+这样训练几小时后，router 就学会了"如果上一个 token 选了专家 {3, 17, 42}，
+这个 token 应该优先在 {3, 17, 42} 里挑"——*在不显著降低质量的前提下*。
+
+*** 为什么这招管用（以及它打开了什么）
+
+管用是因为它击中了真正的矛盾源头：
+- 前人都在 *加东西* 解决问题（加架构、加推理逻辑、加 logit 修正）。
+- ReMoE 是 *减一个加一个*：减掉 aux loss，加上 locality loss。
+- 减掉的那个东西，存在了九年，没人质疑——这是最有力的部分。
+
+结果：DeepSeek-V2-Lite 上专家复用率 +26.4%，
+Jetson Orin NX 上 TPOT 降 43.6~49.8%，1.77~1.99x 解码加速，
+*而 benchmark 几乎不掉*。
+
+它打开了什么：*训练目标不是模型的内禀属性，是部署环境的函数*。
+同一个模型，云端跑要一种 router，手机跑要另一种 router——
+而且换 router 只需要几小时 fine-tune，不需要重训整个模型。
+
+* 前沿延伸
+
+ReMoE 是 2026 年 5 月的论文（ICML 2026），是这条线截至目前的最新进展。
+往后看，几个自然的方向已经显形：
+
+1. *Router 的多目标 fine-tune 变成新范式*。
+   ReMoE 把"为边缘部署 fine-tune router"做出来了，
+   后续工作很可能是为不同部署场景（多用户服务、流式推理、长上下文）
+   各自 fine-tune 不同的 router checkpoint，就像今天大家有不同的 LoRA。
+
+2. *Locality fine-tune + 量化协同*。
+   ReMoE 自己点名：locality 减少 *fetch 次数*，量化减少 *每次 fetch 的大小*，
+   两者正交。SmoothQuant/AWQ + ReMoE 的组合实验是显而易见的下一步。
+
+3. *推理时 cache-aware routing 作为第二层防御*。
+   Cache-Conditional MoE 没死——它可以建在 ReMoE 之上。
+   ReMoE 把训练时分散的倾向修掉了，Cache-Conditional 在推理时再做一次 tie-breaking，
+   对付残余的 long-tail miss。
+
+4. *Pretraining 阶段就内化 locality*。
+   ReMoE 是 post-training。下一代 MoE 模型会不会从一开始就把
+   "B=1 边缘部署"列为训练目标之一？这意味着 aux loss 本身需要被重新设计，
+   而不是简单关掉。
+
+* 一张图看懂
+
+#+begin_example
+                  专家分散 (训练驱动)  <----->  专家聚拢 (推理驱动)
+                       |                              |
+2017  Shazeer ........ * load-bal aux loss 诞生
+                       |                              |
+2021  GShard ......... * aux loss 变硬约束 (多机并行)
+                       |                              |
+2022  Switch ......... * top-1 + aux loss (T-scale)
+                       |                              |
+2024  DeepSeek-V2 .... * fine-grained: N_r=160, K=8
+                       |  ^                           |
+                       |  | 张力到达临界点            |
+                       |  v                           |
+2024  Cache-Cond MoE . *                              *  推理时 hack logit
+                       |                              |
+2025  Oracle-MoE ..... *                              *  重训架构,attention space
+                       |                              |
+2026  ReMoE .......... *  关掉 aux loss      <------- *  fine-tune router only
+                                  +
+                            locality loss
+                                  +
+                            trust-KL anchor
+
+      横轴: 训练时 vs 推理时的张力
+      纵轴: 时间
+      *: 关键介入点
+      斜线: 张力线 — 训练目标和推理需求的矛盾在 2024 达到临界
+      ReMoE 的位置: 把矛盾解在训练目标本身
+#+end_example
+
+* 洞见
+
+读完这条河，浮上来三个观察。
+
+*第一：每个时代的"最佳实践"，都是对当时部署环境的局部最优*。
+2017~2023 年 MoE 的部署场景就是数据中心 GPU 集群，
+load-balancing loss 是这个环境的最优解。
+当部署环境从"集群多用户高吞吐"切换到"单机单用户边缘"，
+原来的"最佳实践"立刻变成最大的反模式。
+但因为它已经被写进了教科书、写进了所有 MoE 训练框架，
+*所有人都默认带着它*，直到 2026 年才有人敢明确地说"关掉它"。
+
+*第二：研究的"加法陷阱"*。
+看 Oracle-MoE -> Cache-Conditional -> ReMoE 这一段：
+前两者都在加东西（新架构、新推理逻辑），都没真正解决问题。
+ReMoE 真正解决问题的关键是 *减法*——关掉 aux loss。
+*越是基础设施级别的默认设置，越值得问一句"如果没有它会怎样"*。
+基础设施是过去时代痛点的化石，新一代的痛点未必兼容它。
+
+*第三：边缘推理正在反向重塑训练目标*。
+传统认知里，训练决定模型，部署只是"把训练好的模型搬过去"。
+ReMoE 之后这个认知要倒过来：*部署环境是一种约束，它向上倒灌进训练目标*。
+这意味着接下来几年，MoE 的训练 recipe 会按部署场景分叉——
+云端 router、边缘 router、长上下文 router、多模态 router——
+都从同一个 base model fine-tune 出来，但各有各的 router 目标函数。
+
+下一步最可能往哪走：*让 fine-tune router 变成像 LoRA 一样的标准动作*。
+今天大家会说"这个 LLM 配什么 LoRA"；
+明年大家会说"这个 MoE 配什么 router fine-tune"。
+
+* 启发
+
+这条河对"怎么找研究问题"有三个直接的启发。
+
+*1. 跨越部署边界找矛盾*。
+ReMoE 的问题不是在算法层面冒出来的，是 *算法 (训练 aux loss) 撞上系统 (UFS I/O 延迟) 撞出来的*。
+最肥的研究问题往往不在单一层内部，而在两层的接缝处。
+当你看到一个领域里"训练界"和"系统界"都在解决同一个症状但解法互相打架时，
+真正的问题大概率在更底层的某个无人质疑的假设里。
+
+*2. 沿着"默认设置"考古*。
+MoE 训练默认带 aux load-balancing loss——这个默认值从 2017 年传到 2026 年没人动。
+任何一个领域，找到那些"大家都用，但没人解释为什么必须这样"的默认值，
+追到源头看看它最初是为什么场景而设的，再看看你现在的场景是否还满足那个前提。
+不满足？这就是一个论文。
+
+*3. 在"最小可行修复"上下功夫*。
+ReMoE 不是最先发现 locality 问题的（Oracle-MoE 比它早一年），
+也不是最先尝试修复的（Cache-Conditional MoE 比它早一年半）。
+但它是 *修复成本最低的*——只 fine-tune router，零推理开销，几小时训练。
+落点在"能用"——这意味着你可以拿任何一个已经训好的 fine-grained MoE，
+今晚就给它做 ReMoE fine-tune，明天早上跑在 Jetson 上看到 2x 加速。
+*"最小可行修复"比"最优雅修复"更容易被工业界采纳，
+也更容易在下一波研究里被叠加*。

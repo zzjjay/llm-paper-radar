@@ -1,0 +1,260 @@
+#+title:      NestedKV: Nested Memory Routing for Long-Context KV Cache Compression
+#+date:       [2026-05-26 Tue 22:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260526T220000-en
+#+source:     https://arxiv.org/abs/2605.26678
+#+authors:    Hong Chen, Xiang Liu, Yubo Gao, Yuxuan Fan, Bo Wang, Yuanlin Chu, Yuanguo Lin, Xuming Hu
+#+venue:      arXiv 2605.26678, cs.CL, 2026-05
+
+* The Problem River
+
+Long-context LLM inference is bottlenecked by one simple fact: every additional token forces one more key and one more value into GPU memory. Read 32k tokens and you have 32k copies sitting there. The model weights haven't moved an inch, yet this pile of "scratch paper" has already saturated the card.
+
+So the question is plain: *which sheets of scratch paper can we tear out?*
+
+It sounds like a small engineering puzzle. But the hard part is that you don't know what will be asked next. Tear out a sheet and the very next second you might need it. For the past seven or eight years, successive generations of researchers have been betting on "what kind of paper will be flipped back to"—each generation with a different wager. NestedKV is the 2026 entry in that relay.
+
+* Lineage Map
+
+#+begin_example
+[2023] H2O / Scissorhands
+  | Bet: tokens that attracted a lot of attention in the past will again in the future
+  | Problem left behind: streaming generation becomes unstable; long-tail tokens drown
+  v
+[2024] StreamingLLM
+  | Observation: the first few tokens are "attention sinks"; drop them and the model collapses
+  | Fix: always keep the first 4 tokens + a sliding window of the most recent N
+  | Problem left behind: the middle portion of evidence is gone entirely
+  v
+[2024] SnapKV
+  | Observation: "past attention high == future attention high" is an assumption, not a fact
+  | Fix: use the very end of the prompt as a "shadow of the future" to vote on which tokens to keep
+  | Problem left behind: questions that reach beyond that shadow are invisible
+  v
+[2024-2026] PyramidKV / Ada-KV
+  | Observation: everyone argues about "which tokens to keep"; nobody asks "how many per layer/head"
+  | Fix: allocate the budget per layer/head adaptively instead of spreading it uniformly
+  | Problem left behind: the scoring mechanism itself is unchanged—still attention-based
+  v
+[2026] KeyDiff
+  | Observation: attention-based scoring requires softmax, which conflicts with optimized kernels
+  | Fix: ignore attention entirely; measure how far each key vector deviates from the global mean
+  | Problem left behind: only one anchor (global mean); local topics and recent context get flattened
+  v
+[2026] NestedKV  <--- this paper
+  | Observation: one anchor = one time scale, but "importance" is inherently multi-scale
+  | Fix: three anchors (global / segment / recent) + each attention head chooses which scale to trust
+  |      + when the three scales disagree sharply, trigger "surprise routing"
+  | Intellectual lineage: parallel branch [2026] Titans -> Nested Learning (HOPE)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | H2O & Scissorhands: The First Admission That Scratch Paper Must Be Torn Out
+
+*** What problem did it see?
+
+Before 2023, everyone assumed the KV cache was free—GPU memory was still plentiful enough. Then long-context demands arrived: 32k, 128k tokens, and memory simply exploded. Model weights were untouched, yet the temporary storage for "reading history" alone maxed out the card.
+
+*** Its solution
+
+It observed one thing: in the attention matrix, the tokens actually queried frequently are very few; the vast majority of columns are sparse. Scissorhands elevated this observation into a slogan— *"persistence of importance"*: tokens that received heavy attention in the past will most likely receive it again. H2O gave the same intuition a different name: heavy hitters.
+
+The operation is simple: accumulate the attention score each token receives during inference; evict those with low scores from the cache.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because attention genuinely has a heavy tail. The pit: this is a *self-fulfilling prophecy*—you only track what has already been visited, so tokens that happened not to be visited yet but carry critical information are evicted and never get a second chance. In streaming generation (ongoing dialogue), later queries can easily ask something completely unrelated to the past attention distribution.
+
+** 2024 | StreamingLLM: Discovering the "Attention Sink"
+
+*** What problem did it see?
+
+Plugging H2O into a streaming chat scenario quickly caused the model to collapse—outputs degraded into gibberish or repetition. Inspecting attention maps layer by layer revealed a counter-intuitive fact: the very first tokens in the sequence (typically BOS or the first few system tokens) absorbed a disproportionately large share of attention regardless of what topic was being discussed.
+
+*** Its solution
+
+It named those early tokens *attention sinks*—they are not "carrying semantics"; they are simply the overflow bucket that softmax uses when it has nowhere else to put residual probability mass. If you follow H2O's rule and evict them as low-priority (their contribution to later generation is actually small), the entire softmax distribution collapses.
+
+StreamingLLM's prescription is blunt: always retain the first 4 tokens, plus a fixed-size sliding window of the most recent N; discard everything in between.
+
+*** Why it worked (and what new pit it dug)
+
+It revealed that the KV cache is not only an "information carrier" but also partly a *computational stabilizer*. However, it completely discards the middle—fine for chat, broken for long-document retrieval: any evidence buried in the middle is irretrievably lost.
+
+** 2024 | SnapKV: Puncturing the "Past == Future" Assumption
+
+*** What problem did it see?
+
+H2O's "past attention high = future attention high" assumption looks intuitive but is actually a gambler's proposition. SnapKV's authors ran a simple experiment: after the model has read the prompt, compare the attention distribution of the last few dozen tokens of the prompt (closest to generation start) against the cumulative attention distribution of the entire prefix—they frequently disagree.
+
+In other words: *the tokens that will actually be queried in the future and the tokens that were queried in the past are two different populations.*
+
+*** Its solution
+
+Rather than using the cumulative "past" to score tokens, use an *observation window*—a small slice at the very end of the prompt—which is closest to the query distribution during upcoming generation. Whichever positions in the prompt this window attends to are the positions worth keeping.
+
+*** Why it worked (and what new pit it dug)
+
+It redefines "important" from "echo of the past" to "shadow of the future." But the shadow has edges: if a future question style is entirely different from the last few dozen prompt tokens (multi-hop reasoning, cross-paragraph citation), the shadow simply doesn't reach far enough.
+
+** 2024–2026 | PyramidKV & Ada-KV: Switching Tracks From "Scoring" to "Budgeting"
+
+*** What problem did it see?
+
+The previous three generations all argued about one thing: how to score tokens. But a separate group changed perspective—after you score every token, you still have to decide how many tokens each layer / each attention head is allotted. The prior default was uniform: all 32 layers get the same quota.
+
+PyramidKV found that attention follows a pyramid shape—shallow layers are diffuse, deep layers are concentrated, so shallow layers should retain more and deep layers less. Ada-KV further observed that *within the same layer, different heads vary enormously*: some heads are highly concentrated, others nearly uniform.
+
+*** Its solution
+
+Split "which tokens to keep" from "how large a budget each head gets" into two separate problems. The former reuses existing scoring; the latter allocates adaptively based on each head's attention concentration—low-entropy heads need smaller budgets, high-entropy heads need larger ones.
+
+*** Why it worked (and what new pit it dug)
+
+Its importance lies in opening the research from "one-dimensional scoring optimization" into a two-axis space of "scoring × budgeting." But it does not change scoring itself. So the next wave of researchers went back to attack scoring—and dug deeper.
+
+** 2026 | KeyDiff: Dropping Attention Entirely
+
+*** What problem did it see?
+
+Every prior method fundamentally required *computing attention*—either reading pre-computed attention or running an extra observation-window pass. The problem: modern inference uses fused kernels like FlashAttention, which never materialize the attention matrix explicitly. Extracting attention scores requires an additional computation outside the kernel—directly contradicting the goal of optimized inference.
+
+*** Its solution
+
+KeyDiff makes a radical move: it never touches attention. It looks only at *key vectors themselves*. Compute the mean direction of all keys, then measure the cosine distance of each token's key from that mean—tokens far from the mean are "geometrically distinctive" and should be kept; tokens close to the mean are "going with the flow" and can be discarded.
+
+The analogy: in a room full of people, whoever speaks most unlike the prevailing theme is the key player.
+
+*** Why it worked (and what new pit it dug)
+
+Being key-only immediately unlocks compatibility with FlashAttention, and empirically it performs surprisingly well on long contexts. But the pit is clear: *only one anchor (the global mean)*. This means:
+
+- A local topic that appears within a passage (episodic) may sit close to the global mean and get treated as background noise
+- A thread that just appeared and is about to be referenced (recent) also gets drowned by the global mean
+- Different attention heads each care about different scales, yet all are forced to share the same global anchor
+
+NestedKV attacks exactly this gap.
+
+** 2026 (Parallel Branch) | Titans & Nested Learning: Providing a Theoretical Shell
+
+*** What problem did it see?
+
+This branch lives outside KV compression; it belongs to the "rethinking Transformers" community. A group of researchers felt that Transformer inference is not fundamentally "unlimited-context attention" but rather *maintaining a finite, multi-scale memory system*. Titans proposed a test-time learning long-term memory module; Nested Learning abstracted the whole thing further as a "nested optimization problem"—the model simultaneously maintains memory at multiple time scales, together with a *self-modifying* update rule: when the "surprise" caused by compression is large, the system actively adjusts its own update strategy.
+
+*** Its solution
+
+It proposes a *Continuum Memory System*: not one memory state but a chain of memory states across time scales (stable / episodic / current), paired with an inner learner + outer learner structure. The outer learner dynamically adjusts the aggregation strategy based on "disagreement among the inner learners."
+
+*** Why it worked (and what new pit it dug)
+
+It was originally designed for "training new architectures." But the NestedKV authors spotted a *free transfer opportunity*—this framework maps cleanly onto training-free KV compression, because the KV cache is itself a finite memory and token "importance" is inherently multi-scale.
+
+** 2026 | NestedKV: Exploding the Single Anchor Into Three Anchors + Adaptive Mixing
+
+*** What problem did it see?
+
+Across this entire lineage, one fact has been proven and then sidestepped repeatedly: *"importance" is not single-scale.*
+
+- A token may be *globally distinctive* (a rare word across the entire document)
+- Or *locally distinctive* (anomalous only within the current chunk)
+- Or *recency-distinctive* (just appeared and about to be used)
+
+KeyDiff sees only the global view; SnapKV sees only the tail; StreamingLLM sees only the head + sliding window. Nobody looks at all three simultaneously. The more aggressively you compress (the fewer tokens you keep), the more these three notions of "distinctive" diverge, and any single viewpoint will miss the other two categories of tokens that should be kept.
+
+*** Its solution
+
+Take KeyDiff's geometric idea and *instantiate it at three scales*:
+
+1. *Stable anchor*: mean key direction over the entire prompt (equivalent to the original KeyDiff; represents the global scale)
+2. *Episodic anchor*: mean key direction over the current block (paragraph-level)
+3. *Current anchor*: mean key direction over the most recent sliding window
+
+Each token receives three cosine anomaly scores and three corresponding rankings. Then two critical mechanisms—
+
+- *Head-adaptive blend*: each attention head selects which scale to trust most (weighted by that head's discriminative power across the three scales), so different heads can specialize in "globally rare," "paragraph-level jumps," or "recently active" tokens
+- *Surprise-gated routing*: when the three rankings conflict strongly (high disagreement), this signals a "surprise event" caused by compression—the scoring smoothly switches from the blended view to the single strongest individual memory, preventing dilution by averaging
+
+On top of this, the Ada-KV trick is layered in: each head's budget is also allocated adaptively. The whole system remains *training-free* and remains *key-only*, preserving FlashAttention compatibility.
+
+*** Why it worked (and what new pit it dug)
+
+The root of why it works: *it directly instantiates the Nested Learning "inner learner + outer learner + self-modification" structure as a test-time compressor.* No new parameters, no changes to the LLM—only a reorganization of scoring. Empirically, on Qwen3-4B at an extreme compression ratio of r=0.75, NestedKV outperforms KeyDiff by 19.29 points on LongBench; at r=0.95 (retaining only 5% of the cache), it still holds 37.32 vs KeyDiff's 17.55.
+
+New pits left behind:
+
+- The boundaries of the three scales (block size, window size) are currently hand-tuned hyperparameters; optimal values likely differ across tasks and models
+- "Each head chooses its own scale" assumes heads are independent, but in GQA models heads share KV—the cost of this assumption has not been quantified
+- The multi-scale anomaly scoring adds overhead: though small per step, computing three cosine distances at every inference step accumulates non-trivially over long contexts
+
+* Frontier Extensions
+
+As of late May 2026, NestedKV has only been on arXiv for a few days, and no public follow-up work has yet directly critiqued or improved it. But judging from the pace of evolution in this line, three directions are almost certain to emerge:
+
+1. *Scale count from 3 to K*: if 3 scales beat 1, would K be even better? Almost certainly this will hit diminishing returns and rising overhead in a sharp trade-off.
+2. *Replace the mean anchor with a richer statistic*: e.g., the PCA principal direction, cluster centroids, or even a small trained MLP as the anchor. But once the core "training-free" constraint is broken, this line merges with learned compression / KV cache distillation.
+3. *Coupling with value-side compression*: this entire line compresses only K, not V, because V lacks an interpretable geometry. If someone carries NestedKV's multi-scale idea over to V, a new branch may open.
+
+* A Single Diagram
+
+#+begin_example
+   Year    Scoring basis           Budget allocation   # Anchors   New angle
+   ----   ----------------------  -----------------   ---------   ----------------------
+   2023   Accumulated past attn   Uniform               -          heavy hitter hypothesis
+            (H2O)
+            v
+   2024   Attention + sinks       Uniform               -          head/recency backstop
+            (StreamingLLM)
+            v
+   2024   Attention of tail win.  Uniform               -          "future shadow" replaces past
+            (SnapKV)
+            v
+   2024+  (same)                  Pyramid / adaptive    -          scoring vs. budget decoupled
+            (PyramidKV,
+             Ada-KV)
+            v
+   2026   Key geometric distance  Ada-KV style          1 (mean)   FlashAttn compatible
+            (KeyDiff)
+            v
+   2026   Multi-scale key anomaly Ada-KV style          3          Inherits Nested Learning:
+            + outer surprise route                                  inner + outer + self-modify
+            (NestedKV)                                              applied to KV compression
+#+end_example
+
+This entire line in one sentence:
+
+#+begin_example
+  "Find importance via the past" -> "via the future" -> "via geometry" -> "via multi-scale + self-modification"
+#+end_example
+
+* Insight
+
+Reading this line from beginning to end, what is truly evolving is not the technology—it is *the concept of "importance" itself.*
+
+- Generation 1 (H2O): importance = historical frequency
+- Generation 2 (StreamingLLM): importance = historical frequency + positional prior (head + recent)
+- Generation 3 (SnapKV): importance = proxy for future queries
+- Generation 4 (KeyDiff): importance = geometric minority
+- Generation 5 (NestedKV): importance = being a minority *at a particular time scale*, and letting the model decide which scale each head should trust
+
+Each generation *deconstructs "importance" from a scalar into a higher-dimensional object.* From a single number, to a number with a positional prior, to a query-dependent function, to a function tied to vector-space geometry, to a function tied to time scale and head identity.
+
+At a deeper level: *this line is quietly migrating "inductive biases learned at training time" onto "statistics computed at test time."* Transformers have already learned "what tokens matter" during training—but when compressing the cache, we dare not use that learned judgment directly (because we don't want to fine-tune), so each generation searches for a "proxy computable at test time." NestedKV's reason for invoking Nested Learning is that it borrows a *test-time self-modifying framework*—this is the first crack in the wall between "training-time bias" and "test-time statistics."
+
+Where is the next step most likely to go? My bet: *introducing lightweight learnable weights as "factory calibration" without breaking the training-free constraint*—for example, each head's scale preference would no longer rely on NestedKV's fixed prior + test-time adjustment, but would be calibrated offline in advance. Once that step is taken, the training-free line will have reached its terminus and will merge with the learned compression line.
+
+* Takeaways
+
+If you are doing research, this lineage demonstrates a remarkably clear *"circle around and open a new dimension"* pattern:
+
+1. *Generation 1* always uses the most naïve statistic (cumulative past)
+2. *Generation 2* patches its failure corners (StreamingLLM's sink fix)
+3. *Generation 3* challenges its root assumption (SnapKV punctures "past == future")
+4. *Generation 4* adopts a completely orthogonal perspective (KeyDiff drops attention for geometry)
+5. *Generation 5* *combines the key discoveries of prior generations into a multi-view* (NestedKV's three scales)
+
+This rhythm is one that almost every mature field walks through. If you are currently at generation 3 or 4, your competitors are probably quietly assembling the generation-5 combination punch.
+
+More concretely: *if you see a field where everyone is optimizing a single scalar, ask—can this scalar be deconstructed into a multi-component object, then recombined by an outer learner (learned or test-time statistical)?* That is the entirety of what NestedKV does. Simple enough to port to any "rank by a single signal" scenario: feature selection, prompt compression, retrieval re-ranking, agent memory management.
+
+If you take away just one sentence: *replace "one score" with "K scores + one outer layer".*
