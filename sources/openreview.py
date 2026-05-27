@@ -1,4 +1,4 @@
-"""Fetch submissions from OpenReview venues (ICLR / NeurIPS / ICML / etc.).
+"""Fetch submissions from OpenReview venues (ICLR / ICML / MLSys / AAAI / ACL / EMNLP / NeurIPS / etc.).
 
 Each configured venue invitation (e.g. `ICLR.cc/2026/Conference/-/Submission`)
 is paginated newest-first; notes whose creation date falls inside the rolling
@@ -6,6 +6,15 @@ window are turned into Paper objects with `id = "or-<note_id>"` and the
 forum URL as the canonical link. OpenReview submissions usually don't expose
 an arXiv id during review, so we keep the OpenReview id as the primary key
 and let dedupe treat them as separate entries from any arXiv duplicates.
+
+Venue strings in config may contain a `{year}` placeholder; `_expand_year_templates`
+expands each template into the current and next calendar year (so a venue's
+two-year CFP window is always covered without yearly config edits). Venues
+that don't exist yet — e.g. next year's conference before its CFP opens — are
+silently skipped by `fetch()` when the API returns an error. Only the
+`/-/Submission` invitation is queried, so reviews, official comments,
+rebuttals, and meta-reviews (which live under separate invitations like
+`/-/Official_Review`, `/-/Official_Comment`, `/-/Rebuttal`) are never pulled.
 """
 
 from __future__ import annotations
@@ -122,6 +131,30 @@ def _expand_year_templates(venues: list[str], current_year: int) -> list[str]:
     return out
 
 
+# Hosts that publish multiple conferences from the same root, so the actual
+# conference name is the *second* path segment, not the host. Example:
+# `aclweb.org/ACL/...` and `aclweb.org/EMNLP/...` both live under `aclweb.org`.
+_GENERIC_HOSTS = {"aclweb.org"}
+
+
+def _venue_label(venue: str) -> str:
+    """Short lowercase label for a venue, used as the paper's category tag.
+
+    Handles the three naming patterns OpenReview venues use in the wild:
+
+    - `ICLR.cc/2026/Conference`        → `iclr`
+    - `MLSys.org/2026/Conference`      → `mlsys`
+    - `EMNLP/2025/Conference`          → `emnlp`     (no `.org`/`.cc`)
+    - `aclweb.org/ACL/2026/Conference` → `acl`       (host is a generic org)
+    """
+    head = venue.split("/", 1)[0]
+    if head in _GENERIC_HOSTS:
+        parts = venue.split("/")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1].lower()
+    return head.split(".", 1)[0].lower()
+
+
 def _content_value(content: dict, field: str, default=None):
     """OpenReview v2 wraps fields as `{"value": ...}`; older notes are bare values."""
     v = content.get(field)
@@ -149,8 +182,7 @@ def _note_to_paper(note: dict, venue: str, pub: datetime) -> Paper | None:
     note_id = note.get("id", "")
     if not note_id:
         return None
-    # Pick a short venue label like "ICLR" or "NeurIPS" for the categories list.
-    venue_short = venue.split(".")[0]
+    venue_short = _venue_label(venue)
     return Paper(
         id=f"or-{note_id}",
         title=title,
@@ -159,8 +191,8 @@ def _note_to_paper(note: dict, venue: str, pub: datetime) -> Paper | None:
         url=f"https://openreview.net/forum?id={note_id}",
         pdf_url=f"https://openreview.net/pdf?id={note_id}",
         published_at=pub,
-        primary_category=venue_short.lower(),
-        categories=[venue_short.lower()],
+        primary_category=venue_short,
+        categories=[venue_short],
         sources=[
             SourceRecord(
                 name="openreview",

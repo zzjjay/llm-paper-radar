@@ -33,8 +33,16 @@ class ArxivAuthorsConfig(BaseModel):
 class OpenReviewConfig(BaseModel):
     enabled: bool = True
     window_days: int = 7
-    # Venue invitation prefixes — the fetcher appends `/-/Submission`. Examples:
-    # "ICLR.cc/2026/Conference", "NeurIPS.cc/2025/Conference", "ICML.cc/2026/Conference".
+    # Venue invitation prefixes — the fetcher appends `/-/Submission`. Strings
+    # may contain a `{year}` placeholder, auto-expanded to the current and next
+    # calendar year. Active set (kept in sync with config.yaml):
+    #   ICLR.cc/{year}/Conference
+    #   ICML.cc/{year}/Conference
+    #   NeurIPS.cc/{year}/Conference
+    #   MLSys.org/{year}/Conference
+    #   AAAI.org/{year}/Conference
+    #   aclweb.org/ACL/{year}/Conference
+    #   EMNLP/{year}/Conference
     venues: list[str] = []
 
 

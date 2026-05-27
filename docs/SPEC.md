@@ -133,7 +133,7 @@ Both lists are normalized to `Paper` objects with `name="hf_daily"` but distinct
 | arXiv | 400 | Complete coverage |
 | HF Daily | 20 | Community heat signal |
 | arxiv_authors (watched groups) | 5–10 | Never-miss for curated authors |
-| OpenReview | 5–20 | Pre-arXiv ICLR/NeurIPS submissions |
+| OpenReview | 5–20 | Pre-arXiv ICLR / ICML / MLSys / AAAI / ACL / EMNLP / NeurIPS submissions (venue templates with `{year}` auto-expand to current + next year; `/-/Submission` only — no reviews / comments / rebuttals) |
 | **After dedupe** | **~450–500** | → LLM filter |
 
 ---

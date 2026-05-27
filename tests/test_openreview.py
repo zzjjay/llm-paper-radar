@@ -10,6 +10,7 @@ from sources.openreview import (
     _expand_year_templates,
     _note_pub,
     _note_to_paper,
+    _venue_label,
 )
 
 
@@ -121,6 +122,21 @@ def test_expand_year_templates_passes_through_pinned_literals():
         "ICLR.cc/2026/Conference",
         "ICLR.cc/2027/Conference",
     ]
+
+
+def test_venue_label_handles_all_three_naming_patterns():
+    """OpenReview venues use three naming shapes; the label extractor must
+    produce a clean short tag for each so the rendered category column reads
+    naturally regardless of which host the conference lives under."""
+    # `<CONF>.<tld>/<year>/Conference` — most common form.
+    assert _venue_label("ICLR.cc/2026/Conference") == "iclr"
+    assert _venue_label("MLSys.org/2026/Conference") == "mlsys"
+    assert _venue_label("AAAI.org/2026/Conference") == "aaai"
+    # `<CONF>/<year>/Conference` — EMNLP is the odd one out, no host suffix.
+    assert _venue_label("EMNLP/2025/Conference") == "emnlp"
+    # `<generic_host>/<CONF>/<year>/Conference` — aclweb.org hosts ACL, EMNLP,
+    # NAACL, etc., so the conference name is the second path segment.
+    assert _venue_label("aclweb.org/ACL/2026/Conference") == "acl"
 
 
 def test_expand_year_templates_dedups_overlap_preserving_order():
