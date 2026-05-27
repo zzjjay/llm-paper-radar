@@ -1,0 +1,297 @@
+#+title:      Quantized Keys Steal Attention: Bias Correction for KV-Cache Compression in Video Diffusion
+#+date:       [2026-05-26 Tue 23:14]
+#+filetags:   :paper:river:kvcache:quantization:videodiffusion:en:
+#+identifier: 20260526T231441-en
+#+source:     https://arxiv.org/abs/2605.26266
+#+authors:    Tuna Tuncer, Felix Becker, Thomas Pfeil
+#+venue:      arXiv 2026-05-25 / ICML 2026 workshops (SCALE, F2S)
+
+* The Problem River
+
+Videos grow longer and longer, and to avoid recomputing past context models store their "memories" in a KV cache. But that memory can easily run to several GB, blowing out the GPU. Can we compress those memories down to 2 bits per slot? We can. But the image immediately collapses: faces blur, scenes jump, temporal consistency falls apart.
+
+Why does compressing the memory produce not "slightly blurry" but "catastrophic"? That is the question this river chases: without retraining the model, how do we compress the KV cache to the absolute limit while barely touching visual quality?
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8 / SmoothQuant line
+  |
+  | Discovery: Transformer activations have a small number of
+  |            "outlier channels" that are enormously large;
+  |            quantizing to INT8 crushes all other channels.
+  v
+[2024] Liu et al. - KIVI
+  |
+  | Problem: KV cache is the memory bottleneck for long-context LLMs.
+  | Observation: Key has outliers along the channel dimension;
+  |              Value does not.
+  | Solution: per-channel quant for Key, per-token quant for Value —
+  |           training-free INT2.
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | Problem: KIVI's outliers still inflate Δ; ordinary channels suffer.
+  | Solution: non-uniform datatype + explicitly carve out outliers
+  |           and store them separately — squeezes below 4 bit.
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Problem: "store outliers separately" is an ugly engineering
+  |           special case.
+  | Solution: multiply K and Q by a random Hadamard rotation before
+  |           quantizing — outlier energy spreads evenly across all
+  |           channels, "outlier-free", INT4 natively supported.
+  v
+[2026] Xi et al. - QuantVideoGen
+  |
+  | Problem: LLM quantization recipes on video diffusion —
+  |          INT4 is acceptable, INT2 destroys the image.
+  | Solution: semantic-aware smoothing + progressive residual
+  |           quantization to further shrink quantization error.
+  v
+[2026] Tuncer, Becker, Pfeil - QKSA  (this paper)
+  |
+  | Problem: Everyone races to "make quantization error smaller."
+  |          But the reason INT2 collapses is not only "large error" —
+  |          there is a neglected bias: the exponent in softmax is
+  |          convex, so zero-mean noise going in does not come out
+  |          zero-mean. Cached keys "steal" attention mass from the
+  |          current chunk.
+  | Solution: Derive this Jensen bias analytically; subtract it before
+  |           softmax. No change to any quantization scheme, no
+  |           retraining, nearly zero overhead.
+  v
+[Future] This line will clearly attract follow-up work (see "Frontier Extensions")
+#+end_example
+
+* Evolution Narrative
+
+** 2022 | LLM.int8 / SmoothQuant Line: Spotting the Outlier Channels
+
+*** What Problem It Saw
+
+Apply a single INT8 cut across Transformer activations and precision collapses. At first everyone assumed "INT8 is too coarse," but when Dettmers et al. (LLM.int8, 2022) plotted the distributions they found the truth: among thousands of channels, a handful always have values tens or hundreds of times larger than the rest.
+
+Per-tensor quantization must accommodate these outliers by stretching the step size Δ, and as a result the remaining 99% of channels get squeezed onto one or two grid points, losing all their information.
+
+*** Its Solution
+
+The earliest approaches: keep outlier channels in FP16 and run the rest in INT8 (LLM.int8); or use a diagonal scaling matrix to migrate outlier energy from activations into weights (SmoothQuant).
+
+*** Why It Worked (and What New Trap It Left)
+
+"Outliers are the culprit" became the default assumption from that point on. But every solution was a "special case": identify which channels are outliers, maintain a separate storage path for them — ugly engineering. The next generation would either find a more elegant way to suppress outliers or shift the battlefield — e.g., carry the same ideas over to the KV cache.
+
+** 2024 | KIVI: Compressing KV Cache to 2-bit for the First Time
+
+*** What Problem It Saw
+
+Once LLMs reach long contexts, the KV cache alone exceeds the GPU memory consumed by the model weights. Yet this major memory consumer had never been systematically quantized, because the intuition was "it is generated dynamically — hard to handle."
+
+*** Its Solution
+
+KIVI (Liu et al., 2024) was the first to characterize the distributional structure of the KV cache:
+- *Key has outliers along the channel dimension* — just like activations
+- *Value has no such structure* — relatively uniform
+
+So: Key uses per-channel quantization (each channel gets its own Δ), Value uses per-token quantization (each token gets its own Δ), achieving training-free INT2.
+
+*** Why It Worked (and What New Trap It Left)
+
+A "right medicine for the right illness" victory: rather than forcing one quantization scheme on everything, first understand the structure and then choose accordingly.
+
+New trap: per-channel quantization only "handles each channel uniformly on average"; within an outlier channel the Δ is still inflated by that channel's own maximum. Reaching INT2 does not mean INT2 is actually good — perplexity loss is still substantial, and 4-bit is where comfort lies.
+
+** 2024 | KVQuant: Explicitly Lifting Outliers Out
+
+*** What Problem It Saw
+
+KIVI softened outliers implicitly through per-channel quantization but did not eliminate them. Pushing below 4 bit, those residual outliers start hurting again.
+
+*** Its Solution
+
+KVQuant (Hooper et al., 2024) changed outlier handling from "implicit" to "explicit":
+- Use a *non-uniform* datatype calibrated to the empirical distribution, reserving a denser grid for small values.
+- Truly extreme outliers are *carved out* and stored separately as sparse FP16.
+
+*** Why It Worked (and What New Trap It Left)
+
+Modeling "the vast majority of values" and "the few outliers" separately and optimally for each yields a near-optimal total. Perplexity loss was pushed down dramatically, genuinely entering the sub-4-bit era.
+
+New trap: the separate outlier storage is an ugly bypass — kernel implementation is complex, memory budget is hard to predict precisely. The road seems to continue, but each step is more of a patchwork.
+
+** 2024 | QuaRot: Eliminating Outliers Entirely
+
+*** What Problem It Saw
+
+KVQuant still "accommodates" outliers. Outliers exist because certain channels happen to be exceptionally large — is that arbitrary and therefore rotatable away?
+
+*** Its Solution
+
+QuaRot (Ashkboos et al., 2024): multiply both K and Q by a random Hadamard rotation H (H^T H = I) before quantizing.
+- The Hadamard matrix writes each new channel as a weighted sum of all original channels (half positive, half negative), equivalently *spreading outlier energy uniformly* across all new channels.
+- The distribution transforms from "a few extremely sharp spikes plus a sea of short grass" to "a sea of slightly taller but uniform grass" — outliers vanish.
+- Because H is orthogonal, attention scores are fully preserved: (Hq)^T (Hk) = q^T k — zero cost.
+
+After rotation, apply standard INT4 quantization: outlier-free, no special-case bypass needed.
+
+*** Why It Worked (and What New Trap It Left)
+
+A "mathematically more elegant" victory: use a well-known tool (Hadamard) to geometrically flatten the problem, then let all downstream methods operate on normal terrain.
+
+New trap: with outliers gone and quantization error reduced, the error can never be zero. Once we push toward INT2, residual error still matters — and its effect does not travel through the path of "error directly overturning output" but through softmax's nonlinear amplification. That next layer of the problem is exactly what QKSA captures.
+
+** 2026 | QuantVideoGen: KV Quantization Lands on Video Diffusion
+
+*** What Problem It Saw
+
+Porting the full LLM toolkit (KIVI + QuaRot etc.) to chunk-wise autoregressive video diffusion models (MAGI-1, SkyReels-V2, HY-WorldPlay): INT4 still works, INT2 directly destroys subject and scene structure.
+
+The key difference between video diffusion and LLMs: each chunk contains thousands of spatio-temporal tokens, and *the current chunk is full precision — only past chunks in the cache are compressed*. The current chunk and past chunks are heterogeneous.
+
+*** Its Solution
+
+QuantVideoGen (Xi et al., 2026) continues along the traditional path of "make quantization error smaller":
+- Semantic-aware smoothing: some tokens in the video are more sensitive; smooth the distribution accordingly.
+- Progressive residual quantization: quantize the main signal first, then quantize the residual, squeezing the quantization error further.
+
+*** Why It Worked (and What New Trap It Left)
+
+It claimed the new battlefield of video, but *the thinking is continuous*: still "error is the culprit; compress the error further."
+
+New trap: when the compressed part (cached past) and the uncompressed part (current chunk) *compete for attention mass* inside the same softmax, even zero-mean error causes the exponential in softmax to "rectify" the noise into a bias favoring the cache. This is a bias that *zero error cannot fix*, because it originates in softmax itself. This is QKSA's entry point.
+
+** 2026 | QKSA: Leave Quantization Alone, Fix the Bias Directly ← This Paper
+
+*** What Problem It Saw
+
+The authors visualized the attention maps of an INT2 video model (Fig. 2) and saw a very clean phenomenon:
+
+*After quantization, attention mass systematically migrated from the current chunk to the cache.* Not an isolated event in a particular layer/head/step, but a universal shift strongly correlated with visual collapse.
+
+Diagnosis: integer quantization introduces *zero-mean* noise δ ~ Uniform[-Δ/2, Δ/2], so the pre-softmax score s + δ is unbiased in expectation. But softmax computes e^(s+δ). The exponential is a *convex function*, and by Jensen's inequality:
+
+    E[e^(s+δ)]  >  e^E[s+δ]  =  e^s
+
+The larger the noise and the larger Δ, the more severe this "convex amplification." The authors name it the *Jensen bias*.
+
+All keys in the cache have this bias added to them; the current chunk's keys do not (they are full precision). So the cache becomes "puffed up" in the softmax denominator, taking away attention mass it should not have — this is the literal meaning of the title "Quantized Keys Steal Attention."
+
+*** Its Solution
+
+Since the bias is systematic, simply *write it down and subtract it*:
+
+    s_corrected = s_quantized - b(Δ, ||q||)
+
+A second-order Taylor expansion yields a closed form for b that depends only on:
+1. The quantization step size Δ_i of that cached key (already stored in the cache)
+2. The query norm ||q||
+
+→ Zero additional memory, nearly zero additional computation (one multiply-add per score), no change to any quantization scheme, no retraining.
+
+*** Why It Worked (and What New Trap It Left)
+
+A conceptual shift: the previous five generations all asked "how do we make quantization error smaller." QKSA asks "even infinitesimal error cannot save us, because softmax rectifies any zero-mean noise into a bias — so let's just compute that bias analytically and subtract it."
+
+Results:
+- On three video diffusion models (MAGI-1, SkyReels-V2, HY-WorldPlay), INT2 + QKSA approaches BF16 quality.
+- 2.19 effective bits + QKSA outperforms 4.38 effective bits without correction → *half the memory footprint*.
+- Orthogonal to QuantVideoGen: one compresses error, the other corrects bias; combining both is best.
+
+New traps / open questions:
+- The derivation assumes zero-mean, symmetric RTN noise. For other quantizers (non-uniform datatypes like NF4), the closed-form Jensen bias needs to be re-derived.
+- Does the second-order Taylor expansion remain accurate at extreme Δ (e.g., INT1)? The paper stops at INT2.
+- When the current chunk is also quantized (e.g., prefill is also compressed), the bias is no longer one-sided and the correction formula needs extension.
+
+* Frontier Extensions
+
+The target paper was posted on 2026-05-25 and has no public follow-up work critiquing it yet. But the river's trajectory makes several obvious next steps predictable:
+
+1. *Extending to non-uniform quantizers*: NF4, KIVI's mixed per-channel/per-token schemes, etc. — the noise distribution is no longer Uniform, so the Jensen bias must be re-derived (Appendix E of the paper already handles the per-channel version; room remains).
+
+2. *Corresponding biases on the Q / softmax / V side*: this paper only corrects the score-level bias introduced by K quantization. When Q is also quantized, ||q|| itself is biased; when V is quantized, the weighted output sum is biased — all are natural extensions of the same idea.
+
+3. *Feeding back from video diffusion to LLMs*: Appendix O already runs experiments on LLM partial-prefill. The likely next step is embedding QKSA into production inference frameworks like vLLM/SGLang to make INT2 KV cache genuinely viable for LLMs.
+
+4. *Combining with sparse attention / cache eviction*: the two major cost-reduction paths for KV cache (quantization and sparsity/eviction) have long run in parallel. The Jensen bias diagnosis may also apply to the approximate distribution left behind by evicted cache entries — worth watching.
+
+* One Diagram
+
+#+begin_example
+                          The Conceptual Spine of This River
+                          ===================================
+
+  Battlefield:  LLM KV cache  -------->  Video diffusion KV cache
+                                         (current chunk uncompressed,
+                                          past chunk compressed)
+
+  Problem model (inherited generation by generation):
+
+  L0: "Outlier channels are very large"
+        Dettmers 2022                          [Root cause = distribution shape]
+            |
+            v
+  L1: "Key has outliers, Value does not"
+        KIVI 2024                              [Targeted fix: per-channel/token]
+            |
+            v
+  L2: "Outliers remain; use non-uniform grid + separate storage"
+        KVQuant 2024                           [Explicit special-casing]
+            |
+            v
+  L3: "Use Hadamard rotation to spread outlier energy"
+        QuaRot 2024                            [Elegant elimination]
+            |
+            v
+  L4: "Port this to video; squeeze error a bit further"
+        QuantVideoGen 2026                     [New battlefield, same tradition]
+            |
+            v
+  L5: "However small the error, softmax rectifies zero-mean noise into bias"
+        QKSA 2026  *<-- Paradigm shift: from "compress error" to "correct bias"*
+
+  Hidden belief of all five generations:  "Smaller error → better output"
+  Fact this paper surfaces:               "Zero-mean error → softmax still
+                                           produces a *systematic* bias"
+                                          (Jensen's inequality / convex exponential)
+
+  Solution paradigm comparison:
+    L0–L4:  Modify the *quantizer* (change Δ, grid, datatype, coordinate system)
+    L5:     Leave the quantizer alone; modify the *step before softmax*,
+            subtracting an analytically derived bias term
+#+end_example
+
+* Insights
+
+Looking back across this river, what truly changes from generation to generation is not "how low the quantization precision goes" but *where people look for the root cause of the problem*:
+
+- The first five generations stood on the *compressor's side*: outlier channels problematic? Change channel granularity. Error too large? Switch datatype. Δ too large? Rotate to spread outliers. Everything focused on "how to make the quantization noise itself smaller."
+- QKSA shifts the gaze to the *consumer's side*: softmax is not a passive box that simply accepts noise — it is a *convex nonlinearity* that *rectifies* any zero-mean noise into a one-sided bias. The root cause is not quantization alone but the interaction of quantization × convex function.
+
+This is a recurring pattern in ML systems optimization: when one side (here the quantizer) is optimized close to its physical limit, the next breakthrough often comes from re-examining *the nonlinearity of the downstream operator it feeds into*.
+
+Similar shifts have happened before:
+- Early attention work put all attention on "how to make attention sparser" → FlashAttention shifted to "the memory traffic of the softmax step is the bottleneck."
+- Early LLM quantization work competed endlessly on "better quantization schemes" → SmoothQuant shifted to "why do outliers exist; migrate them from activations to weights."
+
+*Where is the most likely next step?* Along the direction of "re-examine downstream nonlinearities":
+- The bias introduced by LayerNorm / RMSNorm under quantization (division and square root are also nonlinear).
+- Quantization distortion of angles after RoPE rotation.
+- Accumulated bias across timesteps in multi-step diffusion.
+
+* Takeaways
+
+If you work on ML systems optimization, this river offers three concrete, actionable suggestions:
+
+1. *Visualize before you optimize.* The entire story of QKSA begins with "plot the attention weights" (Fig. 2). Had the authors looked only at PSNR numbers, they would have seen "INT2 doesn't work," not "attention mass shifts systematically." Whenever you push any quantization/pruning/distillation method to its limit, *plot the intermediate tensors first* — anomalies are usually written in large letters on the face of the distribution.
+
+2. *Zero-mean noise ≠ unbiased estimate.* Any time your zero-mean approximation passes through a nonlinearity (exp, softmax, sqrt, division), assume by default that it will be rectified into a one-sided bias. Jensen's inequality should be a tool you can reach for instantly.
+
+3. *A correction orthogonal to existing work is worth more than an adversarial improvement.* QKSA did not try to beat QuaRot or QuantVideoGen — it declared "I am orthogonal to both." The result in Table 1 is that combining them works best. Work that "stacks painlessly" faces the least resistance in deployment and is most readily absorbed by industry.
+
+The bottom line is "make it usable": the next time you see a bottleneck in some "keep squeezing the error" arms race, try stepping back and asking — what downstream nonlinear operator consumes this error? Is that operator convex? Could convexity rectify zero-mean noise into a bias? If yes, *stop racing to shrink the error and just write down the bias and subtract it.*
+
+---
+
+/Note: This paper was posted to arXiv on 2026-05-25. The citation chain (KIVI → KVQuant → QuaRot → QuantVideoGen) strictly follows the papers the authors explicitly named and contrasted in their Related Work section. QuantVideoGen (Xi et al., 2026) is the work the authors themselves identify as "most directly related." KVLinC (Saxena and Roy, 2025) is the "conceptually closest" parallel thread (it also corrects key quantization but uses a trainable adapter); it is excluded from the main narrative to preserve a single-thread story./

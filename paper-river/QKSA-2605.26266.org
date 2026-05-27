@@ -1,0 +1,285 @@
+#+title:      Quantized Keys Steal Attention: Bias Correction for KV-Cache Compression in Video Diffusion
+#+date:       [2026-05-26 Tue 23:14]
+#+filetags:   :paper:river:kvcache:quantization:videodiffusion:
+#+identifier: 20260526T231441
+#+source:     https://arxiv.org/abs/2605.26266
+#+authors:    Tuna Tuncer, Felix Becker, Thomas Pfeil
+#+venue:      arXiv 2026-05-25 / ICML 2026 workshops (SCALE, F2S)
+
+* 问题之河
+
+视频越生越长，模型为了不重算前面，把过去的"记忆"存在 KV cache 里。可是这块记忆动辄几个 GB，把显卡撑爆。能不能把记忆压缩成 2 个 bit 一格的"罐头"？能。但画面立刻崩了：人脸糊掉，场景跳变，时间一致性瓦解。
+
+为什么压一下记忆，结果不是"略糊"，而是"灾难"？这条河追的就是这个问题：在不重训模型的前提下，怎样把 KV cache 压到极致而几乎不损画质。
+
+* 溯源地图
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8 / SmoothQuant 系
+  |
+  | 发现: Transformer 的激活有少数 "outlier 通道" 极大
+  |       一压成 INT8 就把别的通道挤死了
+  v
+[2024] Liu et al. - KIVI
+  |
+  | 问题: KV cache 是 LLM 长上下文的内存瓶颈
+  | 观察: 关键发现 — Key 沿 channel 维有 outlier, Value 没有
+  | 解法: 对 Key 走 per-channel, 对 Value 走 per-token, 免训练做到 INT2
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | 问题: KIVI 的 outlier 还是会把 Δ 拉大, 普通通道吃亏
+  | 解法: 非均匀 datatype + 显式把 outlier 抠出来单存
+  |       挤进 <4-bit
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | 问题: "把 outlier 单独存" 是工程上 ugly 的特例处理
+  | 解法: 在量化之前给 K, Q 都乘一个 Hadamard 随机旋转
+  |       outlier 的能量被均匀摊到所有通道, "outlier-free"
+  |       天然支持 INT4
+  v
+[2026] Xi et al. - QuantVideoGen
+  |
+  | 问题: LLM 那一套量化拿到视频扩散上, INT4 还行, INT2 画面就废
+  | 解法: 语义感知 smoothing + 渐进残差量化, 进一步压小量化误差
+  v
+[2026] Tuncer, Becker, Pfeil - QKSA  (本文)
+  |
+  | 问题: 大家都在卷 "把量化误差做小"
+  |       但 INT2 之所以崩, 并不只是 "误差大" — 还有一个被忽视的偏差
+  |       softmax 的指数是凸的, 零均值噪声进去, 出来就不再零均值
+  |       缓存里的 key 会 "偷" 走当前 chunk 的注意力质量
+  | 解法: 解析地把这个 Jensen bias 写出来, 在 softmax 前减掉它
+  |       不改任何量化方案, 不重训, 几乎零开销
+  v
+[未来] 这一条线上明显还会有人接着做 (见 "前沿延伸")
+#+end_example
+
+* 演化叙事
+
+** 2022 | LLM.int8 / SmoothQuant 系: 看见了 outlier 通道
+
+*** 它看到了什么问题
+
+把 Transformer 的激活按 INT8 一刀切下去, 精度就崩。一开始大家以为是 "INT8 太粗", 但 Dettmers 等人 (LLM.int8, 2022) 把分布画出来后发现真相: 几千个通道里, 总有那么几个通道, 数值是其它通道的几十上百倍。
+
+per-tensor 量化要照顾这几个 outlier, 就得把 Δ (步长) 拉得很大, 结果剩下 99% 的通道全被挤到一两个 grid 上, 信息丢光。
+
+*** 它的解法
+
+最早的几种方案: 把 outlier 通道单独留 FP16, 别的走 INT8 (LLM.int8); 或者用一个对角缩放矩阵把 outlier 能量从激活搬到权重 (SmoothQuant)。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+"outlier 是凶手" 这件事从此变成默认设定。但所有解法都是 "特例化": 要识别哪个通道是 outlier, 要单独维护它的存储路径, 工程上很丑。下一代要么找更优雅的方式压制 outlier, 要么换战场 — 比如把这套思路搬到 KV cache 上去。
+
+** 2024 | KIVI: 第一次把 KV cache 压到 2-bit
+
+*** 它看到了什么问题
+
+LLM 一旦上长上下文, KV cache 占的显存就直接超过模型权重本身。但 KV cache 这块"内存大户"长期没人系统地量化, 因为大家直觉觉得 "这是动态生成的, 不好做"。
+
+*** 它的解法
+
+KIVI (Liu et al., 2024) 第一次把 KV cache 的分布性质看清楚:
+- *Key 沿 channel 维有 outlier* — 和激活一样
+- *Value 没有这种结构* — 比较均匀
+
+于是: Key 走 per-channel 量化 (每个通道自己一个 Δ), Value 走 per-token 量化 (每个 token 自己一个 Δ), 整体免训练做到 INT2。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+"对症下药" 的胜利: 不是用一套量化方案硬怼, 而是先看清结构再选方案。
+
+新坑: per-channel 量化只是 "把每个通道平均地处理", outlier 通道里 Δ 还是被它内部的最大值撑得很大。能做到 INT2 不代表 INT2 真的好用 — perplexity 损失依然可观, 4-bit 才比较安心。
+
+** 2024 | KVQuant: 把 outlier 显式拎出去
+
+*** 它看到了什么问题
+
+KIVI 用 per-channel 暗中缓和了 outlier, 但没消灭。要再降到 <4 bit, 这点剩余 outlier 又开始疼。
+
+*** 它的解法
+
+KVQuant (Hooper et al., 2024) 把 outlier 处理从 "隐式" 改成 "显式":
+- 用按经验分布校准过的 *非均匀* datatype, 给小数值留更密的 grid
+- 把真正的 outlier *单独抠出来* 用稀疏 FP16 存
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+把 "大多数值" 和 "少数 outlier" 分开建模, 各自最优, 总和近最优。Perplexity 损失被压到很小, 真正进入了 sub-4-bit 时代。
+
+新坑: 单独存 outlier 是个 ugly 的旁路 — kernel 实现复杂, 内存预算难以精确预估。这条路看似还能往下走, 但越走越 "缝缝补补"。
+
+** 2024 | QuaRot: 直接消灭 outlier
+
+*** 它看到了什么问题
+
+KVQuant 仍在 "迁就" outlier。outlier 之所以存在是因为某些通道恰好特别大 — 这是不是任意的、可以被旋转掉的？
+
+*** 它的解法
+
+QuaRot (Ashkboos et al., 2024): 在量化之前对 K, Q 同时乘一个 Hadamard 随机旋转 H (H^T H = I)。
+- Hadamard 矩阵把每个通道写成所有原通道的加权和 (一半正一半负), 等价于把 outlier 的能量 *均匀摊* 到所有新通道上
+- 整个分布从 "几个极尖的峰 + 一片矮草" 变成 "一片更高一点的草", outlier 消失
+- 因为 H 是正交的, 注意力分数完全保持: (Hq)^T (Hk) = q^T k — 0 代价
+
+旋转后再做标准 INT4 量化, outlier-free, 不需要任何特例旁路。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+这是 "数学上更优雅" 的胜利: 用一个 well-known 的工具 (Hadamard) 把问题的几何结构整平, 然后让所有下游方法回到平坦地形上的常规处理。
+
+新坑: outlier 没了, 量化误差也变小了, 但 *误差永远不可能为零*。一旦还要往 INT2 推, 残余误差仍然会有影响 — 而且这个影响走的不是 "误差直接掀翻输出" 那条路, 是经由 softmax 的非线性放大走出来的。这正是 QKSA 要捕捉的下一层问题。
+
+** 2026 | QuantVideoGen: KV 量化登陆视频扩散
+
+*** 它看到了什么问题
+
+把 LLM 那一整套 (KIVI + QuaRot 等) 搬到 chunk-wise 自回归视频扩散模型 (MAGI-1, SkyReels-V2, HY-WorldPlay), INT4 还能用, INT2 直接把主体和场景结构打烂。
+
+视频扩散和 LLM 的关键差异: 每个 chunk 有上千个 spatio-temporal token, 而且 *当前 chunk 是 full precision 的, 只有过去的 chunk 在 cache 里被压了*。当前 chunk 和过去 chunk 是异质的。
+
+*** 它的解法
+
+QuantVideoGen (Xi et al., 2026): 继续沿着 "把量化误差做小" 的传统路线 —
+- semantic-aware smoothing: 视频里有些 token 更敏感, 平滑分布
+- progressive residual quantization: 先量化主体, 残差再量化, 把 quantization 误差挤得更小
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它接住了 video 这一新战场, 但*思路是连续的*: 还是 "误差是凶手, 把误差再压小"。
+
+新坑: 当被压的部分 (cached past) 和不被压的部分 (current chunk) 在同一个 softmax 里 *竞争注意力质量* 时, 哪怕误差零均值, softmax 的指数也会把噪声 "整流" 成偏向 cache 的偏置。这是 *零误差也救不了* 的偏差, 因为它来自 softmax 本身。这正是 QKSA 的入口。
+
+** 2026 | QKSA: 不动量化, 直接修偏差 ← 本文
+
+*** 它看到了什么问题
+
+作者把 INT2 视频模型的 attention map 画出来 (Fig. 2), 看到一个非常 clean 的现象:
+
+*量化之后, 注意力质量系统性地从当前 chunk 跑去了 cache。* 不是哪个 layer/head/step 的偶发, 是普适地偏移, 且和画质崩塌强相关。
+
+诊断: 整数量化引入的是 *零均值* 噪声 δ ~ Uniform[-Δ/2, Δ/2], 所以 pre-softmax 的 score s + δ 在均值上无偏。但 softmax 要算 e^(s+δ)。指数是 *凸函数*, 由 Jensen 不等式:
+
+    E[e^(s+δ)]  >  e^E[s+δ]  =  e^s
+
+噪声越大, Δ 越大, 这个 "凸性放大" 就越严重。作者把它命名为 *Jensen bias*。
+
+cache 里的 keys 全部被加了这个 bias, 当前 chunk 的 keys 没有 (它们是 full precision)。所以 cache 在 softmax 的分母里 "虚胖", 拿走了不该拿的注意力质量 — 这就是 "Quantized Keys Steal Attention" 这个标题的本义。
+
+*** 它的解法
+
+既然 bias 是系统性的, 就直接 *把它写出来减掉*:
+
+    s_corrected = s_quantized - b(Δ, ||q||)
+
+用二阶 Taylor 展开把这个 b 推出闭式: 它只依赖于
+1. 缓存里那个 key 的 quantization step size Δ_i (cache 自己就存着)
+2. query 的范数 ||q||
+
+→ 0 额外内存, 几乎 0 额外算量 (只是 per-score 一次乘加), 不改任何量化方案, 不重训。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+精神层面的转向: 前面五代人都在问 "怎么让量化误差更小", QKSA 问 "误差再小也救不了, 因为 softmax 会把任意零均值噪声整流成偏置 — 那我就直接把那个偏置算出来减掉"。
+
+效果:
+- MAGI-1, SkyReels-V2, HY-WorldPlay 三个 video diffusion 模型上, INT2 + QKSA 接近 BF16 画质
+- 2.19 effective bits + QKSA 优于 4.38 effective bits 不修正 → *省一半显存*
+- 和 QuantVideoGen 是 *正交* 的: 一个压误差, 一个修偏差, 组合最好
+
+新坑 / 留下的问题:
+- 这个推导基于零均值、对称的 RTN 噪声分布。若换成其它量化器 (NF4 之类的非均匀 datatype), Jensen bias 的闭式还需要重新推
+- 二阶 Taylor 在极端 Δ (比如 INT1) 下是否仍然准确? 论文止于 INT2
+- 当前 chunk 也被量化的场景下 (比如 prefill 也量化), 偏置不再单边, 修正公式要扩展
+
+* 前沿延伸
+
+目标论文 2026-05-25 才挂出, 暂时还没有公开的后续工作直接批判它。但从这条河的走势可以预判几个明显的下一步:
+
+1. *扩展到非均匀量化器*: NF4, KIVI 的混合 per-channel/per-token 等, 噪声分布不再 Uniform, Jensen bias 需要重新推导 (论文附录 E 已经做了 per-channel 的版本, 还有空间)
+
+2. *Q 端 / softmax 端 / V 端 的对应偏差*: 这篇只修 K 量化引入的 score-level 偏差。Q 也量化时 ||q|| 本身就有偏, V 量化会让输出加权和有偏 — 这些都是同一思路可延伸的方向
+
+3. *从 video diffusion 反哺 LLM*: 论文附录 O 已经在 LLM partial-prefill 上做了实验。下一步很可能是把 QKSA 嵌入 vLLM/SGLang 这类生产推理框架, 让 INT2 KV cache 在 LLM 上真正落地
+
+4. *和 sparse attention / cache eviction 的结合*: KV cache 的两大省钱路径 (量化、稀疏/淘汰) 长期是平行的。Jensen bias 的诊断可能也适用于 "被驱逐的 cache 留下的近似分布", 那条线值得看
+
+* 一张图看懂
+
+#+begin_example
+                          这条河的精神主轴
+                          ====================
+
+  战场:  LLM KV cache  -------->  Video diffusion KV cache
+                                  (current chunk 不压, past chunk 压)
+
+  问题模型 (代代相传):
+
+  L0: "outlier 通道很大"
+        Dettmers 2022                          [病灶 = 分布形状]
+            |
+            v
+  L1: "Key 有 outlier, Value 没有"
+        KIVI 2024                              [对症: per-channel/token]
+            |
+            v
+  L2: "outlier 还在, 用非均匀格点 + 单存"
+        KVQuant 2024                           [显式特例化]
+            |
+            v
+  L3: "用 Hadamard 旋转把 outlier 摊平"
+        QuaRot 2024                            [优雅消除]
+            |
+            v
+  L4: "把这套搬到视频, 误差再压小一点"
+        QuantVideoGen 2026                     [换战场, 续传统]
+            |
+            v
+  L5: "误差再小, softmax 把零均值噪声整流成偏置"
+        QKSA 2026  *<-- 范式转向: 从"压误差"到"修偏差" *
+
+  五代人的隐含信念:   "误差小 → 输出好"
+  本文挑明的事实:    "误差零均值 → softmax 后 *仍然有* 系统性偏差"
+                    (Jensen 不等式 / 指数凸性)
+
+  解法范式对照:
+    L0-L4:   动 *量化器* (改 Δ, 改 grid, 改 datatype, 改坐标)
+    L5:      不动量化器, 动 *softmax 之前那一步*, 减一个解析偏置项
+#+end_example
+
+* 洞见
+
+这条河看下来, 真正在变化的不是 "量化精度做得多低", 而是 *人们在哪里寻找问题的根源*:
+
+- 前五代人都站在 *压缩器一侧* 找问题: outlier 不好? 改通道粒度。误差太大? 换 datatype。Δ 太大? 旋转把 outlier 摊平。一切聚焦于 "怎么让量化噪声本身更小"
+- QKSA 把视线移到了 *消费者一侧*: softmax 不是被动接受噪声的盒子, 它是一个 *凸非线性*, 它会把任何零均值噪声 *整流* 成单边偏置。问题根源不在量化, 而在量化 × 凸函数的相互作用
+
+这是 ML 系统优化中一个反复出现的模式: 当某一侧 (这里是量化器) 被优化到接近物理极限, 下一波突破往往来自重新审视 *被它影响的下游算子的非线性*。
+
+类似的转向之前发生过:
+- 早期 attention 工作把全部注意力放在 "如何让 attention 更稀疏" → FlashAttention 转向 "softmax 这一步的内存搬运才是瓶颈"
+- 早期 LLM 量化工作不断在 "更好的量化方案" 上卷 → SmoothQuant 转向 "为什么会有 outlier, 把它从激活搬到权重"
+
+*下一步最可能往哪走?* 沿着 "重审下游非线性" 的方向:
+- LayerNorm / RMSNorm 在量化下的偏置 (除法、平方根也都是非线性)
+- RoPE 旋转后角度的量化失真
+- 多步 diffusion 在 timestep 上的偏差累积
+
+* 启发
+
+如果你在做 ML 系统优化, 这条河给你三条具体的可操作建议:
+
+1. *先画图再优化*。QKSA 的整个故事是从 "把 attention weight 可视化" 开始的 (Fig. 2)。如果作者只看 PSNR 数字, 看到的就是 "INT2 不行", 不会看到 "attention mass 系统性偏移"。在你 push 任何量化/剪枝/蒸馏方法到极限时, *先把中间张量画出来*, 异常往往是大写在脸上的
+
+2. *零均值噪声 ≠ 无偏估计*。任何时候你的零均值近似要进入一个非线性 (exp, softmax, sqrt, division), 默认它会被整流成单边偏置。Jensen 不等式应该是你随手就能调用的工具
+
+3. *正交于现有工作的修正比对抗式改进更值钱*。QKSA 没有试图打败 QuaRot 或 QuantVideoGen, 而是声明 "我和你们正交"。结果在 Table 1 里组合起来效果最好 — 这种 "可以无痛叠加" 的工作在落地时阻力最小, 也最容易被工业界吸纳
+
+落点在 "能用": 下次你在某个 "误差越压越小" 的内卷战场看见瓶颈, 试着退一步问 — 这些误差被下游什么非线性算子消费了? 那个算子是不是凸的? 凸性会不会把无偏噪声整流成偏置? 如果是, *别再卷误差了, 直接把偏置写出来减掉*。
+
+---
+
+/注: 本文于 2026-05-25 挂上 arXiv, 引用链 (KIVI → KVQuant → QuaRot → QuantVideoGen) 严格依据论文 Related Work 中作者明确点名的批判/对比对象。QuantVideoGen (Xi et al., 2026) 是作者自己声称 "最直接相关" 的前序工作。KVLinC (Saxena and Roy, 2025) 是 "概念上最接近" 的另一条支线 (它也修正 key 量化, 但用可训练 adapter), 没纳入主线以保持单线叙事。/

@@ -1,0 +1,284 @@
+#+title:      InfoQuant: Shaping Activation Distributions for Low-Bit LLM Quantization
+#+date:       [2026-05-26 Tue 23:08]
+#+filetags:   :paper:river:en:
+#+identifier: 20260526T230823-en
+#+source:     https://arxiv.org/abs/2605.26175
+#+authors:    Ke Li, Dong An, Xiaoling Zang, Can Ye, Liang Xie, Qibo Qiu, Chen Shen, Xiaofei He, Wenxiao Wang
+#+venue:      arXiv 2026-05-25 (cs.LG)
+
+* The River of Problems
+
+LLM inference is expensive — a 70B-parameter model already saturates the GPU just moving weights around, let alone actually running. The most direct fix: compress every number from 16-bit float down to 4-bit integer, cutting storage and compute by 4×.
+
+But one hurdle refuses to yield: compressing weights to 4 bits is fine, yet compressing *activations* causes immediate collapse. The problem is not the numbers themselves — it is the distribution. LLM activations always carry a handful of channels on a handful of tokens whose values are wildly large. They stretch the quantization range so wide that ordinary values end up crammed into one or two bins in the middle, and all information is lost.
+
+For three full years, generation after generation circled this "outlier" problem. Each generation believed it saw something the previous one had missed. InfoQuant is the freshest cut on this line as of 2026 — and it argues that every predecessor was optimizing the wrong objective.
+
+* Provenance Map
+
+#+begin_example
+[2022] LLM.int8() - Dettmers et al.
+  |
+  | Discovery: LLM activations contain a few "outlier channels" with
+  |            enormous values; vanilla INT8 quantization breaks immediately.
+  | Compromise: Extract outlier channels and compute them in FP16;
+  |             compute the rest in INT8.
+  v
+[2023] GPTQ - Frantar et al.
+  |
+  | Problem: Compress only weights, leave activations alone;
+  |          4-bit weights can still preserve accuracy.
+  | Solution: Column-wise error compensation guided by Hessian information.
+  | Open gap: Weights solved; nobody dares touch activations.
+  v
+[2023] SmoothQuant - Xiao et al.
+  |
+  | Problem: Want to quantize activations, but outlier channels are stubborn.
+  | Solution: Diagonal scaling — migrate the "hardness" from activations
+  |           to weights.
+  | Open gap: Breaks at 4-bit — migration is not enough.
+  v
+[2024] QuaRot - Ashkboos et al.
+  |
+  | Problem: Diagonal scaling can suppress but cannot redistribute;
+  |          it cannot scatter outlier energy.
+  | Solution: Hadamard rotation scatters outlier energy across all channels.
+  | Open gap: Fixed random Hadamard — not necessarily optimal per layer.
+  v
+[2025] SpinQuant - Liu et al.
+  |
+  | Problem: Random rotation is wasteful — why not learn the best one?
+  | Solution: Learn orthogonal matrices on the Stiefel manifold,
+  |           trained end-to-end with task loss.
+  | Open gap: The training target is task loss, not a quantization-friendly
+  |           distribution — the objective is unclear.
+  v
+[2025] FlatQuant / OSTQuant / Kurtail / BASE-Q
+  |
+  | Various tricks: Kronecker decomposition, bias terms,
+  |                 kurtosis control, ...
+  | Shared problem: All heuristically reshape the distribution;
+  |                 nobody defines the target clearly.
+  v
+[2026] InfoQuant - Li et al. (this paper)
+
+  Key turn: Information-theoretic perspective —
+            what property of the distribution actually governs quantization error?
+  Answer: (1) Narrow numerical range (low peak)
+          (2) Large variance within that range (spread out)
+  Solution: PSOT (Peak Suppression Orthogonal Transformation)
+            Learn an orthogonal rotation whose explicit objective is
+            "suppress peak + spread values."
+#+end_example
+
+* Evolutionary Narrative
+
+From start to finish, the protagonist of this story is one and the same: *those few extraordinarily large numbers in LLM activations — and what on earth to do with them.*
+
+** 2022 | LLM.int8(): First Acknowledgment That "Outlier Channels" Are Real
+
+*** What Problem It Saw
+
+Before LLM.int8(), the default assumption in quantization was that a tensor's values were roughly uniformly distributed — find the range, slice it into 256 bins (INT8), done. That recipe worked for CNNs; applied to LLMs it immediately failed. In models with 6.7B or more parameters, fewer than 0.1% of activation values are "outliers" that dwarf normal values by tens or even hundreds of times. Direct INT8 quantization causes a cliff-edge accuracy drop.
+
+*** Its Solution
+
+Without touching the architecture, make a compromise: before each matmul, scan the activations and pull out the channels (not individual tokens, but entire feature channels) that contain outliers. Compute those channels in FP16; compute the well-behaved channels in INT8; sum the two streams at the end.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it *acknowledged the non-uniformity of LLM activation distributions* — a foundational insight. But the cost was high: mixed precision requires detecting outlier channels at runtime; hardware implementation is complex. More critically, it only solves 8-bit. At 4-bit there are only 16 quantization levels; mixed precision cannot save you there.
+
+Moreover, it never explained *why* outlier channels exist and never tried to reshape the distribution — it simply routed around them. The next generation would ask: can we make the distribution "well-behaved" before quantization?
+
+** 2023 | GPTQ: Compress Weights to 4-Bit with Essentially No Accuracy Loss
+
+*** What Problem It Saw
+
+Set activations aside for now — the dominant memory bottleneck is *weights*. A 70B model is 140 GB in FP16. Previous weight-quantization methods (round-to-nearest or simple calibration) collapsed at 4-bit by several points.
+
+*** Its Solution
+
+Quantize column by column. After quantizing each column of weights, use the Hessian matrix to estimate how much that quantization error will hurt downstream outputs, then compensate for the "lost information" by adjusting columns not yet quantized. In essence, a greedy algorithm guided by second-order information.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Weight distributions are flat and nearly uniform; second-order error compensation is extremely efficient on such distributions. GPTQ turned 4-bit weight quantization into the standard — LLaMA-2 70B under GPTQ 4-bit is nearly lossless.
+
+But the hole it left: *it only touches weights, not activations.* Activations remain FP16. Matrix multiplications therefore save no compute (W4A16 still has to dequantize to FP16 before the GEMM); only memory bandwidth is saved. To go further, the hard problem of activation quantization — the one LLM.int8() sidestepped — has to be tackled.
+
+** 2023 | SmoothQuant: Migrate the "Hardness" of Activations to Weights
+
+*** What Problem It Saw
+
+After GPTQ, the obvious next step was W8A8 (or even W4A8). But directly quantizing activations to 8-bit still degraded accuracy, for the same reason: outlier channels. LLM.int8() avoided them with mixed precision, but that prevents GEMM fusion and is hardware-unfriendly.
+
+Could both activations and weights be pure INT8, with no mixed precision at all?
+
+*** Its Solution
+
+Exploit a symmetry: in a matmul $Y = X W$, if you scale each channel as $X' = X / s$ and $W' = s W$, the output $Y$ is unchanged. Outlier channels have large activation values; the corresponding weight rows are usually normal. So divide the activations by a large $s$ (suppressing the outlier) and multiply the weight rows by $s$ (absorbing it). Activations become easy to quantize; weights become slightly harder — but weights were never the fragile part.
+
+*Migrate* the difficulty rather than *eliminate* it.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Highly successful at 8-bit — W8A8 is nearly lossless, making LLM activation quantization practically viable for the first time.
+
+But there is a fundamental limitation: *diagonal scaling can suppress but cannot rotate.* An outlier channel can only be compressed along its own axis; the relationships between channels are untouched. With 256 bins at INT8 there is enough room to squeeze; at 4-bit with only 16 bins, suppression alone is insufficient. Yi et al. formally proved in 2025 that channel scaling used alone at 4-bit always fails.
+
+The next generation would ask: instead of just scaling, can we *rearrange* the activations — scatter the outlier energy across all channels?
+
+** 2024 | QuaRot: Scatter Outlier Energy with Rotation
+
+*** What Problem It Saw
+
+SmoothQuant uses a diagonal transform (one scalar per channel) — limited expressive power. If a *full orthogonal matrix* were applied to the activations, outlier channel energy could be distributed across all channels; no single channel would stand out; the overall distribution would approach Gaussian — much friendlier to quantize.
+
+Orthogonal transforms have a mathematical bonus: at certain positions in a Transformer (the residual stream between blocks), the rotation can be *absorbed into the weights* — zero overhead at inference time (the "computational invariance" result of Ashkboos 2024a).
+
+*** Its Solution
+
+Use a random Hadamard matrix (a special sparse orthogonal matrix with ±1 entries). The Hadamard transform has the property of spreading any sparse vector into a dense one. An outlier channel is essentially a sparse high-energy signal; after the Hadamard, its energy is evenly distributed across all channels.
+
+*** Why It Worked (and What New Hole It Dug)
+
+First time W4A4 became usable — LLaMA-2 at 4-bit activations while retaining most accuracy.
+
+But two holes were left. First, *the Hadamard is random* — it is not tailored to this model or this layer; it merely happens to be "scattery enough." Second, and more deeply: the goal is still "scatter outliers," with no stated reason why scattering is necessarily good for quantization. If the scattered distribution is flat but wide, it may still be poor for low-bit quantization.
+
+The next generation would ask: can the rotation be learned to be optimal?
+
+** 2025 | SpinQuant: Learn the Rotation Matrix
+
+*** What Problem It Saw
+
+QuaRot uses a fixed random Hadamard. The obvious next step: make the rotation matrix *learnable* — different layers and models should have different optimal rotations.
+
+*** Its Solution
+
+Constrain the rotation matrix to the *Stiefel manifold* (the set of all orthogonal matrices) and backpropagate end-to-end using task loss (e.g., cross-entropy on a downstream task). Manifold optimization ensures the rotation stays orthogonal throughout training, preserving the "absorb into weights" property.
+
+*** Why It Worked (and What New Hole It Dug)
+
+The learned rotation substantially outperforms a random Hadamard. But the authors of InfoQuant sharply identify a deeper problem:
+
+*SpinQuant trains the rotation with task loss — it learns "which rotation makes the final task perform well," not "which rotation makes the post-quantization distribution easier to quantize."* These two objectives look similar but are not the same. Task loss conflates "distribution-friendliness" and "model robustness to quantization error" in a single gradient signal, making optimization inefficient and requiring large amounts of calibration data for backpropagation.
+
+A cluster of 2025 papers (FlatQuant with Kronecker decomposition, OSTQuant with distillation, Kurtail with kurtosis control, BASE-Q with bias terms) all elaborate on this line, but none answers the fundamental question: *what exactly does a "quantization-friendly" activation distribution look like?*
+
+** 2026 | InfoQuant: First Define What a "Good Distribution" Is, Then Learn to Create It
+
+*** What Problem It Saw
+
+After surveying all prior methods, the InfoQuant authors identified a shared blind spot:
+
+- SmoothQuant's goal: "suppress outliers"
+- QuaRot's goal: "scatter energy"
+- SpinQuant's goal: "improve task performance"
+- FlatQuant's goal: "minimize MSE reconstruction error"
+
+*None of these is the actual quantization error.* A distribution may have small MSE (numerically close to the original) but under round-to-nearest quantization most values collapse into the same few bins — all information is lost, KL divergence explodes, yet MSE looks fine.
+
+More awkwardly: nobody had clearly argued *why achieving these proxy goals actually improves quantization.* It was essentially empiricism plus intuition.
+
+*** Its Solution
+
+Return to first principles; derive from information theory.
+
+Step 1: Use a smoothed KL divergence as the measure of quantization error (rather than MSE), because KL captures "distribution collapse" — a loss that MSE cannot see.
+
+Step 2: Under common distributional assumptions (Gaussian, Laplacian), derive an upper bound on quantization error. The result is a clean criterion:
+
+$$\lambda = \bar{s} / b_n$$
+
+where $\bar{s}$ is the range-normalized quantization step size and $b_n$ is the normalized standard deviation. Smaller $\lambda$ means smaller quantization error.
+
+Plain-language translation: *a good activation distribution has two properties — narrow numerical range (low peak) and large variance within that range (spread out).* Both are necessary: suppressing the peak without spreading the values just crowds them together; spreading without suppressing the peak leaves the range wide.
+
+Step 3: Use this criterion as the objective and learn an orthogonal rotation — *Peak Suppression Orthogonal Transformation (PSOT)*. Train the rotation matrix directly with "peak suppression" as the loss function, which naturally induces narrow-range, high-variance distributions. Two auxiliary components complete the picture: adaptive outlier-token selection (so optimization is not hijacked by extreme samples) and learnable clipping (a fine-trim after the rotation).
+
+*** Why It Worked (and What Holes Remain)
+
+On W4A4KV4, the accuracy gap for LLaMA-2 13B shrinks by 42% relative to the previous SOTA. LLaMA-2 70B runs 4-bit inference on 24 GB of VRAM.
+
+But this line is far from closed. InfoQuant assumes Gaussian/Laplacian distributions; real activations are more complex. It learns only orthogonal transforms, not general affine transforms (FlatQuant's line is still running). KV cache quantization, and ultra-low-bit weight quantization (2-bit or even 1-bit), remain unsettled.
+
+* Frontier Extensions
+
+InfoQuant is a 2026-05 paper and currently represents the leading edge in this direction. Contemporaneous work as of now:
+
+- *FlatQuant line* continues pushing affine transforms in parallel with InfoQuant — two sibling paths (learn orthogonal vs. learn affine).
+- *Kurtail / BASE-Q* pursue finer statistical control (kurtosis, mean) — these serve as auxiliary tools in the InfoQuant toolbox.
+- The whole field is probing more extreme bit-widths such as W2A4 and W4A2; whether the information-theoretic framework holds there is the next test.
+
+* One Diagram
+
+#+begin_example
+                   Three Years, Three Generations: Tackling LLM Activation Outliers
+  =========================================================================
+
+  Gen   Year  Paper         Problem Seen                  Solution               Gap Left
+  ----  ----  ------------  ----------------------------  ---------------------  -----------------------
+   0    2022  LLM.int8()    Outlier channels in           Outlier channels       Cannot fix 4-bit
+                            LLM activations               run in FP16
+                              ↓
+   1    2023  GPTQ          Compress weights first        Hessian error          Activations untouched
+                                                          compensation
+                              ↓
+   2    2023  SmoothQuant   Activation outliers           Diagonal scaling       Still breaks at 4-bit
+                            too stubborn                  migrates to weights
+                              ↓
+   3    2024  QuaRot        Diagonal not enough;          Fixed Hadamard         Rotation not optimal
+                            need rotation                 scatters energy
+                              ↓
+   4    2025  SpinQuant     Rotation should be            Stiefel manifold       Objective is murky
+                            learnable                     + task loss
+                              ↓
+   5    2026  InfoQuant     Root problem: "good           Info-theoretic         Affine transforms &
+                            distribution" undefined       criterion + direct     lower bits unsolved
+                                                          optimization
+                              ↓
+                                  (Next stop?)
+
+  =========================================================================
+
+  Evolution of objectives:
+     "Avoid outliers" --> "Migrate outliers" --> "Scatter outliers" --> "Learn rotation to scatter"
+                                                                              |
+                                                                              v
+                                                "Define what a good distribution is, then learn to create it"
+  =========================================================================
+#+end_example
+
+* Insights
+
+Reading this line, what you see is not "a pile of five quantization methods" but *a progressive upgrade in clarity about what the objective actually is.*
+
+Each generation improved the previous generation's *means*:
+- SmoothQuant improved on LLM.int8()'s means: migrate instead of route around.
+- QuaRot improved on SmoothQuant's means: rotate instead of scale.
+- SpinQuant improved on QuaRot's means: learn instead of fix.
+
+Until InfoQuant, nobody stopped to ask: *what are we actually optimizing?* And when they did, they found that everyone had been using heuristic proxy objectives (outlier magnitude, MSE, task loss) — nobody was optimizing the true quantization error.
+
+This is a textbook research pattern: *when SOTA climbs the same optimization trajectory until it plateaus, the next breakthrough rarely comes from a better optimizer — it comes from redefining the summit.*
+
+InfoQuant carries a second insight: *the geometric properties of the distribution matter more than the magnitude of individual values.* Prior generations stared at outliers as a "phenomenon." InfoQuant steps up one level of abstraction and stares at the *shape* of the distribution — narrow and spread. Outliers are merely a side effect of a "bad shape."
+
+The most likely next directions:
+1. Extend the information-theoretic criterion to non-Gaussian/non-Laplacian distributions (real activation shapes are more complex).
+2. Apply the same "define the good distribution, then optimize toward it" strategy to weight quantization (W2 or even W1).
+3. KV cache quantization — different tensors, but the same "narrow + spread" criterion likely applies.
+
+* Takeaways
+
+The lessons this line offers for *how to do research* are unusually crisp.
+
+*When an entire field is using the same class of heuristic objectives, derive what the true objective actually is.* SmoothQuant → QuaRot → SpinQuant represents three years of engineering iteration — each step improved the numbers a little, but nobody stopped to ask "what are we optimizing?" InfoQuant redefined the entire objective with one page of information-theoretic derivation.
+
+*Do not compete with SOTA on technique; compete on the clarity of the objective.* If you can articulate what SOTA is implicitly optimizing and why that is not the true objective, you have found the entry point for the next paper.
+
+In practice this means: take any mature field, list the last three years of SOTA, write their loss functions side by side, and ask "what is each of these approximating? What does the true objective look like?" — a highly generative paper-mining pattern.
+
+Applied to this specific line: if you are working on LLM inference optimization, what InfoQuant gives you is not the tool "use PSOT" but the *recipe* — "first use information theory to characterize what a good intermediate state looks like, then engineer your way toward it." The same recipe can be applied to sparsification, pruning, and speculative decoding: any two-stage pipeline of "first transform, then apply a lossy operation" is worth asking the question: "what must the intermediate distribution satisfy to make the second stage as cheap as possible?"
