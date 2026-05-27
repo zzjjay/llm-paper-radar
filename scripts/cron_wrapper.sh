@@ -9,7 +9,7 @@
 # (and, for the weekly job, the weekday matches).
 #
 # Usage:
-#   cron_wrapper.sh --at-hour 6        daily.sh        # fire at Beijing 06:00
+#   cron_wrapper.sh --at-hour 14       daily.sh        # fire at Beijing 14:00 (= UTC 06:00)
 #   cron_wrapper.sh --at-hour 8 --dow 1 weekly.sh      # fire at Beijing Monday 08:00
 #
 # --dow: Beijing day of week, 1=Mon .. 7=Sun (POSIX %u).

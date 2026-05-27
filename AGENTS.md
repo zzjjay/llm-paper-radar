@@ -11,7 +11,7 @@ your own initiative — even when you think it'll take too long.
 
 The `auto_paper_river` step runs the `ljg-paper-river` skill in headless
 mode for every paper surfaced in the current rollup window (default
-`--window-days 2`, matching `daily.sh`'s `--days`). Typical cron runs
+`--window-days 1`, matching `daily.sh`'s `--days`). Typical cron runs
 generate a handful of `.org` files — but a `--all-history` backfill or
 a long `--days` window can balloon to hundreds × 5-10 min each. The
 output `.org` files are the whole point of the run.

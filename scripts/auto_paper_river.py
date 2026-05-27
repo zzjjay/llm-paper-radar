@@ -26,7 +26,7 @@ which invokes the ljg-paper-river Claude Code skill in headless mode.
 Per-paper failure is logged and does not abort the batch.
 
 Usage:
-    uv run python scripts/auto_paper_river.py                 # current 2-day window
+    uv run python scripts/auto_paper_river.py                 # current 1-day window
     uv run python scripts/auto_paper_river.py --window-days 7 # current 7-day window
     uv run python scripts/auto_paper_river.py --all-history   # legacy: every surfaced paper ever
     PAPER_RIVER_MAX=2 uv run python scripts/auto_paper_river.py   # cap at 2 this run
@@ -127,10 +127,10 @@ def surfaced_ids(window_days: int | None = None) -> set[str]:
 @click.command()
 @click.option(
     "--window-days",
-    default=2,
+    default=1,
     type=int,
-    help="How many recent days of summarized JSON to scan. Default 2 to match"
-    " daily.sh's rollup. Ignored when --all-history is set.",
+    help="How many recent days of summarized JSON to scan. Default 1 to match"
+    " daily.sh's single-day rollup. Ignored when --all-history is set.",
 )
 @click.option(
     "--all-history",

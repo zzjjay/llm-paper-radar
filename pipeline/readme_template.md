@@ -10,7 +10,7 @@ A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watche
 
 ## 📰 Today's digest
 
-> Auto-updated daily at 06:00 local time. The README is the **compact table view** — full summaries, why-selected rationale, and related methods live under [`digests/`](digests/), one md per day. See [INDEX.md](INDEX.md) for history.
+> Auto-updated daily at Beijing 14:00 (= UTC 06:00) — by that hour arxiv has finished publishing the previous UTC day's batch, so the digest covers a complete publication day. The README is the **compact table view** — full summaries, why-selected rationale, and related methods live under [`digests/`](digests/), one md per day. See [INDEX.md](INDEX.md) for history.
 
 <!-- LATEST_START -->
 <!-- LATEST_END -->
