@@ -827,16 +827,7 @@ def _render_aggregated_compact_md(
 
     span = f"{start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
     body: list[str] = []
-    # Default cron is single-day (handled by render_daily, not here), so
-    # aggregated rendering only fires for ad-hoc --days N > 1 backfills.
-    # 2-day case: title with the older (= complete) day, since the other
-    # is usually a partially-fetched "today". For >2 days the explicit
-    # N-day span is unambiguous and more useful than a single date.
-    if len(days) == 2:
-        title_suffix = start_date.strftime("%Y-%m-%d")
-    else:
-        title_suffix = f"{len(days)}-day · {span}"
-    body.append(f"# LLM Inference Optimization Daily · {title_suffix}\n")
+    body.append(f"# LLM Inference Optimization Daily · {len(days)}-day · {span}\n")
     body.append(f"> 📅 Window: {span}")
     body.append(
         f"> 📊 Scanned {total_scanned} papers → surfaced {len(pairs)}"
