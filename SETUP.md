@@ -83,11 +83,17 @@ If everything is wired up, you'll see `data/raw/`, `data/deduped/`, `data/scored
 
 ```bash
 crontab -e
-# add (replace path):
+# Simple host-local schedule (fire at host 06:00 every day):
 0 6 * * * /absolute/path/to/llm-paper-radar/scripts/daily.sh
+
+# Or — fire at Beijing 14:00 (= UTC 06:00) regardless of host timezone,
+# via the included wrapper. By Beijing 14:00 arxiv has finished publishing
+# the previous UTC day, so the digest covers a complete publication day:
+0 * * * * /absolute/path/to/llm-paper-radar/scripts/cron_wrapper.sh \
+    --at-hour 14 /absolute/path/to/llm-paper-radar/scripts/daily.sh
 ```
 
-`scripts/daily.sh` sources `~/.bashrc` for the Anthropic env vars, runs the full pipeline (`fetch → dedupe → filter → summarize → render`), and only commits + pushes when something actually changed. Logs land in `scripts/log/YYYY-MM-DD.log`.
+`scripts/daily.sh` sources `~/.bashrc` for the Anthropic env vars, runs the full pipeline (`fetch → dedupe → filter → summarize → render`), and only commits + pushes when something actually changed. Logs land in `scripts/log/YYYY-MM-DD.log`. For a manual rerun of a specific arxiv publication day: `./scripts/daily.sh --date 2026-05-20`.
 
 **Option B — GitHub Actions (forks with a public sk-ant key).** Three workflows are wired up under `.github/workflows/`: `daily.yml` (schedule commented out — fetch → render → push), `weekly.yml` (Mondays 23:00 UTC — 7-day rollup), and `cleanup.yml` (Sundays 22:00 UTC — prune old raw data). To use them, set repo secrets and (for `daily.yml`) re-enable the schedule line:
 

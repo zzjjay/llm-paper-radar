@@ -675,7 +675,7 @@ def _render_compact_md(
 
     body: list[str] = []
     body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
-    body.append(f"> 📅 Window: {date.strftime('%Y-%m-%d')} (UTC daily)")
+    body.append(f"> 📅 Publication date: {date.strftime('%Y-%m-%d')} (UTC)")
     body.append(
         f"> 📊 Scanned {scanned} papers → passed hard_gate {len(surviving)}"
         f" · 👤 {watched_count} from watched authors"
