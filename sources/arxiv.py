@@ -17,10 +17,6 @@ ARXIV_ID_RE = re.compile(r"abs/([\d.]+)(?:v\d+)?$")
 class ArxivSource(Source):
     name = "arxiv"
     BASE_URL = "http://export.arxiv.org/api/query"
-    # Switch from descending-pagination to date-range query when the target
-    # day is older than this. 5 days matches the ~1000-paper-page-cap reach
-    # of cs.CL/cs.LG/cs.AR fetches in May 2026; bump if arXiv volume drops.
-    RECENT_DAYS = 5
 
     def __init__(self, categories: list[str], page_size: int = 200, max_pages: int = 5):
         self.categories = categories
@@ -28,37 +24,30 @@ class ArxivSource(Source):
         self.max_pages = max_pages
 
     async def fetch(self, target_date: datetime) -> list[Paper]:
-        """Fetch papers submitted within ~24h ending at target_date (UTC).
+        """Fetch papers whose arxiv `<published>` falls on `target_date`
+        (UTC). Window: [target 00:00, target+24h 00:00).
 
-        Uses two query strategies depending on how recent `target_date` is:
-        - **Recent (≤ RECENT_DAYS old)**: descending-by-submittedDate pagination
-          from "now", early-break when the page is older than the window. Cheap
-          and matches the cron's daily usage pattern.
-        - **Old (> RECENT_DAYS)**: explicit `submittedDate:[start TO end]`
-          range query, so the fetch lands on the correct historical window
-          regardless of how much later we run it. Critical for backfills —
-          without this, sub-1000-paper-page-cap means anything older than
-          ~5 days returns 0 papers.
+        `target_date` is interpreted as the **arxiv publication date**.
+        The fetched papers' `published_at` will all fall inside the day,
+        and downstream folder/digest/README naming uses the same date,
+        so everything stays consistent.
+
+        Uses an explicit `submittedDate:[start TO end]` query (not
+        descending-from-now pagination) so the same code path serves
+        both "yesterday" (cron) and "30 days ago" (backfill).
         """
-        now = datetime.now(UTC)
-        age = (now - target_date).total_seconds() / 86400
         cat_query = "+OR+".join(f"cat:{c}" for c in self.categories)
+        ws = target_date
+        we = target_date + timedelta(hours=24)
+        range_q = (
+            f"submittedDate:[{ws.strftime('%Y%m%d%H%M')}+TO+"
+            f"{we.strftime('%Y%m%d%H%M')}]"
+        )
+        full_query = f"({cat_query})+AND+{range_q}"
         all_entries: list[dict] = []
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
             start = 0
             for _ in range(self.max_pages):
-                if age > self.RECENT_DAYS:
-                    # Historical backfill: pin the query to the exact 24h
-                    # window so we don't depend on pagination depth.
-                    ws = target_date - timedelta(hours=24)
-                    we = target_date + timedelta(hours=24)
-                    range_q = (
-                        f"submittedDate:[{ws.strftime('%Y%m%d%H%M')}+TO+"
-                        f"{we.strftime('%Y%m%d%H%M')}]"
-                    )
-                    full_query = f"({cat_query})+AND+{range_q}"
-                else:
-                    full_query = cat_query
                 url = (
                     f"{self.BASE_URL}?search_query={full_query}&start={start}"
                     f"&max_results={self.page_size}"
@@ -72,40 +61,20 @@ class ArxivSource(Source):
                     break
                 all_entries.extend(feed.entries)
                 start += self.page_size
-                # Stop early if oldest entry on page is older than window
-                oldest = _entry_published(feed.entries[-1])
-                if oldest < target_date - timedelta(days=2):
-                    break
                 await asyncio.sleep(3.0)  # arXiv rate limit guidance
 
-        is_historical = age > self.RECENT_DAYS
-        return list(self._to_papers(all_entries, target_date, is_historical))
+        return list(self._to_papers(all_entries, target_date))
 
     def _to_papers(
         self,
         entries: list[dict],
         target_date: datetime,
-        is_historical: bool = False,
     ) -> Iterable[Paper]:
-        # Recent (cron): window = [target - 24h, target + 1h]. Matches the
-        # "noon UTC cron grabs yesterday's papers" pattern: target = today
-        # 00:00, fetcher grabs papers from [yesterday 00:00, today 01:00).
-        # The trailing +1h cushion is so a cron started a bit late still
-        # gets that early-morning trickle. Folder convention: papers fetched
-        # on day D land in folder D, even if their publication date is D-1.
-        #
-        # Historical (backfill): window = [target 00:00, target+1 00:00).
-        # When a user asks for "papers from 4/20", they mean papers
-        # *published on 4/20*, not papers ending at 4/20 00:00 (which would
-        # be 4/19's batch). This is the intuitive semantics for backfill;
-        # we accept the asymmetry with recent-mode to keep cron behavior
-        # unchanged.
-        if is_historical:
-            window_start = target_date
-            window_end = target_date + timedelta(hours=24)
-        else:
-            window_start = target_date - timedelta(hours=24)
-            window_end = target_date + timedelta(hours=1)
+        # Window = [target 00:00, target+24h 00:00). All emitted papers'
+        # published_at live inside this day, so folder/digest/README
+        # naming stays consistent with the actual arxiv publication date.
+        window_start = target_date
+        window_end = target_date + timedelta(hours=24)
         now = datetime.now(UTC)
         for e in entries:
             pub = _entry_published(e)

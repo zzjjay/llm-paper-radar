@@ -3,26 +3,30 @@
 # Designed for cron. Sources ~/.bashrc so the AMD Anthropic proxy env vars are present.
 #
 # Usage:
-#   daily.sh                 # default: yesterday only (UTC), force re-fetch
-#   daily.sh --days 60       # backfill last 60 days (skips days whose digest exists)
-#   daily.sh --days 60 --force  # backfill last 60 days, re-fetch even if digest exists
-#   daily.sh --no-fetch      # skip the source fetch step; re-run dedupe→render
-#                              against whatever is already in data/raw/
-#   DAYS=14 daily.sh         # env var also works
+#   daily.sh                          # cron default: yesterday-UTC, force re-fetch
+#   daily.sh --date 2026-05-20        # fetch arxiv publication date 2026-05-20 (manual rerun)
+#   daily.sh --days 60                # backfill last 60 days from today (skip existing digests)
+#   daily.sh --days 60 --force        # backfill last 60 days, re-fetch even if digest exists
+#   daily.sh --no-fetch               # skip the source fetch step; re-run dedupe→render
+#                                       against whatever is already in data/raw/
+#   DAYS=14 daily.sh                  # env var also works
 #
-# Defaults: cron runs `daily.sh` at Beijing 14:00 (= UTC 06:00). By that
-# hour arxiv has finished publishing the previous UTC day's batch, so the
-# pipeline treats yesterday-UTC as "today" (via RADAR_DAY_OFFSET=1) and
-# fetches that single complete day. README title therefore matches the
-# Beijing-yesterday calendar date the user expects.
+# Date semantics: the "target date" everywhere (folder names, digest
+# filenames, README title, paper Date column) is the **arxiv publication
+# date** of the batch being processed. Cron at Beijing 14:00 (= UTC 06:00)
+# targets yesterday-UTC via RADAR_DAY_OFFSET=1, by which hour arxiv has
+# finished publishing the previous UTC day's batch. Manual --date pins
+# RADAR_TARGET_DATE so all components agree on the same publication day.
 
 set -uo pipefail
 
 DAYS="${DAYS:-1}"
+DATE=""
 
 # Shift every "today" the pipeline computes back by one UTC day. The
 # cron fires at UTC 06:00 — UTC today is still mostly empty on arxiv,
 # while UTC yesterday is the freshly-complete batch. See pipeline/_clock.py.
+# Overridden below if --date is passed (RADAR_TARGET_DATE wins).
 export RADAR_DAY_OFFSET=1
 NO_FETCH=0
 FORCE=1   # default on: the daily cron's whole point is to re-render yesterday
@@ -30,6 +34,8 @@ DAYS_EXPLICIT=0
 FORCE_EXPLICIT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --date) DATE="$2"; shift 2 ;;
+        --date=*) DATE="${1#*=}"; shift ;;
         --days) DAYS="$2"; DAYS_EXPLICIT=1; shift 2 ;;
         --days=*) DAYS="${1#*=}"; DAYS_EXPLICIT=1; shift ;;
         --no-fetch) NO_FETCH=1; shift ;;
@@ -38,6 +44,18 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown arg: $1" >&2; exit 1 ;;
     esac
 done
+
+# --date pins the publication date all components target. Mutually
+# exclusive with the offset-based default; clearing OFFSET avoids the
+# silent compose where "yesterday" would override the explicit pin.
+if [[ -n "$DATE" ]]; then
+    if ! [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "--date must be YYYY-MM-DD, got: $DATE" >&2
+        exit 1
+    fi
+    export RADAR_TARGET_DATE="$DATE"
+    unset RADAR_DAY_OFFSET
+fi
 
 # If the caller passed --days (backfill mode) without an explicit --force/--no-force,
 # fall back to the historical behavior of skipping days whose digest already exists.
