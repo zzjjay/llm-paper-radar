@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Weekly rollup: re-aggregate the last 7 daily digests into weekly/<start>-<end>.md.
-# Designed for cron (Mondays at Beijing 08:00). Mirrors daily.sh's env setup so
-# git push + uv work the same way under cron.
+# Designed for cron (Mondays at Beijing 16:00, ~2h after daily.sh on Mondays
+# so the week's last digest is in before the rollup runs). Mirrors daily.sh's
+# env setup so git push + uv work the same way under cron.
 #
 # Usage:
 #   weekly.sh                       # today's 7-day window (ending today UTC)

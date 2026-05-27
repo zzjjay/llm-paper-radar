@@ -10,7 +10,7 @@
 #
 # Usage:
 #   cron_wrapper.sh --at-hour 14       daily.sh        # fire at Beijing 14:00 (= UTC 06:00)
-#   cron_wrapper.sh --at-hour 8 --dow 1 weekly.sh      # fire at Beijing Monday 08:00
+#   cron_wrapper.sh --at-hour 16 --dow 1 weekly.sh     # fire at Beijing Monday 16:00
 #
 # --dow: Beijing day of week, 1=Mon .. 7=Sun (POSIX %u).
 # Remaining args after the gate flags are the script + any flags it takes.
