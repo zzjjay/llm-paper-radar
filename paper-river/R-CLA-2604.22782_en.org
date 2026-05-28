@@ -1,0 +1,175 @@
+#+title:      Stochastic KV Routing: Enabling Adaptive Depth-Wise Cache Sharing
+#+date:       [2026-05-28 Thu 13:24]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T132421-en
+#+source:     https://arxiv.org/abs/2604.22782
+#+authors:    Anastasiia Filippova, David Grangier, Marco Cuturi, João Monteiro (Apple)
+#+venue:      arXiv 2026-04
+
+* One-Line Overview
+
+The R-CLA line of work addresses a deadlock that has gone unsolved for over a decade: to run fast, a transformer must cache the K and V tensors computed at every layer; but as models grow longer and deeper, those caches blow up memory. An entire generation of researchers has asked whether one can store less—ideally just one copy per stack of layers, letting lower layers borrow from an upper one—without making the model dumber. Each paper in this line patches a hole left by the previous "store-less" scheme. R-CLA's patch is the strangest of all: stop fixing who borrows from whom, randomize that choice during training, and the result is a single model that can be deployed under any hardware budget.
+
+* Provenance Map
+
+#+begin_src
+                          [Root of the Problem]
+                                |
+                                v
+              KV cache is huge: one token in Llama-2-7B costs 512 KB
+              A book-length context outweighs model weights by 1.4×
+                                |
+                                v
+             +------------------+------------------+
+             |                                     |
+             v                                     v
+       [Horizontal: time axis]              [Vertical: across layers]
+       Drop old tokens / compress            Let multiple layers share one K,V
+                                                   |
+                                                   v
+                                       +-----------+----------+
+                                       |                      |
+                                       v                      v
+                                [Within-layer sharing]   [Cross-layer sharing]
+                                       |                      |
+                                       v                      v
+                                MQA (Shazeer 2019)      (no one had cracked this)
+                                Raffel 2020                   |
+                                  |                           v
+                                  v                       CLA (Brandon 2024)
+                                GQA (Ainslie 2023)        Fixed pattern, train once
+                                  |                           |
+                                  +------+--------------------+
+                                         |
+                                         v
+                              XC-Cache (Monteiro 2024)
+                              Layer-Condensed (Wu & Tu 2024)
+                              Full sharing, but either needs an external encoder
+                              or makes prefill crawl
+                                         |
+                                         v
+                              MiniCache (Liu 2024)
+                              Skip retraining; merge layers post-hoc
+                              Limited gains, still locked to one sharing scheme
+                                         |
+                                         v
+                              ============================
+                              [R-CLA] Randomize who borrows at training time
+                              One model = any hardware budget
+                              (Filippova et al. 2026)
+                              ============================
+                                         |
+                                         v
+                              (forward reference) Wu et al. 2025
+                              Systematic sweep over sharing patterns
+                              Still trains a separate model per pattern
+#+end_src
+
+* Evolutionary Narrative: A Decade-Long Obsession with Storing Less KV
+
+** Stop 1: MQA (Shazeer 2019 / Raffel 2020) — The First Admission That K,V Are Redundant
+
+Early transformer builders did not think hard about this. Every layer had as many K,V pairs as it had attention heads, all independent. More heads meant a fatter cache. Llama-2-7B has 32 layers × 32 heads; each token sits in the cache as 512 KB.
+
+Shazeer was the first to push back: are all those K,V copies actually earning their keep? His answer was blunt — within a single layer, collapse all 32 heads onto a single shared K,V and let only the queries remain head-specific. That is *Multi-Query Attention (MQA)*.
+
+The result: KV size drops by 32×. The cost: a visible drop in model quality. But the cut established something important — K and V are more redundant than anyone assumed, and sharing works.
+
+** Stop 2: GQA (Ainslie 2023) — MQA Cut Too Deep; Find a Middle Ground
+
+Collapsing 32 heads to 1 was too aggressive; the model struggled to learn. Ainslie reasoned: why go all the way at once? Group the heads and share within each group.
+
+*GQA (Grouped Query Attention)* divides 32 heads into 8 groups of 4, each group sharing one K,V. That is a 4× reduction rather than 32×, quality loss becomes negligible, and cache size still shrinks substantially. Llama-2 with MHA costs 512 KB/token; Qwen3-8B using GQA drops to 144 KB/token.
+
+GQA became the default for every mainstream model almost overnight. But it left one assumption unchallenged: *sharing is only allowed within a layer; crossing layer boundaries is forbidden*. Every layer still stores its own K,V. A 36-layer 8B model still pays 144 KB × 36.
+
+** Stop 3: CLA (Brandon 2024) — Why Not Share Across Layers?
+
+Brandon flipped that assumption. He asked: if layer 5 and layer 6 produce nearly identical K,V tensors, why not let layer 6 reuse layer 5's K,V and compute only its own Query?
+
+*Cross-Layer Attention (CLA)* lifts GQA's logic from within-layer to cross-layer. A fixed pattern is specified up front — say, every 2 layers share one K,V, or every 4 layers share one — and the model is trained from scratch under that pattern. Cache shrinks by another 2–4×.
+
+But CLA carries a very practical burden: *the sharing scheme must be frozen before training begins*. Train a model for "every-2 sharing" and want to try "every-4"? Retrain. Build an "every-4" variant for an edge device and need an "every-2" variant for the cloud? Retrain again. N deployment targets means N training runs — costs explode.
+
+** Stop 4: XC-Cache / Layer-Condensed (Monteiro 2024, Wu & Tu 2024) — Pushed to the Extreme, Stumbled on Engineering
+
+One of R-CLA's own authors, Monteiro, went a step further the year before. If 2-layer and 4-layer sharing work, why not store *just one K,V copy for the whole model*?
+
+*XC-Cache* attaches an external bidirectional encoder that ingests the entire context in one pass and produces a single shared K,V; every decoder layer then reads from it. Cache shrinks from 36 copies to 1.
+
+*Layer-Condensed KV Cache* (Wu & Tu) takes a different route: no external encoder; instead, upper-layer K,V tensors are estimated iteratively during prefill.
+
+Both paths hit the same engineering wall: inference slows down. XC-Cache pays the encoder's forward-pass cost; Layer-Condensed inflates time-to-first-token noticeably because multiple forward passes are needed for the estimates to converge. You save memory but users wait too long for the first token — an unacceptable trade-off in production.
+
+** Stop 5: MiniCache (Liu 2024) — Skip Retraining; Compress After the Fact
+
+Unable to break through the engineering wall, Liu changed angle: if fixing the sharing scheme at training time is expensive, can one take an already-trained model and compress it afterwards?
+
+*MiniCache* observed that in a fully trained model the K,V tensors of late layers look very similar to one another. It merges them post-hoc by interpolating adjacent layers into a single copy. No retraining needed; use the model as-is.
+
+But the ceiling of post-hoc compression is obvious — the model was trained expecting 36 independent K,V tensors, so merging incurs information loss. Squeezing out 30% is roughly the limit; pushing harder causes collapse. And the model is still *locked to one fixed sharing scheme*.
+
+** Stop 6: R-CLA (Filippova 2026) — Stop Choosing One Scheme; Learn Them All
+
+By this point, you can see exactly where the whole line is stuck: every paper picks one sharing scheme and trains the model to fit it. CLA picks a fixed pattern, XC-Cache picks "full sharing", MiniCache picks "merge late layers". Once the choice is made, deployment flexibility is gone.
+
+Filippova's breakthrough is elegantly simple: *make no choice during training*.
+
+At every forward pass, each layer flips a coin. With probability p it uses its own K,V (standard self-attention); with probability 1−p it randomly picks any earlier layer and borrows that layer's K,V for its attention computation.
+
+This is *R-CLA (Random Cross-Layer Attention)*. Seen another way, it replaces CLA's "fix l' before training" with "sample l' afresh every forward pass." That one small change has large consequences:
+
+1. The model is forced to learn that its Query must be compatible with *any* earlier layer's K,V — this is a form of *representational robustness*.
+2. At deployment you can choose any sharing scheme on the fly: keep 100% of the cache on a high-end GPU, drop to 25% on an edge device, all from *the same model*, no retraining.
+3. In data-limited settings, the randomness during training acts as *regularization* — on some tasks R-CLA beats full-cache standard self-attention by up to 50%.
+
+The effect is most striking on Q&A: on HotpotQA with Llama-3.1-8B, the standard model collapses when half the cache is dropped (F1 falls from 0.20 to 0.17), while R-CLA at half-cache actually rises to 0.30. At 25% cache the standard model is nearly dead (F1 = 0.08); R-CLA still holds 0.24.
+
+** Forward Reference: Wu et al. 2025
+
+Shortly before R-CLA appeared, Wu et al. (2025) published a systematic study that enumerated many cross-layer sharing patterns and compared them. But they trained *a separate model for every pattern* — exactly the overhead R-CLA sets out to avoid. Placed side by side, R-CLA's "one model fits all patterns" makes the cost-benefit case all the more compelling.
+
+Future directions are clear:
+- Orthogonal composition with quantization and GQA (R-CLA itself notes there is no conflict)
+- Validation at longer contexts (32K+)
+- Replacing the random coin flip with an adaptive policy — letting the model learn when to borrow and from which layer
+
+* Summary Table: See → Solution → New Problem
+
+#+begin_src
+Node                   Problem Seen                            Solution                               New Problem Left Behind
+------------------------------------------------------------------------------------------------------------------------------
+MQA (2019)             One K,V per head — too redundant        Share one K,V across all heads          Quality drops too much
+GQA (2023)             MQA's 32× collapse breaks quality       Group-wise sharing within layer (4-8×)  Cross-layer sharing still forbidden
+CLA (2024)             GQA only compresses within a layer;     Cross-layer sharing with a fixed        Pattern must be fixed before training;
+                       heavy cross-layer redundancy remains    pattern                                 inflexible deployment
+XC-Cache (2024)        CLA not aggressive enough; want full    Single K,V for whole model via          External encoder adds latency
+                       sharing                                 external encoder
+Layer-Cond. (2024)     XC-Cache needs an external component    Iteratively estimate upper K,V          TTFT spikes; users can't wait
+MiniCache (2024)       Retraining is too costly                Merge similar layers post-hoc           Large information loss; still locked
+                                                                                                       to one scheme
+------------------------------------------------------------------------------------------------------------------------------
+R-CLA (2026)           Everyone picks one scheme, locking      Randomize borrowing at training time;   Does it hold at long context?
+                       deployment flexibility                  one model fits any hardware budget;     Can randomness be replaced by
+                                                               regularization bonus included           learned adaptation?
+#+end_src
+
+* What Is Really Happening Under the Hood
+
+On the surface this looks like a sequence of incremental KV-cache compression tricks. One level deeper, it is a *cognitive shift about when to make a choice*.
+
+- MQA / GQA / CLA era: the choice (head count, sharing pattern) is made *at architecture design time*, then the model is trained.
+- XC-Cache / Layer-Condensed era: the choice (full sharing) is made *at training time*, then the model is deployed.
+- MiniCache era: the choice (which layers to merge) is made *after training*.
+- R-CLA: *no choice is made at any stage of training*; the decision is deferred to deployment.
+
+This is a recurring paradigm — push the decision point as late as possible. Dropout does the same thing: at training time no neuron is permanently dropped; the mask is only applied at that moment. MoE does the same: no expert is permanently assigned to any token; the router decides at inference time. R-CLA transplants that logic onto KV-cache sharing.
+
+The natural next step: replace "random" with "learned." R-CLA's coin is uniform, but in principle a model could learn that "layer 17 borrowing from layer 12 is optimal" — that is mixture-of-cache, a paper that has not been written yet.
+
+* Honest Annotations
+
+- *Confirmed citations*: Papers explicitly cited and compared in R-CLA: CLA (Brandon 2024), GQA (Ainslie 2023), MQA (Raffel 2020), XC-Cache (Monteiro 2024a, same lead author), Layer-Condensed (Wu & Tu 2024), MiniCache (Liu 2024), Wu et al. (2025).
+- *Inferred connections*: The MQA → GQA → CLA backbone is explicitly threaded through the paper's Related Work section. XC-Cache and Layer-Condensed are parallel "full-sharing" proposals from the same era — a side-by-side contrast, not a sequential critique.
+- *Not expanded here*: The time-axis compression line (StreamLM → SnapKV → PyramidKV → H2O) is mentioned in passing but not developed — that is a separate river. R-CLA explicitly states it is *orthogonal* to that line and can be stacked with it.
+- *Five steps total*: MQA → GQA → CLA → XC-Cache / Layer-Condensed (parallel, counted as one step) → MiniCache → R-CLA, making five evolutionary steps plus one forward-reference node, Wu 2025.

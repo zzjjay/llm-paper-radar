@@ -1,0 +1,277 @@
+#+title:      AGoQ: Activation and Gradient Quantization for Memory-Efficient Distributed Training of LLMs
+#+date:       [2026-05-28 Thu 13:45]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T134513-en
+#+source:     https://arxiv.org/abs/2605.00539
+#+authors:    Wenxiang Lin, Juntao Huang, Luhan Zhang, Laiyi Li, Xiang Bao, Mengyang Zhang, Bing Wang, Shaohuai Shi
+#+venue:      arXiv 2026 (cs.CL)
+
+* The River of the Problem
+
+Training a large model is expensive — but the costliest item is not the parameters. It is the *intermediate results*.
+
+Imagine a GPU training one pass of LLaMA-32B. The model weights themselves occupy a manageable amount of memory, a few dozen gigabytes. But every value that each layer computes during the forward pass — the activations — must be retained in full, waiting for the backward pass to arrive and use them to compute gradients. And the size of those activations scales linearly with *sequence length × batch size*. For a model like LLaMA with contexts of 4K or 8K tokens, activations can consume more than 70% of total GPU memory.
+
+So for a decade, one generation after another has wrestled with the same question: *How do you make those "must-keep but enormous" intermediate values take up less memory?*
+
+Each generation gave an answer. Each answer left a new hole. The next generation climbed out of that hole.
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: Introduced Transformer; each layer must cache activations for backprop
+  | Status:  Training memory devoured by activations
+  v
+[2016] Chen et al. - Training Deep Nets with Sublinear Memory Cost
+  |
+  | Problem: Activations don't fit in memory
+  | Fix:     Don't store everything — keep a few checkpoints,
+  |          recompute the discarded values during backprop
+  | New hole: Recomputation means the forward pass runs twice; ≥30% slower
+  v
+[2022] Liu et al. - GACT (ICML)
+  |
+  | Problem: Recomputation is too slow
+  | Fix:     Don't recompute — compress activations to 2-bit/4-bit and store them
+  |          Estimate and compensate quantization error with statistical methods
+  | New hole: Validated mainly on CNNs / small models; severe accuracy drop on Transformers
+  v
+[2024] Xi et al. - Jetfire (ICML)
+  |
+  | Problem: Quantizing the whole matrix at once; outliers blow up the dynamic range
+  | Fix:     INT8 + block-wise quantization (each small block gets its own scale)
+  |          + end-to-end INT8 dataflow; matrix multiplications run in INT8
+  | New hole: INT8 is the floor — pushing to 4-bit causes immediate collapse
+  v
+[2025] Xi et al. - COAT (ICLR)
+  |
+  | Problem: INT8 has limited expressiveness; want the friendlier dynamic range of FP8
+  | Fix:     FP8 activations + FP8 optimizer states with dynamic-range extension
+  |          Fully utilizes H100's FP8 compute throughput
+  | New hole: Every layer treated identically at FP8
+  |           Ignores the huge variation in quantization sensitivity across layers
+  |           Gradients still stored in FP32; communication still in FP32
+  v
+[2026] AGoQ  <-- this paper
+  |
+  | Observed problems:
+  |  (1) COAT's uniform precision is wasteful — Attention Q/K/V can go to 4-bit,
+  |      but sensitive layers like RMSNorm cannot be touched; *bit-width should be
+  |      allocated per layer*
+  |  (2) PP stages have unequal memory pressure — earlier stages cache more;
+  |      stages with spare memory can afford higher bit-width to compensate errors
+  |  (3) Gradients still stuck at FP32; FP8-LM (Peng 2023) tried FP8 gradients
+  |      but All-Reduce summation overflowed and convergence collapsed
+  |
+  | Fixes:
+  |  (1) LAAQ: layer-aware activation quantization, averaging ~4-bit
+  |  (2) PP-stage-aware dynamic bit-width compensation
+  |  (3) QuanGrad: 8-bit gradient storage + precision-preserving 8-bit All-Reduce
+  v
+[Future] The next generation — not yet written
+#+end_example
+
+(Note: Vaswani 2017 is the "source of the problem"; Chen 2016 is chronologically earlier,
+but it addresses the activation-memory problem that exploded the moment Transformers appeared.
+The ordering here follows "problem emerges → first solution", not strict publication date.)
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: Activations Become the Largest Memory Consumer
+
+*** What Problem It Saw
+
+In the RNN era, tokens were processed one at a time and intermediate states could be discarded. The Transformer is different — its attention mechanism requires every token to attend to every other token. This means that Q, K, V, attention scores, and FFN intermediate values computed during the forward pass all have to be kept until the backward pass arrives.
+
+When models were still small, this was barely noticeable. Then GPT-3 (175B) appeared, and an uncomfortable truth became clear: *the dominant memory consumer is not the parameters*. Training an 8B LLaMA model in BF16, the weights occupy 16 GB — but activations routinely reach 50–80 GB.
+
+*** Its Fix
+
+The Transformer itself did not fix this problem. It merely *created* the problem.
+
+*** Why It Worked (and Where the New Hole Was)
+
+It made long-context understanding possible, at the cost of memory overhead that grows linearly with context length. Every paper below is paying down that debt.
+
+** 2016 | Chen-Sublinear: Don't Store Everything — Discard and Recompute
+
+*** What Problem It Saw
+
+Activations don't fit. But look carefully at the backward-pass equations: most intermediate activations are computed in the forward pass, then sit idle in memory for tens of milliseconds, read exactly once when the backward pass finally arrives.
+
+*** Its Fix
+
+Blunt and direct: store only a small set of "checkpoint" activations; discard everything in between. When backprop needs a discarded value, *rerun the forward pass from the nearest checkpoint*.
+
+This is what became ~torch.utils.checkpoint~ in PyTorch — commonly called "gradient checkpointing" or "activation recomputation."
+
+*** Why It Worked (and Where the New Hole Was)
+
+Memory does come down — the classic analysis gives O(sqrt(N)) in the number of layers. But *the cost is time*: the forward pass runs twice, making training 30–40% slower.
+
+A deeper issue: there is no information-theoretic insight here. Activations contain enormous redundancy. Why discard and recompute rather than compress and store?
+
+** 2022 | GACT (Liu et al.): Don't Recompute — Compress and Keep
+
+*** What Problem It Saw
+
+Chen 2016 frames the choice as "save memory vs. compute more." Liu saw a third option: neither store full BF16 nor discard, but *compress to INT4/INT2 and store*.
+
+The intuition is simple: in a 16-bit BF16 float, the actual information content is usually much lower than 16 bits. Compressing to 4 bits loses a little precision but costs far less than rerunning the forward pass.
+
+*** Its Fix
+
+Quantize activations to 2-bit or 4-bit, store them in memory, dequantize back to FP32 during backprop. The key technique: use statistical analysis to estimate the "gradient variance" introduced by quantization in each layer, then preserve higher precision for layers where compression hurts most and compress aggressively where it barely matters.
+
+*** Why It Worked (and Where the New Hole Was)
+
+Works well on CNNs — CNN activations have relatively well-behaved distributions.
+
+But *porting to Transformers causes immediate collapse*: Transformer activations contain massive outliers. A single token in a single dimension can be 100× larger than the rest. Quantizing with a single global scale per matrix lets those outliers dominate the dynamic range; all other values collapse to the same quantized bin, losing their information entirely.
+
+GACT works on ResNet. It drops accuracy on GPT. The problem is not 4-bit precision per se — it is quantizing an entire matrix with one scale.
+
+** 2024 | Jetfire (Xi et al.): Block-Wise Quantization — Let Outliers Only Hurt Their Own Block
+
+*** What Problem It Saw
+
+GACT's failure taught the Xi team that *outliers are a locality problem, not a distribution problem*. In a given matrix, 99% of values lie in [−1, 1] while 1% lie in [−100, 100]. Sharing a single scale ties the majority to the minority's range and destroys their precision.
+
+*** Its Fix
+
+Partition the matrix into small tiles — say 32×32 — and compute an independent quantization scale for each tile. Outliers now contaminate at most their own tile; every other tile retains full precision at its own scale.
+
+Jetfire went one step further: not just "quantize when storing," but *run matrix multiplications directly in INT8* — an end-to-end INT8 dataflow through both forward and backward passes, exploiting the GPU's native INT8 throughput.
+
+*** Why It Worked (and Where the New Hole Was)
+
+Block-wise quantization localizes the "one outlier ruins everything" problem. INT8 training of Transformers became viable for the first time.
+
+But: *INT8 is Jetfire's floor*. INT8 provides only 256 discrete values. Pushing to INT4 (just 16 values) causes immediate collapse even with block-wise scaling. Another limitation: Jetfire addresses storage and computation; it leaves gradients untouched.
+
+** 2025 | COAT (Xi et al.): Replace INT8 with FP8, Then Compress the Optimizer Too
+
+*** What Problem It Saw
+
+Jetfire hit the INT8 ceiling, but new hardware — the H100 — natively supports *FP8*. FP8 is a floating-point format with an exponent field; its dynamic range is orders of magnitude wider than INT8 at the same 8-bit budget.
+
+And activations are not the only large memory consumer during training. *Optimizer states* — Adam's momentum and variance buffers — are also memory-hungry. Prior work (8-bit Adam, Dettmers 2022) addressed them, but not integrated into an FP8 training system.
+
+*** Its Fix
+
+Activations and optimizer states *both in FP8*. The block-wise approach is retained, but the format is upgraded from INT8 to FP8, combined with dynamic-range extension techniques. The result is a production-grade FP8 training stack.
+
+*** Why It Worked (and Where the New Hole Was)
+
+COAT was the strongest FP8 training system of its time — it preserved loss curves and delivered speedups on LLMs. But it left three visible holes that became AGoQ's starting point:
+
+1. *Uniform treatment*: COAT applies FP8 uniformly to all Transformer layers. In reality, Attention Q/K/V inputs are highly robust to quantization (could go to 4-bit), while RMSNorm inputs are extremely sensitive (any compression causes collapse). COAT makes no distinction.
+
+2. *Ignores PP imbalance*: Under pipeline parallelism, earlier stages cache more micro-batch activations; later stages cache fewer. COAT assigns the same precision to every stage, wasting the spare memory available in later stages.
+
+3. *Gradients still FP32*: COAT compressed activations and optimizer states but *not gradients*. Yet gradients are simultaneously a major memory consumer and a communication bottleneck — one All-Reduce step for a 32B model transmits tens of gigabytes of gradient data. Meanwhile, Microsoft's FP8-LM (Peng 2023) tried FP8 gradients and *found that All-Reduce summation overflows, causing divergence*. That failure left the impression that 8-bit gradients simply cannot work.
+
+** 2026 | AGoQ (this paper): Fill All Three Holes at Once
+
+*** What Problem It Saw
+
+AGoQ takes COAT's three limitations as its starting point:
+1. Quantization sensitivity varies enormously across layer types, but COAT ignores this.
+2. Memory headroom varies enormously across PP stages, but COAT ignores this.
+3. Gradients are still FP32, wasting memory and communication bandwidth. FP8-LM's failure was caused by FP8 overflow *during All-Reduce summation* — this is a *solvable implementation problem*, not evidence that 8-bit gradients are fundamentally impossible.
+
+*** Its Fix
+
+(1) *Layer-Aware Activation Quantization (LAAQ)*: A formal gradient-error analysis (§4.1 derives an upper bound on quantization error per layer type using norm inequalities) assigns each layer type a minimum safe bit-width. Attention QKV can be reduced to 0 bits (recomputed on the fly); RMSNorm must be kept at 4 bits; FFN intermediate layers can use 4 bits. The result averages *close to 4 bits/element* — half the cost of COAT's 8-bit baseline.
+
+(2) *PP-stage dynamic bit-width compensation*: Earlier pipeline stages are memory-constrained and compress more aggressively; later stages have spare capacity and can afford higher bit-widths to compensate for accumulated quantization error from earlier stages. Memory headroom becomes precision budget.
+
+(3) *QuanGrad — precision-preserving 8-bit All-Reduce*: Gradients are stored locally in 8-bit. All-Reduce communication also uses 8-bit, but *the summation itself is performed at higher precision* before being compressed back to 8-bit. Memory savings and communication savings are achieved together, while the overflow trap that caught FP8-LM is systematically avoided.
+
+*** Why It Worked (and Where the New Hole Was)
+
+End results: 52% memory reduction, 1.34× training speedup, no loss degradation, no downstream task accuracy drop.
+
+Quantization granularity has evolved from "one setting for the whole model" → "FP8 for the whole model" → "per-layer-type and per-PP-stage bit-width allocation" — a clear progression toward ever finer differentiation.
+
+Remaining holes:
+- LAAQ's per-layer bit-width assignments are determined by offline analysis and set manually; no online adaptation during training.
+- 8-bit gradients are at the stable floor for current hardware; 4-bit gradients remain untouched.
+- The full system is designed around LLaMA-style architectures; switching to MoE or SSM requires a fresh analysis.
+
+* Frontier Extensions
+
+As of this writing (2026-05), AGoQ was just released (v1: 2026-05-01, v2: 2026-05-11). Direct follow-up work has not yet appeared.
+
+Likely future directions (speculative, not published):
+- *Adaptive bit-width*: Automatically adjust per-layer bit-width during training based on the loss landscape — turning LAAQ's offline analysis into online decision-making.
+- *FP4 training*: Blackwell architecture natively supports FP4; the next generation of papers will likely cut the average activation bit-width in half again.
+- *MoE adaptation*: Extend "per-layer-type bit-width allocation" to "per-expert bit-width allocation."
+
+* One Diagram
+
+#+begin_example
+                "Transformer training: activations/gradients consume too much memory"
+                                          |
+       +----------------+-----------------+----------------+------------------------+
+       |                |                                  |                        |
+   [2016] Recompute  [2022] Whole-matrix              [2024] Block-wise        [2026] Per-layer +
+   Chen              quantization                     Jetfire                  per-PP-stage
+   Saves memory      GACT                             INT8 end-to-end          LAAQ ~4-bit
+   ≥30% slower       CNNs: ok                         Works on Transformers    + QuanGrad
+                     Transformers: collapse                                     8-bit gradient
+
+   Granularity evolution:
+   -----------------------------------------------------------------------
+   "One setting for whole model"  ->  "One scale per matrix"
+   ->  "One scale per small tile"  ->  "One bit-width per layer type"
+   ->  "One bit-width per layer type × per PP stage"
+   -----------------------------------------------------------------------
+
+   Dimension evolution:
+   -----------------------------------------------------------------------
+   Compress activations only
+       |
+       +--> Compress activations + optimizer states (COAT 2025)
+                |
+                +--> Compress activations + optimizer states + gradients (AGoQ 2026)
+                         |
+                         +--> Gradient communication also in low precision (AGoQ QuanGrad)
+   -----------------------------------------------------------------------
+
+   Format evolution:
+   BF16/FP16  ->  INT8 (Jetfire)  ->  FP8 (COAT)  ->  ~4-bit mixed (AGoQ)
+#+end_example
+
+* Insight
+
+On the surface, this line of work is about "pushing bit-width lower and lower." But what is actually happening underneath is a *revolution in granularity*.
+
+The first generation (Chen 2016) is all-or-nothing: either keep full precision, or keep nothing and recompute during backprop.
+The second generation (GACT) refines the decision to "choose per layer whether to compress."
+The third generation (Jetfire) refines it further to "choose a scale per small tile of each matrix."
+The fourth generation (COAT) differentiates by tensor type: activations, optimizer states, and gradients each get their own treatment.
+The fifth generation (AGoQ) differentiates simultaneously along two new axes: layer type and PP stage.
+
+The real advance at each generation is not "I used a smaller bit count." It is *"I discovered a new dimension along which things can be treated differently."*
+
+Where will the next generation most likely go? Look at which dimensions have not yet been refined:
+- Training phase (warmup / mid-training / convergence) — every current method uses a fixed bit-width from start to finish.
+- Individual token or individual batch — all current methods operate at layer granularity.
+- Expert-level differentiation (MoE) — not yet exploited.
+
+In one sentence: *Progress in AI systems optimization is fundamentally about finding the next dimension along which differential treatment is possible.* Each time a new dimension is discovered and exploited, a new generation of work is born.
+
+* Takeaways
+
+If you work on systems or performance optimization:
+- Don't start by asking "how do I compress this number further." Start by asking *"along this dimension, is there a substructure nobody has distinguished before?"* Compression = finding redundancy; finding redundancy = finding variation.
+- A failed attempt (e.g., FP8-LM's 8-bit gradients) *does not mean the direction is dead*. Ask precisely where it died. The failure is almost always in a specific detail of the *implementation mechanism*, not in the idea itself.
+
+If you are choosing a research topic:
+- Take the current SOTA paper and list everything it treats uniformly — what dimensions does it handle identically for all elements? Each of those "one-size-fits-all" choices is the entry point for the next paper.
+- AGoQ's methodology is worth emulating: *do a formal error analysis first* (the norm-inequality derivations in §4.1), using math to prove why this layer can be compressed and that layer cannot — rather than tuning hyperparameters by trial and error.
+
+The landing point: whenever you read a paper that applies "uniform treatment of X," immediately ask — *along what sub-dimensions could X actually be treated differently?* Find one, and you have your next paper.

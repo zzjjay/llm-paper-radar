@@ -1,0 +1,264 @@
+#+title:      DepthKV: Layer-Dependent KV Cache Pruning for Long-Context LLM Inference
+#+date:       [2026-05-28 Thu 13:30]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T133028-en
+#+source:     https://arxiv.org/abs/2604.24647
+#+authors:    Zahra Dehghanighobadi, Asja Fischer
+#+venue:      arXiv 2026 (cs.CL)
+
+* The Problem River
+
+Why is long-context LLM inference so expensive? Because for every additional token, the model must cache the keys and values of every preceding token in GPU memory — this KV cache grows linearly with sequence length, and tens of thousands of tokens can exhaust a GPU's VRAM entirely.
+
+For nearly a decade, the field has been asking the same question: *Can we discard some KVs while keeping what the model truly needs to remember?* Generation after generation has answered in different poses: prune during training (Longformer), prune by position at inference (StreamingLLM), prune by attention weight (H2O), prune by "window-based prediction" (SnapKV).
+
+But one hidden assumption was never challenged — *all transformer layers matter equally, so prune the same amount from each.* DepthKV punctures that assumption: layer-to-layer sensitivity varies by an order of magnitude, so why divide the budget uniformly?
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Saw: RNNs must compute one token at a time — no parallelism
+  | Fix: Replace RNNs with pure self-attention
+  | Leftover debt: Attention is O(N^2), and all KVs must be cached
+  |                to avoid recomputation
+  v
+[2020] Beltagy / Zaheer - Longformer / BigBird
+  |
+  | Saw: O(N^2) is intractable on long documents
+  | Fix: Sparse attention at training time (local window + global tokens)
+  | Leftover debt: Requires retraining — pretrained GPT/LLaMA cannot use it
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Saw: Deployed pretrained models also need to save KV, without retraining
+  | Found: A few initial tokens (attention sinks) + a recent window suffice
+  | Leftover debt: Position-only rule — semantically important but
+  |                middle-positioned tokens are discarded without mercy
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | Saw: Position is unreliable; prune by "true importance" instead
+  | Fix: Accumulate attention each token receives; keep heavy hitters
+  | Leftover debt: (a) Uses the past to predict the future; evictions
+  |                    are irrecoverable
+  |                (b) Same budget applied uniformly to every layer
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Saw: H2O's global scoring is too coarse; recent query signals are sharper
+  | Fix: Use an "observation window" at the end of the prompt to vote on
+  |      which prefix tokens to keep
+  | Leftover debt: Token selection improved, but per-layer budget still uniform
+  v
+[2026] DepthKV  <-- this paper
+  |
+  | Saw: Layers are not equal — trim a middle layer slightly and performance
+  |      collapses; trim early/late layers heavily and almost nothing happens
+  | Fix: Under a fixed global budget, reallocate KV budget by layer sensitivity
+  |
+  | Parallel tracks (not in this paper's critique chain, but address the same pain):
+  |   - Quest / RetrievalAttention / MorphKV  - query-aware dynamic selection
+  |   - DuoAttention / SeerAttention          - learn a small module to select
+#+end_example
+
+Note: DepthKV's citations do not include PyramidKV / AdaKV / CAKE and other 2024–2025 works that already explored non-uniform cross-layer budget allocation. Those are parallel explorations in the same direction. The paper frames itself as "the first to challenge the uniform-layer assumption," which overstates its novelty somewhat. The narrative below follows the paper's own critique chain and honestly flags this at the end.
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Carrying the Entire Past on Its Back
+
+*** What Problem It Saw
+RNNs processing long sequences must proceed step by step: token 1000 cannot be computed until tokens 1–999 are done. The GPU's parallel capacity is wasted.
+
+*** Its Solution
+"Attention is all you need" — every token directly attends to every other token, all computed in parallel. No more waiting in line.
+
+*** Why It Worked (and What New Debt It Created)
+Attention is matrix multiplication — GPUs love it. But this single design choice planted the seed for all subsequent KV work:
+1. *Attention is O(N^2)* — every token looks at every other token; long sequences explode.
+2. *KV cache is mandatory* — to avoid recomputing the full history every time a new token is generated, the key and value for every token at every layer must be cached in memory, which grows proportionally with sequence length.
+
+The next nine years of papers are, in essence, paying off these two debts.
+
+** 2020 | Longformer / BigBird: Sparsify Attention at Training Time
+
+*** What Problem It Saw
+Transformers processing full books hit a wall: O(N^2) makes a 16K-token document produce a 16K × 16K attention matrix that alone exhausts memory.
+
+*** Its Solution
+Most distant token pairs are irrelevant to each other — no need for every token to attend to every other. Force attention to cover only: (1) a sliding local window around each token, and (2) a small set of designated "global" tokens. Complexity drops from O(N^2) to O(N).
+
+*** Why It Worked (and What New Debt It Created)
+Designed in from the start, the model learns to function under sparse attention. But the flaw is fatal: *you must train from scratch.* Models already pretrained with dense attention — GPT-3.5, LLaMA, Claude — cannot have their attention swapped out Longformer-style without catastrophic performance loss.
+
+The question shifts: *Can we save KV at inference time without touching model weights?*
+
+** 2023 | StreamingLLM: The First Few Tokens Turn Out to Be Gold
+
+*** What Problem It Saw
+Running a pretrained LLaMA on long conversations, the output degrades once the sequence exceeds the training length. Researchers tried a "sliding window" (keep only the most recent N tokens' KV) to cap memory — and performance collapsed entirely.
+
+*** Its Solution
+A surprising observation: *the first few tokens (including BOS) receive anomalously high attention scores — the model stares at them obsessively.* Drop them, and the attention distribution destabilizes. The fix is simple: keep the initial "attention sink" tokens plus a recent sliding window. Discard everything else.
+
+*** Why It Worked (and What New Debt It Created)
+Attention sinks act like a "trash can" — softmax must sum to 1, and when nothing in the middle is relevant, the model dumps excess probability onto the initial tokens. Maintaining this trash can stabilizes the attention distribution.
+
+But StreamingLLM is a *positional rule* — it cares only about where a token sits in the sequence. A critical piece of information buried in the middle of a long document (say, "the answer is 42") gets discarded regardless of its importance. The next paper attacks exactly this: *prune by semantic importance, not by position.*
+
+** 2023 | H2O: Whoever Attracts the Most Attention Is a Heavy Hitter
+
+*** What Problem It Saw
+StreamingLLM is too mechanical — content-blind. A genuinely critical token at position 5,000 gets thrown out just the same.
+
+*** Its Solution
+"An important token = one that has been heavily attended to throughout history." Implementation: maintain a running accumulator; each time a new token is generated, add the attention weight each historical token received at that step; keep those with the highest cumulative scores, plus the most recent few. This is *Heavy-Hitter Oracle (H2O)*.
+
+*** Why It Worked (and What New Debt It Created)
+Intuition: tokens the model keeps returning to are likely genuinely useful (names, key numbers, entities in the question). Empirically, H2O substantially outperforms StreamingLLM on long-context tasks.
+
+But it buries two problems — one that subsequent work on this branch addresses, and one that DepthKV is truly here to fix:
+
+1. *Using the past to predict the future*: a token that looked unimportant early on may become critical 5,000 steps later ("that chemical reaction I mentioned earlier"). Once H2O evicts it, it cannot be recovered.
+2. *Same logic, same budget, every layer*: H2O silently assumes all 32 transformer layers should be pruned at the same ratio — the exact assumption DepthKV will break.
+
+** 2024 | SnapKV: Use an "Observation Window" to Anticipate Which Tokens Will Be Needed
+
+*** What Problem It Saw
+H2O's cumulative attention sums over the full history — but the most relevant signal for the generation phase is what the most recent queries have been looking at. Global accumulation gets contaminated by early-stage noise.
+
+*** Its Solution
+Take a short segment at the end of the prompt (e.g., the last 32 tokens) as an "observation window." Identify which earlier tokens these final queries attend to most, designate those as "frequently accessed," and keep them; evict the rest.
+
+*** Why It Worked (and What New Debt It Created)
+Intuition: the last few words of a user's question already reveal "what I am about to look for." Letting those words vote on the preceding tokens is far more precise than undifferentiated global accumulation. SnapKV is near SOTA on LongBench.
+
+But the underlying assumption is still untouched — *how much budget each layer gets.* SnapKV perfects the "which tokens to select" step, yet still applies the same budget to all 32 layers. That sets the stage for DepthKV.
+
+** 2026 | DepthKV: Someone Finally Asks "Why the Same Budget per Layer?"
+
+*** What Problem It Saw
+Every predecessor — H2O, SnapKV, StreamingLLM, FastGen — carefully refined "how to pick tokens within a layer," but nobody questioned "how to divide the budget across layers." They all implicitly assumed: 32-layer transformer, every layer equally important, so prune each at the same ratio.
+
+DepthKV ran a simple experiment that nobody had run before: *aggressively prune just one layer at a time and measure how much performance drops.* The results were dramatic:
+
+- Pruning certain middle layers: performance collapses.
+- Pruning early or late layers heavily: almost no effect.
+- A *permutation test* confirms: the null hypothesis that "all layers are equally important" is rejected consistently.
+
+Going further, the authors find that sensitive layers share a common signature — when they are pruned, the model's outputs become shorter and less informative. They name these *content amplification layers*, hypothesizing that they are responsible for "amplifying" contextual information into generatable content.
+
+*** Its Solution
+Fix a global KV budget B_total and redistribute the per-layer budget B^(l) according to layer sensitivity. Three strategies:
+- *MLP (Middle-Layer Protection)*: directly assign more budget to middle layers.
+- *MGA (Metric-Guided Allocation)*: score layers with InfoNCE or other representational metrics; higher-scoring layers get more budget.
+- *MLMA*: a hybrid of the two.
+
+On LongBench, QA, and mathematical reasoning, DepthKV outperforms uniform-pruning baselines like SnapKV and H2O under the same global budget.
+
+*** Why It Worked (and What New Debt It Created)
+This is the classic "spend your money where it matters" story — the total budget is unchanged, only the allocation is different. That it wins demonstrates: previous uniform pruning was wasting budget on early and late layers that barely need it, while the middle layers that genuinely do were being starved.
+
+New debts:
+1. Layer sensitivity is measured offline; it may differ across (model, task) combinations — *cross-task generalization is not guaranteed.*
+2. The paper assumes layer importance is a static property — but sensitivity likely shifts with the input distribution.
+3. No comparison with PyramidKV / AdaKV, which already addressed cross-layer allocation (see next section).
+
+* Frontier Extensions
+
+DepthKV is very new (April 2026, just one month ago), and no paper has yet specifically critiqued it. But several parallel threads are worth knowing.
+
+** Parallel Track 1: Non-Uniform Cross-Layer Allocation (not cited by DepthKV)
+
+- *PyramidKV / PyramidInfer (2024)*: observes that attention patterns sharpen progressively from bottom to top layers; proposes a pyramid-shaped budget (more at the bottom, less at the top).
+- *AdaKV (2024)*: adaptive allocation at the head level.
+- *CAKE (2025)*: another variant of cross-layer allocation.
+
+DepthKV positions itself as "the first to challenge the uniform-layer assumption," but strictly speaking that is inaccurate — this track has been active for over a year. DepthKV's genuine distinctiveness lies in: *applying a permutation test to produce statistically rigorous evidence of inter-layer inequality*, and introducing the "content amplification layers" interpretation.
+
+** Parallel Track 2: Query-Aware Dynamic Selection
+
+- *Quest (2024)*: partitions KV into pages; at each generation step, re-selects the most relevant pages for the current query.
+- *RetrievalAttention (2024)*: builds a vector index over KV; retrieves at each step.
+- *MorphKV (2025)*: iteratively updates a fixed-size KV set.
+
+This track attacks H2O's other remaining debt — "using the past to predict the future." These methods acknowledge that token importance drifts with the query and re-select at every step, at the cost of additional computation.
+
+** Parallel Track 3: Learning-Based Selection
+
+- *DuoAttention (2024)*: learns a per-head gate, dividing heads into "retrieval heads" and "streaming heads."
+- *SeerAttention (2024)*: learns a block-level sparse attention module.
+
+The classic heuristic-vs-learning rivalry, transplanted into the KV pruning setting.
+
+* One Diagram to See It All
+
+#+begin_example
+                Problem: KV cache grows linearly with sequence length → VRAM explosion
+                                       |
+                                       v
+        +---------+---------+--------------+--------------+--------------+
+        |         |         |              |              |              |
+   Training-time  System-  Post-training KV pruning (this paper's branch)  |
+   arch change   level     |                                               |
+   (GQA)        (vLLM,     |                                               |
+        |      PagedAttn)  |                                               |
+        |         |        |                                               |
+        |    No KV shrink; +-------------+-------------+                   |
+        |    optimize     "Which tokens" "Which layers" "Dynamic select"   |
+        |    access only         |              |               |           |
+        |                +-------+---+          |               |           |
+        |                |       |  |           |               |           |
+   Retraining        Stream   H2O  SnapKV  PyramidKV         Quest         |
+   required          LLM    (heavy (window  (2024:        (query-           |
+   (Longformer)    (position) hitter) vote) pyramid        aware)           |
+                                   |       allocation)                      |
+                                   +--------------+                         |
+                                          |                                 |
+                                          v                                 |
+                                    [This paper: DepthKV]                   |
+                                  - Permutation test proves                 |
+                                    layers are not equal                    |
+                                  - Introduces "content                     |
+                                    amplification layers"                   |
+                                  - Three allocation strategies             |
+                                    (MLP / MGA / MLMA)                      |
+                                                                            |
+   Timeline: 2017 ---- 2020 ---- 2023 ---- 2024 ---- 2025 ---- 2026 ------+
+              |          |          |          |          |          |
+          Transformer Longformer  H2O,       SnapKV   MorphKV    DepthKV
+                                 Stream    Pyramid
+                                 LLM       KV/AdaKV
+#+end_example
+
+* Insights
+
+The biggest shift this thread reveals is not technical — it is a shift in *how to ask the question*:
+
+1. *From "what to prune" to "how much budget goes where."* The previous five generations (StreamingLLM, H2O, SnapKV, FastGen, DuoAttention) all refined the art of "selecting tokens." DepthKV — not truly the first, but the one that articulates it most clearly — steps back and asks "is the budget allocation itself reasonable?" This is a textbook example of *dropping one level of abstraction*: while everyone else was dissecting "which tokens matter," DepthKV asked "which layers matter," lifting the problem from token space into layer space.
+
+2. *The underestimated value of a well-designed ablation.* The core contribution of this paper is not the DepthKV algorithm; it is the *permutation test* and the *per-layer ablation*. The algorithm itself (allocate more budget to more sensitive layers) is obvious once you think of it. But the experimental design provides, for the first time, statistically significant evidence that "layers are unequal." When a field is stuck, what is often missing is not a new method, but an experiment that punctures a hidden assumption.
+
+3. *"Content amplification layers" is a thread worth pulling.* If these sensitive layers are genuinely "amplifying context into generatable content," they connect directly to the mechanistic interpretability literature. Will someone build a bridge there?
+
+Where things are most likely to go next:
+
+- *Dynamic cross-layer allocation* — DepthKV measures sensitivity offline, but sensitivity almost certainly varies with input. The next step is query-aware layer-level allocation (converging with the Quest track).
+- *Optimizing "layer equivalence" during fine-tuning* — since layer inequality is something the model grows into, could pre-training or fine-tuning objectives explicitly encourage more uniform layer importance? Then uniform pruning at inference would suffice.
+- *Joint optimization of layer allocation × token selection* — currently DepthKV uses SnapKV as its token selector and only manages budget distribution. Folding both steps into a single joint optimization may unlock additional gains.
+
+* Takeaways
+
+On *how to find problems*:
+
+1. *Find an assumption everyone takes for granted but nobody has verified.* "Every layer matters equally" was the implicit default in KV pruning for three years, and nobody ran a cross-layer ablation. Once someone did, the assumption failed — and the paper wrote itself.
+2. *Borrow tools across subfields.* DepthKV combines the *permutation test* (statistics) + *InfoNCE / representational similarity* (representation learning) + *layer ablation* (mechanistic interpretability). None of these tools is new individually; combined, they produce a fresh angle.
+3. *A weak new method plus a strong new observation is still publishable.* The algorithmic section of this paper (allocate budget by sensitivity) can be summarized in three sentences. The first four sections are almost entirely pre-study and ablation. Reviewers respond to this: *"I looked again at something everyone has seen, and reached a different conclusion"* tends to hit harder than *"I proposed a new algorithm."*
+
+What this means practically:
+
+- In any field you know well, list "implicit assumptions nobody has questioned in three years," run controlled experiments against each — you will very likely find at least one publishable gap.
+- When engineering KV cache systems, *do not default to uniform per-layer pruning* — test DepthKV's approach (or a simpler variant: prune early and late layers more aggressively, leave the middle layers with more budget) and you may pick up 1–2 points for free.
+- In any budget-allocation problem — model compression, quantization, pruning — always ask: "Is the granularity of this budget unit (per-layer / per-head / per-token) the right one?" Changing the allocation granularity is often a free source of performance.

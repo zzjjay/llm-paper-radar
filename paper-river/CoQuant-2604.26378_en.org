@@ -1,0 +1,272 @@
+#+title:      CoQuant: Joint Weight-Activation Subspace Projection for Mixed-Precision LLMs
+#+date:       [2026-05-28 Thu 13:39]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T133950-en
+#+source:     https://arxiv.org/abs/2604.26378
+#+authors:    Zhe Ding, Su Pan, Duowei Pan (NJUPT & Amazon AGI)
+#+venue:      arXiv preprint, 2026-04-29
+
+* The River of the Problem
+
+Fitting a model with tens of billions of parameters onto a consumer GPU and making it run fast while still giving correct answers.
+
+The core tension is simple: the numbers inside the model are originally 16-bit floats, and you want to cut them down to 4 bits or lower. Chop 75% of the bit-width, save 75% of memory and bandwidth. But once each number shrinks from 16 bits to 4 bits, precision collapses — the model may start producing nonsense.
+
+The entire research thread keeps answering one question: *When cutting bit-width, what exactly do you cut, what do you keep, and what technique do you use, so that you save memory without sacrificing accuracy?* One generation compresses weights; the next discovers that activations are harder to compress; another invents rotation tricks; yet another starts picking which dimensions to keep at high precision. Every step forward exists because the previous step left a gap. CoQuant is the latest installment on this thread as of 2026.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ / AWQ - weight-only compression
+   |
+   | Gap: activations uncompressed → no GPU compute or bandwidth savings
+   v
+[2022] LLM.int8() - first identification of "outlier channels"
+   |
+   | Fix: keep the few outlier columns in 16-bit, quantize the rest to 8-bit
+   | Gap: hard heuristic (pick by max value); only reaches 8-bit
+   v
+[2023] SmoothQuant - migrate activation difficulty onto weights
+   |
+   | Fix: introduce scale factor s so activations become flatter,
+   |      weights steeper — both become easier to quantize
+   | Gap: still struggling in the "original coordinate system"; 4-bit still breaks
+   v
+[2024] QuaRot / QuIP - rotation to disperse outliers
+   |
+   | Fix: Hadamard orthogonal matrix spreads outlier energy across all dimensions
+   | Gap: full 4-bit quantization still lags noticeably behind FP16
+   v
+[2024] QUIK - mixed-precision revisited
+   |
+   | Fix: most channels at 4-bit, the most anomalous channels kept at 8-bit
+   | Gap: "which channels are outliers" still heuristic (selected by max value)
+   v
+[2025] ResQ - PCA to find the subspace
+   |
+   | Fix: PCA on activation covariance; top principal directions kept at high precision
+   | Gap: only looks at activations, ignores weights —
+   |      but the error of a linear layer is determined by both sides together
+   v
+[2026] CoQuant  <-- this paper
+   |
+   | Fix: derive joint error; obtain closed-form weighted PCA solution
+   |      high-precision subspace = top-r eigenvectors of (λ_X·Σ_X + λ_W·Σ_W)
+   v
+[2026+] As of 2026-05, no subsequent public work has been identified
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ & AWQ: First, compress weights to 4-bit
+
+*** What problem did it see
+
+Once an LLM reaches tens of billions of parameters, it no longer fits in GPU memory. The earliest idea was straightforward: all those floating-point numbers — can we round them to fewer bits? Cutting from 16-bit to 4-bit immediately reduces storage by 75%.
+
+But naive rounding destroys the model. GPTQ's insight was: when quantizing a layer, you can use a small amount of second-order information (a Hessian approximation) to decide which 4-bit integer each weight should snap to. AWQ further discovered that the "importance" of different weights is related to the magnitude of their corresponding activations — columns paired with large activations are so sensitive that even a tiny weight perturbation breaks the model, so those columns need to be "protected" before quantization.
+
+*** Its solution
+
+Touch only the weights, leave activations alone. Weights are stored compressed at 4-bit and decompressed back to float at inference time before multiplying with activations.
+
+*** Why it worked (and what gap it left)
+
+Memory savings are real, but *computation* is entirely unchanged. The GPU is still doing FP16 × FP16 multiplications. You captured the memory dividend but not the bandwidth dividend — and certainly not the compute dividend. To actually go faster, activations must also be low-bit integers so the GPU can use its INT4/INT8 matrix instructions.
+
+But quantizing activations turns out to cause serious problems. That is where the next paper begins.
+
+** 2022 | LLM.int8(): A few "outlier channels" are the culprits
+
+*** What problem did it see
+
+Quantize activations naively to 8-bit, and the model breaks down for any model above roughly 6 billion parameters. The LLM.int8() authors went and looked at what activations actually look like, and found a counter-intuitive fact:
+
+More than 99% of activation values sit quietly within a small range, but a few *fixed channels (feature dimensions)* suddenly spike to values 10× or 100× larger. An entire column goes rogue. These outlier columns are rare, but at quantization time they stretch the representable range — what should have been 256 evenly-spaced levels is instead almost entirely devoted to covering the extremes, so all the normal values get crammed into the first few levels.
+
+*** Its solution
+
+Simple and direct: extract those few outlier columns, *compute them in 16-bit*, and compute the remaining columns in 8-bit. Merge the two results afterwards. This is the embryo of "mixed-precision decomposition" — most columns low-bit, a few high-bit.
+
+*** Why it worked (and what gap it left)
+
+The outlier energy is isolated; the quantization range for the normal channels immediately relaxes and precision recovers. The cost is:
+
+1. *Selection relies on heuristics* — channels picked by max value, no theoretical guarantee
+2. *Only reaches 8-bit* — getting down to 4-bit is still far off
+
+Both gaps are addressed by subsequent papers.
+
+** 2023 | SmoothQuant: Transfer the activation difficulty onto the weights
+
+*** What problem did it see
+
+LLM.int8() handles outlier columns separately, which is engineering-unfriendly — hardware has to support mixed-dtype matrix multiplications, which is slow. Can we avoid the split entirely, and make *all* activations easy to quantize?
+
+SmoothQuant's finding: activations are hard to compress because they are "spiky" (many outliers), while the weights at the same positions tend to be "flat" (uniformly distributed). The difficulty is asymmetric between the two sides.
+
+*** Its solution
+
+Introduce a diagonal scaling matrix s: divide the activations by s (flattening them) and multiply the weights by s (steepening them). Mathematically identical (X·s⁻¹ · s·W = XW), but after the transfer both sides are easier to quantize.
+
+*** Why it worked (and what gap it left)
+
+8-bit quantization now incurs almost no accuracy loss. But at 4-bit things still fall apart — scaling merely relocates the difficulty, it does not eliminate it. To stay accurate at such an extreme bit-width you need a more fundamental solution.
+
+** 2024 | QuaRot / QuIP: Use orthogonal rotation to disperse outliers across all dimensions
+
+*** What problem did it see
+
+Both LLM.int8() and SmoothQuant are fighting in the *original coordinate system* — outliers live on a few fixed channels, and you either handle them separately or transfer them. But fundamentally you have not changed the fact that a few dimensions concentrate almost all the energy.
+
+QuIP and QuaRot approached it from a different angle: what if we *rotate* the entire feature space?
+
+*** Its solution
+
+The linear layer Y = X·W has a beautiful property: you can insert any orthogonal matrix U satisfying UU⊤ = I without changing the result:
+
+Y = X·(UU⊤)·W = (XU)·(U⊤W)
+
+If U is chosen to be a Hadamard matrix — the kind that spreads energy uniformly — then the outlier energy that was concentrated in a few channels gets distributed evenly across all dimensions. When you then quantize (XU) and (U⊤W), each dimension has a comparable range, and the quantizer is no longer held hostage by outliers.
+
+*** Why it worked (and what gap it left)
+
+Now 4-bit quantization is largely feasible, with end-to-end weights, activations, and KV cache all quantized together. But compared to FP16 there is still a noticeable gap — especially for smaller models or lower bit-widths. The rotation smoothing is not lossless: spreading the energy means every dimension now absorbs a bit of damage, and the aggregate is still considerable.
+
+To close the remaining gap, you have to return to the old idea: keep a small critical portion at high precision. Mixed-precision comes back.
+
+** 2024 | QUIK: After rotation, keep a few channels at high precision
+
+*** What problem did it see
+
+QuaRot pushes everything to 4-bit, but some dimensions inevitably matter more than others. Could we now avoid the naive "pick outlier channels" trick (the old LLM.int8() way) and instead combine it with the rotation?
+
+*** Its solution
+
+First apply the rotation to disperse outliers, then pick the most critical few columns and keep them at 8-bit while quantizing the rest to 4-bit. This is essentially the LLM.int8() idea combined with the QuaRot idea.
+
+*** Why it worked (and what gap it left)
+
+Accuracy moves another step closer to FP16. But *how to pick the "critical channels"* remains the old problem — QUIK uses a heuristic (by outlier magnitude), with no theoretical optimality guarantee. If the selection is imprecise, the high-precision budget is wasted.
+
+The next paper upgrades the selection process from a heuristic to an optimization.
+
+** 2025 | ResQ: Use PCA to find the high-precision subspace
+
+*** What problem did it see
+
+QUIK picks channels *along the original coordinate axes*. But since we already allow arbitrary orthogonal rotations U, why not pick a *subspace* rather than individual channels? Information may not be concentrated along any coordinate axis — it might be concentrated along some oblique direction.
+
+*** Its solution
+
+Run PCA on the activation covariance matrix Σ_X. The top-r principal directions (top-r eigenvectors) are the "r-dimensional subspace where activation energy is most concentrated." Keep this subspace at 8-bit; quantize the remaining (d-r) dimensions to 4-bit.
+
+In theory, this minimizes an upper bound on the *activation* quantization error — and is provably better than the heuristic channel selection.
+
+*** Why it worked (and what gap it left)
+
+Empirical accuracy does exceed QUIK. But ResQ left a hole: it only examines the activation covariance and completely ignores what is happening on the *weight* side.
+
+Yet the output error of a linear layer Y = X·W is determined by both sides together: noise in the activations and noise in the weights are intertwined. Optimizing only one half yields a *unilateral optimum* — not a *joint optimum*. This is precisely the hole CoQuant is designed to fill.
+
+** 2026 | CoQuant: Joint optimization — activations and weights decide the subspace together
+
+*** What problem did it see
+
+ResQ's subspace selection answers the question: "If we only look at perturbations in X, which r dimensions should we protect?" — but what actually determines the deviation in the output Y is the noise in X *plus* the noise in W *plus* their interaction.
+
+The authors' experiment is straightforward: hold all other layers of the model at FP16, apply ResQ-style mixed-precision quantization to a single k_proj layer, and measure the output error. Then repeat with CoQuant's method. CoQuant reduces the per-layer error by 30–60% relative to ResQ, consistently across layers. The gap is stable, not a coincidence.
+
+*** Its solution
+
+CoQuant derives from the output error directly, in several steps:
+
+1. Expand ‖ΔY‖² into the noise term from X, the noise term from W, and the cross term
+2. Under the assumption that quantization noise is approximately isotropic white noise, the cross term simplifies via the trace identity
+3. The result is a weighted PCA problem: the high-precision subspace should be the top-r eigenvectors of
+
+   λ_X · Σ_X + λ_W · Σ_W
+
+λ_X and λ_W are bit-width-dependent weights — the coarser the quantization on one side, the larger its weight, because it contributes more noise and needs more protection.
+
+On the engineering side, CoQuant also introduces *fused projections*: in LLaMA-style architectures where W_Q/W_K/W_V share the same input, the three weight covariances can be merged into a single Σ_W, saving computation. The KV cache can be quantized using the same subspace decomposition, further reducing memory.
+
+*** Why it worked (and what gap it left)
+
+This is a *closed-form optimal solution*, not a heuristic. On Llama-3.2 and Qwen2.5, it consistently outperforms ResQ, QUIK, and QuaRot on WikiText perplexity and zero-shot commonsense reasoning tasks.
+
+Remaining gaps:
+
+1. *White-noise assumption* — is quantization noise truly isotropic? In practice it is biased (depending on the input distribution); this approximation may break down at more extreme bit-widths (W3A3, W2A4)
+2. *Tuning λ_X / λ_W* — the paper provides a heuristic choice, but the theoretically optimal values depend on the specific hardware bit-width configuration, so there may be room to squeeze further
+3. *Joint, but not yet dynamic* — the subspace dimension r is fixed; in reality, "which dimensions matter most" shifts across tokens and prompts
+
+* Frontier Extensions
+
+CoQuant was made public on 2026-04-29. As of 2026-05-28, no subsequent paper clearly citing and improving upon it has been identified (the paper is too new — three weeks is not enough time for citations to accumulate).
+
+Extrapolating from the evolutionary momentum of this research thread, likely next directions include:
+
+- *Dynamic subspace*: r is not fixed but adapts per prompt, per layer, or per token
+- *Learned joint covariance*: go beyond first-order activation/weight statistics and incorporate Hessian information (from the GPTQ line) into the subspace computation
+- *Hardware co-design*: the theoretically "optimal subspace" and a GPU-kernel-friendly memory layout may not coincide — the next step may be "optimal under hardware constraints"
+
+* One Diagram to Understand It All
+
+#+begin_example
+
+  Time axis -->
+
+  2022 ------- 2023 ------- 2024 ----------- 2025 ----- 2026
+  GPTQ/AWQ    Smooth      QuaRot   QUIK     ResQ      CoQuant
+  LLM.int8()  Quant       /QuIP                       (this)
+
+  ---------------------------------------------------------------
+
+  Dimension 1: What gets quantized?
+   weight-only -> +activation -> +KV cache -> fully quantized
+
+  Dimension 2: How are outliers handled?
+   ignored     -> isolate outlier channels -> scale/transfer -> rotation dispersion -> rotation + mixed-precision
+                  (LLM.int8)                  (SmoothQ)         (QuaRot)               (QUIK/ResQ/CoQuant)
+
+  Dimension 3: What stays at high precision? (evolution of the selection criterion)
+   all low-bit -> max-value channels (heuristic) -> post-rotation channels -> PCA subspace (activation only) -> weighted PCA (activation + weight)
+                  LLM.int8                           QUIK                     ResQ                              CoQuant
+                  [heuristic]                         [heuristic]               [unilateral optimum]              [joint optimum, closed-form]
+
+  Dimension 4: Theoretical rigor?
+   engineering-driven ---------> experiment-driven ---------> upper-bound minimization -> expected-error minimization
+                                                               (ResQ)                      (CoQuant)
+
+  Core trend: from "engineering intuition" to "closed-form optimum"
+              from "unilateral view" to "joint view"
+              from "identifying outliers" to "reshaping the space"
+
+#+end_example
+
+* Insights
+
+After reading through the entire thread, the deepest impression is not "technological progress" — it is an elevation in *cognitive level*.
+
+*First level: from "treating symptoms" to "reshaping the space."* LLM.int8() and SmoothQuant follow the logic: "outliers exist → handle them separately." QuaRot flips the whole perspective: outliers are not *objects*, they are an unfortunate artifact of the *coordinate system*. Change the coordinate system and the outliers disappear. This is a leap from fighting symptoms to transforming the substrate.
+
+*Second level: from "heuristic" to "optimization."* LLM.int8() picked channels by eye; QUIK was still heuristic; ResQ was the first to produce a subspace that is provably optimal under a specific upper bound; CoQuant goes further and gives a closed-form optimum under expected error. The entire thread is systematically converting engineering black boxes into mathematical white boxes.
+
+*Third level: from "unilateral" to "joint."* This is CoQuant's genuine contribution. A seemingly obvious fact — "the error of a linear layer is caused by X and W together" — took years to be taken seriously on this research thread. Earlier authors were not blind to it; they *tolerated* the unilateral approximation because the joint analysis requires an extra layer of mathematics (handling the cross term). CoQuant clears that hurdle with an isotropic-noise assumption.
+
+*Corollary*: This pattern — "tolerate a unilateral approximation for years before someone finally provides the joint treatment" — very likely recurs in other sub-fields. For example, KV cache quantization currently almost always quantizes K and V separately; what about their joint covariance? Or distillation: logit loss and hidden-state loss are typically optimized separately; what about a joint formulation? *"Wherever there is a unilateral approximation, there is a future paper."*
+
+The most probable next direction: push "joint" one step further — not just joint across activations and weights within a layer, but model the *inter-layer* error coupling as well, since output errors in early layers feed into deeper layers and are amplified further.
+
+* Takeaways
+
+For research:
+
+1. *Always look for the approximations that predecessors "tolerated."* Every major advance is not the invention of something new — it is the serious treatment of something that earlier work left unserious.
+2. *Closed-form solutions beat heuristics.* Even if a closed-form solution requires assumptions (such as CoQuant's white-noise assumption), it gives future researchers a precise and criticizable target, which drives the field forward far more effectively than an uncriticizable "pick by experience" approach.
+3. *Make differences visible.* CoQuant's Figure 2 — a per-layer bar chart showing 30–60% error reduction — is the single most persuasive element in the paper. It turns the abstract concept of "joint vs. unilateral" into a gap that is visible at a glance. Research should always give readers that kind of figure.
+
+For engineering deployment:
+
+If you are working on LLM inference optimization, the right starting point in 2026 is *mixed-precision + subspace decomposition*, not plain INT8/INT4. The engineering implication of the CoQuant line is: as you push to lower bit-widths (W3A3 or more aggressive), what carries you forward is not a better quantizer — it is better subspace selection. Framework authors should therefore treat "PCA / weighted-PCA subspace decomposition" as a standard component with a well-defined interface, rather than burying quantization inside an opaque function.
