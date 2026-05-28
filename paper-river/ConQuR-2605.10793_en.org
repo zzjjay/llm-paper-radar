@@ -1,0 +1,149 @@
+#+title:      ConQuR: Corner Aligned Activation Quantization via Optimized Rotations for LLMs
+#+date:       [2026-05-28 Thu 10:06]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T100620-en
+#+source:     https://arxiv.org/abs/2605.10793
+#+authors:    Chayne Thrash, Ali Abbasi, Soheil Kolouri (Vanderbilt)
+#+venue:      arXiv 2026.05
+
+* The Problem River
+
+The most direct way to fit a 70B model into a phone or edge GPU is to "compress the bit-width" — squeezing each number from 16 bits down to 4 bits makes the model immediately 4× smaller and 4× faster. But compress it and it collapses.
+
+Every generation on this river has been chasing the same ghost: *activation outliers*. Certain channels inside a Transformer are tens or even hundreds of times larger than their neighbors. Quantizing to 4 bits is like drawing only 16 tick marks on a 1-meter ruler — most values are crammed into 1 centimeter, while a handful of outliers stretch the scale to its limit, rounding all the normal values down to zero. The model is ruined.
+
+For five years every generation has answered the same question: *how do you "hide" these outliers so that 4 bits is enough?* Each generation's hiding strategy has been cleverer and cheaper than the last — until ConQuR compressed the whole thing into a closed-form update requiring neither gradient descent nor stored activation data.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8()    Discovered a few channels carry massive outliers; keep FP16, rest INT8
+   v
+[2023] SmoothQuant   Mixed precision breaks regularity; per-channel scaling shifts difficulty to weights
+   v
+[2023] QuIP          Scaling only relocates; random orthogonal matrices spread weights (incoherence)
+   v
+[2024] QuaRot        QuIP only handles weights; embed Hadamard rotations inside Transformer
+   v
+[2024] SpinQuant     Fixed Hadamard is suboptimal; gradient descent on Stiefel manifold learns rotations
+   v
+[2025] DFRot         Gradient descent is slow and brittle; switch to Procrustes closed-form, but must store activations
+   v
+[2026] ConQuR  <-- this paper
+       Storing calibration activations costs tens of GB; offline computation cannot adapt to post-quantization distribution;
+       Online mini-batch Procrustes pulls activations onto hypercube corners
+#+end_example
+
+DFRot is the paper's "most similar to our work" comparison. QuIP / QuaRot / SpinQuant / SmoothQuant are all directly cited in Related Work. LLM.int8() is not in the citation list but is universally recognized as the starting point.
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering the Ghost
+
+Below 6.7B parameters, quantizing to 8 bits is fine. Cross that threshold and performance suddenly collapses. Tracing the cause leads to *a handful of channels* — more than 20× larger than the rest, appearing in roughly the same positions on every input. The effect grows stronger with scale: an "emergent" property of LLMs.
+
+The fix was blunt: keep the outlier channels in FP16 and everything else in INT8. Mixed precision simply sidesteps the problem. The cost is an irregular kernel that delivers GPU acceleration far below the theoretical maximum. The next generation would have to find a way to treat every channel equally.
+
+** 2023 | SmoothQuant: Shifting Difficulty from Activations to Weights
+
+LLM.int8()'s mixed precision breaks regularity. SmoothQuant wants all channels to travel the same INT8 path.
+
+An equivalent transformation: Y = X·W = (X/s)·(s·W). Divide a given activation channel by s and multiply the corresponding weight row by s — the result is unchanged. The outlier in the activation disappears, and the difficulty is relocated into the weights — which are static, can be inspected in advance, and are controllable. Both sides become clean INT8.
+
+But *it only relocates, never eliminates* — the total difficulty is conserved, just moved to a new address. At 4 bits, the weight side cannot hold it either. What is needed is not relocation but *genuinely scattering the outliers*.
+
+** 2023 | QuIP: Flattening the Distribution with Random Rotations
+
+QuIP's observation: outliers are hard precisely because the signal is *concentrated* in a few dimensions. If the signal could be *spread uniformly across all dimensions*, quantization would become easy. This property is called incoherence — the distribution is "non-aligned" with the coordinate axes.
+
+Method: take a random orthogonal matrix R, replace weight W with R·W·R^T, and apply the corresponding rotation to inputs at inference time. An orthogonal transformation is mathematically equivalent (leaves the result unchanged) but scatters energy that was concentrated in a few directions across all directions. The paper also gives theoretical precision guarantees for 2-bit quantization.
+
+But QuIP only handles *weights* — the activation side remains exposed. To extend this to activations, the rotations must be *embedded directly into the Transformer's computation graph*, not patched on after the fact.
+
+** 2024 | QuaRot: Embedding Rotations Inside the Transformer
+
+QuaRot's key engineering contribution: inserting Hadamard rotations at specific positions in the Transformer (before and after attention, before and after MLP), exploiting the rotational invariance of RMSNorm and residual connections so that these rotations *can be absorbed into adjacent weight matrices*, adding almost zero overhead at inference time. For the first time, *activations, weights, and KV cache are all 4-bit* — end-to-end runnable and accelerated.
+
+But QuaRot uses a *fixed, layer-shared* Hadamard matrix — a "uniformly scatter everything" rotation. The problem: activation distributions vary enormously across layers. Why should the same Hadamard apply everywhere? Intuitively it is clearly suboptimal.
+
+** 2024 | SpinQuant: Learning an Optimal Rotation
+
+SpinQuant replaces the fixed Hadamard with a *learnable rotation matrix*: one R_l per layer, directly minimizing the quantized task loss.
+
+The technical challenge: R must be strictly orthogonal, or the mathematical equivalence breaks. Ordinary gradient descent pushes R off the orthogonal "shell." SpinQuant performs gradient descent on the *Stiefel manifold* (the geometric space of all n×n orthogonal matrices) — projecting each update direction back onto the manifold and using a retraction to stay on it.
+
+The result is a clear improvement: 4-bit accuracy substantially better than QuaRot. But the cost is *expensive training* — end-to-end backpropagation plus manifold optimization plus multi-GPU, especially painful for 70B models. Manifold optimization itself converges slowly, is sensitive to learning rate, and is unstable.
+
+** 2025 | DFRot: Procrustes Closed-Form, But Must Store Activations
+
+DFRot's key insight: you do not actually need gradient descent. If the goal is "find an orthogonal matrix R such that R·X is as close as possible to some target Y," this is the classical *orthogonal Procrustes problem* — and it has a closed-form solution: SVD-decompose Y·X^T = U·Σ·V^T, then R = U·V^T.
+
+DFRot casts the objective as "minimize quantization error" and solves for R iteratively via Procrustes. No gradients, no manifold optimization, no learning rate — one SVD gives the answer directly. Much faster and more stable than SpinQuant.
+
+But there is a hidden cost: Procrustes requires *seeing all calibration activations at once* to construct the target matrix. This means *running the calibration set through every layer and saving the activations to disk* — tens to hundreds of GB for a 70B model. And the process is *offline and one-shot*: once the rotation is computed it is never updated; it optimizes against the statistics of *unquantized* activations and cannot see the perturbations introduced by quantization itself.
+
+** 2026 | ConQuR: Online Procrustes + Corner-Alignment Objective
+
+ConQuR's two-part breakthrough:
+
+*Step one: replace "minimize quantization error" with "align activations to the corners of the unit hypercube."* The paper proves these two are equivalent (Appendix B), but the corner-alignment objective has one key advantage — it is *computable sample by sample*, with no dependence on global corpus statistics. For each mini-batch of normalized activations X, the target Y is simply "the nearest hypercube corner vertex for each row of X."
+
+Intuition: minimizing quantization error means each activation vector should sit as close as possible to a quantization grid point. The corner vertices of the unit hypercube (vectors whose every component is ±1/√d) are the *most symmetric and most spread-out* grid points. Aligning activations to these corners is equivalent to minimizing quantization error.
+
+*Step two: online mini-batch calibration.* Since the target is computable per sample, there is no need to store all activations upfront. For each mini-batch: rotate with the current R → quantize → dequantize → measure error → update R by one Procrustes closed-form step → discard the batch → move to the next. Two compounding benefits follow:
+
+1. *Zero activation storage* — disk overhead drops from tens of GB to 0.
+2. *Awareness of quantization perturbations* — because R is updated after the "quantize–dequantize" round-trip actually happens, R learns to counter the *real post-quantization distribution*, not DFRot's assumption of "optimal for unquantized data."
+
+Results: on Llama-2 / Llama-3 (3B to 70B), 4-bit perplexity and commonsense reasoning tasks match or exceed SpinQuant and DFRot — with zero gradient descent and zero activation storage.
+
+* Frontier Extensions
+
+As of May 2026, ConQuR is the latest waypoint on the "learned-rotation quantization" line. Several extension directions are visible:
+
+- *Lower bit-widths*: 3-bit and 2-bit activation quantization remain open problems. QuIP# / QTIP have already pushed the weight side to 2-bit + vector quantization; an equivalent breakthrough on the activation side has yet to appear.
+- *Combining with post-training fine-tuning*: the pure PTQ route (ConQuR, DFRot) versus the QAT route (BitNet b1.58, LLM-QAT) — which is more cost-effective remains unsettled.
+- *Hardware co-design*: new data formats like MXFP4 (natively supported on NV Blackwell and AMD MI355X) push the hardware speedup for 4-bit activation inference from 2× toward 4×. Rotation-calibration methods need to be redesigned to match block-scale formats.
+
+* One Diagram
+
+#+begin_example
+                 The activation-outlier problem: how to keep 4-bit quantization from collapsing
+
+            Target              Transform           Optimization          Offline / Online
+            ------              ---------           ------------          ----------------
+LLM.int8()  Isolate outliers    Bypass (FP16 mix)   None                  No calibration
+SmoothQuant Relocate to weights per-channel scaling  Stat max/min          Offline stats
+QuIP        Weights             Random orthogonal    Random                Offline
+QuaRot      Weights + activs    Fixed Hadamard       None (hardcoded)      Offline
+SpinQuant   Weights + activs    Per-layer rotation   Stiefel gradient      Offline training (costly)
+DFRot       Weights + activs    Per-layer rotation   Procrustes closed     Offline + store activs
+ConQuR      Weights + activs    Per-layer rotation   Procrustes closed     Online mini-batch
+
+                                                                           ^
+                                              Cheap + adapts to quant perturbations ----+
+#+end_example
+
+* Insights
+
+Reading this river, what emerges is not "yet another quantization algorithm" but rather *a picture of how a field's optimization cost gets shaved down step by step*:
+
+1. *FP16 mixing → equivalent transformation → embedded rotation*: from "route around the problem" to "use mathematical equivalence to reframe the problem" to "let the reframing disappear into the operator graph" — each step pushes human intervention further toward invisibility.
+
+2. *End-to-end training → gradient + manifold → closed-form SVD → online closed-form*: optimization cost descends from "backpropagate through the whole network" all the way to "one SVD per mini-batch." The essence of this line is that the *objective function is geometrized one layer at a time* — SpinQuant still needs a task loss; DFRot simplifies it to Procrustes; ConQuR further proves corner alignment is the per-sample-decomposable form of Procrustes. *Every time a geometric structure is uncovered, the optimizer gets to skip one more detour.*
+
+3. *Offline → online*: DFRot already cut calibration time to a few minutes, yet still required tens of GB of disk. ConQuR eliminates that last bottleneck too. This hints at a principle — *calibration should be streaming*, not "sample first, compute later." Online calibration also perceives the perturbations introduced by quantization itself, making it lossless or even superior in accuracy versus offline methods — not a trade-off.
+
+Where is the next move most likely to come from? Combining the "corner alignment" geometric objective with *block-scale data formats* (MXFP4 / MXFP6) — the shape of the hypercube corners needs to be redefined, because each block now carries its own scale. Whoever solves that first claims the quantization standard on the next generation of GPUs.
+
+* Takeaways
+
+What this river suggests about doing research:
+
+- *Finding a problem's geometric structure is worth ten times more than designing a more complex optimizer.* SpinQuant → DFRot → ConQuR is not a story of algorithms getting cleverer — it is a story of the *objective function being understood more deeply*. Every time the problem was reposed, a full order of magnitude of simplification followed.
+
+- *"Equivalent transformation" is an extraordinarily powerful class of ideas*: change the difficulty's distribution without changing the result. SmoothQuant's X·W = (X/s)·(sW), QuaRot's rotational invariance of RMSNorm, ConQuR's equivalence of corner alignment to minimizing quantization error — these are all "mathematical free lunches," safe to apply precisely because the output is unchanged.
+
+- *Storage is usually a hidden cost, and eliminating storage often yields an accuracy gain*: the step from DFRot to ConQuR looks like pure engineering optimization (don't store activations), yet it delivers the accuracy benefit of "perceiving quantization perturbations." Turning an engineering constraint (online, no looking back) into a methodological constraint often forces a better method into existence.
+
+The implication: the next time you face a problem where "optimization is too expensive," don't reach first for "try a different optimizer." Ask instead: "Have I found the right geometric structure for my objective function?" Replay the pivots of every generation on this river and you will find it is almost always the same move.

@@ -1,0 +1,273 @@
+#+title:      Theory-optimal Quantization Based on Flatness
+#+date:       [2026-05-28 Thu 10:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T105438-en
+#+source:     https://arxiv.org/abs/2605.18800
+#+authors:    Xiusheng Huang, Zhe Li, Xuanwu Yin, Lu Wang, Yequan Wang, Dong Li, Emad Barsoum, Kang Liu
+#+venue:      arXiv 2026-05 (cs.LG)
+
+* The River of the Problem
+
+In one sentence: *A small cluster of "outliers" in LLM weights and activations are disproportionately large. They force quantization to stretch its numeric scale to accommodate them, crushing all the finer values in between — and accuracy collapses. How do we flatten these outliers?*
+
+Why is this hard? Neural-network activation distributions are not uniform bells. In an LLM layer's activation matrix, the vast majority of elements are tiny (near zero), but every so often a handful of values shoot up tens or hundreds of times larger than the rest — concentrated in a few channels, dubbed outliers. To "fit" these large values, the integer scale must be stretched wide, and the fine-grained signal in the middle gets wiped out in a single stroke. At 8-bit the damage is tolerable; drop to 4-bit and everything breaks.
+
+This line of work spans seven or eight years, and every generation is doing the same thing: *finding a way to "flatten" outliers — either migrate them from activations into weights, rotate them so their energy disperses, or learn a transform that makes the distribution more uniform*. But each generation leaves new problems for the next. The BDQ paper argues that predecessors were all flattening by intuition, with no one ever proving what "flattest" actually means. It supplies a mathematically optimal criterion called Flatness.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  |
+  | Problem: quantizing the whole matrix at once accumulates error
+  | Solution: quantize column-by-column; after each column, update
+  |           the remaining columns to compensate
+  v
+[2022/23] SmoothQuant (Xiao et al.)
+  |
+  | Problem: GPTQ only handles weights; outliers in activations are
+  |          untouched — W8A8 collapses
+  | Solution: divide each activation channel by a per-channel scale s,
+  |           multiply the corresponding weight row by s;
+  |           "difficulty" migrates from activations to weights
+  v
+[2024] AWQ (Lin et al.)
+  |
+  | Problem: SmoothQuant hand-tunes the scale and treats all channels
+  |          equally, with no notion of which weights matter
+  | Solution: use activation statistics to identify "salient channels";
+  |           protect only those with higher precision
+  v
+[2024/25] QuaRot (Ashkboos et al.)
+  |
+  | Problem: per-channel scaling and "protect the few" are local patches;
+  |          the concentrated structure of outliers itself is never broken
+  | Solution: apply a Hadamard rotation matrix R to both weights and
+  |           activations; outlier energy spreads uniformly across all channels
+  v
+[2024] SpinQuant (Liu et al.)
+  |
+  | Problem: a random fixed rotation is not optimal; different models
+  |          and layers should have different optimal rotations
+  | Solution: make the rotation matrix R a learnable parameter, trained
+  |           on a small calibration set
+  v
+[2024/25] FlatQuant
+  |
+  | Problem: learning a full invertible square matrix is too expensive —
+  |          too many parameters, too hard to optimize
+  | Solution: approximate the rotation with a Kronecker product (A ⊗ B),
+  |           drastically reducing the parameter count
+  v
+[2026] BDQ (this paper)
+  |
+  | Problem: after rotation/Kronecker, residual "row-concentrated" and
+  |          "column-concentrated" outlier patterns remain — and no one
+  |          has proven whether any of these methods is optimal
+  | Solution: formally define a Flatness metric, derive a closed-form
+  |           optimal solution — two pairs of learnable diagonal matrices
+  |           (row scaling + column scaling), followed by a Hadamard
+#+end_example
+
+Note: The critique/improvement relationships shown above — GPTQ → SmoothQuant → AWQ → QuaRot → SpinQuant — are explicitly cited in the paper's Related Work section. The FlatQuant link is inferred from Appendix A, "Difference from Previous Rotation Based Methods" (the entire appendix is a head-to-head comparison with FlatQuant).
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Quantize Column by Column, Compensate as You Go
+
+*** What Problem It Saw
+
+Quantizing an entire weight matrix to 4-bit all at once — rounding each weight independently — looks simple, but errors accumulate. A matrix with millions of weights, each off by a little, multiplied against activations, becomes a disaster. Early round-to-nearest at 4-bit was essentially unusable.
+
+*** Its Solution
+
+Drawing on OBS (Optimal Brain Surgeon): *quantization is a "perturbation" — every time one weight is moved, update all remaining weights to absorb the error*. Concretely, sweep left to right column by column; after quantizing each column, use the inverse Hessian to tell the remaining columns how to nudge themselves to compensate for the damage just done.
+
+*** Why It Works (and What Hole It Left)
+
+Isolated rounding becomes coordinated rounding — later-quantized weights know what happened earlier. This idea is still alive today.
+
+The hole it left: *GPTQ only touches weights, not activations*. Yet LLM activations contain those massive outliers concentrated in a few channels; when you quantize the activations, these outliers blow the scale wide open and everything else gets zeroed out. GPTQ is excellent at W8A16/W4A16 (weight-only quantization), but is helpless the moment you want W8A8 (quantizing activations too).
+
+** 2022/23 | SmoothQuant: Transfer the "Hard Part" of Activations to Weights
+
+*** What Problem It Saw
+
+Activation outliers cluster in a few fixed channels and detonate the quantization scale. Meanwhile, the weights at those corresponding positions are not especially large — meaning that in the matrix multiply =Y = XW=, all the "quantization difficulty" is piled on the X side.
+
+*** Its Solution
+
+Mathematically elegant: =Y = (X/s)(s·W)=, the product is unchanged. Divide each activation channel by a scale factor s, multiply the corresponding weight row by s. *"Difficulty" migrates from the activation side to the weight side.* The activations become smooth; the weights can handle a little extra range — their distribution was more uniform to begin with.
+
+*** Why It Works (and What Hole It Left)
+
+It identified the central tension in LLM quantization: activations are hard, weights are easy — so transfer some hardness to the easy side. W8A8 suddenly became feasible.
+
+The hole it left: *s is tuned by hand (from offline statistics), and it is only a per-channel scaling — it assumes outliers are neatly arranged column-by-column*. As soon as outliers span multiple channels or the activation distribution is more complex, per-channel scaling is palliative at best. Dropping to W4A4 still breaks.
+
+** 2024 | AWQ: Not All Weights Matter — Protect the Few
+
+*** What Problem It Saw
+
+SmoothQuant scales all channels equally. But in practice only about 1% of weight channels are "salient" — they correspond directly to the large activation outliers. Protect that 1%; let the rest be quantized freely.
+
+*** Its Solution
+
+Use activation magnitude statistics to identify *salient channels* and assign them larger scale factors, so quantization error falls as little as possible on them. Still per-channel scaling at heart, but the design goal shifts from "flatten the distribution" to "protect the critical weights."
+
+*** Why It Works (and What Hole It Left)
+
+It explicitly models which weights are worth protecting — more targeted than SmoothQuant.
+
+The hole it left: *still a local, axis-aligned patch — per-channel*. The structural fact that outliers concentrate in a small number of channels is never broken. What if we could prevent outliers from concentrating at all — spreading their energy across every channel?
+
+** 2024/25 | QuaRot: Use a Random Rotation to Spread Outliers Everywhere
+
+*** What Problem It Saw
+
+Per-channel scaling can never change one thing: *outliers still concentrate in the same channels as before*. Can we "scramble" the channel dimension — find a transform R so that outlier energy is shared uniformly across all channels?
+
+*** Its Solution
+
+Exploit an identity: =Y = X·W = (X·R)·(R^T·W)=, valid as long as R is orthogonal. Choose R to be a Hadamard matrix (a special orthogonal matrix with all ±1 entries), which spreads any vector's energy uniformly across all dimensions. *After one rotation by R, outliers that were concentrated in 3 channels are now spread across 4096 channels, each carrying only 1/sqrt(4096) of the original magnitude.* The activation distribution flattens instantly.
+
+*** Why It Works (and What Hole It Left)
+
+The first method to escape "local channel scaling" and view the problem through the lens of a global orthogonal transform. Hadamard also computes fast (O(n log n)), so the inference overhead is minimal. W4A4 finally looked feasible.
+
+The hole it left: *R is a fixed random matrix, not tailored to each model or layer*. Different layers have different outlier profiles; one fixed Hadamard cannot be optimal for all of them.
+
+** 2024 | SpinQuant: Let the Rotation Matrix Learn
+
+*** What Problem It Saw
+
+A fixed Hadamard is "average optimal," not "specifically optimal." Each layer has its own activation statistics and deserves its own best rotation.
+
+*** Its Solution
+
+Make R a learnable parameter and optimize it with gradient descent on a small calibration set (128 samples). *To keep R orthogonal, parametrize optimization over the Stiefel manifold (using tricks like the Cayley transform).*
+
+*** Why It Works (and What Hole It Left)
+
+The rotation adapts to each layer. W4A4 quality improved another notch.
+
+The hole it left: *R is a full n×n orthogonal matrix; n is routinely 4096, giving 16M parameters*. Optimization is slow and hard to converge; the Stiefel-manifold constraint makes the loss landscape non-convex. Can we approximate R with far fewer parameters?
+
+** 2024/25 | FlatQuant: Compress the Rotation with a Kronecker Decomposition
+
+*** What Problem It Saw
+
+An n×n rotation matrix is too large. But if some expressiveness can be traded away, can R be decomposed as a Kronecker product R = A ⊗ B? Parameter count drops from n² to 2·sqrt(n)².
+
+*** Its Solution
+
+Learn a pair of small matrices A and B whose Kronecker product approximates the rotation/affine transform. Everything else follows SpinQuant's pipeline.
+
+*** Why It Works (and What Hole It Left)
+
+Parameters are dramatically reduced; the optimization becomes tractable.
+
+The holes left (called out explicitly by BDQ in its appendix):
+- *The Kronecker structure limits expressive power.* A ⊗ B cannot represent an arbitrary orthogonal matrix.
+- *The optimization objective is non-convex*, prone to local optima.
+- Most critically: *there is no theoretical guarantee* — you do not know whether the learned (A, B) is optimal, or whether outliers have truly been flattened.
+
+** 2026 | BDQ: Stop Guessing — Derive the Closed-Form Optimal
+
+*** What Problem It Saw
+
+From SmoothQuant to FlatQuant, every generation constructed transforms by intuition: per-channel scaling, Hadamard rotation, Kronecker affine… *No one ever defined "what does flattest mean," let alone proved their method achieved it.* If the numbers looked good experimentally, that was enough.
+
+More concretely: after rotation or Kronecker transforms, residual "row-concentrated" and "column-concentrated" outlier patterns remain — certain rows and columns still carry disproportionately large values.
+
+*** Its Solution
+
+Three steps:
+
+1. *Formalize "how flat."* Borrowing the spirit of information entropy, define a metric called Flatness:
+   #+begin_example
+   F = sum_{i,j} (W_ij^2 / (a_i * b_j)) * ln(W_ij^2 / (a_i * b_j))
+   #+end_example
+   where a_i is the energy weight for row i and b_j for column j. This expression is minimized when every W_ij^2/(a_i b_j) equals a constant — meaning "each element contributes equally relative to the average for its row and column." That is the mathematical definition of being flattened.
+
+2. *Derive the closed-form optimal solution.* Minimize F subject to energy constraints and solve for the optimal (a_i, b_j) — yielding the entries of two diagonal matrices.
+   *The structure of the optimal transform is: left-multiply each linear layer by one diagonal matrix and right-multiply by another — bidirectional diagonal scaling.* That is where the name Bidirectional Diagonal Quantization comes from.
+
+3. *Stack a Hadamard as a safety net.* Diagonal scaling can only handle "row/column axis-aligned" outlier patterns. Stacking a Hadamard further scatters residual outliers across the full matrix. A Recursive Cross-Entropy Loss is added to prevent overfitting when only 128 calibration samples are used.
+
+*** Why It Works (and What Holes It Left)
+
+For the first time, this line of work advances from "constructing transforms by feel" to "optimizing under a well-defined metric." Diagonal transforms are convex (each row/column is independently solvable), so optimization is easy; the Hadamard cleans up the residual that diagonals cannot reach.
+
+By the numbers: LLaMA-3-8B at W4A4 loses < 1% accuracy; DeepSeek-R1-Distill-LLaMA-70B at the extreme setting W2A4KV16 narrows the gap to the prior SOTA by 39.1%.
+
+New holes left:
+- Is a Flatness measure in the information-entropy style the only reasonable metric? A different metric (e.g., L∞ norm, Wasserstein distance) might yield a completely different "optimal" structure.
+- Diagonal + Hadamard is optimal under Flatness, but *is Flatness-optimal equivalent to quantization-error-optimal?* The paper shows strong correlation; it does not prove equivalence.
+- W2 is already the floor. Going further (W1, ternary), the outlier structure itself may transform completely — does this theory still hold?
+
+* Frontier Extensions
+
+As of 2026-05 (when this paper appeared), BDQ is itself the latest advance in this line and no public follow-up has explicitly critiqued it yet. Foreseeable directions:
+
+- *Replace the proxy metric with end-to-end optimization.* BDQ uses Flatness as a surrogate; the next step may target post-quantization task loss directly in closed form.
+- *Make the Hadamard a learnable low-parameter structure too.* BDQ's diagonal is the optimal solution but the Hadamard is still fixed; future work may jointly optimize "diagonal + rotation" in closed form.
+- *Cross-layer joint optimization.* BDQ still processes one layer at a time; outliers coupled across layers have not been systematically modeled by anyone.
+
+* One Diagram
+
+#+begin_example
+Time →
+2022       2023        2024              2025         2026
+GPTQ ----> SmoothQ --> AWQ ---> QuaRot --> SpinQ --> FlatQ --> BDQ
+              |          |        |         |          |        |
+Weight       Act/Wt    Protect   Fixed    Learned    Kron     Optimal
+compensation  rebal-   salient   rotation  rotation   decom-   diagonal
+(per-col      ancing   channels                       position + Had
+ error        per-ch                                           + theory
+ absorption)  scale
+
+Evolution of the solution dimension:
+  Local --------------------------> Global -----------> Optimal
+  (per-channel)                    (full-matrix rot.)  (closed form)
+
+  Hand-designed ----------------> Learned -------> Derived
+  (statistics/Hessian)           (gradient desc.) (entropy + convex opt.)
+
+  No theory ---------------------------------> Theoretical
+  (empirically validated)                       (Flatness-optimal)
+#+end_example
+
+* Insights
+
+Reading this line end to end, three layers of understanding surface:
+
+*1. On the surface this looks like "quantization tricks" evolving; underneath it is the understanding of outliers that is deepening.*
+
+#+begin_example
+  Outliers are a bug  ->  Can't bypass them; must transport them
+  -> Outlier concentration is structural; must be scattered
+  -> Scattering should be adaptive, not random
+  -> Adaptation needs a theoretical criterion, not alchemy
+#+end_example
+
+Each generation did not invent a new algorithm so much as develop a deeper understanding of the same phenomenon.
+
+*2. This line displays a textbook "heuristic to theory" maturation arc.* SmoothQuant is engineering intuition; QuaRot is a mathematical trick; SpinQuant is a learning paradigm; FlatQuant is parameter compression; BDQ is convex optimization plus closed-form derivation — the field has traveled the full arc from "it works" to "why does it work" to "what is the best it can be." That arc is actually rare in deep learning; most subfields never leave "works well enough."
+
+*3. "Optimal" is always relative to the chosen metric.* BDQ's "optimal" is optimal under the Flatness metric. Switch to a different metric and the optimal structure may be entirely different. So the paper's real contribution is not the BDQ method itself — it is *pulling this line from an "algorithm competition" into a "metric competition."* Future methods will need to answer first: what metric are you optimizing, and why is that metric the right one?
+
+Where is this heading next? My guess is *cross-layer / cross-module joint optimality* — within-layer Flatness optimality is now solved, but a Transformer is a stack of layers in series, and per-layer optimality does not imply global optimality. Someone will start working on "end-to-end Flatness."
+
+* Takeaways
+
+For researchers:
+
+- *When you find a problem that has been "improved" over and over for many years, ask: has anyone ever defined what "optimal" looks like?* If not, that is the real research opportunity — stop building the next heuristic; go build the metric.
+- *Elegant mathematical structures (here: diagonal matrices + information entropy) rarely appear from nowhere; they emerge from forcing an intuition into an existing mathematical framework and pushing through.* BDQ invented no new mathematics — it used Shannon's 1948 entropy and the diagonal matrices from first-year linear algebra.
+- *The appendix comparison with the closest baseline is often the paper's real battleground.* BDQ courteously acknowledges everyone in the main text; the fireworks are in Appendix A's four subsections — degrees of parametric freedom, convexity, error bounds, information loss — each one pressing FlatQuant into the mat.
+
+For practitioners deploying quantized models:
+
+- If your deployment target is W4A4 or more aggressive, *BDQ's "bidirectional diagonal + Hadamard" combination can be inserted directly into an existing PTQ pipeline* — it only adds diagonal scaling and a Hadamard before and after each Linear layer; at inference time the diagonals can be folded into the weights, and the Hadamard is an O(n log n) fast transform.
+- The arc of this line teaches one lesson: *never benchmark only a single quantization method.* The performance gap between SmoothQuant, QuaRot, SpinQuant, and BDQ on the same model can easily exceed the gap between models. Your real choice is not "to quantize or not" — it is "which generation of quantization to use."

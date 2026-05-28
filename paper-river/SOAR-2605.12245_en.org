@@ -1,0 +1,330 @@
+#+title:      SOAR: Scale Optimization for Accurate Reconstruction in NVFP4 Quantization
+#+date:       [2026-05-28 Thu 10:18]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T101816-en
+#+source:     https://arxiv.org/abs/2605.12245
+#+authors:    Chengzhu Bao, Xianglong Yan, Zhiteng Li, Guangshuo Qin, Guanghua Yu, Yulun Zhang (Shanghai Jiao Tong University, Tencent Hunyuan)
+#+venue:      arXiv 2026-05-12 (cs.LG)
+
+* The Problem River
+
+After compressing LLM weights to 4 bits, how do you minimize the gap between the pre- and post-compression representations?
+
+More concretely: a weight matrix holds hundreds of millions to billions of floats, yet hardware gives you only 4 bits per value (FP4 = E2M1, just 16 legal values). Rounding to the nearest legal value causes some large weights (outliers) to distort explosively, collapsing the activations of the entire layer.
+
+A key insight emerged: *share a single scale per block*. Slice the weights into small tiles; choose one scale value per tile to normalize all its elements into the range FP4 can represent. Outliers get absorbed by the scale, and the elements within each block become relatively uniform. This is *microscaling* — MXFP4 and NVFP4 are two distinct variants of this idea.
+
+But how should the scale itself be chosen? Historically the answer has always been a *max-based* rule of thumb: take the maximum absolute value within the block. At the extreme low-bit regime of FP4 this rule is not good enough — a slightly wrong scale inflates the reconstruction error for the entire block. For three years the microscaling line of work has been answering the same question in different ways:
+
+  *Given hardware constraints (block size, scale bit-width and format), how do we find the best scale?*
+
+Every step forward is another bite out of this same bone.
+
+* Source Map
+
+#+begin_example
+[2022] Frantar et al. -- GPTQ
+  |
+  | Problem seen: round-to-nearest gives large reconstruction error; Hessian
+  |               information is never used
+  | Solution: column-wise OBS compensation + Cholesky; makes INT4 PTQ work on 175B
+  | Remaining gap: INT quantization is unfriendly to heavy-tailed LLM distributions;
+  |                collapses below 4 bits
+  v
+[2023] Xiao et al. / Lin et al. -- SmoothQuant, AWQ
+  |
+  | Problem seen: outlier channels blow up the dynamic range of entire rows
+  | Solution: migrate outliers from activations to weights, then apply channel-wise scale
+  | Remaining gap: still INT format; does not match the floating-point distribution of LLMs
+  v
+[2023] Rouhani et al. -- MXFP4 (Microscaling FP4)
+  |
+  | Problem seen: INT4 / uniform scale cannot accommodate heavy-tailed LLM distributions
+  | Solution: 32-element blocks share one E8M0 exponent as scale; block elements use FP4 (E2M1)
+  | Remaining gap: scale can only be an integer power of 2; granularity is too coarse
+  v
+[2025] NVIDIA -- NVFP4
+  |
+  | Problem seen: MXFP4's E8M0 scale too coarse; block size 32 too large
+  | Solution: block shrinks to 16; scale upgraded to FP8 (E4M3); one FP32 global scale added;
+  |           natively supported on Blackwell GPUs
+  | Remaining gap: everyone still uses max-based heuristics to choose scales;
+  |                FP8 quantization of the scale itself introduces error
+  v
+[2025] Cook et al. -- 4over6
+  |
+  | Problem seen: max-based scale is one-size-fits-all; not adaptive
+  | Solution: choose between two preset scale ranges (6 and 4) per block based on MSE
+  | Remaining gap: only "two levels" of resolution — far too discrete;
+  |               quantization and dequantization share the same FP8-constrained scale
+  v
+[2026.05] Bao et al. -- SOAR  <-- this paper
+  |
+  | Problem seen: (1) scale selection should be a continuous optimization problem, not a
+  |                   binary choice;
+  |               (2) the scale used at quantization time need not equal the hardware-
+  |                   constrained scale used at dequantization time
+  | Solution: CJSO -- derives a closed-form joint optimal solution for global + block scales;
+  |           DSS  -- decouples the high-precision quantization scale from the FP8
+  |                   dequantization scale via discrete joint search
+  v
+[2026] Chhugani / Meng / Egiazarian et al. -- Overflow-Aware, ARCQ, MR-GPTQ ...
+  |
+  | Problem seen: further gains in NVFP4 are available from other angles
+  |               (dynamic range, residual channels, Hadamard rotation)
+  | Solution: each attacks from overflow awareness, residuals, or rotation
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Thirty Years of Hessian Compensation Polished to Run on 175B
+
+*** What Problem It Saw
+
+LLMs are too large; after training, squeezing them into consumer GPUs requires quantization. Naive round-to-nearest makes model perplexity blow up to unusable levels. This generation inherited the OBD/OBS line of work (using second-order Hessian information to guide rounding), but the OBS formula at O(d^3) could not scale to billions of parameters.
+
+*** Its Solution
+
+Column-wise processing + lazy batched updates + Cholesky factorization — engineering the formula for "how to compensate all other weights after one weight is quantized" to the point where it runs on a 175B model. Result: INT4 quantization with only a small perplexity drop. From that point on, GPTQ became the default baseline for the entire LLM PTQ field; all subsequent work either builds on it or challenges it.
+
+*** Why It Works (and What New Holes It Left)
+
+Column-wise processing is an engineering compromise — reducing the globally joint optimization to cacheable per-layer subproblems. The Hessian H = X^T X is computed once and reused; the constant factor becomes manageable.
+
+But it left two long-tail problems:
+
+1. *INT quantization is unfriendly to LLMs.* LLM weight distributions are heavy-tailed — most elements are near zero, while a few have large absolute values. INT4 uses a uniform grid: either sacrifice precision (small values all crowd toward zero) or sacrifice range (large values overflow). No matter how clever the Hessian compensation, it cannot fix this fundamental *representation mismatch*.
+2. *Collapse below 4 bits.* GPTQ perplexity degrades sharply at 3-bit and 2-bit. This is the vulnerability that the ADMM-Q line of work attacks.
+
+The microscaling line chooses a different angle of attack: *stop insisting on INT; switch to FP formats*.
+
+** 2023 | SmoothQuant / AWQ: Migrating Outliers from Activations to Weights
+
+*** What Problem It Saw
+
+LLM activations contain a small number of channels whose absolute values are tens to hundreds of times larger than all other channels (outlier channels). When quantizing activations, these channels drag the dynamic range of entire rows to the limit, single-handedly destroying precision for the whole row. GPTQ only handles weights; the activation side was left almost entirely unaddressed.
+
+*** Its Solution
+
+Introduce a per-channel scaling variable s_c. Divide activations by s_c; multiply weights by s_c — the output is mathematically unchanged, but the outlier burden is transferred from activations to weights. Weights are relatively easy to handle (offline, can be tuned slowly), so activations become quantization-friendly.
+
+*** Why It Works (and What New Holes It Left)
+
+This is an *equivalence transform* — using algebraic manipulation to move the hard part to where it is easier to handle. Later, SpinQuant and QuaRot pushed this idea further (using Hadamard rotation to smooth outlier distributions across entire matrices).
+
+But it never resolved a more fundamental issue: the *quantization format itself* is still integer. Once you see that real LLM weight distributions are heavy-tailed, the equal-spacing assumption of an integer grid is simply wrong. The next necessary step is a format change.
+
+** 2023 | MXFP4: Floating-Point + Block-Shared Scale, Natively Matching Heavy-Tailed Distributions
+
+*** What Problem It Saw
+
+The equally-spaced INT grid cannot accommodate heavy-tailed distributions. FP (floating-point) grid points are naturally non-uniform — fine-grained near zero, coarser for large values — which matches the shape of heavy-tailed distributions exactly. But a single FP4 element has too narrow a dynamic range (E2M1 can represent at most 6) to be used alone.
+
+*** Its Solution
+
+Slice weights into *blocks of 32 elements*. Each block shares one *scale* — an E8M0 exponent (i.e., only integer powers of 2 are allowed). Each element within the block is represented in FP4 (E2M1).
+
+  original value ≈ scale_block × FP4_element
+
+This is *microscaling*: fine-grained block-wise scaling, with each block choosing its own dynamic range. Outlier blocks automatically receive a larger scale; normal blocks get a smaller one; overall dynamic range is distributed across blocks.
+
+*** Why It Works (and What New Holes It Left)
+
+Two alignments happen simultaneously:
+- FP grid points match the *shape* of heavy-tailed distributions
+- Block-shared scales match the fact that LLM outliers are *locally clustered* (adjacent columns in the same row tend to be outliers together)
+
+The remaining gap: scales can only be integer powers of 2 (E8M0 is a pure exponent). The granularity is too coarse — if the block max falls anywhere between 1.1 and 1.9, the scale must take the same power of 2, effectively wasting half the dynamic range. A finer scale representation is needed.
+
+** 2025 | NVFP4: Block Shrinks to 16, Scale Upgraded to FP8 + One Global Scale Added
+
+*** What Problem It Saw
+
+MXFP4's E8M0 scale is too coarse, and block size 32 is still not fine-grained enough. LLM outlier distributions tend to be more local — the smaller the block, the more precisely it can capture them.
+
+*** Its Solution
+
+A new format natively supported on NVIDIA Blackwell GPUs:
+
+- Block size reduced from 32 to *16* (finer granularity)
+- Block scale upgraded from E8M0 to *FP8 (E4M3)* (now has both exponent and mantissa — far more continuous)
+- On top of all block scales, one *FP32 global scale α* is added — one more rescaling for the entire tensor
+
+  original value ≈ α × scale_block_FP8 × FP4_element
+
+Hardware support means NVFP4 is not just a numerical format — it is a format that *runs fast*. Overnight it became everyone's new baseline.
+
+*** Why It Works (and What New Holes It Left)
+
+The two-level scale is the key: the global α governs the dynamic range of the entire tensor; the block scale handles local detail. This is a *hierarchical* design.
+
+Yet every paper at this point still uses the *max-based heuristic* to choose scales — alpha = max(|X|) / (M_FP4 · M_FP8), and the block scale is block max divided by M_FP4. This is the attitude of "using the format as the algorithm" — hardware delivered a new format, but the scale-selection algorithm remained stuck in the max-based dead rule of the INT era.
+
+A deeper hole: FP8 (E4M3) is itself only an 8-bit format; the scale values it can represent are discrete. Your computed scale might be 1.234, but FP8 can only store something like 1.25 — this *scale quantization error* directly affects final reconstruction. Yet nobody specifically addressed it.
+
+** 2025 | 4over6: Adding a Binary Switch to Scale Selection
+
+*** What Problem It Saw
+
+NVFP4 computes the block scale from the block max, meaning scale = max / 6 (because the maximum representable value of FP4 is 6). But you could also choose scale = max / 4 — this causes only the maximum element to be clamped to 4 and lose precision, while all other elements are represented with finer resolution. Which is better depends on whether this block has only a few outliers. If the max is an isolated outlier, a smaller scale (using 4) is actually friendlier to the other elements; if the max is not isolated, the larger scale (using 6) is needed to avoid information loss.
+
+*** Its Solution
+
+For each block, *compute reconstruction MSE for both scale choices and pick the smaller one*. Two preset resolution levels (6 and 4); per-block binary selection.
+
+*** Why It Works (and What New Holes It Left)
+
+This is the first time NVFP4 scale selection becomes *adaptive*. It demonstrates that "the max-based dead rule is not optimal," opening the door for what follows.
+
+But its resolution is still too coarse:
+
+1. *Only two levels.* The optimal scale may be some continuous value between 4 and 6, such as 5.2. Binary selection cannot capture it.
+2. *The global scale α is never touched.* The two levels of scale are actually coupled — if the block scale changes, the optimal α changes with it. Tuning them independently never reaches the global optimum.
+3. *Quantization and dequantization share the same FP8 scale.* This assumption goes undiscussed — since the scale must be stored in hardware as FP8, quantization is also forced to use that FP8 scale. But this is an overlooked assumption.
+
+** 2026.05 | SOAR: Scale Selection as Continuous Optimization + Decoupling Quantization from Dequantization
+
+*** What Problem It Saw
+
+SOAR addresses both gaps left by 4over6 simultaneously:
+
+1. *Discrete binary choice → continuous optimization.* If scale selection is fundamentally a continuous problem (choosing a real number within some range), then it is an *optimization problem with a closed-form solution* — no enumeration needed.
+2. *The quantization scale and dequantization scale need not be the same mathematically.* Hardware only mandates that the scale used *at dequantization* must be storable in FP8 — because dequantization is an inference-time operation executed directly by hardware. The scale used *at quantization time* is computed offline during PTQ; nothing forces it to be FP8. Figure 2(b) in the paper draws exactly this with a red lock / green checkmark: the dequantization scale is locked, the quantization scale need not be — yet everyone binds them as a single variable.
+
+This is a *representational asymmetry* that the entire 4over6 / NVFP4 line of work overlooked.
+
+*** Its Solution
+
+Two components, combined into SOAR:
+
+*CJSO (Closed-form Joint Scale Optimization) — reducing scale selection to a closed-form solution*
+
+The objective is the classic reconstruction MSE:
+
+  min  Σ_i || W_i - Q(W_i / (α · Δ_i)) · (α · Δ_i) ||^2
+  α,Δ
+
+where α is the FP32 global scale and Δ_i is the scale of block i. Q is FP4 quantization.
+
+Jointly optimizing over (α, Δ) is difficult because Q is discrete. But *if the assignment by Q is held fixed*, the objective is quadratic in (α, Δ). First-order optimality conditions ∂L/∂α = 0, ∂L/∂Δ_i = 0 directly yield closed-form updates:
+
+  α* = Σ W·Q·Δ / Σ Q^2·Δ^2          (closed-form solution for the global scale)
+  Δ_i* = Σ W·Q·α / Σ Q^2·α^2        (closed-form solution for the block scale)
+
+Then Δ_i* is projected onto the nearest legal FP8 value. The two formulas alternate — this is *coordinate descent*: fix block scales and update the global one, then fix the global and update block scales; each step strictly decreases MSE.
+
+Compared with 4over6's binary choice: 4over6 picks from two preset values; CJSO directly *computes* the optimal value and then rounds to the nearest legal point. This is an upgrade from *search* to *solve*.
+
+*DSS (Decoupled Scale Search) — decoupling the quantization-side and dequantization-side scales*
+
+CJSO still produces a single variable. SOAR goes further: let Δ_q denote the scale used at quantization time, and Δ_d the scale stored for dequantization. Δ_d must be FP8 (hardware constraint); Δ_q can be any high-precision real number (it runs offline during PTQ; nobody forces it to be FP8).
+
+Rewriting the objective:
+
+  min  Σ_i || W_i - Q_FP4(W_i / (α · Δ_q_i)) · (α · Δ_d_i) ||^2
+  Δ_q∈R, Δ_d∈FP8
+
+- Δ_q determines *which FP4 bin a weight is mapped into* (quantization side, continuous)
+- Δ_d determines *which scale is multiplied during dequantization to reconstruct the value* (dequantization side, FP8 discrete)
+
+Once decoupled, DSS performs a joint search around the initial values given by CJSO — over the FP8 neighbors of Δ_d combined with the continuous neighborhood of Δ_q — and selects the pair (Δ_q, Δ_d) that minimizes reconstruction MSE.
+
+*The full SOAR pipeline*: CJSO provides closed-form initialization → DSS performs local refinement → alternate and iterate.
+
+*** Why It Works (and What New Holes It Left)
+
+The essential difference *in one sentence*: 4over6 enumerates over two preset levels; SOAR computes the answer from first-order optimality conditions and treats hardware constraints as the projection boundary / search boundary. This upgrades scale selection from *heuristic* to *optimization problem*.
+
+The Decoupled Scale trick is the more crucial insight — it reveals a *hardware interface asymmetry* the entire microscaling line had overlooked: dequantization is a hard hardware constraint; quantization is a free software choice. Everyone assumed the two must be identical because the storage and execution interface happens to use the same FP8 field. Once that binding is released, accuracy is gained at zero cost (no hardware changes, no inference changes).
+
+On Qwen3-8B under NVFP4, averaged over 5 zero-shot tasks: SOAR 70.68 vs. SOTA 70.12. Small but real — in PTQ, every 0.5 point is hard-won.
+
+Remaining new gaps:
+
+1. *Search cost.* DSS is a discrete search; its cost grows with model size. CJSO closed-form is fast; DSS is slow — how to engineer this for very large models is left open.
+2. *The hardware interface is still given.* SOAR finds the optimum while accepting the NVFP4 interface. If a future-generation format (NVFP4 v2 or a competitor) changes the interface (e.g., allowing higher-precision scale storage), the entire optimization must be rederived.
+3. *No integration with GPTQ / Hadamard and other orthogonal directions.* MR-GPTQ is already combining scale search with GPTQ and Hadamard rotation; SOAR for now is a single-point optimization.
+4. *Activation quantization is untouched.* Outliers on the activation side of NVFP4 remain an independent problem; SOAR only addresses weights.
+
+* Frontier Extensions
+
+SOAR only just appeared on arXiv (2026-05-12), yet within the same time window this line of work is already advancing in multiple directions simultaneously:
+
+- *MR-GPTQ (Egiazarian et al. 2026)*: Merges scale search with GPTQ's Hessian compensation and Hadamard rotation. Parallel to rather than competing with SOAR — SOAR's scale search module could directly replace the corresponding module in MR-GPTQ.
+- *Overflow-Aware Scaling (Chhugani et al. 2026)*: Chooses scales from a different angle — dynamic-range / overflow awareness — without changing hardware. Philosophically close to CJSO but targets the overflow corner case.
+- *ARCQ (Meng et al. 2026)*: Uses *residual channels* to compensate quantization error. Orthogonal to scale optimization — using SOAR as a baseline and then applying residual compensation is an obvious next step.
+- *RaZeR (Chen et al. 2025)*: Discovers that FP4 (E2M1) has redundant zero values (+0 and -0); remaps the extra zero codepoint to an additional quantization level, gaining higher representational capacity for free.
+
+Together these confirm: the NVFP4 format is experiencing a concentrated burst of research in 2025-2026. Everyone is attacking the same surface — given the hardware interface, every 0.5 point squeezed out is valuable.
+
+Most likely directions forward:
+
+- *Cross-layer joint scale optimization.* SOAR is still layer-wise — each layer optimizes its scales independently. Once inter-layer error propagation is considered, scale selection becomes a global problem (the ADMM-Q line has already done something analogous for pruning/quantization).
+- *CJSO inside quantization-aware training (QAT).* Bringing CJSO into the training loop so that scales and weights are learned together could break new ground for sub-4-bit microscaling (e.g., future formats like NVFP3 or MXFP3).
+- *The hardware interface itself being challenged.* SOAR accepts the constraint that "dequantization must use FP8." If the next hardware generation supports higher-precision scale storage (e.g., FP16 scale + FP4 element), the entire optimization space reopens.
+
+* One Diagram
+
+#+begin_example
+                   Three Years of Evolution in Microscaling FP4 Quantization
+
+         Format expressiveness ^
+                               |                                  [SOAR 2026.05]
+         Scale is the solution |                                       *
+         to an optimization    |                                     /
+         problem               |                                   /  decouple Δ_q / Δ_d
+                               |                                 /    closed-form joint solve
+                               |                          [4over6 2025]
+         Adaptive scale,       |                              *
+         binary choice         |                            /  per-block binary choice
+                               |                          /    breaks max-based rule
+                               |                        /
+                               |                [NVFP4 2025]
+         Two-level scale:      |                    *
+         FP8 block scale       |                  /  block=16
+         + FP32 global scale   |                /    natively on Blackwell
+                               |              /
+                               |     [MXFP4 2023]
+         FP block-shared       |          *
+         E8M0 scale            |        /     32-element blocks, 2^k scale
+                               |      /       natively matches heavy-tailed distributions
+                               |    /
+         INT4 channel-wise     |  [AWQ/SmoothQuant 2023]
+         compensation          |     *
+                               |   /  migrate outliers from activations to weights
+         Pure INT4 +           |  [GPTQ 2022]
+         Hessian compensation  | *  column-wise OBS + Cholesky
+                               +-----------------------------------------> time
+
+  --------- Shared DNA: "How to fit heavy-tailed LLM weights into a fixed bit budget" ---------
+
+  INT era (2022-2023)           | Microscaling era (2023-2025)    | Scale-optimization era (2025-2026)
+  Change algorithm              | Change format                   | Change how the scale is chosen
+  (Hessian / scale transform)   | (FP4 + block scale)             | (heuristic → optimization)
+  Quantization format is fixed  | Format finally matches the      | Accept the format; treat
+                                | distribution shape              | scale as the variable
+#+end_example
+
+* Insights
+
+*What truly happened is not "one more algorithm was added" — the problem was cut three times.*
+
+First cut: from *INT* to *FP*. Once it was clear that LLM weights follow heavy-tailed distributions, the equally-spaced grid was the wrong tool. MXFP4 made this cut.
+
+Second cut: from *a single scale* to *hierarchical scales*. Once it was clear that outliers are locally clustered, a single global scale wastes dynamic range. NVFP4 made this cut.
+
+Third cut (SOAR): from *choosing scales by heuristic* to *solving for scales by optimization*, and discovering that *the scale on the quantization side and the scale on the dequantization side need not be the same mathematically*.
+
+Each cut takes something that was *assumed to be fixed* and places it back into the space of *choices*. The next cut will most likely fall on:
+
+- *The hardware interface itself becoming a choice* — if the next-generation format (NVFP6? MXFP3?) makes scale precision a configurable parameter, SOAR's optimization paradigm gains ten times the room.
+- *The layer-wise assumption* — SOAR still optimizes within each layer independently. Cross-layer joint optimization is the obvious next cut.
+
+A deeper pattern: *whenever hardware introduces a new format, a wave of "old methods in new bottles" work immediately follows (max-based scale selection is exactly this). Real progress comes when someone realizes that a hidden degree of freedom in the new format has never been exploited — and that degree of freedom almost always lives at the "constrained vs. free" boundary of the hardware interface.* The "quantization-side scale is not locked to FP8" freedom that SOAR found is a textbook example of a boundary degree of freedom.
+
+* Takeaways
+
+1. *When you see a heuristic rule, first ask: can this be written as an optimization problem?* Max-based scale selection was a heuristic rule that sat unquestioned for three years. SOAR simply wrote it as min MSE, found that first-order optimality yields a closed-form solution, and the heuristic collapsed. Many "industry-standard practices" are only standard because *nobody sat down and formulated them as optimization problems* — once you do, they often fall apart.
+2. *When you see a "unified variable," first ask: is unity a mathematical necessity, or merely an engineering coincidence?* In NVFP4 the quantization scale and dequantization scale are assumed identical purely because the storage and execution interface happens to use the same FP8 field. But *quantization is offline; dequantization is inline* — two different processes, two different variables. Decoupling them costs nothing and wins accuracy. Coupled dual variables are a gold mine for papers.
+3. *Asymmetries in the hardware interface are free optimization space.* What SOAR exploits is the fact that "hardware governs runtime but cannot reach into offline PTQ" — a *interface asymmetry*. Every hardware–algorithm collaboration contains such asymmetries; finding one lets you improve performance without touching hardware.
+4. *The moment a field receives a new hardware format (like Blackwell + NVFP4), the time window for scale-level optimization is most profitable.* Every baseline is still using the max-based dead rule inherited from an earlier era; closed-form optimization can claim a free 0.5–1 point gain. This implies a practical strategy: watch for NVFP3 / MXFP3 / the next generation of low-bit formats in the next 1–2 years — the first wave of scale optimization papers after a new format lands are typically the easiest to publish.

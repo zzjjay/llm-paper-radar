@@ -1,0 +1,231 @@
+#+title:      VeriCache: Turning Lossy KV Cache into Lossless LLM Inference
+#+date:       [2026-05-28 Thu 10:52]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T105236-en
+#+source:     https://arxiv.org/abs/2605.17613
+#+authors:    Jiayi Yao, Samuel Shen, Kuntai Du, Shaoting Feng, Dongjoo Seo, Rui Zhang, Yuyang Huang, Yuhan Liu, Shan Lu, Junchen Jiang
+#+venue:      arXiv 2026.05 (UChicago / Tensormesh / Samsung / MSR)
+
+* The River of the Problem
+
+A deceptively simple question: you feed a large model one million tokens of context, and every time it emits a new word, it has to "look over" that entire context again. That look doesn't run through the CPU — it streams the whole thing out of HBM into the chip to compute attention. The longer the context, the more data must move per step, and the slower the output. The thing being shuffled back and forth is the KV cache.
+
+So for the past three years everyone has been doing one thing: *making the KV cache smaller*. Either drop some tokens (the model probably doesn't need all of them anyway), or compress each value into fewer bits. The results look great — throughput goes up two to five times.
+
+But there is a fact that has been consistently sidestepped: *every one of these methods is lossy*. Short answers show no problem; long answers start to fall apart — code generation goes syntactically haywire halfway through, tool-call parameters come out mismatched. At a 4× compression ratio, format-correct code generation drops from 100% to nearly 0%.
+
+The central question of this river is: *can you have the speed of KV compression without sacrificing the correctness of no compression?*
+
+Why is this hard? Because "correctness" is a binary judgment — one wrong semicolon and the entire code block is dead. And every compression method's error accumulates step by step along the autoregressive chain. The reason so many have tried and failed is that every prior solution was aimed at "making fewer mistakes," not at genuinely recovering "zero mistakes."
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | The origin of the KV cache concept: autoregressive decoding caches
+  | K/V from previous steps to avoid recomputing them.
+  | Debt left behind: the longer the context, the larger the cache,
+  | and the slower each step's read becomes.
+  v
+[2023] Leviathan / Chen - Speculative Decoding
+  |
+  | Problem: the big model must do a full forward pass every step.
+  |          Can a small model guess ahead while the big model only verifies?
+  | Solution: a small drafter proposes gamma tokens; the large target
+  |           verifies them in a single parallel forward pass —
+  |           accepted tokens are kept, the first rejected one is resampled.
+  | Key property: output is bit-perfect identical to running the large
+  |               model directly — lossless speedup.
+  v
+[2023] H2O / StreamingLLM (Zhang / Xiao et al.)
+  |
+  | Problem: KV cache fills up HBM; long contexts don't fit.
+  | Solution: keep only "important" tokens (heavy hitters / attention sinks),
+  |           discard the rest.
+  | Debt left behind: discarded tokens are gone for good — lossy.
+  v
+[2024] KIVI / KVQuant (Liu / Hooper et al.)
+  |
+  | Problem: dropping tokens is too coarse; can we keep all tokens
+  |          but represent each with fewer bits?
+  | Solution: per-channel / per-token quantization to 2–4 bit.
+  | Debt left behind: quantization error also accumulates — still lossy.
+  v
+[2024] MagicDec (Sadhukhan et al.)
+  |
+  | Problem: can these lossy methods be "rehabilitated" into lossless ones?
+  | Solution: use compressed KV as the drafter, full KV as the verifier —
+  |           speculative decoding's "self-deceive then self-catch" variant.
+  | Debt left behind: full KV must stay pinned in HBM for the verifier
+  |                   to run at any time — the memory savings are
+  |                   handed right back.
+  v
+[2025] QuantSpec / SparseSpec (Tiwari / Zhao et al.)
+  |
+  | Similar "compressed-as-drafter" approach, but still assumes full KV
+  | lives in HBM; each work also hard-codes a single compressor type.
+  v
+[2026] VeriCache (Yao et al.) <== target paper
+  |
+  | Key insight: evict full KV from HBM — move it to CPU memory or
+  |              remote storage.
+  | Let "draft with compressed KV" (HBM-bandwidth-bound) and
+  |     "swap full KV in to verify" (PCIe/network-bound)
+  | run on different resources, overlapped via cross-resource staggering.
+  | Combine with "high draft acceptance rate amortizes one swap over
+  | many steps" to achieve full-KV output quality at 4× throughput.
+  v
+[Future]  ???
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer + KV cache: an unintended seed
+
+*** What problem it saw
+RNNs encode sequences one step at a time, making hardware parallelism impossible.
+
+*** Its solution
+Discard the temporal recurrence; use attention alone — every position computes similarity directly against every other position. Training is fully parallel.
+
+*** Why it worked (and what new debt it created)
+Training accelerated by orders of magnitude. Inference was a different story: generating one token requires attending over all past tokens, so every generation step re-runs attention from scratch. The engineering compromise was to *store the K and V tensors from every past step* — that is the KV cache. For short contexts it is a harmless optimization; for long contexts it becomes a monster: 100 K tokens occupy ~15 GB, and the entire cache must be read every step. The whole story of KV compression starts here.
+
+** 2023 | Speculative Decoding: introducing the "propose + verify" paradigm
+
+*** What problem it saw
+The large model runs a full network pass for every single token, yet many tokens are "obvious" (the / of / a / …). Making the large model compute those from scratch is wasteful.
+
+*** Its solution
+Recruit a small model (drafter) to propose γ tokens in sequence, then let the large model (target) *verify all γ candidates in a single parallel forward pass* — accepted ones are kept, the first rejection truncates and resamples.
+
+*** Why it worked (and what new debt it created)
+The critical property is *losslessness*: under greedy decoding the output is bit-perfect identical to running the large model directly. This established the template for all subsequent "compression + verification" work: use something *approximate and cheap* to propose, keep something *exact and expensive* to verify, and the final output is exact.
+
+Debt left: the drafter is a separate small model that needs its own training and its own memory footprint. Later work would ask — can we skip the independent small model and let *some simplified form of the large model itself* serve as the drafter?
+
+** 2023–2024 | H2O / StreamingLLM / KIVI / KVQuant: shrinking the KV cache
+
+*** What problem it saw
+Long contexts fill HBM with KV cache. 100 K tokens evict entire batches; at 500 K tokens, reading the KV cache alone costs ~25 ms per decode step.
+
+*** Its solution
+Two tracks:
+- *Token dropping* (H2O, StreamingLLM): keep only "important" tokens — e.g., a few attention sinks at the start plus the most recent N tokens, or the heavy hitters by attention score.
+- *Quantization* (KIVI, KVQuant): keep all tokens, but compress each value from 16-bit down to 2–4 bit.
+
+*** Why it worked (and what new debt it created)
+Both work — average throughput rises 2–5×, and F1 / ROUGE on open-ended QA / summarization tasks barely drops.
+
+But there is a fact everyone privately knows yet collectively avoids: these methods are all *lossy*. The next-token distribution p_lossy produced by a compressed KV differs from the true distribution p_full. On short-answer benchmarks this is invisible because the per-step KL divergence is only ~0.02 nats. *VeriCache runs the exact calculation*: under autoregressive generation, KL accumulates linearly with step count; after 250 steps the cumulative KL is ≈ 6 nats, meaning the probability that the compressed model produces the same output as full KV is e^(−6) ≈ 0.25%.
+
+That is why tasks requiring strict syntactic or semantic validity — code generation, tool calling — collapse: the first 200 lines look fine; the next 200 are garbage.
+
+** 2024 | MagicDec: the first attempt to bridge both tracks
+
+*** What problem it saw
+Compressed KV is fast but lossy; full KV is correct but slow. Can we port the speculative decoding "propose + verify" template here — let *compressed KV propose* and *full KV verify*? The final output would match full KV, but most computation would run on the cheap compressed version.
+
+*** Its solution
+The drafter is not a separate small model but *the same model with a sparse KV cache*; the verifier is *the same model with the full KV cache*. Draft γ tokens, verify in one pass.
+
+*** Why it worked (and what new debt it created)
+This is a clever structural reframing — it transforms KV compression from an "approximation algorithm" into an "approximate drafter," translating the question of output correctness from a *precision problem* into an *acceptance-rate problem* (the more accurately the drafter guesses, the faster inference runs).
+
+But it leaves one very concrete debt: *full KV still has to be pinned in HBM* so the verifier can run at any time. Yet the entire motivation for compression in the first place was that *full KV doesn't fit in HBM* — putting it back defeats the purpose. The memory saved by compression (which was supposed to enable larger batches) is returned. MagicDec works in the single-request long-decoding regime, but in multi-request serving and remote prefix caching scenarios where *HBM is the binding constraint*, its gains largely disappear.
+
+QuantSpec / SparseSpec (2025) follow the same line of reasoning but likewise assume full KV lives in HBM, and each work hard-codes a single compressor type.
+
+** 2026 | VeriCache: evicting full KV from HBM
+
+*** What problem it saw
+MagicDec's fundamental contradiction: *drafting doesn't need full KV; only verification does*. So why does full KV occupy HBM all the time? If it is only needed for the brief verification moment, can it *live in CPU memory or remote storage and be swapped in only then*?
+
+The intuitive objection: swapping is too slow — PCIe 4.0 offers ~32 GB/s; a remote network gives 10–100 Gbps; swapping 60 GB of KV would take 1–5 seconds, slower than just decoding with full KV directly.
+
+*** Its solution
+Two interlocking insights:
+
+1. *Cross-resource staggering* — compressed KV decoding is bottlenecked on HBM bandwidth; full KV swapping is bottlenecked on PCIe / network bandwidth. The two pipes do not contend. So "continuously drafting with compressed KV on the GPU" and "swapping full KV in from CPU" can run *in parallel*: one uses GPU memory bandwidth, the other uses PCIe bandwidth, with no mutual interference.
+
+2. *Long drafting horizon amortization* — compressed KV draft acceptance rates are high (KL only ~0.02 nats per step), so drafting γ tokens yields most of them accepted. Stretching γ out (e.g., 32 or 64 tokens) spreads one swap cost over many accepted tokens, making the amortized overhead of verification small.
+
+Rounding out the design is a unified *compressor interface* that lets both sparse and quantization methods plug in.
+
+*** Why it worked (and what new debt it created)
+In essence, VeriCache restructures MagicDec's "speculative decoding within HBM" into "speculative decoding across memory hierarchy" — extending speculative decoding, originally an optimization purely in the *compute* dimension, into the *storage* dimension.
+
+Measured results: up to 4× throughput versus full KV, with bit-perfect output parity.
+
+New debts (the paper's own Limitations section acknowledges them):
+- Total memory footprint is not actually reduced — full KV still has to live somewhere (CPU / remote); it just moved out of HBM.
+- γ is static — dynamic adjustment is not implemented.
+- One drafter paired with one compressor; cross-architecture combinations are unexplored.
+- The framework has only been applied to "compressed KV as verifier"; other forms of "approximate compute + verify" have not been systematically explored.
+
+* Frontier Extensions
+
+VeriCache was submitted in 2026.05 and no direct follow-on work is yet visible. But following its logic, two directions are foreseeable:
+
+1. *Adaptive drafter* — γ adjusts dynamically with the observed acceptance rate. The paper itself flags this.
+2. *Generalization of the verify paradigm* — the shell of "approximate algorithm + full verify" can be applied far beyond attention: approximate MoE routing + full routing verification, approximate RAG retrieval + full reranking verification, and so on. VeriCache's staggering trick is fundamentally about "finding a pair of approximate/exact algorithms whose resource bottlenecks do not conflict and running them interleaved." That *systems-level ansatz* may prove more valuable than any specific instantiation.
+
+* One Diagram
+
+#+begin_example
+              The river of "fast-but-lossy" vs "slow-but-exact"
+
+  ===========================================================
+   Time ->    2017       2023            2024         2026
+  ===========================================================
+
+  How KV is handled:
+  ------------------
+   Store full KV    full KV        full KV        full KV (HBM)      full KV off-HBM
+   (no opt.)          |               |                |                    |
+                      v               v                v                    v
+   Speed vs quality  slow/exact -> fast/lossy -> fast/lossy -> fast/lossless but -> fast/lossless/
+                                                               HBM-constrained      HBM freed
+
+  Key representatives:
+  --------------------
+   Transformer    Spec.Decode    H2O/KIVI       MagicDec              VeriCache
+   (KV cache      (draft+verify  (drop/quant    (compressed-draft     (move full
+    introduced)   lossless        2-5× but       + full-verify         KV off-GPU,
+                  template)       lossy)          in HBM)              stagger w/ swap)
+
+  What it solved:
+  ---------------
+   Parallel        Lossless       Fits in         Compression +         Compression +
+   training        inference      memory          lossless output       lossless output
+                   speedup                                              + HBM truly freed
+
+  Debt left:
+  ----------
+   Long-context    Drafter is     Output can      Full KV still in      Total KV
+   inference       a separate     look fluent     HBM, competing        footprint not
+   is slow         model with     but be          for resources         actually
+                   training cost  functionally                          reduced
+                                  broken                                (just relocated)
+#+end_example
+
+* Insights
+
+On the surface this river is solving the engineering problem of "KV cache is too large," but viewed from above it is actually tracing the evolution of a deeper idea:
+
+*Phase one* (the compression camp): the default assumption was "approximate is fine — most tasks don't care." This is a *statistician's* view: as long as the average holds, it is good enough.
+
+*Phase two* (MagicDec / VeriCache): the frame flips. *Not every task can tolerate approximation — but every task can tolerate "approximate guess, then exact verify."* This is a *systems engineer's* view: approximation need not compromise correctness; it only needs to compromise the runtime execution path.
+
+At a deeper level, what VeriCache is doing is isomorphic to *speculative execution* in CPUs — the CPU also guesses which branch to take, rolls back on a mispredict, and ultimately guarantees ISA-level semantic correctness. LLM inference is quietly being re-invented as a microarchitecture problem: HBM is L1, CPU memory is L2, remote storage is L3, and draft + verify is branch prediction + rollback.
+
+Where does the next step most likely go? My bet: *the drafter and the verifier will stop sharing the same model*. Once you accept the "approximate + verify" paradigm, the drafter can be anything more aggressive — a different architecture, a different precision, even a rule-based engine — as long as the full model's verify provides the safety net. The entire LLM inference stack may evolve into a two-stage pipeline of *heterogeneous proposers + a single authoritative verifier*.
+
+* Takeaways
+
+1. *Don't develop compression in isolation* — its value may lie not in the final output itself but in *serving as a cheaper proposer*. For any "approximate algorithm" you are building, ask: can it be recast as a drafter, paired with a full verify?
+
+2. *Resource-bottleneck staggering is a severely underrated lever* — VeriCache's core contribution is not a new algorithm; it is the observation that *HBM bandwidth and PCIe bandwidth are two independent pipes*, and running two things in parallel across them is free throughput. In your own systems, find places where "two seemingly sequential steps are actually blocked on different resources" — there is almost always performance left to squeeze.
+
+3. *Benchmark metrics will deceive you* — a 5% drop in F1 / ROUGE can translate to a 95% drop in code generation correctness. When a field starts accepting "lossy but good enough on average" as the default, it is usually exactly the moment when someone can shuffle the deck with "lossless but smarter at runtime." Next time you see "we sacrifice a small amount of accuracy for an X× speedup," ask: does that sacrifice explode in the long tail, in structured output tasks, under autoregressive error accumulation?

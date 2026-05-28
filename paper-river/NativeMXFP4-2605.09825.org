@@ -1,0 +1,391 @@
+#+title:      Pretraining large language models with MXFP4 on Native FP4 Hardware
+#+date:       [2026-05-28 Thu 09:59]
+#+filetags:   :paper:river:quantization:fp4:training:mxfp4:hadamard:amd:
+#+identifier: 20260528T095938
+#+source:     https://arxiv.org/abs/2605.09825
+#+authors:    Musa Cim, Poovaiah Palangappa, Miro Hodak, Ravi Dwivedula, Meena Arunachalam, Mahmut Taylan Kandemir (Penn State + AMD)
+#+venue:      arXiv preprint, May 2026
+
+* 一句话
+
+四年了，从"FP4 推理能不能行"一路打到"FP4 训练能不能撑住"，所有人都把锅扣在
+"激活离群值 + 软件模拟太慢"上。这篇论文搬到了 AMD MI355X 的 *原生 MXFP4* 硬件上，
+一段一段地开 FP4——Fprop 开了行，再开 Dgrad 还行，再开 Wgrad *训练就崩了*。
+然后他们试了一圈"加随机性"的招（stochastic rounding、随机 Hadamard），全都救不回来；
+只有 *确定性 Hadamard 旋转* 把训练拉回 FP8 的轨道，token 开销从 26% 降到 8%。
+结论极冷酷：FP4 训练的不稳定不是"随机性不够"，是 *Wgrad 路径上结构性的 micro-scaling 误差*。
+
+* 这条线的核心问题
+
+整个领域过去四年都在解同一道压缩题：
+
+#+begin_example
+能不能用 4 bit 浮点替掉 16/8 bit，又不让 LLM 训练或推理崩？
+#+end_example
+
+但"崩"这个字，每一代论文看到的层面都不一样：
+
+- *2023* 大家在问：能不能把训练好的模型 *推理* 时塞进 4 bit？（PTQ）
+- *2024* 把问题升级到：能不能干脆 *训练* 就用 4 bit？（emulation）
+- *2025* 又升级到：能不能 *全管线*（forward + 两条 backward）都用 4 bit？（NVFP4/MXFP4 recipes）
+- *2026* 这篇问出了最尖锐的版本：当硬件终于支持原生 FP4 之后，*到底是哪条 GEMM 路径在崩*，
+  以及 *被广泛使用的稳定化技巧（stochastic rounding、随机旋转）真的有用吗*？
+
+每一代论文都看到了前一代的一个盲点。这篇看到的盲点最具体——它说前人开的"全管线 FP4"
+要么靠模拟跑、要么没把崩的位置定位到 Wgrad、要么误以为 *加噪声 = 稳*。
+
+* 溯源地图
+
+#+begin_example
+[2022.09] Outlier Suppression                    Wei et al. (NeurIPS)
+          "outlier 是 LayerNorm 的 gamma 在放大。把 gamma 迁走 + token-wise clip"
+          解法: 等价变换 + 截断，PTQ 把 BERT 6-bit 拉回全精度
+                   |
+                   | 这条支线后来被 Hadamard 旋转接走
+                   v
+[2023.10] LLM-FP4 (PTQ)                          Liu et al. (EMNLP)
+          "PTQ 把 LLaMA-13B 压到 W4A4 浮点，关键观察:
+           inter-channel 方差极高、intra-channel 极低 → 激活有结构性 outlier"
+          解法: per-channel activation scaling, reparameterized 成 weight 的 exponent bias
+                   |
+                   | 问题: 这是 *推理时* 的事；训练时还能不能这么干？
+                   |       而且 per-channel scale 对硬件不算友好
+                   v
+[2023.10] MX Formats (Microscaling)              Rouhani et al. (Microsoft/AMD/Arm 等)
+          "定义一族 MX 数据格式: 一个 block (32 个数) 共享一个 8-bit scale,
+           block 内每个数用窄浮点/整数 (FP4/FP6/FP8/INT8)"
+          解法: 把 'per-tensor scale' 升级到 'per-block scale', 同时硬件友好
+                首次展示 sub-8-bit weight+activation+gradient 训练 GPT-class 模型
+                   |
+                   | 留下: MXFP4 这个 *格式标准* 就此成形, 等硬件支持
+                   v
+[2025.01] Wang et al. (微软)  "Optimizing LLM Training using FP4"
+          "第一次把 FP4 端到端塞进训练框架, 13B / 100B tokens"
+          解法: differentiable quantization estimator (forward-backward 不一致的 STE 升级)
+                + outlier clamping & compensation, mixed precision, vector-wise quant
+                所有实验仍在 *软件模拟* 上跑
+                   |
+                   v
+[2025.02] Zhou et al.  "Towards Efficient Pre-training: FP4"
+          "FP4 训练崩, 那就 mixed-precision 救场——
+           不同 module、不同训练阶段, 用不同精度的目标 schedule"
+          解法: 给每个 layer 配精度策略, 跑出 BF16/FP8 可比的精度
+                   |
+                   | 共同问题: emulation 跑出来的 token 开销和 throughput
+                   |           都不真实, 也没说清"全管线 FP4 为什么崩"
+                   v
+[2025.05] Chmiel et al.  "FP4 All the Way"
+          "200B tokens, NVFP4 (16 个 FP4 共享 E4M3 scale) 最优,
+           backward 用 stochastic rounding, forward 用 RTN"
+          理论贡献: 梯度噪声超过 sqrt(3) 倍量化噪声时, 量化训练就废了
+                   |
+                   | 仍然: emulation. 没区分 Fprop / Dgrad / Wgrad 的贡献.
+                   |       笃信 stochastic rounding 是必备稳定化
+                   v
+[2025.09] Abecassis et al. (NVIDIA)  "Pretraining LLMs with NVFP4"
+          "Blackwell 上 NVFP4 配方一整套, 偏 vendor-specific"
+                   |
+                   v
+[2026.03] Cim et al.  "Diagnosing FP4 Inference"  <-- 本文一作的前作
+          "MXFP4 vs NVFP4 推理时, 哪些 layer / block 最敏感?
+           答: MLP up/down 项目层最敏感, 早期 block 在 MXFP4 下也很敏感"
+                   |
+                   | 这告诉作者: 不同位置敏感性差异巨大 → 训练里也应分位置看
+                   v
+[2026.05] *本文*  Cim et al.  "Pretraining LLMs with MXFP4 on Native FP4"
+          "搬到 AMD MI355X 原生 MXFP4 硬件, 不再 emulation.
+           逐段开 FP4: Wgrad 是崩点; stochastic rounding 和随机 Hadamard 救不了;
+           确定性 Hadamard 把 token 开销 26% -> 8%"
+
+旁支 (Hadamard 这条线):
+[2024.04] QuaRot / SpinQuant  Ashkboos / Liu et al.
+          "把权重和激活用 Hadamard 矩阵旋转, 让分布近高斯, outlier 被稀释.
+           因为 H H^T = I, 不改变 Wx 结果"
+          但这是 *推理*. 本文把它带进了 *训练*, 而且强调 deterministic vs randomized
+#+end_example
+
+* 演化叙事
+
+** 2022.09 | Outlier Suppression: outlier 不是噪声，是 gamma 在放大
+
+*** 它看到了什么问题
+
+在它之前，大家把 Transformer 量化的精度损失当成"分布太散，bit 不够"的简单故事。
+Wei et al. 跑了一圈实验，发现根源更具体：LayerNorm 里的可学参数 gamma 才是真正的
+"outlier 放大器"。哪几个 channel 的 gamma 数值大，对应位置的激活就被无限拉长，
+量化器看到的就是几个柱子顶天，其余全压在地板上。
+
+*** 它的解法
+
+两步：
+- *Gamma migration*: 把 LayerNorm 的 gamma 等价地迁到下一层的权重里，原始计算不变，
+  但激活分布瞬间变平。
+- *Token-wise clipping*: 不同 token 的 outlier 模式不同，分别决定截断阈值。
+
+把 BERT 的 6-bit PTQ 拉回了 fp32 精度。
+
+*** 留给后面的坑
+
+它告诉所有人一件事：*outlier 不是天然就有的，是结构性产生的，可以被等价变换"搬"或"消"*。
+这个思想后来变成两条线——SmoothQuant 用 per-channel scale 搬，QuaRot 用 Hadamard 旋转打散。
+本文走的是第二条。
+
+** 2023.10 | LLM-FP4: 4-bit 浮点推理终于能用
+
+*** 它看到了什么问题
+
+整数 8-bit 推理已经稳了，但低于 8-bit 就崩——尤其是 W4A4。
+原因仍是激活离群值。但 Liu et al. 把观察精确化了：*inter-channel 方差极高，
+intra-channel 方差极低*。换句话说，每个 channel 内部数据挺集中，但 channel 之间差几十倍。
+
+*** 它的解法
+
+既然 channel 之间差得多，就给 *每个 channel* 单独一个 scale。
+然后用一招漂亮的代数：per-channel activation scale 可以重参数化进权重的 *exponent bias*，
+对硬件的额外成本可以忽略。
+
+LLaMA-13B W4A4 推理精度只比全精度低 5.8 分。
+
+*** 留给后面的坑
+
+但这一切都是 *推理* 阶段（PTQ）。训练的时候权重在动、激活分布也在变，
+per-channel scale 怎么实时维护？且 per-channel 在硬件 GEMM 单元里其实并不友好——
+要么用 vector-wise，要么换更结构化的 scheme。MX format 直接接过这第二条路。
+
+** 2023.10 | MX Formats: 把 "per-tensor scale" 升级成 "per-block scale"
+
+*** 它看到了什么问题
+
+PTQ 那一套依赖 "per-channel" 才能压住 outlier，但 channel 维度对 GPU 的 tile-based GEMM
+不天然亲和。同时 per-tensor 一个 scale 又太粗，outlier 直接撑爆 dynamic range。
+
+*** 它的解法
+
+Microsoft + AMD + Arm + NVIDIA + Intel + Qualcomm 合力提了一组数据格式：
+- 把 tensor 切成 *32 个数一组的小 block*
+- 每个 block 单独共享一个 8-bit 指数（power-of-two scale）
+- block 内每个数用窄浮点（FP4/FP6/FP8）或整数
+
+这样 outlier 的影响只限在它所在的 block 内，不会污染整个 tensor；
+同时一个 block 32 个数对 tile-based GEMM 几乎零额外开销。
+
+MX 格式还首次展示了 *训练* 端的 sub-8-bit 收敛——不只是推理。
+
+*** 留给后面的坑
+
+格式定义出来了，但谁也没有原生 FP4 硬件。MXFP4 这个名字此后两年都活在
+"软件模拟 + 等硬件" 的状态里。同时 *训练* 端能不能做 *4-bit*，仍然是开放问题。
+
+** 2025.01-05 | Wang / Zhou / Chmiel: FP4 训练终于跑通，但全在 emulator 上
+
+*** 它们一起看到了什么问题
+
+MX 论文虽然展示过 sub-8-bit 训练，但当时是混着 FP6 用，不是纯 FP4。
+真正的 FP4 训练有两大死角：
+- 权重梯度（Wgrad）的有效范围比 forward activation 大得多，4-bit 根本装不下
+- 激活离群值在训练中实时漂移，PTQ 那套静态 scale 完全失效
+
+*** Wang 2025（Optimizing LLM Training using FP4）
+
+第一个端到端 FP4 训练框架。两个核心招：
+- *Differentiable quantization estimator*: 比传统 STE 更平滑的反向梯度估计
+- *Outlier clamping & compensation*: outlier 截断后, 把损失的能量补回去
+
+加上 mixed-precision（某些层留 8-bit）和 vector-wise quantization, 跑通了 13B / 100B tokens, 精度近 BF16。
+
+*** Zhou 2025（Towards Efficient Pre-training）
+
+更工程：给不同 module（attention vs MLP）、不同训练阶段配不同精度策略，
+跑出 BF16/FP8 可比的精度。本质是 "FP4 单独跑会崩, 就别让它单独跑"。
+
+*** Chmiel 2025（FP4 All the Way）
+
+最深的一篇。200B tokens、7B 参数。关键贡献：
+- NVFP4 格式 (block size 16, scale 用 E4M3 而非 power-of-two) 比 MXFP4 更好
+- backward 用 *stochastic rounding*, forward 用 *round-to-nearest*
+- 推出一个理论门槛：梯度范数低于约 sqrt(3) 倍量化噪声时, 量化训练就废了
+
+*** 它们留给本文的坑
+
+三件事：
+1. *全部跑在软件 emulation 上*——throughput 数据不真实, 训练 stability 也可能被 emulator 的精度污染掉
+2. *没有人把 FP4 拆成 Fprop / Dgrad / Wgrad 三段独立观察*——大家都"一起开"或"一起不开"
+3. *stochastic rounding 被默认为必备稳定化*——FP4 All the Way 直接当成 backward 的标配
+
+这三件事正好对应本文要解决的三个东西。
+
+** 2026.03 | Cim et al.（同一作者）: FP4 推理的位置敏感性
+
+*** 它看到了什么问题
+
+本文一作 Musa Cim 在三个月前发了一篇 "Diagnosing FP4 Inference"——专门把 MXFP4 和 NVFP4
+在不同 layer、不同 block 的 *推理敏感性* 一一测出来。
+
+结论很有意思：
+- MLP up/down projection 一直是 FP4 最敏感的位置
+- gate 和 attention projection 反而宽容
+- 早期 block 在 MXFP4 下也异常敏感（与"最后几层最敏感"的常识不符）
+
+*** 它给本文埋的线
+
+这告诉作者：*FP4 的脆弱性不是均匀分布的, 而是高度结构化的——
+某些路径就是天然不行。* 既然推理时位置敏感性这么强,
+训练时一定也得分位置（Fprop / Dgrad / Wgrad）独立观察, 不能一刀切。
+
+本文几乎是它的训练版续集——同一个分而治之的思路, 搬到训练管线。
+
+** 2026.05 | 本文: 原生 FP4 + 拆段开 + 把"加随机性"证伪
+
+*** 它看到了什么问题
+
+前人 FP4 训练论文（Wang / Zhou / Chmiel）都说自己跑通了, 但本文质疑：
+
+1. 你们跑在 emulation 上, *硬件层面的真实 throughput 谁见过*？
+2. 你们说全管线 FP4 能行, 但 *Fprop、Dgrad、Wgrad 哪个才是 token 开销的真凶*?
+3. Chmiel 把 stochastic rounding 当成 backward 的标配, *它真的稳定了训练, 还是只是在 emulator 上看起来稳*?
+
+*** 它的解法（实验设计本身就是论文的主货）
+
+拿到 AMD MI355X——这是首批支持 *原生 MXFP4 tensor core* 的硬件,
+不需要任何软件模拟。
+
+跑 Llama 3.1-8B + C4 数据集 + MLPerf 标准 setup, 目标：validation perplexity 3.3。
+
+然后做了一个 *progressive ladder*: 别的全固定, 只动一件事——把 MXFP4 从最浅一层一层
+往深开:
+- FP8 baseline -> token 开销 0%
+- 只开 Fprop -> 8-9%
+- 加 Dgrad -> 10-11%  （还在可接受范围）
+- 再加 Wgrad -> *26-27%*  （直接翻三倍）
+
+锁定: *Wgrad 是 FP4 训练的不稳定主因*。
+
+*** 然后试稳定化
+
+每个 stage 都试了三类稳定器:
+- *Stochastic rounding* (Chmiel 等人推崇的标配)
+- *Randomized Hadamard rotation* (随机 sign flip + Hadamard 矩阵)
+- *Deterministic Hadamard rotation* (固定的 H_16 矩阵)
+
+结果非常干净:
+- 前两个在 Fprop / Fprop+Dgrad 上没差别 (~10% 开销)
+- 一旦开到 Wgrad, 前两个 *直接 Does Not Converge*
+- 只有 deterministic Hadamard 把 token 开销拉回 8-9%, 还顺手把 train-step throughput 提了 20%
+  (end-to-end +9-10% 真实加速)
+
+*** 它的真正洞见
+
+不是"用 Hadamard 救 FP4"那么浅。真正的洞见是:
+
+#+begin_example
+FP4 训练不稳是 *结构性 micro-scaling 误差*,
+不是 *随机性不足*.
+#+end_example
+
+stochastic rounding 这种 "加噪音" 的方法, 解的是 "舍入有偏" 的问题——
+但 MXFP4 的真正杀手是: *Wgrad 中某些 channel 进入 block 时, 整个 block 的共享指数
+被它一个人撑爆, 块内其他数全被压成零*。这是结构性的, 不是随机的。
+你再加随机性, 反而把这个结构性误差放大成 noise。
+
+只有 deterministic Hadamard 旋转, 在进入 GEMM 前 *把激活/梯度在 block 内打散成近高斯*,
+让没有一个 channel 能单独撑爆 block scale——这才是真正的稳定化。
+
+*** 它留下了什么新问题（也即它老实承认的局限）
+
+作者自己写在 Key Understanding #3 里:
+- 这个配方在 Llama 3.1-8B + C4 上灵, 不代表在别的模型 / 数据集 / fine-tuning 上灵
+- FP4 训练 recipe 不是 universal 的, 应该按场景重测
+- H_16 比 H_32 快 8%, 但 H 尺寸的最优值依赖硬件 tile size
+
+最大的开放问题: *Wgrad 为什么对 micro-scaling 误差这么敏感*?
+论文只在附录 C 证明了 Hadamard 在数学上不改变前向输出, 但 *为什么 Wgrad 路径上
+这种结构性误差最致命*, 没有理论解释。这是下一篇论文的活儿。
+
+* 问题-解法演化总览图
+
+#+begin_example
++--------------------------------------------------------+
+| 大问题: 4-bit 算力能不能在 LLM 上真实落地?              |
++--------------------------------------------------------+
+       |
+       v
++---------------------+   "outlier 在哪? 怎么消?"
+| 推理 / PTQ 阶段     |
+|---------------------|
+| Wei 2022   gamma 是放大器, 等价迁走
+| Liu 2023   per-channel scale, FP4 W4A4 推理通了
+| Rouhani 23 per-block scale (MX format), 硬件友好
++---------------------+
+       |
+       | 把同一个洞带进训练:
+       | "动态的激活、动态的梯度,
+       |  per-channel scale / per-block scale 还顶得住吗?"
+       v
++---------------------+   "FP4 训练能不能 emulator 跑通?"
+| 训练 / 软件模拟阶段  |
+|---------------------|
+| Wang 2025   differentiable estimator + outlier clamping
+| Zhou 2025   module-wise mixed precision schedule
+| Chmiel 25   200B tokens, NVFP4 + stochastic rounding
++---------------------+
+       |
+       | 但 emulator 数据不真实, 且没人区分 Fprop/Dgrad/Wgrad
+       v
++----------------------------------------------------+
+| 本文 (Cim 2026): 原生 MXFP4 硬件 + 分段拆解         |
+|----------------------------------------------------|
+| 发现: Wgrad 是真正的崩点 (token 开销 8% -> 26%)     |
+| 证伪: stochastic rounding / 随机 Hadamard 救不了    |
+| 提出: deterministic Hadamard 把 Wgrad 也稳住        |
+| 洞见: 不稳是 *结构性* micro-scaling 误差,           |
+|       不是 *随机性* 不足                            |
++----------------------------------------------------+
+       |
+       v
++--------------------------------------------------------+
+| 留下的开放问题:                                          |
+| 1. Wgrad 为什么对 micro-scaling 这么敏感? (无理论)       |
+| 2. 这条 recipe 在别的模型 / 任务上是否成立? (未验证)     |
+| 3. Hadamard 尺寸 H_16 vs H_32, 硬件无关的最优解?         |
++--------------------------------------------------------+
+#+end_example
+
+* 这条线背后真正在发生什么
+
+表面看是 "bit 数从 16 -> 8 -> 4 一路压". 但拆开看, 真正在发生的是 *对"量化误差"
+认知的逐级深化*:
+
+1. *2022 之前*: 误差被当成 i.i.d 高斯噪声, 解法是"分布够窄就行"
+2. *2022 Wei / 2023 Liu*: 发现误差是 *结构化的 outlier* 主导, 解法是"找到放大器, 用等价变换消掉"
+3. *2023 Rouhani*: 误差的局部性可以用 *per-block scale* 限制, 解法变成 "格式本身就让 outlier 不跨界"
+4. *2025 Chmiel*: 误差在 forward / backward 不对称, backward 用 *stochastic rounding* 抵消舍入偏差
+5. *2026 本文*: 误差在三条 GEMM 路径上 *分布也不对称*, Wgrad 路径上的误差是 *结构性* 的,
+   *加随机性反而有害*, 只有 *确定性结构化变换* 能压下去
+
+每一代都把 "误差" 这个对象切得更细——从 "标量噪声" 到 "channel 级离群值"
+到 "block 级 outlier" 到 "路径级敏感性差异". 切得越细, 解法越精准, 也越接近硬件真相。
+
+*下一步最可能往哪走*: 既然 Wgrad 路径如此特殊, 是不是该给 Wgrad *单独设计一个量化格式*?
+（比如 NVFP4 给 forward, MXFP4-with-larger-block 给 Wgrad）。
+或者更激进: *让训练 schedule 自己探测哪条路径该升 8-bit*, 像 Zhou 2025 那样但更细。
+另一条线: 把 Hadamard 旋转换成 *learnable 正交矩阵*, 让它适配模型本身的 outlier 模式
+（QuaRot 后继 SpinQuant 已经在推理端做了, 训练端是空白）。
+
+* 一句话精神内核
+
+#+begin_quote
+当 bit 数压到极限, "随机性救一切" 不再成立——
+得用 *确定性的结构变换* 去匹配 *硬件 micro-scaling 的结构性盲区*.
+#+end_quote
+
+* 诚实标注
+
+- *确认的引用关系*: Wei 2022, Liu 2023, Rouhani 2023, Wang 2025, Zhou 2025, Chmiel 2025,
+  Abecassis 2025, Cim 2026 (Diagnosing FP4 Inference) 都是本文 References 里明确列出的
+- *推测的影响关系*: QuaRot (Ashkboos 2024) 是 Hadamard-for-quantization 这条线最有名的工作,
+  但本文没直接引——本文引的 Hadamard 来源是 Wei 2022. 我把 QuaRot 列在旁支是基于
+  "Hadamard rotation 进入量化语境" 的时间线推断, 不是本文直接致谢
+- *未找到的后续工作*: 本文 2026-05-11 发, 今天 2026-05-28, 仅 17 天.
+  没有在 arXiv 上找到明确针对此文的后续 FP4 训练工作. 可能存在但尚未索引
+- *硬件相关的细节*: AMD MI355X 的 MXFP4 tensor core 实测 throughput 数据
+  来自本文 Table 2, 没有第三方复现

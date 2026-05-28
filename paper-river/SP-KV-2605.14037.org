@@ -1,0 +1,270 @@
+#+title:      Self-Pruned Key-Value Attention: Learning When to Write by Predicting Future Utility
+#+date:       [2026-05-28 Thu 14:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T140000
+#+source:     https://arxiv.org/abs/2605.14037
+#+authors:    Gergely Szilvasy, Manuel Faysse, Maria Lomeli, Matthijs Douze, Pierre-Emmanuel Mazaré, Loïc Cabannes, Wen-tau Yih, Hervé Jégou (Meta FAIR)
+#+venue:      arXiv 2026-05-13 (cs.LG)
+
+* 问题之河
+
+你让一个大模型处理一份十万字的长文档。模型每生成一个新的 token，都要回头看一遍前面所有 token 的 key 和 value。这堆 key/value 就是 *KV cache*。它随着序列长度线性膨胀，每读一次都要从显存里拖出来。
+
+到了 agent 时代、test-time-compute 时代，序列长度动辄上百 K，KV cache 把 GPU 显存和带宽两头都吃干。
+
+九年来所有人都在同一个问题上死磕：能不能 *少存* 一点、或者 *少读* 一点 KV，又不让模型变笨？每往前一步，都是在啃同一块骨头：哪些 token 重要，哪些可以扔；什么时候判断，怎么判断。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. -- Attention Is All You Need
+  |
+  | 看到的问题: RNN 串行、CNN 视野有限，长程依赖抓不住
+  | 解法: 自注意力 -- 每个 token 看所有别的 token
+  | 留下的坑: 推理时每个新 token 都要看完整的过去 -> KV cache 线性膨胀
+  v
+[2020] Beltagy et al. -- Longformer
+  |
+  | 看到的问题: 全注意力 O(N^2)，长文档跑不动
+  | 解法: 固定模式的稀疏注意力 = 局部滑窗 + 少量全局 token
+  | 简化: 模式由人写死，谁是 "全局 token" 提前指定
+  | 留下的坑: 一刀切的模式不知道当下哪个 token 真重要
+  v
+[2023.06] Zhang et al. -- H2O (Heavy-Hitter Oracle)
+  |
+  | 看到的问题: Longformer 那套固定模式太蠢，重要 token 是数据决定的，不是位置决定的
+  | 解法: 跑一遍前向，累积每个 token 收到的注意力分数；
+  |       分高的 = "heavy hitter" 留下，分低的从 cache 里赶出去
+  | 简化: 仍然是 *训完之后* 再做剪枝，模型本身不知道自己在被剪
+  | 留下的坑: 训练时见的是完整 cache，推理时见的是稀疏 cache -- 不一致
+  v
+[2023.10] Xiao et al. -- StreamingLLM
+  |
+  | 看到的问题: H2O 砍着砍着发现最前面几个 token 永远砍不掉，否则模型直接崩
+  | 解法: 显式承认 "attention sink" -- 前 4 个 token 永远保留 + 局部滑窗
+  | 简化: 把 H2O 学到的最强信号 (前几个 token 极重要) 硬编码进规则
+  | 留下的坑: 仍然假装训练用的模型能直接拿来稀疏推理，train-test gap 还在
+  v
+[2025] Lancucki et al. -- DMS (Dynamic Memory Sparsification)
+  |
+  | 看到的问题: StreamingLLM/H2O 全是 post-hoc，模型从没"知道"自己会被稀疏化
+  | 解法: 在预训练好的 checkpoint 上做短期继续训练，
+  |       用 teacher logit distillation + sparsification loss 让模型学会被剪
+  | 简化: 引入了 teacher、引入了 distillation loss -- pipeline 复杂
+  | 留下的坑: 还是分两步 (先有 teacher 再蒸馏)；评分仍然依赖外部目标
+  v
+[2026.04] Jégou et al. -- KVZap
+  |
+  | 看到的问题: H2O 用历史注意力打分，是一个被动统计；
+  |             post-hoc 校准用的 calibration set 太小，分布一变就崩
+  | 解法: 在 *冻结* 的预训练模型上额外训一个轻量打分器，
+  |       学一个比"历史注意力均值"更准的 eviction 策略
+  | 简化: 不动 LLM 权重，只学打分器
+  | 留下的坑: LLM 还是没见过被自己剪过的输入；
+  |           train-test mismatch 在高压缩比下急剧放大
+  v
+[2026.05] Szilvasy et al. -- SP-KV  <-- 本篇
+  |
+  | 看到的问题: 所有 post-hoc 方法 (H2O / StreamingLLM / KVZap) 都有一个共同病根 --
+  |             模型自己不知道它的 KV 会被剪。所以训练时学到的表示，
+  |             和推理时实际能拿到的 KV，根本不是同一套东西。
+  |             DMS 看到了这点但用了蒸馏的弯路。
+  | 解法: LLM 权重 + 一个轻量 utility predictor *联合端到端训练*，
+  |       只用 next-token loss，不要 teacher、不要 distillation。
+  |       训练时用可微 gating 让梯度流过，推理时用阈值硬剪。
+  |       不强制固定压缩比 -- 让模型自己决定每个位置该不该写。
+  v
+[2026+] (前沿延伸) ...
+  -- DeepSeek Sparse Attention (v3.2): query-aware *读* 时稀疏，cache 全留
+  -- Gated DeltaNet: 整层换成 RNN-like 固定大小记忆
+  -- SP-KV 自己的副产品: 用学出来的 head-level 稀疏度做架构搜索，
+     指导设计 hybrid local-global transformer
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 一切的起点，也是一切的债
+
+*** 它看到了什么问题
+
+RNN 一个 token 接一个 token 串行，长程依赖被层层遗忘。CNN 视野只有 kernel 那么宽。两者都抓不住"第 1 个词和第 1000 个词的关系"。
+
+*** 它的解法
+
+每个 token 直接看所有别的 token。三个矩阵 Q、K、V，一个 softmax，关系全部摆在桌面上。
+
+*** 它埋下的坑
+
+推理时是 *autoregressive*：每生成一个新 token，都要把过去所有 token 的 K、V 重新算一遍。为了避免重复计算，把它们缓存起来 -- 这就是 *KV cache*。
+
+它随序列长度 *线性* 膨胀。100K 上下文的 70B 模型，KV cache 能吃掉几十 GB。后面九年所有人做的事，本质上都是在还这笔债。
+
+** 2020 | Longformer: 既然不能全看，那就规定好看哪些
+
+*** 它看到了前一篇的什么问题
+
+Vaswani 的全注意力对长文档不友好 -- O(N^2) 计算量和 O(N) 显存都扛不住。但你又不能完全放弃远距离的信息。
+
+*** 它的解法
+
+每个 token 只看附近一个滑动窗口里的 token (比如 512)，再加上少数几个"全局 token"让所有 token 都能跟它通话。模式是 *固定* 的、*手工设计* 的。
+
+如果你把 Longformer 的全局位置改成"任意位置"、把"是否全局"做成一个学出来的标量，你就开始走向 H2O 了。
+
+*** 它留下的坑
+
+模式由人写死。但 *哪个 token 真重要* 是当下的数据决定的，不是它在序列里的位置决定的。一份代码文件里关键 token 是函数名，一份合同里关键 token 是金额数字 -- 用同一个固定模式扫，注定浪费一半带宽在不重要的位置上。
+
+** 2023.06 | H2O: 让数据告诉你谁该被砍
+
+*** 它看到了前一篇的什么问题
+
+Longformer 用固定位置当 "重要"，但重要性是 *数据相关* 的。同一个位置，在不同输入里重要程度天差地别。
+
+*** 它的解法
+
+跑一遍前向，记录每个 token *被* 其他 token 看的次数 (注意力分数累积值)。这个累积分数高的，叫 "heavy hitter"。
+
+推理时只保留 heavy hitter + 最近的滑窗，剩下的从 KV cache 里赶出去。不需要重新训练，是一个 *post-hoc* 的剪枝策略。
+
+*** 它留下的坑
+
+两条线埋在地下，后面三篇都在挖：
+
+1. *Train-test mismatch*: 模型 *训练* 时见的永远是完整 KV cache。它从来没经历过 "你过去的某些 token 被我藏起来了" 这种情况。推理时硬塞给它一个被剪过的 cache，它的内部表示其实没准备好。
+2. *Sink token 现象*: 实操中发现，最前面的几个 token (BOS, 标点等) 必须保留，否则注意力分布会爆炸。H2O 没解释为什么，只是靠经验留着。
+
+** 2023.10 | StreamingLLM: 给 sink token 一个正式名分
+
+*** 它看到了前一篇的什么问题
+
+H2O 必须留着最前面几个 token 才能跑稳定 -- 这个现象 H2O 自己没正面回答。
+
+*** 它的解法
+
+承认这是一类独立的现象 -- *attention sink*。softmax 要求注意力分数加起来等于 1，但有时候模型其实没什么"想看"的，它就把多余的注意力都倒进开头几个 token 当垃圾桶。
+
+策略简化成：永远留前 4 个 + 最近 N 个滑窗。其他全扔。一行规则，比 H2O 的统计还简单。
+
+*** 它留下的坑
+
+它把 H2O 的统计简化掉了，换来了显著更稳定的极端压缩 (能跑到上百万 token 的流式输入)。但它和 H2O 共享同一个根本病：*post-hoc*。模型的权重根本不知道你在剪它的 cache，它对剪了之后会变成什么样毫无心理准备。
+
+压缩比越高，这道伤口越深。
+
+** 2025 | DMS: 让模型先 "知道" 自己要被剪
+
+*** 它看到了前一篇的什么问题
+
+H2O 和 StreamingLLM 都是把训完的 dense 模型直接拿来稀疏推理。模型 *从没* 在 "你的 KV 会被剪" 的条件下训练过。
+
+*** 它的解法
+
+在预训练好的 checkpoint 上 *继续训练一小段*。目标是让模型学会一个 eviction policy。为了不让模型在短训练中崩坏，引入一个 *teacher*：用原 dense 模型的输出 logits 做 distillation，再叠加一个 sparsification loss。
+
+模型于是边被剪边训练，知道自己未来推理时会处在什么环境里。
+
+*** 它留下的坑
+
+方向对了，但路绕了：
+
+- 需要一个外部 teacher (其实就是它自己的 dense 版本) 来稳定训练
+- 需要 distillation loss + sparsification loss + LM loss 三个目标拼起来调参
+- pipeline 比 post-hoc 复杂得多
+
+如果模型自己 *只用* next-token loss 就能学会被剪 -- 那 teacher 和 distillation 全都是多余的脚手架。
+
+** 2026.04 | KVZap: 学一个比统计更准的打分器
+
+*** 它看到了前一篇的什么问题
+
+DMS 改了模型权重，复杂。H2O 那种用注意力均值做评分的，是被动统计，不够准。能不能 *不动模型权重*、只学一个轻量的打分器，把 eviction 做得比 H2O 准？
+
+*** 它的解法
+
+冻结预训练好的 LLM。额外训一个 *KV utility predictor* -- 一个轻量神经网络，吃 token 的隐藏状态，吐出一个"将来有多有用"的分数。
+
+推理时用这个分数做 eviction。比 H2O 的统计更聪明，比 DMS 的 pipeline 更简单。
+
+*** 它留下的坑
+
+它解决了"打分器够不够聪明"，但绕开了"模型本身知不知道"这个更深的问题。LLM 权重还是没见过被剪过的 cache。
+
+这道 train-test gap 在压缩比上去后依然张牙舞爪：在 SP-KV 论文 Table 2 里，KVZap 在 ~20% 密度下 NLL 增加 +1.23%，在 15% 密度下 +1.77% -- 已经是 post-hoc 阵营里最强的，但还是比 SP-KV 差一个数量级。
+
+** 2026.05 | SP-KV: 把脚手架全拆了
+
+*** 它看到了前一篇的什么问题
+
+DMS 看对了方向 (模型要 *知道* 自己被剪)，但用了 teacher + distillation 这套脚手架。KVZap 看对了简洁 (轻量打分器)，但守着 frozen LLM 不动，没真正解决 train-test gap。
+
+两边各对一半。
+
+*** 它的解法
+
+把两件事一次做了：
+
+1. 一个轻量 utility predictor，跟 KVZap 同思路 -- 给每个 KV pair 打分。
+2. 但 *不冻结 LLM*。让 LLM 权重和 predictor *一起* 端到端训练，目标 *只用* next-token loss。
+
+训练时为了能反向传播，把硬阈值换成可微 gating (论文用了带温度退火的连续门)。推理时切回硬阈值：分数过线写进 cache，不过线直接丢。最近 128 个 token 永远保留 (吸收 StreamingLLM 的教训)。
+
+如果你把 KVZap 的 frozen LLM 解冻、把 DMS 的 teacher 和 distillation loss 去掉、把所有 sparsification 辅助目标去掉，只留 next-token loss -- 你就得到了 SP-KV。
+
+*** 几个意外的好处
+
+- *不强制固定压缩比*：模型自己决定每个位置该不该写。结果是 *输入越长越能压* (因为长序列里冗余更多)，平均压到 3-10 倍。
+- *NLL 几乎不掉*：25% 密度下 NLL 只升 +0.08%，是 KVZap 的十几分之一。
+- *副产品: 架构指南*：训完之后看每个 head 学到的平均 utility，发现稀疏度在 layer 和 head 之间结构化分布。把高 utility 的 head 设为 global、低 utility 的设为 local，搭出来的 hybrid 架构比标准 interleave 还好。
+
+*** 它留下了什么新问题
+
+- joint training 需要 continued pretraining，计算成本比 KVZap 的轻量 post-hoc 高 (虽然比从头训 DMS 便宜)
+- 阈值是手工设的；不同任务 / 不同长度的最优阈值还在探索
+- 这套机制能不能搬到更激进的架构 (MLA、Gated DeltaNet 等) 还没验证
+
+* 问题-解法总览
+
+#+begin_example
+                        |  谁来评分           | 模型权重  | 训练目标                | 评分准吗  | 模型知道吗
+------------------------+---------------------+----------+-------------------------+-----------+------------
+Vaswani Transformer     |  (不评分, 全留)     |    --    |  next-token             |   N/A     |   N/A
+Longformer              |  位置 (人写死)      |  pretrain|  next-token             |   差      |   不知道
+H2O                     |  历史注意力累积     |  frozen  |  无 (post-hoc 推理时跑) |   一般    |   不知道
+StreamingLLM            |  位置 (前 4 + 滑窗) |  frozen  |  无                     |   极简    |   不知道
+DMS                     |  学出来的 policy    |  finetune|  next-token + distill   |   好      |   知道 (蒸馏)
+KVZap                   |  学出来的 predictor |  frozen  |  predictor-only loss    |   好      |   不知道
+SP-KV                   |  学出来的 predictor |  联合训练|  *只用* next-token      |   最好    |   *知道*
+#+end_example
+
+整条线在做一件事：让"是否保留某个 KV"这个决策，从 *人写死的位置规则*，演化到 *基于历史的被动统计*，再演化到 *学出来的主动评分*；同时让 *模型本身* 从 "完全不知情" 演化到 "知情但靠蒸馏教" 演化到 "知情且自己学会"。
+
+* 内核洞见
+
+这条九年演化线的真正主题，不是 "怎么压缩 KV cache"。
+
+是 *训练-推理一致性* (train-inference consistency) 这个更老、更根本的话题在一个新场景里的重演。
+
+- H2O / StreamingLLM / KVZap: 试图在 *推理侧* 用越来越聪明的策略弥补一致性裂缝
+- DMS: 第一次承认裂缝必须在 *训练侧* 缝合，但用了蒸馏这条"教师-学生"的传统拐杖
+- SP-KV: 发现拐杖可以扔 -- 只要让稀疏化机制 *从训练第一秒就在场*，next-token loss 自己就会教会模型一切
+
+这其实是过去几年深度学习反复学到的同一课：
+- Dropout 当年也是先 post-hoc，后来发现必须训练时就在
+- Quantization-aware training 战胜了 post-training quantization
+- Mixed precision 训练战胜了训完再降精度
+
+每次都是同一个故事：*别在事后弥补，让模型从一开始就生活在它最终要工作的环境里*。
+
+* 下一步可能往哪走
+
+1. *联合训练 + 极简 loss 这个范式，会被复用* -- 类似套路可以套到 quantization-aware、tool-use-aware、retrieval-aware 训练。本质上是 "让模型在它推理时的真实环境下学习"。
+2. *架构-评分一体化* -- SP-KV 的副产品 (用学到的 head utility 指导 local/global 设计) 暗示了一个更激进的路线: KV cache 压缩、head 类型选择、layer 类型选择全部融进一个联合优化目标，从训练中长出最优架构而不是手工 ablation。
+3. *动态 vs 固定压缩比的钟摆* -- 工业部署喜欢 *可预测* 的内存占用，SP-KV 的 "输入越长越能压" 反而让显存预算难规划。会有人做 "保证 X% 密度上限的 SP-KV 变种"。
+4. *跟 sparse-read 的合流* -- SP-KV 决定 "写不写"，DeepSeek Sparse Attention 决定 "读不读"。下一篇大概率把两者放进同一个端到端目标里同时优化。
+
+* 备注
+
+- 引用关系: SP-KV 论文 Section 5 (Related Work) 和 Appendix A 直接对比 H2O、StreamingLLM、KVZap、DMS，因此 SP-KV → 这四篇的批判线是 *确认的*。
+- 推测部分: Longformer → H2O 的演化线是基于 "从固定模式到学习评分" 的领域共识构造的，*非直接引用关系*。Vaswani 2017 是所有 transformer 工作的共同祖先，未在 SP-KV 中被批判。
+- 前沿延伸 (DeepSeek Sparse Attention v3.2、Gated DeltaNet) 是 SP-KV 在 Introduction 中并列提到的同时代工作，*不是* SP-KV 的后续。真正的后续要等几个月才会出现。

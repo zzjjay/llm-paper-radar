@@ -1,0 +1,213 @@
+#+title:      Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion
+#+date:       [2026-05-28 Thu 10:30]
+#+filetags:   :paper:river:
+#+identifier: 20260528T103000
+#+source:     https://arxiv.org/abs/2605.12825
+#+authors:    Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham, Ryan A. Rossi, Franck Dernoncourt, Thien Huu Nguyen
+#+venue:      arXiv preprint, 2026-05
+
+* 一句话开场
+
+LLM 一字一字往外吐字太慢——人们花了五年时间想让它一口气吐一整块，每一次尝试都换来质量塌方，*Orthrus* 是这条路上第一个真正做到既快又一字不差的方案。这条线讲的就是这个"鱼与熊掌"是怎么被一刀两刀劈开的。
+
+* 真正的主角：那个问题
+
+"AR 模型质量好但慢，并行模型快但质量差。能不能同时要？"
+
+这是一个看上去很物理的问题——速度和保真度，听起来必然要二选一。这条演化线，本质是一群人五年里反复试图证明：这个二选一是个伪命题。每一篇论文都在用不同的方式回答同一个问题，每一次都被现实打回去一次，每次回去都学到一点新东西。
+
+* 溯源地图
+
+#+begin_example
+
+           [L5: GPT / AR Decoding]
+                Radford 2019
+                自回归，慢但准
+                       |
+                       | "能不能不一个一个出？"
+                       v
+       [L4: Discrete Diffusion for Text]
+              D3PM (Austin 2021)
+              SEDD / MDLM (2024)
+              把扩散搬到离散 token 上
+                       |
+                       | "从零训练太贵，质量也不够"
+                       v
+        [L3: 端到端训练的 DLM]
+              LLaDA (2025) / Dream (2025)
+              规模化扩散语言模型
+                       |
+                       | "AR 模型已经训好了，直接改不香吗？"
+                       v
+      [L2: AR -> Diffusion 适配]
+              Fast-dLLM-v2 (Wu 2025)
+              SDAR (Cheng 2025)
+              微调 AR 变 DLM，省训练但还是掉点
+                       |
+                       | "改基座必然漂移——能不能不改？"
+                       v
+         [L1: Orthrus (本文, 2026.05)]
+              冻住 AR，旁边接一个 diffusion head
+              共享 KV cache，用 AR 自己当 verifier
+              7.8x 加速 + 严格无损
+                       |
+                       v
+        [L0: 未来：多步并行 / 多模态扩散]
+
+  另一条平行支线（被 Orthrus 用来对比）：
+         Speculative Decoding (Leviathan 2022)
+              -> EAGLE-3 (2025)
+              -> DFlash (2026)
+              另开一个小模型 draft，验证后接受
+              问题：要养两个模型，KV cache 翻倍
+
+#+end_example
+
+* 一层一层倒回去
+
+** L5：源头——AR 是怎么把自己锁进顺序里的
+
+回到 2019 年。GPT-2 用 Transformer 跑自回归——预测下一个 token 时严格条件在之前所有 token 上。这件事在数学上漂亮：联合概率被精确分解成 ~p(x1)*p(x2|x1)*p(x3|x1,x2)*...~，没有任何独立性假设，没有任何近似。所以 AR 拿到的是 *真实分布*。
+
+代价是：要出 N 个 token，必须做 N 次前向。每一次前向都要把之前所有 KV cache 重新读一遍。所以推理的瓶颈不是算力，是 *显存带宽*。GPU 算力闲着，带宽爆满，这就是 Leviathan 2022 那篇 Speculative Decoding 里说的 "memory-bandwidth-bound bottleneck"。
+
+记住这件事：AR 的慢，不是因为算得慢，是因为读得慢。
+
+** L4：第一波反抗——把图像扩散搬到文字上
+
+人们看着图像扩散（DDPM, 2020），眼睛发亮——那玩意儿一步出一张图，并行得很自然。于是 Austin 等人 2021 年提了 D3PM (Discrete Denoising Diffusion Probabilistic Models)：能不能把这套搬到离散 token？
+
+思路是：在文本上加噪声（把一些 token 替换成 [MASK]），训一个网络一步去噪。生成时反过来——从一堆 [MASK] 开始，逐步揭开，每一步都是 *一整块一起预测*。
+
+到了 2024 年，SEDD (Lou) 和 MDLM (Sahoo) 把这个思路打磨得更干净——发现 *Masked Diffusion* 这个变种在性能和稳定性上都更好，本质上就是 BERT 那种 fill-in-the-blank，但加上一个迭代去噪的外壳。
+
+突破点：生成不再是顺序的。代价：训练目标用了一个 *条件独立假设*——预测 token y_k 时不看已揭开的 y_{k-1}。这在数学上就把和 AR 的真实分布 *撕开了一条缝*。
+
+** L3：规模化的尝试——LLaDA 和 Dream
+
+到 2025 年，有人把扩散语言模型规模化到 7B 量级，叫 LLaDA、Dream。在 580B token 上从零训练，目标就是证明 DLM 能正面打 AR。
+
+结果：能并行出字，速度漂亮。但在 GSM8K、MATH-500 这些推理任务上，*同规模下系统性落后 AR*。Dream-7B 在 MATH-500 拿 39.6 分，同期 AR 模型轻松上 80 分。
+
+为什么差？两点：
+1. *条件独立假设的代价* —— 长序列上误差一步步累积，叫"条件漂移 (conditional drift)"。
+2. *训练成本天文* —— 580B token 从零训练，等于又造了一遍预训练。中小机构玩不起。
+
+这里大家开始想：何必从零？已经有训好的 AR 模型了，能不能拿过来"改造"成 DLM？
+
+** L2：AR -> Diffusion 适配——以为捡到便宜
+
+2025 年下半年，Fast-dLLM-v2 (Wu)、SDAR (Cheng) 走这条路。思路：把 Qwen 或 LLaMA 这种已经训好的 AR 模型，拿去做 *Block-wise Masked Diffusion* 的二阶段微调，让它学会一次出一整块。
+
+省了从零训练，看起来很美。继续训 50B token 量级就能跑起来。但问题不肯走：
+
+- *Fast-dLLM-v2 在 MATH-500 上比它的 AR 基座掉 11 分。* 论文原话："adapted models lose the ability to recover the exact predictive distribution of the original baseline"。
+- 为了把质量找回来，推理时要跑 *多次迭代 refinement*。理论上的并行加速被这些 refinement 步骤吃光，最后实测加速 1-2x，聊胜于无。
+- 改了基座权重就是改了。AR 那个"严格因果"的优点就废了。
+
+这一步教训很关键：*只要你动了 AR 的权重，分布就漂*。无论你训得多小心。
+
+读到这儿你应该已经在心里替作者想下一步了——*那别动权重不就行了？*
+
+** L1：Orthrus——这次他们终于不动 AR 了
+
+Orthrus 的核心一句话：*把原来的 AR 模型冻起来，旁边并排接一个 diffusion head，让它们共享同一份 KV cache。*
+
+具体怎么搬：
+
+1. *双头共享 KV cache* —— Transformer 每一层里，原来有一个 attention（AR head），现在旁边再加一个 attention（diffusion head）。两个头共用 K 和 V。Prefill 时只走 AR head 建 cache，生成时让 diffusion head 一次性出一块 K 个候选 token。
+2. *只训 diffusion head，AR 完全冻死* —— 全模型只有 ~16%~ 的参数在训，训 ~<1B~ token，单 8xH200 节点 24 小时搞定。
+3. *用 AR 自己来 verify* —— Diffusion head 出了 K 个候选 token 后，把它们塞回 AR head 走一遍前向。AR head 一次性算出每个位置的正确分布，逐位比对——和 greedy AR 预测一致就接受，不一致就在第一个分歧点截断、用 AR 的答案补上。
+
+这个 verify 机制就是 *intra-model consensus*。它和 Speculative Decoding 在哲学上完全一致——*让快的做投机，让准的做裁判*——但 Speculative 用两个独立模型（draft + target），Orthrus 用 *同一个模型的两个头*。
+
+结果：在 Qwen3-8B 上 5.39x 平均加速，MATH-500 96.0 分（和 AR 基座完全一致），把适配派那些方案按在地上摩擦。
+
+而且因为是冻 AR 的——*Orthrus 拿到的是基座模型的精确推理质量。你换更强的基座，Orthrus 就更强。* 这件事在工程上很值钱。
+
+** 旁路对比：为什么不直接用 Speculative Decoding？
+
+Speculative Decoding (Leviathan 2022) 的思想其实和 Orthrus 几乎一样——快模型出草稿，准模型来验。EAGLE-3 (Li 2025) 是当前 SoTA。
+
+但有个硬伤：*draft 模型和 target 模型是分开的*，意味着两套 KV cache、两套权重。对大模型来说显存翻倍。Orthrus 的卖点就是把"草稿"塞进同一个模型的同一份 KV cache 里，~O(1)~ 显存额外开销。
+
+* 演化线的核心戏剧
+
+#+begin_example
+
+  问题：能不能既快又准？
+  ======================
+
+  L5  AR (GPT)
+      策略：严格因果
+      赢：保真度满分
+      输：必须一步一步走
+                |
+                | "扔掉因果"
+                v
+  L4  Discrete Diffusion (D3PM/MDLM)
+      策略：条件独立 + 迭代去噪
+      赢：天然并行
+      输：分布漂了
+                |
+                | "规模化把质量推回来"
+                v
+  L3  LLaDA / Dream
+      策略：从零训练 7B 量级 DLM
+      赢：证明 DLM 能跑大
+      输：质量还是追不上 AR，训练巨贵
+                |
+                | "改造现成 AR 省钱"
+                v
+  L2  Fast-dLLM-v2 / SDAR
+      策略：微调 AR 变 DLM
+      赢：省训练
+      输：改基座必然漂移（MATH-500 掉 11 分）
+                |
+                | "那就别改基座"
+                v
+  L1  Orthrus
+      策略：冻 AR，加 diffusion head，共享 KV，自己验自己
+      赢：5x+ 加速 + 严格无损 + 16% 可训参 + 单节点 24h
+      输：仍是两次前向/cycle（理论下界 0.5 TPF）
+                |
+                v
+       下一步：多步并行？跨模态扩散？
+
+#+end_example
+
+* 这条线背后真正在发生什么
+
+表面看是"加速 LLM 推理"的技术迭代。往深处看，这条线讲的是一件更微妙的事——*关于"如何修改一个已经很好的东西"的认知转变*。
+
+- L4-L3 的世界观：*推翻重来*。AR 不行，那就换扩散范式从头训。
+- L2 的世界观：*改造适配*。AR 是好东西，但稍微改改它的权重让它会并行。
+- L1 的世界观：*寄生而不入侵*。AR 一个字都不动，把新能力 *附着* 在它身上，用它自己来背书。
+
+最后这个范式很有意思——它把 AR 模型当成了一个 *不可侵犯的 oracle*。你可以借它的表征（KV cache）、借它的判断（verifier），但不能动它一根毛。这种"信任并寄生"的设计哲学，其实和 LoRA、Adapter、Speculative Decoding 是同一种东西——*承认基座模型本身就是答案，你的任务是搭脚手架，不是拆房子*。
+
+放大看，这是过去三年大模型工程的一个共同方向：从"训练 = 修改权重"转向"训练 = 在不动权重的前提下加能力"。Orthrus 在并行解码这条线上把它推到了一个干净的形态。
+
+* 下一步会去哪
+
+1. *多步并行* —— Orthrus 目前 diffusion head 只跑一步去噪就丢给 verifier。如果跑多步（像传统 DLM 那样），草稿质量更高、verify 接受率更高，但每 cycle 多一些前向。这是个明显的设计旋钮。
+2. *跨模态* —— 同样的"冻基座 + 加并行 head"思路可以搬到视觉、语音的 AR 模型上（比如 VAR、AudioLM）。Orthrus 这套架构没有任何文本特异性。
+3. *和 Speculative Decoding 融合* —— 现在 Orthrus 用同模型 verify，但理论上也可以再嵌一个更小的 draft head，三层接力。
+
+最大的开放问题是：*5.39x 是不是这条架构路线的上限？* 如果是，下一波加速要换路线（比如 MoE-style 稀疏激活、或者直接架构层面的非自回归 Transformer）。
+
+* 内核
+
+#+begin_quote
+*真正的工程美感，是承认你做不出比基座更好的判断，于是让基座来当裁判，自己只负责猜得快。*
+#+end_quote
+
+并行解码这条五年线，本质是从"想替代 AR"到"想伺候好 AR"的认知转变。
+
+* 诚实标注
+
+- L1 → L2 → L3 的批判链是论文 §2.2 明确写出来的，引用关系确认。
+- L4 (D3PM/SEDD/MDLM) 是 LLaDA/Dream 那一辈的理论基础，引用链清楚但 Orthrus 本文没直接点名。
+- L5 (GPT/AR) 在 Orthrus §1 引言中明确作为"sequential bottleneck"的代表被批评。
+- Speculative Decoding 支线是 Orthrus §4.4 显式对比的对象，不是推测。
+- 后续展望（多步并行、跨模态）是推测，论文未明确承诺。

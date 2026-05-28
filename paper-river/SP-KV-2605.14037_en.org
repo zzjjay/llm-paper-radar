@@ -1,0 +1,293 @@
+#+title:      Self-Pruned Key-Value Attention: Learning When to Write by Predicting Future Utility
+#+date:       [2026-05-28 Thu 14:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T140000-en
+#+source:     https://arxiv.org/abs/2605.14037
+#+authors:    Gergely Szilvasy, Manuel Faysse, Maria Lomeli, Matthijs Douze, Pierre-Emmanuel Mazaré, Loïc Cabannes, Wen-tau Yih, Hervé Jégou (Meta FAIR)
+#+venue:      arXiv 2026-05-13 (cs.LG)
+
+* The River of the Problem
+
+You ask a large model to process a hundred-thousand-word document. Every time it generates a new token, it must look back at the keys and values of every previous token. That heap of keys and values is the *KV cache*. It grows linearly with sequence length, and each access drags the whole thing out of GPU memory.
+
+In the era of agents and test-time compute, sequences routinely stretch to hundreds of thousands of tokens, and the KV cache devours both GPU memory and memory bandwidth simultaneously.
+
+For nine years everyone has been grinding on the same question: can we *store* less, or *read* less of the KV, without making the model dumber? Every step forward is another bite of the same bone: which tokens matter, which can be discarded, when to judge, and how.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. -- Attention Is All You Need
+  |
+  | Problem seen: RNNs are serial; CNNs have limited receptive fields;
+  |               long-range dependencies slip through
+  | Solution: self-attention -- every token attends to every other token
+  | Debt left: at inference, each new token must attend to the full past
+  |            -> KV cache grows linearly
+  v
+[2020] Beltagy et al. -- Longformer
+  |
+  | Problem seen: full attention is O(N^2); long documents are intractable
+  | Solution: fixed-pattern sparse attention = local sliding window +
+  |           a few global tokens
+  | Simplification: the pattern is hand-coded; which tokens are "global"
+  |                 is decided in advance
+  | Debt left: a one-size-fits-all pattern cannot know which token
+  |            actually matters right now
+  v
+[2023.06] Zhang et al. -- H2O (Heavy-Hitter Oracle)
+  |
+  | Problem seen: Longformer's fixed positions are too crude;
+  |               importance is data-driven, not position-driven
+  | Solution: run a forward pass; accumulate the attention score each token
+  |           receives; high-score tokens = "heavy hitters" kept in cache;
+  |           low-score tokens evicted
+  | Simplification: still post-hoc -- the model itself is unaware of pruning
+  | Debt left: training sees a full cache; inference sees a sparse cache --
+  |            train-test mismatch
+  v
+[2023.10] Xiao et al. -- StreamingLLM
+  |
+  | Problem seen: H2O keeps finding that the very first tokens can never be
+  |               dropped without catastrophic collapse
+  | Solution: formally acknowledge "attention sinks" -- always keep the
+  |           first 4 tokens + a local sliding window
+  | Simplification: hard-codes H2O's strongest empirical signal
+  |                 (first tokens are critical)
+  | Debt left: still assumes a dense-trained model can be used directly
+  |            for sparse inference; train-test gap remains
+  v
+[2025] Lancucki et al. -- DMS (Dynamic Memory Sparsification)
+  |
+  | Problem seen: StreamingLLM/H2O are fully post-hoc; the model has never
+  |               "known" it will be sparsified
+  | Solution: short continued training on a pretrained checkpoint;
+  |           teacher logit distillation + sparsification loss teach the
+  |           model to tolerate pruning
+  | Simplification: introduces a teacher and a distillation loss --
+  |                 complex pipeline
+  | Debt left: still two stages (teacher first, then distillation);
+  |            the scoring signal still depends on an external objective
+  v
+[2026.04] Jégou et al. -- KVZap
+  |
+  | Problem seen: H2O's accumulated-attention scoring is passive statistics;
+  |               post-hoc calibration on a small calibration set breaks
+  |               under distribution shift
+  | Solution: freeze the pretrained LLM; train a lightweight scorer on top
+  |           that learns a better eviction policy than "mean attention"
+  | Simplification: LLM weights stay frozen; only the scorer is trained
+  | Debt left: the LLM has still never seen its own pruned inputs;
+  |            train-test mismatch explodes at high compression ratios
+  v
+[2026.05] Szilvasy et al. -- SP-KV  <-- this paper
+  |
+  | Problem seen: every post-hoc method (H2O / StreamingLLM / KVZap) shares
+  |               the same root pathology -- the model does not know its KV
+  |               will be pruned. The representations learned at training time
+  |               and the KV actually available at inference time are simply
+  |               not the same thing.
+  |               DMS identified this but took the detour of distillation.
+  | Solution: jointly train LLM weights + a lightweight utility predictor
+  |           end-to-end with next-token loss only -- no teacher, no
+  |           distillation. During training, use differentiable gating so
+  |           gradients flow through; at inference, switch to a hard threshold.
+  |           No fixed compression ratio -- the model decides for itself
+  |           whether to write each position.
+  v
+[2026+] (frontier extensions) ...
+  -- DeepSeek Sparse Attention (v3.2): query-aware *read*-time sparsity,
+     full cache retained
+  -- Gated DeltaNet: entire layer replaced with RNN-like fixed-size memory
+  -- SP-KV's own byproduct: use learned head-level sparsity to guide
+     architecture search for hybrid local-global transformers
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: The Origin of Everything — and the Source of All Debt
+
+*** What problem it saw
+
+RNNs process one token at a time serially; long-range dependencies fade layer by layer. CNNs are bounded by their kernel width. Neither can capture "the relationship between word 1 and word 1,000."
+
+*** Its solution
+
+Every token attends directly to every other token. Three matrices Q, K, V; one softmax; all relationships laid on the table at once.
+
+*** The debt it buried
+
+Inference is *autoregressive*: generating each new token requires recomputing the K and V of every past token. To avoid redundant computation, they are cached — this is the *KV cache*.
+
+It grows *linearly* with sequence length. For a 70B model with a 100K context, the KV cache can consume tens of gigabytes. Everything everyone has done in the nine years since is, at its core, paying back this debt.
+
+** 2020 | Longformer: If You Can't Attend to Everything, Decide in Advance What to Attend To
+
+*** What problem it saw in the predecessor
+
+Full attention is intractable for long documents — both O(N^2) compute and O(N) memory are prohibitive. But you cannot simply abandon long-range information.
+
+*** Its solution
+
+Each token attends only to a local sliding window (e.g., 512 tokens), plus a small number of "global tokens" that every token can communicate with. The pattern is *fixed* and *hand-designed*.
+
+If you let the global positions be arbitrary and turn "is this token global?" into a learned scalar, you begin moving toward H2O.
+
+*** The debt it buried
+
+The pattern is written by a human. But *which token actually matters* is determined by the data at hand, not by its position in the sequence. In a source file the critical tokens are function names; in a contract they are monetary figures — scanning with the same fixed pattern wastes half your bandwidth on unimportant positions.
+
+** 2023.06 | H2O: Let the Data Tell You Who Gets Cut
+
+*** What problem it saw in its predecessor
+
+Longformer treats fixed positions as "important," but importance is *data-dependent*. The same position can be critical in one input and irrelevant in another.
+
+*** Its solution
+
+Run a forward pass and record the cumulative attention score each token *receives* from others. Tokens with high cumulative scores are "heavy hitters."
+
+At inference, keep only heavy hitters plus a recent sliding window; evict the rest from the KV cache. No retraining required — a purely *post-hoc* pruning strategy.
+
+*** The debt it buried
+
+Two fissures form here that the next three papers will excavate:
+
+1. *Train-test mismatch*: the model *trains* on a complete KV cache, always. It has never experienced "some of your past tokens have been hidden from you." Handing it a pruned cache at inference time is handing it an environment its internal representations were never prepared for.
+2. *The sink-token phenomenon*: in practice, the first few tokens (BOS, punctuation, etc.) must always be kept or the attention distribution explodes. H2O has no explanation; it just keeps them empirically.
+
+** 2023.10 | StreamingLLM: Giving Sink Tokens an Official Name
+
+*** What problem it saw in its predecessor
+
+H2O must always keep the first few tokens to remain stable — a fact H2O itself never addressed head-on.
+
+*** Its solution
+
+Acknowledge this as a distinct phenomenon — *attention sinks*. Softmax forces attention weights to sum to one, but sometimes the model has nothing it really "wants" to look at, so it dumps the excess attention into the opening tokens as a garbage bin.
+
+The policy simplifies to: always keep the first 4 tokens + a recent sliding window of size N. Everything else is discarded. One rule, even simpler than H2O's statistics.
+
+*** The debt it buried
+
+It strips away H2O's statistics in exchange for dramatically more stable extreme compression (enabling streaming inputs of millions of tokens). But it shares H2O's fundamental disease: *post-hoc*. The model's weights have no idea its cache is being pruned; it has no preparation for what it will look like after pruning.
+
+The higher the compression ratio, the deeper this wound.
+
+** 2025 | DMS: Making the Model "Know" It Will Be Pruned
+
+*** What problem it saw in its predecessors
+
+H2O and StreamingLLM both take a dense pretrained model and apply sparse inference directly. The model has *never* been trained under the condition "your KV will be pruned."
+
+*** Its solution
+
+*Continue training* on a pretrained checkpoint for a short period. The goal is to teach the model an eviction policy. To keep the model from collapsing during this brief training, a *teacher* is introduced: distill from the original dense model's output logits, overlaid with a sparsification loss.
+
+The model therefore trains while being pruned, learning what environment it will inhabit at inference time.
+
+*** The debt it buried
+
+The direction is right, but the path is roundabout:
+
+- Requires an external teacher (the dense version of itself) to stabilize training
+- Requires three objectives stitched together: distillation loss + sparsification loss + LM loss
+- The pipeline is far more complex than any post-hoc method
+
+If the model could learn to tolerate pruning *with only* next-token loss — the teacher and distillation would be unnecessary scaffolding.
+
+** 2026.04 | KVZap: Learning a Scorer Smarter Than Statistics
+
+*** What problem it saw in its predecessors
+
+DMS modifies the model weights — complicated. H2O's attention-mean scoring is passive statistics — not accurate enough. Can we *leave the model weights frozen* and just learn a lightweight scorer that evicts better than H2O?
+
+*** Its solution
+
+Freeze the pretrained LLM. Train a separate *KV utility predictor* — a lightweight neural network that takes a token's hidden state and outputs a "how useful will this be in the future?" score.
+
+Use that score to drive eviction at inference time. Smarter than H2O's statistics; simpler pipeline than DMS.
+
+*** The debt it buried
+
+It solves "is the scorer smart enough?" while sidestepping the deeper question of "does the model itself know?" The LLM weights have still never seen a pruned cache.
+
+That train-test gap remains ferocious at high compression ratios: in SP-KV's Table 2, KVZap's NLL rises +1.23% at ~20% density and +1.77% at 15% density — the strongest result in the post-hoc camp, yet still an order of magnitude worse than SP-KV.
+
+** 2026.05 | SP-KV: Tearing Down All the Scaffolding
+
+*** What problem it saw in its predecessors
+
+DMS identified the right direction (the model must *know* it will be pruned) but leaned on the scaffolding of teacher + distillation. KVZap identified the right simplicity (lightweight scorer) but kept the LLM frozen and never truly resolved the train-test gap.
+
+Each was half right.
+
+*** Its solution
+
+Do both things at once:
+
+1. A lightweight utility predictor — same intuition as KVZap — that scores each KV pair.
+2. But *don't freeze the LLM*. Train LLM weights and the predictor *together*, end-to-end, with *only* next-token loss as the objective.
+
+During training, replace the hard threshold with differentiable gating (the paper uses a continuous gate with temperature annealing) so gradients can flow through. At inference, switch back to a hard threshold: if the score clears the bar, write to cache; if not, discard. The most recent 128 tokens are always retained (absorbing StreamingLLM's lesson).
+
+If you take KVZap's frozen LLM and unfreeze it, then take DMS and remove the teacher, the distillation loss, and every sparsification auxiliary objective, leaving only next-token loss — you get SP-KV.
+
+*** Several unexpected benefits
+
+- *No fixed compression ratio*: the model decides for itself whether to write each position. The result is that *longer inputs compress more* (more redundancy in long sequences), averaging 3–10× compression.
+- *NLL barely moves*: at 25% density, NLL rises only +0.08% — roughly one-tenth to one-twentieth of KVZap's degradation.
+- *Byproduct: architecture guidance*: examining the average utility learned by each head reveals that sparsity distributes in a structured pattern across layers and heads. Designating high-utility heads as global and low-utility heads as local yields a hybrid architecture that outperforms standard interleaved designs.
+
+*** The new questions it leaves open
+
+- Joint training requires continued pretraining; the compute cost is higher than KVZap's lightweight post-hoc approach (though cheaper than training DMS from scratch)
+- The threshold is set by hand; the optimal threshold across different tasks and sequence lengths is still being explored
+- Whether this mechanism transfers to more aggressive architectures (MLA, Gated DeltaNet, etc.) has not been verified
+
+* Problem-Solution Overview
+
+#+begin_example
+                        | Who scores            | Model weights | Training objective      | Score quality | Model aware?
+------------------------+-----------------------+---------------+-------------------------+---------------+--------------
+Vaswani Transformer     | (no scoring, keep all)|      --       | next-token              |   N/A         |   N/A
+Longformer              | position (hand-coded) |  pretrain     | next-token              |   poor        |   no
+H2O                     | cumulative attention  |  frozen       | none (post-hoc at infer)|   fair        |   no
+StreamingLLM            | position (first 4 +   |  frozen       | none                    |   minimal     |   no
+                        |   sliding window)     |               |                         |               |
+DMS                     | learned policy        |  finetune     | next-token + distill    |   good        |   yes (distilled)
+KVZap                   | learned predictor     |  frozen       | predictor-only loss     |   good        |   no
+SP-KV                   | learned predictor     |  joint train  | *next-token only*       |   best        |   *yes*
+#+end_example
+
+The entire arc is doing one thing: evolving the decision of "whether to retain a given KV" from *hand-coded positional rules*, to *passive statistics over history*, to *actively learned scoring*; and simultaneously evolving the model itself from *completely unaware*, to *aware but taught by distillation*, to *aware and self-taught*.
+
+* The Core Insight
+
+The true theme of this nine-year evolutionary arc is not "how to compress the KV cache."
+
+It is *train-inference consistency* — an older, more fundamental topic — playing out again in a new setting.
+
+- H2O / StreamingLLM / KVZap: attempt to patch the consistency crack from the *inference side* with progressively smarter strategies
+- DMS: the first to acknowledge that the crack must be sealed from the *training side*, but reaches for the traditional crutch of teacher-student distillation
+- SP-KV: discovers the crutch can be thrown away — if the sparsification mechanism is *present from the very first training step*, next-token loss will teach the model everything it needs to know
+
+This is actually the same lesson deep learning has re-learned repeatedly in recent years:
+- Dropout was initially applied post-hoc; it was later found that it must be present during training
+- Quantization-aware training defeated post-training quantization
+- Mixed-precision training defeated reduce-precision-after-training
+
+Every time, the same story: *don't patch things up after the fact — let the model live, from the very beginning, in the environment where it will ultimately have to work*.
+
+* Where Things Might Go Next
+
+1. *The joint-training + minimal-loss paradigm will be reused* — a similar recipe can be applied to quantization-aware, tool-use-aware, and retrieval-aware training. The essence is "let the model learn under its true inference environment."
+2. *Architecture and scoring unified* — SP-KV's byproduct (using learned head utility to guide local/global design) hints at a more aggressive direction: KV cache compression, head-type selection, and layer-type selection all folded into a single joint optimization objective, growing the optimal architecture out of training rather than hand-ablating it.
+3. *The dynamic-vs-fixed compression ratio pendulum* — production deployments prefer *predictable* memory footprints; SP-KV's "longer inputs compress more" property actually makes memory budgeting harder to plan. Someone will build a "guaranteed-at-most-X%-density SP-KV variant."
+4. *Convergence with sparse-read methods* — SP-KV decides "whether to write"; DeepSeek Sparse Attention decides "whether to read." The next paper will likely put both into the same end-to-end objective and optimize them simultaneously.
+
+* Notes
+
+- Citation relationships: SP-KV's Section 5 (Related Work) and Appendix A directly compare against H2O, StreamingLLM, KVZap, and DMS, so the critical line SP-KV → those four papers is *confirmed*.
+- Speculative portions: the evolutionary link Longformer → H2O is constructed from the domain consensus around "from fixed patterns to learned scoring" and is *not a direct citation relationship*. Vaswani 2017 is the common ancestor of all transformer work and is not critiqued in the SP-KV paper.
+- Frontier extensions (DeepSeek Sparse Attention v3.2, Gated DeltaNet) are contemporary works mentioned in parallel in SP-KV's Introduction; they are *not* successors to SP-KV. True successors will emerge in the months ahead.

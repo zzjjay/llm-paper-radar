@@ -1,0 +1,254 @@
+#+title:      SPHERICAL KV: Angle-Domain Attention and Rate-Distortion Retention for Efficient Long-Context Inference
+#+date:       [2026-05-28 Thu 10:57]
+#+filetags:   :paper:river:
+#+identifier: 20260528T105729
+#+source:     https://arxiv.org/abs/2605.18856
+#+authors:    Anay Chauhan, Gurucharan Marthi Krishna Kumar, Arion Das, Amit Dhanda, Vinija Jain, Aman Chadha, Amitava Das
+#+venue:      arXiv preprint, May 2026
+
+* 问题之河
+
+长上下文推理时，模型每生成一个 token，都要把过去所有 token 的 Key/Value 缓存从显存里再读一遍。上下文越长，这堆缓存越大，读得也越慢——最后瓶颈不是算力，而是显存带宽。
+
+这件事难就难在：你既想少存一点（省显存），又想读得快（不堵带宽），还想算得准（不掉点）。这三件事互相打架。一代代研究者前赴后继，每次只敢拧紧一颗螺丝——结果发现整台机器还是漏风。Spherical KV 这条线，就是在追问：能不能换个坐标系，让这三件事在同一个地方一起解决？
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 问题: 注意力是 O(T^2)，每生成一个 token 要从头算
+  | 解法: 缓存 K 和 V（KV cache），后续 token 只算新 query 对老 KV 的注意力
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | 问题: 注意力慢的真正原因不是 FLOPs，而是 HBM 反复读写
+  | 解法: 分块计算 + 算子融合，让 K/V 只读一次，把 IO 而非算力当成核心瓶颈
+  v
+[2023] Zhang et al. (H2O) / Xiao et al. (StreamingLLM)
+  |
+  | 问题: 长上下文下 KV 一直膨胀，HBM 装不下也读不动
+  | 解法: 别全留——只留少数"重要 token"（heavy hitter / attention sink），其它扔掉
+  v
+[2024] Liu et al. (KIVI) / Hooper et al. (KVQuant)
+  |
+  | 问题: 扔太多 token 会掉点；留下来的能不能存小一点？
+  | 解法: 把 K/V 量化到 2-4 bit，存的时候省；算的时候还原回 FP16 再做点积
+  v
+[2025] 极坐标/球面 KV (Han et al., Wu et al., Xiao 等)
+  |
+  | 问题: K 向量的"方向"决定相似度，"长度"只是缩放——为什么混在一起量化？
+  | 解法: 拆成 (半径, 角度) 两路，方向多花点位、长度少花点位
+  v
+[2026.05] Spherical KV (本文)
+  |
+  | 问题: 上面这些方法存的时候省了，算的时候还是要"解压回稠密 K 再点积"——
+  |       那一步把节省的 HBM 流量又赔回去了；而且 token 该留几个、每个留几位，
+  |       到现在还是各管各的两阶段决策。
+  | 解法: (i) 让 attention kernel 直接吃压缩后的角度码，从此不解压；
+  |       (ii) 把"留不留"和"留几位"塞进一个率-失真预算里联合决策。
+  v
+[前沿] 朝向"压缩域里跑完整 decode"的全栈融合
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer / KV cache: 把"已经看过的"存下来
+
+*** 它看到了什么问题
+
+最早的语言模型用 RNN，一个词一个词往后走，前一步算完才能算下一步。GPU 算力闲着，时间却拖得长。
+
+*** 它的解法
+
+干脆扔掉 RNN，让每个 token 都能直接"看到"前面所有 token——这就是注意力机制。但天然代价是：第 T 个 token 要和前面 T-1 个 token 都算一次相似度。
+
+为了不让生成阶段反复重算，工程上很快补了一招：把每一层的 K（Key，"我是什么"）和 V（Value，"我说什么"）算一次就存下来，叫 *KV cache*。下一个 token 来了，只用新 query 去查这堆老 KV 就行。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+省了重算，但埋了一个慢性病：KV cache 的大小，等于 *batch × 层数 × token 数 × 头数 × 头维度 × 2*。上下文一长，这块内存膨胀得吓人——而且每生成一个新 token，都要把它整个读一遍。
+
+那时候大家以为这事不打紧——反正显存够大。等上下文从 2K 涨到 32K 再涨到 128K，这个"小问题"长成了主要矛盾。
+
+** 2022 | FlashAttention: 真正堵的是显存带宽，不是算力
+
+*** 它看到了什么问题
+
+很多人优化 attention 的方向，是减少 FLOPs（比如稀疏注意力、低秩近似）。可真正测下来发现：在长序列里，GPU 大部分时间都在等内存——把中间结果反复在 *HBM*（显存）和片上 SRAM 之间搬来搬去。算得再快也没用，瓶颈在路上。
+
+*** 它的解法
+
+把 attention 的 softmax 拆成可以流式累加的小块，整个 attention 在 SRAM 里一次性算完，中间结果不落 HBM。这叫 *IO-aware* 内核 + *kernel fusion*。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把研究者的注意力从"算多少"转向了"读多少"——这之后所有 KV 压缩方法，都不再以"减 FLOPs"为目标，而是以"减 HBM bytes 移动"为目标。
+
+但 FlashAttention 只优化了"怎么算"，没碰"存什么"。KV cache 本身还是稠密的 FP16。上下文一长，光是把它从 HBM 流回片上就足以拖垮带宽——这就给了后面所有压 KV 的工作合法性。
+
+** 2023 | H2O / StreamingLLM: 干脆别全留
+
+*** 它看到了什么问题
+
+既然每生成一个 token 都要扫一遍整个 KV，那把 KV 整体砍小，最直接。研究者一看 attention 分布，发现大多数 token 其实根本没被 query 注意到——只有少数"重击者"（heavy hitter）和最开头的几个"注意力下水道"（attention sink）反复被点名。
+
+*** 它的解法
+
+H2O：根据历史 attention 分数，动态丢掉那些没人理的 token。StreamingLLM：固定保留最开头几个"sink" + 滑动窗口里最近的若干 token，中间的扔掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+KV 体积一下子能砍 5-10 倍，HBM 流量同比下降。但很快暴露两个问题：
+
+1. *"扔哪个"是动态决策*：基于 attention score 选 token，意味着每一步都要重新评分，本身就是开销。
+2. *扔错就回不来*：被扔掉的 token，如果未来 query 突然需要它（比如 needle-in-haystack 检索任务），就永远找不回来——性能在长上下文 QA 上掉得厉害。
+
+于是大家想：留下来的能不能存得更紧凑一点？
+
+** 2024 | KIVI / KVQuant: 留下来的也别用 FP16 占着
+
+*** 它看到了什么问题
+
+H2O 这类方法把"留几个"压到极限了，但留下来的每个 token 还是 16 位精度。一个 128K 的上下文，留 50% 还是 64K × 数 GB。继续往下省，只剩"每个 token 占几位"这一招。
+
+*** 它的解法
+
+把 KV 量化到 2-4 bit。但很快发现两个细节：
+- Key 和 Value 的统计性质不一样——KIVI 提出 K 按 channel 量化、V 按 token 量化。
+- 有些 outlier channel 一旦量化就掉点很惨——KVQuant、OTT、RotateKV 等设计了各种"保护机制"，给 outlier 留高位、其它走低位。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+确实把每 token 字节数砍到 1/4 - 1/8。但留下了一个所有人当时都默认接受的"隐藏税"：
+
+decode 时，kernel 读出来的是低位码，必须先 *解压回稠密 FP16 K 向量*，才能和 query 做点积。这一步——
+
+- 在 HBM 里要写一份临时的稠密 K，等于把刚省下的带宽又花回去；
+- 破坏了 FlashAttention 那种"压缩状态直接进 SRAM"的融合路径；
+- 对 paged KV（vLLM 那套）也不友好，因为页内布局多了一个反量化阶段。
+
+存的时候省了，算的时候赔回来了。
+
+** 2025 | 极坐标 / 球面 KV (Han / Wu / Xiao 等): 方向和长度该分开省
+
+*** 它看到了什么问题
+
+KIVI 这类方法把 K 向量当成普通数字数组在压。但 attention 的本质是 *q·k = ‖q‖·‖k‖·cos θ*——决定谁更像谁的，是 *方向*（cos θ），不是 *长度*（‖k‖）。一个把方向和长度搅在一起量化的方案，等于让两件重要程度不同的事情用同一个精度预算。
+
+*** 它的解法
+
+把每个 K 写成 *(半径 r, 角度 φ)* 两部分（球面 / 极坐标分解）。方向那部分多花点位（它真正影响相似度），半径那部分少花点位（它只是个缩放常数）。这条线还附带一个好处：方向被压缩后，可以在压缩域上算"角度近似"，不必完全解压。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+率失真分配从"每个数字 N bit"变成"按几何重要性分配 bit"——理论上 Pareto 前沿更靠前。
+
+但落地时还卡两件事：
+1. 大多数实现还是会把角度码 *解码成稠密单位向量*，再和量化半径乘起来，得到稠密 K 再做点积——也就是说，*压缩域计算* 这个机会被惦记到了，但还没真的拿走。
+2. "留不留这个 token" 和 "留几位" 还是两步独立决策——eviction 控制器和 quantizer 各管各的，没人统筹这块预算到底该怎么花。
+
+到这里，Spherical KV 看到了一个空当：把压缩域计算 *真做出来*，把两个控制环 *合并起来*。
+
+** 2026.05 | Spherical KV: 在压缩域里把 attention 算完 + 一起决策
+
+*** 它看到了什么问题
+
+把前面几篇连起来看，问题非常具体：
+
+- FlashAttention 教会我们"瓶颈是 HBM 流量"；
+- H2O 砍了 token 数；
+- KIVI 砍了每 token bit 数；
+- 极坐标 KV 让 bit 分得更合理；
+- 但 *decode kernel 里那一步"解压成稠密 K"*，始终没人真正去掉。它是上述所有方法效果打折的共同原因。
+
+同时，*留不留* 和 *留几位* 仍然是两个互相不通气的控制器——一个 token 可能被"低优先级"控制器以低位保留，但其实该被 keep/drop 控制器整个丢掉；预算总体被浪费了。
+
+*** 它的解法
+
+两件事一起做：
+
+1. *Angle-Domain Attention (ADA)*：K 存成 (量化半径 r̃, 紧凑角度码 c^θ)。decode kernel 直接吃这两个码，沿用恒等式 *q·k ∝ ‖q‖·r·cos θ*，*完全不重建稠密 K*。这一步保住了 paged + fused 的 IO 路径——存少了，读也真的少了，省下来的 HBM 流量不会在反量化时漏掉。Value 仍然以标准形式存——因为它最终要和 softmax 权重做加权和，反量化在那里反而便宜。
+
+2. *Rate-Distortion Retention (RDR)*：把"留不留 z_i ∈ {0,1}"和"留几位 b_i"塞进同一个有约束优化：
+   #+begin_example
+   min E[L(decode({z_i, b_i}))]   s.t.   sum_i z_i · cost(b_i) ≤ B
+   #+end_example
+   用拉格朗日松弛 + "每字节价值" (vpB_i = ΔL / Δcost) 贪心。决策规则简单可工程化：*先降级，再丢弃*；retrieval 关键 token 强制 protected。
+
+整套东西的物理产物是 *tier-homogeneous KV pages*——同一页里精度档位一致，serving kernel 可以 header-guided 顺序读，coalesced，不需要随机 gather。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是这条线第一次把"代表"（spherical encoding）、"决策"（RDR）、"执行"（fused angle-domain kernel）三件事 *同一坐标系下一并设计*。论文报数：8K / 32K / 128K 下 decode 吞吐 *1.55× - 1.72×*，KV 字节数减 *24-42%*，128K 收益最大——这是符合 HBM-bound 直觉的（越长越受益）。
+
+留下的新口子：
+- ADA 把 *direction* 从计算中真正抽出来了，但 *value* 路径还是标准的——下一步显然会去碰 value 的压缩域计算；
+- RDR 是离线/在线混合的策略学习问题，跨任务可迁移性还要打磨；
+- "tier-homogeneous page" 是个 deployment contract，需要整个 serving stack（vLLM/SGLang）配合才能吃到最大红利。
+
+* 前沿延伸
+
+截至 2026 年 5 月，Spherical KV 是这条 *"压缩域 attention + 联合率失真"* 线上的最新一步。再往前看，最可能发生三件事：
+
+1. *V 也进压缩域*——目前 V 仍然以标准形式读出再加权。一旦 V 也能在压缩域里参与"加权求和"近似（例如低秩或角度域近似），HBM 流量还能再砍一档。
+2. *Coder 学习化*——目前的 spherical 编码 + RD 控制器更多是手工设计 + 简单 learned policy。会很快被端到端可学的 KV coder 取代，让"方向码本"对特定模型/任务自适应。
+3. *Serving 栈协同*——tier-homogeneous page 已经是面向 vLLM/SGLang 的 deployment contract。接下来 scheduler、prefix cache、speculative decoding 都会按 tier 重新组织——这条线会从"算子级 trick"扩成"整个 serving 栈的内存模型"。
+
+* 一张图看懂
+
+#+begin_example
+   时间 ->  2017      2022       2023        2024         2025          2026.05
+            ----      ----       ----        ----         ----          -------
+   关心     算法       IO         留几个       留几位        bit 怎么分     压缩域里算 + 联合决策
+   什么    (FLOPs)   (HBM)       (token)     (bit/token)   (geometry)    (joint coding+compute)
+
+   代表    Attn      Flash      H2O          KIVI          Polar/        Spherical KV
+   工作    Is All    Attn       Stream       KVQuant       Spherical
+            You      (Dao)      LLM          GEAR          KV (Han,
+            Need                Scissor                    Wu, Xiao)
+
+   解决     缓存重算   IO 而非     稠密 KV     扔太多        方向和长度    "解压回稠密 K
+   了什么            FLOPs       太大        会掉点         混着压不       再点积" 那一步
+                    是瓶颈                                合理           的隐藏 HBM 税
+
+   留下     KV 越     存什么       扔错了       存的省了      还是要解压    V 还没进压缩域；
+   什么     来越大    没碰         回不来       算的赔回去    回稠密 K      learned coder；
+   坑                                                                  serving 栈重组
+
+   核心     +cache    +fusion    -tokens     -bits         -bits/geom    -reconstruct
+   动作                                                                  +joint RD
+
+   |--------------------- HBM 流量这一个目标 --------------------- |
+              (一代比一代更靠近"读多少 = 真的存多少"这条理论下界)
+#+end_example
+
+* 洞见
+
+把这五代叠在一起看，背后真正发生的事，不是"压缩越来越狠"，而是 *被优化的对象在不停换坐标系*：
+
+- 第一次换：从 *FLOPs* 换到 *HBM bytes*（FlashAttention）。这之后"快"和"小"挂钩了。
+- 第二次换：从"减总量"换到"按重要性分配"（H2O / KIVI）——但 token 维度和 bit 维度各自独立。
+- 第三次换：从"笛卡尔向量"换到"方向 + 长度"（球面 KV）——bit 终于按几何意义分配。
+- 第四次换（这篇）：从"压缩然后解压再算"换到 *"压缩域就是计算域"*；同时把两个控制环并成一个 *率-失真预算*。
+
+每一次"换坐标系"，都让一个旧的假设变得不必要：
+- 不必假设 FLOPs 是瓶颈；
+- 不必假设所有 token 同等重要；
+- 不必假设所有维度同等重要；
+- 不必假设算之前必须解压；
+- 不必假设 retention 和 quantization 是两个问题。
+
+继续推演，下一个被打破的假设很可能是："Key 和 Value 必须用同一种存储和访问范式"——Spherical KV 已经把它们拆成两条路径了，下一步是给 V 找它自己的压缩域计算原语。
+
+更深一层：这条线说明 *LLM 推理优化正在从"算法 trick"演化成"信息论 + 系统协同"*。Shannon 1948 的率失真理论被一篇 2026 年的 KV 论文当成中心引用——这件事本身就是个信号。
+
+* 启发
+
+- *找问题：去那些"被默认接受的隐藏税"里找*。KIVI 已经把 KV 砍到 2-bit 了，但所有人默默接受"算的时候要还原成稠密 K"——Spherical KV 的整个动机就是去掉这一步。最值钱的研究往往不是发明新东西，而是 *指出"原来这一步根本不必存在"*。
+
+- *做研究：换坐标系比加 trick 更值钱*。这条线每一次大跳跃，都是换了一个被优化的指标（FLOPs → HBM → bit/token → bit/geometry → compressed-domain compute）。在你自己的领域里问：现在大家在优化的那个指标，是真正的瓶颈，还是历史惯性？
+
+- *合并被错误分离的控制环*。"留不留" 和 "留几位" 长期是两个独立模块，Spherical KV 用一个率-失真预算把它们焊在一起——结果两个都做得更好。你身边哪些"两个团队各管一摊"的事，其实是一件事？
+
+- *能用的版本*：如果你在做 long-context serving，从两件事开始动手：(1) 检查你的 KV 路径里有没有"压完又解开"的隐藏反量化；(2) 检查 eviction 和 quantization 是不是各自为政——它们应该共享一个统一的"每字节价值"评分函数。

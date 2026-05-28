@@ -1,0 +1,329 @@
+#+title:      WinQ: Accelerating Quantization-Aware Training of Language Models Around Saddle Points
+#+date:       [2026-05-28 Thu 10:48]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T104816-en
+#+source:     https://arxiv.org/abs/2605.17471
+#+authors:    Dongyue Li, Zechun Liu, Kai Yi, Zhenshuo Zhang, Changsheng Zhao, Raghuraman Krishnamoorthi, Harshit Khaitan, Hongyang R. Zhang, Steven Li (Meta + Northeastern)
+#+venue:      ICML 2026 (arXiv 2026-05-17, cs.LG)
+
+* The Problem River
+
+You have trained a full-precision large model — seven billion parameters, excellent quality. Now you need to compress every weight into 2 bits — four integers {-1, 0, 1, 2}. A hard round-down causes accuracy to collapse, so you quantize during training: the forward pass rounds weights onto a grid, while the backward pass pretends that rounding is an identity mapping and lets gradients flow through as normal.
+
+This approach is called *quantization-aware training (QAT)*. It can bring a 4-bit model back close to FP16 quality. But the moment you push toward 3-bit, 2-bit, or 1-bit, training starts to *stall* — loss plateaus early at a high value, and throwing more tokens at it yields only the slowest trickle of progress.
+
+For a decade, everyone has observed this phenomenon, yet nobody has explained *why*. Is the optimizer to blame? Is the gradient estimation bias too large? Is model capacity insufficient? Each researcher backs a different cause and applies a patch — different rounding schemes, different step sizes, Hadamard rotations, trust masks … the patches help but treat the symptom.
+
+Every paper on this river gnaws at *the same bone*: at low bit-widths the gradient feedback signal becomes increasingly sparse, the model oscillates back and forth among the discrete grid points, and nobody has ever truly mapped out what the loss surface looks like or why training can't move. Not until WinQ picked up the Hessian spectrum as a scalpel and cut in — discovering that it isn't a lazy optimizer, it's the terrain itself: the model is trapped in *the flat region around a saddle point*.
+
+* Source Map
+
+#+begin_example
+[2013] Bengio, Leonard, Courville -- STE (Straight-Through Estimator)
+  |
+  | Problem seen: round() is non-differentiable; backprop cannot pass through it
+  | Solution: in the backward pass, pretend it is the identity map;
+  |           gradients flow as if round() does not exist
+  | Hole left: this is a "fake" gradient — nobody quantifies how large the bias is
+  v
+[2018] Jacob et al. -- Quantization-Aware Training (QAT)
+  |
+  | Problem seen: post-training rounding (PTQ) collapses at low bit-widths
+  | Solution: simulate quantize/dequantize during training so weights
+  |           adapt to the discrete grid in advance. STE handles gradients
+  | Hole left: choosing step size / quantization range is still heuristic
+  v
+[2020] Esser et al. -- LSQ (Learned Step Size Quantization)
+  |
+  | Problem seen: the quantization step size should be learned together with loss
+  | Solution: treat step size s as a learnable parameter,
+  |           optimize it alongside weights via gradient descent
+  |           4-bit ImageNet approaches FP32
+  | Hole left: works on CNNs; transplanting to billion-parameter LLMs is a
+  |            completely different story
+  v
+[2023] Liu et al. -- LLM-QAT (+ BitNet, concurrent)
+  |
+  | Problem seen: LLMs are too large; QAT retraining is prohibitively expensive;
+  |               pretraining data is typically unavailable
+  | Solution: use the teacher model to self-distill training data —
+  |           sample text from the full-precision LLM, use its soft logits
+  |           as labels to train the quantized student (data-free).
+  |           BitNet takes the other route: train 1-bit from scratch.
+  | Hole left: 4-bit is fine; below 3-bit convergence is extremely slow,
+  |            requiring 10B+ tokens
+  v
+[2025] Panferov et al. -- QuEST
+  |
+  | Problem seen: at low bit-widths STE gradients carry large bias;
+  |               gradients for weights far from the grid are especially
+  |               untrustworthy
+  | Solution: (1) Hadamard transform "flattens" weight distribution,
+  |               reducing quantization error
+  |           (2) trust gradient estimator: mask out gradients for weights
+  |               with large quantization error
+  | Hole left: convergence is still slow — the patch suppresses per-step error
+  |            but does not answer "why won't training move?"
+  v
+[2026.05] Li et al. -- WinQ  <-- this paper
+  |
+  | Problem seen: all prior work tunes gradient estimation;
+  |               nobody has visualized the QAT loss surface
+  | Solution: estimate Hessian spectrum -> weights are stuck in "saddle flat zones",
+  |           40%+ of eigenvalues concentrated near 0 -> two targeted remedies:
+  |           (a) periodically pull weights partway onto the grid (linear interp)
+  |           (b) inject noise into weights before computing gradients,
+  |               implicitly regularizing the Hessian
+  | Result: up to 4x speedup; sub-4-bit accuracy improves by up to 8.8%
+  v
+[2025-2026, concurrent] LOTION / CAGE / follow-on work
+  |
+  | LOTION: rewrites "quantization loss" as "expected loss under additive noise",
+  |         a second-order smoother — conceptually similar to WinQ's noise injection
+  | CAGE:   multi-objective (loss + distance-to-grid + curvature scheduling)
+  | Shared direction: QAT is no longer a minor patch on STE but is treated as
+  |                   a "non-smooth non-convex optimization" problem by design
+#+end_example
+
+* Evolutionary Narrative
+
+** 2013 | STE: Letting Gradients Pass Through the Non-Differentiable
+
+*** What problem it saw
+
+Neural-network backpropagation relies on the chain rule — every layer must be differentiable. But quantization's round(x) is a staircase function whose derivative is zero everywhere (except at jump points). Once a round() is inserted into the forward pass, gradients reaching it are zeroed out and all upstream weights stop updating.
+
+*** Its solution
+
+Bengio gave an answer that is clean to the point of being cheeky: *in the backward pass, pretend round() is the identity map*. The forward pass computes discrete values; gradients flow back as if rounding never happened.
+
+This is the Straight-Through Estimator (STE).
+
+*** Why it was enough at the time — and what hole it left
+
+It worked reasonably well in small binary networks — but everyone knew STE delivers *fake gradients*. How large is the bias relative to the true gradient? Under what conditions does that bias destroy training? Nobody could answer.
+
+Looking back through WinQ's diagnosis, it is precisely this chain of fake gradients that, at low bit-widths, flattens the loss surface into a swamp of saddle points.
+
+** 2018 | Jacob et al.: Teaching the Model to Live with Low Precision During Training
+
+*** What problem it saw in the prior step
+
+STE solved "can gradients pass through at all?" But the dominant workflow was still *train then quantize* (post-training quantization, PTQ) — train in FP32, round to INT8 at deployment. This works barely at INT8 and collapses below INT4.
+
+The root cause: the model never sees its own quantized form during training, so the learned weight distribution is mismatched to the quantization grid.
+
+*** Its solution
+
+Insert the quantize/dequantize pair *into the training forward pass*. Forward: weights and activations are rounded to INT, then dequantized back to float before continuing. Backward: STE lets gradients flow normally.
+
+Effect: throughout training the model *continuously sees its own quantized form*, and weights gradually migrate toward grid-friendly distributions. INT8 models become nearly lossless; INT4 is recoverable.
+
+*** The hole it left
+
+The core hyperparameters of QAT — the quantization step size (how wide each grid cell is) and the clipping range — are still set by hand. Different layers and tasks require different values; get them wrong and training collapses.
+
+** 2020 | LSQ: Hand the Step Size Over to Gradient Descent
+
+*** What problem it saw in the prior step
+
+Jacob's QAT assumed you could *pre-select* the right quantization range. But the weight distribution shifts throughout training — a fixed step size either wastes grid capacity (range too wide, density too low) or clips important weights (range too narrow).
+
+*** Its solution
+
+Treat the step size $s$ as a learnable parameter and optimize it alongside weights with gradient descent. STE propagates gradients through the round operation back into $s$.
+
+In effect: "stop tuning by hand — the model will find the right step size on its own."
+
+The improvement on CNNs was immediate: 4-bit ResNet nearly matches FP32.
+
+*** The hole it left
+
+LSQ was validated in the ImageNet/CNN era. Two implicit assumptions that do not necessarily hold for LLMs:
+- Model scale: ResNet has tens of millions of parameters; LLMs have billions to hundreds of billions.
+- Training data: ImageNet has 1.3 M images; LLM training routinely consumes trillions of tokens.
+
+Transplanting LSQ directly to LLMs raises entirely new questions about training cost and convergence.
+
+** 2023 | LLM-QAT / BitNet: QAT Enters the Large-Model Era
+
+*** What problem it saw in the prior step
+
+QAT in the LLM era faces two genuinely new challenges:
+
+1. *Training data is unavailable*: LLM pretraining data is typically proprietary; downstream users cannot access it. How do you run QAT without data?
+2. *Training cost explodes*: retraining a model with tens of billions of parameters amounts to half a pretraining run — economically prohibitive.
+
+*** Its solution
+
+LLM-QAT's answer: *let the teacher generate its own training data*. Sample large amounts of text from the full-precision LLM, feed it to the quantized student, and use the teacher's soft logits for knowledge distillation. Completely data-free.
+
+Concurrent BitNet took a more radical path: *train 1-bit from scratch*. No distillation — binary weights are used from the very first pretraining step.
+
+*** The hole it left
+
+By this point a clear decay curve had become visible:
+
+- 8-bit: nearly free
+- 4-bit: recoverable in a few epochs
+- 3-bit: requires *far* more tokens than expected
+- 2-bit / 1-bit: even after 10B+ tokens, loss is still crawling down a long tail
+
+Everyone attributed it to "less information at lower bit-widths," but where exactly was training stuck? Nobody said.
+
+** 2025 | QuEST: Sharpening the Fake-Gradient Ruler of STE
+
+*** What problem it saw in the prior step
+
+QuEST's diagnosis: *STE gradients carry too much bias at low bit-widths*. Specifically —
+
+- Weight distributions are heavy-tailed (a few weights have very large magnitudes); quantization grids are uniform. Heavy-tailed weights incur very large quantization errors.
+- STE treats all weights identically when propagating gradients; the gradients corresponding to weights with large quantization errors are effectively misleading and pull training astray.
+
+*** Its solution
+
+A two-punch combination:
+
+1. *Hadamard transform*: before quantizing, multiply the weight matrix by a Hadamard rotation matrix. Hadamard acts as a "scattering" operation — it transforms heavy-tailed distributions to be more Gaussian, makes uniform grid partitioning more sensible, and suppresses large quantization errors on individual weights.
+2. *Trust gradient estimator*: mask out gradients for weights whose quantization error remains large. Only trust the gradients flowing back from weights that are already close to the grid.
+
+Practical results were solid: a 1-bit LLM trained for 10B tokens could approach a competitive baseline.
+
+*** The hole it left
+
+Every improvement in QuEST is about *correcting the bias of STE* — making the fake gradient a little less fake.
+
+But look again at the decay curve: 4-bit takes a few epochs, 3-bit takes many more tokens, 2-bit is very slow, 1-bit takes 10B+ tokens to reach a shoulder. The phenomenon of *training cost growing exponentially as bit-width decreases* is unexplained by QuEST. Its patches can suppress per-step bias but cannot free training from "glacial convergence."
+
+Why won't training move? This question has hung over every QAT paper for ten years.
+
+** 2026 | WinQ: The First Map of the QAT Loss Surface
+
+*** What problem it saw in the prior step
+
+WinQ stops chasing STE tuning parameters and instead steps back to ask: *what does the QAT loss surface actually look like?*
+
+Why ask that? Because:
+
+- First-order information (gradients) is already near zero (otherwise training wouldn't stall).
+- When the first order is near zero, how fast you can move depends on *second-order information* — the eigenvalues of the Hessian.
+- Nobody had ever measured the Hessian spectrum during QAT training.
+
+*** Its findings
+
+Using stochastic Lanczos quadrature to estimate the Hessian spectrum, three clean observations emerge:
+
+1. *Saddle-point flat zones*: late in training, the Hessian has both positive and negative eigenvalues (the signature of a saddle point), and a large fraction of eigenvalues are clustered near zero — this region is neither a local minimum (convex) nor a local maximum (concave), but a *nearly flat saddle zone*.
+2. *Zero-clustering grows over time*: as training progresses, the proportion of eigenvalues near zero increases and their magnitudes shrink — the loss surface becomes progressively flatter.
+3. *Worse at lower bit-widths*: the largest eigenvalue magnitude at 1-bit is more than an order of magnitude smaller than at 4-bit — the same saddle structure is incomparably flatter at lower precision.
+
+This is the answer: QAT doesn't stall because the optimizer is lazy — it stalls because *the loss surface at low bit-widths is compressed into a saddle-point swamp*. Gradients are near zero; second-order curvature is also near zero — classically the most treacherous terrain in optimization.
+
+*** Its solution
+
+If the problem is "flat saddle points," *actively restore curvature*. Two targeted remedies:
+
+1. *Periodic interpolation reset (Win)*: every K steps, pull the full-precision latent weight $w$ to $\alpha \cdot w + (1-\alpha) \cdot \mathrm{quantize}(w)$ — that is, move it partway onto the grid. Geometrically, this shifts weights closer to the quantization grid, which is equivalent to pushing the model into a region where *Hessian eigenvalue magnitudes are larger*, escaping the flat saddle zone.
+
+2. *Noise-injected gradients*: add Gaussian noise to weights and compute gradients at the perturbed location. This can be interpreted as implicitly regularizing the Hessian — smoothing the loss surface so that directions with small eigenvalues also receive meaningful gradient signal.
+
+Together, these two remedies *explicitly steepen the loss surface*, and training can finally make progress.
+
+*** Experiments
+
+- Across 16 configurations involving LLaMA-3, Qwen, OPT, and others, QAT is accelerated by up to 4×.
+- Under the same training budget, sub-4-bit accuracy improves by up to 8.8% over the state of the art.
+- The diagnosis is validated: after applying WinQ, the proportion of eigenvalues clustered near zero in the Hessian spectrum drops significantly, and the largest eigenvalue magnitude recovers.
+
+*** Open questions it leaves
+
+- Three hyperparameters (K, $\alpha$, $\sigma$) still need tuning.
+- Theoretical analysis only provides convergence guarantees under a convex approximation; a rigorous characterization of saddle-point escape has not been established.
+- Can the "saddle-point diagnosis" generalize to activation quantization, KV-cache quantization, and MoE quantization?
+
+** Concurrent Work | LOTION / CAGE: From the STE Paradigm to Non-Smooth Optimization
+
+At the same time WinQ appeared, two other threads were converging on the same judgment: *QAT should be treated as a non-smooth non-convex optimization problem, not as a minor patch on STE*.
+
+- *LOTION* (Kwun et al. 2025): rewrites the quantization loss as "the expected loss after adding random rounding noise to weights." Mathematically this is equivalent to a *second-order curvature-aware regularizer* — conceptually the same channel as WinQ's noise-injected gradients, but derived as an explicit smoother.
+- *CAGE* (Tabesh et al. 2025): a multi-objective formulation that combines training loss, weight-to-grid distance, and Hessian curvature into a single objective with curvature-aware scheduling.
+
+Viewed together, all three papers are doing the same thing — treating the optimization geometry of QAT as a first-class research problem rather than continuing to tweak the aging STE tool.
+
+* Problem–Solution Overview
+
+#+begin_example
+Why won't QAT training move? How the answer evolved over ten years:
+
+[2013-2020]  "STE's gradient estimate is too coarse"
+              -> add step-size learning to STE (LSQ)
+              -> add trust mask + Hadamard to STE (QuEST)
+              All work assumes: make the fake gradient more accurate
+                                and training will speed up
+              Evidence strength: empirically effective;
+                                 never answers "why does it stall?"
+
+[2023]       "LLMs are too large and training data is unavailable"
+              -> data-free distillation (LLM-QAT)
+              -> 1-bit from scratch (BitNet)
+              Engineering brings QAT to LLMs, but slow sub-4-bit
+              convergence becomes *even more severe*
+
+[2026]       "The loss surface is simply flat; better gradients don't help"
+              <-- WinQ
+              -> estimate Hessian spectrum: saddle points + flat zones
+                 + eigenvalue mass concentrated near zero
+              -> actively reshape the terrain: pull back to grid
+                 + noise-smooth the Hessian
+              First time "why it is slow" is transformed from an
+              empirical observation into a *measurable geometric fact*
+
+[Concurrent LOTION/CAGE]  Consensus forming:
+                   "QAT is non-smooth non-convex optimization,
+                    not STE parameter tuning"
+                   -> explicit smoothers / multi-objective
+                      curvature-aware optimization
+
+
+  Lower bit-width
+    ^
+    |                          Saddle flat zones worsen
+    |                          Training steps grow exponentially
+4-bit |  a few epochs
+3-bit |  many more tokens  <-- discovered in LLM-QAT/BitNet era
+2-bit |  very slow
+1-bit |  10B+ tokens to reach a shoulder  <-- QuEST era
+    |
+    +----------------> Training cost
+
+  WinQ's diagnosis: the problem is not STE coarseness —
+                    the loss surface at low bit-widths is
+                    compressed into a saddle-point swamp.
+  WinQ's remedy:    periodically pull weights back to the grid (Win)
+                    + noise-injected gradients regularize the Hessian
+#+end_example
+
+* Core Insight
+
+The real shift in this river is not "yet another trick to speed up QAT" — it is *moving the research question one step further back*:
+
+- The preceding decade asked: *how do we make the fake gradient more like the true gradient?*
+- WinQ asks: *why doesn't training move even when we have the best possible gradients?*
+
+The answer to the second question lives in *the geometry of the loss surface*, not in the gradients themselves.
+
+This shift echoes a classical arc in optimization theory — "convex → non-convex → saddle point." The field once believed deep learning was hard because non-convex loss surfaces have many local minima; later it discovered that what truly paralyzes training is not local minima but *the flat regions around saddle points*. WinQ independently replays that discovery within the sub-field of QAT.
+
+Where does the river go next? Two directions are visible:
+
+1. *Theory*: formally transplant the classical tools for saddle-point escape (Perturbed SGD, complexity bounds for escaping saddles) into the quantized-training setting, providing rigorous convergence rates for the WinQ family of methods.
+2. *Algorithms*: now that we know what the terrain looks like, can we *directly* design second-order optimizers (quantization-aware variants of K-FAC or Shampoo) rather than relying on the indirect approach of first-order updates plus injected perturbations?
+
+Looking further ahead — this line of work suggests a broader methodological principle: when an entire field's incremental improvements are all focused on "reducing variance in the gradient estimate" yet chronic slow convergence persists, *switching to a different instrument and cutting through the loss surface itself* often reveals something entirely new.
+
+* Honest Annotations
+
+- *Confirmed citation relationships*: WinQ's related-work section explicitly cites STE (Bengio 2013), Jacob 2018, LSQ (Esser 2020), LLM-QAT (Liu), QuEST (Panferov 2025), LOTION (Kwun 2025), CAGE (Tabesh 2025), and BitNet (Wang 2023).
+- *Inferred connections*: "LLM-QAT and BitNet are concurrent" is a structural simplification; the two have different technical approaches (distillation vs. from-scratch training) and are not in a strict causal chain. The leap from LSQ to LLM-QAT omits several intermediate CNN quantization works (PACT, QIL, etc.) to keep the main thread clear.
+- *Untraceable directions*: the parallel thread of GPTQ / AWQ / OBQ — *PTQ + Hessian* — is not included. Those methods share WinQ's intuition that "second-order information matters," but they belong to the post-training quantization branch and are not on this river's main axis of "slow QAT convergence."
+- *Uncertainty in forward-looking extensions*: WinQ appeared on arXiv in May 2026; downstream work citing it has not yet emerged, so only the concurrent LOTION/CAGE are listed as directional references, not as WinQ's successors.

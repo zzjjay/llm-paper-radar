@@ -1,0 +1,212 @@
+#+title:      VeriCache: Turning Lossy KV Cache into Lossless LLM Inference
+#+date:       [2026-05-28 Thu 10:52]
+#+filetags:   :paper:river:
+#+identifier: 20260528T105236
+#+source:     https://arxiv.org/abs/2605.17613
+#+authors:    Jiayi Yao, Samuel Shen, Kuntai Du, Shaoting Feng, Dongjoo Seo, Rui Zhang, Yuyang Huang, Yuhan Liu, Shan Lu, Junchen Jiang
+#+venue:      arXiv 2026.05 (UChicago / Tensormesh / Samsung / MSR)
+
+* 问题之河
+
+一个朴素的问题：你给大模型喂了 100 万 token 的上下文，模型每吐一个新词，都得把这堆上下文整个再"看一遍"。看的过程不是过 CPU，是从显存（HBM）里把这堆东西搬到芯片上算注意力。上下文越长，每一步搬得越多，吐字越慢。这个被搬来搬去的东西叫 KV cache。
+
+于是过去三年大家都在做一件事：*把 KV cache 弄小*。要么扔掉一些 token（反正模型不一定都用得上），要么把每个数压缩到更少的比特。结果都很漂亮——吞吐涨两到五倍。
+
+但有一个一直被回避的事实：*这些方法全是有损的*。短答案看不出问题，长答案就开始崩——写代码到一半语法错乱，工具调用参数对不上。压缩比 4x 的时候，代码格式正确率从 100% 掉到接近 0。
+
+这条河的核心问题就是：*能不能既要 KV 压缩的速度，又要不压缩的正确性？*
+
+这个问题难在哪？难在"正确性"是一个二元判断——一个分号错了整段代码就废了。而所有压缩方法的误差都会沿着自回归一步步累积。这条河上的人前赴后继，是因为前面所有的解法都在"少错一点"，没人真的把"零错"重新拿回来过。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | KV cache 这个概念的源头：自回归解码不想重算前面的 K/V，就缓存下来
+  | 留下的坑：上下文越长，缓存越大，每步读取越慢
+  v
+[2023] Leviathan / Chen - Speculative Decoding
+  |
+  | 问题: 大模型每步都要算一遍，能不能让小模型先猜，大模型只验证？
+  | 解法: 小 drafter 猜 gamma 个 token，大 target 一次性并行验证，对的留下错的丢
+  | 关键性质: 输出和"直接用大模型"完全一致——无损加速
+  v
+[2023] H2O / StreamingLLM (Zhang / Xiao et al.)
+  |
+  | 问题: KV cache 占满显存，长上下文塞不进去
+  | 解法: 只保留"重要的" token (heavy hitters / attention sinks)，扔掉其余
+  | 留下的坑: 扔错了就回不来——有损
+  v
+[2024] KIVI / KVQuant (Liu / Hooper et al.)
+  |
+  | 问题: 扔 token 太粗暴，能不能保留所有 token 但每个用更少比特？
+  | 解法: per-channel / per-token 量化到 2-4 bit
+  | 留下的坑: 量化误差也累积——还是有损
+  v
+[2024] MagicDec (Sadhukhan et al.)
+  |
+  | 问题: 这些有损方法到底能不能"补救"成无损？
+  | 解法: 用压缩 KV 当 drafter，用 full KV 当 verifier — 投机解码的"自己骗自己自己抓"版本
+  | 留下的坑: full KV 还得钉在 HBM 里随时验证，那压缩省的显存又吐回去了
+  v
+[2025] QuantSpec / SparseSpec (Tiwari / Zhao et al.)
+  |
+  | 类似的"压缩当 drafter"思路，但仍假设 full KV 在 HBM；且每个工作只绑死一种压缩器
+  v
+[2026] VeriCache (Yao et al.) <== 目标论文
+  |
+  | 关键洞察: 把 full KV 赶出 HBM——放 CPU 内存或远端存储
+  | 让"用压缩 KV 起草" (HBM 带宽瓶颈) 和 "swap full KV 进来验证" (PCIe/网络瓶颈)
+  | 跑在不同资源上、可以并行错开 (cross-resource staggering)
+  | 加上"草稿命中率高就 swap 一次摊薄多步"，达到 full KV 的输出 + 4x 吞吐
+  v
+[未来]  ???
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer + KV cache: 一个无心插下的伏笔
+
+*** 它看到了什么问题
+RNN 编码序列必须一个接一个走，硬件并行没法用。
+
+*** 它的解法
+扔掉时间循环，纯靠注意力——每个位置直接和所有其他位置算相似度。训练时全部并行。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+训练快了几个量级。但推理时是另一回事：生成一个 token 要看过去所有 token，每生成一步就要重新跑一遍 attention。工程上的妥协是 *把过去每一步的 K 和 V 存下来*——这就是 KV cache。短上下文时它是无害的优化；长上下文时它变成怪兽：100K token 占 15 GB，每步都得整个读一遍。整个 KV 压缩的故事就是从这里开始的。
+
+** 2023 | Speculative Decoding: 引入"猜+验"的范式
+
+*** 它看到了什么问题
+大模型每解一个 token 都要走完整个网络，但很多时候下一个 token 是"明显的"（the/of/a 之类）。让大模型从头算一遍这种 token，浪费。
+
+*** 它的解法
+拉一个小模型（drafter）连猜 γ 个 token，再让大模型（target）*一次并行 forward* 来验证这 γ 个候选——对的保留、第一个错的位置截断重采。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+关键性质是 *无损*：在贪心解码下，输出和直接跑大模型 bit-perfect 一致。这给后来所有"压缩-验证"型工作奠定了模板：你可以用一个"近似而便宜"的东西去 propose，只要有一个"精确而昂贵"的东西做 verify，最终结果就是精确的。
+
+留下的坑：drafter 是一个独立的小模型，需要单独训、单独占显存。后面会有人想——能不能不要这个独立的小模型，让 *大模型自己的某种简化形态* 当 drafter？
+
+** 2023-2024 | H2O / StreamingLLM / KIVI / KVQuant: 把 KV cache 弄小
+
+*** 它看到了什么问题
+长上下文下 KV cache 把显存吃光。100K token 直接挤掉 batch，单 batch 跑不动；500K 时每个 decode step 光读 KV 就 25ms。
+
+*** 它的解法
+两条路：
+- *Token dropping* (H2O, StreamingLLM)：只留"重要"的 token——比如开头几个 attention sink + 最近 N 个，或者按 attention 分数留 heavy hitters。
+- *Quantization* (KIVI, KVQuant)：保留所有 token，但每个数从 16 bit 量化到 2-4 bit。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+都管用——平均吞吐能涨 2-5x，开放问答 / 摘要等任务上 F1 / ROUGE 几乎不掉。
+
+但是有一个所有人都心知肚明、又集体回避的事：这些都是 *有损* 的。压缩后的 KV 算出来的下一个 token 分布 p_lossy 和真正的 p_full 不是同一个分布。在评测短答案的时候看不出来，因为 KL 散度每步只有 0.02 nats——肉眼分不出。但 *VeriCache 这篇论文里精确算了一笔账*：自回归下 KL 沿步数线性累积，250 步之后累积 KL ≈ 6 nats，意味着压缩模型吐出 full KV 同样输出的概率只有 e^(-6) ≈ 0.25%。
+
+这就是为什么代码生成、tool calling 这些 *要求严格语法/语义* 的任务会崩——前 200 行漂亮，后 200 行废了。
+
+** 2024 | MagicDec: 第一次把两条线接上
+
+*** 它看到了什么问题
+压缩 KV 快但有损，full KV 准但慢。能不能把投机解码的"猜+验"模板搬过来——让 *压缩 KV 去猜*，让 *full KV 去验*？这样最终输出和 full KV 一致，但大部分计算用的是便宜的压缩版。
+
+*** 它的解法
+具体做法：drafter 不是另一个小模型，而是 *同一个模型 + 稀疏 KV cache*；verifier 是 *同一个模型 + full KV cache*。一次 draft γ 个 token，一次 verify。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+这是一个非常聪明的结构变形——它让 KV 压缩从"近似算法"变成了"近似 drafter"，把"是否输出正确"从一个 *精度问题* 翻译成了一个 *接受率问题*（drafter 猜得越准，越快）。
+
+但它留下一个非常实在的坑：*full KV 还得钉在 HBM 里*，verifier 才能随时跑。可是当初做压缩的整个动机就是 *显存装不下 full KV*——你现在又把它装回去了，那压缩省下的显存（用来增大 batch）就吐回去了。MagicDec 在单请求长解码场景能跑，但在多请求服务、remote prefix caching 这些 *显存就是瓶颈* 的场景里，它的收益基本消失。
+
+QuantSpec / SparseSpec (2025) 沿着 MagicDec 的思路继续走，但同样假设 full KV 在 HBM。而且每个工作只支持一种压缩器（要么 sparse 要么 quant），换一个就得重写。
+
+** 2026 | VeriCache: 把 full KV 赶出 HBM
+
+*** 它看到了什么问题
+MagicDec 的根本矛盾：*draft 不要 full KV，verify 才要*。那为什么 full KV 平时要占着 HBM？如果只在 verify 那一瞬间需要，能不能 *平时放在 CPU 内存 / 远端存储，需要时再 swap 进来*？
+
+直觉上 swap 太慢——PCIe 4.0 大概 32 GB/s，远端网络 10-100 Gbps，60 GB 的 KV 要 swap 1-5 秒，比直接用 full KV 解码还慢。
+
+*** 它的解法
+两个相互咬合的洞察：
+
+1. *Cross-resource staggering*——压缩 KV 解码瓶颈在 HBM 带宽，full KV swap 瓶颈在 PCIe/网络。两条管子不打架。所以"用压缩 KV 在 GPU 上一直 draft"和"从 CPU swap full KV 过来"可以 *并行* 跑。一个用 GPU 的内存带宽，一个用 PCIe 带宽，互不挤占。
+
+2. *Long drafting horizon amortization*——压缩 KV 的草稿命中率高（KL 每步才 0.02 nats），所以 draft γ 个 token 大部分会被接受。把 γ 拉长（比如 32 或 64），一次 swap 摊到多个被接受的 token 上，verify 的均摊开销就小了。
+
+加上一个统一的 *compressor interface*，让 sparse 和 quant 方法都能插进来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+本质是把 MagicDec "在显存内做投机解码"重构成了 "跨内存层级做投机解码"——它把投机解码这个原本只在 *计算* 维度上的优化推广到了 *存储* 维度。
+
+实测最高 4x 吞吐于 full KV，且输出 bit-perfect 一致。
+
+新坑（论文自己的 Limitations 里也说了）：
+- 内存开销没真省下来——full KV 还得存在某处（CPU/远端），只是不在 HBM。
+- γ 是固定的——动态调整未实现。
+- 一种 drafter 配一种 compressor，跨架构组合还没探索。
+- 这套思路只用在了"用压缩 KV 做 verify"上；其他形式的"近似计算 + verify" 还没人系统地做。
+
+* 前沿延伸
+
+VeriCache 是 2026.05 投稿，目前还没看到针对它的直接后继工作。但顺着它的逻辑能预测两个方向：
+
+1. *Drafter 自适应*——γ 跟着接受率动态变。论文自己点了。
+2. *Verify 范式泛化*——"近似算法 + full verify" 这个壳子完全可以套到 attention 之外，比如近似 MoE 路由 + full routing verify，近似 RAG 检索 + full reranking verify，等等。VeriCache 的 staggering trick 本质是"找到一对资源瓶颈不冲突的近似/精确算法，让它们错开跑"，这个 *系统层 ansatz* 可能比具体方法更值钱。
+
+* 一张图看懂
+
+#+begin_example
+              "压缩快" vs "全量准" 这条河
+
+  ===========================================================
+   时间 ->   2017       2023            2024         2026
+  ===========================================================
+
+  KV 怎么处理:
+  -----------
+   存全量         全量          全量           全量 (HBM)         full off-HBM
+   (无优化)        |             |               |                    |
+                   v             v               v                    v
+   速度 vs 质量    慢/准 ---> 快/有损 ---> 快/有损 ---> 快/无损但 HBM 紧 ---> 快/无损/HBM 空
+
+  关键代表:
+  ---------
+   Transformer    Spec.Decode    H2O/KIVI       MagicDec              VeriCache
+   (KV cache      (draft+verify  (drop/quant    (compressed-draft     (move full
+    出现)         无损模板)       2-5x 但有损)   + full-verify         KV off-GPU,
+                                                 in HBM)              stagger w/ swap)
+
+  解决了什么:
+  ----------
+   并行训练       推理无损加速    显存装得下      压缩 + 输出无损       压缩 + 输出无损
+                                                                       + 显存真的省
+
+  留下的坑:
+  --------
+   长上下文       drafter 单独    输出会"看似       full KV 还在        KV 总占用
+   推理慢         模型/训练成本    流畅但功能错"     HBM 里抢资源       仍未减少
+                                                                       (只是搬位置)
+#+end_example
+
+* 洞见
+
+这条河看起来在解"KV cache 太大"这个工程问题，但抽出来看其实在演化一个更深的认知：
+
+*第一阶段* (压缩派)，大家默认"近似就近似吧，反正大多数任务不在乎"。这是一个 *统计学家* 的视角——只要平均下来还行就行。
+
+*第二阶段* (MagicDec / VeriCache)，认知翻转了：*不是所有任务都能接受近似——但所有任务都能接受"先近似猜，再精确验"*。这是一个 *系统工程师* 的视角——近似不必妥协正确性，它只需要妥协"运行时的计算路径"。
+
+更深一层，VeriCache 在做的事和 *投机执行* (speculative execution) 在 CPU 里做的事是同构的——CPU 也是先猜分支走哪条、错了 rollback，最终保证 ISA 语义一致。LLM 推理正在被悄悄地"重新发明"成一个微体系结构问题：HBM 是 L1，CPU 内存是 L2，远端存储是 L3，draft+verify 就是分支预测+回滚。
+
+下一步最可能往哪走？我赌：*Draft 和 verify 不再共享同一个模型*。一旦你接受"近似 + 验证"的范式，drafter 就可以是任何更激进的东西——别的架构、别的精度、甚至是规则引擎——只要 full model 的 verify 兜底。整个 LLM 推理可能会变成一个 *异构 propose / 单一 verify* 的两阶段流水线。
+
+* 启发
+
+1. *压缩这件事别孤立做*——它的价值很可能不在最终输出，而在 *当一个更便宜的 proposer 用*。任何你在做的"近似算法"都可以问一句：能不能改造成 draft，配一个 full verify？
+
+2. *瓶颈错峰是被严重低估的杠杆*——VeriCache 的核心不是新算法，是发现 *HBM 带宽和 PCIe 带宽是两根独立的管子*，让两件事并行跑就赚到了。在你自己的系统里，找出"两个看起来串行的步骤其实卡在不同资源上"的地方，几乎都能再拧出一截性能。
+
+3. *评测指标骗你*——F1/ROUGE 上的 5% 退化在代码生成里可能是 95% 退化。当一个领域开始接受"有损但平均够用"作为默认，往往就是有人能用"无损但运行更聪明"重新洗牌的时候。下次看到"我们牺牲了少量精度换取了 X 倍速度"，问一句：这个牺牲在长尾、在结构化输出、在自回归累积下会不会爆炸？

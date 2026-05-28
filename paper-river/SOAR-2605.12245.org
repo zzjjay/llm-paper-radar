@@ -1,0 +1,323 @@
+#+title:      SOAR: Scale Optimization for Accurate Reconstruction in NVFP4 Quantization
+#+date:       [2026-05-28 Thu 10:18]
+#+filetags:   :paper:river:
+#+identifier: 20260528T101816
+#+source:     https://arxiv.org/abs/2605.12245
+#+authors:    Chengzhu Bao, Xianglong Yan, Zhiteng Li, Guangshuo Qin, Guanghua Yu, Yulun Zhang (Shanghai Jiao Tong University, Tencent Hunyuan)
+#+venue:      arXiv 2026-05-12 (cs.LG)
+
+* 问题之河
+
+LLM 权重压到 4 比特之后，怎么把"压缩前"和"压缩后"的差距压到最小？
+
+具体一点：一个权重矩阵几亿到几十亿个浮点数，硬件只给你 4 bit 来表示每个数（FP4 = E2M1，可选值只有 16 个）。直接舍入到最近合法值会让一些大权重（outlier）爆炸性失真，整层激活就跟着崩了。
+
+人们想到一招：*按块共享一个 scale*。把权重切成小块，每块挑一个 scale 数把所有元素归一化到 FP4 能表示的范围里。这样 outlier 就被 scale 吸收，单块内部相对均匀。这就是 *microscaling*——MXFP4、NVFP4 都是它的不同变种。
+
+但 scale 本身怎么选？历史上一直靠 *max-based* 的死规则（取这一块绝对值的最大值）。这条规则在 FP4 这种极低比特上不够好——选偏一点点，整块的重建误差都会膨胀。三年来 microscaling 这条线，本质上就在反复回答同一个问题：
+
+  *给定硬件约束（block size、scale 的位宽和格式），怎么找出最好的 scale？*
+
+每往前一步，都是在啃这块骨头。
+
+* 溯源地图
+
+#+begin_example
+[2022] Frantar et al. -- GPTQ
+  |
+  | 看到的问题: 直接 round-to-nearest 重建误差太大，Hessian 信息没用上
+  | 解法: 按列 OBS 补偿 + Cholesky，让 INT4 PTQ 跑通 175B
+  | 留下的坑: INT 量化对 LLM 重尾分布不友好，4-bit 以下崩
+  v
+[2023] Xiao et al. / Lin et al. -- SmoothQuant, AWQ
+  |
+  | 看到的问题: outlier channel 把整列动态范围拉爆
+  | 解法: 把 outlier 从激活迁到权重，再做 channel-wise scale
+  | 留下的坑: 还是 INT 格式，没匹配 LLM 浮点分布
+  v
+[2023] Rouhani et al. -- MXFP4 (Microscaling FP4)
+  |
+  | 看到的问题: INT4 / 统一 scale 都装不下 LLM 重尾分布
+  | 解法: 32 元素一块共享一个 E8M0 指数当 scale，块内用 FP4 (E2M1)
+  | 留下的坑: scale 只能是 2 的整数次幂，粒度太粗
+  v
+[2025] NVIDIA -- NVFP4
+  |
+  | 看到的问题: MXFP4 的 E8M0 scale 太粗 + block 32 太大
+  | 解法: 块缩到 16，scale 升级成 FP8 (E4M3)，外加一个 FP32 全局 scale；
+  |       Blackwell GPU 原生支持
+  | 留下的坑: 大家仍用 max-based 启发式选 scale；FP8 量化 scale 自身也有误差
+  v
+[2025] Cook et al. -- 4over6
+  |
+  | 看到的问题: max-based scale 一刀切，没自适应
+  | 解法: 在两个预设 scale 范围（6 和 4）之间二选一，按 MSE 挑
+  | 留下的坑: 只有"两档"分辨率，离散得太粗；
+  |          量化和反量化共用一个被 FP8 约束的 scale
+  v
+[2026.05] Bao et al. -- SOAR  <-- 本篇
+  |
+  | 看到的问题: (1) scale 选择应该是连续优化问题，不是二选一；
+  |             (2) 量化端用的 scale 不必和反量化端硬件约束的 scale 是同一个
+  | 解法: CJSO —— 对 global + block scale 推闭式联合最优解，
+  |       DSS  —— 解耦"高精度量化 scale"和"FP8 反量化 scale"，离散联合搜索
+  v
+[2026] Chhugani / Meng / Egiazarian 等 -- Overflow-Aware, ARCQ, MR-GPTQ ...
+  |
+  | 看到的问题: 还有别的角度可以再榨 NVFP4 (dynamic range、补偿通道、和 GPTQ 融合)
+  | 解法: 各自从 overflow、残差、Hadamard 旋转入手
+#+end_example
+
+* 演化叙事
+
+** 2022 | GPTQ: 把 30 年的 Hessian 补偿打磨到能跑 175B
+
+*** 它看到了什么问题
+
+LLM 太大，训完之后想塞进消费级 GPU 必须量化。简单 round-to-nearest 让模型困惑度炸得不能用。这一代人继承了 OBD/OBS 那条线（用二阶 Hessian 信息指导舍入），但 OBS 公式 O(d^3) 完全扛不到几十亿参数。
+
+*** 它的解法
+
+按列处理 + lazy batched update + Cholesky 因子重写——把"砍/量化一个权重之后所有其他权重该如何补偿"的公式工程化到能跑 175B 模型。结果：4-bit INT 量化 + 困惑度只掉一点点。GPTQ 从此成为整个 LLM PTQ 领域的默认 baseline，所有后续工作要么基于它要么挑战它。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+按列处理是工程妥协——把全网联合优化降级成可缓存的单层子问题。Hessian H = X^T X 一次算完反复用，常数压到能用。
+
+但它留了两个长尾问题：
+
+1. *INT 量化对 LLM 不友好*。LLM 权重分布是重尾的——大部分元素接近 0，少量元素绝对值很大。INT4 是等间距 grid，要么牺牲精度（小元素都挤到 0），要么牺牲范围（大元素溢出）。再聪明的 Hessian 补偿也救不了这个根本的 *表示不匹配*。
+2. *4-bit 以下崩盘*。3-bit、2-bit 上 GPTQ 困惑度急剧恶化。这是后来 ADMM-Q 那条线在攻击的。
+
+我们这条线（microscaling）选择换一个攻击方向：*不再死守 INT，换成 FP 格式*。
+
+** 2023 | SmoothQuant / AWQ: 把 outlier 从激活搬到权重
+
+*** 它看到了什么问题
+
+LLM 激活里有少数 channel 的绝对值比其他大几十上百倍（outlier channel）。激活量化时这些 channel 会把整行的动态范围拖爆，结果整行精度都被它一个人毁掉。GPTQ 只管权重，激活这边几乎没人收尾。
+
+*** 它的解法
+
+引入一个 per-channel 的缩放变量 s_c。激活那边除以 s_c，权重那边乘以 s_c——数学上输出不变，但 outlier 的麻烦从激活转嫁到了权重侧。权重相对容易处理（离线、能慢慢调），激活就好量化了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是一种 *等价变换*——用代数变换把困难的部分搬到容易处理的地方。后来 SpinQuant、QuaRot 把这个思路推得更激进（用 Hadamard 旋转抹平整张矩阵的 outlier 分布）。
+
+但它没解决一个更根本的问题：*量化格式本身* 还是整数。一旦你看到 LLM 权重的真实分布是 heavy-tailed，整数 grid 的等间距假设本身就是错的。下一步必然是换格式。
+
+** 2023 | MXFP4: 浮点 + 块共享 scale，原生匹配重尾分布
+
+*** 它看到了什么问题
+
+INT 等间距 grid 装不下重尾分布。FP（浮点）的格点天然不等间距——小数值精细、大数值粗放，正好对上重尾分布的形状。但 FP4 单个元素的动态范围太窄（E2M1 最大表示 6），单独用不了。
+
+*** 它的解法
+
+把权重切成 *32 个元素一块*。每块共享一个 *scale*——这个 scale 是个 E8M0 的指数（也就是只能取 2 的整数次幂）。块内每个元素用 FP4 (E2M1) 表示。
+
+  原值 ≈ scale_block × FP4_element
+
+这就是 *microscaling*：fine-grained block-wise，每块自己挑动态范围。outlier 块自动会得到较大 scale，正常块得到小 scale，整体动态范围被分摊。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+两个匹配同时发生：
+- FP 格点匹配重尾分布的 *形状*
+- 块共享 scale 匹配 LLM outlier 是 *局部聚簇* 的事实（同一行的相邻几列往往一起 outlier）
+
+留下的坑：scale 只能是 2 的整数次幂（E8M0 就是个纯指数）。粒度太粗——同一块里如果 max 在 1.1 和 1.9 之间，scale 都只能取同一个 2 次幂，相当于浪费一半的动态范围。需要更细的 scale 表示。
+
+** 2025 | NVFP4: 块缩到 16，scale 升级成 FP8 + 加一个全局 scale
+
+*** 它看到了什么问题
+
+MXFP4 的 E8M0 scale 太粗，且块大小 32 还是不够 fine-grained。LLM 的 outlier 分布往往更局部——块越小，越能精准捕捉。
+
+*** 它的解法
+
+NVIDIA 在 Blackwell GPU 上原生支持的新格式：
+
+- 块大小从 32 缩到 *16*（更细）
+- 块 scale 从 E8M0 升级成 *FP8 (E4M3)*（既有指数又有尾数，连续多了）
+- 在所有块 scale 之上，再加一个 *FP32 全局 scale α*——给整张张量再做一次缩放
+
+  原值 ≈ α × scale_block_FP8 × FP4_element
+
+硬件支持意味着 NVFP4 不光是个数值格式，还是个 *能跑得快* 的格式。一夜之间它成了所有人的新基线。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+两级 scale 是关键：全局 α 管住整张张量的动态范围，块 scale 管住局部细节。这是一个 *分层* 的设计。
+
+但论文里所有人都还是用 *max-based 启发式* 选 scale——alpha = max(|X|) / (M_FP4 · M_FP8)，每块的 scale 也是块内 max 除以 M_FP4。这是 "拿格式当算法" 的态度——硬件给了你新格式，但选 scale 的算法还停留在 INT 时代的 max-based 死规则。
+
+更深一层的坑：FP8 (E4M3) 本身只是个 8-bit 格式，能表示的 scale 值是离散的。你的 scale 算出来是 1.234，FP8 只能存成最接近的 1.25 之类——这个 *scale 量化误差* 直接影响最终重建。但没人专门处理它。
+
+** 2025 | 4over6: 给 scale 选择加一个二选一开关
+
+*** 它看到了什么问题
+
+NVFP4 用块内 max 算 scale，意味着 scale = max / 6（因为 FP4 max 表示值是 6）。但你也可以选 scale = max / 4——这样块内只有那个最大元素会被 clamp 到 4 然后丢失精度，其他元素却能被表示得更精细（分辨率提升）。
+
+哪种更好？取决于这一块是不是只有少数 outlier。如果 max 是孤立 outlier，scale 小一点（用 4）反而对其他元素更友好；如果 max 不孤立，scale 大一点（用 6）才不会丢信息。
+
+*** 它的解法
+
+对每一块，*两种 scale 都算一遍重建 MSE，挑小的那个*。预设两档分辨率 (6 和 4)，块级二选一。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+第一次让 NVFP4 的 scale 选择 *自适应*。证明了"max-based 死规则不是最优"这件事，给后面打开了空间。
+
+但它的分辨率太粗：
+
+1. *只有两档*。最优 scale 可能在 4 和 6 之间的某个连续值，比如 5.2。二选一抓不到。
+2. *没动全局 scale α*。两级 scale 实际上是耦合的——块 scale 调了，最优的 α 也会跟着变。各调各的得不到全局最优。
+3. *量化和反量化共用一个 FP8 scale*。这条没人讨论——既然 scale 要存进硬件就必须是 FP8，那量化时也只好用 FP8 scale。但这是一个被忽视的假设。
+
+** 2026.05 | SOAR: scale 选择是连续优化 + 量化端解耦反量化端
+
+*** 它看到了什么问题
+
+SOAR 同时看到了 4over6 留下的两个坑：
+
+1. *离散二选一 → 连续优化*。如果 scale 选择本质上是连续的（在某个范围里挑实数），那它就是一个 *有闭式解的最优化问题*，没必要靠枚举。
+2. *量化 scale 和反量化 scale 在数学上不必相同*。硬件只规定了 *反量化时* 用的 scale 必须能存进 FP8——因为反量化是 inference-time 的事情，硬件直接执行。但 *量化时* 用的 scale 是离线 PTQ 跑的，没人逼你也用 FP8。论文 Figure 2(b) 的红锁/绿勾就是在画这件事：反量化 scale 被锁，量化 scale 没必要被锁，但所有人都把它们绑成一个变量。
+
+这是被 4over6 / NVFP4 整条线视而不见的 *表示不对称*。
+
+*** 它的解法
+
+两件事，凑成 SOAR：
+
+*CJSO（Closed-form Joint Scale Optimization）—— 把 scale 选择推成闭式解*
+
+目标函数是经典的重建 MSE：
+
+  min  Σ_i || W_i - Q(W_i / (α · Δ_i)) · (α · Δ_i) ||^2
+  α,Δ
+
+其中 α 是 FP32 全局 scale，Δ_i 是第 i 块的 scale。Q 是 FP4 量化。
+
+直接对 (α, Δ) 联合优化困难——Q 是离散的。但 *固定 Q 的赋值* 之后，目标关于 (α, Δ) 是二次的。一阶最优性 ∂L/∂α = 0、∂L/∂Δ_i = 0 直接给出闭式更新：
+
+  α* = Σ W·Q·Δ / Σ Q^2·Δ^2          （全局 scale 的闭式解）
+  Δ_i* = Σ W·Q·α / Σ Q^2·α^2        （块 scale 的闭式解）
+
+然后投影 Δ_i* 到最近的 FP8 合法值。两条公式交替执行——这是 *坐标下降*：固定块 scale 更新全局，固定全局更新块 scale，每一步都让 MSE 严格下降。
+
+对比 4over6 的二选一：4over6 是从两个预设值里挑；CJSO 是直接 *算* 出最优值，再四舍五入到合法点。这是从 *搜索* 升级到 *求解*。
+
+*DSS（Decoupled Scale Search）—— 解耦量化端和反量化端的 scale*
+
+CJSO 给的还是单一变量。SOAR 进一步说：量化时用的 scale 叫 Δ_q，反量化时存的 scale 叫 Δ_d。Δ_d 必须是 FP8（硬件约束），Δ_q 可以是任意高精度实数（离线 PTQ 跑就行）。
+
+重写目标：
+
+  min  Σ_i || W_i - Q_FP4(W_i / (α · Δ_q_i)) · (α · Δ_d_i) ||^2
+  Δ_q∈R, Δ_d∈FP8
+
+- Δ_q 决定权重 *被映射到 FP4 的哪一格*（量化端，连续）
+- Δ_d 决定 *反量化时乘哪个 scale 去还原*（反量化端，FP8 离散）
+
+两者解耦后，DSS 围绕 CJSO 给的初值，在 Δ_d 的 FP8 邻居 + Δ_q 的连续邻域上做联合搜索，挑出让重建 MSE 最小的那对 (Δ_q, Δ_d)。
+
+*整体 SOAR 框架*：CJSO 给闭式初值 → DSS 做局部精修 → 交替迭代。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+差异的本质 *一句话*：4over6 是"在两档预设里枚举"，SOAR 是"按一阶最优性算出来，再把硬件约束当成投影/搜索的边界"。这是把 scale 选择从 *启发式* 升级成 *优化问题*。
+
+Decoupled Scale 那一招更关键——它揭示了一个被整条 microscaling 线忽视的 *硬件接口不对称*：反量化是硬件强约束，量化是软件自由选择。所有人都默认两者必须一致，是因为把硬件接口直接当成了数学约束。SOAR 把这个绑定解开后，零成本（不改硬件、不改 inference）就榨出了准确率。
+
+Qwen3-8B 在 NVFP4 上 5 zero-shot 任务平均：SOAR 70.68 vs SOTA 70.12。小但真实，因为对 PTQ 来说每 0.5 个点都难。
+
+留下的新坑：
+
+1. *搜索成本*。DSS 是离散搜索，对很大的模型成本会上去。CJSO 闭式是快的，DSS 是慢的——超大规模上工程化怎么办没说。
+2. *Scale 的硬件接口仍然是给定的*。SOAR 在"接受 NVFP4 接口"前提下找最优。如果未来一代格式（NVFP4 v2 或竞争对手）改了接口（比如允许更高精度的 scale 存储），整套优化要重做。
+3. *不和 GPTQ / Hadamard 等正交方向融合*。MR-GPTQ 已经在做"scale 搜索 + GPTQ + 旋转"的组合；SOAR 暂时还是单点优化。
+4. *没动 activation 量化*。NVFP4 的激活侧 outlier 仍然是个独立问题，SOAR 只管权重。
+
+* 前沿延伸
+
+SOAR 刚挂上 arXiv（2026-05-12），但同一时间窗口里这条线已经在多个方向同时推进：
+
+- *MR-GPTQ (Egiazarian et al. 2026)*：把 scale 搜索和 GPTQ 的 Hessian 补偿、Hadamard 旋转融合在一起。和 SOAR 是平行而非竞争的——SOAR 可以替换掉 MR-GPTQ 里的 scale 搜索模块。
+- *Overflow-Aware Scaling (Chhugani et al. 2026)*：从另一个角度——动态范围/溢出感知——选 scale，不改硬件。和 CJSO 哲学接近但攻击 overflow 这个 corner。
+- *ARCQ (Meng et al. 2026)*：用 *残差通道* 补偿量化误差。和 scale 优化正交——把 SOAR 当 baseline 之后再做残差补偿是显然的下一步。
+- *RaZeR (Chen et al. 2025)*：发现 FP4 (E2M1) 有冗余的零值（+0 和 -0），把多余的零位重新映射到额外量化值上，免费换更高表示能力。
+
+这些一起说明：NVFP4 这个格式在 2025-2026 年集中爆发。所有人都在攻击同一个表面——给定硬件接口，每榨出 0.5 个点都值钱。
+
+下一步最可能往哪走：
+
+- *跨层联合 scale 优化*。SOAR 还是 layer-wise——一层一层独立优化 scale。一旦考虑层间误差传递，scale 选择应该是全局问题（ADMM-Q 那条线在剪枝/量化上已经在做类似事）。
+- *量化感知训练（QAT）下的 CJSO*。把 CJSO 推到训练循环里，让 scale 和权重一起学，可能在 sub-4-bit microscaling（比如 NVFP3、MXFP3 这种未来格式）上有突破。
+- *硬件接口本身被挑战*。SOAR 接受"反量化必须用 FP8"这个约束。如果下一代硬件支持更高精度的 scale 存储（比如 FP16 scale + FP4 element），整条线的优化空间会重开。
+
+* 一张图看懂
+
+#+begin_example
+                     "Microscaling FP4 量化" 三年演化
+
+                    格式表达力 ^
+                                |                                  [SOAR 2026.05]
+                  scale 是优化  |                                       *
+                  问题的解      |                                     /
+                                |                                   /  解耦 Δ_q / Δ_d
+                                |                                 /    闭式联合解
+                                |                          [4over6 2025]
+                  scale 自适应   |                              *
+                  二选一        |                            /  per-block 二选一
+                                |                          /    打破 max-based
+                                |                        /
+                                |                [NVFP4 2025]
+                  两级 scale     |                    *
+                  FP8 块 scale   |                  /  block=16
+                  + FP32 全局    |                /    Blackwell 原生支持
+                                |              /
+                                |     [MXFP4 2023]
+                  FP 块共享       |          *
+                  E8M0 scale     |        /     32 元素一块, 2^k scale
+                                 |      /       原生匹配重尾分布
+                                 |    /
+                  INT4 通道补偿   |  [AWQ/SmoothQuant 2023]
+                                 |     *
+                                 |   /  outlier 从激活搬到权重
+                  纯 INT4 +      |  [GPTQ 2022]
+                  Hessian 补偿    | *  按列 OBS + Cholesky
+                                +-----------------------------------------> 时间
+
+  ---------------- 共享 DNA: "怎么用有限的比特，装下 LLM 重尾权重" ----------------
+
+  INT 时代 (2022-2023)      | Microscaling 时代 (2023-2025)  | Scale 优化时代 (2025-2026)
+  改算法 (Hessian/scale 变换) | 改格式 (FP4 + 块 scale)         | 改 scale 怎么选 (启发式 -> 优化)
+  量化格式是 fixed           | 量化格式终于匹配分布形状        | 接受格式, 把 scale 当变量
+#+end_example
+
+* 洞见
+
+*真正发生的变化不是"加了一个新算法"，而是问题被切了三次。*
+
+第一次切：从 *INT* 切到 *FP*。看清楚 LLM 权重是重尾分布之后，等间距 grid 就是错的工具。MXFP4 切完。
+
+第二次切：从 *单一 scale* 切到 *分层 scale*。看清楚 outlier 是局部聚簇之后，全局一个 scale 浪费动态范围。NVFP4 切完。
+
+第三次切（SOAR）：从 *启发式选 scale* 切到 *优化求解 scale*，并且发现 *量化端和反量化端的 scale 在数学上不必相同*。
+
+每一次切都是把一个 *被默认成事实* 的东西放回到 *可选择* 的位置上。下一刀大概率会切在：
+
+- *硬件接口本身可选*——如果下一代格式 (NVFP6? MXFP3?) 让 scale 精度成为可选参数，SOAR 的优化范式会扩大十倍空间。
+- *Layer-wise 假设*——SOAR 还在层内做最优。跨层联合是显然的下一刀。
+
+更深一层的 pattern：*每当硬件给出一个新格式，紧接着会有一波"用旧方法装新瓶子"的工作（max-based scale 选择就是这种）。真正的进步发生在有人意识到新格式的某个隐含自由度从来没人用过——这个自由度往往就在硬件接口的"约束 vs 自由"边界上。* SOAR 找到的"量化端 scale 不被 FP8 锁住"就是典型的边界自由度。
+
+* 启发
+
+1. *看到"启发式规则"四个字，先问：这件事能不能写成优化问题？* max-based scale 选择是个写了三年的启发式规则。SOAR 直接把它写成 min MSE，发现一阶最优性给出闭式解。很多"行业默认做法"其实只是 *没人坐下来把它推成优化问题*——一推就垮。
+2. *看到"统一的变量"，先问：是数学上必须统一，还是工程上恰好绑在一起？* NVFP4 里 quant scale 和 dequant scale 被默认成同一个，纯粹因为存储和运行的接口是同一个 FP8 字段。但 *量化是离线、反量化是 in-line*——两个流程，两个变量。一旦解开，零成本就拿到准确率。这种"绑定的对偶变量"是 paper 的金矿。
+3. *硬件接口的不对称性是免费的优化空间*。SOAR 利用的是 "硬件管运行时但管不到离线 PTQ"——这是个 *接口不对称*。每一种硬件 + 算法的协作里都有这种不对称，找到它就能不动硬件白嫖性能。
+4. *一个领域刚迎来新硬件格式（像 Blackwell + NVFP4）的时候，是动手做 scale-level 优化最赚的时间窗口*。所有 baseline 还在用旧时代的 max-based 死规则，闭式优化能拿到 0.5-1 个点的免费提升。这意味着你可以——盯紧未来 1-2 年的 NVFP3 / MXFP3 / 下一代低比特格式发布，第一波 scale 优化工作通常是最容易发的论文。

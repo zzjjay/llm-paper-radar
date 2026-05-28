@@ -1,0 +1,256 @@
+#+title:      SPHERICAL KV: Angle-Domain Attention and Rate-Distortion Retention for Efficient Long-Context Inference
+#+date:       [2026-05-28 Thu 10:57]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T105729-en
+#+source:     https://arxiv.org/abs/2605.18856
+#+authors:    Anay Chauhan, Gurucharan Marthi Krishna Kumar, Arion Das, Amit Dhanda, Vinija Jain, Aman Chadha, Amitava Das
+#+venue:      arXiv preprint, May 2026
+
+* The River of the Problem
+
+During long-context inference, every time the model generates a token, it must read the Key/Value cache for every past token back out of HBM. The longer the context, the larger this cache grows and the slower each read becomes — until the bottleneck is no longer compute, but memory bandwidth.
+
+What makes this hard is the three-way tension: you want to store less (save HBM capacity), read faster (unclog bandwidth), and compute accurately (preserve quality). These three goals fight each other. Generation after generation of researchers attacked the problem, each time daring to tighten only one screw — only to find the whole machine still leaking air. The Spherical KV line of work asks: can we change coordinate systems so that all three goals can be addressed together in one place?
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: attention is O(T^2); generating each token requires recomputing from scratch
+  | Solution: cache K and V (KV cache); subsequent tokens only compute attention of new query against old KV
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | Problem: the real reason attention is slow is not FLOPs but repeated HBM reads/writes
+  | Solution: tiled computation + kernel fusion; K/V read only once; IO rather than compute is the core bottleneck
+  v
+[2023] Zhang et al. (H2O) / Xiao et al. (StreamingLLM)
+  |
+  | Problem: in long contexts the KV cache keeps growing; HBM can neither hold it nor stream it
+  | Solution: don't keep everything — retain only a few "important tokens" (heavy hitters / attention sinks), evict the rest
+  v
+[2024] Liu et al. (KIVI) / Hooper et al. (KVQuant)
+  |
+  | Problem: evicting too many tokens hurts quality; can the survivors be stored more compactly?
+  | Solution: quantize K/V to 2-4 bit; save in compressed form; dequantize back to FP16 for the dot product
+  v
+[2025] Polar/Spherical KV (Han et al., Wu et al., Xiao et al.)
+  |
+  | Problem: the *direction* of a K vector determines similarity; *magnitude* is just a scale — why quantize them together?
+  | Solution: decompose into (radius, angle); spend more bits on direction, fewer on magnitude
+  v
+[2026.05] Spherical KV (this paper)
+  |
+  | Problem: the methods above save bits at rest but still "decompress back to dense K before the dot product" at decode time —
+  |          that step gives back the HBM savings that were just earned; and "how many tokens to keep" vs. "how many bits per token"
+  |          are still two separate, uncoordinated decisions.
+  | Solution: (i) let the attention kernel consume compressed angle codes directly, eliminating decompression;
+  |           (ii) fold "keep or evict" and "how many bits" into a single rate-distortion budget for joint decision.
+  v
+[Frontier] Toward full-stack fusion: running the entire decode in the compressed domain
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer / KV cache: Cache What Has Already Been Seen
+
+*** What Problem It Saw
+
+The earliest language models used RNNs, processing one word at a time, each step waiting on the previous. GPU compute sat idle while wall-clock time stretched out.
+
+*** Its Solution
+
+Throw out the RNN entirely and let every token attend directly to all preceding tokens — that is the attention mechanism. But the natural cost is that the T-th token must compute a similarity score against every one of the T-1 tokens before it.
+
+To avoid recomputing this during generation, engineers quickly added a practical fix: compute each layer's K ("what am I?") and V ("what do I say?") once and cache them — the *KV cache*. When the next token arrives, only the new query needs to query this accumulated store of old KV pairs.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Recomputation was eliminated, but a slow-burning disease was planted. The size of the KV cache equals *batch × layers × token count × heads × head dimension × 2*. As context grows, this block of memory inflates alarmingly — and every new token generated requires reading the entire thing once.
+
+At the time, everyone assumed this was a minor nuisance — after all, HBM was large enough. As context lengths grew from 2K to 32K to 128K, this "small problem" became the primary bottleneck.
+
+** 2022 | FlashAttention: The Real Bottleneck Is Memory Bandwidth, Not Compute
+
+*** What Problem It Saw
+
+Many efforts to optimize attention aimed at reducing FLOPs — sparse attention, low-rank approximations, and so on. But careful profiling revealed that in long sequences, the GPU spends most of its time waiting on memory: intermediate results shuttling back and forth between *HBM* and on-chip SRAM. Faster compute helps nothing when the bottleneck is the road.
+
+*** Its Solution
+
+Decompose the softmax of attention into streaming, incrementally accumulating tiles, computing the entire attention pass inside SRAM without spilling intermediate results to HBM. This is the *IO-aware* kernel combined with *kernel fusion*.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It redirected researchers' attention from "how much to compute" to "how much to read" — from that point forward, every KV compression method abandoned "reducing FLOPs" as its goal and adopted "reducing HBM byte movement" instead.
+
+But FlashAttention only optimized *how to compute*; it never touched *what to store*. The KV cache itself remained dense FP16. As context lengthened, simply streaming it from HBM back onto chip was enough to saturate bandwidth — and this gave all subsequent KV compression work its legitimacy.
+
+** 2023 | H2O / StreamingLLM: Just Don't Keep All of Them
+
+*** What Problem It Saw
+
+Since every generated token requires a full scan of the KV cache, the most direct lever is to shrink the cache as a whole. Researchers looked at attention distributions and noticed that most tokens are almost never attended to — only a handful of "heavy hitters" and the very first few "attention sink" tokens are repeatedly referenced.
+
+*** Its Solution
+
+H2O: dynamically evict tokens that no query ever attends to, guided by historical attention scores. StreamingLLM: permanently keep the first few sink tokens plus a sliding window of the most recent tokens; evict everything in between.
+
+*** Why It Worked (and What New Pit It Dug)
+
+KV volume could be slashed 5–10× immediately, and HBM traffic fell proportionally. But two problems quickly surfaced:
+
+1. *"Which to evict" is a dynamic decision*: selecting tokens by attention score means re-evaluating every step, which is itself overhead.
+2. *Eviction is irreversible*: an evicted token that a future query suddenly needs — say, in a needle-in-a-haystack retrieval task — is gone forever. Performance on long-context QA degraded sharply.
+
+The natural follow-up question: can the tokens that are kept be stored more compactly?
+
+** 2024 | KIVI / KVQuant: Don't Keep the Survivors in FP16 Either
+
+*** What Problem It Saw
+
+Methods like H2O had pushed "how many tokens" close to the limit, but each surviving token still occupied 16 bits. Even 50% of a 128K-token context is 64K tokens × several GB. The only lever left was "how many bits per token."
+
+*** Its Solution
+
+Quantize KV to 2–4 bits. Implementation quickly revealed two important nuances:
+- K and V have different statistical profiles — KIVI proposed quantizing K per-channel and V per-token.
+- Outlier channels, once quantized, cause catastrophic quality loss — KVQuant, OTT, RotateKV, and others designed various "protection mechanisms": keep high precision for outliers, low precision for the rest.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Bytes per token fell to 1/4 – 1/8 of the original. But a hidden tax that everyone silently accepted was left in place:
+
+At decode time, the kernel reads compressed low-bit codes and must first *decompress back to a dense FP16 K vector* before it can perform the dot product with the query. This step —
+
+- writes a temporary dense K into HBM, effectively spending back the bandwidth that was just saved;
+- breaks the "compressed state flows directly into SRAM" fusion path that FlashAttention established;
+- is also unfriendly to paged KV (the vLLM model), because the layout inside each page now includes a dequantization stage.
+
+Savings at rest; losses at compute.
+
+** 2025 | Polar / Spherical KV (Han / Wu / Xiao et al.): Direction and Magnitude Should Be Compressed Separately
+
+*** What Problem It Saw
+
+Methods like KIVI treated K vectors as plain arrays of numbers. But the essence of attention is *q·k = ‖q‖·‖k‖·cos θ* — what determines who attends to whom is *direction* (cos θ), not *magnitude* (‖k‖). A scheme that quantizes direction and magnitude together assigns the same precision budget to two things of very different importance.
+
+*** Its Solution
+
+Decompose each K into *(radius r, angle φ)* (spherical / polar decomposition). Spend more bits on the direction component — it is what truly governs similarity — and fewer bits on the radius, which is merely a scaling constant. This decomposition also carries a bonus: once direction is compressed, one can compute an "angular approximation" in the compressed domain without full reconstruction.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Rate-distortion allocation shifted from "N bits per scalar" to "bits allocated by geometric importance" — in theory, the Pareto frontier moved forward.
+
+But two obstacles remained in practice:
+1. Most implementations still *decode the angle code into a dense unit vector*, multiply by the quantized radius, reconstruct a dense K, then perform the dot product — meaning *compressed-domain computation* was recognized as an opportunity but never truly seized.
+2. "Keep or evict this token" and "how many bits for this token" remained two independent decisions — the eviction controller and the quantizer operated without coordination, and nobody managed the budget as a whole.
+
+This is the gap Spherical KV saw: *actually deliver* compressed-domain computation, and *merge* the two control loops.
+
+** 2026.05 | Spherical KV: Compute Attention Inside the Compressed Domain + Decide Everything Jointly
+
+*** What Problem It Saw
+
+Reading the preceding papers together, the problem is very concrete:
+
+- FlashAttention taught us "the bottleneck is HBM traffic";
+- H2O cut the number of tokens;
+- KIVI cut the bits per token;
+- Polar KV made bit allocation geometrically sensible;
+- But *the "decompress to dense K" step inside the decode kernel* was never truly eliminated by anyone. It is the shared reason that all of the above methods under-deliver on their promises.
+
+At the same time, *keep/evict* and *how many bits* were still two controllers that never talked to each other — a token might be retained at low priority by the quantizer when it should have been dropped entirely by the eviction controller; the total budget was being wasted.
+
+*** Its Solution
+
+Two things at once:
+
+1. *Angle-Domain Attention (ADA)*: K is stored as (quantized radius r̃, compact angle code c^θ). The decode kernel consumes these two codes directly, exploiting the identity *q·k ∝ ‖q‖·r·cos θ*, *without ever reconstructing dense K*. This preserves the paged + fused IO path — less is stored, less is truly read, and the HBM savings no longer leak away during dequantization. V is still stored in standard form — because it must ultimately participate in a softmax-weighted sum, and dequantization there is comparatively cheap.
+
+2. *Rate-Distortion Retention (RDR)*: "Keep or drop z_i ∈ {0,1}" and "how many bits b_i" are folded into a single constrained optimization:
+   #+begin_example
+   min E[L(decode({z_i, b_i}))]   s.t.   sum_i z_i · cost(b_i) ≤ B
+   #+end_example
+   Solved via Lagrangian relaxation + a "value-per-byte" (vpB_i = ΔL / Δcost) greedy. The decision rule is simple and engineerable: *demote first, then evict*; retrieval-critical tokens are forcibly protected.
+
+The physical artifact of the whole system is *tier-homogeneous KV pages* — all slots within one page share the same precision tier, allowing the serving kernel to read sequentially guided by a page header, coalesced, with no random gather.
+
+*** Why It Worked (and What New Pits It Left)
+
+This is the first time in this line of work that *representation* (spherical encoding), *policy* (RDR), and *execution* (fused angle-domain kernel) are designed together in the same coordinate system. The paper reports: decode throughput *1.55× – 1.72×* at 8K / 32K / 128K context lengths, KV byte count reduced *24–42%*, with the largest gains at 128K — fully consistent with the HBM-bound intuition (longer context, greater benefit).
+
+New gaps left open:
+- ADA truly extracts *direction* from the computation path, but the *value* path remains standard — the obvious next step is compressed-domain computation for V as well;
+- RDR is an offline/online hybrid policy-learning problem; cross-task transferability needs further development;
+- "Tier-homogeneous pages" is a deployment contract that requires the entire serving stack (vLLM / SGLang) to cooperate before the full gains can be harvested.
+
+* Frontier Extensions
+
+As of May 2026, Spherical KV is the latest step along the *"compressed-domain attention + joint rate-distortion"* line. Looking further ahead, three developments seem most likely:
+
+1. *V also enters the compressed domain* — V is currently read out and weighted in standard form. Once V can participate in an approximate "weighted sum" in the compressed domain (e.g., via a low-rank or angle-domain approximation), HBM traffic can drop another notch.
+2. *Learned coders* — the current spherical encoding and RD controller are largely hand-designed with a simple learned policy. They will soon be replaced by end-to-end learnable KV coders that adapt "direction codebooks" to specific models and tasks.
+3. *Serving-stack co-design* — tier-homogeneous pages already constitute a deployment contract targeting vLLM / SGLang. Next, the scheduler, prefix cache, and speculative decoding will all be reorganized around tiers — this line of work will grow from an "operator-level trick" into the memory model of the entire serving stack.
+
+* One Diagram to Understand It All
+
+#+begin_example
+   Time ->  2017      2022       2023        2024         2025          2026.05
+            ----      ----       ----        ----         ----          -------
+   What     Algorithm  IO         How many    How many     How to         Compute in compressed
+   matters  (FLOPs)   (HBM)      tokens      bits/token   split bits     domain + joint decision
+                                                           (geometry)     (joint coding+compute)
+
+   Key      Attn      Flash      H2O          KIVI          Polar/        Spherical KV
+   work     Is All    Attn       Stream       KVQuant       Spherical
+            You       (Dao)      LLM          GEAR          KV (Han,
+            Need                 Scissor                    Wu, Xiao)
+
+   Solved   Cached    IO not     Dense KV     Evicting      Direction      The hidden HBM tax of
+   what     recompute FLOPs is   too large    too much      and magnitude  "decompress to dense K
+                      bottleneck              hurts quality mixed together  before dot product"
+
+   Pit      KV keeps  What to    Eviction     Save at       Still need     V not in compressed
+   left     growing   store      is           rest; pay     to reconstruct domain; learned coders;
+                      untouched  irreversible at compute    dense K        serving stack reorg
+
+   Core     +cache    +fusion    -tokens     -bits         -bits/geom    -reconstruct
+   action                                                                  +joint RD
+
+   |--------------------- One goal: HBM traffic ----------------------------|
+              (each generation moves closer to the theoretical lower bound:
+               "bytes read = bytes truly stored")
+#+end_example
+
+* Insights
+
+Stacking all five generations together, what is really happening is not "compression getting increasingly aggressive" — it is that *the object being optimized keeps changing coordinate systems*:
+
+- **First shift**: from *FLOPs* to *HBM bytes* (FlashAttention). After this, "fast" became synonymous with "small."
+- **Second shift**: from "reduce total volume" to "allocate by importance" (H2O / KIVI) — but the token dimension and the bit dimension were managed independently.
+- **Third shift**: from "Cartesian vectors" to "direction + magnitude" (spherical KV) — bits finally allocated by geometric meaning.
+- **Fourth shift (this paper)**: from "compress then decompress then compute" to *"compressed domain is the compute domain"*; simultaneously, the two control loops are merged into a single *rate-distortion budget*.
+
+Each coordinate-system change made one old assumption unnecessary:
+- No need to assume FLOPs are the bottleneck;
+- No need to assume all tokens are equally important;
+- No need to assume all dimensions are equally important;
+- No need to assume decompression must precede computation;
+- No need to assume retention and quantization are two separate problems.
+
+Extrapolating forward, the next assumption to be broken is likely: "Key and Value must use the same storage and access paradigm" — Spherical KV has already split them into two separate paths; the next step is finding V its own compressed-domain compute primitive.
+
+At a deeper level, this line of work signals that *LLM inference optimization is evolving from "algorithmic tricks" into "information theory + systems co-design."* Shannon's 1948 rate-distortion theory appearing as a central citation in a 2026 KV paper is itself a signal worth noting.
+
+* Takeaways
+
+- *Finding problems: look inside the "hidden taxes everyone silently accepts."* KIVI had already squeezed KV down to 2 bits, yet everyone quietly accepted "you have to restore dense K before computing." The entire motivation of Spherical KV is eliminating that one step. The most valuable research is often not inventing something new but *pointing out that a step never needed to exist in the first place.*
+
+- *Doing research: changing coordinate systems is worth more than adding tricks.* Every major leap in this line came from switching the metric being optimized (FLOPs → HBM → bit/token → bit/geometry → compressed-domain compute). In your own field, ask: is the metric everyone is currently optimizing the true bottleneck, or is it historical inertia?
+
+- *Merge control loops that were wrongly separated.* "Keep or evict" and "how many bits" were long two independent modules; Spherical KV welded them together with a single rate-distortion budget — and both improved as a result. In your own work, which "two teams each managing their own piece" situations are really one problem?
+
+- *Actionable version*: if you are working on long-context serving, start with two concrete checks: (1) inspect your KV path for any "compress then immediately decompress" hidden dequantization; (2) check whether eviction and quantization are operating independently — they should share a unified "value-per-byte" scoring function.

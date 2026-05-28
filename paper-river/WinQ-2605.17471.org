@@ -1,0 +1,309 @@
+#+title:      WinQ: Accelerating Quantization-Aware Training of Language Models Around Saddle Points
+#+date:       [2026-05-28 Thu 10:48]
+#+filetags:   :paper:river:
+#+identifier: 20260528T104816
+#+source:     https://arxiv.org/abs/2605.17471
+#+authors:    Dongyue Li, Zechun Liu, Kai Yi, Zhenshuo Zhang, Changsheng Zhao, Raghuraman Krishnamoorthi, Harshit Khaitan, Hongyang R. Zhang, Steven Li (Meta + Northeastern)
+#+venue:      ICML 2026 (arXiv 2026-05-17, cs.LG)
+
+* 问题之河
+
+你训了一个全精度的大模型，七十亿参数，效果很好。现在要把每个权重压到 2 个比特里——四个整数 {-1, 0, 1, 2}。直接砍下去精度暴跌，于是你边训边量化：前向把权重 round 到 grid 上，反向假装这个 round 是恒等映射，让梯度照常流回去。
+
+这套办法叫 *quantization-aware training (QAT)*。它能把 4-bit 模型救回到接近 FP16 的水平。但只要你想往 3-bit、2-bit、1-bit 走，训练就开始 *爬不动*——loss 早早地卡在一个高位上，再多塞 token 也只是缓慢蹭一点点。
+
+十年来，所有人都看到这个现象，却没人说清楚 *为什么*。是优化器不行？是梯度估计的偏差太大？是模型容量不够？大家各自押一个原因，往上糊补丁——换 round 方式、换 step size、加 Hadamard 旋转、加 trust mask……补丁有效，但治标。
+
+这条河上每一篇论文都在啃 *同一根骨头*：低 bit 下，梯度的反馈信号变得越来越稀薄，模型在 grid 的离散点之间反复横跳，loss 表面长什么样、为什么走不动，没人真正画出来过。直到 WinQ 拿起 Hessian 谱这把刀切下去，发现：它不是优化器懒，是地形本身——模型卡在了 *鞍点的平坦区*。
+
+* 溯源地图
+
+#+begin_example
+[2013] Bengio, Leonard, Courville -- STE (Straight-Through Estimator)
+  |
+  | 看到的问题: round() 不可导，反向传播过不去
+  | 解法: 反向假装它是恒等映射，让梯度照流
+  | 留下的坑: 这是个"假"梯度——偏差有多大没人说
+  v
+[2018] Jacob et al. -- Quantization-Aware Training (QAT)
+  |
+  | 看到的问题: 训完再 round (PTQ) 在低 bit 下精度崩
+  | 解法: 训练时就模拟 quantize/dequantize，让权重
+  |       提前适应离散 grid。STE 处理梯度
+  | 留下的坑: step size / 量化范围怎么选都是 heuristic
+  v
+[2020] Esser et al. -- LSQ (Learned Step Size Quantization)
+  |
+  | 看到的问题: 量化的 step size 应该跟着 loss 一起学
+  | 解法: 把 step size s 也当参数，跟权重一起梯度下降
+  |       4-bit ImageNet 接近 FP32
+  | 留下的坑: 在 CNN 上行得通，搬到几十亿参数的 LLM 完全是另一码事
+  v
+[2023] Liu et al. -- LLM-QAT (+ BitNet 同期)
+  |
+  | 看到的问题: LLM 太大，QAT 重训成本爆炸；数据也拿不全
+  | 解法: 用 teacher 模型 self-distill 生成数据，
+  |       全精度 logits 当 soft label，把 QAT 搬到 LLM 上
+  |       (BitNet 同期走另一条路: 1-bit 从头训)
+  | 留下的坑: 4-bit 还行，3-bit 以下收敛极慢，要 10B+ token
+  v
+[2025] Panferov et al. -- QuEST
+  |
+  | 看到的问题: 低 bit 下 STE 给的梯度偏差大，
+  |             离 grid 远的权重梯度尤其不可信
+  | 解法: (1) Hadamard 变换把权重分布"摊平"，减少量化误差
+  |       (2) trust gradient estimator: mask 掉量化误差大的权重的梯度
+  | 留下的坑: 收敛速度还是慢——补丁能压住误差，
+  |           但没回答"为什么训练就是爬不动"
+  v
+[2026.05] Li et al. -- WinQ  <-- 本篇
+  |
+  | 看到的问题: 前面所有工作都在调梯度估计，
+  |             没人画过 QAT 的 loss 表面长什么样
+  | 解法: 估 Hessian 谱 -> 发现权重停在"鞍点平坦区",
+  |       40%+ 的特征值挤在 0 附近 -> 两招对症下药:
+  |       (a) 周期性把权重往 grid 上拉一截(线性插值)
+  |       (b) 给权重加噪声再算梯度,正则化 Hessian
+  | 结果: 4x 加速,sub-4-bit 精度涨 8.8%
+  v
+[2025-2026 同期] LOTION / CAGE / 后续工作
+  |
+  | LOTION: 把"量化损失"重写成"加噪损失的期望",
+  |         二阶平滑器,本质和 WinQ 加噪那招通路相似
+  | CAGE:   多目标 (loss + 距 grid 距离) + curvature 调度
+  | 共同方向: QAT 不再是 STE 的小修小补,
+  |           而是看作"非光滑非凸优化"问题来设计算法
+#+end_example
+
+* 演化叙事
+
+** 2013 | STE: 让梯度从不可导的地方过去
+
+*** 它看到了什么问题
+
+神经网络的反向传播靠链式法则——每一层都要可导。但量化操作 round(x) 是阶梯函数，导数处处为零（除了跳变点）。一旦你在前向里插入一个 round()，反向传到这里梯度就被砸成零，整个上游的权重都不更新了。
+
+*** 它的解法
+
+Bengio 给了一个干净到耍赖的答案：*反向传播时假装 round() 是恒等映射*。前向算的是离散值，反向梯度照常往回流，就当 round 不存在。
+
+这叫 Straight-Through Estimator (STE)。
+
+*** 为什么这招在当年够用（以及哪里埋了新坑）
+
+在小型 binary 网络里效果还不错——但所有人都知道 STE 给的梯度是 *假梯度*。它和真实梯度的偏差有多大？这个偏差在什么时候会摧毁训练？没人答得上。
+
+十年后，回头看 WinQ 的诊断，正是这条假梯度链在低 bit 下把 loss 表面拉成了一片鞍点沼泽。
+
+** 2018 | Jacob et al.: 训练时就让模型适应低精度
+
+*** 它看到了前一步什么问题
+
+STE 解决了"梯度能不能过"的问题。但人们的用法还停留在 *训完再 quantize* (post-training quantization, PTQ)——模型用 FP32 训好，部署时再 round 成 INT8。这种事后行为在 INT8 上勉强，到 INT4 以下精度直接崩。
+
+根本原因：训练过程里模型从未"看见"过自己被量化后的样子，它学到的权重分布和量化 grid 不匹配。
+
+*** 它的解法
+
+把 quantize/dequantize 这一对操作 *塞进训练前向里*。前向：权重和激活先 round 到 INT，再 dequantize 回 float 继续算。反向：用 STE 让梯度照常流。
+
+效果：训练过程中模型 *持续看着量化后的自己*，权重慢慢往 grid 友好的分布上挪。INT8 模型几乎无损，INT4 也能挽救。
+
+*** 它留下的坑
+
+QAT 的核心超参——量化的 step size（每个 grid 格子有多宽）、clipping 范围——全是人工拍的。不同层、不同任务都得调，调不好就崩。
+
+** 2020 | LSQ: 把 step size 也交给梯度去学
+
+*** 它看到了前一步什么问题
+
+Jacob 的 QAT 假设你能 *提前* 选对量化范围。但权重分布在训练中一直在变——固定的 step size 要么浪费 grid（范围太大、密度不够），要么 clip 掉重要权重（范围太小）。
+
+*** 它的解法
+
+把 step size $s$ 当成一个可学习参数，和权重一起做梯度下降。STE 帮忙把 round 操作里的梯度传到 $s$ 上。
+
+这等于说："你别人工调了，模型自己会调到合适的 step size。"
+
+CNN 上的效果立竿见影——4-bit ResNet 几乎追平 FP32。
+
+*** 它留下的坑
+
+LSQ 是在 ImageNet/CNN 时代验证的。两个隐含假设到了 LLM 时代不一定成立：
+- 模型规模：ResNet 几千万参数，LLM 几十亿到几千亿
+- 训练数据：ImageNet 1.3M 张图，LLM 训练动辄上 T tokens
+
+把 LSQ 直接搬到 LLM，训练成本和收敛性都是新问题。
+
+** 2023 | LLM-QAT / BitNet: QAT 第一次进入大模型时代
+
+*** 它看到了前一步什么问题
+
+LLM 时代的 QAT 面对两个崭新难题：
+
+1. *训练数据不可得*：LLM 的预训练数据通常是私有的，下游用户拿不到。没数据怎么做 QAT？
+2. *训练成本爆炸*：在百亿参数模型上重训等于半个预训练，成本难以承受。
+
+*** 它的解法
+
+LLM-QAT 给出的答案：*用 teacher 自己生成数据*。让全精度 LLM 自由采样生成大量文本，把这些文本喂给量化版的 student，用 teacher 的 soft logits 做知识蒸馏。完全 data-free。
+
+同期的 BitNet 走了更激进的路：*从头就用 1-bit 训练*。不蒸馏，预训练阶段就上 binary 权重。
+
+*** 它留下的坑
+
+到这里你能看出一条清晰的衰减曲线：
+
+- 8-bit: 几乎免费
+- 4-bit: 训几个 epoch 也能救
+- 3-bit: 要训 *远* 比预期更多 token
+- 2-bit / 1-bit: 即使训 10B+ token，loss 还在缓慢下降的尾巴上
+
+所有人都把它归因于"低 bit 下信息少"，但具体卡在哪里？没人说清。
+
+** 2025 | QuEST: 把 STE 这把假梯度尺打磨得更锋利
+
+*** 它看到了前一步什么问题
+
+QuEST 的诊断是：*STE 在低 bit 下给的梯度偏差太大*。具体地——
+
+- 权重分布是长尾的（少数权重值很大），量化 grid 是均匀的，长尾权重的量化误差会非常大
+- STE 对所有权重一视同仁地传梯度，那些量化误差大的权重对应的梯度其实"骗人"，会把训练带歪
+
+*** 它的解法
+
+两招组合拳：
+
+1. *Hadamard 变换*：在量化之前把权重矩阵乘以一个 Hadamard 旋转矩阵。Hadamard 是一种"打散"操作——它能把长尾分布变得更接近高斯，让 grid 的均匀划分更合理，单个权重的量化误差被压下去。
+2. *Trust gradient estimator*：mask 掉那些"量化误差仍然很大"的权重的梯度。只信任那些已经离 grid 比较近的权重传回来的梯度。
+
+实际效果不错：1-bit LLM 训练 10B token 后能逼近一个不错的 baseline。
+
+*** 它留下的坑
+
+QuEST 的所有改进都是在 *修正 STE 的偏差*——让假梯度尽量不那么假。
+
+但回头看那条衰减曲线：4-bit 几个 epoch、3-bit 多很多、2-bit 慢、1-bit 极慢——这个 *训练步数随 bit 指数级膨胀* 的现象，QuEST 没有解释。它的补丁能压住单步的偏差，但没能让训练从"龟速爬坡"里挣脱。
+
+为什么训练就是爬不动？这是悬在十年来所有 QAT 工作头上的一个问题。
+
+** 2026 | WinQ: 第一次画出 QAT 的 loss 表面
+
+*** 它看到了前一步什么问题
+
+WinQ 不再追着 STE 调参数，而是后退一步问：*QAT 的 loss 表面到底长什么样？*
+
+为什么这么问？因为：
+
+- 一阶信息（梯度）已经接近零（otherwise 训练不会卡住）
+- 一阶接近零时，下一步走多快取决于 *二阶信息*——Hessian 的特征值
+- 没人画过 QAT 训练中的 Hessian 谱
+
+*** 它的发现
+
+用 stochastic Lanczos 估计 Hessian 谱，三个干净的观察：
+
+1. *鞍点平坦区*：训练后期，Hessian 的特征值既有正的也有负的（鞍点的特征），而且大量特征值挤在 0 附近——这块区域既不是极小值（凸的）也不是极大值（凹的），是 *几乎平坦的鞍点区*
+2. *零附近的特征值越来越多*：训练步数越往后，0 附近的特征值占比越大、绝对值越小——loss 表面越来越 "flat"
+3. *bit 越低越严重*：1-bit 的最大特征值幅度比 4-bit 小一个数量级以上——同样是鞍点，1-bit 那块"平坦"得简直水平
+
+这就是答案：QAT 不是优化器懒，是 *loss 表面在低 bit 下被压成了鞍点沼泽*。梯度接近零、二阶曲率也接近零——经典优化理论里这是最难走的地形之一。
+
+*** 它的解法
+
+既然问题是"鞍点平坦"，那就 *主动把曲率拉回来*。两招对症：
+
+1. *周期性插值复位 (Win)*：每隔 K 步，把全精度 latent weight $w$ 拉成 $\alpha \cdot w + (1-\alpha) \cdot \mathrm{quantize}(w)$——也就是把它往 grid 上拉一截。这件事的几何效果是：让权重离量化 grid 更近，等价于把模型推到一个 *Hessian 特征值幅度更大* 的区域，离开平坦鞍点。
+
+2. *噪声注入梯度*：对权重加一个高斯噪声，在加噪后的位置上算梯度。这个操作可以解释成隐式地对 Hessian 做了正则化——平滑了 loss 表面，让小特征值的方向也能被梯度感知到。
+
+两招一起，loss 表面被 *显式地变陡*，训练终于爬得动了。
+
+*** 实验
+
+- 在 LLaMA-3, Qwen, OPT 等 16 种配置上，QAT 加速最多 4x
+- 同样的训练成本下，sub-4-bit 精度比 SOTA 高最多 8.8%
+- 验证了诊断：用了 WinQ 之后，Hessian 谱里 0 附近的占比显著下降，最大特征值幅度回升
+
+*** 它留下的坑（开放问题）
+
+- 三个超参 (K, $\alpha$, $\sigma$) 还是要调
+- 理论分析只给了凸近似下的收敛保证，鞍点逃逸的严格刻画还没有
+- "鞍点诊断"是否能推广到 activation 量化、KV-cache 量化、MoE 量化？
+
+** 同期 | LOTION / CAGE: 从 STE 范式转向"非光滑优化"范式
+
+WinQ 出现的同一时间，有两条不同的路径在汇向同一个判断：*QAT 应该被当作非光滑非凸优化问题来对待，而不是 STE 的小修小补*。
+
+- *LOTION* (Kwun et al. 2025): 把量化损失改写为 "权重加随机舍入噪声后损失的期望"。数学上这相当于一个 *二阶曲率感知的正则化器*——和 WinQ 的"加噪梯度"那一招通路相似，但 LOTION 是显式推导的平滑器
+- *CAGE* (Tabesh et al. 2025): 多目标公式——把训练损失、权重到 grid 的距离、Hessian 曲率一起放进目标函数
+
+把这三篇放在一起看，会发现 *它们都在做同一件事*——把 QAT 的优化几何重新当成头等问题来研究，而不是继续微调 STE 这个老工具。
+
+* 问题-解法总览
+
+#+begin_example
+QAT 训练为什么爬不动？十年的答案演化:
+
+[2013-2020]  "STE 的梯度估计太粗了"
+              -> 给 STE 加 step size 学习 (LSQ)
+              -> 给 STE 加 trust mask + Hadamard (QuEST)
+              所有工作都假设: 把假梯度修得更准, 训练就会快
+              证据强度: 经验上有效, 没回答"为什么会卡"
+
+[2023]       "LLM 太大, 数据拿不到"
+              -> data-free distillation (LLM-QAT)
+              -> 1-bit from scratch (BitNet)
+              工程上把 QAT 推到 LLM, 但 sub-4-bit 收敛慢的现象 *更严重*
+
+[2026]       "loss 表面就是平的, 梯度怎么修都没用" <-- WinQ
+              -> 估 Hessian 谱: 鞍点 + 平坦区 + 零附近聚集
+              -> 主动改造地形: 拉回 grid + 噪声平滑
+              第一次把"为什么慢"从经验观察变成 *可测量的几何事实*
+
+[同期 LOTION/CAGE] 共识在形成:
+                   "QAT 是非光滑非凸优化, 不是 STE 调参"
+                   -> 显式平滑器 / 多目标曲率感知优化
+
+
+  bit 越低
+    ^
+    |                          鞍点平坦区越严重
+    |                          训练步数指数膨胀
+4-bit |  几个 epoch
+3-bit |  多很多 token  <-- LLM-QAT/BitNet 时代发现
+2-bit |  非常慢
+1-bit |  10B+ tokens 才到肩  <-- QuEST 时代
+    |
+    +----------------> 训练成本
+
+  WinQ 的诊断: 不是 STE 太粗, 是 loss 表面
+              在低 bit 下被压成了鞍点沼泽
+  WinQ 的解药: 周期把权重拉回 grid (Win) +
+              加噪梯度正则 Hessian
+#+end_example
+
+* 内核
+
+这条河里的真正变化，不是"又一个加速 QAT 的 trick"，而是 *把研究问题的位置整体往后推了一步*：
+
+- 前十年的工作都在问：*怎么把假梯度修得更像真梯度?*
+- WinQ 问的是：*为什么用了再多的真梯度，训练还是不动?*
+
+后一个问题的答案藏在 *loss 表面的几何* 里，不在梯度里。
+
+这个转移有点像优化理论里 "convex → non-convex → saddle point" 那条经典演化线——人们先以为 deep learning 优化难是因为 non-convex 有很多 local minima，后来发现真正卡死训练的不是 local minima 而是 *saddle points 的平坦区*。WinQ 在 QAT 这个子领域里，独立地重演了这一发现。
+
+下一步往哪走？两个方向可见：
+
+1. *理论侧*：把"鞍点逃逸"的经典工具（Perturbed SGD, escape saddle 的复杂度界）正式地搬到量化训练的设定下，给 WinQ 一类方法严格的收敛速率
+2. *算法侧*：既然知道了地形长什么样，能不能 *直接* 设计基于二阶信息的优化器（K-FAC、Shampoo 的量化版本），而不是用一阶 + 注入扰动这种间接办法
+
+更远一点——这条线启示了一个更普遍的方法论：当一个领域的所有改进都在"调梯度估计的方差"上打转、却始终不解决慢收敛问题时，*换一把刀去切 loss 表面本身*，往往能看到全新的东西。
+
+* 诚实标注
+
+- *确认的引用关系*: WinQ 论文相关工作部分明确引用 STE (Bengio 2013)、Jacob 2018、LSQ (Esser 2020)、LLM-QAT (Liu)、QuEST (Panferov 2025)、LOTION (Kwun 2025)、CAGE (Tabesh 2025)、BitNet (Wang 2023)。
+- *推测的环节*: "LLM-QAT 和 BitNet 同期" 是结构性简化，二者技术路线不同（蒸馏 vs from-scratch），并非严格因果链。LSQ 到 LLM-QAT 的跨越中省略了若干 CNN 量化工作（PACT、QIL 等）以保持主线清晰。
+- *未追踪的方向*: 没有列入 GPTQ/AWQ/OBQ 这条 *PTQ + Hessian* 的并行线索——它们与 WinQ 共享"二阶信息很重要"的直觉，但属于 post-training quantization 分支，不在本河"QAT 收敛慢"的主轴上。
+- *forward 延伸的不确定性*: WinQ 2026-05 才上 arXiv，引用它的后续工作尚未出现，所以只列了同期的 LOTION/CAGE 作为方向性的参照，不是 WinQ 的下游。

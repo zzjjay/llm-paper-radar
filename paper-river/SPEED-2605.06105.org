@@ -1,0 +1,267 @@
+#+title:      Shallow Prefill, Deep Decoding: Efficient Long-Context Inference via Layer-Asymmetric KV Visibility
+#+date:       [2026-05-28 Thu 09:52]
+#+filetags:   :paper:river:
+#+identifier: 20260528T095258
+#+source:     https://arxiv.org/abs/2605.06105
+#+authors:    Jungsuk Oh, Hyeseo Jeon, Hyunjune Ji, Kyongmin Kong, Jay-Yoon Lee (SNU)
+#+venue:      arXiv preprint, May 2026
+
+* 问题之河
+
+长上下文推理为什么这么贵？因为模型每生成一个新词，都要把前面成千上万个 prompt token 的"记忆"（KV cache）从显存里搬一遍，而且每一层都要搬。
+
+这件事难，是因为 KV cache 的尺寸 = 序列长度 N × 层数 L × 隐藏维度。N 涨到 128K，L 是 32，每生成一个 token 都要把这堆东西读一遍。结果是：首字延迟（TTFT）爆炸，每字延迟（TPOT）爆炸，显存爆炸。
+
+一代一代的研究都在问：*这么大一堆 KV，到底有多少是真的有用的？* 早期的人说"很多 token 不重要，扔掉"；后来的人说"不只 token 冗余，层与层之间也冗余"；再后来发现"prefill 阶段和 decode 阶段的需求其实不一样"。SPEED 站在这条线的末端，把这套观察推到了一个极端：*上层根本不用让 decode 看见 prompt 的 KV*。
+
+* 溯源地图
+
+#+begin_example
+[2023] Pope et al. - Efficiently Scaling Transformer Inference
+  |
+  | 问题: KV cache 在长上下文下成了主要瓶颈，但大家还没怎么动它
+  | 解法: 系统性地把推理拆成 prefill / decode 两阶段，量化代价
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | 问题: 所有 prompt token 都缓存，但其实大多数 token 几乎没人看
+  | 解法: 横向砍——只保留"重击者"（attention 集中的 token）的 KV
+  v
+[2023] Xiao et al. - StreamingLLM (Attention Sink)
+  |
+  | 问题: 砍掉开头的 token，模型生成立刻崩
+  | 解法: 开头 BoS 是一个"注意力下水道"，必须留着当锚
+  v
+[2024] Brandon et al. - Cross-Layer Attention (CLA)
+  |
+  | 问题: 横向砍完还是大，因为冗余其实是纵向的——上层 KV 跟下层很像
+  | 解法: 纵向砍——多层共享同一份 KV cache
+  v
+[2025] Qiao et al. - SwiftKV
+  |
+  | 问题: 死板共享太粗，prefill 的算力也没省下来
+  | 解法: 让上层 KV "从下层表征里学着投影出来"，prefill 时跳过深层
+  v
+[2026] He et al. - POP (Prefill-Only Pruning)
+  |
+  | 问题: 上层 KV 还是要算 (用投影)，能不能干脆别算？
+  | 解法: prefill 时直接砍掉深层算力，decode 时用独立 KV 投影补回来
+  v
+[2026] Oh et al. - SPEED (本篇)
+  |
+  | 问题: POP 算力是省了，但上层 prefill KV 还在显存里占地方
+  | 解法: 干脆让上层 decode 看不见 prompt——prefill 浅、decode 深
+#+end_example
+
+* 演化叙事
+
+** 2023 | Pope 等 - Efficiently Scaling Transformer Inference: 把账算清楚
+
+*** 它看到了什么问题
+
+在 GPT-3 这种动辄几百亿参数的模型时代，大家一直觉得"推理慢"是模型太大。Pope 等人第一次系统地把账翻出来——发现长上下文时，瓶颈不是模型参数，是 *KV cache 的反复搬运*。
+
+举个具体场景：你给模型一个 32K 的文档让它总结。模型先要把整个 32K 跑一遍生成 KV（prefill 阶段），然后逐字生成总结（decode 阶段）。decode 时，每生成一个字，都要把 32K × 层数 × 隐藏维度那么大的 KV 读一遍。显存带宽撑不住。
+
+*** 它的解法
+
+它本身不是一个"减肥"方法，而是一个 *拆解和测量* 的框架。把推理明确拆成 prefill 和 decode 两个阶段，分别度量首字延迟（TTFT）、每字延迟（TPOT）、显存带宽利用率。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把账算清，后面所有人才知道该砍哪里。坑是：它指出了瓶颈在 KV cache，但没告诉你 KV cache 里哪部分能砍。这成了之后所有工作的起点——*哪些 KV 是真的重要的？*
+
+** 2023 | Zhang 等 - H2O: 横向砍掉"陪跑"的 token
+
+*** 它看到了什么问题
+
+H2O 团队做了一件简单的事：把 attention 的权重热图画出来。结果发现一个惊人的现象——*绝大多数 prompt token 在生成时几乎没人看它*，attention 集中在少数几个 token 上。
+
+打个比方：你读一篇 5000 字的文章，回答问题时其实只回看了 50 个关键词。剩下 4950 个词的 KV 一直占着显存，但被读到的次数趋近于零。
+
+*** 它的解法
+
+只保留"重击者"（heavy hitters）的 KV，扔掉其余的。怎么挑重击者？看历史 attention 分数，谁累计被关注得最多就留谁。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为 attention 分布本来就是稀疏的。坑有两个：
+- 坑 1：扔掉开头的 token，模型会突然乱掉（这个坑直接催生了下一篇）
+- 坑 2：这是 *横向* 砍——在 token 维度上找冗余。但其实冗余还有另一个方向（这个坑要再过半年才有人意识到）
+
+** 2023 | Xiao 等 - StreamingLLM: 发现"注意力下水道"
+
+*** 它看到了什么问题
+
+StreamingLLM 团队想做无限长流式对话——窗口外的 token 直接丢。结果发现：*只要丢掉开头第一个 token，模型立刻开始胡言乱语*。
+
+这非常诡异。开头第一个 token（通常是 BoS，开始符号）能有什么信息？
+
+*** 它的解法
+
+诊断后他们发现：模型把开头几个 token 当成了 *attention 的下水道*——softmax 总要把概率分配到某处，没东西可看时就全倒进开头 token。所以 BoS 不是携带信息，是承担注意力的"溢出口"。
+
+解法：永远保留开头几个 token 作为 anchor，剩下的随便滑窗丢。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它给后人留下了一个极便宜的稳定器：*想要让模型在大幅修改 KV 后仍然不崩，留个 BoS 锚就行*。SPEED 三年后会把这个礼物原封不动地拿来用。
+
+坑：StreamingLLM 关心的是流式滑窗，没有触及"层间冗余"这件事。
+
+** 2024 | Brandon 等 - CLA: 纵向砍——上下层共享 KV
+
+*** 它看到了什么问题
+
+H2O 在 token 轴上砍完之后，KV 还是大。Brandon 等人换了个角度：把一个模型不同层的 KV 拿出来比较，发现 *上层的 K 和下层的 K 长得很像*——尤其是越深越像。
+
+这意味着，每一层都独立存一份 KV，其实是在重复存差不多的东西。
+
+*** 它的解法
+
+Cross-Layer Attention（CLA）：让相邻的若干层 *共享同一份 KV cache*。比如每 4 层共用一份，KV 显存直接砍 4 倍。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为深层 KV 本来就高度相似。坑是：
+- 共享意味着所有共享层的 KV 都长得一模一样，太死板
+- prefill 阶段还是得把每一层都算一遍——*只省了存储，没省算力*
+
+下一篇就是冲着"还能不能再省算力"来的。
+
+** 2025 | Qiao 等 - SwiftKV: 让上层 KV 从下层"长出来"
+
+*** 它看到了什么问题
+
+CLA 的共享太粗。SwiftKV 团队问：能不能让上层 KV 不是简单复制下层，而是 *从下层学一个投影*？这样既保留了上下层之间的差异，又能在 prefill 时跳过上层的大量计算。
+
+更进一步：prefill 时跳过上层算力，等到 decode 时再用学好的投影把上层 KV 补出来。
+
+*** 它的解法
+
+训练一个轻量级的投影模块：从下层 hidden states 直接投影出上层 KV。prefill 时只跑下层，上层 KV 通过投影 *构造* 出来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为上层 KV 本来就是下层表征的某种函数，可以近似学出来。坑是：
+- 投影也要算，*上层 KV 还是要存进显存*
+- 投影模块需要训练，多了一份训练成本
+
+下一篇会问：连投影都不要呢？
+
+** 2026 | He 等 - POP: prefill 时直接砍掉深层算力
+
+*** 它看到了什么问题
+
+SwiftKV 已经把 prefill 的深层算力砍了，但还是要 *补* 出来上层 KV 存到 cache 里。POP 团队进一步质问：上层 prefill KV 是否真的有必要在 decode 时被反复读取？
+
+它们的观察：上层的 attention 在 decode 时对 prompt token 的关注度本来就低（前面的 H2O 热图已经暗示了这一点）。
+
+*** 它的解法
+
+POP（Prefill-Only Pruning）：prefill 时只跑下层，上层完全跳过。但与 SPEED 不同——POP 在 decode 时用独立的 KV 投影机制把上层 prefill KV *补出来* 给 decode 用，并配套精心设计的边界处理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它确认了"上层 prefill 算力可以省"这件事。坑是：
+- POP 还是 *保留* 了上层 prompt KV 的概念——只是把它的来源从"算"变成"补"
+- 显存上，上层 prompt KV 还在占地方
+- 多了一套独立投影 + 边界处理的工程复杂度
+
+SPEED 站在 POP 旁边问了一个极简的问题：能不能 *根本不要* 上层 prompt KV？
+
+** 2026 | SPEED (本篇): 上层 decode 干脆看不见 prompt
+
+*** 它看到了什么问题
+
+SPEED 团队画的热图把一切都说清了：在 Llama-3.1-8B 上，*decode token 对 prompt token 的 attention 在中层达到峰值，到上层基本归零*。换句话说，上层 decode 根本没在认真看 prompt。
+
+既然没在看，凭什么还要把上层 prompt KV 存在显存里？POP 还在拼命把它"补"出来，但补出来后也没人理它。
+
+*** 它的解法
+
+phase-asymmetric KV-visibility——prefill 浅，decode 深。具体做法极简：
+- prefill token 只走前 K 层（默认 K = 24，即用 75% 的层）
+- decode token 走全部 L 层（默认 32 层）
+- 上层 decode 只看见前面已生成的 decode token + 一个 BoS 锚
+
+这里 BoS 锚是直接借用了 2023 年 StreamingLLM 的发现——只要留个开头 token 当 attention 下水道，上层不至于因为"无东西可看"而崩溃。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为：
+- 上层 decode 本来对 prompt 的关注就很弱（attention 热图证明）
+- decode 自身依然全深度，*生成能力不打折*
+- BoS anchor 撑住了 softmax 的稳定
+
+数字：用 75% 的层处理 prompt，Llama-3.1-8B 的 OLMES 平均分 51.2 vs 全深度 51.4（几乎没差）；128K 上下文下 TTFT -33%，TPOT -22%，显存 -25%。
+
+坑：
+- K 怎么选目前还需要扫一遍（虽然他们给了 layer-wise 诊断工具来辅助）
+- 只在 Llama-3.1-8B 上做了详细实验，规模化到更大模型还需要验证
+- "上层 decode 完全看不见 prompt" 是一刀切——更极端的任务（比如需要在生成后期突然回看 prompt 的多步推理）可能会受影响
+
+* 前沿延伸
+
+SPEED 是 2026 年 5 月的论文，是这条"depth-asymmetric KV"演化线上目前最新的代表。截至本文整理时，这条线上更新的工作还很少，但可以预期几个方向已经在路上：
+
+- *自适应 K*：不再靠扫描选 K，而是让模型根据 prompt 内容自己决定哪一层开始"放弃看 prompt"
+- *任务感知 visibility*：不同 head / 不同 head group 用不同的 cutoff，更细粒度地利用冗余
+- *与 token-level eviction 结合*：把 SPEED 的层维度砍法叠加到 H2O / SnapKV 等 token 维度砍法上，理论上可以乘性叠加
+
+不确定的部分：还没看到对 SPEED 的明确批判性后续工作。这可能是因为论文太新，也可能因为这个思路本身就接近"该砍的都砍了"的下限——再砍下去会动到生成质量。
+
+* 一张图看懂
+
+#+begin_example
+     什么是冗余？             怎么砍？             代价/留下的坑
+     --------------          --------------      --------------
+2023 | Pope: 拆账           | 把 prefill/decode | 没说怎么砍
+     |  发现 KV cache 是瓶颈 |   分开度量         |
+     v                       v                    v
+2023 | H2O: token 冗余       | 横向砍：           | 砍开头会崩
+     |  多数 token 没人看    |   只留 heavy hitter|
+     v                       v                    v
+2023 | StreamingLLM: 锚       | 留 BoS 当 attn    | 没碰层间冗余
+     |  开头 token 是下水道  |   sink             |
+     v                       v                    v
+2024 | CLA: 层间冗余          | 纵向砍：           | 只省存储
+     |  上下层 KV 很像       |   多层共享 KV      |   不省算力
+     v                       v                    v
+2025 | SwiftKV: prefill 可投影| prefill 跳上层    | 上层 KV 还得补
+     |  上层 KV 可从下层投影 |   decode 时补 KV   |   还得训投影
+     v                       v                    v
+2026 | POP: prefill 可剪     | prefill 砍深层    | 上层 prompt KV
+     |  上层 prompt 关注度低 |   decode 独立投影  |   还在显存里
+     v                       v                    v
+2026 | SPEED: visibility 砍  | 上层 decode       | K 要扫
+     |  上层 decode 不看 prompt |  根本不见 prompt KV |   靠 BoS 锚兜底
+     |                        |  + 借 StreamingLLM 的 BoS |
+#+end_example
+
+* 洞见
+
+读完整条线，背后真正在发生的不是"找新算法"，是 *对"什么是冗余"的认知层层下沉*：
+
+- 第一层认知：token 维度冗余（H2O：很多词不重要）
+- 第二层认知：layer 维度冗余（CLA：很多层的 KV 长得像）
+- 第三层认知：phase 维度冗余（SwiftKV/POP：prefill 阶段的上层算力其实可以省）
+- 第四层认知：visibility 维度冗余（SPEED：上层 decode 根本不需要看见 prompt 的 KV）
+
+每一代都在问"上一代说的冗余真的是冗余的尽头吗？"，每一代都把"冗余"的定义往更精细的维度推。本质是 *对 transformer 内部工作机理理解的逐步精化*——从把模型当黑盒（H2O 只看 attention 分数），到承认上下层有共性（CLA），到承认 prefill/decode 不对称（SwiftKV/POP），到承认 *prefill 信息只在中层流动*（SPEED）。
+
+下一步最可能往哪走？我赌两个方向：
+1. *Head-level / group-level 的 visibility 切分*——不是"前 24 层全看，后 8 层全不看"，而是不同 head 在不同层有不同的 cutoff
+2. *动态 visibility*——根据 prompt 的实际信息密度自动决定 K，便宜 prompt 用更小的 K，难 prompt 用更大的 K
+
+* 启发
+
+这条演化线对怎么做研究有两个启发：
+
+*启发 1：诊断先于优化。* H2O 画了 attention 热图、CLA 比较了上下层 KV、SPEED 画了 decode-to-prefill attention 的热图——每一代突破前面都有一个 *清晰的可视化诊断*，发现"原来这块是空的"。优化是 *看见空地之后的自然动作*，不是凭空构造新算法。
+
+意味着你可以：每次想优化一个系统前，先把它内部的"工作量分布"画出来。哪里是热的、哪里是冷的、哪里是冗余的——画完之后再决定砍哪里。
+
+*启发 2：极简是终点，不是起点。* SPEED 的"上层 decode 不看 prompt"在 2023 年的人听来会觉得疯狂——不看 prompt 怎么可能不崩？但它能成立，是因为前面三年里 H2O、StreamingLLM、CLA、SwiftKV、POP 一层层把"上层 prefill 不重要"这个认知夯实了。
+
+意味着你可以：当你看到一个领域里堆了很多复杂的工程方案时（比如 POP 的独立投影 + 边界处理），问自己——*"是不是这件事根本不需要做？"* 复杂工程方案往往是过渡形态，真正的下一步可能是把整个动作干脆删掉。

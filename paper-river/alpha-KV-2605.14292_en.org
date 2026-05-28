@@ -1,0 +1,290 @@
+#+title:      Minimal-Intervention KV Retention via Set-Conditioned Diversity
+#+date:       [2026-05-28 Thu 10:37]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T103708-en
+#+source:     https://arxiv.org/abs/2605.14292
+#+authors:    Libo Sun, Po-wei Harn, Peixiong He, Xiao Qin
+#+venue:      arXiv 2605.14292 (cs.LG), May 2026
+
+* The Problem River
+
+In long-context large language models, every additional token generated adds another K and V entry in GPU memory. Running Llama-8B over thousands of steps on long reasoning tasks, the KV cache can consume more memory than the model weights themselves. Hence the need for *KV-cache compression*: periodically selecting a handful of "important" tokens to keep and discarding the rest.
+
+The crux is "which ones to keep." From 2023 to 2026, virtually every method followed the same playbook: compute an importance score *s_i* for each token, sort, and take the top k. The only variation was *how to compute the score* — cumulative attention? windowed attention? statistical priors?
+
+This line of work ran for three years and spawned more than thirty papers, with scores growing ever more sophisticated yet accuracy curves barely moving. Nobody stopped to ask: why must it be "sort and take top-k"? If the k tokens you pick look nearly identical to each other, together they represent only one token — the remaining k-1 slots are wasted.
+
+The sharpness of this paper (α): everyone was changing the *score*; it changed the *selection rule*.
+
+* Source Map
+
+#+begin_example
+[2023] H2O (Zhang et al.)
+  |
+  | Problem observed: keeping the entire KV cache is too expensive
+  | Solution: attention is sparse — it suffices to keep the
+  |           "heavy-hitters," the small number of tokens with
+  |           the highest cumulative attention scores
+  v
+[2023] Scissorhands (Liu et al.)
+  |
+  | Problem observed: cumulative scores carry an "ancient halo" —
+  |                   a single early spike keeps a token alive
+  |                   indefinitely, even when it is no longer relevant
+  | Solution: replace accumulation with "persistence" — only retain
+  |           tokens that rank highly across recent windows
+  v
+[2024] StreamingLLM (Xiao et al.)
+  |
+  | Problem observed: empirically, the very first tokens always
+  |                   receive disproportionate attention regardless
+  |                   of content — even "<s>" or punctuation
+  |                   (attention sink)
+  | Solution: stop scoring altogether; keep sinks + recent window;
+  |           positional prior is more stable than content prior
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Problem observed: "was important in the past" ≠ "will be needed
+  |                   in the future"
+  | Solution: use the tail window of the prefill phase to predict
+  |           which tokens future queries will likely attend to,
+  |           then retain those predicted tokens
+  v
+[2026] TriAttention (Mao et al.)  ← direct predecessor of α
+  |
+  | Problem observed: SnapKV's "window voting" still requires
+  |                   running attention at runtime, which is costly
+  | Solution: compute Q/K frequency statistics offline and store
+  |           them as a lookup table; score tokens at inference
+  |           time by table lookup, then top-k
+  v
+[2026] α (Sun et al.) ← this paper
+  |
+  | Problem observed: all prior methods change how scores are
+  |                   computed, but the selection rule is always
+  |                   top-k — independent ranking. If two high-scoring
+  |                   tokens are nearly collinear in V-space, keeping
+  |                   both is equivalent to keeping one: one slot wasted
+  | Solution: use the same TriAttention scores, but replace top-k
+  |           with greedy selection — each newly chosen token is
+  |           penalized by its maximum cosine similarity to the
+  |           already-selected set in V-space.
+  |           One hyperparameter λ, one line of code changed.
+#+end_example
+
+Note: H2O → α traces an evolutionary line tightly coupled to the *scoring axis*. Two orthogonal branches co-exist: (1) changing the cache representation (PyramidKV, Ada-KV allocate per-layer / per-head budgets), and (2) quantizing the cache (KIVI, KVQuant compress each slot to low bits). α explicitly opts out of both branches and operates only on the scoring line.
+
+* Evolutionary Narrative
+
+** 2023 | H2O: Attention Is Sparse — Keep Only the Heavy-Hitters
+
+*** What Problem It Saw
+
+The naïve approach is to keep everything. But at 8K context, the KV cache already consumes more memory than the model itself — especially during long chain-of-thought reasoning, where the cache grows by one entry per generated token with no natural stopping point.
+
+The naïve optimization is a sliding window: keep only the most recent N tokens and discard older ones. But for reasoning tasks this is catastrophic — a chain-of-thought at step 500 may need intermediate results computed at step 30, which the window has long since evicted.
+
+*** Its Solution
+
+H2O proposes the *heavy-hitter hypothesis*: in a transformer, attention distributions are highly sparse — a small subset of tokens is repeatedly attended to across most steps, while the rest are almost never consulted. These few heavy-hitters are the ones that actually carry the future predictions; retaining them is enough.
+
+Concretely: maintain the cumulative attention score for each token (total attention mass received from all queries so far), sort, and keep the top k at each compression step. Simple and blunt.
+
+*** Why It Works (and What New Problem It Buries)
+
+The power-law distribution of attention is an empirically well-verified fact — most attention mass does concentrate on a small fraction of tokens.
+
+But a latent issue lurks: the "ancient halo." A token that received intense attention at step 50 due to one relevant sentence accumulates a high score; even if it is never consulted again afterward, it stays in the cache through step 5000. Cumulative scores cannot distinguish between "was important once" and "is relevant now."
+
+** 2023 | Scissorhands: Replace Accumulation with Persistence
+
+*** What Problem It Saw
+
+Scissorhands brings H2O's ancient-halo problem to the surface: cumulative scores are biased by early spikes, causing the cache to fill up with "faded celebrities."
+
+A concrete example: in long reasoning tasks the problem statement appears at the very beginning. Keywords in the problem attract the full attention of all prefill queries, accumulating enormous scores. By step 800, the model has long internalized the problem and is solving its third sub-step — but the cache still holds the original problem keywords, crowding out useful intermediate results computed at step 700.
+
+*** Its Solution
+
+Replace accumulation with a *persistence test*: slide a window over the most recent steps, and retain only tokens that *consistently* score highly throughout that window. A one-time spike does not count; the token must maintain sustained high relevance.
+
+*** Why It Works (and What New Problem It Buries)
+
+This change is especially effective for reasoning tasks — it identifies "working memory" that is revisited repeatedly, rather than early one-shot peaks.
+
+The cost: every step requires recomputing attention over the window, which is non-trivial. More fundamentally, persistence testing still looks *backward* — it assumes that past attention predicts future attention. That assumption roughly holds for reasoning tasks but begins to break down for open-ended generation.
+
+** 2024 | StreamingLLM: A Counterintuitive Finding Shakes the Whole Line
+
+*** What Problem It Saw
+
+While running long-context experiments, StreamingLLM noticed something strange: regardless of what the model is doing, *the very first tokens always receive high attention* — even semantically empty tokens like "<s>" or punctuation marks.
+
+They named this phenomenon *attention sink*. Their hypothesis: the softmax normalization forces attention to distribute probability mass somewhere; when no semantically relevant target exists, the mass piles onto the earliest tokens.
+
+This finding was awkward for the prior two years of work: all the algorithms scoring tokens by "content importance" were being contaminated by this *positional artifact*. No matter how carefully you score, if you evict the sink tokens, the model collapses.
+
+*** Its Solution
+
+Stop scoring entirely. Simply *keep two fixed segments*: the first few sink tokens + a recent sliding window.
+
+This sounds like a regression to the sliding-window era, but it solves something H2O and Scissorhands never addressed: stability under extremely long contexts without degradation.
+
+*** Why It Works (and What New Problem It Buries)
+
+It reveals a previously underappreciated insight: token selection is not a purely content-based game — *positional priors* are an independent, powerful signal.
+
+But the approach is too aggressive in its simplification: everything between the sinks and the recent window is discarded. For long reasoning tasks requiring distant look-backs, this is catastrophic. It suits open-ended conversational generation, not mathematical reasoning.
+
+** 2024 | SnapKV: Keep What Will Be Needed, Not What Was Important
+
+*** What Problem It Saw
+
+SnapKV identifies the shared assumption underlying all prior methods: *"was attended to in the past = will be needed in the future."* This does not always hold. The model's attention pattern shifts with each reasoning phase: step one attends to the problem; step two attends to the intermediate result from step one; by step three, the fine details of step one no longer matter.
+
+H2O looks at past cumulative scores; Scissorhands looks at past windows; StreamingLLM ignores content entirely. None of them try to *predict what future queries will want*.
+
+*** Its Solution
+
+Use the tail segment of the prefill phase (the "observation window"): observe which earlier tokens those final prefill queries attend to. Those tokens are likely to be the ones the first decode-phase queries will also attend to.
+
+Retain the tokens identified by this prediction; discard the rest.
+
+*** Why It Works (and What New Problem It Buries)
+
+This introduces a *forward-looking signal* — while still inferred from the past (the observation window), it more closely tracks "what the model is thinking right now" than H2O's purely cumulative score.
+
+New problems: the observation window must be recent and representative; the model's behavior must be stable; when reasoning phases shift sharply the prediction misfires. And running attention over the observation window at every compression step is still computationally expensive.
+
+** 2026 | TriAttention: Compress "Observation" into a Statistical Prior
+
+*** What Problem It Saw
+
+SnapKV requires running the observation-window attention at every inference step; H2O and Scissorhands maintain rolling history windows — all of them carry runtime computation costs. TriAttention's motivation is pragmatic: can we precompute "which tokens tend to be attended to"?
+
+*** Its Solution
+
+Run a large corpus offline, collect frequency statistics on the Q/K characteristics of each token (more precisely, each position/type), and store them in a lookup table. At inference time, score each token via table lookup to produce *s_i*, then take the top k.
+
+This is α's direct predecessor — the α paper refers to it internally as the "1d scorer" baseline.
+
+*** Why It Works (and What New Problem It Buries)
+
+Cheap, stable, no runtime observation required. In the experiments reported by the α paper, this baseline outperforms H2O and the SnapKV family by a noticeable margin on MATH-500.
+
+But it inherits the one unquestioned assumption shared by *every method in three years of this research line*:
+
+#+begin_quote
+Given scores s, the optimal selection rule is argmax top-k.
+#+end_quote
+
+Statistically this is equivalent to treating each token as an independent individual: the k with the highest scores form the optimal subset.
+
+α pries open a crack right here.
+
+** 2026 | α: Change the Selection Rule, Not the Score
+
+*** What Problem It Saw
+
+The α paper did something no prior work had done systematically: they internally ran *seven* different structural modifications — changing the cache representation, head routing, compression cadence, decoding behavior, plus two different scoring corrections — and *all seven failed*.
+
+Under a rigorous "matched-mean cache" evaluation protocol (not just matching at the end of prefill, but averaging cache match across the entire decode process), every one of these "seemingly well-motivated" structural improvements fell below the baseline.
+
+They also identified a concrete form of waste: among the high-scoring tokens produced by TriAttention, several are frequently nearly collinear in V-space — meaning their encoded information is highly redundant. argmax-top-k does not care; it keeps all of them. If the budget is 64 slots and 5 are occupied by nearly identical tokens, the effective budget is only 60.
+
+This "redundancy waste" is a structural defect of top-k, not a symptom of imprecise scoring.
+
+*** Its Solution
+
+Change exactly one function. Leave K/V representation, routing, compression cadence, decoding, and *the scoring formula* all untouched — replace only argmax-top-k with greedy selection:
+
+Token 1: still the highest-scoring candidate (preserving backward compatibility).
+
+Token t+1: the "marginal gain" of candidate i is
+
+#+begin_example
+  Δ(i | S_t) = s_i - λ · max(0, max_{j∈S_t} cos(v_i, v_j))
+#+end_example
+
+In plain terms: *your original score, minus your maximum cosine similarity to the already-selected set in V-space.* The candidate with the highest marginal gain is selected next.
+
+λ is the sole hyperparameter, controlling the strength of the diversity penalty. Setting λ=0 causes the formula to degenerate exactly to top-k (the paper also adds a fast path guaranteeing bitwise equivalence).
+
+Formally this is a *facility-location-style greedy subset selection* — a classic tool from combinatorial optimization that α imports into KV retention.
+
+*** Why It Works (and What New Problem It Buries)
+
+The key shift: the selection decision moves from *modular (independent scoring and ranking)* to *set-conditioned (conditioned on the already-selected set)*. The former can only ask "how important is this token by itself?"; the latter asks "given what has already been selected, how much new information does adding this token contribute?"
+
+On DeepSeek-R1-Distill's Qwen-7B and Llama-8B, at budgets 64 and 128 on MATH-500 reasoning tasks, two of the four (model, budget) cells pass Bonferroni-corrected significance tests; none is significantly negative.
+
+Two new open problems remain:
+
+1. *Does cosine similarity in V-space actually capture semantic redundancy?* The paper does not address this directly. V vectors are learned by the model; vector proximity does not necessarily imply semantic proximity — proximity might arise because both tokens begin with mathematical symbols, not because they carry redundant information.
+2. *Only one form of set-conditioned selection is explored (greedy + facility-location).* Submodular optimization and DPP (determinantal point processes) offer stronger diversity guarantees and broader theoretical backing. α chose the lightest possible variant to keep the "one-line change" appeal, not because it is optimal.
+
+* Frontier Extensions
+
+As of May 2026, α is the most recent published method on the KV-cache scoring line. Likely subsequent directions include:
+
+1. *Combining with orthogonal axes*: Ada-KV (per-head adaptive budgets) and α (set-conditioned selection) are orthogonal in principle and composable. The α paper explicitly notes "can be stacked" but does not do so.
+2. *Replacing greedy facility-location with submodular / DPP methods*: stronger theoretical guarantees, more general diversity measures — but heavier implementation, contradicting α's "one-line change" philosophy.
+3. *Finer-grained redundancy measures in V-space*: averaging V across layers is coarse; different layers may have very different redundancy structures.
+4. *Methodological spillover*: the core methodological contribution of the α paper may not be α itself, but rather the "matched mean cache + held-out pre-registration + Bonferroni correction" evaluation protocol. If adopted by the community, many of the "improvements" reported over the past three years may need to be re-examined — an infrastructure-level contribution that will outlast any individual method.
+
+* One Diagram
+
+#+begin_example
+          How the scoring signal is computed          Selection rule
+          ==============================              ==============
+
+2023  H2O          cumulative attention          ┐
+                                                 │
+2023  Scissorhands sliding-window persistence    │
+                                                 │  argmax-top-k
+2024  StreamingLLM positional prior (sink+near)  │  (modular, independent)
+                                                 │
+2024  SnapKV       prefill-tail prediction       │
+                                                 │
+2026  TriAttention offline Q/K statistical prior ┘
+
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                  (three years of refinement, all on the left side)
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2026  α            same as TriAttention          ━━>  greedy + V-redundancy penalty
+                                                       (set-conditioned, depends on
+                                                        already-selected set)
+
+
+Insight: no matter how precise the score, top-k cannot detect
+          "there is redundancy among these k tokens."
+
+          α's leverage is not on the signal side — it is on the
+          selection side.
+#+end_example
+
+* Insights
+
+Reading this entire line of work, what is really happening is not "scores growing ever more precise," but rather *the research frontier gradually shifting from the signal side toward the selection side*.
+
+The first five generations all changed the signal — cumulative → persistent → positional → predictive → statistical. Each generation was chasing the same question: "what signal best predicts future attention?" This reflects a *silently accepted framework*: the selection problem is equivalent to a ranking problem, so all leverage comes from the score.
+
+What α does is *disassemble that framework*. It points out that the top-k selection rule is itself an unquestioned design choice — and that this choice has a structural defect (inability to perceive redundancy). Once you see this defect, "improving the score" and "improving the selection rule" split into two independent research spaces, the latter having been overlooked for three years.
+
+There is a deeper pattern here: *when all methods in a field look alike and perform similarly, it is often not because everyone is hovering near the optimum, but because everyone has accepted the same hidden constraint.* Breaking through a performance ceiling requires not a more refined algorithm but *identifying and releasing that hidden constraint*.
+
+What is the next hidden constraint on the KV-cache line? My guess is *compression events are discrete and mutually independent* — the compression schedule is itself a scheduling problem, but every existing method treats it as a fixed exogenous variable. If someone jointly optimizes "when to compress" and "what to compress," there may be another leap.
+
+* Takeaways
+
+1. *When searching for a research problem, first ask "what is everyone changing?" then ask "what is nobody changing?"* A design choice shared by every paper over three years is often the next point of leverage.
+
+2. *Minimal modification + rigorous evaluation* produces more genuine results than *sweeping changes + weak evaluation*. The most counterintuitive finding in the α paper is that seven "seemingly clever" structural modifications all failed; the only success was a small patch that changed one function. This is not because α was especially clever — it is because the evaluation protocol filtered out spurious improvements.
+
+3. *The evolutionary shape of a baseline is itself research material.* From H2O to TriAttention, five generations all changed the signal — this kind of collective convergence is a sign that the research space is unhealthy, that everyone is circling the same hilltop. Recognizing such convergence is a prerequisite for finding a new slope.
+
+4. *A methodological contribution may matter more than the method itself.* The most enduring part of the α paper may not be α, but the "matched mean cache + pre-registration + held-out confirmation" evaluation protocol. If the community adopts it, improvement claims across the entire KV-cache subfield will be recalibrated — an infrastructure-level contribution that far outlasts any single new method.
+
+This implies a transferable heuristic: in any field where all methods look alike, find the design assumption they all share — that is usually where the next breakthrough is hiding.

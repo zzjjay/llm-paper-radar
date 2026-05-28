@@ -1,0 +1,281 @@
+#+title:      Multi-Scale Dequant: Eliminating Dequantization Bottleneck via Activation Decomposition for Efficient LLM Inference
+#+date:       [2026-05-28 Thu 10:31]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T103114-en
+#+source:     https://arxiv.org/abs/2605.13915
+#+authors:    Lingchao Zheng, Yuwei Fan, Jun Li, Chengqiu Hu, Qichen Liao, Junyi Fan, Rui Shi, Fangzheng Miao (Huawei)
+#+venue:      arXiv 2605.13915, stat.ML, 2026-05
+
+* The River of the Problem
+
+Why does LLM inference seem to stall the harder you optimize it? Because everyone is compressing weights — 4-bit, 8-bit, smaller and smaller. But GPU matrix-multiply units only speak BF16 / FP16, so before every multiply, the 4-bit values must be "restored" to BF16. This restoration step — called *dequantization* — should be a trivial side operation, yet on the latest accelerators it has become the dominant bottleneck: the matrix-multiply units sit idle waiting for restoration, while the restoration units can't keep up.
+
+The core tension in this problem is:
+*The smaller you compress weights, the less memory bandwidth you spend — but the less bandwidth you spend, the more you get stuck on the restoration step, and the saved bandwidth is entirely consumed by type conversion.*
+
+This is a classic whack-a-mole situation — the gains from compression are eaten by the cost of dequantization. For over a decade, generation after generation of researchers have circled this restoration step: some tried to optimize it, some tried to hide it, some tried to route around it, some tried to move it from the weight side to the activation side. MSD is the latest nail driven into this line.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers - LLM.int8()
+  |
+  | Problem seen: BF16 LLM inference is memory-hungry, but naive INT8 breaks
+  |               due to outlier activations
+  | Solution: Most channels use INT8; a small number of outlier channels use FP16
+  | Residual gap: dequant is still needed; mixed-precision path is complex
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem seen: LLM.int8 is still 8-bit — can we go further?
+  | Solution: Use second-order information (OBQ) for post-training quantization,
+  |           compressing weights to 3–4 bits
+  | Residual gap: Inference still requires dequant 4-bit -> BF16 before GEMM
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem seen: GPTQ treats all channels equally; critical weights are
+  |               compressed without protection
+  | Solution: Scale important channels protectively (based on activation magnitude)
+  |           before quantizing
+  | Residual gap: Quantization is more accurate, but the dequant path is unchanged
+  v
+[2024] Lin et al. - QServe
+  |
+  | Problem seen: dequant accounts for 20–90% of end-to-end runtime in W4A8 inference
+  | Solution: Compute-aware weight reordering + register-level parallelism,
+  |           fusing dequant into GEMM
+  | Residual gap: Still "optimizing dequant," not eliminating it
+  v
+[2024] Zeng et al. - ABQ-LLM
+  |
+  | Problem seen: The dequant path is structurally necessary because weights and
+  |               activations have mismatched precision
+  | Solution: Decompose low-bit weights into multiple 1-bit components;
+  |           run pure-integer GEMM using Binary TensorCore
+  | Residual gap: Decomposing on the weight side — but activations are already
+  |               high-precision; wrong direction
+  v
+[2026] Zheng et al. - MSD  <-- target paper
+  |
+  | Problem seen: Weights are already stored at low bit-width; why decompose them?
+  |               Decompose the activations instead
+  | Solution: Split BF16 activations into two INT8 / MXFP4 components;
+  |           feed them directly to Cube cores
+  | Residual gap: One extra GEMM call; errors amplify when activation outliers
+  |               are severe
+  v
+[?] Future work
+  | As of 2026-05, MSD was just published; no public critical follow-up yet
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Fitting Large Models into INT8 — First Industrial-Scale Success
+
+*** What Problem It Saw
+
+The biggest pain in LLM inference is memory. GPT-3 at 175B needs 350 GB in FP16 — impossible on a single card. Compressing weights to INT8 is the obvious direction. But before Dettmers, every attempt failed because of a peculiar split in large models: a tiny fraction of "outlier activations" have values more than 10× larger than their neighbors. Once you apply per-tensor INT8 quantization, these outliers blow up the entire tensor's scale, normal channels collapse to zero, and accuracy falls off a cliff.
+
+*** Its Solution
+
+Scan activations channel by channel: any channel whose maximum exceeds a threshold is pulled out and computed in FP16; the vast majority proceed in INT8. One matrix multiply becomes two: a large INT8 GEMM for the main body plus a small FP16 GEMM for the outliers, then summed together.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it acknowledged a truth — outliers are a minority, but they cannot be compressed. This observation directly opened the door to LLM quantization research.
+
+But it left two holes: (1) there is still an INT8 → FP16 restoration path, because the final result must return to FP16 to be added to the outlier branch; (2) the forked path introduces scheduling overhead. In other words, *memory was saved, but dequantization appeared for the first time as a clearly visible presence on the critical path of LLM inference*.
+
+** 2022 | GPTQ: If INT8 Works, Why Not 4-bit?
+
+*** What Problem It Saw
+
+LLM.int8() stops at 8-bit — far from the limit. Can we reach 3-bit or 4-bit? Early round-to-nearest (RTN) at 4-bit caused accuracy collapse — quantization errors accumulated and the model started producing nonsense.
+
+*** Its Solution
+
+Borrow the second-order analysis from Optimal Brain Quantization: after quantizing each weight, immediately update the remaining unquantized weights to compensate for the error introduced. Sweep column by column, passing errors along like a hot potato. Result: a 175B model quantized to 3–4 bits with almost no accuracy drop.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it transformed quantization from "independent rounding" into "global error minimization."
+
+But it dug a deeper hole: *after compressing weights to 4-bit, hardware has no native GEMM instruction for INT4 × BF16. So at inference time, you must first restore 4-bit to BF16, then feed it to the tensor core*. GPTQ solved the storage problem, but shifted the central tension of inference latency from "can't fit in memory" to "restoration path consumes all clock cycles." This is the moment dequantization formally took the stage as a bottleneck.
+
+** 2023 | AWQ: Not All Weights Are Equally Important
+
+*** What Problem It Saw
+
+GPTQ compresses all weights uniformly, but Lin et al. observed that only 1% of weights truly matter in the forward pass — those channels activated by large activation values. Compressing that 1% to 4-bit is self-sabotage.
+
+*** Its Solution
+
+Scan activation magnitudes channel by channel; multiply critical channels by a protective scale before quantizing (and divide activations by the same scale afterward — mathematically equivalent). The essence is to shift quantization error from "important channels" to "unimportant channels."
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it recognized that *activation distribution and weight importance are coupled* — an observation that SmoothQuant, QServe, and a series of later papers would exploit repeatedly.
+
+But AWQ left the restoration path entirely untouched. Compression became more precise; dequant still had to happen. By 2024, the research community had recognized: *further improving quantization algorithms is not the answer — the bottleneck is the dequantization operation itself*.
+
+** 2024 | QServe: Since Dequant Must Happen, Hide It Inside GEMM
+
+*** What Problem It Saw
+
+The QServe team did detailed profiling and arrived at a sobering number: on the W4A8 inference path, dequant accounts for 20–90% of end-to-end runtime. In other words, the memory-access savings earned over years of painstaking effort to compress weights to 4-bit were almost entirely consumed by dequant.
+
+*** Its Solution
+
+Compute-aware weight reordering — pre-packing weights according to the GEMM tile access order so that dequant operations can be completed in registers, unrolled in parallel with GEMM. Combined with KV cache also compressed to 4-bit (W4A8KV4), total throughput roughly doubles.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it collapsed dequant from an "explicit kernel call" into "a handful of instructions inside the GEMM kernel." On NVIDIA GPUs, this fused path can make dequant nearly free.
+
+But it left a fundamental problem: *on architectures where Vector and Cube cores are decoupled (e.g., Huawei Ascend NPU), dequant must run on the Vector core and GEMM must run on the Cube core — they don't even share a cache. Any fusion requires a round trip through HBM. On such architectures, QServe's approach simply doesn't apply*. This is exactly the departure point for both ABQ-LLM and MSD.
+
+** 2024 | ABQ-LLM: Decompose Weights into 1-bit Components, Route Around Dequant
+
+*** What Problem It Saw
+
+ABQ-LLM went straight for the root cause: dequant exists because weights and activations have mismatched precision — hardware doesn't support INT4 × BF16 GEMM natively. What if both sides could be made to match in precision?
+
+*** Its Solution
+
+Decompose W6 weights into 6 one-bit components: W = b5·2^5 + b4·2^4 + ... + b0·2^0. Then use NVIDIA's Binary TensorCore (BTC) to run 6 passes of 1-bit × INT8 GEMM, and accumulate the results with the appropriate bit-shifts. The entire path is pure integer arithmetic — not a single type conversion.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it achieved a paradigm shift — *from "one high-precision computation" to "many low-precision computations accumulated"*. Multiple GEMMs sound more expensive, but since each is the fastest possible 1-bit operation, total throughput is actually higher, and dequant is completely eliminated.
+
+However, ABQ-LLM decomposes the *weights*. This creates two awkward issues:
+1. Weights are already stored at low bit-width in HBM; decomposing them requires an extra decoding step
+2. Activations are naturally BF16 — inherently suited for decomposition; forcing the decomposition onto weights makes the compute flow take a detour
+
+This misalignment is exactly what MSD noticed.
+
+** 2026 | MSD: Since Activations Are High-Precision, Decompose the Activations
+
+*** What Problem It Saw
+
+MSD advanced ABQ-LLM's insight one step further — but in the opposite direction. The team focused on the real bottleneck on Ascend NPU:
+
+- Weights are already stored as INT8 / MXFP4; they arrive from HBM as low-bit values
+- Activations are BF16; they come out of the previous layer as high-precision values
+- Every existing approach "promotes weights up" — but this requires the Vector core to read INT8, convert to BF16, write back to HBM, and then the Cube core reads BF16 from HBM again — at least two full HBM round trips per restoration
+- The direction of the entire data flow is wrong
+
+*** Its Solution
+
+Reverse the direction. *Instead of promoting low-precision weights up, decompose high-precision activations down*:
+
+#+begin_example
+Traditional:  x_BF16 × W_INT8  ->  first promote W to BF16  ->  BF16 GEMM
+                                    ^^^^^^^^^^^^^^^^^^^^
+                                    runs on Vector core, two HBM round trips
+
+MSD:   x_BF16 ≈ α·x1_INT8 + β·x2_INT8
+       W·x ≈ α·(W·x1) + β·(W·x2)
+            ^^^^^^^^^^^^^^^^^^^^^^^
+            two pure INT8 GEMMs, both run on Cube core, no dequant
+#+end_example
+
+Mathematically: split the BF16 activation into two INT8 components, with the approximation error absorbed by scale factors α and β. Two INT8×INT8 GEMMs run directly on Cube cores, then the results are accumulated. The Vector core is never needed for dequant anywhere in the path.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it accepted a fact: *running one extra GEMM is cheaper than one HBM dequant round trip*. The INT8 throughput of Cube cores is 2× that of BF16, so two INT8 GEMMs take roughly the same Cube time as one BF16 GEMM — while eliminating all Vector cycles and HBM traffic that dequant would have required. The paper reports: HBM traffic for the KV cache drops to 1/2.5 of the baseline.
+
+On precision: W8A16 with two rounds of INT8 decomposition achieves approximately 16 effective bits (error M/2^16), essentially losslessly routing BF16 through an INT8 path; W4A16 with two rounds of MXFP4 decomposition achieves 6.6 effective bits — higher than a single MXFP8 round (5.24 bits).
+
+New holes left behind:
+1. Two GEMM dispatch calls add scheduling overhead, which may amplify for small matrices or long contexts
+2. The decomposition relies on the choice of scale factors α and β; when activation outliers are severe, the second-round residual grows large
+3. The method is tightly coupled to Ascend's Cube/Vector decoupled architecture; the paper acknowledges that whether the same gains hold on NVIDIA Hopper remains to be verified
+
+* Frontier Extensions
+
+MSD was posted to arXiv as a v1 preprint in 2026-05. As of the time of writing (2026-05-28), no public follow-up papers directly critiquing or improving MSD have appeared.
+
+Several foreseeable extension directions:
+
+1. *Larger K for multi-scale activation decomposition*. MSD argues for the sweet spot at K=2, but theoretically K=3 may be superior in error-sensitive scenarios — papers will systematically sweep this trade-off
+2. *Dynamic decomposition*. The current α and β are optimized offline; future work may adjust them online based on each layer's activation distribution
+3. *Native hardware support*. If this "multiple low-precision accumulations" pattern can receive native acceleration instructions on next-generation tensor cores (analogous to ABQ-LLM exploiting BTC), further savings are possible
+4. *MSD during training*. Currently validated only at inference; if MSD-style decomposition is applied in the backward pass as well, weight distributions may naturally adapt to be more decomposition-friendly
+
+These are predictions, however — MSD is currently the latest nail in this line.
+
+* The Whole Picture at a Glance
+
+#+begin_example
+
+Time ---->
+                                                       Is dequant
+                                                       eliminated?
+                                                           |
+[2022] LLM.int8()    ---> INT8 + FP16 outlier compensation     untouched
+       (compress weights, tolerate outliers)
+              |
+              v
+[2022] GPTQ          ---> 4-bit weights + dequant path          untouched
+       (second-order optimization, compress harder)             (first fully exposed)
+              |
+              v
+[2023] AWQ           ---> 4-bit with importance-aware protection  untouched
+       (differentiate by activation magnitude)
+              |
+              v
+[2024] QServe        ---> dequant hidden inside GEMM kernel     optimized, not gone
+       (compute-aware reorder)                                  (fails on Ascend)
+              |
+              v
+[2024] ABQ-LLM       ---> decompose weights into 1-bit, use Binary GEMM  eliminated
+       (wrong direction: decomposes already-low-bit weights)
+              |
+              v
+[2026] MSD           ---> decompose activations into INT8, run pure INT8 GEMM  eliminated
+       (right direction: decomposes naturally high-bit activations)              (naturally)
+
+   Approach  | Bit-width | Dequant path         | Decoupled arch support
+------------ + --------- + -------------------- + ----------------------
+LLM.int8()  |    8b     | still present         | no
+GPTQ        |    4b     | still present (worse) | no
+AWQ         |    4b     | still present         | no
+QServe      |  4b/8b   | optimized             | no (breaks on Ascend)
+ABQ-LLM     |  any     | eliminated (wt. side) | partial
+MSD         |  4b/8b   | eliminated (act. side)| yes
+
+#+end_example
+
+* Insight
+
+Reading through this line of work, what emerges is not simply "quantization getting more aggressive with each generation" — that is only the surface. The real transformation is that *researchers' conception of "the bottleneck" gradually migrated from "how large is the model" to "how does data flow through the hardware"*.
+
+- In 2022, LLM.int8() framed the bottleneck as *memory capacity*.
+- In 2023, AWQ reframed it as *quantization accuracy*.
+- In 2024, QServe reframed it as *type-conversion overhead inside the kernel*.
+- In 2024, ABQ-LLM reframed it as *precision mismatch between hardware primitives*.
+- In 2026, MSD reframed it as *data movement between heterogeneous, decoupled compute units*.
+
+At every step, researchers pushed the magnifying glass one level deeper into the hardware. MSD arrives at an interesting position — it no longer tries to improve the algorithm in the abstract, but instead *accepts the hardware architecture (Vector/Cube decoupling) as a given, and bends the algorithm to fit the physical shape of the hardware*. This is a hallmark of hardware-software co-design reaching maturity.
+
+Where is the next step most likely to go? Two directions:
+
+1. *Upward*: abstract one level above the GEMM kernel. Once MSD-style "activation decomposition + multiple GEMMs" becomes a standard primitive, compilers and graph optimizers will automatically decide when to apply it and how many rounds to use.
+2. *Downward*: hardware designers will respond. The next generation of Ascend / Hopper / TPU may natively implement "multiple low-precision accumulations + scale fusion" as a native instruction, at which point MSD's software trick becomes part of the hardware ISA.
+
+Historical pattern: operations that run comfortably on hardware tend to become part of the hardware itself a few generations later. MSD is very likely on that path.
+
+* Takeaways
+
+This evolutionary line offers three direct lessons for "how to find the right problem":
+
+1. *Bottlenecks move*. Don't treat "the bottleneck" as a static attribute. When compressing weights, the bottleneck is memory; once memory is solved, the bottleneck shifts to type conversion; once type conversion is solved, the bottleneck shifts to HBM traffic. Every layer you resolve immediately exposes the next one. Cultivate the habit: right after solving a problem, ask "what's the new constraint?" — the seed of the next paper is right there.
+
+2. *Directional correctness is worth more than magnitude of improvement*. ABQ-LLM had already achieved the breakthrough of eliminating dequant entirely. MSD appears to add no new magnitude of improvement — it only flips the decomposition from the weight side to the activation side. Yet that directional correction lets it capture gains on Ascend hardware that ABQ-LLM simply cannot. So when a research line looks "good enough," the most valuable question is not how to squeeze out a few more percentage points, but "are we going in the right direction?"
+
+3. *Hardware shape is the strongest constraint — and the strongest hint*. MSD was essentially forced into existence by Ascend's Cube/Vector decoupled architecture — an architecture where dequant cannot be hidden. But by the same token, that constraint contained the answer: if Cube cores only speak INT8, make every input INT8. Constraints are both resistance and signpost — *the next time you're stuck, put the hardware datasheet back on the table and read it again*.
+
+The practical landing point: *whenever you work on any "accelerate / optimize" problem, start by drawing a data-flow diagram of the target hardware (which units exist, how much bandwidth, who can talk directly and who must go through HBM), then decide the shape of your algorithm. Algorithms that fit the hardware win far more often than algorithms that expect the hardware to fit them.*

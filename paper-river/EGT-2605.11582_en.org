@@ -1,0 +1,286 @@
+#+title:      Efficient LLM-based Advertising via Model Compression and Parallel Verification
+#+date:       [2026-05-28 Thu 10:14]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T101452-en
+#+source:     https://arxiv.org/abs/2605.11582
+#+authors:    Wenxin Dong, Chang Gao, Guanghui Yu, Xuewu Jiao, Mingqing Hu, Qiang Fu, Peng Xu, Penghui Wei, Hui Xu, Yue Xing, Shuanglong Li, Lin Liu (Baidu)
+#+venue:      arXiv 2605.11582 (industry paper, deployed at Baidu since 2024)
+
+* The River of Problems
+
+How much of a model are you willing to carve away for speed, if you need to fit a 1.5B-parameter language model into a real-time advertising pipeline and respond to every request in tens of milliseconds?
+
+This is a problem as old as thirty-plus years, and every generation has attacked it with different tools. Once a neural network grows large enough, a substantial fraction of its weights look important but are actually expendable. The questions are:
+
+- How do you know which weights are "junk"?
+- How do you remove them without retraining?
+- After removal, can the hardware actually run faster — or have you just shrunk the parameter table?
+
+Every few years someone sharpens a better blade. What makes EGT's blade distinctive is not the edge itself, but the fact that it is the first blade to be fitted into a real advertising engine and to carry tens of billions of daily queries in production.
+
+* A Map of Origins
+
+#+begin_example
+[1989/1990] LeCun et al. - Optimal Brain Damage / Surgeon (OBD/OBS)
+  |
+  | Problem: How do you know which weights can be discarded?
+  | Solution: Use the Hessian (second-order derivatives) to quantify
+  |           the "importance" of each weight; discard those whose
+  |           removal causes the smallest increase in loss.
+  |
+  | Remaining gap: The Hessian is intractable at millions of
+  |                parameters, let alone billions.
+  v
+[2022/2023] Frantar et al. - GPTQ
+  |
+  | Problem: OBS reasoning is sound, but completely unscalable to LLM size.
+  | Solution: Restrict the Hessian to each layer's local computation;
+  |           use Cholesky decomposition; update one row of weights at
+  |           a time so the algorithm can run on a GPU in batches.
+  |           First proof that a 175B-parameter model can be quantized
+  |           to 4-bit overnight.
+  |
+  | Remaining gap: Group size is fixed (typically g=128);
+  |                all layers treated identically.
+  v
+[2023] Frantar & Alistarh - SparseGPT
+  |
+  | Problem: Can GPTQ's machinery be turned around — not to reduce
+  |           precision, but to delete weights outright?
+  | Solution: Reuse the same OBS-on-layer math to compute the cost
+  |           of removing each weight. Proves OPT-175B can be pruned
+  |           to 50% sparsity in one shot with negligible accuracy drop.
+  |           Also supports hardware-friendly 2:4 semi-structured sparsity.
+  |
+  | Remaining gap: Computing the Hessian inverse is expensive;
+  |                all layers use the same sparsity ratio.
+  v
+[2024] Sun et al. - WandA (Weights and Activations)
+  |
+  | Problem: Is second-order information really necessary?
+  | Solution: Score each weight directly as |W| * ||X||_2;
+  |           keep the large scores, prune the small ones.
+  |           No Hessian, no backprop, no weight updates.
+  |           One forward pass over calibration data; matches SparseGPT quality.
+  |
+  | Remaining gap: Scores are purely local; all layers still use the
+  |                same sparsity ratio; no layer-wise prior on which
+  |                layers can least afford pruning.
+  v
+[2026] Dong et al. - EGT (this paper)
+  |
+  | Problem: WandA's simplicity is appealing, but industrial deployment
+  |          requires getting three things right:
+  |   (1) Different layers have different sensitivity; they need different
+  |       sparsity ratios and grouping sizes.
+  |   (2) The combined sparse + quantized operator simply does not exist
+  |       in NVIDIA's libraries.
+  |   (3) In advertising, the candidate token set is a closed domain;
+  |       decoding can be verified in parallel.
+  | Solution: WandA score + gradient term; layer-adaptive 2:4/1:4 mixed
+  |           sparsity; custom SparseGemv INT4 kernel; prefix-trie
+  |           parallel verification.
+  v
+[2024-2026] (parallel tributary: speculative decoding)
+  Leviathan/Chen (2023) -> Medusa (Cai 2024) -> SpecInfer (Miao 2024) -> EGT dynamic triggering
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1989/1990 | OBS/OBD: The First "Scissors" for Neural Networks
+
+*** What Problem It Saw
+
+In the late 1980s, a neural network with a few thousand parameters was already considered "very large." LeCun noticed something: after training, many weights had small absolute values, but you could not simply prune by |w| magnitude — because some small weights sat in regions of high loss-surface curvature, and removing them would cause the error to explode.
+
+A more reliable criterion than "sort by magnitude" was needed.
+
+*** Its Solution
+
+Expand the loss function as a Taylor series around the current weights; the second-order coefficients form the Hessian H = ∂²L/∂w². Removing weight w_q (setting w_q → 0) incurs a loss increase of approximately (1/2) · w_q² · H_qq.
+
+The "cost" of removal thus depends on both the weight's magnitude and the local curvature. Sort all weights by this cost and prune those with the smallest cost — that is OBD/OBS.
+
+*** Why It Worked (and What Pit It Left)
+
+The mathematics is clean: the Taylor expansion gives you the locally optimal pruning order.
+
+But the Hessian is an N×N matrix where N is the parameter count. Even a moderately sized network makes it impossible to store, let alone invert. OBS is perfect on small networks, starts requiring heavy approximations at a million parameters, and completely stalls at the billion scale.
+
+This "scissors" sat in a drawer for thirty years, waiting for hardware and algorithms to catch up.
+
+** 2022/2023 | GPTQ: Fitting the Old Scissors into a GPU Pipeline
+
+*** What Problem It Saw
+
+By 2022, LLMs had tens to hundreds of billions of parameters. The question had flipped — people were no longer debating "drop 5% of weights" but rather "compress every weight from 16-bit float to 4-bit integer." Yet the underlying mathematics is identical to OBS: find a perturbation δw that minimizes the change in loss.
+
+The difficulty was still the Hessian. For a 175B-parameter model the Hessian is 1.75e11 × 1.75e11 — completely out of reach.
+
+*** Its Solution
+
+Frantar et al. made a key dimensional reduction: instead of computing the Hessian over the entire model, **compute it over each layer's input activations**. That is, replace the objective of "minimize final task loss" with "minimize the reconstruction error of each layer's output."
+
+This reduces the Hessian to d × d (where d is the layer's input dimension, a few thousand to tens of thousands), making inversion feasible. A Cholesky decomposition then pre-computes the update order for all columns, and weights are quantized row by row in batches — exactly matching GPU parallelism.
+
+Result: OPT-175B can be quantized to 4-bit on a single A100 overnight with almost no accuracy drop.
+
+*** Why It Worked (and What Pit It Left)
+
+Trading "global optimality" for "layer-wise optimality" is the critical compromise that makes OBS-on-LLM tractable. Each layer is optimized independently; the aggregate is not globally optimal, but is good enough in practice.
+
+The pit left behind: the grouping strategy is fixed — all layers use g=128 grouping and are uniformly quantized to INT4. But in reality some layers (e.g., Q/K/V projections in attention) are extremely sensitive to quantization, while others (e.g., the latter portion of FFN) are highly robust. A one-size-fits-all policy is clearly suboptimal.
+
+** 2023 | SparseGPT: The Same Scissors, This Time Actually Pruning Instead of Quantizing
+
+*** What Problem It Saw
+
+GPTQ solved "can 4-bit quantization scale to LLMs," but there is another family of compression: sparsification — setting a fraction of weights to exactly zero. Before the LLM era, sparsification either required retraining (expensive) or complicated iterative pruning.
+
+Frantar and Alistarh noticed that GPTQ's mathematics is not limited to "replacing a weight with its nearest low-precision value" — it can equally well "replace a weight with 0," since zero is just one particular low-precision value.
+
+*** Its Solution
+
+Rewrite GPTQ's algorithm slightly: instead of "find the nearest value in the quantization grid," now "choose between {current value, 0}." Same layer-wise Hessian, same Cholesky update, same GPU batching.
+
+This proves that OPT-175B can be pruned to 50% sparsity in a single shot with negligible perplexity increase. It also supports NVIDIA Ampere's 2:4 semi-structured sparsity (exactly 2 zeros in every 4 consecutive weights), a structure that Sparse Tensor Cores can genuinely accelerate.
+
+*** Why It Worked (and What Pit It Left)
+
+Reusing the same machinery was a stroke of genius — it demonstrated that the "weight importance" framework transfers from quantization to sparsification.
+
+But SparseGPT inherited all of GPTQ's limitations: every layer uses the same sparsity ratio (50% means 50% everywhere) and the same scoring criterion. And computing the Hessian inverse remains expensive — pruning time is nearly as long as quantization time.
+
+A deeper question: is second-order information really necessary? When the Hessian term is expanded via Cholesky, much of it resolves into a weighted product of "weight magnitude × input activation magnitude." If you compute that product directly, is it sufficient?
+
+** 2024 | WandA: Throw Out the Hessian Entirely
+
+*** What Problem It Saw
+
+The WandA team ran a "disenchantment" experiment: they printed out the actual weights that SparseGPT pruned and compared them against a very naive metric — |W_ij| × ||X_j||₂ (weight absolute value × L2 norm of the corresponding input channel's activation) — and found near-perfect overlap.
+
+In other words: SparseGPT's elaborate Hessian, Cholesky decomposition, and iterative updates end up making essentially the same pruning decisions as "sort by |W| × ||X||."
+
+*** Its Solution
+
+Use |W_ij| · ||X_j||₂ directly as the score. Run one forward pass over a batch of calibration data, collect the activation norm of each input channel, multiply by the corresponding weight's absolute value, rank within each row (output channel), and prune the smallest 50%.
+
+Done. No Hessian, no iteration, no weight updates. Pruning runs tens of times faster than SparseGPT; quality matches.
+
+*** Why It Worked (and What Pit It Left)
+
+The intuition is natural: a weight's "importance" should reflect "the intensity of its actual contribution to the computation" — if the weight is small or the input signal it multiplies is weak, its contribution to the output is small and removing it causes little harm. The elaborate second-order machinery ultimately approximates this same thing indirectly.
+
+But WandA leaves two pits:
+
+First, uniform sparsity across layers. In practice the "information density" varies enormously — pruning some attention projection layers to 50% causes a significant accuracy drop, while FFN intermediate layers can tolerate 75% sparsity without issue.
+
+Second, no gradient information in the score — it sees only "weight × activation," not "weight × gradient of loss with respect to weight." In many tasks, the gradient term is the decisive signal for "how important is this weight to the final objective."
+
+** 2026 | EGT: Assembling Everyone's Work into a Deployable System
+
+*** What Problem It Saw
+
+Baidu's engineering team needed to embed ERNIE-1.5B into a generative advertising retrieval system in 2024. Academic methods like GPTQ/SparseGPT/WandA are all elegant, but none of them is production-ready:
+
+(1) *Fixed grouping and fixed sparsity ratios are insufficient.* WandA applies 50% sparsity uniformly, but the "value" of the first attention layer versus the last FFN layer differs by orders of magnitude — the former cannot be touched, the latter can easily be pruned to 75%.
+
+(2) *The required operator simply does not exist.* The combination of INT4 weights + 2:4 sparsity + GEMV (matrix-vector multiplication at batch size 1) is not supported by cuSPARSE or cuSPARSELt. This means the "theoretical speedup" claimed in academic papers is entirely unrealized in the batch-size-1 decoding scenario.
+
+(3) *Advertising retrieval has special structure that hasn't been exploited.* Advertising candidates form a closed set (millions of merchant names and keywords) that can be pre-organized into a prefix trie. Decoding is not "free generation" — it is fundamentally a walk through a tree.
+
+*** Its Solution
+
+Four components assembled together:
+
+**Improved WandA score**: Add a |W|·|∂L/∂W| gradient term to the existing |W|·||X|| term. The sum of both serves as the pruning criterion.
+
+**Layer-adaptive sparsity**: Based on per-layer importance, "critical layers" retain 2:4 sparsity (denser) while "peripheral layers" use 1:4 sparsity (sparser). The same layer-adaptive logic is applied to INT4 quantization — sensitive layers get more groups (fine granularity), insensitive layers get fewer groups (coarse granularity).
+
+**Custom SparseGemv kernel**: Replace standard CSR with 2bit-CSR, compressing index overhead to 30% of the original. Use the `lop3.b32` assembly instruction for INT4→FP16 dequantization. Use shared memory + shuffle layouts to avoid bank conflicts. This step converts "theoretical FLOP reduction" into "measured latency reduction."
+
+**Prefix trie + speculative decoding**: Organize advertising candidates hierarchically using DSI (Differentiable Search Index) into a wide-top, narrow-bottom trie. During decoding, generate autoregressively while dynamically evaluating when to "switch to tree verification" — when (remaining paths in trie) × (single-step verification cost) < (remaining tokens to generate) × (single-step generation cost), verify the entire subtree in parallel at once.
+
+*** Why It Worked (and What Pit It Left)
+
+This is an integrative work. Forty years of pruning, quantization, and speculative decoding research accumulated a collection of components; EGT reassembles them according to industrial requirements:
+
+- WandA's simplicity + GPTQ's layer-wise thinking → layer-adaptive compression
+- SparseGPT's 2:4 + custom INT4 kernel → real measured speedup
+- Medusa/SpecInfer's tree speculation + advertising closed set → dynamically triggered parallel verification
+
+Measured result: 1.78× end-to-end speedup; recall drops from 0.084 to 0.081 (3% degradation); deployed in Baidu advertising production.
+
+Remaining pit (acknowledged by the paper itself): all layer-adaptive thresholds are tuned by hand — which layers count as "sensitive" is determined by engineering judgment. The conclusion mentions "future work will explore reinforcement learning for automatic selection," but for now it is manual. Additionally, the optimization heavily depends on the "closed candidate set" assumption; the prefix-trie verification half is inapplicable to open-ended generation (e.g., chatbots).
+
+* Frontier Extensions
+
+Looking forward from EGT (as of mid-2026):
+
+- *The speculative decoding tributary goes further.* EAGLE / EAGLE-2 (2024) turn the "draft model" into a lightweight branch of the original model itself, eliminating the need for a separate draft model; EAGLE-3 makes tree search learnable. EGT uses "closed candidate set + static trie," which is a special-case solution for industrial settings; EAGLE is the main line for the general case.
+
+- *Quantization pushes to lower bit-widths.* MXFP4 (Microscaling FP4) became a natively supported format on NVIDIA Blackwell and AMD MI355 in 2025. EGT's "layer-adaptive grouping" philosophy is now absorbed directly into hardware — the hardware itself provides block-wise scale factors. What remains to differentiate is higher-level policy: "which layers use which format."
+
+- *Sparsification moves toward "layer dropping."* Works like ShortGPT (2024) find that instead of pruning at the weight level, you can simply drop entire transformer blocks. For LLMs, functional redundancy between adjacent layers is far higher than expected. This challenges EGT's fine-grained per-weight layer-sensitivity scoring — perhaps you don't need to go down to individual weights; whole-layer removal is sufficient.
+
+(Some of the above frontier information is speculative and should be verified when needed.)
+
+* One Diagram to Understand It All
+
+#+begin_example
+                Compression = (importance metric) x (granularity)
+                                                                    Granularity evolution
+                                                           scalar --> grouped --> layer-adaptive
+    1989  OBS:      Full Hessian matrix                        |
+                    (perfect but intractable)                   v
+                                                          [uniform across all weights]
+    2022  GPTQ:     Layer-wise Hessian + Cholesky              |
+                    (tractable; 4-bit quantization)             v
+                                                          [all layers g=128]
+    2023  SparseGPT: Same machinery, now for pruning           |
+                    (50% sparsity is feasible)                  v
+                                                          [all layers 50%]
+    2024  WandA:    |W| x ||X||                               |
+                    (discard Hessian; speed explodes)           v
+                                                          [all layers 50%, still uniform]
+    2026  EGT:      |W| x ||X|| + |W| x |dL/dW|              |
+                    + layer-adaptive sparsity ratio             v
+                    + custom INT4xSparse kernel            [critical layers 2:4, peripheral 1:4]
+                    + prefix-trie speculative decoding     [critical layers fine-grained grouping,
+                    -----> production deployment            others coarse-grained]
+                                                          [cross-layer heterogeneous]
+
+    Overall trend along the time axis:
+
+      Importance metric:   progressively cheaper (Hessian -> local Hessian -> no Hessian -> heuristic)
+      Granularity:         progressively finer   (uniform -> grouped -> layer-adaptive -> cross-layer heterogeneous)
+      Output:              progressively useful  (theoretical proof -> academic open-source -> academic SOTA -> shipped and profitable)
+#+end_example
+
+* Insights
+
+Reading through this lineage, three quiet shifts stand out:
+
+*First, "theoretical optimality" has continuously yielded to "engineering utility."* OBS has the most rigorous mathematics but cannot run. GPTQ made the first compromise (layer-wise objective instead of global objective). SparseGPT reused that same compromise. WandA discarded the entire second-order apparatus — and found that the simplified version loses almost nothing. Each generation asked: "Was the previous generation's complexity actually necessary?"
+
+*Second, the answer to "which weights matter" has become increasingly heuristic.* From the Hessian's second-order derivatives (mathematically rigorous), to layer-wise Hessian approximation (engineering compromise), to |W|·||X|| (pure statistical intuition), to EGT adding a gradient term on top and stratifying by layer importance (stacked empirical heuristics). This looks like regression — yet measured quality hasn't dropped at each step. This suggests that in the over-parameterized regime of LLMs, the signal for weight importance is itself redundant: coarse metrics capture most of it.
+
+*Third, the field has shifted from "algorithm" to "algorithm + operator + scenario" as the unit of work.* OBS/GPTQ/SparseGPT/WandA are all pure algorithm contributions — proving that "pruning or quantizing by this rule won't collapse model quality." EGT is the first work to actually "finish the job": algorithm (adaptive sparsity + quantization) + operator (custom SparseGemv kernel) + scenario (prefix-trie speculative decoding exploiting the closed candidate set). Joint optimization across all three levels; removing any one of them would forfeit the 1.78× real-world speedup.
+
+Where is the field most likely to go next? Two bets:
+
+One: *hardware absorbs part of the algorithm.* Native block-wise quantization formats like MXFP4/NVFP4 are making "grouping policy" a hardware concern — EGT-style manual grouping will soon be replaced by hardware-native grouping. What remains to differentiate is higher-level decision-making: "which layers use which format."
+
+Two: *compression decisions themselves become learned.* EGT's "which layers are sensitive" is hand-labeled — exactly the natural food for reinforcement learning or Bayesian optimization. The next generation of work will very likely have the model learn its own compression policy rather than relying on an engineer's judgment.
+
+* Takeaways
+
+For those working on LLM inference optimization — especially industrial deployment:
+
+- *Don't chase SOTA papers first.* Along the GPTQ→SparseGPT→WandA line, "theoretical optimality" has saturated at WandA — further accuracy gains are marginal. The real industrial increment lies at the EGT level of "combination + customization": the algorithms themselves need not be the latest, but the right components assembled correctly for the right scenario.
+
+- *The operator layer is the hidden battlefield.* Papers rarely emphasize it, but more than half of EGT's 1.78× speedup comes from the custom SparseGemv kernel — because cuSPARSE simply does not accelerate GEMV at batch size 1. Academia assumes the kernel exists; industry discovers the kernel must be written from scratch. This gap is larger than it appears.
+
+- *Closed scenarios give you extra leverage.* EGT's prefix-trie speculative decoding is completely inapplicable to open-ended generation. But many industrial scenarios (search, recommendation, advertising, customer service) have outputs that are closed or semi-closed domains — a severely underestimated optimization dimension. If your scenario has bounded outputs, don't use a general-purpose LLM decoding strategy.
+
+- *"Layer-adaptive" is the dominant theme of all LLM optimization in the past three years.* From quantization (different bit-widths per layer) to sparsification (different sparsity ratios per layer) to KV cache (different retention policies per layer) to attention (different sparse patterns per layer) — whenever you see a paper still applying a uniform policy across all layers, it will almost certainly be superseded by the next paper that introduces layer-adaptive treatment.

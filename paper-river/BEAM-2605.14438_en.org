@@ -1,0 +1,235 @@
+#+title:      BEAM: Binary Expert Activation Masking for Dynamic Routing in MoE
+#+date:       [2026-05-28 Thu 10:40]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T104003-en
+#+source:     https://arxiv.org/abs/2605.14438
+#+authors:    Juntong Wu, Jialiang Cheng, Qishen Yin, Yue Dai, Yuliang Yan, Fuyu Lv, Ou Dan, Li Yuan
+#+venue:      arXiv 2026 (Alibaba Taobao & Tmall + Peking University)
+
+* The Problem River
+
+A large MoE model has hundreds of "expert sub-networks," and for each incoming token it picks a few to compute. The trouble is: every token is forced to pick the same number of experts — a simple token still picks 8, and so does a hard one. The compute spent on simple tokens is pure waste.
+
+Why is this hard to fix? Over thirty years, every generation has tried to let tokens speak for themselves: "I only need 2 experts — don't stuff 8 in." But every attempt to let the model "decide how many to pick" hits a wall — either training and inference fall out of sync (train-inference mismatch), or the count collapses to 0 and everything breaks, or the two tasks of "picking experts" and "deciding how many" fight each other inside a single module and neither is learned well.
+
+So the evolution along this line is, at its core, a question asked over and over: "Can we let the model learn, on its own, how many experts each token should use — and does that number actually save compute, rather than just pretending to?"
+
+* Source Map
+
+#+begin_example
+[1991] Jacobs & Jordan - Adaptive Mixtures of Local Experts
+  |
+  | Problem: one network handles all inputs, specializes in nothing
+  | Solution: several small experts + one gate, each handling its own sub-task
+  v
+[2017] Shazeer et al. - Sparsely-Gated MoE (Top-K routing)
+  |
+  | Problem: more experts = smarter, but running all of them defeats the purpose — compute still explodes
+  | Solution: pick only the Top-K experts to compute; the rest sleep
+  v
+[2020] Lepikhin et al. - GShard (Top-2 in Transformer)
+  |
+  | Problem: Shazeer's setup ran on LSTM; porting to Transformer + multi-machine requires a rewrite
+  | Solution: embed Top-2 routing + load balancing into Transformer; define distributed execution clearly
+  v
+[2024] Huang et al. - MoE-Dynamic / XMoE (cumulative-prob threshold)
+  |
+  | Problem: fixed Top-K gives every token the same budget; simple tokens waste compute
+  | Solution: accumulate routing weights in descending order; stop when the threshold is crossed —
+  |           simple tokens naturally pick fewer experts
+  v
+[2024] Zeng et al. - AdaMoE (null experts)
+  |
+  | Problem: threshold methods must select at least one expert; sparsity is stuck at a floor
+  | Solution: add several "null experts" (output zero); being selected is equivalent to skipping
+  v
+[2026] Wu et al. - BEAM (binary mask + decoupled router)  <-- target paper
+  |
+  | Problem: null experts are passively sparse; selecting experts and setting sparsity
+  |          crowd one router and interfere with each other
+  | Solution: add a separate mask router that emits a binary mask over Top-K candidates —
+  |           1 = keep, 0 = drop
+  v
+[2026+] Follow-on work (still emerging)
+#+end_example
+
+Note: this chain was selected by tracing the most direct line of "explicitly criticized by → explicitly improved by." The BEAM paper actually critiques three broad categories of methods (logits modification, special experts, static pruning/merging); the path traced here follows the most representative strand — "logits modification → special experts" — because it maps most directly onto BEAM's core motivation.
+
+* Evolutionary Narrative
+
+** 1991 | Jacobs & Jordan: Let a Group of Small Experts Divide the Labor
+
+*** What Problem It Saw
+
+Neural networks of that era were "one network covers everything" — the same weights processed all inputs. But real tasks often contain multiple sub-patterns: when recognizing handwritten digits, "drawing a 1" and "drawing an 8" involve completely different stroke structures. Cramming them into one network causes the weights to interfere with each other, and neither pattern is learned well.
+
+*** Its Solution
+
+Like a small restaurant that hires several cooks: one specializes in pasta, one in sushi, one in burgers. A host at the door (the gating network) looks at each customer and leads them to the right cook. Each cook (expert) learns only one type of dish; the gate only learns "which kind of customer goes to which cook."
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+With division of labor, each expert faces less parameter pressure and can focus on one class of patterns. But the pit is: to make the model smarter you need more experts — and with more experts, the gate still has to query every expert to compute weights, so compute explodes again. That is exactly what Shazeer set out to fix.
+
+** 2017 | Shazeer et al. (Sparsely-Gated MoE): Don't Call All the Cooks to a Meeting — Only Summon the Top-K
+
+*** What Problem It Saw
+
+At the time, researchers wanted to stack hundreds or even thousands of experts to expand capacity. But processing every token through all experts means more experts = slower model; scaling capacity becomes self-defeating. The "full-staff vote" of Jacobs/Jordan is simply infeasible at large scale.
+
+*** Its Solution
+
+After the gate computes a score for each expert, only the K highest-scoring experts (e.g., K = 2) are actually computed; the rest go dormant and are not evaluated at all. In one move, compute drops from O(N experts) to O(K experts) — no matter how large N grows.
+
+To prevent the model from lazily reusing the same two or three experts every time, a load-balancing auxiliary loss was added, forcing the gate to distribute work evenly across all experts.
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+Sparse activation + load balancing is a brilliant combination: parameters can scale without bound while compute stays flat. But the new pit is: every token is forced to pick exactly K experts — a token like "the" picks the same number as "prove Fermat's last theorem." Simple tokens are wasting compute.
+
+** 2020 | GShard (Lepikhin et al.): Actually Moving MoE into the Transformer Era
+
+*** What Problem It Saw
+
+Shazeer's MoE ran on an LSTM translation model. By 2018–2020, Transformers had taken over everything. Embedding MoE into a Transformer is not a simple copy-paste — it also requires multi-machine parallelism (a single expert may not fit on one GPU), cross-machine communication, and distributed load balancing.
+
+*** Its Solution
+
+Top-2 routing (K = 2, a special case of Top-K) was inserted into the FFN layers of a Transformer, alternating every other layer with a MoE layer. A full "expert parallelism" engineering scheme was defined: each expert lives on one GPU, and tokens are dispatched to the right GPU via all-to-all communication. The load-balancing loss was retained but made stricter — imbalance causes communication bottlenecks.
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+Transformer + Top-2 + expert parallelism became the template for all subsequent MoE engineering (Mixtral, DeepSeek-V2, Qwen3-MoE are all built on this foundation). But the assumption of "Top-2" — more precisely, "fixed Top-K" — was left untouched. The pit remains: every token is forced to consult the same number of experts.
+
+** 2024 | MoE-Dynamic / XMoE (Huang et al.; Yang et al.): Simple Tokens Should Pick Fewer Experts
+
+*** What Problem It Saw
+
+The fixed Top-K assumption inherited from the GShard lineage was finally challenged seriously in 2023–2024. Researchers observed that after softmax, routing weights tend to follow a long-tail distribution: "0.7, 0.2, 0.05, 0.03, ...". Those trailing experts at 0.05 and 0.03 contribute almost nothing when computed — they are just filling a quota.
+
+*** Its Solution
+
+Drop the fixed K. Switch to a "cumulative threshold": accumulate routing weights in descending order and stop once the running sum exceeds a threshold (e.g., 0.9). A simple token may cross 0.9 after just two experts; a hard one might need five or six. Each token adapts individually.
+
+XMoE and similar works all share this core idea: use cumulative probability as a proxy for K.
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+Tokens finally have differentiated compute budgets. But three new pits open up simultaneously:
+1. It assumes "low routing weight = unimportant," but high-weight experts are not necessarily truly important (BEAM's Section 5 uses experiments to challenge this assumption).
+2. At least one expert must be selected — otherwise softmax is mathematically undefined — so the sparsity floor is hard-coded.
+3. This approach cannot drop an expert that scores high but is actually redundant.
+
+** 2024 | AdaMoE (Zeng et al.); MoE++ (Jin et al.): Add Some "Null Experts" — Even a Placeholder Can Save Compute
+
+*** What Problem It Saw
+
+The "at least one expert" constraint of threshold methods is a dead end. To push some tokens' compute budget close to zero, changing the threshold alone is insufficient — a different approach is needed.
+
+*** Its Solution
+
+Add a few special "null experts" — experts whose compute is zero (they output zero directly, or simply pass the input through unchanged). They participate in Top-K scoring just like real experts; being selected means that slot is effectively "voided." If a token is assigned two real experts and six null experts, only two real experts' work is actually computed.
+
+LongCat (2025) engineered this idea into production. MoE++ went further with three varieties of null expert.
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+This sidesteps the "at least one real expert" constraint. But BEAM identifies:
+1. The number of null experts is a hyperparameter that is cumbersome to tune.
+2. Sparsity control is "passive" — you cannot say "I want 50% sparsity"; you can only hope the model happens to pick null experts.
+3. It modifies the model architecture; it is not a pure software change, making integration difficult.
+
+The deeper problem: expert selection, load balancing, and sparsity control are still all crammed into the same router, and their gradients fight each other.
+
+** 2026 | BEAM (Wu et al.): Expert Selection Is One Thing; Expert Pruning Is Another
+
+*** What Problem It Saw
+
+After surveying all the prior approaches, BEAM distills the root cause into three sentences:
+1. Using "routing rank" as a proxy for "expert importance" is wrong. A low-ranked expert may be critically important; a high-ranked one may be redundant.
+2. Neither cumulative thresholds nor null experts can "actively" drop redundant experts — sparsity is only achieved indirectly.
+3. Expert selection, load balancing, and sparsity control are all crammed into one router, and their objectives conflict.
+
+*** Its Solution
+
+Completely decouple "picking experts" from "deciding how many to pick." The original router remains, continuing to select Top-K candidates as before. A lightweight "mask router" is added on top, dedicated solely to emitting a binary mask (0/1) over the Top-K candidates — those with mask value 1 are kept; those with 0 are dropped.
+
+Binary values are non-differentiable? Use Bengio 2013's STE (Straight-Through Estimator): the forward pass uses binary values; the backward pass pretends they are continuous. A sparsity-encouraging auxiliary loss is added, and the whole system is trained end-to-end, so the model itself learns "how many experts to drop for this token to be most efficient."
+
+A custom CUDA kernel integrated into vLLM is also provided — usable in a single line of code.
+
+*** Why It Worked (and Where the Next Pit Was Buried)
+
+All three problems are addressed:
+- Active pruning: the mask directly decides fate, without relying on indirect signals.
+- Decoupling: expert selection and sparsity control no longer interfere.
+- End-to-end: sparsity is learned, not a hand-tuned hyperparameter.
+
+Remaining pits? Training is required (it is not train-free); the CUDA kernel is hand-written and must be rewritten for new hardware; the mask router itself has computational overhead — small but not zero.
+
+* Frontier Extensions
+
+As of May 2026 (when BEAM was submitted), the most direct follow-on work along this line is still emerging — it typically takes the form of:
+- Pushing BEAM's masking idea to more aggressive sparsity (>90% FLOPs reduction);
+- Replacing "binary" with "low-bit" (2-bit/3-bit) for finer-grained control;
+- Further lightening the mask router, or having it share some parameters with the original router;
+- Extending to long-context settings, jointly optimizing sparsity across position and layer (BEAM's own Section 5.2 already begins exploring this).
+
+Most of these directions have not yet crystallized into landmark papers. Honestly: BEAM is currently the most recent well-defined node on this line.
+
+* One Diagram to See It All
+
+#+begin_example
+
+Timeline →   1991      2017       2020        2024(early)     2024(mid)      2026
+             Jacobs    Shazeer    GShard      MoE-Dyn/XMoE    AdaMoE/MoE++   BEAM
+
+Capacity:    [small] → [large, sparse activation] → → → → → → → → → → → → [large, ultra-sparse]
+
+Routing:     gate      Top-K      Top-2       cumul. thresh.  Top-K+null     Top-K+binary mask
+             (soft)    (fixed)    (fixed)     (dynamic K)     (indirect       (active pruning)
+                                                               sparse)
+
+Who decides: gate      gate       gate        gate            gate           main router + mask router
+                                                                             (decoupled)
+
+Per-token    --        fixed      fixed       adaptive        adaptive       adaptive + can reach 0
+compute:                                      (>=1)           (>=0,          (>=0, directly)
+                                                              indirect)
+
+New pits:    compute   all tokens only        high-weight     many           requires training,
+             explodes  eat the same  engineer- experts        hyperparams,   kernel must be
+                       budget        ing fix   can't be cut,  struct change,  rewritten
+                                               >=1 floor      indirect sparse
+
+#+end_example
+
+* Insights
+
+On the surface, this thirty-year line is about "how to make MoE more compute-efficient." Looked at more deeply, it is a recurring cognitive shift: *from "a model = a fixed set of operations" to "a model = a set of learnable switches."*
+
+Every generation's advance consists of taking something "decided by humans" and letting the model learn it instead:
+- Jacobs/Jordan: the division of labor is learned by the model (rather than tasks being partitioned by hand).
+- Shazeer: which experts to pick is learned by the model (rather than querying everyone).
+- MoE-Dynamic: how many experts each token picks is learned by the model (rather than a fixed K).
+- BEAM: precisely "which candidates to drop from the already-selected set" is learned by the model (rather than passive sparsity).
+
+Each generation's solution looks like "add one more learnable switch." But every time a switch is added, it exposes a "coupling" that nobody had noticed before — the original router was quietly doing several jobs at once. BEAM's real contribution is not the technical binary mask (that trick goes back to STE in 2013), but the diagnosis: "expert selection and sparsity control are two separate things and should be handled separately."
+
+Where is the next step most likely to go? I would bet on two directions:
+1. *Keep decoupling.* BEAM splits the router into 2 components; the next generation may split it into 3 (expert selection, load balancing, and sparsity each handled independently). Coupling is the mother lode of engineering progress.
+2. *Hardware co-design.* BEAM's binary mask is a "hardware-friendly" signal, but it is still a software-level afterthought. The next generation will know, at training time, how sparse the target hardware can actually run, and will fold hardware characteristics back into the loss.
+
+* Takeaways
+
+For research practice —
+
+*Watch for coupling, not metrics.* BEAM is not a paper that improves a benchmark by 1 point. Its core insight is "these three things were fighting each other," and it separates them. Work that identifies a hidden coupling has more lasting impact than any metric gain. When you see a module doing multiple things at once — load balancing, selection, and sparsity all crammed into one router — there is almost certainly a paper hiding there.
+
+*"Passive vs. active" is a dichotomy worth revisiting repeatedly.* MoE-Dynamic is passively sparse (relying on a threshold to stumble into sparsity); AdaMoE is also passive (relying on null experts being selected by chance); BEAM is active (the mask directly names who gets dropped). The same dichotomy applies across many domains: cache eviction policies (LRU is passive, LLM-judged is active), attention sparsification, quantization, and so on.
+
+Practical implications —
+
+*When tuning MoE inference*, the first line of defense is no longer quantization or KV cache — it is asking "am I giving every token the same compute budget?" If your workload contains a large proportion of simple tokens (conversation, template generation, code completion), dynamic routing may yield larger gains than quantization.
+
+*When designing new methods*, start by drawing out which coupled objectives are crowded into a single module. The more tightly they are packed, the more worthwhile it is to pull them apart.

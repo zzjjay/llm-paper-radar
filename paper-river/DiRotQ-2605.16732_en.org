@@ -1,0 +1,292 @@
+#+title:      DiRotQ: Rotation-Aware Quantization for 4-bit Diffusion Transformers
+#+date:       [2026-05-28 Thu 14:00]
+#+filetags:   :paper:river:quantization:diffusion:en:
+#+identifier: 20260528T140000-en
+#+source:     https://arxiv.org/abs/2605.16732
+#+authors:    Sayeh Sharify, Mahsa Salmani, Hesham Mostafa (d-Matrix)
+#+venue:      arXiv:2605.16732 [cs.CV], 2026-05-16
+
+* The Problem River
+
+Where exactly does fitting an image-generation model into a laptop's VRAM get stuck? FLUX with 1.2 billion parameters already devours 24 GB for weights alone; add activations and attention — and a 4090 blows up immediately. The most natural way to save memory is to "cut every number from 16 bits down to 4 bits": 4× less memory, and in theory 4× less compute as well. But the moment you actually make that cut, generation quality visibly degrades.
+
+Why can't you simply cut? Because certain numbers in the model are wildly large, and they coexist with ordinary numbers in a way that lets neither side win. Either you accommodate the large values and the small ones get erased by rounding, or you accommodate the small ones and the large ones overflow. These troublemakers have a technical name: *outliers*.
+
+This river is the story of successive generations wrestling with "how to handle outliers" over seven years — from LLMs all the way to diffusion models, from "dodge them" to "redistribute them" to "rotate the basis." DiRotQ is the latest turning point in this river: it argues that the previous generation was wrong to declare "this approach doesn't work for diffusion models."
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Observed problem: as model scale grows, extreme outliers appear
+  |                   in activations; 8-bit quantization collapses
+  | Solution:         a few outlier channels stay in FP16,
+  |                   the rest go through INT8
+  | Remaining pit:    mixed precision = branch logic + two kernels,
+  |                   ugly in practice
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Observed problem: outliers live in activations; weights are tame.
+  |                   Why bother with two precisions?
+  | Solution:         migrate the "hardness" from activations to weights
+  |                   by a per-channel scale (X*s, W/s), making both
+  |                   easier to quantize
+  | Remaining pit:    scalar scaling only shifts distributions, can't
+  |                   rearrange them. A few axes remain sharply peaked;
+  |                   approach 4-bit and it collapses
+  v
+[2024] Ashkboos et al. - QuaRot         ||  [2025] Saxena - ResQ (parallel LLM branch)
+  |                                      ||
+  | Observed problem: scaling is 1D      ||  ResQ: Hadamard "spreads uniformly"
+  |   patching; outliers concentrate     ||  without direction preference, but
+  |   along a few directions and need    ||  outliers have clear principal
+  |   rotation to scatter them           ||  directions — PCA is the right fix
+  | Solution: Hadamard rotation spreads  ||  Solution: PCA rotation; keep high
+  |   energy evenly across all channels; ||  precision for principal components,
+  |   everything goes into 4-bit         ||  quantize the tail to 4-bit
+  | Remaining pit: rotation can be       ||  Shared pit: this works beautifully
+  |   "absorbed" into adjacent weights,  ||  for LLMs — does it transfer to
+  |   only if there is no dynamic norm.  ||  diffusion models?
+  |   Diffusion models have AdaLN…       ||
+  v                                      ||
+[2025] Li et al. - SVDQuant  <----------- explicitly states: rotation methods
+  |                              don't apply to DiTs because
+  |                              (a) AdaLN prevents offline fusion of rotation
+  |                              (b) timestep variation makes a single rotation
+  |                                  matrix ineffective
+  | Observed problem: in Diffusion Transformers (DiT), activation outliers
+  |                   are both time-varying and channel-correlated
+  | Solution:         skip rotation; "migrate" activation hardness to weights,
+  |                   then use SVD to split off a low-rank part that runs in
+  |                   high precision while the residual runs in W4A4
+  | Remaining pit:    operating in "weight space" can't see the true activation
+  |                   statistics; FID is still 14% above the 16-bit baseline
+  v
+[2026] Sharify et al. - DiRotQ        <===  this paper
+         |
+         | Rebuttal: rotation methods CAN work in DiTs —
+         |           you just need to (a) use PCA instead of Hadamard,
+         |                            (b) one basis per layer, shared
+         |                               across timesteps; timestep drift
+         |                               handled by per-token scalar scaling,
+         |                            (c) inverse rotation folded offline into
+         |                               weights; forward rotation computed
+         |                               online via a Triton kernel
+         | Result:   FID 15.9 vs SVDQuant 18.9; 2.3× speedup; 2.1× memory saving
+#+end_example
+
+* Evolutionary Narrative
+
+The protagonist of this story is not any particular model — it is an adversary that was never fully tamed: *extreme outliers in activation values*. Each generation approached them differently: dodging, suppressing, or rearranging them.
+
+** 2022 | LLM.int8(): First Glimpse of "Large Models Have Monsters"
+
+*** What problem did it see?
+
+When models were still small, activation distributions were well-behaved, and INT8 quantization errors were nearly imperceptible. But once parameter counts crossed 6B, things suddenly changed: a handful of channels contained activation values hundreds or even thousands of times larger than the median. Stuffing these values together with the rest into an 8-bit bucket had two outcomes — either the monsters were erased by rounding, or all normal values got crushed together into a single grid cell. Either way the model collapsed.
+
+Nobody had anticipated this, because nobody had seriously tried to quantize models at 6B+ scale before.
+
+*** Its solution
+
+Straightforward: *identify which channels contain outliers, keep those channels in FP16, and send the rest through INT8*. Two parallel paths, merged at the end.
+
+*** Why it worked — and what new pit it dug
+
+It worked because it directly acknowledged that "outliers are a minority, concentrated in a fixed few channels." Keeping the minority at high precision while lowering the majority is the most elementary way to split the problem.
+
+But it left two pits. First, mixed precision requires branch logic inside the kernel, making it very hard to achieve real throughput gains in practice. Second, it never asked a deeper question: *do outliers have to stay where they are? Can they be moved?*
+
+** 2023 | SmoothQuant: "Migrate the Hardness from One Side to the Other"
+
+*** What problem did it see?
+
+LLM.int8() treated outliers in activations as a given. But SmoothQuant noticed something peculiar: *outliers appear almost exclusively in activations; weights are consistently tame and easy to quantize*. Both sides need to be aligned in precision to run fast, yet activations are dragging things down while weights sit with headroom to spare — an imbalance.
+
+*** Its solution
+
+Mathematically elegant. In a matrix multiply Y = X·W, multiplying a channel by a scale factor s and dividing the corresponding weight column by s leaves the result unchanged: Y = (X·diag(1/s)) · (diag(s)·W).
+
+Using this identity, "divide down" the largest outlier in the activation while "multiplying up" the corresponding weight column. Activations become easier to quantize; weights become slightly harder — but weights were overly tame to begin with, so a bit of hardness costs little. *Hardness migrates from activations to weights; the overall balance improves.*
+
+*** Why it worked — and what new pit it dug
+
+It hit a key insight: quantization error is a zero-sum game, but *budget allocation can be redistributed*. Activations and weights don't each have to fend for themselves.
+
+New pit: the scaling is a per-channel scalar. It can only make each channel uniformly larger or smaller; *it cannot change the relative structure within a channel*. If an outlier channel contains both large and small values, after scaling it still contains both large and small values. Push further toward 4-bit and per-channel scaling simply can't hold.
+
+** 2024 | QuaRot: "What if We Rotate the Coordinate System?"
+
+*** What problem did it see?
+
+SmoothQuant adjusts the length of each axis in the original coordinate system. But must outliers actually live on those particular axes? Perhaps in a different coordinate system they would barely stand out.
+
+Analogy: viewed from one angle a mountain looks terrifyingly tall; from another it is merely a fold in the terrain. The issue isn't how tall the mountain is — it's how you're looking at it.
+
+*** Its solution
+
+Multiply activations by an *orthogonal matrix R* — a Hadamard matrix, a special ±1 rotation. After multiplication, the outlier energy that was concentrated in a few channels gets "scattered" across all channels. No single axis has extreme values anymore; the distribution becomes smooth and quantization-friendly.
+
+The key trick: because R is orthogonal, its inverse R^T can be precomputed and *folded into the adjacent weight matrix* offline. At inference time the only overhead is one Hadamard multiply (cheap, because Hadamard entries are only ±1).
+
+*** Why it worked — and what new pit it dug
+
+It upgraded "outlier suppression" from a 1D scalar adjustment to a *2D basis rotation*. Hadamard's virtue is "blindly uniform scattering" — no data needed, runs fast.
+
+But it dug two pits that DiRotQ would later drive nails into:
+- *Hadamard has no directional preference.* Outliers actually have preferred directions (visible via PCA); uniform scattering is equivalent to uniformly diluting the information. ResQ (same year) addressed exactly this by switching to PCA rotation.
+- *Folding R^T into the weight assumes the weight is not dynamically modified.* If the weight is preceded by AdaLN (Adaptive Layer Normalization, whose parameters vary per input), R^T cannot be "welded" in. LLMs don't have AdaLN; Diffusion Transformers are full of it.
+
+** 2025 | SVDQuant: "Rotation Doesn't Work in DiTs — So We Take Another Route"
+
+*** What problem did it see?
+
+A Diffusion Transformer (DiT) running W4A4 faces two new obstacles that LLMs never encountered:
+
+1. *AdaLN (Adaptive Layer Normalization)*. Each Transformer block is preceded by a scale/shift dynamically generated from the timestep. This means the "effective weight" changes at every timestep, so QuaRot's offline "fold R^T into a fixed weight" approach immediately fails.
+2. *Timestep drift*. A diffusion model denoises across dozens of steps; the activation statistics at each step are different. A fixed rotation matrix calibrated at step 1 is wrong by step 20.
+
+SVDQuant's conclusion: *the rotation route is blocked.*
+
+*** Its solution
+
+Return to SmoothQuant's "migrate to weights" idea and upgrade it:
+- Use *SVD decomposition* to split the weight: W ≈ L₁L₂ + R, where L₁L₂ is low-rank and kept in 16-bit, R is the residual and quantized to 4-bit.
+- Absorb the outliers from activations through the corresponding low-rank branch.
+
+In terms of results, this achieved W4A4 SOTA on DiTs. But because the surgery is performed in *weight space*, it never directly sees the true activation statistics — it assumes "hardness can be equivalently migrated," but the complex structure of outliers is compressed when viewed from the weight side.
+
+*** Why it worked — and what new pit it dug
+
+The low-rank + residual structure implicitly acknowledges that "the distribution is heterogeneous" — a few principal components need protection while the rest can be coarse. The same insight appears in ResQ.
+
+New pit (and DiRotQ's entry point):
+- What happens in weight space is *an indirect view of activation structure*. The principal-component directions of activations, their time-varying patterns — all of this gets compressed into the indirect signal of "how should the weight compensate."
+- The result: on PixArt-Σ, SVDQuant's FID is still 14% above the 16-bit baseline. Not fatal, but clearly visible.
+
+** 2026 | DiRotQ: "Rotation Actually Works — Here's How"
+
+*** What problem did it see?
+
+It directly rebuts SVDQuant: you said AdaLN prevents offline fusion of rotation and that timestep variation makes a single rotation matrix ineffective — both points are correct, *but the answer is not to abandon rotation; it is to design a rotation scheme that navigates around both constraints.*
+
+At a deeper level, it identifies the fundamental limitation of SVDQuant: operating in weight space is always indirect. Outliers in activations have a clear low-dimensional structure (in a PCA basis, the top 10% of directions capture 80%+ of variance), and *addressing them directly in activation space is the right approach.*
+
+*** Its solution
+
+A three-part package:
+
+1. *PCA rotation instead of Hadamard.* Compute PCA of each layer's activations; find the principal-variance directions. Rotate activations into this basis: the first few dimensions (principal components) carry enormous variance and are kept in 16-bit; the remaining large majority carries small variance and is quantized to 4-bit. This is more targeted than Hadamard's "undifferentiated uniform spreading" — it acknowledges that outliers have directions rather than pretending they don't.
+2. *One PCA per layer, shared across timesteps.* Rather than computing a separate PCA for every timestep (infeasible to store or compute), use the *time-averaged* covariance to derive a single unified basis. Amplitude differences across timesteps are absorbed by per-token scalar scaling. The division of labor: "static basis + dynamic scaling."
+3. *Forward pass online, backward pass offline.* The forward rotation U^T·x runs via a Triton kernel, adding a small latency overhead. The inverse rotation U is pre-multiplied offline into the following weight W, yielding W·U. AdaLN operates per-token and does not affect the layer-level weight fusion — *as long as the rotation is placed at a position outside the AdaLN*, the fusion remains valid.
+
+*** Why it works — and what new pit it digs
+
+It works because it acknowledges three levels of heterogeneity and applies the right tool to each:
+- *Directional heterogeneity* (which channels are outliers) — PCA rotation
+- *Temporal heterogeneity* (distribution drift across timesteps) — per-token scalar scaling
+- *Tail heterogeneity* (a few extreme values that can't be suppressed) — high-precision tail (top r dimensions retained in 16-bit)
+
+Numbers speak: on PixArt-Σ, FID drops from SVDQuant's 18.9 to 15.9; PSNR rises from 17.6 to 19.1 dB. On the FLUX.1-dev 12B model a 4090 achieves 2.3× speedup and 2.1× memory savings.
+
+New pits dug:
+- The PCA basis is estimated from a calibration set — when the calibration distribution diverges from the true distribution, performance degrades.
+- "Time averaging" is an approximation. If a particular timestep's distribution deviates far from the average, per-token scaling may not fully compensate.
+- The paper introduces VLM-as-a-Judge as a new evaluation paradigm, but the reliability of that paradigm itself is still in its early days.
+
+* Frontier Extensions
+
+DiRotQ just appeared (2026-05) and follow-up work has not yet solidified. But several parallel threads emerging at the same time are worth noting:
+
+- *TurboQuant (Zandieh 2026)*: uses "random orthogonal rotation" for KV cache quantization, pushing QuaRot's Hadamard idea into the inference-cache layer. It does not directly engage with DiRotQ, but shares the same ancestry — both sit on the main road of "rotation scatters outliers."
+- *FP4 / MX-FP4 route (FP4DiT, NVFP4)*: change the number format — use 4-bit floating point instead of INT4. This is a different approach: swapping the scale rather than rearranging the basis. Blackwell-generation GPUs have native FP4 support, so the hardware dividend is substantial. Whether DiRotQ's INT4 route or the FP4 route becomes mainstream will depend on the balance between hardware support and accuracy gains.
+- *Training-aware quantization (QAT for DiT)*: DiRotQ is pure PTQ (no retraining). If limited fine-tuning is allowed, the PCA basis can be learned rather than estimated from calibration — an obvious evolution. SpinQuant has already gone down this road for LLMs.
+
+* One Diagram
+
+#+begin_example
+                  Evolution of Outlier Handling
+                  ==============================
+
+  Year  Paper          Domain  How outliers are handled        Core spirit
+  ----  -----------    ------  ----------------------------    ----------------
+  2022  LLM.int8()     LLM     Dodge (mixed precision)         "Monsters exist — route around them"
+  2023  SmoothQuant    LLM     Migrate (X/s, W*s)              "Spread the hardness to someone else"
+  2024  QuaRot         LLM     Spread (Hadamard rotation)      "Change basis — monsters disappear"
+  2025  ResQ           LLM     Isolate principal components    "Monsters have direction — treat accordingly"
+                               (PCA rotation)
+  2025  SVDQuant       DiT     Absorb into weights             "DiT can't rotate — take a detour"
+                               (low-rank + residual)
+  2026  DiRotQ         DiT     PCA rotation + timestep scale   "DiT CAN rotate — here's how"
+                               + high-precision tail
+
+
+  Upgrade in action dimensionality
+  ---------------------------------
+
+  1D scalar scheduling  (SmoothQuant)
+       |
+       v
+  2D basis rotation  (QuaRot: data-free; ResQ: PCA data-driven)
+       |
+       v
+  2D rotation + 1D timestep scaling + high-precision tail  (DiRotQ)
+   (spatial)        (temporal)              (extremes)
+        ^                 ^                      ^
+        |                 |                      |
+   PCA principal    per-token scale         small subspace
+   directions       (dynamic)               kept in 16-bit
+   (static)                                 (safety net)
+
+
+  Who critiques whom
+  ------------------
+
+  SmoothQuant ----critiques---->  LLM.int8()  ("mixed precision unnecessary")
+  QuaRot      ----critiques---->  SmoothQuant ("scalars aren't enough — rotate")
+  ResQ        ----critiques---->  QuaRot      ("Hadamard wrong tool — use PCA")
+  SVDQuant    ----critiques---->  QuaRot/ResQ ("unusable in DiT — use low-rank instead")
+  DiRotQ      ----critiques---->  SVDQuant    ("your 'unusable' verdict was wrong")
+#+end_example
+
+* Insight
+
+Reading this river from source to mouth, one thing becomes clear: *each generation's understanding of "outliers" advanced by exactly one dimension.*
+
+- LLM.int8() treated outliers as "a minority at fixed positions" — route by position.
+- SmoothQuant treated outliers as "hardness that can be redistributed" — schedule by channel.
+- QuaRot treated outliers as "a coordinate-system-dependent phenomenon" — change basis and they vanish.
+- ResQ treated outliers as "a minority with principal directions" — sort by variance.
+- SVDQuant treated outliers as "a problem to migrate into weight space" — but thereby lost a direct view.
+- DiRotQ treats outliers as "three-layer heterogeneity: spatial, temporal, and tail" — with the right tool for each layer.
+
+*The true trend of this whole river is not "precision keeps dropping" — it is "the characterization of distributional heterogeneity keeps getting finer."* 4-bit, 2-bit are merely outcomes; the cause is that we have gradually figured out exactly where the "hard-to-compress" parts are hard — whether the difficulty is location, direction, or time-variation.
+
+A second thread worth noticing: *DiRotQ's rebuttal posture.* SVDQuant offered a syllogism:
+1. Given that AdaLN prevents offline fusion of rotation,
+2. Given that timestep drift makes a single rotation matrix ineffective,
+3. Therefore, rotation methods do not apply to DiTs.
+
+DiRotQ does not deny either premise — it denies the inevitability of the "therefore." AdaLN's constraint can be sidestepped by choosing where the rotation is fused; timestep drift can be resolved by the division of labor between "static basis + dynamic scaling." *True premises do not guarantee a true conclusion when the premises can be recombined in new ways.* This is extremely common in engineering research — a "recognized obstacle" in a field is often just someone mistaking "a particular implementation doesn't work" for "this whole direction doesn't work."
+
+Where things are most likely to go next:
+1. *Replace calibration with learning.* PCA bases estimated from calibration will naturally give way to "learned rotations + learned scales" — SpinQuant has already gone this route for LLMs.
+2. *Combine with FP4 number formats.* INT4 + PCA rotation is one path; FP4's non-uniform grid is inherently friendlier to outliers, and combining the two may outperform a plain format switch.
+3. *Share bases across blocks.* Computing a separate PCA per layer is non-trivial; can a set of "global bases" be learned and shared across many layers? This is the direction for one more level of compression.
+
+* Takeaways
+
+Reading this river end to end, here are the lessons for "how to find problems":
+
+*Don't be intimidated by a prior paper's verdict.* SVDQuant stated with considerable confidence that "rotation is unsuitable for DiTs," and the field accepted that for a full year — until DiRotQ decomposed "unsuitable" into two specific engineering constraints and broke each one separately. When a field has a "recognized, seemingly clean verdict," *lift the premises one by one*. In nine out of ten cases, the "not" is hiding a particular implementation assumption masquerading as a physical law.
+
+*The space you choose to look at a problem in determines how deeply you can solve it.* SmoothQuant looked in "channel" space and could only do scalar scheduling. QuaRot elevated to "basis" space and could do rotation. SVDQuant retreated to "weight" space and could only see indirect signals. DiRotQ returned to "activation" space but wearing PCA glasses, and thereby saw all three layers of heterogeneity. *Changing the space you work in is usually worth more than changing the technique.*
+
+*Heterogeneity can be handled layer by layer.* This is DiRotQ's most elegant point: three types of heterogeneity — spatial, temporal, tail — three phenomena of different natures, three different tools applied separately. PCA handles the spatial dimension, scaling handles the temporal dimension, high-precision tail handles the extreme values. Force one tool to cover all dimensions and you either fail entirely or end up with a Frankenstein. *First decompose a complex problem into orthogonal axes, then treat each one appropriately* — this recipe is nearly universal in algorithm design.
+
+Practical landing points:
+- If you are deploying DiT / video / multimodal diffusion models, this is currently the strongest W4A4 PTQ approach — FLUX on a 4090 is now feasible.
+- If you are quantizing LLMs or VLMs, the "PCA rotation + per-token scaling (analogous to timestep scaling) + high-precision tail" three-part framework transfers back in reverse — LLMs have no timestep, but they have layer-wise or task-wise drift, and the logic is the same.
+- If you are making research judgments, remember: when a field produces a hard "this won't work" verdict, start by pulling apart its premises. In the vast majority of cases, the word "not" is concealing a specific implementation choice, not a law of physics.

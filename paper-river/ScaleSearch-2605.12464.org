@@ -1,0 +1,292 @@
+#+title:      Search Your Block Floating Point Scales!
+#+date:       [2026-05-28 Thu 10:22]
+#+filetags:   :paper:river:
+#+identifier: 20260528T102211
+#+source:     https://arxiv.org/abs/2605.12464
+#+authors:    Tanmaey Gupta, Hayden Prairie, Xiaoxia Wu, Reyna Abhyankar, Qingyang Wu, Austin Silveria, Pragaash Ponnusamy, Jue Wang, Ben Athiwaratkun, Leon Song, Tri Dao, Daniel Y. Fu, Chris De Sa
+#+venue:      arXiv preprint, May 2026 (under review MLSys)
+
+* 问题之河
+
+把神经网络的乘法压到 4 比特，硬件就能算得飞快——但精度怎么不崩？
+
+这条线四十年来一直在一个夹缝里挣扎：浮点数表达范围大但慢，整数快但范围太窄，激活值里一个离群点就把整块毁了。每一代人都在找新的中间形态——既要硬件喜欢的规整结构，又要数学需要的动态范围。到 2026 年这一代，硬件已经长出 FP4 Tensor Core，可以一条指令乘 16 个 4 比特数。问题终于从"用什么格式"变成了："格式都定好了，我们真的把它用到极致了吗？"
+
+ScaleSearch 这篇就是回头看了一眼，发现：没有。整个工业界用 NVFP4 的方式，相当于买了一台手动挡跑车，全程只挂一档。
+
+* 溯源地图
+
+#+begin_example
+[2016-2018]  Lin / Jacob et al. - Fixed-point quantization
+  |
+  | 问题: 浮点对齐慢，硬件想要纯整数 MAC
+  | 解法: INT8 / 定点数，模型重训到适应窄范围
+  |
+  | 留下的坑: 动态范围太窄，一个离群点全块爆掉
+  v
+[2018]  Drumond et al. - HBFP (Hybrid Block Floating Point) [NeurIPS]
+  |
+  | 问题: 纯定点训不下去，纯浮点又太贵
+  | 解法: 块内共享一个指数 (BFP)，块内做定点乘
+  |       矩阵乘用 BFP, 其他算子保留 FP
+  |
+  | 留下的坑: 学术 demo, 缺生产规模验证 + 标准化
+  v
+[2020]  Darvish Rouhani et al. - MSFP (Microsoft Floating Point) [NeurIPS]
+  |
+  | 问题: BFP 要进生产云，还得证明能扛住 CNN/RNN/Transformer
+  | 解法: 工业化 BFP，MSFP12/16 在 Azure 上线
+  |
+  | 留下的坑: 厂内方言，没有跨厂商标准
+  v
+[2023]  Rouhani et al. - OCP Microscaling (MX) Spec / MXFP4 [arXiv 2310.10537]
+  |
+  | 问题: AMD/Intel/NV/微软/Meta 各搞各的，硬件软件碎片化
+  | 解法: 开放标准, 32 元素一块, E8M0 (纯指数, 2 的幂) 共享 scale
+  |
+  | 留下的坑: scale 只有指数, 颗粒太粗
+  v
+[2025]  Alvarez et al. - NVIDIA Blackwell / NVFP4
+  |
+  | 问题: MXFP4 颗粒粗, 精度损失在 LLM 上不可忽略
+  | 解法: 块缩到 16 元素, scale 升级到 E4M3 (带尾数!) FP8 格式
+  |       Blackwell 加 NVFP4 Tensor Core, FP4 算力 2x FP8
+  |
+  | 留下的坑: 默认 scale = max(|x|) / 6,
+  |          E4M3 那几位尾数全浪费了
+  v
+[2026.05]  Gupta et al. - ScaleSearch (本文)
+  |
+  | 看到: 既然 scale 有尾数, 那相邻的 FP8 scale 都是合法的,
+  |       max-scale 不一定 MSE 最小
+  | 解法: 在 max-scale 附近搜 9 个 offset (-2 到 +6),
+  |       取 MSE 最小的那个。免训练, 无格式改动。
+  v
+[2026.05+ 并行/后续]
+  - SageAttention3 (Zhang 2025): FP4 attention - 被 ScaleSearch 直接超越 14 点
+  - MX+ (Lee MICRO'25): 借用 outlier 的指数位扩 mantissa (另一条改良线)
+  - Wang/Tseng 2025: 全量 FP4 训练 (训练侧的延伸)
+#+end_example
+
+* 演化叙事
+
+** 2016-2018 | Fixed-point: 整数最快, 但太窄
+
+*** 它看到了什么问题
+
+FP32 训练好的模型, 部署时每个乘法都要做指数对齐, 硬件晶体管全花在这上面。手机、边缘芯片根本扛不住。Jacob 等人 (CVPR 2018) 干脆: 推理就别用浮点了, 全 INT8, 跟着量化感知训练 (QAT) 一起喂回去, 让权重提前适应窄范围。
+
+*** 它的解法
+
+把整张权重张量乘一个全局 scale, 投到 [-128, 127] 的 INT8 桶里。乘法变成纯整数乘累加 (MAC), 硬件密度起飞。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+CNN 的权重分布相对集中, INT8 够用。但只要碰到一个"离群"的大值, 整张 tensor 的 scale 就被拉大, 大多数小值挤到几个桶里全变成 0。Transformer 一来这毛病就爆炸——激活值里几个 attention sink 通道动辄是周围值的 100 倍, INT8 直接崩盘。
+
+下一步必须的方向: 别让一个离群点拖累一整张 tensor。把 tensor 切成小块, 每块自己一个 scale。
+
+** 2018 | HBFP (Drumond et al., NeurIPS): 块内共享指数, 救场
+
+*** 它看到了什么问题
+
+纯定点训不下去 (DNN 训练梯度的动态范围跨 10 个数量级), 纯浮点又贵。前一代的 fixed-point 方案是 tensor 级 scale, 一个离群点污染一整张 tensor。
+
+*** 它的解法
+
+借鉴 80 年代 DSP 的老把式: Block Floating Point。把一个向量切成几十个元素一块, 块内所有元素共享一个指数, 各自保留尾数。块内的乘法可以用纯整数 MAC (因为指数已经被提到块级), 而块与块之间相互不影响——一个块里有离群点, 只污染自己这一块。
+
+更聪明的一招: 矩阵乘用 BFP, 其他算子保留 FP32。因为 dot product 是"求和", 大值主导, 小值被冲掉不要紧; 但激活函数、softmax 这些点对点算子受不了精度损失。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+把"动态范围"和"块内精度"这两个原本耦合的事情解开了。FPGA 原型显示算术密度逼近纯定点, 精度逼近 FP32, 等于鱼和熊掌。
+
+留下的坑: 这是学术 demo, 跑在小模型上。块大小怎么选, scale 怎么算, 都没标准。每个厂如果各搞各的, 软件栈要碎成一地。
+
+** 2020 | MSFP (Darvish Rouhani et al., NeurIPS): 把 BFP 拉进云生产
+
+*** 它看到了什么问题
+
+HBFP 是学术原型, 工业上没有任何一家云厂敢真上线——因为生产模型有几百种, CNN/RNN/Transformer 都得过, 还要在 Azure 那种规模上不掉点。
+
+*** 它的解法
+
+Microsoft Floating Point。基本结构就是 BFP, 但配套做了三件事: (1) 大量真实模型上的精度审计, MSFP12 对齐 INT8、MSFP16 对齐 BF16, 但成本只有 1/3 到 1/4; (2) 跟自研 FPGA (Brainwave) 协同设计, 硬件直接吃 MSFP; (3) 集成进生产推理 pipeline, 不改模型拓扑。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+证明了 BFP 在生产规模可行。这件事压制了"BFP 只是学术玩具"的怀疑。
+
+但 MSFP 是微软方言, AMD/Intel/NVIDIA 不会原样用。下一步必须的方向: 跨厂商标准, 否则 PyTorch/CUDA 这一层永远割裂。
+
+** 2023 | OCP MX 标准 / MXFP4 (Rouhani et al.): 跨厂商统一
+
+*** 它看到了什么问题
+
+到 2023 年, MSFP、AMD 的 BF8、英特尔的 FP8 各种变体满地跑。模型导出后换块卡就废, 训练框架要为每种格式写一遍 kernel。
+
+*** 它的解法
+
+AMD、Arm、Intel、Meta、Microsoft、NVIDIA、Qualcomm 七家在 Open Compute Project (OCP) 框架下坐下来谈出 MX (Microscaling) 标准。规定: 元素用 E2M1 (FP4)、E3M2 (FP6)、E4M3 (FP8) 等; 每 32 个元素一块, 共享一个 E8M0 的 scale。E8M0 = 纯指数, 8 位全部是指数 (2 的幂)。
+
+这就是 MXFP4: 32 个 FP4 元素 + 一个 2 的幂的指数。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+标准一统天下, 软件栈终于能跨厂商互操作。MXFP4 在 LLM 推理上做到接近 INT8 精度但比特数少一半。
+
+留下的坑: 块大 (32), scale 颗粒粗 (只能取 2 的幂, 1/2 → 1 → 2 这种跳跃)。对 attention 里那种动态范围大的中间张量, 这个跳跃就是 MSE 的来源。
+
+** 2025 | NVFP4 (NVIDIA Blackwell, Alvarez et al.): 把 scale 从"粗筛"变"细筛"
+
+*** 它看到了什么问题
+
+MXFP4 的 scale 只有指数, 颗粒粗。对一块值: 如果最大值是 5.7, scale 取 1 太大 (元素溢出), 取 2 又太大 (浪费动态范围), 没有 1.5、1.7 这种细致选择。LLM 上这个粗糙度直接吃掉几个 PPL。
+
+*** 它的解法
+
+NVFP4 在 MXFP4 基础上改两个地方:
+1. 块从 32 缩到 16 (颗粒更细, 离群点污染范围更小)。
+2. Scale 从 E8M0 (纯指数) 升级到 E4M3 (4 位指数 + 3 位尾数), 还是 8 位但表达能力强得多。
+
+E4M3 能表达 1.0、1.125、1.25、1.375、1.5 等等——不再只是 2 的幂。配套硬件: Blackwell B200/B300 加专门的 NVFP4 Tensor Core, FP4 吞吐量是 FP8 的 2-3 倍。
+
+平均每个数 4.5 bit (16 个 4-bit 元素 + 8-bit scale, 摊到 16 个数上)。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+精度逼近 FP8, 吞吐 2x FP8。LLM 推理直接上 NVFP4 weight + activation, 几乎不掉点, 且免训练。
+
+但是——NVIDIA 给的默认 round 算法 (vLLM、TensorRT 都照抄) 是这样的:
+
+#+begin_example
+scale = round_E4M3( max(|x|) / 6 )
+#+end_example
+
+意思是: 块里最大绝对值除以 6 (FP4 能表达的最大数), 再 round 到最近的 E4M3 值。
+
+注意: round 到"最近的"E4M3 值。这意味着 scale 永远落在 max-scale 附近的 *一个* 离散点上。但 E4M3 在那附近其实还有 8 个左右合法的 scale 可以选——它们全被忽略了。
+
+这个坑就是 ScaleSearch 的起点。
+
+** 2026.05 | ScaleSearch (Gupta et al., 本文): 不改格式, 把 scale 当超参搜一下
+
+*** 它看到了什么问题
+
+把前一段的话翻过来说: NVFP4 给了你 E4M3 这种有尾数的 scale 格式, 等于在 max-scale 附近开了一整片合法 scale 的连续邻域 (离散但密集)。但工业界的 round 代码只走最近邻——拿到默认 scale 就收工。
+
+作者直接做了个实验: 用 max-scale 量化一个标准高斯张量, MSE = 0.0990; 在邻近的 256 个 scale 里穷搜最佳, MSE = 0.0066。降了 93%。
+
+什么意思? 这就是手动挡跑车全程一档的画面。
+
+*** 它的解法
+
+ScaleSearch 算法本质就一句话:
+
+#+begin_example
+拿 max-scale s 当起点, 把它的 8 位 int 表示加上 offset f
+(f 从 -2 到 +6, 总共 9 个值), 算每个 offset 的 MSE,
+留 MSE 最小的那个。
+#+end_example
+
+为什么是 -2 到 +6 这 9 个? 作者做了一张"offset 直方图":
+真实 LLM 的 key tensor 上, 最优 offset 呈双峰分布——
+一峰在 0 附近 (= 块内最大值正好对应 FP4 的 ±6),
+另一峰在 4-5 附近 (= 块内最大值用 FP4 的 ±4 表示, scale 放大 1.5 倍更划算)。
+
+没有第三峰, 因为 ±3 永远不如 ±6 (减半 scale)。
+所以搜 9 个就够吃满 99% 的收益。
+
+附加产物 *ScaleSearchAttention*: 把 ScaleSearch 套到 FlashAttention 的 Q、K、V、P 矩阵上, 再叠两个救命补丁:
+- *Incoherence Processing* (来自 QuIP/QuIP#): 用 Hadamard 变换把 outlier 打散到所有维度;
+- *Attention sink-aware mixed precision* (来自 StreamingLLM): 前几个 token + 最近几个 token 保留 FP16, 中间老老实实 NVFP4。
+
+结果: 端到端 NVFP4 attention + KV cache, Llama 3.1 70B 上 Wikitext-2 PPL 只比 FP16 高 0.04。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+管用是因为: 这是个 *免训练、不改格式、不改硬件* 的纯算法补丁。量化 kernel 里加一个 9 次循环, 量化时间慢 1.74x, 推理时间不变 (因为搜完一次就缓存)。所有 NVFP4 部署都能直接吃。
+
+埋的坑:
+- 9 个 offset 是经验值, 没有理论保证最优;
+- MXFP4 的 E8M0 scale 没尾数, ScaleSearch 几乎没收益 (作者诚实地承认);
+- 训练侧能不能搜? 反向传播会不会被搜索算子打断? 论文没碰。
+
+* 前沿延伸
+
+这篇论文太新 (2026.05), 还没有直接的后续论文。但同一时间窗口里有几条并行/相邻的线值得标记:
+
+- *SageAttention3* (Zhang et al., 2025): 第一篇把 FP4 用到 attention 的工作, 默认 max-scale。ScaleSearchAttention 把它当 baseline 直接超 14 个点 (Mochi VQA-t), 证明 SageAttention3 的精度损失主要来自 scale 选错而不是格式本身。
+- *MX+* (Lee et al., MICRO 2025): 另一条改良线——既然 outlier 已经占了 scale, 它的 element exponent 位是冗余的, 借过来当额外 mantissa 用。和 ScaleSearch 正交, 理论上可以叠加。
+- *NVFP4 训练* (Wang 2025, Tseng 2025, Chmiel 2025): 把 FP4 推到训练侧, 跟 ScaleSearch 是两条不同的延伸——一个深挖推理量化、一个把战线推进训练。
+- *AMXFP4* (ACL 2025): 非对称 FP4 处理 activation outlier, 又是一个正交方向。
+
+可以预判: 接下来 6-12 个月会有人把 ScaleSearch + MX+ + 非对称 + 训练侧整合, 同时把 9-offset 搜索从经验值推到理论最优 (大概率借 vector quantization 的几何工具)。
+
+* 一张图看懂
+
+#+begin_example
+  时间      格式演化                         scale 的"自由度"演化
+  ----      --------                         --------------------
+
+  1985+     IEEE 754 Float                   按元素自带指数 (最自由)
+              | 太贵
+              v
+  2016+     INT8 / Fixed-point               一张 tensor 一个 scale (最粗)
+              | 离群点污染整张
+              v
+  2018      HBFP (Drumond)                   一块一个共享指数
+              | 学术原型
+              v
+  2020      MSFP (Microsoft)                 同上, 加生产验证
+              | 微软方言
+              v
+  2023      MXFP4 (OCP 标准)                 32 元素一块, scale = E8M0
+                                              (只能 2 的幂, 跳跃 2x)
+              | scale 颗粒粗
+              v
+  2025      NVFP4 (NVIDIA Blackwell)         16 元素一块, scale = E4M3
+                                              (带 mantissa, 颗粒 ~1.1x)
+              | E4M3 mantissa 被默认 round 吃掉
+              v
+  2026.05   ScaleSearch (本文)               搜 9 个邻近 E4M3 scale,
+                                              MSE 选最优
+                                              "格式没变, 自由度还回来了"
+
+  关键转折点:
+    Fixed-point      ->  HBFP:      把 scale 从 tensor 级降到块级
+    HBFP             ->  MXFP4:     把 scale 从厂内方言变成开放标准
+    MXFP4            ->  NVFP4:     把 scale 从纯指数升到带尾数
+    NVFP4            ->  ScaleSearch: 把 scale 从"算出来的"变成"搜出来的"
+#+end_example
+
+* 洞见
+
+读完这条线, 我看到的不是"格式越来越复杂", 而是 *把数值精度的自由度往哪里放* 的循环试错。
+
+- Float 把自由度放在 *每个元素* 上 (元素自带指数), 结果硬件吃不消。
+- INT8 把自由度全收走 (全 tensor 一个 scale), 结果离群点把一切毁了。
+- BFP/MX 在中间: 自由度放在 *块* 上。
+- ScaleSearch 进一步说: 即使在块这一级, 自由度也不是只能"算出来", 还可以"搜出来"。
+
+更深一层: 整个 BFP 演化史里, scale 一直被当成 *数据的副产品* —— max 是多少, scale 就跟着算出来。ScaleSearch 是第一次把 scale 当成 *独立的可优化变量*。这跟"超参搜索"从手工调到 grid search 到 NAS 是同一种认知转变: 把一个被认为"自然推导出来"的东西重新当成搜索空间。
+
+这条线下一步最可能往哪走? 三个方向:
+
+1. *Scale 搜索的代价摊薄到训练*: 把 9 个 offset 的选择当作可学习的离散变量, 训练时用 STE (straight-through estimator) 反向传播, 部署时直接读缓存。
+2. *跨块联合优化*: 当前 ScaleSearch 是块独立的, 但同一行/同一通道的块之间可能存在相关性, 联合搜更优。
+3. *Scale 之外的离散变量*: 块大小、scale 格式 (E4M3 vs E5M2)、rounding mode (RNE vs RTZ)——这些目前都是定死的, 但同样可以纳入搜索空间。
+
+* 启发
+
+最大的启发: *别相信"默认值"是经过严肃论证的*。
+
+NVFP4 的默认 round 算法是 NVIDIA 工程师拍脑袋写的、被 vLLM/TensorRT 抄过去全行业用的——但它把 E4M3 mantissa 的好处直接扔了一半多。一个 8 字符的 `for f in -2..+6` 循环就能把误差降 26%。
+
+这意味着你可以:
+- 拿到任何一份"业界标准实现", 先盯着默认值看一眼: 这些常数是凭直觉拍的, 还是真的扫过参数空间?
+- 任何"导出参数 = f(数据)"的封闭式公式, 都值得改写成"在 f(数据) 附近搜一个最优解"。算力便宜了, 搜索的代价远低于精度收益。
+- 论文/产品最值钱的地方常常不是新发明的算子, 而是发现 *现有自由度被浪费了多少*。
+
+第二个启发: *倒读硬件的格式说明书*。NVFP4 的 E4M3 scale 不是为了 ScaleSearch 设计的——它是 NVIDIA 为了多一点动态范围加进去的副产物。但这个副产物里藏着一片未被开采的搜索空间。下次拿到任何新硬件格式 (FP6、INT4 with shared scale、新一代 Hopper/Blackwell 后继), 第一件事不应该是看 throughput, 应该是看 *它给了什么默认值默认掉的自由度*。
