@@ -103,11 +103,14 @@ git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
 
 run_step() {
     local name="$1"; shift
+    local start=$SECONDS
     echo "[$(date -Is)] step: $name"
     if ! "$@"; then
-        echo "[$(date -Is)] step '$name' failed (exit $?)"
+        local rc=$?
+        echo "[$(date -Is)] step '$name' failed (exit $rc) after $((SECONDS - start))s"
         return 1
     fi
+    echo "[$(date -Is)] step '$name' done in $((SECONDS - start))s"
 }
 
 # Fetch all sources over the requested window. Per-day sources loop via
