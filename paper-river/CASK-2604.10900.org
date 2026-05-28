@@ -1,0 +1,346 @@
+#+title:      CASK: Core-Aware Selective KV Compression for Reasoning Traces
+#+date:       [2026-05-28 Thu 15:50]
+#+filetags:   :paper:river:
+#+identifier: 20260528T155011
+#+source:     https://arxiv.org/abs/2604.10900
+#+authors:    Buseong Kim, Heejun Gwon
+#+venue:      arXiv 2604.10900 (2026.04)
+
+* 问题之河
+
+一个会"思考"的大模型——AIME 数学题、自我反思、来回回溯、推翻重来——在生成几千上万个 token 之后，
+显存里塞满了过去每个 token 的 key 和 value。这堆东西叫 KV cache，长度涨多少它涨多少。
+模型还没回答完，显存先满了。
+
+*问题: 怎么把这堆 KV 砍小，又不让模型把推理过程忘掉？*
+
+这条路上一代一代人的赌注都是同一个：给每个 token 打分，排个名，分低的扔掉。
+赌十年了，到 2026 年 CASK 这篇说：你们赌错地方了——重要的不是分打得多准，而是分根本就不该这样用。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | KV cache 这个概念第一次出现：每个 token 都要把自己的 key 和 value
+  | 留下来给后面的人查。便利的代价：cache 跟序列长度成正比。
+  v
+[2023.09] Xiao et al. - StreamingLLM (attention sinks)
+  |
+  | 发现: 头几个 token 就算语义无关也不能删, 删了模型直接崩
+  | 解法: 固定保留 sink + 滑动窗口, 中间全扔
+  | 留坑: 太粗暴, 中间真有用的 token 一起被埋了
+  v
+[2023.06] Zhang et al. - H2O (Heavy-Hitter Oracle, NeurIPS'23)
+  |
+  | 发现: 注意力分数是高度集中的, 少数 "重击者" 撑起大部分权重
+  | 解法: 给每个 token 累计注意力分, 留 heavy hitter, 扔轻量
+  | 留坑: 分数是看过去算的, 未来的 query 没必要也按过去来
+  v
+[2024.04] Li et al. - SnapKV (NeurIPS'24)
+  |
+  | 发现: prompt 末尾的几十个 token (observation window) 能预报
+  |       后面 query 会去问 prefix 的哪里
+  | 解法: 用观察窗注意力做 prefix 端 KV 剪枝
+  | 留坑: 这是 prefix 的故事, decode 阶段一长起来照样爆
+  v
+[2025.05] Cai et al. - R-KV (Redundancy-aware KV)
+  |
+  | 发现: 推理任务的 decode 轨迹里到处是重复 (重述、自我检查、走错路再走一遍)
+  | 解法: 把"冗余"也并进打分, 让 scorer 在 reasoning 上变聪明
+  | 留坑: 还是在打分 + 扔, 真正应该保住的"骨架 token"没被识别成骨架
+  v
+[2026.04] Mao et al. - TriAttention (trigonometric KV compression)
+  |
+  | 发现: reasoning 的 think-段和 answer-段在注意力上不对称
+  | 解法: 三角函数式的段感知加权, 让 scorer 更贴近 reasoning 结构
+  | 留坑: 仍然是 "改进打分函数", 实测发现 keep-set 几乎不变
+  v
+[2026.04] Kim & Gwon - CASK (这篇)
+  |
+  | 发现: 打分再花哨, 留下来的那批 token 几乎纹丝不动——
+  |       既然如此, 杠杆根本就不在打分上
+  | 解法: 砍掉"全部排名再扔"的框架, 改成
+  |         (a) 把 token 分成 "保护核心 vs 可合并草稿" 两类
+  |         (b) 核心一个不动, 草稿做加权融合
+  |         (c) prefix 和 decode 用不同 primitive: prefix 仍然扔, decode 改合并
+
+并行的合并系 (CASK 借用了它们的合并算子, 但都不是 reasoning-aware):
+  KVMerger (Wang 2024) / CaM (Zhang 2024) / D2O (Wan 2024)
+   -> KeepKV (Tian 2025) / AsymKV (Tao 2025)
+
+并发对手 (同一时期换思路, 但用 answer-first 启发式而非角色分离):
+  Crystal-KV (Wang et al. 2026.01)
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: KV cache 这个原罪是这里埋下的
+
+*** 它看到了什么问题
+
+RNN 慢——每一步都得等上一步算完。Vaswani 团队想把整段序列摊开同时算。
+
+*** 它的解法
+
+注意力机制：每个新 token 要算自己的 query, 然后跟过去所有 token 的 key/value 做点积。
+注意, 这句话里那个"过去所有 token 的 key/value"——就是 KV cache 的诞生。
+它是为速度服务的: 算过一次就别再算了, 直接缓存。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+self-attention 比 RNN 快几十倍, 但 cache 跟序列长度 N 线性涨。
+当时谁也没在乎——序列也就几百个 token。
+六年后, 你让模型做一道 AIME 数学题, 它 think 出几万 token, 显存就炸了。
+这就是后面所有人要解决的同一个原罪。
+
+** 2023.09 | StreamingLLM: 头几个 token 是模型的"地基", 千万别动
+
+*** 它看到了什么问题
+
+如果你想做无限长上下文 (聊天机器人无止境对话), KV cache 必须丢东西。
+最直觉的做法: 只留最近 N 个 token, 老的扔掉——
+结果模型直接崩溃, perplexity 飙到天上。
+
+*** 它的解法
+
+惊人的观察: 把序列最开头那 4 个 token 死保不放, 后面再用滑动窗口, 模型立刻稳了。
+这几个 token 不一定有语义, 但模型把它们当作注意力的"垃圾桶"——
+所有 query 都把多余的注意力扔向它们。删掉它们就等于拆地基。
+这就是 *attention sinks* 概念的起点。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它第一次提出"KV 不是所有 token 一视同仁的, 有些 token 角色特殊"。
+但解法太粗了: 只区分了"开头 + 最近", 中间那一大段不分青红皂白全扔。
+中间段里若有关键事实 (比如 "答案是 42"), 也照丢不误。
+
+** 2023.06 | H2O: 给每个 token 算个分, 重击者留下
+
+*** 它看到了什么问题
+
+StreamingLLM 太粗——它没去看 token 在历史中实际被注意多少。
+H2O 团队观察到: 注意力分布高度长尾, 一小撮 token (heavy hitters) 撑起了大头权重。
+
+*** 它的解法
+
+给每个 token 累计"被注意了多少", 排个序, 留头部, 扔尾部。
+Heavy Hitter Oracle 这个名字的来源——它假装有一个能预测重击者的神谕。
+实操中神谕用累计注意力做近似。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是 *eviction-centered* 框架的奠基: 把问题变成"给 token 打分 + 扔分低的"。
+未来五年所有人都在这个框架里改良 scorer。
+留下的坑很微妙: 分数是回头看的, 但未来的 query 不一定按过去那套来。
+更深的坑——大家从此都默认"打分 + 扔"是正确的, 没人怀疑这个框架本身。
+
+** 2024.04 | SnapKV: prompt 末尾几十个 token 知道未来要查哪里
+
+*** 它看到了什么问题
+
+H2O 给每个时刻每个 token 算分, 太贵。
+而且它是 decode 时才生效, 对一开始就塞进来的超长 prompt 没办法——
+你给它一篇 100 页的论文, prompt 一次性涌进去, cache 一下就满。
+
+*** 它的解法
+
+发现 prompt 末尾的"观察窗" (最后几十个 token) 的注意力分布,
+能很准地预报后面 decode 时 query 会去问 prefix 哪些位置。
+据此一次性把 prefix 端不需要的 token 剪掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+prefix 一刀切完, 后续 decode 速度大幅提升。
+但 SnapKV 解决的是"prompt 长"的故事 (典型场景: 长文档问答)。
+对"decode 长"的推理任务——模型想 5000 token 才答出来——它没辙。
+推理任务专属的故事还没人讲。
+
+** 2025.05 | R-KV: 推理 trace 里有大量冗余, 把冗余也当成扣分项
+
+*** 它看到了什么问题
+
+到了 OpenAI o1 / DeepSeek R1 时代, 模型动不动 "think" 几千 token,
+里面塞满重述、自我检查、走错路又走回来。
+H2O 那套打分对长上下文管用, 但它没意识到推理 decode 里有特殊的 *冗余结构*。
+
+*** 它的解法
+
+把 redundancy-aware 项加进打分函数: 长得跟前面很像的 token 分数往下压。
+本质还是 "打更精准的分, 然后扔"。但它是第一篇明确把推理任务摆上台面的。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它第一次把 reasoning 的特殊性带进了 KV 压缩讨论。
+但 *框架没换*——还在 eviction 里. 留下了一个 CASK 后来才挑明的问题:
+"如果某个 token 是骨架 (比如刚算出来的中间结论), 你打分再聪明也保不齐
+随便一个分高的草稿把它挤掉"。
+
+** 2026.04 | TriAttention: 用三角函数式加权刻画 think/answer 段的不对称
+
+*** 它看到了什么问题
+
+R-KV 把冗余处理了, 但还有别的结构没用上——比如 think 段和 answer 段
+在注意力分布上是不对称的, 段内段间的相关性也很不一样。
+
+*** 它的解法
+
+设计一套基于三角函数权重的 scorer, 让段感知信息融进重要性打分。
+在 AIME24/25 等 reasoning benchmark 上比 R-KV 强。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"reasoning 专用 scorer"这条路推到了一个新高点。
+*但它把 CASK 直接逼出来了*。CASK 团队 (在论文里叫 Phase 1) 沿着同样的方向试了
+adaptive horizon、RMS2、variational horizon 等更复杂的打分变体, 发现一件事:
+
+  *打分函数变了, 实际被保留的那批 token 几乎没变。*
+
+这是个非常致命的发现——它意味着过去十年所有 scorer engineering 的努力,
+对实际行为的影响, 比大家以为的小得多。如果 keep-set 不变, fidelity 上的差异
+就不可能主要来自打分的精细度。
+
+那杠杆在哪？
+
+** 2026.04 | CASK: 别再打分了, 先决定谁不许碰, 再决定谁可以合并
+
+*** 它看到了什么问题
+
+承接上面: scorer refinement 是个低杠杆动作。问题被框错了——
+所有 token 都当成"被排序的候选, 排到末尾就扔"的设定本身就是错的。
+推理 trace 里其实有两类 token, 性质完全不同:
+
+- 答案形成、中间状态锚点、最近的推理转折——这些动一下下游就垮
+- 重复探索、复述、自检、近似重复推导——这些只要留个代表就够了
+
+把它们扔进同一个排名表打分, 就好比给"主梁"和"装饰柱"同一个评分标准,
+然后说"分低的拆掉"——结果可能把主梁拆了。
+
+*** 它的解法
+
+三件事一起换:
+
+1. *角色分离*: trace 一进来就拆成 *protected core* (保护核心) 和
+   *mergeable scratch* (可合并草稿)。core 写进约束 ~C ⊆ R~——
+   不管预算多紧, 它都得在最终集合里。
+
+2. *合并代替扔*: 对 scratch, 不是排名扔尾部, 而是对相似的一组 token
+   做 m-folding——按权重把它们的 key/value 加权平均, 生成一个代表。
+   信息没扔, 是被折叠了。借助 Phase 1 留下的 kappa-weighted 几何,
+   合并距离会偏重对未来 query 更相关的频段。
+
+3. *prefix 和 decode 用不同 primitive*:
+   prompt-heavy 场景下, prefix 占满预算, decode 阶段的合并路径根本就没机会启动。
+   于是 Stage 1: 对 prefix 仍然 evict (腾空间), Stage 2: 对 decode 才做合并。
+   核心叙事不是"哪个 primitive 更强", 而是 *prefix 别堵死 decode 的方法覆盖*。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+实验上, 在 AIME24/25 上 cask@384 (预算 384) 反复打过 triattention@512 (预算 512)——
+即用更少的 KV, 拿到比对手更高的 full-KV 续写一致度 (top-1 / top-5 / NLL).
+CASK 团队特意强调: 这不是"我们扔得更狠", 反过来 saved ratio 有时还更低;
+真正的 headline 是 *minimum usable budget 下移*——
+"维持同样行为所需要的最小预算"被压低了。
+
+留下的坑作者自己很诚实地列了:
+
+- 不能说 decode 合并在所有 witness 上都是主角 (qasper 实际靠 two-stage)
+- prompt-heavy 里 qmsum/gov_report 暴露了 prefix_budget_exhausted 边界
+- output 端的桥接还窄, 只在几个 witness 上做了
+- core 怎么界定、合并组怎么挑, 都还是启发式, 没有最优性保证
+
+* 前沿延伸
+
+这篇是 2026 年 4 月的论文, "之后"还没真正展开。
+
+最接近的同代对手是 *Crystal-KV* (Wang et al., 2026.01, arxiv 2601.16986).
+Crystal-KV 走的是 "answer-first principle"——围绕"最终答案 token"的逆向
+重要性来管理 cache, 同样意识到推理任务里 token 角色不平等。
+和 CASK 的差别: 它用 answer-first 启发式, 而 CASK 用 core/scratch 显式角色分离 + 合并。
+两条路在同一年里独立长出来, 说明 "reasoning trace 上 token 不该被一视同仁"
+这个直觉已经到了多个团队同时撞见的程度。
+
+可以预期的下一步：
+
+- 把 core 的界定从启发式变成学的——用一个小模型或在线信号决定谁是 core
+- 把合并算子也针对 reasoning 重新设计 (现在用的合并算子来自通用 KV 合并系)
+- 把 two-stage 推广成 multi-stage, prefix / think / answer 三段不同 primitive
+
+* 一张图看懂
+
+#+begin_example
+              eviction-centered framing                 |  merge-centered framing
+              (打分 + 扔)                               |  (合并 + 代表)
+              ----------------------------------------- | -------------------------
+                                                        |
+  2017  KV cache 出生 (Vaswani et al.)                  |
+        |                                               |
+  2023  StreamingLLM: 保 sink + 窗口                    |
+        |  发现 token 角色不均匀, 但只分两档              |
+  2023  H2O: 累计注意力打分                              |
+        |  奠定 eviction 框架, 占了未来十年的主流          |
+  2024  SnapKV: prefix 端剪枝 (观察窗预报)               |  KVMerger / CaM / D2O:
+        |  解决长 prompt, 没解决长 decode                |  通用合并算子诞生
+        |                                               |  (但不针对 reasoning)
+  2025  R-KV: 冗余感知 scorer (reasoning 首次专属)        |  KeepKV / AsymKV:
+        |                                               |  合并误差控制 / 量化
+  2026  TriAttention: 段感知 scorer                     |
+        |  Phase-1 实验暴露死结: scorer 怎么换           |
+        |  实际 keep-set 几乎不变                        |
+        |                                               |
+        v                                               v
+       (CASK 2026.04: 把两条线缝在一起, 但把 reasoning 角色分离放在最前面)
+
+            预算 384 的 CASK > 预算 512 的 TriAttention
+            => "维持行为所需的最小 KV" 这条边界往下移了
+#+end_example
+
+* 洞见
+
+*这条线背后真正在发生什么变化*
+
+表面上是"KV 怎么砍小"的工程迭代。底下其实在悄悄改变 *我们怎么看待 token*。
+
+- 2017—2023: token 都是平等的, 该不该留, 看 attention 累计分
+- 2023—2025: token 有角色, 但角色只有两种 (sink vs 其他, heavy vs light)
+- 2025—2026: token 角色和 *任务结构* 绑定 (think 段 vs answer 段, 冗余 vs 非冗余)
+- 2026 CASK: 角色不是用来"打分修正", 而是用来 *分配不同的 primitive*——
+  核心保住、草稿合并、prefix 仍然扔. 这是从 "scorer 思维" 跳到 "policy 思维" 的一步。
+
+CASK 论文里 Phase 1 那段坦白特别值得注意——它不是写"我们做了 A 然后做了 B 更好",
+而是 *"我们花很长时间在做 A, 然后发现 A 这个方向本身就是错的"*.
+这是把 "negative result 当作论文的转折点" 来用, 在 ML 论文里非常少见。
+
+*下一步最可能往哪走*
+
+- *Core 不该手工定义*——某种意义上 CASK 还在用启发式判断谁是 core。
+  下一步是让 model 自己 (或者一个 sidecar) 输出 core mask。
+- *合并算子也要 reasoning-aware*——目前用的还是从长上下文借来的通用算子,
+  对推理特有的"等价改写"结构没有专门设计。
+- *训练侧呼应*——压缩友好的 reasoning trace 是不是可以训出来? 让模型自己产生
+  能更容易被合并的 think 文本。这是把推理时的压缩约束反向注入到预/后训练里。
+
+* 启发
+
+这条河给"怎么做研究"的启发, 比技术本身更刺。
+
+1. *框架是真正的杠杆, 不是细节*. 十年的 scorer 改良, 论文一篇接一篇,
+   benchmark 一档一档升, 但 CASK 一句"keep-set 几乎不变"就把这十年的努力
+   拍到次要位置。当你发现自己在一个框架里反复调细节、收益越来越薄, 该怀疑的
+   是框架, 不是你调得不够。
+
+2. *Negative result 是路标*. CASK 的 Phase 1 是失败的——更复杂的 scorer
+   没换来 keep-set 的实质变化。但他们没有把这段藏掉, 反而把它放进 Appendix,
+   并明说 "正是这个失败让我们 pivot"。失败有信息, 删掉就当于扔掉信息。
+
+3. *给问题换一个动词*. 整个领域问 "*哪些* token 该扔?" 换成
+   "哪些 token *绝对不能动*?" 之后, 一切都重新洗牌。
+   动词换了, 解空间也换了。
+
+4. *不一定要赢全场*. CASK 在 saved ratio 上不一定比对手狠, 在所有
+   benchmark 上不一定通杀。但它清晰地说 "我们的强项是 minimum usable budget
+   下移", 然后只就这件事拿证据。这种 *bounded claim* 比"全面超越"更可信,
+   也更可被后人扩展。
+
+落点: 你在自己的方向上, 也可以这样做——找到你这条 "scorer 战争" 在哪里,
+然后问: 大家这十年是不是都在改 scorer? 该问问框架本身了。

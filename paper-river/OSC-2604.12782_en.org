@@ -1,0 +1,331 @@
+#+title:      OSC: Hardware Efficient W4A4 Quantization via Outlier Separation in Channel Dimension
+#+date:       [2026-05-28 Thu 14:30]
+#+filetags:   :paper:river:quantization:llm:hardware:en:
+#+identifier: 20260528T143000-en
+#+source:     https://arxiv.org/abs/2604.12782
+#+authors:    Zhiyuan Zhang, Yanzhao Li, Zhiqiang Zou, Bai Du, Yupeng Sun, Hui Dong, Hui Wang (Huawei)
+#+venue:      arXiv preprint, 2026-04-14
+
+* The River of Problems
+
+Compressing large models to 4-bit inference halves memory and roughly doubles throughput. But W4A4 (weights 4-bit, activations 4-bit) is where almost every method breaks down — not because weights are hard to quantize, but because *a small number of extremely large values in activations*, called outliers, resist being packed into the ~16 slots of a 4-bit grid. Either the outliers themselves get clipped, or they crowd all the other small values into a single bucket.
+
+This thread has been grinding for a decade, cycling around three recurring questions:
+- *Where are the outliers?* — Scattered randomly, or locked to specific channels?
+- *How to handle them?* — Give them high precision (dynamic detection), spread them out (reparameterization), or simply isolate them statically?
+- *Can hardware cope?* — Algorithmically elegant solutions often run slower than FP16 in practice, because they destroy the regular memory access patterns that GEMM units depend on.
+
+OSC, published in 2026, is where this river finally converges — it argues: everything before was too "dynamic"; let us accept that outliers live in fixed channels, build an offline lookup table, peel them out, and compute them in parallel with the main body so hardware can run at full utilization.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | Problem: 8-bit quantization suddenly collapses on models ≥ 6.7B —
+  |          certain channels carry activations of ±70, dwarfing the
+  |          ±5 seen in other channels
+  | Solution: At runtime, identify these "emergent outlier" channels
+  |           and compute them in FP16; compute the rest in INT8,
+  |           then sum the two results
+  | Residual: Which channels are outliers must be decided on the fly;
+  |           branched execution + scattered memory access makes the
+  |           GEMM slower than plain FP16
+  v
+[2023] SmoothQuant (Xiao et al.)
+  |
+  | Problem: LLM.int8()'s "dynamic routing" is ugly in production —
+  |          can we eliminate outliers at the source?
+  | Solution: Activations have outliers but weights are flat. Divide
+  |           the outlier channel's activations by a large scale s,
+  |           multiply the corresponding weight rows by s — the product
+  |           is unchanged but activations become smooth
+  | Residual: The "mountain" is just moved to the weights — with W4A4
+  |           the 16 weight slots cannot hold it either; accuracy drops
+  |           ~15 points
+  v
+[2024] QuaRot (Ashkboos et al.)
+  |
+  | Problem: SmoothQuant is a "local shuffle"; not aggressive enough
+  |          for W4A4. Can outliers simply be made to disappear?
+  | Solution: Apply a rotation matrix (Hadamard / random orthogonal)
+  |           to activations and weights — rotation preserves the
+  |           matrix product but spreads a single large channel across
+  |           all channels
+  | Residual: The rotation itself is an extra dense multiply that
+  |           disrupts memory layout; W4A4 still drops ~3.5 points
+  v
+[2025] SpinQuant (Liu et al.)
+  |
+  | Problem: QuaRot uses a fixed Hadamard — why not learn a better one?
+  | Solution: Treat R as a learnable parameter; do gradient descent on
+  |           the Stiefel manifold (the space of orthogonal matrices)
+  |           to find the rotation that makes activations flattest
+  | Residual: Drop shrinks to 1.9 points, but hardware cost of the
+  |           rotation is unchanged; learning R also requires a
+  |           training pass
+  v
+[2025] TetraJet-v2 (Chen et al., concurrent work)
+  |
+  | Problem: FP4 training also breaks under outliers, causing activation
+  |          oscillations. Instead of detecting them every step, accept
+  |          that they are fixed
+  | Solution: Statically retain a small number of outlier channels in
+  |           high precision; route everything else through FP4
+  | Shift in perspective: First explicit "static-index" approach — but
+  |                       it targets training instability, not
+  |                       inference throughput
+  v
+[2026] OSC (this paper, Zhang et al. @ Huawei)
+  |
+  | Observed problems: Rotation-based methods (QuaRot/SpinQuant) are
+  |                    algorithmically elegant but break GEMM regularity
+  |                    and are hardware-unfriendly; dynamic methods
+  |                    (LLM.int8/SpQR/Atom) are accurate but branch-
+  |                    heavy with fragmented memory; TetraJet-v2 found
+  |                    the right "static" direction but only for
+  |                    training, and ignores per-module outlier
+  |                    heterogeneity
+  |
+  | Key observation: Profiling Qwen3-8B under MXFP4's 32-element group
+  |                  granularity shows that outlier channels at Attention
+  |                  inputs and FFN W1/W3 inputs have a clustering ratio
+  |                  above 60% (the same channel fires on almost every
+  |                  token), whereas W2 (down-projection) inputs have
+  |                  dispersed outliers — these two regimes require
+  |                  different treatment
+  |
+  | Solution: Offline sweep → pick "most-often-outlier column" per group
+  |           → store in a lookup table (LUT). At inference:
+  |             - Main body runs through 4-bit GEMM
+  |             - Outlier columns are extracted and physically repacked
+  |               into a dense compact matrix, then run through 16-bit GEMM
+  |             - The two results are summed
+  |           For W2 layers (dispersed outliers), fall the entire layer
+  |           back to FP8 rather than forcing 4-bit
+  | Gains: Qwen3-8B drops 2.19 points; Qwen3-30B-MoE drops 1.12 points;
+  |        1.78× speedup over W8A8 baseline
+#+end_example
+
+Note: The rotation family (QuaRot → FlatQuant → SpinQuant) and the reparameterization family (SmoothQuant → AWQ) are two parallel "algorithm-side" threads; the dynamic family (LLM.int8 → SpQR → Atom) is a separate "engineering-side" thread. OSC's "static-index" route had barely been explored before TetraJet-v2; OSC pushes it to production-viable inference quality.
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Outliers Are Not Noise — They Are Structure
+
+*** What problem did it see?
+
+Before 2022, 8-bit quantization was considered a safe bet — accuracy loss was negligible. Then Dettmers ran it on OPT-175B and it collapsed, with larger models collapsing more completely. Careful inspection revealed: once a model exceeds ~6.7B parameters, certain activation channels suddenly "emerge" with absolute values of 60–70, more than ten times the magnitude of other channels in the same layer. The 256 bins of 8-bit quantization are monopolized by these few extremes, leaving all other channels crammed into the middle bins — effectively unquantized.
+
+More importantly: these large values are not random. They *appear in the same channels consistently* — feed in 100 different prompts and the outliers always land in the same set of channels.
+
+*** Its solution
+
+Since the outliers can be identified, compute them separately. LLM.int8() profiles activations at runtime each batch, picks out the outlier channels, computes those channel multiplications in FP16, computes the remaining channels in INT8, and sums the two results:
+
+#+begin_example
+X * W  =  X_normal_int8 * W_normal_int8  +  X_outlier_fp16 * W_outlier_fp16
+         \_______main path_______/        \____sparse path____/
+#+end_example
+
+Mathematically sound; accuracy barely drops.
+
+*** What it left behind
+
+It runs slower than FP16 in practice. Reasons:
+- Each batch requires re-profiling which channels are outliers — control flow is data-dependent
+- The outlier channels are non-contiguous, requiring scattered memory gathers
+- The FP16 main path and the INT8 sub-path require coordinating two separate kernels
+
+GPU GEMM units are designed to consume dense, regular matrix multiplications. This scattered, sparse access pattern drives arithmetic utilization into single digits. The algorithm won; the hardware lost.
+
+** 2023 | SmoothQuant: Outliers Live in Fixed Channels — So Move Them Away Offline
+
+*** What problem did it see?
+
+LLM.int8()'s runtime routing was too messy for production. Xiao et al. asked: since outliers live in fixed channels, why not deal with them offline and be done with it?
+
+They noticed a key asymmetry: activations have outliers but weights are flat. In the matrix multiplication ~Y = X @ W~, one column of X is enormous while the corresponding row of W is mild.
+
+*** Its solution
+
+If you divide that column of X by s and multiply the corresponding row of W by s, the product ~Y~ is unchanged. This is an equivalence transformation. SmoothQuant does exactly this:
+
+#+begin_example
+Original: X @ W       X has outliers, hard to quantize
+Transformed: (X/s) @ (s·W)
+              \____/   \___/
+           smoothed   slightly larger, but weights were already easy to quantize
+#+end_example
+
+Choose s to make both sides quantization-friendly (take the α-th power of the column magnitude of X), compute it offline once, and absorb it into the weights.
+
+*** What it left behind
+
+With W4A4, the 16 weight bins cannot absorb the added dynamic range after the outlier is "moved" there. On Llama2-70B this causes a 15-point accuracy drop. The fundamental issue: SmoothQuant *relocates* outliers — it does not *eliminate* them. The mountain has been shifted from activations to weights, but the mountain is still there.
+
+** 2024 | QuaRot: Make Outliers Disappear Entirely
+
+*** What problem did it see?
+
+SmoothQuant's scale is one-dimensional (one scalar per channel) — too weak to handle outliers that are coupled across multiple channels. Eliminating outliers thoroughly requires a more expressive equivalence transformation.
+
+Linear algebra provides the tool: an orthogonal rotation matrix R. Because ~R^T @ R = I~, we have ~Y = X @ W = (X @ R) @ (R^T @ W)~. If R is chosen well, every column of ~X @ R~ is a mixture of all columns of X — a single-point outlier gets *averaged out*.
+
+*** Its solution
+
+Use a Hadamard matrix (a special orthogonal matrix with entries of only ±1) as R. Two advantages:
+- Mathematically provable: for Gaussian input, the post-rotation variance is minimized
+- Multiplication can be accelerated with a fast Hadamard transform
+
+Weights are transformed once when the model is loaded; activations pass through the Hadamard transform at the beginning of each layer at runtime.
+
+*** What it left behind
+
+Spreading out the outliers requires an extra dense multiply (the Hadamard transform). W4A4 accuracy drop falls to 3.5 points, but end-to-end speed is partially eaten by the transform. A deeper problem: after rotation, the physical meaning of each channel is gone — channel 3 is now a linear combination of all 4096 original channels, which breaks debugging, interpretability, and quantization-aware training.
+
+** 2025 | SpinQuant: If We Must Rotate, Learn the Best Rotation
+
+*** What problem did it see?
+
+QuaRot's Hadamard is one-size-fits-all. But every model and every layer has a different activation distribution — the optimal rotation direction should obviously vary.
+
+*** Its solution
+
+Treat R as a learnable orthogonal matrix — specifically, perform gradient descent on the Stiefel manifold (the space of all orthogonal matrices), optimizing toward the rotation that makes the post-rotation activation distribution flattest. Train for a few hours on a small calibration dataset to obtain a rotation tailored to the specific model.
+
+W4A4 accuracy drop falls from QuaRot's 3.5 points to 1.9 points.
+
+*** What it left behind
+
+The hardware cost of the rotation is unchanged — every layer still pays for an extra dense multiply before computation. And this line of research has reached an awkward ceiling: algorithmic headroom (better rotations, finer-grained scales) is nearly exhausted, while the hardware overhead has only grown.
+
+** 2025 | TetraJet-v2: Different Angle — Don't Suppress Outliers, Give Them Room
+
+*** What problem did it see?
+
+The concurrent work of Chen et al. encountered the same issue in FP4 training: activation outliers caused training to diverge. They noticed an overlooked fact — outlier channels are actually very stable. LLM.int8() said "identify at runtime," but what if you *identify once offline and fix the assignment forever*?
+
+*** Its solution
+
+Before training, sweep the data to find outlier channels, mark them as "always high precision," and route everything else through FP4. This label is frozen for the entire training run.
+
+*** What it left behind
+
+It addresses training-time activation oscillations, not inference throughput. It does not distinguish between modules with different outlier behavior (Attention vs. FFN). And it does not address how to execute the "high-precision scattered channels" efficiently on hardware — it says "use high precision," not "here is how the GPU should compute it efficiently."
+
+** 2026 | OSC: Push "Static Indexing" to Its Hardware-Friendly Extreme
+
+*** What problem did it see?
+
+The OSC authors surveyed the landscape and identified three facts:
+
+1. *Rotation-based methods are algorithmically elegant but hardware-hostile* — QuaRot/SpinQuant's real-world GPU throughput is eaten by the transform; worse, specialized accelerators that natively support MXFP4/NVFP4 are entirely incompatible with these extra dense multiplications in their GEMM pipelines.
+2. *Dynamic methods are accurate but branch-heavy* — the LLM.int8() family's runtime identification always collides with "memory fragmentation + control-flow divergence."
+3. *The static route has barely started and isn't quite right yet* — TetraJet-v2 found the right direction but only for training; and nobody had paid attention to the fact that different modules have different outlier behaviors.
+
+More critically: modern accelerators (Blackwell B100, Huawei's own chips) are beginning to natively support *grouped micro-scaling* format MXFP4, where every 32 consecutive elements share one scale. This provides a natural granularity for static indexing.
+
+*** Its key observation
+
+The authors profiled Qwen3-8B carefully, defining a "clustering ratio": within each 32-element group, what fraction of outlier tokens does the most-frequently-outlier column account for?
+
+Two distinct regimes emerged:
+- *Attention inputs and FFN W1/W3 inputs*: clustering ratio *above 60%* — within a group, nearly always the same column fires as the outlier.
+- *FFN W2 inputs* (down-projection): clustering ratio is low — outliers wander across columns within the group.
+
+This heterogeneity had been invisible to SmoothQuant and QuaRot. It means: static indexing works for the first regime; it cannot work for the second.
+
+*** Its solution
+
+#+begin_example
+Offline: sweep calibration data -> pick "most-often-outlier column" per group -> store in LUT
+
+Online (for high-clustering layers):
+   ┌──────────────────────────────────────┐
+   │ Input activation X (4096 channels)   │
+   └─────────────┬────────────────────────┘
+                 │
+        Split into two paths via LUT
+                 │
+   ┌─────────────┴────────────────────────┐
+   │                                      │
+ Main body (3968 channels)        Outlier columns (128 channels)
+   │                                      │
+   │                              Repacked into a contiguous dense matrix
+   │                                      │
+ 4-bit GEMM                       16-bit GEMM
+   │                                      │
+   └─────────────┬────────────────────────┘
+                 │
+              Sum -> Output
+
+For W2 layers (low clustering ratio):
+   Fall the entire layer back to FP8; no splitting
+#+end_example
+
+The critical design choice: outlier columns are *physically repacked into a contiguous compact matrix* on hardware, so the 16-bit path is also a regular dense GEMM, not a scattered memory access. Both paths are in exactly the form that GPUs and accelerators want to consume.
+
+*** Its gains and what remains
+
+- Qwen3-8B drops 2.19 points; Qwen3-30B-A3B (MoE) drops 1.12 points — slightly worse than SpinQuant's 1.9, but *far more hardware-friendly* than dynamic or rotation-based approaches.
+- 1.64×–1.78× speedup over W8A8 baseline.
+
+What remains:
+- FP8 fallback is at *whole-layer granularity* — all W2 layers fall back to FP8. In reality, perhaps only a subset of W2 layers truly need it; the authors acknowledge this is coarse-grained.
+- Performance numbers are modeled estimates, not end-to-end measurements on real silicon.
+- No QAT integration — purely a PTQ method.
+
+* Problem–Solution Overview
+
+#+begin_example
+                     Where are outliers?       How handled?             Hardware cost
+                     ------------------        ------------             -------------
+LLM.int8 (2022)      Identified at runtime     FP16 for outlier         High (dynamic branches)
+                     fixed channels but        INT8 for rest
+                     re-confirmed each batch
+                          |
+                          v
+SmoothQuant (2023)   Known offline             scale moves outlier      Low (absorbed into weights)
+                     (per-channel)             to weight side           | but W4A4 is not enough
+                          |
+                          v
+QuaRot (2024)        Don't care where          Rotation matrix          Medium (extra dense multiply)
+                     rotation flattens all     spreads them out         |
+                          |
+                          v
+SpinQuant (2025)     Same as QuaRot            Learn the optimal        Medium (same as QuaRot)
+                                               rotation
+                          |
+                          v
+TetraJet-v2 (2025)   Determined offline        Statically retain        Not focused on inference
+                     fixed channels            high precision           hardware
+                     (for training)
+                          |
+                          v
+OSC (2026)           Offline + fine-grained    LUT + dual-path GEMM     Low (regular dense)
+                     per-group; also           + FP8 fallback for       Adapted to MXFP4 hardware
+                     distinguishes outlier     dispersed regions
+                     behavior per module
+#+end_example
+
+* Insights
+
+** This Thread Is *Shifting from "Algorithmically Beautiful" to "Hardware Compatible"*
+
+The main arc of LLM.int8 → SmoothQuant → QuaRot → SpinQuant was always competing on *algorithmic accuracy*, pushing the accuracy drop from 15 points down to 1.9. But the hardware cost at each step was never seriously accounted for — dynamic branches, extra rotations, custom kernels — and when deployed, end-to-end speed turned out to be disappointing.
+
+OSC is the first point on this arc to say explicitly: "My accuracy is 0.2 points worse than yours, but I can saturate the hardware." This is a reversal of priorities: when model deployment becomes the bottleneck, *"can this actually hit expected throughput on the accelerator"* matters more than one or two extra accuracy points.
+
+** The Real Key Insight Is "Trusting the Structural Nature of Outliers"
+
+LLM.int8() already saw in 2022 that outliers live in fixed channels — but it chose the conservative route of re-identifying them every batch, because it didn't dare trust that this structure would remain stable across data and batches. SmoothQuant half-believed it (per-channel scaling implicitly assumes fixed channel identity, but doesn't fully exploit the structure). QuaRot and SpinQuant abandoned exploiting the structure altogether and pivoted to "pretend outliers don't exist."
+
+OSC is the first method on this arc to *fully commit to "outlier channels are fixed" as a hard prior and extract every benefit from it* — and it goes further, discovering that the structure is heterogeneous (W2 layers behave differently). This kind of "willingness to trust a prior" is often the turning point where a research thread becomes engineering-viable.
+
+** Where Does This Go Next?
+
+- *Finer-grained fallback*: OSC itself acknowledges that falling an entire W2 layer back to FP8 is too coarse; the next step should be group-level fallback.
+- *QAT integration*: Train the model to avoid producing outliers in certain channel assignments, or to concentrate outliers into even fewer channels.
+- *Native hardware support*: The next generation of accelerators may directly support "grouped dual-path GEMM" at the hardware level, eliminating the need for software-level orchestration of OSC-style methods.
+- *Cross-architecture generalization*: All current conclusions are based on Qwen3; it remains to be verified whether Llama, DeepSeek, and Mistral series exhibit the same clustering ratio patterns.

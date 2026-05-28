@@ -1,0 +1,285 @@
+#+title:      The Illusion of Equivalence: Systematic FP16 Divergence in KV-Cached Autoregressive Inference
+#+date:       [2026-05-28 Thu 16:09]
+#+filetags:   :paper:river:
+#+identifier: 20260528T160907
+#+source:     https://arxiv.org/abs/2604.15409
+#+authors:    Ranjith Chodavarapu, Lei Xu
+#+venue:      arXiv preprint, 2026-04 (cs.LG)
+
+* 问题之河
+
+你给同一个大模型同样的输入，同样的硬件，同样的权重，关掉所有采样的随机性（greedy decoding），它会在两次推理里吐出完全一样的 token 序列吗？
+
+直觉答案：会。这是数学。a*W 就是 a*W，没什么好抖的。
+
+实际答案：不会。哪怕你只改一件事——把 KV cache 打开和关掉——同样的提示，同样的模型，同样的 GPU，生成出的 token 100% 不一样。在 LLaMA-2、Mistral、Gemma 三个模型、GSM8K 数据集、所有采样策略上都是 100%。而且不是随机不一样，是系统性地不一样——开 cache 的版本在 9 种条件里有 8 种准确率更高。
+
+这条线为什么会走到这里？因为整条 LLM 推理栈，从 2017 年混合精度训练把 FP16 钉成默认精度的那一天起，到 2022 年 FlashAttention、2023 年 PagedAttention、GQA 一个接一个上来"优化 KV cache"，所有人都默认了一件事：cache-ON 和 cache-OFF 在数学上等价，所以在数值上也等价。
+
+问题是 FP16 的加法不满足结合律。(a+b)+c ≠ a+(b+c)。两条执行路径只要 *累加顺序* 不一样，输出就有差异——一开始只是末位的几个 bit，但这些 bit 写进了 KV cache，下一步又从 cache 读出来参与新的计算，错误像复利一样滚。GQA 还把这个错误从一个 KV head 广播到所有共享它的 query head 上，让原本独立的小误差变成相关的大误差。
+
+所以这篇论文做的事，其实是把一个所有人脚下都踩着、但没人低头看的假设挖出来——"KV cache 是免费的优化"——然后给它钉上一个反例。
+
+* 溯源地图
+
+#+begin_example
+[2015] Gupta et al. - Deep Learning with Limited Numerical Precision
+  |
+  | 立的: 16-bit 定点训练在 MNIST/CIFAR 上不掉精度
+  | 留下的口子: 只在小模型小任务上验证, "精度够用"成了默认信念
+  v
+[2017] Micikevicius et al. - Mixed-Precision Training (FP16 + loss scaling)
+  |
+  | 看到的问题: Gupta 那套定点不实用, GPU 要的是 FP16 浮点
+  | 解法: FP16 算 + FP32 主权重 + loss scaling, 训练加速且不掉点
+  | 钉死的信念: "FP16 对神经网络是安全的"
+  | 留下的盲点: 只验证了训练 loss 不变, 没问推理路径是否一致
+  v
+[2017] Vaswani et al. - Transformer (vanilla MHA)
+  |
+  | 立的: 自注意力, 每个 token 都要看前面所有 token
+  | 留下的口子: 推理时前缀的 K/V 重复计算, O(n^2) 内存/算力
+  v
+[2019] Shazeer - Multi-Query Attention (MQA)
+  |
+  | 看到的问题: 解码时 KV cache 内存爆炸
+  | 解法: 所有 query head 共享一个 KV head, 内存除以 head 数
+  | 假设: 共享 KV 不影响输出质量, FP16 精度足够
+  v
+[2022/2023] Dao et al. - FlashAttention v1/v2
+  |
+  | 看到的问题: 标准 attention 内存带宽是瓶颈, 不是算力
+  | 解法: 分块累加, 在 SRAM 里算完再写回, IO-optimal
+  | *改变了累加顺序*, 但论文里写: "数学上等价"
+  v
+[2023] Ainslie et al. - Grouped-Query Attention (GQA)
+  |
+  | 看到的问题: MQA 太激进掉点, vanilla MHA 太贵
+  | 解法: 折中, 每 R 个 query head 共享一个 KV head
+  | 同样假设: 数学等价, FP16 精度足够, 不研究累加顺序
+  v
+[2023] Kwon et al. - PagedAttention / vLLM
+  |
+  | 看到的问题: KV cache 内存碎片化, GPU 利用率上不去
+  | 解法: 把 KV cache 分页管理, 像虚拟内存
+  | 同样假设: 分页前后的 cache 数值上等价
+  v
+[2026-04] Chodavarapu & Xu - "Illusion of Equivalence" (本篇)
+  |
+  | 看到的问题: 上面所有"等价"假设, 没人验过
+  | 做的事: 系统测三个模型、三种采样、五个实验
+  |        - 100% token 发散率
+  |        - cache-ON 在 8/9 条件下准确率更高 (系统性, 不是噪声)
+  |        - FP32 把发散减少 8 个数量级, 锁定 FP16 累加序为根因
+  |        - GQA 模型在第一层就发散, MHA 模型逐层累积
+  |        - 残差流 activation patching 救不回来, 证明病灶在 KV state
+  v
+[2025+] Thinking Machines 等 - "Defeating Nondeterminism in LLM Inference"
+  |
+  | 顺势而下: 不再假装等价, 转而追求 batch-invariant kernels
+  |          —— 同一个请求不管在多大 batch 里都给同样输出
+  | 与本篇关系: 本篇是诊断书, 这些是治疗方案
+#+end_example
+
+* 演化叙事
+
+** 2015 | Gupta et al.: "16 位就够了"
+
+*** 它看到了什么问题
+
+2015 年训神经网络默认用 FP32。GPU 跑得动，但要省电、要塞进 FPGA、要做 ASIC，32 位太奢侈。能不能用更少的位？
+
+*** 它的解法
+
+用 16 位定点数训。MNIST、CIFAR 上跑出来精度几乎不掉。
+
+*** 哪里埋了坑
+
+它只在小模型、小数据集上验了"训练 loss 不变"。从来没人问：推理时，同一个权重在两条不同的计算路径上跑，输出还会不会逐 bit 一致？这个问题在 2015 年根本不存在——那时候没有 KV cache，没有 FlashAttention，没有分布式推理。但"16 位精度够用"这句话从此成了整个圈子的默认信念。
+
+** 2017 | Micikevicius et al.: FP16 + loss scaling，钉死了"安全"
+
+*** 它看到的问题
+
+Gupta 那套定点不实用——NVIDIA Volta 出了原生 FP16 浮点，工业界要的是这个，不是定点。但 FP16 浮点的动态范围太窄，梯度里小的值直接 underflow 成 0，训不动。
+
+*** 它的解法
+
+混合精度训练：算用 FP16，主权重存 FP32，loss 上乘一个大常数（loss scaling）把梯度推进 FP16 的可表示区间。在 ImageNet、机器翻译、语言模型上验证：训练速度翻倍，最终精度持平。
+
+*** 它怎么影响后面所有人
+
+从这篇之后，FP16 在深度学习圈子里从"实验性优化"变成"工业标准"。所有人都信了一句话：神经网络对 FP16 精度是 robust 的。
+
+但这篇论文证的其实是一个非常窄的命题：训练收敛后，验证集 loss 不会显著退化。它没证、也没人去证的是：同一个 FP16 模型在两条不同实现路径上的推理结果，是 bit-for-bit 一致的。
+
+这两件事差着十万八千里。前者只要末尾几 bit 的噪声平均下来不偏，就成立。后者要求每个 bit 都对得上。
+
+这个错位的信念，是后面整条 KV cache 优化链踩着的地板。
+
+** 2017 | Vaswani et al.: Transformer，把问题做大了
+
+*** 它带来的新约束
+
+Transformer 把 RNN 那种逐步状态换成全局注意力——好处是并行训练，坏处是推理时每生成一个新 token，都要重新对整个前缀算一遍 K 和 V。生成第 1000 个 token 时，前 999 个 token 的 K/V 已经算过 999 次了。
+
+这就是 KV cache 出现的原因。它本来应该是一个纯粹的"工程优化"——把算过的存下来，避免重复计算。所有人都相信这个优化不改变模型行为。
+
+** 2019 | Shazeer: MQA，第一次动了 KV 的"结构"
+
+*** 它看到了什么问题
+
+KV cache 在长序列下内存会爆。32 个 head × 序列长度 × hidden 维度 × 两份（K 和 V），一个 7B 模型推理几千 token 就吃掉几个 GB。
+
+*** 它的解法
+
+让所有 query head 共享同一个 KV head。内存除以 head 数，立省 32 倍。
+
+*** 它埋的坑
+
+注意这里发生了一件细微的事：原来每个 head 有独立的 K/V，rounding error 是独立的；现在大家共享一个 K/V，rounding error 也被共享了。本来 32 个独立的小误差，加起来会因为方向随机而部分抵消；现在变成 32 个完全相关的同方向误差，叠加之后放大。
+
+但 2019 年没人关心这个——Shazeer 只验了准确率掉得不多。FP16 的 rounding 行为？没人问。
+
+** 2022-2023 | FlashAttention：明明改了累加顺序，却说"数学等价"
+
+*** 它看到的问题
+
+GPU 上 attention 不是算力瓶颈，是 SRAM ↔ HBM 来回搬数据的带宽瓶颈。标准实现要把整个 N×N attention matrix 写回 HBM 再读回来，慢得离谱。
+
+*** 它的解法
+
+分块（tiling）：把 Q、K、V 切成块，每块在 SRAM 里算完局部 softmax，用 online softmax 技巧合并，永远不把完整的 N×N matrix 落回 HBM。论文标榜 "exact attention"——数学上和标准 attention 等价。
+
+*** 它和本篇的精确张力
+
+"数学上等价" ≠ "数值上等价"。FlashAttention 把累加顺序从"按行扫"变成了"按块拼"，这两种顺序在实数域上结果一样，在 FP16 下因为非结合律，结果不一样。FlashAttention 论文里没提这件事——它假定 FP16 精度足够吸收这种差异。
+
+这就是本篇 4 年后要拆的假设：差异不是"被吸收"了，是被 *写进了 KV cache*，然后在每一个 decode step 里被反复读出来、再参与新计算、再写回去。误差不是消散，是积累。
+
+** 2023 | GQA：把"误差共享"做成了主流
+
+*** 它看到的问题
+
+MQA 太激进，掉点明显；vanilla MHA 又太贵。中间地带在哪？
+
+*** 它的解法
+
+每 R 个 query head 共享一个 KV head（R=8 就是 8 个 query 共享一个 KV）。LLaMA-2-70B、Mistral、几乎所有现代开源模型都用 GQA。
+
+*** 它在本篇里的角色
+
+本篇做了一个特别漂亮的实验：layer-wise drift profiling。结果是——GQA 模型（LLaMA-2、Mistral）的 cache-ON vs cache-OFF 差异在 *第一层* 就爆发了；vanilla 模型（Gemma 因为大 head dimension 和滑窗 attention，行为更接近 MHA）的差异是逐层均匀累积的。
+
+为什么 GQA 第一层就爆？因为一个 KV head 的 FP16 rounding error 被同时广播给 R 个 query head，R 个 head 算出来的 attention output 误差完全相关，加起来不会互相抵消，反而放大 R 倍。这是 MHA 时代不存在的新失效模式。
+
+GQA 的设计者没看到这件事——他们只看到准确率没掉。但准确率没掉不代表 cache-ON 和 cache-OFF 输出一致。本篇证明：cache-ON 和 cache-OFF 100% 给出不同的 token 序列。
+
+** 2023 | PagedAttention / vLLM：在更高层把假设抬到天上
+
+*** 它看到的问题
+
+线上服务上百个并发请求，每个请求 KV cache 大小不一样，按最大长度静态分配会浪费 60-80% 显存。
+
+*** 它的解法
+
+把 KV cache 像虚拟内存一样分页管理，每页固定大小，按需分配。GPU 利用率立刻翻倍。
+
+*** 它默认的假设
+
+分页前后的 cache，*数值上必须一致*——否则用户会发现"同一个请求，今天和昨天的输出不一样"。PagedAttention 论文从头到尾把这件事当成自明前提，从没验证过。
+
+到了 2023 年底，整个工业级 LLM 推理栈（FlashAttention + GQA + PagedAttention + FP16 + 各种 batch 调度）已经叠到了 5 层抽象，每一层都假设下一层"输出确定且等价"。但没人验过这个等价。
+
+** 2026 | 本篇：把所有人脚下的地板掀开
+
+*** 它看到了什么问题
+
+上面这条链上所有人都假装 cache-ON ≡ cache-OFF，但从没人系统测过。如果这个假设是错的，会有几个严重后果：
+- 学术对比不可复现（同一个模型在不同推理引擎上输出不同）
+- 安全评估失效（红队测出来的对齐失败，在用户那里可能不复现）
+- 数值 ablation 实验全部要重做
+
+*** 它的解法（也是一份精细的诊断流程）
+
+5 个实验串成因果链：
+
+1. *Behavior*：3 模型 × 3 采样策略，cache-ON vs cache-OFF token divergence rate = 100%。Greedy 也是 100%，排除采样随机性。
+
+2. *Direction*：cache-ON 在 9 个条件里 8 个准确率更高（McNemar test，Bonferroni 校正 p<0.05）。说明发散方向是系统性的，不是噪声。
+
+3. *Root cause*：把所有累加换成 FP32（保留其他一切），divergence 掉 8 个数量级，flip rate 归零。锁定 FP16 非结合律是唯一根因。
+
+4. *Propagation*：layer-wise drift profiling，GQA 模型第一层爆发、Gemma 逐层均匀。架构差异预测了误差传播形态。
+
+5. *Localization*：activation patching 整个 residual stream（即把 cache-OFF 的残差流强行注入 cache-ON 路径），救不回 cache-OFF 的轨迹。证明病灶不在残差流，而在 stateful KV cache 本身——一旦 cache 里写进了错误的 FP16 值，下游任何干预都救不回来。
+
+*** 它留下的新问题
+
+如果 cache-ON 和 cache-OFF 不等价，到底哪个才是"对的"？传统假设是 cache-OFF 是 ground truth（因为它和训练时的 forward pass 一致）——但本篇发现 cache-ON 准确率反而更高。这意味着可能我们一直在用一个"错的版本"做 benchmark，而 *实际部署用的是另一个版本*。
+
+** 2025+ | 顺流而下：从"假装等价"到"主动追求确定性"
+
+本篇是诊断书。它之后的工作开始转向治疗：
+
+- *Batch-invariant kernels*（Thinking Machines 等）：重新设计 GEMM 和 attention 内核，让同一个请求不管在多大 batch 里、不管 KV cache 怎么分页，都给出 bit-for-bit 一致的输出。代价是性能略损。
+- *Deterministic inference modes*（vLLM、SGLang 等推理引擎）：提供"确定性档位"，用户可以选"快但不确定"或"慢但可复现"。
+- *FP16 → BF16 → 选择性 FP32*：行业开始往 BF16 迁移（动态范围更大，rounding 行为更可预测），并在 KV cache 这类 stateful 路径上选择性保留 FP32 累加。
+
+* 问题-解法压缩图
+
+#+begin_example
++----------------------------------------------------------------+
+|  根问题: 神经网络推理在低精度下到底有多确定?                   |
++----------------------------------------------------------------+
+         |
+         | (2015) "16 位够用" -- 只在 training loss 层面验证
+         v
++----------------------------------------------------------------+
+|  默认信念: FP16 对神经网络是安全的                              |
++----------------------------------------------------------------+
+         |
+         | (2017) Transformer 出, KV cache 成为必需优化
+         v
++----------------------------------------------------------------+
+|  优化堆栈: MQA -> FlashAttn -> GQA -> PagedAttn -> 批调度      |
+|  每层都假设: 我对底层结果是"数值等价"的, 不验证                |
++----------------------------------------------------------------+
+         |
+         | (2026) 本篇: 把假设拆开测
+         v
++----------------------------------------------------------------+
+|  发现的事实:                                                    |
+|  - 100% token divergence (cache-ON vs cache-OFF)                |
+|  - 系统性偏差 (不是噪声) -- cache-ON 8/9 条件准确率更高        |
+|  - 根因 = FP16 非结合律 (FP32 falsification 8 个数量级降幅)    |
+|  - GQA 第一层爆发 (KV 共享 -> 误差相关性放大)                  |
+|  - 病灶在 stateful KV state, 不在 residual stream              |
++----------------------------------------------------------------+
+         |
+         | (2025+) 顺势: batch-invariant kernels / 确定性档位      |
+         v
++----------------------------------------------------------------+
+|  新范式: 不再假装等价, 主动设计确定性                          |
++----------------------------------------------------------------+
+#+end_example
+
+* 这条线在发生什么
+
+表面上是一篇"FP16 数值精度"的论文。底下其实是 LLM 系统圈的一次认知转折：
+
+*从"算子等价是免费的"到"等价必须验证"*。过去十年的优化都建立在一个隐含契约上——"我改了实现，但数学是对的，所以输出不变"。本篇展示这个契约在 FP16 + 有状态缓存下系统性破裂。一旦破裂，下游所有依赖确定性的事情（评估、复现、对齐、安全）都要重新审计。
+
+*从"看 loss/accuracy"到"看 bit-level 行为"*。深度学习的传统验证范式是统计的——准确率不掉就算"等价"。本篇把验证标准提到逐 bit、逐 token 层面，这是个更工程化、更接近传统系统软件的标准。LLM 长出来之后，它越来越像一个 *分布式系统*，而不是一个 *统计模型*——而分布式系统的人是不接受"输出大概一样"这种话的。
+
+*下一步最可能在哪*：
+1. *Cache-aware 训练*：既然部署时一定用 cache-ON，那训练时是不是也该用同样的累加顺序？现在训练用 cache-OFF（fully parallel），部署用 cache-ON，这是一个 train-test mismatch。
+2. *Bit-deterministic 推理引擎成为标准*：vLLM/SGLang 这类引擎会开始把确定性当成一等性能指标。
+3. *硬件层介入*：下一代 GPU/TPU 可能为 attention 提供 *固定累加顺序* 的专用指令，绕开 FP16 非结合律的暴露面。
+
+* 诚实标注
+
+- 溯源链中 Hinton 时代背景、Gupta 2015、Micikevicius 2017、Vaswani 2017、Shazeer 2019、FlashAttention 2022/2023、GQA 2023、PagedAttention 2023 之间的引用关系来自本篇 related work 直接引用 ([2],[6],[7],[11],[13],[16],[18])，是确认的。
+- "Thinking Machines / Defeating Nondeterminism" 这条 forward link 是基于领域趋势的推测，本篇未引用——但 batch-invariant kernels 与确定性推理是 2025 起的明确公开方向，作为"顺势而下"的代表合理。
+- "cache-aware 训练"这一展望是笔者推断，非论文原文主张。
+- 本篇未提出方法 acronym；本文件用 "Illusion"（取自标题 "The Illusion of Equivalence"）作为短标识。

@@ -1,0 +1,427 @@
+#+title:      Open-TQ-Metal: Fused Compressed-Domain Attention for Long-Context LLM Inference on Apple Silicon
+#+date:       [2026-05-28 Thu 16:20]
+#+filetags:   :paper:river:kv_cache:quantization:attention:apple_silicon:en:
+#+identifier: 20260528T162007-en
+#+source:     https://arxiv.org/abs/2604.16957
+#+authors:    Sai Vegasena (Ensue)
+#+venue:      arXiv preprint, 2026-04-18
+
+* The Problem River
+
+Running Llama 3.1 70B with a full 128K context window on an ordinary 64GB MacBook — as of April 2026, *every* inference framework failed to do this.
+
+Not because of compute. Because of *memory*. The model weights quantized to 4-bit take 39 GB; add the 128K KV cache in FP16 (40 GB) and the total is 79 GB — 15 GB over the 64 GB physical limit. You can't buy a bigger Mac: the consumer-tier Apple Silicon ceiling is exactly here.
+
+The central question of this research thread is:
+
+#+begin_quote
+*How do you scale the KV-cache memory wall?*
+#+end_quote
+
+The difficulty is that several things are knotted together at once:
+- The KV cache grows *linearly* with context length — every new token adds another entry. The moment long-context models became popular, this wall appeared right in front of you.
+- You can *compress* it, but at inference time you have to *decompress* back to full precision before computing attention — the decompression itself must write a large temporary matrix to GPU memory, burning all the bandwidth on data movement.
+- You can compress aggressively (1-bit, polar coordinates), but these "clever" schemes look fine on small models and then collapse catastrophically on 70B / 80-layer depth as errors compound geometrically.
+- Different model architectures use different attention *scale factors* (~attn_scale~) — the same quantization method sits quietly on Llama and produces garbage on Gemma.
+
+The entire thread is a repeated balancing act among four goals: compress more / compute faster / stay accurate / remain stable across architectures. Open-TQ-Metal is the first engineering realization that *eats all four*, and along the way it demonstrates that several previously elegant-looking methods simply do not hold up on large models.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Foundation: autoregressive decoding must retain all past K, V —
+  | this is the birth of the KV cache.
+  | No one realised it would become a memory bottleneck.
+  v
+[2018] Milakov & Gimelshein - Online Softmax
+  |
+  | A seed planted in passing: softmax can be computed "streaming-style"
+  | without first materialising all scores.
+  | Five years later this seed grows into FlashAttention.
+  v
+[2022/23] Dao et al. - FlashAttention / FlashDecoding
+  |
+  | Problem: standard attention writes the S×S score matrix back to HBM,
+  | then reads it again for softmax, writes again, reads again for V.
+  | Bandwidth is eaten by shuttling one large temporary matrix.
+  | Solution: tiled Q + online softmax, attention scores never leave
+  | on-chip cache. FlashDecoding further splits the KV sequence into
+  | split-K chunks for parallel decoding.
+  | Residual: optimises *compute*, leaves *storage format* untouched —
+  | FP16 KV cache for 70B is still your problem.
+  v
+[2023] Kwon et al. - vLLM / PagedAttention
+  |
+  | Problem: multi-request KV caches fragment GPU memory; 60%+ wasted.
+  | Solution: page-table management of KV cache, identical to OS
+  | virtual memory. Enables prefix sharing, copy-on-write, etc.
+  | Residual: solves *management*, not *capacity* — if one request
+  | needs 79 GB, paging cannot save you.
+  v
+[2024] Hooper et al. - KVQuant
+  | Liu et al. - KIVI / Kang et al. - GEAR
+  |
+  | Problem: capacity is the real issue — 10M context is impossible FP16.
+  | Solution: quantize K and V to 4-bit (or 2-bit), per-channel / per-token;
+  | outliers stored separately in FP16.
+  | Residual: must dequantize back to FP16/FP32 before QK^T —
+  | generates a new full-size temporary matrix.
+  | Storage savings are paid back through bandwidth.
+  v
+[2024] Zandieh et al. - QJL
+  |
+  | Problem: 4-bit is still conservative; can we go more aggressive?
+  | Solution: random Gaussian projection of keys, store only sign bits —
+  | 1-bit binary sketch. Query stays full-precision; score estimated
+  | asymmetrically (sketch × full).
+  | Residual: per-layer score correlation ρ ≈ 0.85 looks fine on
+  | 8B models (32 layers) — but no one tested 70B.
+  | This is a depth bomb.
+  v
+[2025] Han et al. - PolarQuant
+  |
+  | Problem: quantizing Cartesian components gives irregular error;
+  | can a different coordinate system help?
+  | Solution: recursively convert KV embeddings to polar coordinates,
+  | quantize only angles. After random preprocessing, angle distribution
+  | concentrates — no normalisation needed. Claims 4.2× compression.
+  | Residual: introduces "structured angular error" delta_theta that
+  | enters score = alpha * q^T * k through the alpha channel.
+  | No one checked whether alpha is the same across architectures.
+  v
+[2025] Zandieh et al. - TurboQuant
+  |
+  | Problem: combine the best of each approach.
+  | Solution: MSE-optimal scalar quantisation (random rotation +
+  | Lloyd-Max codebook, 3.5 bit/dim) + 1-bit QJL residual.
+  | Residual: validated on 8B only; no Apple Silicon / Metal;
+  | no fused kernel; alpha problem latent.
+  v
+[2026.04] Vegasena - Open-TQ-Metal  <-- target paper
+  |
+  | First implementation to weave all threads together on Apple Silicon:
+  | 1. Fused int4 SDPA Metal kernel (no intermediate matrix)
+  | 2. Split-K via MLX Primitives chained through computation graph
+  | 3. 70B + 80-layer validation (exposes QJL depth collapse)
+  | 4. Cross-architecture analysis: exposes PolarQuant failure on
+  |    Gemma 4 (alpha=1.0)
+  | Result: Llama 70B @ 128K context on a 64GB Mac; 48× attention speedup
+  v
+[2026+] TBD: bandwidth wall, MoE, 2-bit weights, RULER long-context quality
+#+end_example
+
+Note: the vLLM branch primarily addresses the *management* dimension and runs parallel to, but separate from, the *compression* main thread. FlashAttention addresses the *compute* dimension and finally merges with the compression thread at Open-TQ-Metal.
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al. *Attention Is All You Need*: autoregressive inference requires a KV cache
+
+*** What problem it saw
+
+RNNs process tokens one at a time; at long sequences they become unusably slow. The entire NLP field before 2017 was bottlenecked by this *sequential dependency*.
+
+*** Its solution
+
+Discard RNNs entirely and stack the model entirely from attention mechanisms. During training all tokens are processed in parallel, yielding an enormous speed increase.
+
+*** Why it worked — and what new hole it dug
+
+The price of parallelism is that *at inference time* all past tokens' K and V projections must be retained. Every newly generated token must attend to all previous K and V entries. This accumulation is the *KV cache*.
+
+The paper barely mentions it — models were small and contexts short, so the KV cache topped out at a few hundred megabytes and nobody treated it as a problem. This seed would take a decade to grow into an 80 GB memory monster.
+
+** 2018 | Milakov & Gimelshein *Online Softmax*: softmax can be computed in a streaming fashion
+
+*** What problem it saw
+
+Standard softmax must see all scores before normalising (find the max, compute the denominator). This forces the entire score vector to be *materialised* in memory first.
+
+*** Its solution
+
+Scan left to right while maintaining two running statistics: the current maximum seen and the running sum of exponentials. A new value updates both in O(1) — effectively "streaming normalisation."
+
+*** Why it worked — and what new hole it dug
+
+This appears to be an inconsequential numerical trick, but it opens a door: *you no longer need to write all attention scores to memory before running softmax*.
+
+Nobody understood the implication at the time. Five years later FlashAttention picked it up and fundamentally changed how attention is computed.
+
+** 2022-23 | Dao et al. *FlashAttention / FlashDecoding*: fuse attention so scores never leave on-chip cache
+
+*** What problem it saw
+
+Standard attention ~softmax(QK^T / sqrt(d)) V~ must write the ~S×S~ score matrix back to HBM, then read it back for softmax, write back again, read again to multiply V. Bandwidth is entirely consumed *moving one large temporary matrix*.
+
+*** Its solution
+
+Tile Q into small blocks; within each tile, execute the full pipeline ~Q_i K^T -> softmax -> multiply V~ entirely in on-chip cache, maintained by online softmax state — the *score matrix is never written to memory*. FlashDecoding further splits the KV sequence into split-K chunks during decoding so multiple workgroups handle the same query in parallel.
+
+*** Why it worked — and what new hole it dug
+
+It targets the right bottleneck: transformers on GPUs are not compute-bound, they are *bandwidth-bound*. Move less data, get immediate speedup.
+
+But it optimises the *compute path*; the *storage format* of the KV cache is untouched. FlashAttention cannot save you from 80 GB of FP16 KV cache for a 70B model.
+
+** 2023 | Kwon et al. *vLLM / PagedAttention*: manage KV cache like an OS manages virtual memory
+
+*** What problem it saw
+
+In server-side inference, KV caches for multiple requests dynamically enter and leave; traditional contiguous allocation wastes 60%+ of GPU memory. An 80 GB GPU might have 50 GB idle but unallocatable.
+
+*** Its solution
+
+Slice the KV cache into fixed-size *pages* indexed by a page table — the same idea as OS virtual memory. This also enables prefix sharing, copy-on-write, and other advanced features.
+
+*** Why it worked — and what new hole it dug
+
+An engineering breakthrough that spawned nearly every production inference framework today. But *it solves a management problem, not a capacity problem*. If a single request needs 79 GB (Llama 70B at 128K context), paging cannot help — you need each token's KV to be physically smaller.
+
+** 2024 | Hooper et al. *KVQuant / KIVI / GEAR*: quantize the KV cache to 4-bit
+
+*** What problem it saw
+
+Capacity was finally confronted head-on: FP16 KV cache is simply too large. Hooper et al. even explicitly targeted "10M context" — impossible at FP16.
+
+*** Its solution
+
+Quantize K and V to 4-bit (even 2-bit). KVQuant quantizes K per-channel and V per-token (because K has outliers along the channel dimension); GEAR adds a residual matrix and low-rank approximation to recover accuracy. Outliers are stored separately in FP16.
+
+*** Why it worked — and what new hole it dug
+
+Memory footprint drops to one quarter. But *when computing attention* the values must first be dequantized back to FP16/FP32 before ~QK^T~ — this materialises a new temporary ~S×d~ matrix back to GPU memory.
+
+Concretely for Gemma 4: 950 tokens × 50 layers requires 742 MB of temporary matrix. *The memory you saved is paid back through bandwidth* — memory pressure becomes bandwidth pressure.
+
+This is one of Open-TQ-Metal's central targets: *why dequantize at all?*
+
+** 2024 | Zandieh et al. *QJL*: a 1-bit sketch of the KV cache
+
+*** What problem it saw
+
+4-bit is still "conservative," storing 4 bits per value obediently. Could a completely different perspective allow a far more aggressive scheme?
+
+*** Its solution
+
+Project keys onto a random Gaussian matrix and *store only sign bits* — 1 bit per component, just -1 or +1. Queries remain full-precision; attention scores are estimated asymmetrically (sketch × full). Compression ratio easily exceeds 5×.
+
+*** Why it worked — and what new hole it dug
+
+Theoretically, random projection followed by sign quantisation preserves relative similarities (cf. SimHash / Hyperplane LSH). Per-layer per-token score correlation ρ ≈ 0.85 looks acceptable.
+
+*But the paper tests only on 8B models (32 layers)*. At 32 layers ~0.85^{32} ≈ 0.006~ — barely usable.
+
+Open-TQ-Metal later ran it on 70B (80 layers): ~0.85^{80} ≈ 2 × 10^{-6}~. The signal is entirely buried in noise. Output degenerates to repeated tokens. This failure mode *only surfaces on large models*.
+
+** 2025 | Han et al. *PolarQuant*: polar-coordinate quantisation — touch only the angle
+
+*** What problem it saw
+
+QJL applies aggressive compression directly in the component dimension. Could a change of coordinate system make the error distribution more tractable?
+
+*** Its solution
+
+Recursively convert KV embedding vectors from Cartesian to polar coordinates (radius + angle), and quantize only the angles. After random preprocessing, angle distributions become highly concentrated — no normalisation needed. Claims 4.2× compression.
+
+*** Why it worked — and what new hole it dug
+
+Mathematically elegant: structured angular error ~delta_theta~ is more controllable than random per-component error. On Llama it achieves cosine similarity 0.989 at 5-bit — nearly perfect.
+
+*But they never tested on Gemma*. A philosophical bomb is buried here: angular error enters the attention score as
+
+#+begin_example
+    delta_score = alpha * |q| * |k| * (1 - cos(delta_theta))
+    # Note the alpha — the attention scale factor
+    # Llama: alpha = 1/sqrt(128) = 0.0884 (standard)
+    # Gemma 4: alpha = 1.0 (11× larger)
+    # Same delta_theta, 11× larger perturbation entering softmax,
+    # compounded over 60 layers of exponentiation → garbage output
+#+end_example
+
+This is Open-TQ-Metal's second core finding: *the success or failure of a quantization method is determined not by model size but by the architecture's attention scale factor*.
+
+** 2025 | Zandieh et al. *TurboQuant*: synthesis — MSE-optimal quantisation + QJL residual
+
+*** What problem it saw
+
+Each method has its strength: scalar quantisation is robust, QJL compresses aggressively, PolarQuant handles angles gracefully. Can they be unified?
+
+*** Its solution
+
+Main path: MSE-optimal scalar quantisation (random rotation + Lloyd-Max codebook). Residual: 1-bit QJL. Theoretically 3.5 bit/dim with neutral quality; 2.5 bit with only mild degradation.
+
+*** Why it worked — and what new hole it dug
+
+Mathematically the most *complete* — error is stratified by contribution before compression. But:
+
+1. *Validated on 8B models only*. Error accumulation from stacking methods has not been tested on large models.
+2. *No Apple Silicon / Metal*. The entire research thread assumes a CUDA ecosystem.
+3. *No fused kernel*. The dequant-then-attend bandwidth burden is fully inherited.
+4. *The alpha problem is ignored*. Gemma 4's ~attn_scale=1.0~ remains a latent threat.
+
+At this point, nearly all "compression cleverness" the field has produced is on the table, but *no one has genuinely combined compression with fused compute, and no one has honestly reproduced results across different architectures*.
+
+** 2026.04 | Vegasena *Open-TQ-Metal*: weaving all threads into one
+
+*** What problem it saw
+
+Looking back along the entire research thread, three gaps are clearly visible:
+
+1. *Dequant-then-attend is self-inflicted bandwidth waste*. KV quantisation saves memory that dequant temporary matrices immediately pay back.
+2. *Small-model validation does not imply large-model success*. QJL works at 8B; at 70B the signal vanishes.
+3. *Single-architecture validation does not imply cross-architecture success*. PolarQuant is perfect on Llama, produces garbage on Gemma 4 — and no one explained why.
+
+*** Its solution
+
+Four components woven into one complete engineering solution:
+
+1. *Fused int4 SDPA Metal kernel*. The Metal compute shader reads packed int4 KV directly and extracts nibbles *inside GPU registers* via bitwise operations, then runs online softmax in a single pass — *zero intermediate matrices*.
+
+   The key trick is *vectorized nibble extraction*: pre-divide the query by ~{1, 16, 256, 4096}~, then dot-product simultaneously with four masks ~{0x000F, 0x00F0, 0x0F00, 0xF000}~ to extract all 4 nibbles in one operation. Borrowed from MLX's ~qdot~ pattern.
+
+2. *Split-K via MLX Primitives chained through computation graph*. At 128K context, a single-threaded pass takes 480 ms per head — parallelism is essential. But multiple dispatches within a single Metal ~eval_gpu()~ call carry *no ordering guarantee* — a race condition.
+
+   Solution: write the partial accumulation stage and the reduction stage as two separate MLX Primitives, then let the reduce stage take the partial stage's output as its input — *lazy evaluation naturally serialises them*. Elegant.
+
+3. *70B + 80-layer validation*. The first time anyone runs QJL and PolarQuant on a genuinely large model. Both the depth bomb and the architecture bomb detonate simultaneously.
+
+4. *Cross-architecture quantization analysis*. Establishes the new insight that ~attn_scale~ is the critical variable determining whether a quantization method succeeds. The entire prior literature implicitly assumed the relevant axes were *method × model size* — wrong. The axis is *method × attention scale factor*.
+
+*** Why it worked — and what new holes it dug
+
+Four numbers tell the story:
+- 48× attention kernel speedup (128K context, Llama 70B)
+- 3.2× KV cache compression (40 GB → 12.5 GB)
+- Llama 70B @ 128K context fits on a 64 GB Mac for the first time
+- Top-1 token *exactly matches* FP16 baseline under greedy decoding
+
+Remaining gaps, stated honestly:
+- *Bandwidth wall*: once attention is optimised to the limit, weight loading becomes the new bottleneck (39 GB / 400 GB/s ≈ 98 ms/token is a physical floor). This points to MoE / 2-bit weights / speculative decoding as the next wave.
+- *Long-context quality* not systematically benchmarked on RULER / Needle-in-Haystack.
+- *Hardware-specific*: algorithm is portable, kernel must be rewritten for CUDA.
+- *18% throughput gap vs. mlx-lm* comes from KV cache management (concat vs. pre-alloc), not the attention kernel itself.
+
+* Frontier Extensions
+
+The paper appeared in April 2026; at this point the "extensions" are mostly directions the author flags in the Discussion section:
+
+- *Bandwidth wall, next steps*: compress weights to 2-bit (though the author's experiments show 2-bit weights on Metal are actually 0.67× *slower* — a dedicated kernel is needed); move to MoE (the Gemma 4 MoE variant activating 4B parameters already runs at 59 tok/s, a 4× gain); use speculative decoding (but a 25% acceptance rate is insufficient — smarter draft models are needed).
+- *Extension of the cross-architecture analysis*: the author hints that future model designers may need to treat ~attn_scale~ as a first-class variable for quantizability — which in turn feeds back into architecture choices.
+- *Ensue distributed memory network*: the author delegated 330 experiments to an 8-agent autonomous loop (orchestrator / profiler / reflector / …). This infrastructure may itself prove a more lasting methodological contribution than any individual paper in the thread.
+
+As of 2026-05 the most recent public paper in this thread is Open-TQ-Metal itself. Follow-on work will most likely split along three directions:
+1. Porting fused compressed-domain attention to CUDA for large-scale cloud inference.
+2. Designing *quantization-aware architectures* — choosing ~attn_scale~ with quantization robustness as a design constraint.
+3. Combining KV cache compression with MoE bandwidth savings — naturally complementary under the bandwidth wall.
+
+* One Diagram
+
+#+begin_example
+                          THE KV CACHE WALL: 2017 -> 2026
+
+  Storage                                                 Compute
+  -------                                                 ---------
+                              [2017]
+                              Vaswani: KV cache exists
+                              "no one cares yet"
+                                  |
+                                  |              [2018] Milakov:
+                                  |              online softmax
+                                  |              (a seed)
+                                  |                       |
+                                  |                       v
+                                  |              [2022-23] FlashAttention
+                                  |              fused compute, no
+                                  |              materialized scores
+                                  |                       |
+                                  v                       |
+                              [2023] vLLM/PagedAttn       |
+                              manage FP16 KV              |
+                              (no compression yet)        |
+                                  |                       |
+                                  v                       |
+                              [2024] KVQuant/KIVI/GEAR    |
+                              quantize to 4-bit           |
+                              BUT dequant before attend   |
+                              (storage wins, BW loses)    |
+                                  |                       |
+                                  v                       |
+                              [2024] QJL: 1-bit sketch    |
+                              (8B only -- 70B blows up)   |
+                                  |                       |
+                                  v                       |
+                              [2025] PolarQuant: angular  |
+                              (Llama only -- Gemma        |
+                              alpha=1.0 blows up)         |
+                                  |                       |
+                                  v                       |
+                              [2025] TurboQuant: combo    |
+                              (8B + CUDA only)            |
+                                  |                       |
+                                  +-----------+-----------+
+                                              |
+                                              v
+                                  [2026.04] Open-TQ-Metal
+                                  - FUSED int4 SDPA (no dequant mat)
+                                  - Split-K via MLX graph chaining
+                                  - 70B / 80-layer validation
+                                  - Cross-arch attn_scale theory
+                                  - First on Apple Silicon
+                                              |
+                                              v
+                                  64GB Mac: Llama 70B @ 128K
+                                  48x attn speedup, 3.2x KV compr
+                                              |
+                                              v
+                                  Next bottleneck: weight bandwidth
+                                  (MoE? 2-bit weights? speculative?)
+
+
+  Pattern:  compression methods marched ahead of the validation surface.
+            Open-TQ-Metal pulled the validation surface forward by 10x
+            (model size) and 2x (architectures), and a lot of
+            "elegant" methods didn't survive.
+#+end_example
+
+* Insights
+
+*What is really happening beneath this entire research thread:*
+
+For the first five years (2022-2025), KV cache compression was a story of *accumulation* — ever more aggressive compression formats, ever cleverer mathematical transforms, ever higher theoretical compression ratios. Each paper compressed harder than the one before.
+
+Open-TQ-Metal is not "harder" in that sense — its compression ratio (3.2×) is actually lower than PolarQuant (4.2×) and far lower than QJL. But it did three things *nobody had done before*:
+
+1. *Fuse* — no longer "compress for storage, decompress to use," but "compressed storage + compressed-domain compute" unified in a single kernel. This is the natural extension of the FlashAttention philosophy (never materialise intermediate matrices).
+2. *Validate honestly* — run on genuinely large models and genuinely different architectures. The result: methods that looked beautiful in prior evaluations crumbled. QJL's 0.85 correlation at 32 layers vs. 80 layers is a completely different story; PolarQuant's 0.989 on Llama vs. garbage on Gemma 4.
+3. *Find the right axis of variation* — reduce cross-architecture differences to a single number (~attn_scale~). This is not algorithmic progress; it is progress in *understanding*. The field had assumed the relevant evaluation dimensions were "method × model size." Wrong. The axis is "method × attention scale factor."
+
+What is really happening across this thread is an *awakening of evaluation dimensions*. The "cleverness" of algorithms has already saturated; the next wave of progress will come from *who can most honestly expose an algorithm's failure modes*.
+
+A quieter shift is also underway: *the boundary between compute and storage is dissolving*. FlashAttention made the score matrix disappear. Open-TQ-Metal makes the dequant matrix disappear. Next — *what if weights never need to be decompressed before matrix multiplication?* This is exactly the direction that weight-only quantization fused kernels are already pursuing, but the two threads have not yet merged.
+
+*Where the next step most likely leads:*
+
+1. *Quantization-aware architecture design* — treating ~attn_scale~, QK normalisation strategy, and similar choices as design constraints with quantization robustness as an explicit objective.
+2. *Bandwidth-first inference stacks* — once attention is pushed to ~10 ms, weight bandwidth is the new bottleneck. MoE + aggressive weight quantisation will dominate the next wave, but at the cost of homogenisation pressure on model architectures.
+3. *Validation as a research product* — Open-TQ-Metal's 330 experiments and multi-agent orchestration system may themselves have more long-term impact than any single paper. "Discovering your method's failure mode before you do" could become the central contribution of the next generation of papers.
+
+* Takeaways
+
+*On how to do research:*
+
+- *Works on small models does not mean works on large models.* Depth accumulation is geometric — 0.85 at 32 layers versus 80 layers is a categorically different story. "Validated on 8B" is a *rhetorical move*, not *evidence*.
+- *Works on one architecture does not mean works across architectures.* Llama and Gemma look like the same kind of transformer, but a single number — ~attn_scale~ — makes the same quantization method succeed on one and fail catastrophically on the other. Always ask: *which specific architectural parameter is your method sensitive to?*
+- *The most valuable papers often do not propose new methods — they honestly expose the limits of old ones.* Open-TQ-Metal's core intellectual contribution — that ~attn_scale~ determines quantization success — may be worth more than its fused kernel.
+
+*On how to find problems:*
+
+- *Systematically scan evaluation dimensions.* When a thread has iterated for years and methods keep getting "cleverer," the evaluation dimensions have usually been conditioned. Pick one dimension *nobody has seriously evaluated* (e.g., cross-architecture ~attn_scale~) and you will very likely find gold.
+- *Erase the boundary between storage and compute.* Every time a large temporary matrix is eliminated, there is a bandwidth dividend. The next KV quantisation step, fusing weight decompression, fusing gradient accumulation — all follow the same pattern.
+
+*On what you can do concretely right now:*
+
+- You can now run Llama 70B @ 128K long context on a 64 GB Mac — previously impossible with any framework.
+- When choosing a quantization method, check the model's ~attn_scale~ first. Standard ~1/sqrt(d)~ architectures can safely try PolarQuant; non-standard ones (Gemma 4, DeepSeek-V3, some custom architectures) should run a cosine similarity sanity check first.
+- When evaluating a new KV compression method, test at minimum across two orders of magnitude of model size and two different ~attn_scale~ values. This is the minimum bar Open-TQ-Metal has set for the field.
+- When writing fused kernels, "decode it in registers" is a dramatically stronger pattern than "store it then load it" — a direct extension of the FlashAttention philosophy.

@@ -1,0 +1,243 @@
+#+title:      ZoomR: Memory Efficient Reasoning through Multi-Granularity Key Value Retrieval
+#+date:       [2026-05-28 Thu 15:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T154649-en
+#+source:     https://arxiv.org/abs/2604.10898
+#+authors:    David H. Yang, Yuxuan Zhu, Mohammad Mohammadi Amiri, Keerthiram Murugesan, Tejaswini Pedapati, Subhajit Chaudhury, Pin-Yu Chen
+#+venue:      arXiv preprint, 2026-04 (RPI + IBM Research)
+
+* The Problem River
+
+Getting a large model to "think through" a math problem means filling tens of thousands of tokens of scratch work. Every additional token occupies one more slot of GPU memory — and that slot is never released. This is the question this river sets out to answer: *How do we keep a model from being burst open by its own scratch paper during extended "thinking"?*
+
+The difficulty comes from how honest the Transformer is about memory — it faithfully stores the key/value of every token it has ever generated (the KV cache), and each new token must attend to every entry in that history. A 16k-token response means Llama-3.1-8B's KV cache alone consumes 16 GB+. No amount of engineering optimization can reclaim that; it is a tax levied by the architecture itself.
+
+Generation after generation of researchers charged at this problem: some trimmed history (StreamingLLM keeps only the head and tail), some selected by importance (H2O scores by attention weight), some picked by paragraph (Quest page-level retrieval), some compressed history into summaries (LightThinker replaces chunks with gist tokens). Every step is a tug-of-war between "what to drop" and "what to keep" — drop too much and you get wrong answers, keep too much and you run out of memory. ZoomR's move is: *stop choosing between drop and keep; build a hierarchy instead — coarse-grained index plus fine-grained zoom-in on demand.*
+
+* Provenance Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNNs are slow and non-parallelizable
+  | Solution: Pure attention + KV cache to accelerate autoregression
+  | Debt incurred: KV cache grows linearly with generation length, never freed
+  v
+[2023] H2O (Zhang et al., NeurIPS)
+  |
+  | Problem: KV cache OOMs during long generation
+  | Observation: Attention scores concentrate heavily on a few "heavy hitter" tokens
+  | Solution: Dynamically evict tokens by accumulated attention score
+  | Debt incurred: Token-level eviction fractures semantic coherence;
+  |               scores must be recomputed at every step
+  v
+[2024] StreamingLLM (Xiao et al., ICLR)
+  |
+  | Problem: Dynamic scoring (H2O-style) is costly; dropping initial tokens causes collapse
+  | Observation: Models place excess attention on the first few tokens — "attention sink"
+  | Solution: Always keep a few sink tokens + one sliding recent window
+  | Debt incurred: Everything in the middle is discarded; critical mid-reasoning
+  |               steps are lost ("lost in the middle")
+  v
+[2024] Quest (Tang et al., ICML)
+  |
+  | Problem: Streaming drops the middle, losing key info in long-input prompts
+  | Solution: Page the KV cache; each step retrieves top-K relevant pages
+  |           via query matching; full cache on CPU, selected pages on GPU
+  | Debt incurred: Designed for long-input prefill; assumes a fixed KV cache;
+  |               does not address the growing cache during long-output decoding
+  v
+[2025] LightThinker (Zhang et al.)
+  |
+  | Problem: Reasoning models write while thinking; KV cache explodes during decoding
+  | Solution: Train the model to compress each reasoning segment into a few "gist"
+  |           tokens, then delete the original tokens from the KV cache
+  | Debt incurred: Summarization is lossy compression — dropped details are
+  |               unrecoverable; steps requiring exact original content fail
+  v
+[2026] ZoomR (Yang et al., this paper)
+  |
+  | Problem: No single granularity suffices — summaries only are too coarse,
+  |          full text is too expensive
+  | Solution: Summaries serve as a "table of contents"; full text offloaded to CPU;
+  |           each step retrieves relevant segments via the index,
+  |           then "zooms in" to load full text back to GPU
+  v
+[Future] Adaptive granularity / learned segment boundaries / cross-domain generalization
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer + KV cache: Trading Space for Time, Planting Future Debt
+
+*** What problem did it see?
+
+RNNs parallelized terribly — computing step t required completing step t−1, making training agonizingly slow.
+
+*** Its solution
+
+Self-attention. Every token attends to all others simultaneously, fused into a single matrix multiply. But at inference time, recomputing full-sequence attention for every new token would cause O(n^2) compute to explode. The KV cache was the answer — store the key/value of every past token and reuse them on the next step.
+
+*** Why it worked (and where the new debt was buried)
+
+KV cache reduced each attention step from "recompute over n tokens" to "dot the current q against n stored k's" — saving time. But *it converted a time problem into a space problem* — the cache grows linearly with generation length; the more a model "can write," the tighter memory gets.
+
+Over the following years people discovered: reasoning models routinely write 20k-token drafts, and the KV cache alone consumes 10+ GB. "How to compress the KV cache" became its own research track.
+
+** 2023 | H2O: Keep the High-Attention Tokens, Evict the Low-Attention Ones
+
+*** What problem did it see?
+
+The KV cache cannot grow without bound. But naively dropping "the oldest" tokens is also wrong — many old tokens are revisited repeatedly. A principled notion of "importance" was needed.
+
+*** Its solution
+
+Observation: attention scores are highly concentrated — a few "heavy hitter" tokens absorb the vast majority of attention weight. So maintain a running accumulated attention score per token and evict the lowest-scoring ones at each step.
+
+*** Why it worked (and where the new debt was buried)
+
+H2O was the first to make KV eviction data-driven, and it outperformed fixed-window approaches by a meaningful margin. But it introduced two new problems: first, *maintaining accumulated scores for all KV entries at every generation step has its own compute overhead*; second, *eviction is at token granularity* — a coherent reasoning chain can be shredded: "this constant equals 0.5" might keep the first half and discard the second, and the model can never reassemble the fragment.
+
+** 2024 | StreamingLLM: The First Few Tokens Are Anchors — Keep Them and Nothing Collapses
+
+*** What problem did it see?
+
+H2O-style dynamic scoring requires score computation and sorting at every step. A cheaper approach is a sliding window — only attend to the most recent N tokens. But experiments showed that a pure sliding window causes models to "mentally collapse" on long sequences, producing garbled output.
+
+*** Its solution
+
+The Xiao team discovered a counterintuitive phenomenon: *models lavish disproportionate attention on the very first few tokens*, calling this an "attention sink." These tokens act like anchors stabilizing the attention distribution — remove them and softmax becomes unbalanced, collapsing generation.
+
+The fix is almost brutally simple: always keep a small set of sink tokens at the head plus a recent sliding window. No scoring, no sorting, O(1) maintenance — enabling infinite streaming generation from an LLM.
+
+*** Why it worked (and where the new debt was buried)
+
+This was an insight about distributional stability — LLMs are not killed by trimming history in general; they are killed specifically by trimming the sinks.
+
+But it left the hole that ZoomR directly calls out: *lost in the middle*. The middle is permanently discarded. Fine for chat, fatal for long reasoning — you cannot solve step 38 if you have forgotten the lemma proved at step 7.
+
+** 2024 | Quest: Not Token-Level Eviction, but Page-Level Selection
+
+*** What problem did it see?
+
+StreamingLLM discards the middle, causing frequent errors in long-context scenarios (long-document QA). The core issue: *which part of the history matters depends entirely on what is being asked right now* — any static rule will fail.
+
+*** Its solution
+
+Divide the KV cache into "pages," each containing tens to hundreds of tokens. At each generation step, score each page against the current query using representative keys, move only the top-K pages to the GPU for attention, and leave the rest on the CPU.
+
+This is query-aware retrieval combined with CPU offloading: accuracy is governed by the query, memory footprint is governed by K.
+
+*** Why it worked (and where the new debt was buried)
+
+Page-level granularity preserves semantic coherence better than token-level eviction, and loading only top-K pages dramatically reduces GPU memory pressure. But Quest was designed for *long-input prefill* — QA over a long document, where the KV cache is produced once from the prompt and stays fixed.
+
+This assumption breaks down during long-output decoding: the cache grows continuously as generation proceeds, changing at every step. Quest's mechanism was never designed for "retrieving while writing." That is the gap ZoomR fills.
+
+** 2025 | LightThinker: Compress Each Passage into a Few Tokens, Discard the Original
+
+*** What problem did it see?
+
+Both H2O and Quest operate within the framework of "which KV entries to keep." But no matter how cleverly you select, the *total volume* of generated tokens is unchanged — the scratch paper is still tens of thousands of tokens long.
+
+*** Its solution
+
+A different angle: train the model to write its own summary. Given a reasoning segment, have the model generate a few "gist" tokens representing it, then *delete the original hundreds of tokens from the KV cache*. Each reasoning chunk compresses from hundreds of tokens down to a handful — dozens of times smaller.
+
+*** Why it worked (and where the new debt was buried)
+
+It reframes "selection" as "rewriting" — the cache stores a distilled version produced by the model itself. Highly compression-friendly.
+
+But ZoomR directly names the debt: *this is irreversible lossy compression*. If step 50 of the reasoning needs to revisit an inconspicuous detail from step 5 (a specific constant, a temporarily introduced variable), LightThinker has only the summary left — the detail is gone forever. The summary might say "I proved Lemma A," but "what exactly is the expression in Lemma A" has been compressed away.
+
+This is precisely what ZoomR's introductory figure tries to convey: *different reasoning steps require different granularities of history.*
+
+** 2026 | ZoomR: Keep Both the Index and the Original Text — Zoom In on Demand
+
+*** What problem did it see?
+
+It surveys the debts left by all four prior generations:
+- H2O fractures semantics at token granularity;
+- StreamingLLM discards the middle;
+- Quest is not designed for decoding;
+- LightThinker permanently welds away fine details.
+
+More fundamentally: *no one holds two granularities simultaneously*. It is either tokens or summaries — never both.
+
+*** Its solution
+
+Have the model write paragraph-level summaries during generation (via LoRA fine-tuning on the Bespoke-17K dataset, using ~begin_of_summary~/~end_of_summary~ delimiters). Then:
+
+1. *Offload the full KV cache to CPU* (summaries and original text alike);
+2. *Keep only the summary keys on the GPU* — serving as the "table of contents";
+3. At each generation step, score the current query against the summary keys and select the top-K most relevant segments;
+4. *Temporarily load the full-text KV of those segments back to the GPU* for attention.
+
+Like hitting Ctrl+F to jump to a chapter of a book, then reading that chapter in full. Across attention heads, a "voting" mechanism (per-head scoring + global consensus) prevents any single head from making a poor retrieval decision.
+
+*** Why it worked (and where the new debt is buried)
+
+It captures a simple truth: *during reasoning, most steps need only summary-level understanding; only a few critical nodes require the original text*. On average the GPU holds very little; when fine detail is needed, it is pulled from the CPU on demand.
+
+Reported numbers: near-full-cache accuracy on AIME2025 / MATH500, with 4× or greater memory savings.
+
+Debts acknowledged in the paper's limitations section:
+- Summary quality relies on offline generation by Llama-70B; quality degrades with smaller models;
+- Segment boundaries are fixed-granularity and may not be optimal;
+- Not validated on code generation or creative writing, where "paragraph" structure is not as clean as in math problems.
+
+* Forward Extensions
+
+ZoomR appeared in April 2026 and has no public direct follow-ups yet. Several natural extension directions are visible:
+
+1. *Learned segment boundaries* — instead of fixed paragraph cuts, let the model decide "it's time to write a summary here." Close in spirit to SepLLM (Chen et al., 2025), which embeds paragraph boundaries into separator tokens.
+2. *Adaptive granularity* — K (how many segments to retrieve) and the compression ratio are currently fixed hyperparameters; the next step is to tune them dynamically based on query difficulty.
+3. *Multi-level hierarchy* — currently only two levels ("summary / original"). A recursive "full book → chapter → paragraph → original text" structure is a natural extension.
+4. *Cross-domain generalization* — code, long dialogue, agentic workflows. The semantic notion of "paragraph" needs to be redefined for these settings.
+5. *Composing with quantization / low-rank / speculative decoding* — ZoomR itself notes orthogonality with KV quantization methods (KIVI, KVQuant); stacking them is expected to yield another tier of memory savings.
+
+* One Figure That Captures It All
+
+#+begin_example
+                              Time →
+   2017        2023           2024              2025            2026
+    |           |              |                 |               |
+[KV cache]   [H2O]      [StreamingLLM]    [LightThinker]     [ZoomR]
+ keep all --> select by    always keep        compress to      summaries as index +
+              importance   head + sliding     gist tokens,     zoom into originals
+              token-level  window             discard source   on demand
+                           sink+window        irreversible     multi-granularity +
+                                              compression      recoverable
+
+  "keep all" → "score & pick" → "guard head & tail" → "rewrite all" → "index + spot-read"
+                   |                   |                    |                  |
+              semantic shards     middle lost         details welded      (not yet exposed)
+
+           Dimension of evolution:
+           Granularity: token -----------------> page -----------> segment + summary
+           Strategy:    eviction ---------------> retrieval ------> retrieval + rewriting
+           Location:    all on GPU -------------> CPU offload ----> CPU offload + index
+           Reversible:  no ---------------------> yes -----------> yes (summary is index, not replacement)
+#+end_example
+
+* Insights
+
+Pulling this line straight, the surface story is "how to compress the KV cache," but underneath is a larger shift:
+
+*Model reasoning is moving from flat, single-layer memory toward hierarchically structured memory.* In the beginning every token was a first-class citizen — stored equally, queried equally, evicted equally. Generation by generation, a truth slowly asserted itself: *history is not homogeneous*. Some positions are anchors (sinks), some are load-bearing (heavy hitters), some are detail (can be replaced by summaries), and some are mid-sequence content (needing on-demand retrieval). The structural nature of model memory was forced into existence by insufficient GPU memory — but its direction looks increasingly like human memory.
+
+Second observation: *every generation wrestled with the binary question of "what to drop / what to keep," until ZoomR reframed it as the ternary question of "how many layers."* H2O selects tokens, StreamingLLM selects positions, Quest selects pages, LightThinker selects a rewrite strategy — all 2D choices. ZoomR adds "granularity" as a new axis, making the choice no longer black-and-white. This upgrade in dimensionality will very likely propagate beyond the KV cache into long-context retrieval, agent memory, and beyond.
+
+Third observation: *"CPU as cold storage, GPU holds only hot data"* — this plain storage-tiering intuition has been settled since Quest. The next competition is not about whether to offload, but about whether the hot/cold boundary can be made both query-aware and token-aware.
+
+The most likely next step: make "segment boundaries," "compression granularity," and "top-K size" all learnable, letting the model decide for itself how fine a memory it needs and when.
+
+* Takeaways
+
+Bringing this to practical use:
+
+1. *When optimizing long-output inference, do not fixate only on prefill.* The entire KV compression literature has a blind spot in "the cache growing during the decoding phase," and substantial headroom remains there — ZoomR is only the opening move.
+2. *When you see a binary-choice paper, try adding one more axis to make it multi-valued.* From H2O's "keep/drop" to ZoomR's "coarse view + fine view," one additional dimension is often a new paper.
+3. *When evaluating, look beyond accuracy — memory curves and accuracy degradation under long outputs reveal true gaps.* Many KV compression methods look clean on short contexts and collapse at 16k output — ZoomR's choice of AIME2025 (math competition, long reasoning) is a well-chosen benchmark.
+4. *The human memory metaphor is not decoration — it is a design guide.* ZoomR directly cites Bartlett's 1932 work on schematic memory. The next wave of efficient inference may come from reading cognitive science more deeply — the mechanisms of working memory, episodic memory, and retrieval cues all have shapes worth borrowing.
+5. *If you are deploying models (especially on consumer-grade GPUs)*, approaches like ZoomR's "summary + zoom on demand" are worth watching — a 4× memory saving means the same GPU can handle reasoning contexts twice as long, or double the batch size at the same context length.

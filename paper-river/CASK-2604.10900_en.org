@@ -1,0 +1,285 @@
+#+title:      CASK: Core-Aware Selective KV Compression for Reasoning Traces
+#+date:       [2026-05-28 Thu 15:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T155011-en
+#+source:     https://arxiv.org/abs/2604.10900
+#+authors:    Buseong Kim, Heejun Gwon
+#+venue:      arXiv 2604.10900 (2026.04)
+
+* The Problem River
+
+A large model that truly "thinks" — working through AIME math problems, reflecting on itself, backtracking repeatedly, tearing up its reasoning and starting over — after generating thousands or tens of thousands of tokens, has its GPU memory stuffed with the key and value of every past token. This accumulation is called the KV cache, and it grows in lockstep with sequence length. The model hasn't finished answering yet, and memory is already full.
+
+*The question: how do you cut this KV heap down without making the model forget its reasoning process?*
+
+Every generation of researchers has placed the same bet on this path: score every token, rank them, and discard the low scorers. A decade of betting, and by 2026 CASK comes along and says: you've been betting on the wrong thing — what matters isn't how accurately you score, but that scoring alone was never the right lever.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | The KV cache concept appears for the first time: every token must leave
+  | behind its key and value for future tokens to query. The price of convenience:
+  | cache grows linearly with sequence length.
+  v
+[2023.09] Xiao et al. - StreamingLLM (attention sinks)
+  |
+  | Finding: the first few tokens cannot be dropped even if semantically irrelevant —
+  |           drop them and the model collapses immediately
+  | Fix: permanently keep sinks + sliding window, discard everything in between
+  | Remaining gap: too blunt; genuinely useful tokens in the middle get buried too
+  v
+[2023.06] Zhang et al. - H2O (Heavy-Hitter Oracle, NeurIPS'23)
+  |
+  | Finding: attention scores are highly concentrated; a small set of "heavy hitters"
+  |           carries the bulk of the weight
+  | Fix: accumulate attention scores per token, keep heavy hitters, drop the rest
+  | Remaining gap: scores are computed looking backward; future queries need not
+  |                follow the same pattern
+  v
+[2024.04] Li et al. - SnapKV (NeurIPS'24)
+  |
+  | Finding: the last few dozen tokens of the prompt (observation window) reliably
+  |           predict which prefix positions future decode queries will attend to
+  | Fix: use observation-window attention to prune prefix KV entries in one shot
+  | Remaining gap: this is a prompt-side story; long decode phases still explode
+  v
+[2025.05] Cai et al. - R-KV (Redundancy-aware KV)
+  |
+  | Finding: decode traces in reasoning tasks are riddled with repetition
+  |           (restatements, self-checks, wrong paths retraced)
+  | Fix: fold "redundancy" into the scoring signal so the scorer gets smarter
+  |       on reasoning workloads
+  | Remaining gap: still score-then-evict; the "skeleton tokens" that must be
+  |                preserved are never identified as such
+  v
+[2026.04] Mao et al. - TriAttention (trigonometric KV compression)
+  |
+  | Finding: the think-phase and answer-phase of reasoning are asymmetric
+  |           in their attention patterns
+  | Fix: trigonometric segment-aware weighting to align the scorer with
+  |       reasoning structure
+  | Remaining gap: still "improve the scoring function"; empirically the keep-set
+  |                barely changes
+  v
+[2026.04] Kim & Gwon - CASK (this paper)
+  |
+  | Finding: no matter how elaborate the scorer, the retained token set stays
+  |           nearly identical — so the lever was never in scoring to begin with
+  | Fix: discard the "rank-all-then-evict" framework; replace it with
+  |       (a) split tokens into "protected core vs. mergeable scratch"
+  |       (b) core tokens are untouched; scratch tokens are weighted-merged
+  |       (c) prefix and decode use different primitives: prefix still evicts,
+  |           decode switches to merging
+
+Parallel merge-based line (CASK borrows their merge operators, but none are reasoning-aware):
+  KVMerger (Wang 2024) / CaM (Zhang 2024) / D2O (Wan 2024)
+   -> KeepKV (Tian 2025) / AsymKV (Tao 2025)
+
+Concurrent competitor (same period, different pivot — answer-first heuristic
+rather than role separation):
+  Crystal-KV (Wang et al. 2026.01)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: the original sin of the KV cache is buried here
+
+*** What problem did it see
+
+RNNs are slow — every step must wait for the previous one to finish. The Vaswani team wanted to spread a whole sequence out and compute it in parallel.
+
+*** Its solution
+
+The attention mechanism: each new token computes its own query, then takes dot products against the keys and values of all past tokens. Notice that phrase — "the keys and values of all past tokens" — that is the birth of the KV cache. It exists to serve speed: compute once, then cache rather than recompute.
+
+*** Why it worked (and what new pit it dug)
+
+Self-attention is orders of magnitude faster than RNNs, but the cache grows linearly with sequence length N. Nobody cared at the time — sequences were only a few hundred tokens long. Six years later, you ask the model to solve an AIME math problem, it thinks for tens of thousands of tokens, and memory explodes. That is the same original sin everyone downstream would spend their careers solving.
+
+** 2023.09 | StreamingLLM: the first few tokens are the model's "foundation" — never touch them
+
+*** What problem did it see
+
+If you want infinite-length context (an endless chatbot conversation), the KV cache must discard things. The most intuitive approach: keep only the most recent N tokens and drop the old ones — but the model immediately collapses, perplexity shooting through the roof.
+
+*** Its solution
+
+A striking observation: hard-preserve just the first 4 tokens of the sequence, then use a sliding window for everything else, and the model stabilizes immediately. These tokens are not necessarily semantically meaningful, but the model uses them as an "attention sink" — all queries offload their surplus attention mass onto them. Deleting them is equivalent to pulling out the foundation. This is the origin of the *attention sinks* concept.
+
+*** Why it worked (and what new pit it dug)
+
+It was the first work to establish that "not all KV tokens are equal — some tokens play special roles." But the solution is too coarse: it distinguishes only "beginning + recent," and the long middle section is discarded wholesale without discrimination. If a critical fact sits in the middle (e.g., "the answer is 42"), it gets thrown away all the same.
+
+** 2023.06 | H2O: score every token, keep the heavy hitters
+
+*** What problem did it see
+
+StreamingLLM is too blunt — it never looks at how much attention each token actually received historically. The H2O team observed that attention distributions are highly heavy-tailed: a small cluster of tokens (heavy hitters) accounts for the lion's share of the weight.
+
+*** Its solution
+
+Accumulate a score for each token tracking "how much attention it has received," rank them, keep the top tier, discard the rest. The name Heavy Hitter Oracle comes from this — it assumes an oracle that can predict heavy hitters in advance. In practice, the oracle is approximated by cumulative attention.
+
+*** Why it worked (and what new pit it dug)
+
+This laid the foundation of the *eviction-centered* framework: reduce the problem to "score tokens + discard the low scorers." Everyone for the next five years would refine the scorer within this framework. The subtle pit left behind: scores are backward-looking, but future queries may not follow the same distribution. The deeper pit — everyone now assumes that "score + evict" is correct, and nobody questions the framework itself.
+
+** 2024.04 | SnapKV: the last few dozen prompt tokens know which prefix positions will be queried
+
+*** What problem did it see
+
+H2O scores every token at every timestep, which is expensive. Furthermore, it only kicks in during decode; it cannot handle an ultra-long prompt that floods in all at once — hand it a 100-page document and the cache fills immediately.
+
+*** Its solution
+
+Discover that the "observation window" at the end of the prompt (the last few dozen tokens) has an attention distribution that reliably predicts which prefix positions the decode queries will target. Use this to prune the prefix KV entries in a single shot before decoding begins.
+
+*** Why it worked (and what new pit it dug)
+
+A single prefix-pruning pass yields substantial decoding speedup. But SnapKV addresses the "long prompt" story (canonical use case: long-document QA). For reasoning tasks with long decode — where the model thinks for 5,000 tokens before answering — it offers no remedy. The reasoning-specific story had yet to be told.
+
+** 2025.05 | R-KV: reasoning traces are full of redundancy — penalize it in the score
+
+*** What problem did it see
+
+In the era of OpenAI o1 / DeepSeek R1, models routinely "think" for thousands of tokens, stuffed with restatements, self-checks, and wrong paths retraced. H2O-style scoring works reasonably on long contexts, but it never recognized the special *redundancy structure* inside reasoning decode traces.
+
+*** Its solution
+
+Add a redundancy-aware term to the scoring function: tokens that closely resemble earlier tokens are penalized. The underlying mechanics are still "produce a more accurate score, then evict." But it is the first paper to explicitly foreground the reasoning task.
+
+*** Why it worked (and what new pit it dug)
+
+It was the first to bring the specificity of reasoning into the KV compression conversation. But *the framework is unchanged* — eviction still governs everything. It left a problem that CASK would later name explicitly: "if a token is a structural anchor (say, a freshly derived intermediate conclusion), no matter how clever your scorer, a high-scoring scratch token can still crowd it out."
+
+** 2026.04 | TriAttention: trigonometric weighting to capture the think/answer asymmetry
+
+*** What problem did it see
+
+R-KV handled redundancy, but other structure went unexploited — the think phase and answer phase differ substantially in their attention distributions, and within-segment and cross-segment correlations are very different as well.
+
+*** Its solution
+
+Design a scorer built on trigonometric weights that folds segment-awareness into the importance estimate. Outperforms R-KV on reasoning benchmarks such as AIME24/25.
+
+*** Why it worked (and what new pit it dug)
+
+It pushed "reasoning-specialized scorer" to a new high-water mark. *But it directly forced CASK into existence.* The CASK team (described in the paper as Phase 1) followed the same direction and tried even more complex scoring variants — adaptive horizon, RMS2, variational horizon — and discovered one thing:
+
+  *Change the scoring function, and the actually retained set of tokens barely changes.*
+
+This is a devastating finding. It means that all the scorer-engineering effort over the past decade has had far less influence on actual model behavior than anyone supposed. If the keep-set is stable, differences in fidelity cannot be primarily explained by scoring precision.
+
+So where is the real lever?
+
+** 2026.04 | CASK: stop scoring — first decide who is untouchable, then decide who can be merged
+
+*** What problem did it see
+
+Picking up where the above leaves off: scorer refinement is a low-leverage action. The problem was framed incorrectly — the assumption that all tokens are "candidates to be ranked, with the bottom tier discarded" is itself wrong. Reasoning traces contain two categorically different kinds of tokens:
+
+- Tokens anchoring answer formation, intermediate-state checkpoints, recent reasoning pivots — disturb one and downstream coherence collapses
+- Tokens encoding repeated exploration, restatement, self-check, near-duplicate derivation — a single representative suffices
+
+Feeding both into the same ranking table is like applying the same evaluation rubric to "load-bearing beams" and "decorative columns," then declaring "tear down the low scorers" — and possibly tearing down a load-bearing beam.
+
+*** Its solution
+
+Three things change simultaneously:
+
+1. *Role separation*: the trace is split on arrival into a *protected core* and *mergeable scratch*. Core tokens are written into a constraint ~C ⊆ R~ — no matter how tight the budget, they must appear in the final retained set.
+
+2. *Merge instead of evict*: for scratch tokens, rather than ranking and dropping the tail, similar groups are subject to m-folding — their keys and values are averaged with learned weights to produce a single representative. Information is not discarded; it is folded. Using the kappa-weighted geometry carried over from Phase 1, merge distances are biased toward frequency bands more relevant to future queries.
+
+3. *Different primitives for prefix and decode*: in prompt-heavy scenarios, the prefix exhausts the budget and the decode-phase merge path never gets a chance to activate. Therefore Stage 1 still evicts on the prefix (to make room), and Stage 2 applies merging only to decode tokens. The central narrative is not "which primitive is stronger" but rather *preventing the prefix from blocking the decode primitive*.
+
+*** Why it worked (and what new pit it dug)
+
+Empirically, CASK@384 (budget 384) consistently outperforms TriAttention@512 (budget 512) on AIME24/25 — using fewer KV entries yet achieving higher full-KV behavioral fidelity (top-1 / top-5 / NLL). The CASK team is explicit: this is not "we evict more aggressively" — the saved ratio is sometimes actually lower. The real headline is that the *minimum usable budget* has been pushed down: "the smallest budget needed to preserve the same behavior" is now cheaper to achieve.
+
+The gaps left behind are acknowledged honestly by the authors:
+
+- Decode merging is not always the dominant contributor across all witnesses (qasper actually relies on two-stage eviction)
+- In prompt-heavy settings, qmsum/gov_report expose the prefix_budget_exhausted boundary condition
+- The output-side bridge is narrow — validated only on a few witnesses
+- How core tokens are defined and how merge groups are selected both remain heuristic, with no optimality guarantee
+
+* Frontier Extensions
+
+This paper is from April 2026, so its "aftermath" has not yet fully unfolded.
+
+The closest contemporary competitor is *Crystal-KV* (Wang et al., 2026.01, arxiv 2601.16986). Crystal-KV pursues an "answer-first principle" — managing the cache based on reverse-traced importance from the final answer tokens, equally recognizing that token roles are unequal in reasoning tasks. The difference from CASK: Crystal-KV uses an answer-first heuristic, whereas CASK uses explicit core/scratch role separation combined with merging. Two independent lines converging in the same year signals that "tokens in a reasoning trace should not be treated uniformly" is an intuition that multiple teams hit simultaneously.
+
+Foreseeable next steps:
+
+- Move core identification from heuristic to learned — use a small model or an online signal to decide what counts as core
+- Redesign the merge operator specifically for reasoning (the current operator is borrowed from general-purpose KV merging)
+- Generalize two-stage into multi-stage, applying distinct primitives to prefix / think / answer separately
+
+* One Diagram
+
+#+begin_example
+              eviction-centered framing                 |  merge-centered framing
+              (score + evict)                           |  (merge + represent)
+              ----------------------------------------- | -------------------------
+                                                        |
+  2017  KV cache is born (Vaswani et al.)               |
+        |                                               |
+  2023  StreamingLLM: keep sinks + window               |
+        |  Token roles recognized as unequal,           |
+        |  but only two tiers distinguished             |
+  2023  H2O: cumulative-attention scoring               |
+        |  Establishes the eviction framework,          |
+        |  dominates the next decade                    |
+  2024  SnapKV: prefix-side pruning (obs-window)        |  KVMerger / CaM / D2O:
+        |  Solves long prompt, not long decode          |  general merge operators born
+        |                                               |  (not reasoning-aware)
+  2025  R-KV: redundancy-aware scorer                   |  KeepKV / AsymKV:
+        |  (first reasoning-specific work)              |  merge error control / quant
+  2026  TriAttention: segment-aware scorer              |
+        |  Phase-1 experiments expose the deadlock:     |
+        |  change the scorer however you like,          |
+        |  the actual keep-set barely moves             |
+        |                                               |
+        v                                               v
+       (CASK 2026.04: stitches both lines together,
+        but puts reasoning role-separation first)
+
+            CASK @ budget 384  >  TriAttention @ budget 512
+            => The "minimum KV needed to preserve behavior" boundary moves down
+#+end_example
+
+* Insights
+
+*What is actually shifting underneath this river*
+
+On the surface this is an engineering iteration on "how to shrink the KV cache." Underneath, it is quietly changing *how we think about tokens*.
+
+- 2017–2023: tokens are equal; whether to keep one is determined by its accumulated attention score
+- 2023–2025: tokens have roles, but only two kinds (sink vs. other, heavy vs. light)
+- 2025–2026: token roles are tied to *task structure* (think phase vs. answer phase, redundant vs. non-redundant)
+- 2026 CASK: roles are not "score corrections" — they determine *which primitive is assigned* — core is preserved, scratch is merged, prefix is still evicted. This is the step from "scorer thinking" to "policy thinking."
+
+The Phase 1 confession in the CASK paper is particularly worth noting — it does not say "we tried A, then tried B and B was better." It says *"we spent a long time on A, then discovered that A's entire direction was wrong."* Using a negative result as the structural turning point of a paper is rare in the ML literature.
+
+*Where things are most likely to go next*
+
+- *Core should not be hand-defined* — in some sense CASK still uses a heuristic to decide what is core. The next step is to have the model itself (or a sidecar model) emit a core mask.
+- *The merge operator also needs to be reasoning-aware* — what is currently used is a general-purpose operator borrowed from long-context work; it has no specialized design for the "equivalent rewriting" structures that are peculiar to reasoning traces.
+- *Training-side alignment* — can you train a model to produce reasoning traces that are compression-friendly? Teaching the model to generate think-text that is easier to merge would push the runtime compression constraint back into pre- or post-training. This is inference-time compression requirements flowing in reverse into the training pipeline.
+
+* Takeaways
+
+What this river offers as a lesson about how to do research is sharper than the technical content itself.
+
+1. *Frameworks are the real lever, not details.* A decade of scorer refinement, paper after paper, benchmark after benchmark — and CASK's single observation that "the keep-set barely changes" relegates all of that effort to secondary status. When you find yourself repeatedly tuning details within a framework with diminishing returns, what deserves suspicion is the framework, not your tuning.
+
+2. *Negative results are signposts.* CASK's Phase 1 failed — more sophisticated scorers did not materially change the keep-set. Rather than burying this, they put it in the Appendix and stated plainly that "this failure was what made us pivot." Failures carry information; deleting them is equivalent to discarding that information.
+
+3. *Change the verb in the problem statement.* The entire field asked "*which* tokens should be evicted?" Reframing it as "which tokens *must not be touched*?" reshuffled the entire solution space. Change the verb, change the space of possible answers.
+
+4. *You don't have to win everywhere.* CASK does not always evict more aggressively than its competitors, and it does not dominate every benchmark. But it states clearly that "our advantage is pushing the minimum usable budget down," and then produces evidence only for that specific claim. A *bounded claim* like this is more credible than "comprehensive outperformance," and more tractable for future work to extend.
+
+Landing point: in your own research direction, you can do the same — find where your "scorer war" is being fought, and ask: has everyone spent the last ten years improving the scorer? Maybe it is time to question the framework.

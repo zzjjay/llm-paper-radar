@@ -1,0 +1,318 @@
+#+title:      IceCache: Memory-efficient KV-cache Management for Long-Sequence LLMs
+#+date:       [2026-05-28 Thu 15:43]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T154342-en
+#+source:     https://arxiv.org/abs/2604.10539
+#+authors:    Yuzhen Mao, Qitong Wang, Martin Ester, Ke Li
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+A 36k-token conversation occupies how much GPU memory during LLM inference? *16 GB as a starting point*—and that is just the KV cache; model weights are on top of that. Then you press Enter, the model begins emitting tokens one by one, and for each token it must sweep through that entire 16 GB again. Generation speed is pinned by memory bandwidth, and even a modest CoT reasoning trace can cost dozens of seconds per token.
+
+The single question this river sets out to answer is: *the KV cache is too large — what do we do about it?*
+
+It sounds almost trivial — it is just a cache, right? Just delete things. But that is precisely where the difficulty lives. LLM attention is dynamic: a token you judge useless today might be essential in the very next sentence. A token that seems critical now may be stale a thousand steps later. "What to evict, what to keep, where to put it" — these three questions have been hammered on for seven or eight years of papers, each one feeling like "we finally cracked it," only for the next paper to point out "your approach collapses in scenario XX."
+
+IceCache is the current frontier of this river. To understand why it is designed the way it is, we need to dig upstream to the source.
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  | Idea: attention concentrates on the first few + the most recent tokens
+  | Approach: discard the middle, keep sink + recent
+  | Weakness: are the middle tokens really useless? Long-doc QA breaks down
+  v
+[2024] H2O (Zhang et al.)
+  | Problem spotted: deleting by position is naive; delete by "how often actually used"
+  | Approach: retain tokens with high cumulative attention scores (heavy hitters)
+  | Weakness: still a one-shot decision; important in the past ≠ important in the future
+  v
+[2023] PagedAttention / vLLM (Kwon et al.)
+  | Infrastructure change orthogonal to the eviction line
+  | Problem spotted: KV cache is like pre-malloc memory — heavily fragmented
+  | Approach: borrow OS virtual-memory paging; KV organized into fixed-size pages
+  | Unsolved: cache still grows; it just grows more neatly
+  v
+[2024 ICML] Quest (Tang et al.)
+  | Finally combines paging + intelligent page selection
+  | Problem spotted: PagedAttention does not know which page matters
+  | Approach: per-page min/max of key vectors → upper bound; select top-k pages per query
+  | Weakness: all pages must stay on GPU; saves compute, not memory
+  v
+[2024 NeurIPS] ArkVale (Chen et al.)
+  | Problem spotted: Quest saves no memory; long context still does not fit
+  | Approach: all pages live on CPU; fetch top-k pages back to GPU per query
+  | Weakness: but! pages are assembled in token-arrival order — related tokens scatter
+  v
+[2026 ICLR] IceCache (Mao et al.)  <-- this paper
+  | Problem spotted: Quest/ArkVale page-hit rate is low
+  |                  because pages follow original order, related tokens are scattered
+  | Approach: semantic clustering (DCI-tree) re-assembles pages; related tokens co-locate
+  | Result: 256-token budget preserves 99% accuracy
+  v
+[2025-2026] FIER / SemantiCache / ...
+  | Problem spotted: the page granularity itself is too coarse
+  | Direction: token-level retrieval / finer semantic merging
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Attention lives at the head and tail — just throw away the middle
+
+*** What problem it saw
+
+The earliest brute-force approach was "window attention" — look only at the most recent N tokens, drop anything beyond that. But there was a counter-intuitive phenomenon: once the model discarded the very first few tokens, generation collapsed into incoherence.
+
+Xiao et al. stared at attention maps and discovered *attention sinks*: the first few tokens absorbed a disproportionately large share of attention weight regardless of the query. They act like anchors that stabilize the downstream attention distribution. Remove the anchor and the boat drifts.
+
+*** Its solution
+
+Disarmingly simple: keep the first 4 sink tokens plus a sliding recent window, drop everything in between. The model stops collapsing and memory is saved.
+
+*** Why it works — and where the new trap is buried
+
+It works because, for most everyday dialogue, the "middle content" genuinely matters little — mid-conversation, the model rarely needs to recall the exact wording of earlier turns verbatim.
+
+But the trap is right there: *this is a static, position-driven strategy*. If you do long-document QA and the critical information happens to sit in some middle paragraph, dropping it means it is gone forever. It equates "what is important" with "where it is positioned," and that equation fails in many real scenarios.
+
+** 2024 | H2O: Delete by "how often actually used" — smarter than deleting by position
+
+*** What problem it saw
+
+StreamingLLM essentially says "important = head + tail," which is obviously too coarse. Whether a token matters should depend on whether it has *actually* been attended to by subsequent tokens — attended to frequently means it was repeatedly consulted during generation, signaling that it carries critical information.
+
+*** Its solution
+
+H2O maintains a "cumulative attention received" score for each token, updating it at every generation step. When eviction is needed, tokens with the lowest cumulative scores are ejected. The survivors are called *Heavy Hitters* — the productive minority.
+
+*** Why it works — and where the new trap is buried
+
+It unlocks a key observation: attention is sparse, and a small minority of tokens genuinely carry the load. Retaining only 5–20% of tokens therefore incurs very little quality loss.
+
+But a new trap appears: *this is still a one-shot, irreversible decision*. At step 100 you judge a token unattended and discard it; at step 1000 the topic cycles back to it — and it is gone. In long generations, multi-turn dialogue, and CoT reasoning, this "fallen-then-risen" pattern is extremely common.
+
+** 2023 | PagedAttention / vLLM: Borrow from the OS — manage KV cache like virtual memory
+
+*** What problem it saw
+
+This is a branch orthogonal to the eviction line. Kwon et al. did not ask "what to delete" — they asked "how to store."
+
+At the time, every inference framework allocated KV cache as one large contiguous block. Since each request has a different length, the maximum length had to be reserved upfront, causing massive fragmentation and waste. An A100 with 80 GB might effectively use less than 30%.
+
+*** Its solution
+
+Directly port the OS virtual-memory model: slice KV cache into fixed-size *pages* (e.g., 16 tokens per page) and use a page table to map logical positions to physical pages. Growing the cache just allocates new pages; reclaiming it returns pages to a pool — zero fragmentation.
+
+*** Why it works — and where the new trap is buried
+
+This is the leap from "raw array" to "virtual memory." Throughput jumped several-fold and it became the standard in every modern inference framework.
+
+But note: *it solves the management problem, not the growth problem*. The cache still keeps growing; PagedAttention just makes it grow more tidily. To truly save memory you still need to layer on eviction or some other technique.
+
+It does, however, plant an important seed: *the page is a good abstraction*. Later researchers will discover that pages are useful not only for memory management but also for "batch decisions" — deciding in bulk whether an entire page should be computed or loaded.
+
+** 2024 ICML | Quest: Score each page, only compute top-k pages per query
+
+*** What problem it saw
+
+Quest merges the two lineages — H2O and PagedAttention.
+
+H2O's history-based eviction has two flaws: (1) decisions are permanent; (2) decisions are based on *past queries*, not the *current query*. Quest observes: if we can cheaply estimate "which tokens matter for *this* query" on the fly, we never need to pre-delete anything or gamble ahead of time.
+
+But computing relevance for every token is equivalent to running attention twice. PagedAttention comes to the rescue: *compute at page granularity*, which is far cheaper.
+
+*** Its solution
+
+Each page stores a compact "summary": the per-dimension min and max of all key vectors within the page. Given a new query q, compute an *upper bound* on the maximum possible attention score any token in that page could receive from q.
+
+Sort pages by their upper bounds and run actual attention only on the top-k pages (e.g., 128 pages); skip the rest.
+
+*** Why it works — and where the new trap is buried
+
+The cleverness lies in *trading negligible metadata for a safe upper bound*. The per-page (min, max) takes almost no space yet guarantees no important page is missed. Self-attention speeds up by up to 7×, end-to-end by more than 2×.
+
+The trap remains: *memory is not saved*. All KV pairs stay on the GPU; Quest saves compute, not memory. A 36k or 200k context that does not fit still does not fit.
+
+** 2024 NeurIPS | ArkVale: Everything lives on CPU, fetch back to GPU on demand
+
+*** What problem it saw
+
+Quest answered "who to compute" but not "where to store." ArkVale asks: since only top-k pages are used per step, can the rest live in CPU memory and be copied back when needed?
+
+CPU memory comfortably holds hundreds of GB, and the new bottleneck becomes PCIe bandwidth — making *accurate page selection* even more critical. Every wrongly selected page carries a PCIe transfer cost.
+
+*** Its solution
+
+Inherits Quest's page summary + top-k selection, and adds two ideas:
+1. *Offloading*: full KV lives on CPU; the GPU holds only the currently active pages.
+2. *Recall*: evicted pages are not permanently discarded — they can be recalled from CPU. This directly addresses H2O's one-shot-decision problem.
+
+*** Why it works — and where the new trap is buried
+
+It separates "large capacity" from "fast access": CPU for capacity, GPU for speed, PCIe for scheduling. In principle, arbitrarily long contexts can be accommodated.
+
+But ArkVale leaves behind one trap that looks innocuous but is actually fatal: *pages are assembled in original token order*. Tokens 0–15 form one page, 16–31 form the next, and so on in chronological sequence.
+
+Why is this a trap? Imagine searching a 50-page legal contract for "breach-of-contract clauses." If the relevant content is scattered across sections 3, 17, 23, and 41, you must load the *entire pages* containing those sections — yet each page may contain only 1–2 truly relevant tokens, with the rest being irrelevant noise that wastes PCIe bandwidth and GPU memory budget.
+
+You select the right pages, but the *token hit rate within those pages* is still very low.
+
+** 2026 ICLR | IceCache: Re-assemble pages by meaning so related tokens naturally co-locate
+
+*** What problem it saw
+
+IceCache delivers the most important conceptual reversal in this lineage. Every prior method — StreamingLLM, H2O, Quest, ArkVale — silently assumes "pages are assembled in chronological order." This assumption was never questioned, because KV pairs are generated sequentially and storing them in generation order feels "natural."
+
+But "natural" does not mean "efficient." The hit-rate ceiling in Quest and ArkVale traces directly back to this hidden assumption.
+
+IceCache asks: *why do pages have to follow chronological order at all? Can we assemble them by meaning?* Group semantically similar tokens into the same page, and when a query arrives, related tokens *naturally* concentrate in a small number of pages — each page almost entirely full of hits, with no noise.
+
+*** Its solution
+
+Build a *DCI-tree* to hierarchically cluster all key embeddings (DCI is a high-dimensional KNN algorithm from Li & Malik 2017, which the authors had previously applied to sparse attention):
+- Leaf nodes = memory pages containing semantically similar tokens
+- Upper nodes = representatives of their children
+- At query time, traverse from root to leaves to retrieve the top-k most relevant pages
+
+The tree is built during the prefill phase; during decoding, each new token is *inserted* into the appropriate leaf (the tree supports dynamic updates).
+
+*** Why it works — and where the new trap is buried
+
+The *coupling point* of the entire pipeline shifts:
+- ArkVale: select page → only a few hits per page → bandwidth and budget wasted
+- IceCache: select page → nearly all tokens in the page are hits → a 256-token budget preserves 99% of original accuracy
+
+The numbers speak: with a 256-token budget, IceCache matches or exceeds the latency and accuracy of competing offloading methods that require only 25% as much budget.
+
+The new trap (and the direction the river flows next): *the page granularity itself is still somewhat coarse*. Even with perfect semantic clustering, a 16-token page will not have every token be exactly what the current query needs. The next generation of methods (FIER, etc.) begins pushing toward *token-level retrieval*, but that faces a metadata explosion problem. The river flows on.
+
+* Frontier Extensions
+
+IceCache appeared in April 2026, and two extension directions have already emerged:
+
+** SemantiCache (2026): Apply "semantic clustering" thinking to KV compression
+
+Rather than offloading, do *compression*. Segment the cache at semantic boundaries (punctuation, paragraphs), then perform greedy seed clustering within each segment to merge multiple similar tokens into a single "semantic nucleus" — storing less while preserving semantics. The distinction from IceCache: IceCache is "keep everything, select what to use"; SemantiCache is "merge and compact what is stored."
+
+** FIER (2025): Abandon page-level selection entirely — select at token level
+
+FIER directly challenges the page granularity: "No matter how cleverly you assemble pages, noise will remain." It performs fine-grained token-level retrieval. The cost is larger metadata and more complex scheduling. This is the direct continuation of IceCache's remaining trap — the possibility of intra-page noise.
+
+As of May 2026, IceCache remains the SOTA on the specific line of "semantic clustering + paging + offloading."
+
+* One Diagram
+
+#+begin_example
+                  Problem: KV cache is too large — cannot fit or run fast
+                                |
+                                v
+        +----------------------+----------------------+
+        | Route A: eviction    |  Route B: memory mgmt|
+        | "drop some of it"    |  "store it more neatly"|
+        +----------------------+----------------------+
+        |                                             |
+        v                                             v
+   StreamingLLM (2023)                       PagedAttention (2023)
+   Delete by position (head+tail)            Virtual-memory paging
+        |                                             |
+        v                                             |
+   H2O (2024)                                         |
+   Delete by cumulative attention                     |
+        |                                             |
+        +-----------+-----------+-----------+---------+
+                                |
+                                v
+                Confluence: pages + query-aware page selection
+                                |
+                                v
+                          Quest (ICML 2024)
+                       Per-page min/max upper bound
+                        Select top-k pages for attention only
+                          (saves compute, not memory)
+                                |
+                                v
+                        ArkVale (NeurIPS 2024)
+                          Everything on CPU, fetch on demand
+                       (saves memory, but high intra-page noise)
+                                |
+                                v   <- key reversal:
+                       *pages need not follow chronological order*
+                                |
+                                v
+                         IceCache (ICLR 2026)
+                        DCI-tree semantic clustering for page assembly
+                       Related tokens naturally co-locate
+                        256-token budget / 99% accuracy
+                                |
+                                v
+                 Next wave: token-level (FIER) / semantic compression (SemantiCache)
+
+
+Timeline ----2023----------2024-----------------------2026----------------->
+
+What gets saved:  memory fragmentation -> compute -> memory -> PCIe bandwidth + budget accuracy
+
+#+end_example
+
+* Insights
+
+** What this river is really evolving
+
+On the surface it looks like "KV cache compression keeps getting better." But underneath there is a deeper trajectory: *the "atomic unit" for managing KV cache is being continually redefined*.
+
+- First generation (StreamingLLM, H2O): the atom is the *token*. Decisions are "should this token be kept?"
+- Second generation (PagedAttention): the atom is the *page*. Pages are introduced as the unit of memory management.
+- Third generation (Quest, ArkVale): the atom is still the *page*, but the page now also serves as the "selection granularity" — one decision covers the whole page.
+- Fourth generation (IceCache): the *composition* of pages is redefined. From "temporally adjacent" to "semantically adjacent."
+- Fifth generation (FIER, emerging): discovering that the page granularity itself is limiting, swinging back toward the token level — but carrying all the engineering lessons learned along the way.
+
+Every step is really answering the question: "*what to manage* and *at what granularity*."
+
+** A seemingly innocuous hidden assumption can be the bottleneck for an entire river
+
+The reason IceCache works is not that the DCI-tree is particularly clever — it is that IceCache *notices a hidden assumption that had been silently accepted for years*: "pages are assembled in chronological order."
+
+That assumption was written in by PagedAttention in 2023 and fully inherited by Quest and ArkVale in 2024; no one questioned it. Then IceCache picks it up and asks "why, exactly?"
+
+The hidden lesson of this entire river: *when multiple consecutive SOTA papers in a field all share an unwritten convention, that convention is usually the next breakthrough waiting to happen*.
+
+** Where to go next
+
+Two directions, and people are already walking both:
+
+1. *Finer granularity* (the FIER line): page-level → token-level → perhaps even sub-token level? The bottleneck is metadata explosion, requiring more compact token fingerprints.
+2. *Smarter organization* (the SemantiCache line): rather than clustering then selecting, *merge* similar tokens to reduce the number of objects that need managing in the first place.
+
+Looking further ahead, a method combining "semantic clustering + token-level retrieval + merge compression" may emerge. This river is far from reaching the sea.
+
+* Takeaways
+
+** Takeaway for finding problems
+
+The biggest lesson from reading this river: *genuine breakthroughs often hide in territory already considered solved*.
+
+ArkVale landed excellent results at NeurIPS 2024 and the community largely felt "KV offloading is about as far as it can go." Then IceCache arrived and showed that the bottleneck was not which pages to select but how pages are composed — a step nobody had looked at. 
+
+This means you *can*:
+- Enter a domain with apparent consensus, ask "what assumption is everyone sharing without questioning" — that assumption is likely your paper.
+- Examine the ablations of baselines: if a whole cohort of methods "naturally" does the same thing but nobody explains why, there is gold there.
+
+** Takeaway for architectural design
+
+Notice how the *coupling point* shifts across the four generations:
+
+Each generation appears to be a minor incremental fix, but actually relocates the *key coupling point*:
+- StreamingLLM / H2O: coupling point is the eviction policy
+- PagedAttention: coupling point is the memory layout
+- Quest / ArkVale: coupling point is the page selection policy
+- IceCache: coupling point is the page assembly policy
+
+If you are doing system design, you can *explicitly enumerate* "where does my design couple with others, and what do I control independently" — the latter is your future moat, and potentially someone else's next breakthrough.
+
+** Takeaway for reading papers
+
+When reading IceCache, the easiest mistake is to be intimidated by the name "DCI-tree" and dive into the KNN mathematics of Li & Malik 2017. But *DCI-tree in this paper is merely a means* — the core insight is "assemble pages by semantics." Replacing it with another ANN algorithm (HNSW, IVF — either would do) leaves the insight intact.
+
+When reading a paper, always distinguish the *core insight* from the *implementation choice*. The former is the paper's real contribution; the latter is an engineering decision. If you mix them together, every paper will feel mysterious; if you separate them, you will find that 90% of papers really only change one insight.

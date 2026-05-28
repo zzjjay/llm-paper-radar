@@ -1,0 +1,248 @@
+#+title:      HieraSparse: Hierarchical Semi-Structured Sparse KV Attention
+#+date:       [2026-05-28 Thu 00:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T000000
+#+source:     https://arxiv.org/abs/2604.16864
+#+authors:    Haoxuan Wang, Chen Wang
+#+venue:      arXiv:2604.16864 (cs.DC), Apr 2026
+
+* 问题之河
+
+长上下文大模型推理，慢在哪、贵在哪？
+
+注意力机制是 O(n^2) 的：序列每翻一倍，算力和显存都按平方涨。当上下文从 4K 推到 128K、再推到 1M，一件本来"几毫秒收尾"的事——一次 token 解码——开始要去翻几十 GB 的 KV Cache，这块 cache 单条请求就能吃掉整张 GPU 的显存。
+
+于是过去几年所有人都在做同一件事：*砍 KV Cache*。砍得粗——按层、按头、按 token 整块扔——快但伤模型；砍得细——一个一个 element 看着扔——精准但快不起来。这条线卡在一个看似无解的取舍上：*你想精细，硬件就不陪你玩；你想要硬件加速，就得砍得粗。* HieraSparse 这篇就是来打这个结的。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 问题: RNN 串行慢
+  | 解法: 全注意力, 但留下 O(n^2) 这个炸弹
+  v
+[2022] FlashAttention (Dao et al.)
+  |
+  | 问题: 注意力中间矩阵 P 占 O(n^2) 显存
+  | 解法: 分块 + 在线 softmax, 不落盘中间结果
+  | 留坑: 计算还是 O(n^2), KV Cache 还是线性涨
+  v
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | 问题: 流式生成时 KV Cache 越攒越大
+  | 发现: 开头几个 token 是"注意力黑洞"(attention sinks),
+  |       窗口外的多数 token 其实没人看
+  | 解法: 只保留 sinks + 最近窗口, 其余丢掉
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | 问题: 纯位置启发(开头+最近)太死板
+  | 解法: 按累计注意力分数动态挑"heavy hitters", 丢其他 token
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | 问题: H2O 每步都要算分数, 在线开销大
+  | 解法: prefill 末尾用观察窗口预测出该留哪些 token, 一次定型
+  v
+[2025] MUSTAFAR (Kim et al.)
+  |
+  | 问题: 整 token 扔得太粗, 信息损失大
+  | 解法: 按元素(unstructured)细粒度 magnitude 剪枝
+  | 留坑: 稀疏算子"load-as-sparse, compute-as-dense",
+  |       省了带宽不省算力; prefill 还白白增加 ~12% 压缩开销
+  v
+[2026] HieraSparse (本篇)
+  |
+  | 问题: 想要细粒度的质量 + 想要硬件真的加速, 能不能都要?
+  | 解法: 半结构化 N:M 稀疏 + 分层(块级 dense/sparse 混排)
+  |       + 直接喂给 GPU 的 sparse tensor core
+  v
+[未来] ?
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 把"看全文"做成一次矩阵乘法
+
+*** 它看到了什么问题
+
+RNN/LSTM 处理序列必须一个 token 接一个 token 算，GPU 这种"一万个工人同时上"的硬件被晾在一边。训长序列又慢又难。
+
+*** 它的解法
+
+砍掉时间链。让每个位置直接用 Query 去和所有位置的 Key 做内积，softmax 加权 Value——一次矩阵乘法搞定"谁该看谁"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+矩阵乘法天生并行，正中 GPU 下怀。但代价埋下了：Q × K^T 这个中间矩阵是 n × n，序列一长就是 *平方爆炸*。后面所有人都在还这个债。
+
+** 2022 | FlashAttention: 中间矩阵不必落盘
+
+*** 它看到了什么问题
+
+n=64K 时，那个 64K × 64K 的 attention score 矩阵根本写不进 HBM——就算写得进，HBM 来回搬运也比算本身慢。瓶颈不是算力，是显存带宽。
+
+*** 它的解法
+
+分块 + 在线 safe-softmax。一次只处理一小块 Q 和一小块 K，softmax 用增量的方式维护行级 max 和 log-sum-exp，永远不在 HBM 上落下完整的 P 矩阵。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"算"和"搬"重新排过——所有中间结果留在 on-chip SRAM 里。但它没动 *计算量* 本身，KV Cache 也照样得存。换句话说：FlashAttention 让 *矩阵* 不爆，没让 *Cache* 不爆。下一波焦点转向了 KV Cache 本身。
+
+** 2023 | StreamingLLM: 大多数 token 其实没人看
+
+*** 它看到了什么问题
+
+聊天机器人要无限往下聊，KV Cache 不能无限增长。但简单丢掉早期 token，模型会"崩"——开始胡言乱语。
+
+*** 它的解法
+
+实测发现一件违反直觉的事：序列最开头的几个 token 像"注意力黑洞"，不论后面多长，所有 head 都还在看它们（命名为 attention sinks）。把这几个 sinks 永远留住，再加一个最近 token 滑动窗口，中间的可以丢。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+发现了 *信息密度不均匀* 这件事——这是后面所有 KV 剪枝工作的母题。但 StreamingLLM 的决策完全靠 *位置*（开头 + 末尾），太死板。中间偶尔会有真正重要的 token，照样被它一刀切了。
+
+** 2023 | H2O: 让分数说话，不让位置说话
+
+*** 它看到了什么问题
+
+"开头 + 最近"是粗暴假设。真正的"重要 token"应该按它被多少 query 看过来定，不是按它坐在哪里。
+
+*** 它的解法
+
+维护每个 token 的累计 attention score，每步淘汰得分最低的 token（heavy-hitter oracle）。把"留哪些"从静态规则变成动态打分。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度上去了，但每个解码步都要更新分数、维护排序，*在线开销* 又起来了。而且它只解决了 decode 阶段的 cache 增长，prefill 那段还是得整段算。
+
+** 2024 | SnapKV: 预测要留谁，一次定型
+
+*** 它看到了什么问题
+
+H2O 这种"每步都重新选"的方式太重。能不能 *一次性* 决定该留哪些 token，之后就锁死，不再动态计算？
+
+*** 它的解法
+
+观察一个现象：prefill 结束时，最后一段 token（观察窗口）对历史的注意力分布，已经能很好预测后续 decode 会看哪些位置。所以在 prefill 末尾算一次 top-k，挑出来，把其他 KV 直接扔掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把动态在线工作变成一次性的离线选择，开销骤降。但它和 H2O 共享一个根本局限：*整 token 扔太粗*。一个 token 里可能 80% 的维度是噪声、20% 是关键——粗粒度方法要么全留要么全扔，没法只扔噪声那部分。
+
+** 2025 | MUSTAFAR: 一个元素一个元素地看
+
+*** 它看到了什么问题
+
+token 是高维向量，里面的 element 远不是同等重要的。Key cache 有"outlier ridges"——某几个 channel 在所有 token 上都很大；其他 channel 接近 0。粗粒度方法看不到这种结构。
+
+*** 它的解法
+
+非结构化(unstructured) 剪枝——直接按 magnitude 把 KV Cache 里数值小的 element 置零，颗粒度细到一个数。算法上证明 key 适合 per-token 剪、value 怎么剪差别都不大。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+质量上确实赢了——同样的稀疏度，比 token 级剪法保得多。但 *硬件不陪它玩*。现有的稀疏算子框架（cuSPARSE 这一类）做的是 "load-as-sparse, compute-as-dense"——从显存读的时候是压缩的，省带宽；但搬到计算单元里要先解压成密集矩阵再算。结果：
+
+- *prefill*（计算密集）：完全没加速，因为本来就是算力瓶颈
+- *decode*（带宽密集）：勉强省点带宽
+- *额外*：压缩成稀疏格式本身要 ~12% 的 latency tax
+
+所以 MUSTAFAR 留下一个尴尬的局面：*算法上你看到了细粒度的好处, 系统上你拿不到。*
+
+这就是 HieraSparse 接手时的现场。
+
+** 2026 | HieraSparse: 让 GPU 的稀疏单元真正动起来
+
+*** 它看到了什么问题
+
+MUSTAFAR 的死结是 "unstructured"。GPU 上其实有专门的硬件——sparse tensor core，从 Ampere 开始，再到 Hopper 和 AMD MI300X——专门加速 *N:M 半结构化稀疏*（每 M 个连续元素里恰好 N 个非零，比如 2:4）。这种硬件能让稀疏矩阵乘法在同样的 cycle 数下做完，等于免费拿到 2× 算力 + 25% 带宽节省。
+
+但 N:M 稀疏有个硬约束：你必须 *每 4 个一组里强制留 2 个*，不能"哪重要留哪"。直接对 KV 上 N:M，等于在 attention sinks、heavy hitters 这些 *必须保全* 的关键区域强行打洞——质量崩盘。
+
+*** 它的解法
+
+*分层(hierarchical)* 思想。把 KV Cache 切块，每个块要么整块 dense（保关键区域），要么整块走 N:M 稀疏（保普通区域）。两种块共存于一个内存池，用一个 block index mapping 索引。
+
+然后是真正的硬骨头——*kernel*：
+
+1. *FlashAttention 风格的双 GEMM 都要稀疏化*：但 sparse tensor core 只压缩第一个操作数。decode 时 Q·K^T 阶段 Q 是稠密的需要重排；prefill 阶段更复杂，要把 dense block 和 sparse block 在同一个 kernel 里混算
+2. *在线压缩 kernel*：传统压缩成 N:M 格式开销巨大。他们设计了一个"近零开销"的在线压缩，融进 prefill pipeline 里，几乎不增加 TTFT
+3. *In-fragment re-layout、异步流水、专用 on-chip 分配*：把这些拼起来才能让稀疏单元真的跑满
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它在三个维度同时赢：
+- 同稀疏度下，比 MUSTAFAR 多 1.2× 压缩比 + 4.57× attention 加速（decode）
+- 第一次把半结构化稀疏推进了 *prefill* 阶段，up to 1.85× 加速
+- 配最简单的 magnitude pruning，端到端就有 1.37× prefill / 1.77× decode 加速，质量不掉
+
+新的开放问题：
+- 块级 dense/sparse 的划分依据现在还很简单(magnitude)，能不能学出来？
+- 2:4 已经在 Ampere 上跑了，未来 1:4、4:8 这些更激进的模式，硬件给不给力？
+- 和量化（INT4/FP8 KV）、和长上下文的位置外推方法（YaRN 之类）能不能叠加？
+
+* 前沿延伸
+
+HieraSparse 发表于 2026 年 4 月，到 2026-05-28 为止还很新，*没找到明确以它为靶子做改进的后续论文*。可观察到的方向（基于同期社区动态，需后续核实）：
+
+- *和 KV 量化结合*：QServe、KVQuant 这条线在做低 bit 量化，HieraSparse 这条做稀疏，两者正交，最自然的合流就是 "稀疏 + 4bit/FP8 同时上"
+- *更激进的 sparsity 模式*：H100/MI300X 之后的 GPU 是否支持 1:4 或动态 N:M，决定了这条路能不能再往前推一倍
+- *学习型 block 选择*：现在 dense/sparse 的划分是手工启发式，可学习的预测器可能再放出 10-30% 质量空间
+
+截至目前，HieraSparse 是 "细粒度质量 + 硬件实际加速" 这条线的最新进展。
+
+* 一张图看懂
+
+#+begin_example
+                  KV Cache 压缩演化 —— 从"算法漂亮"到"硬件配合"
+
+时间  方法           粒度          硬件加速      prefill   decode  关键洞见
+----  -----------    -----------   -----------   -------   ------  -----------
+2017  Transformer    -             dense TC      yes       yes     全注意力, 但留下 O(n^2)
+                                                                   |
+2022  FlashAttn      -             dense TC      yes       yes     算不爆, Cache 还在涨
+                                                                   v
+2023  StreamingLLM   token(位置)   skip-compute  no        yes     信息分布不均: sinks!
+                                                                   |
+2023  H2O            token(动态)   skip-compute  no        yes     按分数挑, 但太重
+                                                                   v
+2024  SnapKV         token(一次)   skip-compute  no        yes     一次定型, 但还是整 token
+                                                                   |
+2025  MUSTAFAR       element       load-sparse,  no        weak    细粒度漂亮, 硬件不陪玩
+                     (unstruct.)   compute-dense                   |
+                                                                   v
+2026  HieraSparse    block + N:M   SPARSE TC     YES 1.85x YES     分层 + 半结构化,
+                     element                     4.57x             硬件第一次真加速
+#+end_example
+
+* 洞见
+
+这条河看起来是"算法越来越细", 实际上每一代真正的转折都不是 *算法* 在变, 是 *硬件假设* 在变。
+
+- StreamingLLM/H2O/SnapKV 这一段, 假设硬件能 "skip computation"——所以解法都是整 token 扔, 因为只有这样才能整块跳过
+- MUSTAFAR 假设硬件支持 *任意* 稀疏度的 GEMM——这个假设其实是错的, 所以它的精度优势在系统层兑现不了
+- HieraSparse 是第一篇 *倒过来* 思考的: 先看硬件愿意接受什么 (N:M 半结构化的 sparse tensor core), 再反推算法上的剪枝粒度应该是什么样
+
+这是 ML 系统研究里反复出现的规律——*真正能落地的算法创新, 形状是被底层硬件决定的*。Transformer 赢 RNN 不只是因为想法好, 是因为它正好是 GPU 喜欢的形状。FlashAttention 赢传统 attention, 是因为它把计算重排成 SRAM 喜欢的形状。HieraSparse 赢 MUSTAFAR, 是因为它把稀疏模式改成 sparse tensor core 喜欢的形状。
+
+下一步最可能往哪走：
+
+1. *硬件感知的混合压缩*: 稀疏 + 量化在同一个 kernel 里做完, sparse tensor core 喂的是 INT4/FP8 而不是 FP16
+2. *训练时就考虑 N:M*: 现在剪枝是事后的, 如果模型训练时就被引导出 N:M 友好的注意力模式, 质量损失可以降到接近零
+3. *block 划分变成可学习的*: 哪些区域 dense、哪些 sparse, 让模型自己说
+
+* 启发
+
+研究上：*不要在算法层堆漂亮的东西, 先去看硬件愿意吃什么*。 一个"算法上更优但系统上零加速"的方法, 在工业界等同于不存在。MUSTAFAR 和 HieraSparse 之间的差别, 不是谁更聪明, 是 HieraSparse 多读了一遍 NVIDIA PTX 文档。
+
+工程上：*"load-as-X, compute-as-Y" 是个反复出现的诊断模式*。每次看到一个号称"省了 X 的方法", 问一句 "省的是带宽还是算力？瓶颈是哪个？"——很多 paper 的加速比一查就是不成立的。
+
+这意味着你可以：
+
+- 看到任何号称 "高效" 的注意力变体, 直接问它在 prefill 还是 decode 加速、用了哪个硬件指令、稀疏模式是 unstructured 还是 N:M——一句话能筛掉 80% 的伪加速
+- 做 KV Cache 相关工作时, *prefill 阶段* 是当前最少人碰的金矿(从 StreamingLLM 到 SnapKV 都只管 decode), 任何能在 prefill 上做出真加速的方法都有大空间
+- AMD MI300X 也有 sparse matrix core 但软件栈薄, 谁先把 HieraSparse 这条路在 ROCm 上跑通, 谁就拿下 AMD 这条线

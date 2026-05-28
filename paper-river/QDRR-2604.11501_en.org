@@ -1,0 +1,350 @@
+#+title:      Quantization Dominates Rank Reduction for KV-Cache Compression
+#+date:       [2026-05-28 Thu 15:53]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T155331-en
+#+source:     https://arxiv.org/abs/2604.11501
+#+authors:    Samuel Salfati (fraQtl AI Research)
+#+venue:      arXiv 2604.11501, 2026-04
+
+* The Problem River
+
+During LLM inference, every newly generated token requires attending back to the key/value vectors of all previous tokens. This collection of vectors is called the KV cache. The longer the context, the larger it grows — on an 8K context with a 7B model, the KV cache occupies more GPU memory than the model weights themselves.
+
+The problem in one sentence: *How do we compress the KV cache without making the model dumber?*
+
+What makes this hard? Two intuitive paths, both looking reasonable:
+
+- *Rank reduction* — each key/value is a 128-dimensional vector; cutting to 32 dimensions saves 4× space. Neural networks almost certainly have redundancy anyway.
+- *Quantization* — keep all 128 dimensions, but store each value in 4 bits instead of 16. Also saves 4×.
+
+Sounds about the same. For a decade the two lines evolved independently, never facing each other head-on. Then QDRR stepped up and declared: stop arguing — *rank reduction is wrong at the root, it loses structurally to quantization, and the gap widens as models scale.*
+
+Why was such a hard conclusion only reached in 2026? Because everyone before was optimizing within their own lane, and no one ran the "head-to-head under identical storage budgets" controlled experiment. The mathematical reason behind the gap — softmax routing — had always lurked beneath intuition, never been formalized.
+
+* Source Map
+
+#+begin_example
+[2022] Frantar et al. - GPTQ                 [2022] Hsu et al. - FWSVD
+   |                                              |
+   | Quantize LLM weights from FP16 to INT4      | Fisher-information-weighted SVD:
+   | with almost no accuracy drop. Proves        | importance-guided pruning beats
+   | "quantization" is viable for large models.  | plain PCA (energy-based pruning).
+   |                                              |
+   v                                              v
+[2024] Liu et al. - KIVI                     [2024] Yang et al. - MatryoshkaKV
+   |                                              |
+   | Brings quantization to KV cache;            | Brings Fisher-SVD thinking to KV
+   | INT2/INT4 both work with                    | cache; uses nested subspaces to
+   | negligible accuracy loss.                   | learn which dimensions matter.
+   |                                              |
+   |                                              v
+   |                                         [2025] Lesens et al. - KQ-SVD
+   |                                              |
+   |                                              | No learning needed — closed-form
+   |                                              | solution: SVD on the covariance
+   |                                              | of V·W^O. Strongest rank-reduction
+   |                                              | method at the time.
+   |                                              |
+   +----------------------+-----------------------+
+                          |
+                          | Under the same storage budget,
+                          | which wins: rank reduction or quantization?
+                          v
+            [2026] Salfati - QDRR (this paper)
+                          |
+                          | Quantization wins across the board, gap 4–364 PPL;
+                          | proved via softmax Fisher metric:
+                          | dimension deletion flips attention routing (discrete failure),
+                          | quantization is bounded noise (continuous perturbation).
+                          | Rank reduction is structurally untenable.
+                          v
+                  [Future] Sub-3-bit quantization?
+                          Adaptive precision?
+                          Quantization + token eviction combined?
+#+end_example
+
+Side branches (orthogonal to this paper, but contemporaneous competing approaches for KV cache compression):
+
+#+begin_example
+[2023] Zhang - H2O               [2023] Liu - Scissorhands
+   |                                |
+   +------------+-------------------+
+                |
+                | Neither compress dimensions nor reduce precision —
+                | simply evict some tokens entirely.
+                | A different axis altogether.
+                v
+        Findings from QDRR can be stacked with these methods
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Large Model Weights Can Run at 4-bit
+
+*** What Problem It Saw
+
+At the time, the prevailing belief was that quantizing neural networks to INT4 would break them — especially large models, where parameters are deeply entangled and any precision drop cascades everywhere. Mainstream LLMs all ran in FP16, with weight memory often reaching tens of gigabytes, making deployment extremely expensive.
+
+Prior quantization methods (QAT, PTQ-static) either required retraining or suffered severe accuracy drops on large models. At the scale of 65B OPT/BLOOM, no one dared touch INT4.
+
+*** Its Solution
+
+GPTQ's core is "layer-wise error compensation":
+
+Rather than simply rounding each weight to the nearest integer, it processes the weight matrix column by column: after quantizing column i, it uses second-order information (approximate Hessian) to compute how the quantization error should be "spread" onto the columns not yet quantized, so those later columns pre-compensate.
+
+Analogy: you're assembling a 1,000-piece jigsaw puzzle and every piece needs trimming. GPTQ's approach is to finish one piece, then immediately adjust the surrounding unfinished pieces based on that piece's deviation, minimizing the overall final error.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It worked because columns of a weight matrix are highly correlated — perturbing one column propagates to every neuron in the next layer. Pre-compensation eliminates a large portion of the second-order error.
+
+But GPTQ solved only half the problem — it compresses *weights*. The other half of inference memory is eaten by the *KV cache*, especially in long-context settings. GPTQ is powerless against the KV cache.
+
+The pit left behind: who handles the KV cache?
+
+** 2022 | FWSVD: Not All Dimensions Are Equally Important
+
+*** What Problem It Saw
+
+The classic approach to compressing a weight matrix was PCA or SVD — keep the top-k directions by variance, discard the rest. Intuitively reasonable: high-variance directions "carry more information."
+
+But FWSVD punctured a common misconception: *high variance ≠ important*.
+
+A direction with high variance might merely reflect the scale of the input distribution, with no bearing on its impact on the final loss. What actually matters is: if you perturb this direction, how much does the loss jump?
+
+*** Its Solution
+
+Fisher-information-weighted SVD.
+
+Concretely: instead of applying SVD directly to the weights, first estimate the second-order sensitivity of each weight to the loss (Fisher information as an approximate Hessian diagonal), then perform a weighted SVD — highly sensitive dimensions get large weights and are harder to prune.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+The intuition: when cutting a budget, cut the projects the boss doesn't care about, not the cheap ones. Fisher tells you which dimensions the loss "boss" actually cares about.
+
+But FWSVD was designed for weight matrices. Can it transfer to KV cache, which is a *runtime* activation? And the KV cache has a special property: it is immediately followed by a softmax — a role FWSVD never considered.
+
+The pit left behind: would transplanting the Fisher-SVD idea to the KV cache fix things?
+
+** 2024 | KIVI: Bringing GPTQ's Thinking to the KV Cache
+
+*** What Problem It Saw
+
+Two years after GPTQ, weight quantization had matured, but KV cache was still running in FP16. In long-context scenarios (32K+), KV cache occupies more memory than the weights and had become the new bottleneck.
+
+Directly applying GPTQ didn't work — GPTQ assumes you can slowly compute the Hessian offline for a fixed weight matrix. KV cache is generated incrementally, one token at a time during inference; there's no offline phase.
+
+*** Its Solution
+
+KIVI's core observation: the statistical distributions of K and V are different.
+
+- *Key matrices*: quantized per-channel — each feature dimension has its own scale.
+- *Value matrices*: quantized per-token — each token position has its own scale.
+
+Why this split? Because Keys have outliers (extremely large values) in certain channels; per-token quantization gets wrecked by those outliers dragging down the scale. Values don't have this problem; per-token quantization better adapts to the scale of each position.
+
+Result: INT4 with almost no accuracy drop; INT2 also runnable (slight drop but usable).
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It worked because it respected the structure of the KV cache — the existence of outliers in K cannot be ignored.
+
+But KIVI only paved the "quantization" path; it didn't answer the other question: *why not just cut dimensions for the same 4× savings? Trim 128 dims down to 32 and you're done, right?* No one had compared the two paths.
+
+The pit left behind: which path is actually better?
+
+** 2024 | MatryoshkaKV: Rank Reduction Can Learn "Nesting" Too
+
+*** What Problem It Saw
+
+KIVI took the "quantization" road. MatryoshkaKV looked at the other path: "rank reduction" — if KV lives in a low-dimensional subspace, just project there.
+
+Prior rank-reduction approaches were clumsy: decide once to cut to 32 or 64 dimensions, then retrain for each model and scenario. Inflexible.
+
+*** Its Solution
+
+Borrowing from Matryoshka representation learning: train the model to learn a set of *nested* subspaces — the first 32 dimensions are "the best projection when cutting to 32," the first 64 are "the best projection when cutting to 64," and all 128 is the full representation.
+
+At deployment, dynamically choose how many dimensions to keep based on memory budget.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It worked because the nested structure allows training once and deploying at multiple compression levels.
+
+But MatryoshkaKV *learns* its subspaces — training is required. Can we skip training and derive the optimal subspace in closed form?
+
+A deeper question: MatryoshkaKV never asks "why is rank reduction a good idea in the first place." It assumes KV has a low-rank structure, then works hard to find the best low-rank approximation. What if that assumption is wrong?
+
+The pit left behind: can we get a closed-form solution? And more fundamentally — is rank reduction itself a good idea?
+
+** 2025 | KQ-SVD: The Cleanest Closed-Form Solution for Rank Reduction
+
+*** What Problem It Saw
+
+MatryoshkaKV requires training — slow, expensive, dependent on training data. KQ-SVD said: I can give you the optimal projection without any learning.
+
+*** Its Solution
+
+Observation: value V is not isolated; it is immediately followed by W^O (the output projection). So what actually "hits the field" is not V but V·W^O.
+
+Therefore, rank reduction should be performed via SVD on the covariance of V·W^O, not on V's own covariance. One-sentence summary: *factor in the downstream geometry of W^O before deciding which dimensions to cut*.
+
+Closed-form. No training needed.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It worked because it explicitly incorporated "how V will be used downstream" into the optimization objective — smarter than PCA, which only looks at V's own energy distribution.
+
+KQ-SVD was the strongest rank-reduction method as of 2025. But it treated W^O as the entirety of the downstream — *it ignored the softmax that comes before W^O, which is actually what governs attention behavior*.
+
+This omission is the fatal blind spot of the entire rank-reduction line. The next paper would pierce it.
+
+The pit left behind: where is the softmax? What happens when we add softmax to the metric? And even the cleverest rank reduction still has to answer the most fundamental question — given the same storage budget, why not just quantize?
+
+** 2026 | QDRR: Same Budget, Quantization Wins — and It's Structurally Inevitable
+
+*** What Problem It Saw
+
+Everyone before had been optimizing within their own lane:
+
+- KIVI/GEAR only compared quantization methods against each other
+- MatryoshkaKV/KQ-SVD only compared rank-reduction methods against each other
+- The two lanes never competed head-to-head under *identical storage budgets*
+
+QDRR found: once you line them up on the same axis, *rank reduction loses every time, by large and monotonically growing margins*. On GPT-2, INT4 quantization yields 44.57 PPL; cutting to the equivalent-storage rank-32 gives 96.71 PPL — a gap of 52 points. On Qwen 3B (GQA-8), the gap stretches to 364 PPL.
+
+And the gap grows monotonically with GQA aggressiveness. MHA: 12–52; GQA-8: 21–364. This means *the more a model resembles real deployed configurations (aggressive GQA), the worse rank reduction performs*.
+
+More critically: even the "hybrid" approach — cut to 64 dims then INT8 quantize — cannot beat pure INT4. Keeping more dimensions at lower precision always beats keeping fewer dimensions at higher precision.
+
+*** Its Solution
+
+QDRR does not propose a new method; it provides a structural proof of *why* quantization must win.
+
+The core argument has two steps:
+
+*Step one: the geometry of softmax*. The essence of attention is softmax routing — scoring all previous tokens and taking a weighted sum. When the score gap Δ between the top-2 tokens is small, attention sits on a "decision boundary" where whichever token is even slightly higher monopolizes the attention weight.
+
+*Step two: the asymmetry of perturbation*. Under the softmax Fisher metric, perturbing a direction u:
+
+- *Rank reduction* (deleting dimension u): directly zeroes out that direction's contribution to the score gap Δ. If this dimension happened to give one token a Δ-point lead over its rival, attention flips — *discrete failure*.
+- *Quantization* (adding quantization noise along dimension u): the noise magnitude is bounded, O(λ_u / 2^b). A flip only occurs when the noise is large enough to cross Δ — which almost never happens at INT4.
+
+Formal result: projection damage / quantization damage = 3 × 2^(2b), which is 768× at INT4.
+
+QDRR also runs a critical control — *basis independence*. Switching to PCA basis, random orthogonal basis, or theorem basis changes quantization results by no more than 0.4 PPL. This proves: quantization wins not because it chose a better coordinate system, but because it *retains all dimensions*.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It works because it elevates a long-running debate from "empirical comparison" to "structural inevitability." In any softmax-routing system, deleting dimensions will lose to quantization, as long as quantization is fine enough (≥ 3 bits).
+
+The argument also incidentally explains why INT2 is bad — at INT2, the noise variance is large enough to cross typical score gaps Δ, triggering the same "flip failure" as rank reduction. So INT2 performs as badly as rank reduction (73–138 PPL) — not a coincidence, but the same mechanism.
+
+Pits left behind:
+
+- What about sub-3-bit quantization? INT2 already fails, but *adaptive* precision between 2 and 3 bits — more bits where Δ is small, fewer where Δ is large — has not been systematically explored.
+- Can the softmax decision-boundary observation be turned around to guide other attention optimizations (e.g., sparse attention)?
+- Orthogonal to token eviction (H2O/Scissorhands) and likely composable — but what is the optimal combined configuration?
+
+* Frontier Extensions
+
+QDRR appeared as a preprint in April 2026 and has no direct follow-up papers yet. But the openings it leaves suggest several obvious directions:
+
+- *Adaptive-precision quantization*: QDRR pinpoints the bottleneck at "decision boundaries" — attention positions where the top-2 score gap Δ is small. The natural next step: allocate more bits to those "dangerous positions" and fewer to "safe" ones. Early work on layer-wise adaptation exists, but QDRR implies the adaptation should be position-wise / head-wise.
+- *Quantization + token eviction combined*: H2O / Scissorhands drop tokens; QDRR keeps all tokens but quantizes them. The two can be multiplicatively stacked for 8× or even 16× compression, but the interaction when combining has not been quantified.
+- *Applying the softmax geometry elsewhere*: QDRR's core insight — "softmax routing's sensitivity to the structure of perturbations" — generalizes. MoE routers are also softmax. Might there be an analogous "deleting an expert is worse than reducing expert weight precision" structure? Where are the compression limits of sparse attention and top-k retrieval?
+
+QDRR's real contribution is not closing this area but opening a new lens on "what forms of compression are structurally safe for attention-based systems."
+
+* A Picture to Understand It All
+
+#+begin_example
+                    The KV Cache Compression Contest (2022 -> 2026)
+                    ================================================
+
+  Timeline ->    2022          2023          2024          2025      2026
+                |             |             |             |          |
+  Rank-red. line  FWSVD -----------------> MatryoshkaKV --> KQ-SVD --+
+   (rank          Fisher-wtd   (iterative    Nested         Closed-   |
+    reduction)    SVD          variants)     subspaces      form      |
+                                                                      |
+  Quant. line     GPTQ -------> AWQ -------> KIVI -------> GEAR -----+
+   (quant.)       INT4 wts     Act-aware     KV cache      +low-rank  |
+                               quant.        quant.        correction |
+                                                                      v
+  Token line      (orthogonal)   H2O / Scissorhands  --------> (orthogonal to this paper)
+
+                                                              ============
+                                                              QDRR (2026)
+                                                              ============
+                                                                |
+                                                                | "Stop competing
+                                                                |  over who has the
+                                                                |  better rank
+                                                                |  reduction"
+                                                                v
+                                              +-----------------------------+
+                                              | Under softmax routing:      |
+                                              | Delete dim  = discrete fail |
+                                              | Quantize    = bounded noise |
+                                              | Gap         = 3 x 2^(2b)   |
+                                              | Rank reduction structurally |
+                                              | loses                       |
+                                              +-----------------------------+
+
+  The essence of the compression–accuracy trade-off:
+      Not "choose the best coordinate system" — "don't delete any coordinate."
+
+  The directional choice (number of dims retained vs. precision per dim):
+      High-dim + low-precision  >  Low-dim + high-precision    (at ≥ 3 bits)
+      High-dim + ultra-low-prec ~ Low-dim + high-precision     (at ≤ 2 bits, both fail)
+#+end_example
+
+* Insights
+
+Reading through this line, what I see is not "quantization beat rank reduction" — it's something deeper:
+
+*Neural network compression has always involved a choice across two axes: "what to compress" (deciding which information to keep) and "how hard to compress" (deciding how much of each piece to keep). Intuitively the former seems smarter — you're making deliberate choices. But QDRR tells us: in a "decision-dense" system like softmax, making that choice is itself the mistake — because you cannot know which dimension will be the decisive Δ-carrier at which position.*
+
+Put another way:
+
+- Quantization is *uniform degradation* — every piece of information loses a little
+- Rank reduction is *violent amputation* — some information is gone entirely
+
+When the downstream operator is something as "structure-sensitive" as softmax, amputation is more dangerous than degradation — because what you amputate might be exactly the nerve that determines the outcome.
+
+The broader lesson: *the geometry of the downstream operator determines the legitimate forms of upstream compression.*
+
+- If downstream is linear, PCA-style "prune by energy" is good enough (linear systems respond smoothly to perturbations).
+- If downstream is softmax, you must retain all dimensions (decision boundaries are structure-sensitive).
+- If downstream is ReLU/gating, the conclusion may differ again (dead zones mean some dimensions are naturally discarded).
+
+FWSVD grasped "variance ≠ importance" back in 2022, but it didn't reach "retaining all dimensions > selecting important dimensions." QDRR pushes that observation to its extreme: when softmax is downstream, no subset-selection strategy can beat retaining everything.
+
+Where to go next? I suspect two directions:
+
+1. *Redesign compression around softmax geometry*: adaptive precision, allocating more bits to low-Δ regions. But this is still a refinement within the "quantization" framework.
+2. *Take this insight beyond KV cache compression*: MoE routers, sparse attention, top-k retrieval — all are variants of softmax routing. Where are their compression boundaries?
+
+* Takeaways
+
+The biggest lesson this evolutionary line offers for *how to do research*:
+
+*Don't just optimize within your own lane — run the cross-lane controlled experiment.*
+
+In KV cache compression, two lines iterated through countless variants from 2022 to 2025 — MatryoshkaKV and KQ-SVD were the pinnacle of rank reduction; KIVI and GEAR were the pinnacle of quantization. But no one ran "head-to-head under identical storage budgets."
+
+This controlled experiment was not technically hard at all — take the same model, the same dataset, match the storage budgets, measure PPL. The difficulty was not technical; it was *acknowledging that the two paths are fundamentally competing for the same resource*. Each community implicitly assumed its own line had independent value, and no one wanted to run the experiment that would embarrass half their peers.
+
+QDRR ran it, and found one side crushing the other.
+
+This suggests you can:
+
+- Identify *two parallel optimization lines* in your research area — typically different conferences, different subcommunities, each doing its own thing.
+- Design a *clearly quantifiable shared budget* — space, time, parameters, energy, any resource will do.
+- Run them head-to-head under that budget and see who wins.
+
+The results are often surprising. Either one side crushes (as here), or you discover the two are actually solving different problems (revealing the true point of disagreement). Both outcomes are more valuable than "our method improves by 0.3 PPL on dataset X."
+
+The sharper move: *give the winner a structural explanation*. QDRR didn't stop at "experiments show quantization wins" — it used the softmax Fisher metric to derive the concrete mathematical constant 3 × 2^(2b). This upgrades an "empirical finding" to an "inevitable law." A finding with a mathematical explanation propagates far further than a bare benchmark number — others can use your explanation to make predictions in entirely new settings.

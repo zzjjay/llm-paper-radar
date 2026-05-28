@@ -1,0 +1,411 @@
+#+title:      Open-TQ-Metal: Fused Compressed-Domain Attention for Long-Context LLM Inference on Apple Silicon
+#+date:       [2026-05-28 Thu 16:20]
+#+filetags:   :paper:river:kv_cache:quantization:attention:apple_silicon:
+#+identifier: 20260528T162007
+#+source:     https://arxiv.org/abs/2604.16957
+#+authors:    Sai Vegasena (Ensue)
+#+venue:      arXiv preprint, 2026-04-18
+
+* 问题之河
+
+想在一台普通的 64GB MacBook 上跑 Llama 3.1 70B 的完整 128K 上下文窗口——这件事，到 2026 年 4 月之前，*所有* 推理框架都做不到。
+
+不是算力不够，是 *内存* 不够。模型权重压到 4 比特占了 39GB，再加上 128K 长度的 KV 缓存（FP16 要 40GB），合起来 79GB，溢出 64GB 物理上限 15GB。你想买更大的 Mac？没有。Apple Silicon 的消费级硬件天花板就在这里。
+
+这条研究线的核心问题，就是：
+
+#+begin_quote
+*KV 缓存这堵内存墙，到底怎么翻？*
+#+end_quote
+
+这事难在好几件事同时拧巴：
+- KV 缓存随上下文 *线性* 膨胀，每加一个 token 就多一份；长上下文模型一火爆，这堵墙立刻顶到眼前
+- 你可以把它 *压缩*，但压完用的时候要 *解压* 回原始精度才能算注意力——解压本身就要写一个临时大矩阵到显存，带宽全耗在搬运上
+- 你可以激进地压（一比特、极坐标），但这些"巧妙"的压法在小模型上看着行，跑到 70B / 80 层深度时误差几何级累积，输出彻底崩
+- 不同模型架构的注意力 *缩放因子*（attn_scale）还不一样——同一种量化方法在 Llama 上岁月静好，在 Gemma 上直接乱码
+
+整条研究线就是在"压得多/算得快/算得准/换到不同架构还得稳"这四件事之间反复腾挪。Open-TQ-Metal 是这条线上第一个 *四头都吃下* 的工程实现，并且顺手证明了之前一些看似漂亮的方法在大模型上其实站不住。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 立柱: 自回归解码需要保留所有历史 K, V，这就是 KV 缓存的诞生
+  | 这个时候没人意识到它会变成内存瓶颈
+  v
+[2018] Milakov & Gimelshein - Online Softmax
+  |
+  | 顺手埋了一颗种子: softmax 可以"流式"算，不必先存下所有分数
+  | 五年后这颗种子长成 FlashAttention
+  v
+[2022/23] Dao et al. - FlashAttention / FlashDecoding
+  |
+  | 问题: 标准注意力要把 S x S 的分数矩阵写回显存，HBM 带宽吃满
+  | 解法: tile 化 + online softmax，注意力分数永远不离开片上缓存
+  |       FlashDecoding 进一步把 KV 序列切成 split-K 块并行
+  | 残留: 它优化的是"算"，没碰"存"——KV 缓存本身还是 FP16
+  v
+[2023] Kwon et al. - vLLM / PagedAttention
+  |
+  | 问题: KV 缓存碎片化、动态批处理时分配不连续，显存浪费 60%+
+  | 解法: 像操作系统管虚拟内存那样分页管理 KV
+  | 残留: 还是 FP16 存储——治了管理问题，没治容量问题
+  v
+[2024] Hooper et al. - KVQuant
+  | Liu et al. - KIVI / Kang et al. - GEAR
+  |
+  | 问题: 容量是真问题——10M context 用 FP16 直接没戏
+  | 解法: 把 KV 量化到 4 / 2 bit per-channel 或 per-token
+  |       outliers 单独存 FP16
+  | 残留: 算注意力时要先 dequant 回 FP16 / FP32，
+  |       重新生成一个全尺寸临时矩阵——省的显存又通过带宽吐回去
+  v
+[2024] Zandieh et al. - QJL
+  |
+  | 问题: 4-bit 还是太"老实"，能不能再激进一点？
+  | 解法: 随机 Gaussian 投影后只存符号位，1-bit 二值草图
+  |       query 端保持高精度，key 端二值化（非对称估计）
+  | 残留: 8B 模型 (32 层) 上 per-layer 相关性 0.85 看着够用
+  |       但没人在 70B (80 层) 上跑过——这是个深度炸弹
+  v
+[2025] Han et al. - PolarQuant
+  |
+  | 问题: 直接量化向量分量误差不规整，能不能换个坐标系？
+  | 解法: 把 KV 嵌入转极坐标，只量化角度
+  |       随机预处理后角度分布集中，不用归一化
+  |       声称 4.2x 压缩率
+  | 残留: 引入了"结构化角度误差" delta_theta——
+  |       这个误差进了 score = alpha * q^T * k 的 alpha 通道
+  |       谁告诉你所有架构的 alpha 都一样？
+  v
+[2025] Zandieh et al. - TurboQuant
+  |
+  | 问题: 把各家招式合一: MSE-optimal 标量量化 + 1-bit QJL 残差
+  | 解法: 随机旋转 + Lloyd-Max 码本 (3.5 bit/dim) + QJL 残差
+  | 残留: 又是只在 8B 模型上测过；
+  |       Metal / Apple Silicon 完全没碰；
+  |       fused kernel 也没写——只是个理论 + CUDA 实验
+  v
+[2026.04] Vegasena - Open-TQ-Metal  <-- 目标论文
+  |
+  | 把以上所有线 *第一次* 在 Apple Silicon 上拧成一根:
+  | 1. fused int4 SDPA Metal kernel (没有中间矩阵)
+  | 2. split-K via MLX Primitives (绕开 Metal 派发竞态)
+  | 3. 70B + 80 层验证 (拆穿 QJL 在深度上的崩溃)
+  | 4. 跨架构分析: 揭穿 PolarQuant 在 Gemma 4 (alpha=1.0) 上的失败
+  | 结果: 64GB Mac 上跑 Llama 70B @ 128K context, 注意力提速 48 倍
+  v
+[2026+] 待定: bandwidth wall, MoE, 2-bit weights, RULER 长上下文质量
+#+end_example
+
+注：vLLM 那一支主要解决 *管理* 维度，与本文 *压缩* 主线并列但分支。FlashAttention 是 *计算* 维度，最终在 Open-TQ-Metal 处与压缩线汇合。
+
+* 演化叙事
+
+** 2017 | Vaswani 等 *Attention Is All You Need*: 自回归推理需要 KV 缓存
+
+*** 它看到了什么问题
+
+RNN 必须一个 token 接一个 token 算，序列长了就慢得没法用。整条 NLP 线在 2017 之前都被这个 *顺序性* 吊在那里。
+
+*** 它的解法
+
+干脆扔掉 RNN，整个 transformer 用注意力机制堆起来。训练时所有 token 并行算，速度暴涨。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行的代价是 *推理时* 要保留所有历史 token 的 K, V 投影——后面每生成一个新 token，都要让它和前面所有的 K, V 算注意力。这堆缓存就是 *KV 缓存*。
+
+2017 年的论文几乎没提这件事——那会儿模型小、上下文短，KV 缓存几百兆顶天，没人觉得是问题。这颗种子要等十年才发芽成 80GB 的内存怪兽。
+
+** 2018 | Milakov & Gimelshein *Online Softmax*: softmax 可以流式算
+
+*** 它看到了什么问题
+
+标准 softmax 需要先看完所有分数才能做归一化（要找 max，再算分母）。这就要求把整个分数向量先 *物化* 在内存里。
+
+*** 它的解法
+
+边扫边维护两个状态：当前已见的 max 值和 running sum of exp。新来一个值就更新这两个状态，等于"流式归一化"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是个看似无关紧要的数值技巧，但它打开了一扇门：*你可以不必先把所有 attention 分数写在显存里，再做 softmax*。
+
+当时没人意识到这意味着什么。五年后 FlashAttention 把它捡起来，从根本上改变了注意力的计算方式。
+
+** 2022-23 | Dao 等 *FlashAttention / FlashDecoding*: 把注意力 fuse 起来，分数永远不出片上缓存
+
+*** 它看到了什么问题
+
+标准注意力 ~softmax(QK^T / sqrt(d)) V~ 要把 ~S x S~ 的分数矩阵写回显存（HBM），然后再读回来算 softmax，再写回，再读，再乘 V。带宽全消耗在 *搬运一个临时大矩阵* 上。
+
+*** 它的解法
+
+把 Q 切成小 tile，每个 tile 在片上缓存里完成 ~Q_i K^T -> softmax -> 乘 V~ 的全流程，靠 online softmax 维护中间状态，*分数矩阵根本不写回显存*。FlashDecoding 在解码阶段进一步把 KV 序列切成 split-K 块，让多个工作组并行处理同一个 query。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它对症下药——transformer 在 GPU 上不是算力受限，是 *带宽受限*。少搬数据，提速立竿见影。
+
+但它优化的是 *计算路径*，KV 缓存本身的 *存储格式* 没动。70B 模型的 80GB FP16 KV 缓存，FlashAttention 救不了你。
+
+** 2023 | Kwon 等 *vLLM / PagedAttention*: 像 OS 管虚拟内存一样管 KV
+
+*** 它看到了什么问题
+
+服务端推理时，多个请求的 KV 缓存动态进出，传统连续分配方式造成 60%+ 的显存碎片浪费。一个 80GB 显卡可能 50GB 在闲置但分配不出来。
+
+*** 它的解法
+
+把 KV 缓存切成固定大小的 *页*，用页表索引——和 OS 的虚拟内存一模一样的思路。还能支持 prefix sharing、copy-on-write 等高级玩法。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+工程上石破天惊，催生了今天几乎所有生产级推理框架。但 *它解决的是管理问题，不是容量问题*。如果你的单个请求就需要 79GB（128K context 的 Llama 70B），分页救不了你——你需要把每个 token 的 KV 本身变小。
+
+** 2024 | Hooper 等 *KVQuant / KIVI / GEAR*: 把 KV 缓存量化到 4-bit
+
+*** 它看到了什么问题
+
+容量问题终于被正面回应：FP16 KV 缓存就是太大了。Hooper 等人甚至直接喊出 "10M context"——那种规模 FP16 根本不可能。
+
+*** 它的解法
+
+把 K 和 V 量化到 4-bit（甚至 2-bit）。KVQuant 按 channel 量化 K、按 token 量化 V（因为 K 在 channel 维度有 outliers）；GEAR 用残差矩阵 + 低秩近似补回精度。outliers 单独存 FP16。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+显存占用一刀砍到 1/4。但 *计算注意力的时候* 必须先 dequant 回 FP16/FP32 才能做 ~Q K^T~——这就生成了一个新的临时 ~S x d~ 大矩阵写回显存。
+
+具体到 Gemma 4，950 tokens × 50 层就要 742MB 临时矩阵。你 *省下的显存通过带宽又吐回去了*——内存压力变带宽压力。
+
+这是 Open-TQ-Metal 的核心打击对象之一：*为什么要 dequant？*
+
+** 2024 | Zandieh 等 *QJL*: 一比特的 KV 草图
+
+*** 它看到了什么问题
+
+4-bit 还是太"老实"，每个值乖乖存 4 个比特。能不能换个角度，搞一个超激进的压法？
+
+*** 它的解法
+
+把 key 投影到随机 Gaussian 矩阵上，*只存符号位*——每个分量 1 bit，就是 -1 或 +1。query 端保持高精度，注意力分数靠"sketch * full"的非对称方式估计。压缩率轻松 5x+。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+理论上 random projection 加符号化能保持相对相似度（参考 SimHash / Hyperloop 思路）。每层 per-token score 的相关系数 ρ ≈ 0.85，看着还行。
+
+*但论文只在 8B 模型 (32 层) 上测过*。32 层下 0.85^32 ≈ 0.006，勉强能用。
+
+Open-TQ-Metal 后来在 70B (80 层) 上一跑——~0.85^80 ≈ 2 × 10^-6~，信号彻底湮没在噪声里。生成出来全是重复 token。这个失败模式 *只有跑到大模型才暴露*。
+
+** 2025 | Han 等 *PolarQuant*: 极坐标量化，只动角度
+
+*** 它看到了什么问题
+
+QJL 是直接在分量维度做激进压缩。能不能换个坐标系，让误差分布更"友好"？
+
+*** 它的解法
+
+把 KV 嵌入向量从笛卡尔坐标递归地转成极坐标（半径 + 角度），只量化角度。经过随机预处理后，角度分布高度集中，连归一化都省了。声称 4.2× 压缩率。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学上很优雅——结构化的角度误差 ~delta_theta~ 比按分量的随机误差更可控。在 Llama 上跑出来 cosine 相似度 0.989 (5-bit)，简直完美。
+
+*但他们没在 Gemma 上测过*。这里埋了一颗哲学层面的炸弹：角度误差进入注意力分数的方式是
+
+#+begin_example
+    delta_score = alpha * |q| * |k| * (1 - cos(delta_theta))
+#+end_example
+
+注意那个 ~alpha~——*注意力缩放因子*。Llama 的 alpha = ~1/sqrt(128) = 0.0884~，是标准的；Gemma 4 的 alpha = ~1.0~，是 11 倍。同一个 delta_theta，进入 softmax 的扰动直接放大 11 倍，再经过 60 层指数累积，输出彻底崩成乱码。
+
+这是 Open-TQ-Metal 第二个核心发现：*量化方法的好坏不是模型大小决定的，是 attn_scale 决定的*。
+
+** 2025 | Zandieh 等 *TurboQuant*: 综合派——MSE-optimal + QJL 残差
+
+*** 它看到了什么问题
+
+各家方法都有所长：标量量化稳健，QJL 压得狠，PolarQuant 角度友好。能不能合一？
+
+*** 它的解法
+
+主干用 MSE-optimal 标量量化（随机旋转 + Lloyd-Max 码本），残差用 1-bit QJL 转换补回精度。理论上 3.5 bit/dim 质量中性，2.5 bit 仅轻微退化。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学最 *complete*——把误差按贡献度分层压缩。但是：
+
+1. *又是只在 8B 模型上验证*。叠加方法的误差累积模式没人在大模型上测过
+2. *没碰 Apple Silicon / Metal*。整个研究脉络都假设 CUDA 生态
+3. *没写 fused kernel*。Dequant-then-attend 的带宽包袱原封不动
+4. *没考虑跨架构的 alpha 问题*。Gemma 4 的 attn_scale=1.0 这个魔鬼依然潜伏
+
+到这里，整条研究线的几乎所有"压缩聪明"都在桌上了，但 *没有人把它们和 fused compute 真正结合，也没有人在不同架构上诚实地复现*。
+
+** 2026.04 | Vegasena *Open-TQ-Metal*: 把所有线拧成一根
+
+*** 它看到了什么问题
+
+把整条研究线倒过来看，三个洞清晰可见：
+
+1. *Dequant-then-attend 是带宽自残*。KV 量化省的显存通过 dequant 临时矩阵又付回去
+2. *小模型验证不代表大模型 work*。QJL 在 8B 上能跑，在 70B 上信号归零
+3. *单架构验证不代表跨架构 work*。PolarQuant 在 Llama 上完美，在 Gemma 4 上乱码——而没人解释为什么
+
+*** 它的解法
+
+四件事拧成一个完整工程：
+
+1. *Fused int4 SDPA Metal kernel*。Metal compute shader 直接读 packed int4 KV，*在 GPU 寄存器里* 用 bitwise 操作解 nibble，online softmax 一遍过——*零中间矩阵*。
+
+   关键技巧叫 *vectorized nibble extraction*：把 query 预先除以 ~{1, 16, 256, 4096}~，与 ~{0x000F, 0x00F0, 0x0F00, 0xF000}~ 四个 mask 同时点乘，一次提取 4 个 nibble。借鉴自 MLX 的 ~qdot~ pattern。
+
+2. *Split-K via MLX Primitives chained through computation graph*。128K context 单线程跑 480ms 一头，必须并行。但 Metal 同一个 ~eval_gpu()~ 内的多次 dispatch *没有顺序保证*——是个 race condition。
+
+   解法：把 partial 阶段和 reduce 阶段写成两个独立的 MLX Primitive，让 reduce 把 partial 的输出作为输入——*lazy evaluation 自然把它们串起来*。优雅。
+
+3. *70B + 80 层验证*。第一次有人在真正的大模型上跑 QJL 和 PolarQuant，QJL 的深度炸弹和 PolarQuant 的架构炸弹同时暴露。
+
+4. *Cross-architecture quantization analysis*。建立了"attn_scale 是量化方法成败的关键变量"这个新认知。整条研究线之前都假设量化方法的好坏由 *方法本身* 和 *模型大小* 决定——错了。是 *模型架构的注意力缩放因子*。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+四个数字说明一切：
+- 注意力 kernel 提速 48× (128K context, Llama 70B)
+- KV 缓存压缩 3.2× (40GB → 12.5GB)
+- 64GB Mac 跑 Llama 70B @ 128K 成为可能（之前所有框架都不行）
+- Top-1 token 与 FP16 *完全一致*（贪心解码下）
+
+留下的新坑也很坦诚：
+- *Bandwidth wall*：注意力优化到极致后，weight loading 成为新瓶颈（39GB / 400GB/s ≈ 98ms/token 是物理下限）。这指向 MoE / 2-bit weights / 推测解码作为下一波
+- *长上下文质量* 没在 RULER / Needle-in-Haystack 上系统验证
+- *硬件锁定* 在 Apple Silicon——算法可迁，kernel 要重写
+- *与 mlx-lm 的 18% 吞吐差距* 来自 KV 缓存管理（concat vs pre-alloc），不是注意力 kernel 本身
+
+* 前沿延伸
+
+论文 2026 年 4 月才出，目前这条线的"延伸"主要由作者自己在 Discussion 里指出来：
+
+- *Bandwidth wall 下一步*：要么压权重到 2-bit（但作者实验显示 2-bit weights 在 Metal 上反而慢 0.67×，需要专门 kernel），要么走 MoE（Gemma 4 MoE 变体激活 4B 参数已经跑到 59 tok/s，4× 提升），要么靠 speculative decoding（但 25% 接受率不够，需要更聪明的 draft）
+- *跨架构分析的延伸*：作者隐约暗示，未来模型设计可能要把 ~attn_scale~ 列为可量化性的一等公民——这反过来影响架构选择
+- *Ensue distributed memory network*：作者把 330 个实验交给 8-agent loop 自主跑（orchestrator / profiler / reflector / ...）。这套基础设施本身是研究方法学上的延伸，可能比单篇论文更有长期影响
+
+截至 2026-05，这条线公开的最新一篇就是 Open-TQ-Metal 本身。后续工作大概率会沿三个方向分裂：
+1. 把 fused compressed-domain attention 移植到 CUDA + 大模型云推理
+2. 设计 *quantization-aware architecture*——选 attn_scale 时考虑量化稳健性
+3. KV 缓存压缩 + MoE bandwidth 节约 *组合*——这两件事在 bandwidth wall 之下天然互补
+
+* 一张图看懂
+
+#+begin_example
+                          THE KV CACHE WALL: 2017 -> 2026
+
+  存储                                                    计算
+  -------                                                 ---------
+                              [2017]
+                              Vaswani: KV cache exists
+                              "no one cares yet"
+                                  |
+                                  |              [2018] Milakov:
+                                  |              online softmax
+                                  |              (a seed)
+                                  |                       |
+                                  |                       v
+                                  |              [2022-23] FlashAttention
+                                  |              fused compute, no
+                                  |              materialized scores
+                                  |                       |
+                                  v                       |
+                              [2023] vLLM/PagedAttn       |
+                              manage FP16 KV              |
+                              (no compression yet)        |
+                                  |                       |
+                                  v                       |
+                              [2024] KVQuant/KIVI/GEAR    |
+                              quantize to 4-bit           |
+                              BUT dequant before attend   |
+                              (storage wins, BW loses)    |
+                                  |                       |
+                                  v                       |
+                              [2024] QJL: 1-bit sketch    |
+                              (8B only — 70B blows up)    |
+                                  |                       |
+                                  v                       |
+                              [2025] PolarQuant: angular  |
+                              (Llama only — Gemma         |
+                              alpha=1.0 blows up)         |
+                                  |                       |
+                                  v                       |
+                              [2025] TurboQuant: combo    |
+                              (8B + CUDA only)            |
+                                  |                       |
+                                  +-----------+-----------+
+                                              |
+                                              v
+                                  [2026.04] Open-TQ-Metal
+                                  - FUSED int4 SDPA (no dequant mat)
+                                  - Split-K via MLX graph chaining
+                                  - 70B / 80-layer validation
+                                  - Cross-arch attn_scale theory
+                                  - First on Apple Silicon
+                                              |
+                                              v
+                                  64GB Mac: Llama 70B @ 128K
+                                  48x attn speedup, 3.2x KV compr
+                                              |
+                                              v
+                                  Next bottleneck: weight bandwidth
+                                  (MoE? 2-bit weights? speculative?)
+
+
+  Pattern:  compression methods marched ahead of the validation surface.
+            Open-TQ-Metal pulled the validation surface forward by 10x
+            (model size) and 2x (architectures), and a lot of
+            "elegant" methods didn't survive.
+#+end_example
+
+* 洞见
+
+*整条研究线背后真正在发生的事：*
+
+KV 缓存压缩这条线，前五年（2022-2025）都在 *做加法*——更激进的压缩格式、更巧妙的数学变换、更高的理论压缩比。每一篇都比上一篇"压得更狠"。
+
+Open-TQ-Metal 不是这个意义上的"更狠"——它的压缩比甚至比 PolarQuant 还低（3.2× vs 4.2×），比 QJL 低得多。但它做了三件 *之前没人做* 的事：
+
+1. *Fuse*——不再是"先压缩存储，用的时候解压"，而是"压缩存储 + 压缩域计算"统一在一个 kernel 里。这其实是 FlashAttention 哲学（不物化中间矩阵）的延伸应用
+2. *Validate honestly*——在真正的大模型 / 真正的不同架构上跑。结果，*之前评测里看起来漂亮的方法纷纷露馅*。QJL 在 32 层 0.85 看着行，80 层就归零；PolarQuant 在 Llama 上 0.989 看着完美，Gemma 上乱码
+3. *Find the right axis of variation*——把跨架构差异归约到一个数 (~attn_scale~)。这不是压缩算法的进步，是 *理解层面* 的进步：之前大家以为"量化方法 × 模型大小"是评测维度，现在发现"量化方法 × 注意力缩放因子"才是
+
+这条线背后真正在发生的，是 *评测维度的觉醒*。算法本身的"聪明度"已经几乎过饱和，下一波进步来自 *谁能更诚实地暴露算法的失败模式*。
+
+另一个不显眼的变化：*计算与存储的边界正在消失*。FlashAttention 已经让"score 矩阵"消失，Open-TQ-Metal 让"dequant 矩阵"也消失。下一步——*weight 也不必先解压再做矩阵乘*？这其实就是 weight-only quantization fused kernel 已经在做的方向，但还没和 KV 这条线汇合。
+
+*下一步最可能往哪走：*
+
+1. *Quantization-aware architecture design*——选 attn_scale、选 QK norm 方式时把"是否对 KV 量化友好"列进设计约束
+2. *Bandwidth-first inference stack*——一旦注意力被压到 ~10ms，权重带宽就是新瓶颈。MoE + 激进 weight quantization 会主导下一波。但代价是模型架构的同质化压力
+3. *Validation-as-a-research-product*——Open-TQ-Metal 的 330 个实验 + 多智能体编排系统，本身可能比单个论文更有长期影响。"我能在你之前发现你方法的失败模式"这件事，可能成为下一代论文的核心贡献
+
+* 启发
+
+*对怎么做研究：*
+
+- *小模型上 work 不代表大模型上 work*。深度累积是几何级的——0.85 在 32 层 vs 80 层是完全不同的故事。"在 8B 上验证"是个 *修辞*，不是 *证据*
+- *单架构上 work 不代表跨架构 work*。Llama 和 Gemma 看起来都是 transformer，但 ~attn_scale~ 一个数字就让同一个量化方法天差地别。永远去问：*你的方法对架构的哪个具体参数敏感？*
+- *最有价值的论文常常不在"提出新方法"，而在"诚实地揭穿旧方法"*。Open-TQ-Metal 的核心智力贡献——~attn_scale~ 决定量化方法成败——价值可能超过它的 fused kernel 本身
+
+*对怎么找问题：*
+
+- *系统性扫描评测维度*。当一条线已经迭代了几年，方法越来越"巧"，往往意味着评测维度被规训了。这时候挑一个 *从来没人正经评测过* 的维度（比如这里的"跨架构 attn_scale"），大概率能挖到金子
+- *把存储和计算的边界擦掉*。每当某个临时大矩阵被消除，就有一波带宽红利。KV 量化的下一步、weight 解压的融合、grad 累积的融合——都是同一个模式
+
+*对你具体能做的：*
+
+- 你现在可以在 64GB Mac 上跑 Llama 70B @ 128K 长上下文了（之前不行）
+- 选量化方法时，先看模型的 ~attn_scale~——标准 ~1/sqrt(d)~ 的可以放心试 PolarQuant；非标准（Gemma 4 / DeepSeek-V3 / 某些定制架构）要先做 cosine 相似度检验
+- 评测一个新 KV 压缩方法时，至少在两个数量级的模型大小 × 两种不同 ~attn_scale~ 上跑——这是 Open-TQ-Metal 给整个领域立的最低门槛
+- 写 fused kernel 时，"在 register 里就把它解了"是个比"先存再读"强很多的模式——这是 FlashAttention 哲学的扩展

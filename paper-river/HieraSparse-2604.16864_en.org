@@ -1,0 +1,249 @@
+#+title:      HieraSparse: Hierarchical Semi-Structured Sparse KV Attention
+#+date:       [2026-05-28 Thu 00:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T000000-en
+#+source:     https://arxiv.org/abs/2604.16864
+#+authors:    Haoxuan Wang, Chen Wang
+#+venue:      arXiv:2604.16864 (cs.DC), Apr 2026
+
+* The River of Problems
+
+Where does long-context LLM inference get slow, and where does it get expensive?
+
+Attention is O(n^2): every time the sequence doubles, both compute and memory grow quadratically. As context stretches from 4K to 128K and then to 1M, something that used to wrap up "in a few milliseconds"—one token decode—now needs to rummage through tens of gigabytes of KV Cache. That cache alone can consume an entire GPU's memory for a single request.
+
+So for the past few years everyone has been doing the same thing: *pruning the KV Cache*. Prune coarsely—drop whole layers, heads, or token blocks—and it's fast but hurts the model. Prune finely—examine element by element—and it's precise but never fast enough. The field has been stuck on a seemingly unsolvable tradeoff: *if you want fine granularity, the hardware won't play along; if you want hardware acceleration, you have to prune coarsely.* HieraSparse is here to cut that knot.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNNs are sequential and slow
+  | Solution: full attention — but plants the O(n^2) time-bomb
+  v
+[2022] FlashAttention (Dao et al.)
+  |
+  | Problem: intermediate attention matrix P takes O(n^2) memory
+  | Solution: tiling + online softmax, never materialising P
+  | Residual issue: compute is still O(n^2), KV Cache still grows linearly
+  v
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | Problem: KV Cache keeps growing during streaming generation
+  | Finding: the first few tokens are "attention sinks" —
+  |          every head keeps attending to them no matter how long the sequence
+  | Solution: keep sinks + a recent-token sliding window, discard the rest
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | Problem: position-based heuristics (start + recent) are too rigid
+  | Solution: dynamically retain "heavy hitters" by cumulative attention score
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Problem: H2O recomputes scores every step — high online overhead
+  | Solution: use an observation window at the end of prefill to predict
+  |           which tokens to keep, then lock in the decision once
+  v
+[2025] MUSTAFAR (Kim et al.)
+  |
+  | Problem: whole-token dropping is too coarse, information loss is high
+  | Solution: element-wise (unstructured) magnitude pruning of KV Cache
+  | Residual issue: sparse operators do "load-as-sparse, compute-as-dense" —
+  |       bandwidth saved, compute not; prefill incurs ~12% compression overhead
+  v
+[2026] HieraSparse (this paper)
+  |
+  | Problem: can we have fine-grained quality AND real hardware acceleration?
+  | Solution: N:M semi-structured sparsity + hierarchical (block-level
+  |           dense/sparse mixing) + direct feeding to GPU sparse tensor cores
+  v
+[Future] ?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Turning "Read the Whole Document" into One Matrix Multiply
+
+*** What Problem It Saw
+
+RNNs and LSTMs process sequences one token at a time, leaving GPUs—designed to run ten thousand workers in parallel—mostly idle. Training on long sequences was both slow and difficult.
+
+*** Its Solution
+
+Break the temporal chain. Let every position directly compute dot products between its Query and all Keys, then softmax-weight the Values—one matrix multiply settles "who should attend to whom."
+
+*** Why It Worked (and What New Pit It Dug)
+
+Matrix multiplication is inherently parallel, perfectly suited to GPU hardware. But the cost was baked in: the intermediate matrix Q × K^T is n × n, and *quadratic explosion* follows as sequences grow. Every subsequent paper is paying off that debt.
+
+** 2022 | FlashAttention: The Intermediate Matrix Need Not Be Written to Memory
+
+*** What Problem It Saw
+
+At n = 64K, the 64K × 64K attention score matrix simply cannot be written to HBM—and even if it could, the round-trip HBM bandwidth is slower than the computation itself. The bottleneck is memory bandwidth, not arithmetic throughput.
+
+*** Its Solution
+
+Tiling + online safe-softmax. Process one small block of Q and K at a time, maintain running row-level max and log-sum-exp incrementally, and never materialise the full P matrix in HBM.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It reordered compute and data movement—all intermediates stay in on-chip SRAM. But it left *compute volume* untouched, and KV Cache still had to be stored. In other words: FlashAttention stopped the *matrix* from exploding; it did nothing about the *cache* explosion. The next wave of focus shifted to the KV Cache itself.
+
+** 2023 | StreamingLLM: Most Tokens Aren't Really Attended To
+
+*** What Problem It Saw
+
+Chatbots need to converse indefinitely, yet KV Cache cannot grow indefinitely. Simply dropping early tokens, however, causes the model to "collapse"—it starts producing incoherent output.
+
+*** Its Solution
+
+Empirical observation revealed a counterintuitive fact: the very first tokens in a sequence act like "attention sinks"—no matter how long the sequence, every head keeps attending to them. Keeping those sinks permanently, plus a sliding window of recent tokens, allows everything in between to be discarded safely.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It surfaced the key insight that *information density is non-uniform*—the founding theme of all subsequent KV pruning work. But StreamingLLM's decisions are driven entirely by *position* (beginning + end), which is rigid. Genuinely important tokens that appear in the middle get discarded just the same.
+
+** 2023 | H2O: Let Scores Decide, Not Positions
+
+*** What Problem It Saw
+
+"Beginning + recent" is a blunt assumption. The truly "important tokens" should be defined by how much attention they collectively receive, not by where they sit.
+
+*** Its Solution
+
+Maintain a cumulative attention score for every token and at each step evict the lowest-scoring token (heavy-hitter oracle). This turns "which tokens to keep" from a static rule into a dynamic scoring problem.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Quality improved. But updating scores and maintaining rankings at every decode step introduces *online overhead*. It also only addresses cache growth during the decode phase; prefill still has to compute the full sequence.
+
+** 2024 | SnapKV: Predict Who to Keep, Decide Once
+
+*** What Problem It Saw
+
+H2O's "re-select every step" approach is heavy. Can we make the keep/drop decision *once*, lock it in, and never compute it again?
+
+*** Its Solution
+
+One observation: at the end of prefill, the attention distribution from the last few tokens (an observation window) over earlier history already predicts well which positions future decode steps will attend to. So compute a top-k over that window at the end of prefill, retain those KVs, and discard everything else.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Turning dynamic online work into a one-time offline decision slashes overhead dramatically. But SnapKV shares a fundamental limitation with H2O: *whole-token dropping is too coarse*. A token is a high-dimensional vector; perhaps 80% of its dimensions are noise and 20% are critical—coarse-grained methods must keep or drop the whole thing and cannot excise just the noisy part.
+
+** 2025 | MUSTAFAR: Element by Element
+
+*** What Problem It Saw
+
+Token vectors are high-dimensional and their elements are far from equally important. Key caches exhibit "outlier ridges"—certain channels are large across all tokens while others are near zero. Coarse-grained methods are blind to this structure.
+
+*** Its Solution
+
+Unstructured pruning—directly zero out elements in the KV Cache whose magnitudes fall below a threshold, down to individual scalars. Analysis showed that Keys are best pruned per-token, while the choice of how to prune Values matters comparatively little.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Quality wins at the same sparsity level—fine granularity preserves much more than token-level dropping does. But *the hardware won't play along*. Existing sparse operator frameworks (cuSPARSE and kin) operate as "load-as-sparse, compute-as-dense": data is read from memory in compressed form (saving bandwidth), but must be decompressed back into a dense matrix before the compute units can touch it. Result:
+
+- *Prefill* (compute-bound): zero acceleration, because the compute was always the bottleneck
+- *Decode* (bandwidth-bound): marginal bandwidth savings at best
+- *Extra cost*: converting to the sparse format itself imposes a ~12% latency tax
+
+MUSTAFAR therefore left an awkward situation: *algorithmically you can see the benefits of fine granularity; systematically you cannot collect them.*
+
+That is the scene HieraSparse inherits.
+
+** 2026 | HieraSparse: Actually Spinning Up the GPU's Sparse Units
+
+*** What Problem It Saw
+
+MUSTAFAR's dead end is "unstructured." GPUs have dedicated hardware—sparse tensor cores, available since Ampere and continuing through Hopper and AMD MI300X—specifically built to accelerate *N:M semi-structured sparsity* (exactly N non-zeros in every M consecutive elements, e.g., 2:4). This hardware lets sparse matrix multiplications complete in the same number of cycles as dense ones, effectively delivering 2× throughput and 25% bandwidth savings for free.
+
+But N:M sparsity carries a hard constraint: you must *force exactly N non-zeros in every group of M*, regardless of which values matter. Naively applying N:M to the KV Cache means punching holes in attention sinks and heavy hitters—the very regions that *must* be preserved—and quality collapses.
+
+*** Its Solution
+
+*Hierarchical* thinking. Partition the KV Cache into blocks; each block is either entirely dense (covering critical regions) or entirely N:M sparse (covering ordinary regions). Both block types coexist in a unified memory pool, indexed by a block index mapping.
+
+Then comes the genuinely hard part—the *kernels*:
+
+1. *Both GEMMs in FlashAttention-style attention must be sparsified*: but sparse tensor cores compress only the first operand. During decode the Q·K^T phase has dense Q that needs re-layout; during prefill it is more complex still, requiring dense and sparse blocks to be mixed inside a single kernel.
+2. *Online compression kernel*: converting to N:M format is traditionally expensive. They design a near-zero-overhead online compression pass fused into the prefill pipeline that adds almost nothing to TTFT.
+3. *In-fragment re-layout, asynchronous pipelining, and dedicated on-chip allocation*: assembling all these pieces is what finally keeps the sparse units running at full utilisation.
+
+*** Why It Worked (and What New Open Questions It Leaves)
+
+It wins on three dimensions simultaneously:
+- At the same sparsity level: 1.2× better compression ratio than MUSTAFAR + 4.57× attention speedup (decode)
+- First work to bring semi-structured sparsity into the *prefill* phase, achieving up to 1.85× speedup there
+- Using the simplest magnitude pruning, end-to-end: 1.37× prefill / 1.77× decode speedup with no quality drop
+
+Open questions going forward:
+- The block-level dense/sparse partition currently uses simple magnitude heuristics—can it be learned?
+- 2:4 already runs on Ampere; will future, more aggressive patterns (1:4, 4:8) get hardware support?
+- Can HieraSparse be stacked with quantization (INT4/FP8 KV) and long-context position extrapolation methods (YaRN, etc.)?
+
+* Frontier Extensions
+
+HieraSparse was published in April 2026 and, as of 2026-05-28, is still very new—*no follow-up papers that explicitly target it for improvement have been identified yet.* Observable directions (based on concurrent community activity; subject to future verification):
+
+- *Combining with KV quantization*: the QServe/KVQuant line pursues low-bit quantization; HieraSparse pursues sparsity. The two are orthogonal, and the most natural confluence is "sparsity + 4-bit/FP8 simultaneously."
+- *More aggressive sparsity patterns*: whether post-H100/MI300X GPUs will support 1:4 or dynamic N:M will determine how much further this road can go.
+- *Learned block selection*: today's dense/sparse partition is a hand-crafted heuristic; a learnable predictor could unlock another 10–30% quality headroom.
+
+As of now, HieraSparse represents the latest advance on the frontier of "fine-grained quality + genuine hardware acceleration."
+
+* One-Picture Summary
+
+#+begin_example
+              KV Cache Compression Evolution — from "Algorithmically Elegant" to "Hardware-Cooperative"
+
+Time  Method          Granularity    HW Acceleration  Prefill   Decode  Key Insight
+----  -----------     -----------    ---------------  -------   ------  -----------
+2017  Transformer     -              dense TC         yes       yes     Full attention, but leaves O(n^2)
+                                                                        |
+2022  FlashAttn       -              dense TC         yes       yes     Matrix OK, Cache still growing
+                                                                        v
+2023  StreamingLLM    token(pos.)    skip-compute     no        yes     Non-uniform density: sinks!
+                                                                        |
+2023  H2O             token(dynamic) skip-compute     no        yes     Score-based, but heavy
+                                                                        v
+2024  SnapKV          token(once)    skip-compute     no        yes     One-shot decision, still whole-token
+                                                                        |
+2025  MUSTAFAR        element        load-sparse,     no        weak    Fine granularity, HW won't play
+                      (unstruct.)    compute-dense                      |
+                                                                        v
+2026  HieraSparse     block + N:M    SPARSE TC        YES 1.85x YES     Hierarchical + semi-structured:
+                      element                         4.57x             first real hardware acceleration
+#+end_example
+
+* Insights
+
+This river looks like "algorithms getting progressively finer," but every genuine turning point is not a change in *algorithm*—it is a change in *hardware assumption*.
+
+- StreamingLLM / H2O / SnapKV all assumed the hardware could "skip computation"—so they drop whole tokens, because only that lets you skip entire blocks.
+- MUSTAFAR assumed the hardware supports GEMM with *arbitrary* sparsity patterns—that assumption was wrong, so its precision advantage never cashed out at the system level.
+- HieraSparse is the first paper to reason *in reverse*: start from what the hardware is actually willing to accept (N:M semi-structured sparse tensor cores), then work backward to determine what pruning granularity the algorithm should use.
+
+This is a recurring pattern in ML systems research—*algorithms that actually land in production are shaped by the underlying hardware.* Transformer beat RNN not just because the idea was good, but because it happened to be the shape GPUs love. FlashAttention beat vanilla attention because it reordered computation into the shape SRAM loves. HieraSparse beats MUSTAFAR because it reshapes the sparsity pattern into the form sparse tensor cores love.
+
+Where next moves are most likely to come from:
+
+1. *Hardware-aware mixed compression*: sparsity + quantization in one kernel, sparse tensor cores fed INT4/FP8 instead of FP16.
+2. *N:M-awareness at training time*: pruning is currently post-hoc; if models are trained to naturally produce N:M-friendly attention patterns, quality loss can approach zero.
+3. *Learned block partitioning*: let the model itself decide which regions go dense and which go sparse.
+
+* Takeaways
+
+For research: *Don't pile up algorithmically beautiful ideas before checking what the hardware is willing to eat.* A method that is "algorithmically superior but yields zero system speedup" is, in industrial terms, the same as nonexistent. The gap between MUSTAFAR and HieraSparse is not a matter of who is smarter—it is that HieraSparse's authors read the NVIDIA PTX documentation one more time.
+
+For engineering: *"load-as-X, compute-as-Y" is a diagnostic pattern that recurs constantly.* Whenever you see a method claiming to "save X," ask: is it saving bandwidth or compute? Which one is the actual bottleneck? Many papers' speedup numbers collapse under that single question.
+
+Practical implications:
+
+- For any attention variant claiming to be "efficient," immediately ask: does it accelerate prefill or decode? Which hardware instruction does it use? Is its sparsity unstructured or N:M?—one question filters out 80% of pseudo-speedups.
+- In KV Cache work, *the prefill phase* is the most underexplored goldmine right now (from StreamingLLM to SnapKV, everyone only addresses decode). Any method that achieves genuine prefill acceleration has enormous room to grow.
+- AMD MI300X has sparse matrix cores too, but its software stack is thin. Whoever first gets HieraSparse's approach running on ROCm will own the AMD side of this line.
