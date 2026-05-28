@@ -1,0 +1,369 @@
+#+title:      GAMMA: Global Bit Allocation for Mixed-Precision Models under Arbitrary Budgets
+#+date:       [2026-05-28 Thu 09:41]
+#+filetags:   :paper:river:quantization:mixed-precision:llm:en:
+#+identifier: 20260528T094104-en
+#+source:     https://arxiv.org/abs/2605.18475
+#+authors:    Yao, Zhao, Wang, Huang, Zhang, Han (Beihang / Tsinghua / ByteDance)
+#+venue:      arXiv May 2026 (cs.LG)
+
+* The River of the Problem
+
+Cramming a tens-of-gigabytes model into a consumer GPU — or even a phone — without letting it get dumb.
+
+That is what the *quantization* river has been doing for more than a decade. The simplest version: compress every weight from 16-bit float down to a 4-bit integer, cutting the footprint by 4×. It runs; accuracy is still acceptable.
+
+Below 4 bits, though, things suddenly get hard. At 3 bits, at 2.5 bits, models start *collapsing* — some layers withstand the squeeze with no complaint; others fall apart the moment you touch them.
+
+So an apparently obvious idea emerges: *don't give every layer the same number of bits*. Give more bits to the important layers, fewer to the robust ones, and keep the average at 3 bits. That is *mixed-precision quantization*.
+
+Sounds simple. But the question that stumped an entire generation follows immediately: *which layers matter? How do you know? How do you find out automatically?*
+
+Every generation answered in its own way: "search," "derive a formula," "learn an allocator." Each answer had a fatal weakness — too slow to be practical, not accurate enough, or requiring a full restart whenever the target budget changed.
+
+- The 2018 cohort said: "Let the network pick its own bit-widths, end-to-end." — but you have to *retrain the whole model*.
+- The 2020 cohort said: "No need to learn; just compute a Hessian score." — but the score is *static*, and changing the budget means *recomputing* everything.
+- The 2025 cohort said: "Just run evolutionary search." — but it is *slow*, and changing the budget means *re-searching* from scratch.
+- The 2026 GAMMA paper says: "Learn — but *learn only the bit assignment, never touching the model weights*; and the learned scores can be *reused across budgets*."
+
+Every step forward along this river is a direct fight against the *specific pain points left by the previous generation*.
+
+* The Source Map
+
+#+begin_example
+[2018] Wu et al.           -  DNAS  (differentiable NAS for bit-width)
+   |
+   | Problem: early mixed-precision relied on hand-tuning or brute-force search
+   | Solution: use Gumbel-Softmax to make "which bit-width to pick" differentiable;
+   |           learn end-to-end
+   |
+   | But: requires quantization-aware training (QAT); only known after retraining
+   |      too expensive for large models; only works on CNNs
+   v
+[2020] Dong et al.         -  HAWQ-V2  (Hessian-aware mixed precision)
+   |
+   | Problem: DNAS retrains the whole network — unaffordable cost on large models
+   | Solution: no training; directly compute per-layer Hessian trace as "sensitivity"
+   |           large trace -> this layer is important -> give more bits
+   |           small trace -> this layer is robust   -> give fewer bits
+   |
+   | But: trace is a *static* per-layer metric
+   |     - misses inter-layer coupling (perturbing one layer affects the entire
+   |       forward path)
+   |     - changing the target budget requires redoing the whole trace + ranking
+   v
+[2022-24] GPTQ / AQLM / QTIP  -  industrial-grade LLM PTQ quantizers
+   |
+   | Context shift: the LLM era arrives; models are 8B–70B
+   | QAT is completely infeasible -> post-training quantization (PTQ) is the
+   | only viable path
+   | These methods push "how to quantize at a single fixed bit-width" to the limit
+   |
+   | But: they are all *uniform-bit*; they do not solve "how many bits per layer"
+   |     - fine above 4 bits; accuracy falls off a cliff below 3 bits
+   v
+[2025] Lee et al.          -  AMQ  (Auto Mixed-Precision for LLMs)
+   |
+   | Problem: at LLM scale, HAWQ's Hessian is intractable, DNAS's QAT won't run;
+   |          yet below 3 bits mixed-precision is mandatory
+   | Solution: skip "learning" and "formula derivation"; do *evolutionary search*
+   |           directly in the discrete bit-width space,
+   |           evaluating each candidate assignment via LLM PTQ output
+   |
+   | But: search is *hugely expensive* (hours per budget)
+   |     does not *strictly satisfy* the global bit-width budget (only approximate)
+   |     changing the target bit-width requires *re-searching* from scratch
+   v
+[2026-05] Yao et al.       -  GAMMA  (this paper)
+   |
+   | Problem: all three roads are blocked —
+   |   1. Learn (DNAS):    requires QAT; infeasible at LLM scale
+   |   2. Compute (HAWQ-V2): static; must recompute per budget; misses inter-layer
+   |                          coupling
+   |   3. Search (AMQ):    slow; budget only approximately satisfied; must re-search
+   |                       per budget
+   |
+   | Solution: resurrect the "learn" branch —
+   |   1. *Freeze model weights*; learn only a lightweight bit-selection mask
+   |      -> no longer QAT; purely PTQ
+   |   2. Use teacher-forced layer-wise hidden-state reconstruction loss
+   |      -> more stable than end-to-end task loss on a small calibration set
+   |   3. Enforce the global bit-width constraint via augmented Lagrangian
+   |      (hard constraint, not soft penalty)
+   |      -> expected bit-width *precisely* converges to the target
+   |   4. What is learned is a *preference ranking*, not budget-specific weights
+   |      -> changing the budget only requires re-solving an integer program
+   |         (minutes), not retraining
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2018 | DNAS: Let the Network Pick Its Own Bit-Widths
+
+*** What Problem It Saw
+
+Before 2018, mixed-precision quantization for a CNN relied on two approaches:
+
+- Hand-tuning — experts relying on intuition: "convolutional layers are sensitive, give them 8 bits; BN layers are robust, give them 2 bits."
+- Brute-force search — try every combination of bit-widths for every layer. A 50-layer network with 4 bit-width choices per layer yields 4^50 ≈ 10^30 combinations. Completely intractable.
+
+Neither scales.
+
+*** Its Solution
+
+DNAS *softened* the act of "choosing a bit-width."
+
+Originally, "layer i uses b bits" was a discrete choice — either you pick it or you don't. DNAS replaced this with a *probability distribution* over bit-widths: this layer is 2-bit with probability 0.1, 4-bit with probability 0.7, 8-bit with probability 0.2, summing to 1.
+
+Using the *Gumbel-Softmax* trick, the discrete choice is replaced by a differentiable continuous relaxation. The entire network can then be trained end-to-end with gradient descent — jointly learning the weights *and* the per-layer bit-width distributions. After training, the bit-width with the highest probability in each layer is selected as the final assignment.
+
+A soft penalty term is added: "if average bit-width exceeds the target, inflate the loss" — naturally nudging the optimizer toward lower bit-widths.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Differentiable means *learnable*. Learnable means *the same machine-learning toolchain can handle it*. This was a paradigmatic victory.
+
+But the pitfall lay in *requiring quantization-aware training (QAT)* — you are not just learning the bit-width assignment; you are also retraining the full model weights so the model adapts to quantization.
+
+In the CNN era this was manageable: tens of millions of parameters, a few days of training.
+
+In the LLM era, parameter counts are 1000× larger. Retraining a 70B model once burns hundreds of H100s for weeks. *QAT had become a luxury item.*
+
+The DNAS path is simply unworkable at LLM scale.
+
+** 2020 | HAWQ-V2: Stop Learning — Just Compute
+
+*** What Problem It Saw
+
+DNAS could run on CNNs, but even there QAT was already painful enough. Dong et al. wondered: can we *skip training entirely* and just compute the bit-width assignment?
+
+If a *static metric* can tell us "how sensitive this layer is to quantization," we can rank layers by sensitivity, assign bit-widths accordingly — zero training, results in minutes.
+
+*** Its Solution
+
+HAWQ-V2's core idea: use the *Hessian matrix* to measure sensitivity.
+
+The Hessian is the matrix of *second-order derivatives* of the loss with respect to the weights. The intuition is:
+
+- If the Hessian is *steep* at some layer (large eigenvalues), a small perturbation to the weights there causes a large change in loss → the layer is *sensitive* → quantization error must be small → *give it more bits*.
+- If the Hessian is *flat* (small eigenvalues), large weight perturbations barely matter → the layer is *robust* → *give it fewer bits*.
+
+HAWQ-V2 uses the *trace* of the Hessian (sum of diagonal elements) as the per-layer sensitivity score. The trace is estimated via Hutchinson's method, far cheaper than computing the full matrix.
+
+Once sorted by sensitivity, bit-widths are assigned in descending order within the given budget.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Completely training-free; done in a few hours. The metric has a mathematical grounding — the Hessian trace connects directly to the second-order Taylor expansion of the loss.
+
+But two fundamental pitfalls:
+
+- *The trace is a static per-layer metric.* Each layer's sensitivity is computed independently, so *inter-layer coupling* is invisible — quantization error in one layer propagates along the forward path and interacts with quantization error in downstream layers. This *cross-module dependency* is entirely ignored.
+- *Changing the target bit-width requires recomputing.* The trace itself does not depend on the budget, but the assignment strategy does. A 3-bit budget and a 2.5-bit budget are two different integer assignment problems that must be solved separately. In industrial deployment — where the same model ships to cloud (4-bit), desktop (3-bit), and mobile (2-bit) — this means *starting from scratch three times*.
+
+** 2024–25 | LLM PTQ Arrives in Force
+
+*** What Problem It Saw
+
+LLM scale exploded. Once GPT-3 landed, QAT was out of the question for everyone. The entire field was forced toward *post-training quantization (PTQ)* — using only a small calibration dataset, without altering a single weight, directly compressing FP16 into low-bit integers.
+
+GPTQ, AWQ, AQLM, and QTIP — a wave of industrial-grade PTQ methods — pushed "losing as little accuracy as possible at a fixed bit-width" to the extreme:
+
+- *GPTQ* (2022): approximate-Hessian-based column-wise weight reconstruction
+- *AWQ* (2024): identify critical channels and protect them selectively
+- *AQLM* (2024): additive vector quantization packing multiple weights together
+- *QTIP* (2024): trellis-coded quantization
+
+*** Its Solution
+
+All of these are *uniform-bit* methods — every layer uses the same bit-width (4-bit, 3-bit, or 2-bit). Above 4 bits, their accuracy loss is nearly negligible.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Uniform-bit at 4 bits and above is practically lossless — sufficient for industrial deployment.
+
+But below 3 bits, *uniform-bit suffers a cliff-edge collapse* — Llama3.1-8B at uniform 3-bit drops from 80% to 70%; at uniform 2-bit it crashes to 40%.
+
+Yet the most commercially valuable deployment zone is precisely 2–3 bits — that is the range where a 70B model fits inside a 24 GB consumer GPU.
+
+The PTQ infrastructure was now mature, but "how not to collapse below 3 bits" remained unanswered. The problem was pushed to a new crossroads: *mixed-precision at LLM scale*.
+
+** 2025 | AMQ: If You Can't Learn and Can't Compute Accurately, Just Search
+
+*** What Problem It Saw
+
+By 2025, both old roads for LLM mixed-precision were blocked:
+
+- The DNAS branch (learn): QAT is infeasible at LLM scale.
+- The HAWQ branch (compute): Hessian trace misses cross-module dependencies and yields limited gains at LLM scale; more critically, *changing the budget requires recomputation*.
+
+Yet below 3 bits, mixed-precision is non-negotiable for deployment.
+
+*** Its Solution
+
+AMQ abandoned both "learn" and "compute," turning instead to *evolutionary search*.
+
+The idea is blunt but forceful:
+
+- Maintain a population of candidate bit-width assignments.
+- Each individual is one "how many bits per layer" configuration.
+- Use a PTQ backend (e.g., AQLM) to actually quantize each individual and evaluate its accuracy.
+- Apply selection, crossover, and mutation over many generations.
+
+The surviving fittest individual at the end is the bit-width assignment for that budget.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Evolutionary search is *gradient-free*, relies on no proxy metric, and uses actual PTQ accuracy as its fitness signal. At LLM scale it is more accurate than Hessian-based methods.
+
+But three new pitfalls:
+
+- *Hugely expensive.* Every generation requires full PTQ evaluation; the entire search takes hours to days.
+- *Budget only approximately satisfied.* The bit-width constraint can only be *approximately* met during search; the final assignment often deviates from the target and needs post-hoc correction.
+- *No reuse across budgets.* A solution found for a 3-bit budget is worthless for a 2.5-bit budget — everything must be *re-searched from scratch*.
+
+Just like HAWQ-V2, the curse of "change the budget, redo everything" remained unbroken.
+
+* Frontier Extension
+
+** 2026-05 | GAMMA: Resurrect the "Learn" Branch, Plus Cross-Budget Reuse
+
+*** What Problem It Saw
+
+GAMMA lines up the pain points of all three prior generations:
+
+| Approach | Strength               | Fatal Weakness                                    |
+|----------+------------------------+---------------------------------------------------|
+| DNAS     | Differentiable, learnable | Requires QAT; infeasible at LLM scale          |
+| HAWQ-V2  | No training, fast      | Static proxy; recompute per budget; misses coupling |
+| AMQ      | Accurate (no proxy)    | Hugely expensive; budget only approximate; re-search per budget |
+
+The observation: among the three branches, *DNAS's "differentiable and learnable" is the most elegant* — driven directly by the optimization objective, capable of capturing cross-module dependencies, and requiring no hand-crafted proxy. It was blocked by exactly one specific constraint: "requires QAT."
+
+If we could make the DNAS machinery *learn only the bit-width assignment without touching the model weights*, we would retain the differentiability advantage while being able to run at LLM scale.
+
+*** Its Solution
+
+GAMMA *transplants the DNAS differentiable framework entirely into a PTQ pipeline*. Four steps:
+
+1. *Candidate pool + frozen weights.* For every linear module, pre-quantize 2-, 3-, 4-, and 8-bit *candidate weights* using a PTQ backend (QTIP / AQLM). All candidate weights are *frozen*.
+
+2. *Learn only the bit-selection mask.* Each module receives a lightweight Gumbel-Softmax mask that outputs a probability distribution over "select b bits for this module." The only parameters being learned are these mask parameters (on the order of a few MB), not the full model weights (tens of GB).
+
+3. *Hidden-state reconstruction as the loss.* Instead of task loss (which overfits on a small calibration set), use *teacher-forced layer-wise hidden-state reconstruction* — force the i-th layer of the mixed-precision model to *match* the i-th layer output of the FP16 model. This loss directly measures how quantization error accumulates along the forward path; *cross-module dependencies are captured naturally*.
+
+4. *Augmented Lagrangian hard constraint.* Unlike DNAS's soft penalty ("if over budget, inflate the loss" — which often fails to converge to the target), GAMMA uses an augmented Lagrangian: Lagrange multipliers λ1 and λ2 are themselves learned, *dynamically tightening the constraint* so that the expected average bit-width *exactly* converges to b_target.
+
+5. *Stage II: integer programming discretization.* Stage I produces soft distributions; a 0-1 knapsack-style integer linear program then projects those soft distributions onto a *strictly budget-satisfying* discrete assignment.
+
+A *miraculous byproduct* emerges here: the mask probabilities learned in Stage I are fundamentally a *cross-budget-stable sensitivity ranking*, not a budget-specific assignment. When the budget changes, *Stage I does not need to be retrained* — only Stage II's integer program needs to be re-solved, cutting the time from hours to minutes.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Reading through the whole river, you feel a *confluence* of satisfaction:
+
+- Takes DNAS's differentiable framework, but removes QAT.
+- Takes HAWQ's "post-training, no retraining" paradigm, but removes the static proxy.
+- Takes AMQ's "driven by actual quantization quality" philosophy, but removes repeated search.
+
+Every historical lesson is absorbed; every historical pain point is surgically addressed.
+
+*Empirical results*: on Llama3.1-8B, Qwen3-8B/14B, *GAMMA at 2.5-bit ≈ uniform 3-bit accuracy*. This means, at the same accuracy level, the model footprint is cut by another 17% — a 70B model drops from 24 GB to ~20 GB, fitting comfortably inside an RTX 3090's 24 GB.
+
+New pitfalls buried:
+
+- The candidate pool must be pre-quantized and stored — approximately K× storage overhead (K candidate bit-widths) during training, discarded at deployment.
+- Stage I still depends on a calibration set; generalization to out-of-distribution data is not fully verified (Section 5.2 includes partial experiments but leaves room for future work).
+- The "score reuse across budgets" property is elegant, but has only been validated within the budget range tested in the paper (2.5–4 bits). Whether it extends to more extreme bit-widths — such as the 1.58-bit BitNet regime — is an open question.
+
+** As of Now, This Is the State of the Art on This Line
+
+GAMMA was submitted in May 2026. It is the first paper to simultaneously achieve all three properties — *learnable + no QAT required + cross-budget reuse* — for mixed-precision LLM quantization. Future work will most likely extend along these directions (speculative; not necessarily already published):
+
+- *Candidate pool compression*: storing K full candidate bit-widths is heavy — can they be generated on the fly?
+- *Cross-architecture transfer*: can scores learned on Llama-8B be directly applied to Llama-70B or Qwen-14B?
+- *Activation quantization included*: currently weight-only; activations remain in high precision.
+- *Joint sparsity*: mixed-precision + structured sparsity co-allocation.
+
+* One Diagram to See It All
+
+#+begin_example
+                    "How to find the right number of bits per layer"
+                                          |
+            +-----------------------------+-----------------------------+
+            |                             |                             |
+          [Learn]                      [Compute]                    [Search]
+            |                             |                             |
+   2018 DNAS                     2019-20 HAWQ/V2               2025 AMQ
+   Gumbel-Softmax                Hessian trace                 Evolutionary
+   end-to-end differentiable     per-layer static              gradient-free search
+            |                             |                             |
+   Strength: elegant, end-to-end  Strength: no training, hours  Strength: accurate (no proxy)
+   Pitfall:  needs QAT, LLM scale  Pitfall:  static, misses      Pitfall:  expensive,
+             infeasible                      coupling                      re-search per budget
+            |                    Pitfall:  recompute per budget           |
+            |                             |                               |
+            |           [LLM era stage shift: PTQ dominates]              |
+            |                             |                               |
+            +-----------------------------+-----------------------------+
+                                          |
+                                          v
+                                    2026 GAMMA
+                                          |
+               [Learn]   -- but freeze weights; learn only the bit-mask
+               [Compute] -- but use hidden-state reconstruction, capturing
+                            cross-module dependencies
+               [Search]  -- but only at the very end, via ILP discretization,
+                            done once
+
+               Key byproduct: learned scores are reusable across budgets
+                              -> train once, serve N budgets
+                              -> cut "hours per budget" down to "minutes"
+
+  Timeline:
+  2018 ---- 2020 ---- 2022-24 ---- 2025 ---- 2026.5
+   |          |          |           |          |
+  DNAS    HAWQ-V2    LLM PTQ      AMQ       GAMMA
+   |          |      infrastructure  |          |
+   |          |       (GPTQ          |          |
+   |          |       AWQ            |          |
+   |          |       AQLM           |          |
+   |          |       QTIP)          |          |
+   |          |                      |          |
+  CNN      CNN              LLM-uniform    LLM-mixed-precision
+  QAT      PTQ               PTQ          PTQ + Learnable + Reusable
+  Learn    Compute           Search        Compute(differentiable)+Project
+#+end_example
+
+* Insights
+
+Reading the whole river reveals not just a technical progression, but a process of *constraints being dismantled one by one*.
+
+Each generation's advance is essentially *identifying which specific constraint had blocked the previous generation*, then operating surgically on that constraint alone, preserving everything else.
+
+- DNAS's constraint was "requires QAT" → HAWQ-V2 removed it, but introduced "static proxy."
+- HAWQ-V2's constraint was "static proxy misses coupling" → AMQ removed it, but introduced "expensive search."
+- AMQ's constraint was "search is expensive and must restart per budget" → GAMMA removed it, returning to "learn," but this time "learn only the mask, not the weights."
+
+Notice that GAMMA did not *invent* anything fundamentally new — Gumbel-Softmax dates to 2016, augmented Lagrangian to 1969, knapsack ILP is even older operations research, and hidden-state reconstruction has been used since the GPTQ era. GAMMA's contribution is *precisely identifying which specific constraint was the true bottleneck of eight years of mixed-precision quantization*, then assembling already-existing tools in a *new configuration*.
+
+A deeper trend visible across the river: *the boundaries between the "learn / compute / search" paradigms are blurring*. GAMMA is simultaneously learning (mask trained with gradients), computing (hidden-state reconstruction is a deterministic objective), and searching (Stage II is ILP). Once you stop insisting on belonging to one camp, your degrees of freedom expand dramatically.
+
+Where is the next step most likely to go? My assessment: *cross-model sensitivity transfer*. If the mask learned on Llama-8B can be directly applied to Llama-70B or Qwen-14B, then Stage I would not need to be rerun at all — that would be truly *train once, deploy anywhere*. GAMMA's "score reuse across budgets" is already the first step, but only reuses within the same model; the next step is reuse across models.
+
+* Takeaways
+
+*Identifying the real constraint* matters far more than *inventing a new method*.
+
+GAMMA's core innovation is not a mathematical trick — it is *peeling "whether QAT is required" away from the "differentiable bit-width search" paradigm*. Once you see clearly that "the DNAS paradigm is elegant; it is only strangled by the single constraint of QAT" — the rest of the work is mechanical: freeze the weights, change the objective, add the constraint.
+
+Implications for research:
+
+- When a direction has stalled for several years, first *list exactly which constraint is blocking the current best method*, then ask *whether that constraint is fundamental or merely a historical accident*. It is usually the latter.
+- When you want to apply an old technique to a new problem, *systematically check each assumption of the old technique to see whether it still holds in the new setting*. Often one or two assumptions have quietly expired — but because nobody asked explicitly, the entire technique gets dismissed as "inapplicable."
+- Properties that look like "mere engineering details" — such as *cross-budget reuse* — are often the true bottleneck for real deployment. The paper's casual mention that "scores can be reused" converts a multi-hour ad-hoc workflow into a minutes-long automated pipeline; the industrial value of that single sentence far exceeds the accuracy numbers reported in the paper.
+
+The bottom line is "actually usable": this means you can —
+
+- When deploying a 70B model on consumer hardware, *stop repeatedly ab-testing between accuracy and footprint*. One GAMMA training run plus multiple ILP solves, and all target-budget configurations are ready within minutes.
+- Handle a non-standard requirement like "3.7-bit average budget" without training a new solution from scratch.
+- Transfer GAMMA's design pattern to *KV cache quantization, attention sparsity allocation, MoE expert pruning*, and any other problem that faces "allocate resources under a budget" — the same recipe of "freeze the large part, learn a small mask, augmented Lagrangian constraint, ILP discretization" is likely to transfer.
