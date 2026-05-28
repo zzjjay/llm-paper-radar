@@ -1,0 +1,210 @@
+#+title:      Reformulating KV Cache Eviction Problem for Long-Context LLM Inference
+#+date:       [2026-05-28 Thu 12:11]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T121130-en
+#+source:     https://arxiv.org/abs/2605.07234
+#+authors:    Tho Mai, Joo-Young Kim (KAIST)
+#+venue:      arXiv 2605.07234 (2026-05-08)
+
+* The Problem River
+
+During long-context LLM inference, the KV cache grows linearly with sequence length, and GPU memory explodes after tens of thousands of tokens. The most direct cost-saving strategy is "drop some tokens" — but which tokens can safely go, and which must stay?
+
+The question sounds simple, yet three years of research have not fully resolved it. The difficulty lies in the composite nature of the attention mechanism: multi-head, multi-layer, followed by an output projection. Whether a token "matters" depends on its contribution across the entire forward pass, not on the attention score of a single head in a single layer. Yet the vast majority of methods look only at attention weights — because they are cheap and easy to compute. This buries a systemic flaw: using a proxy metric for a critical decision. Every generation of papers wrestles with this flaw.
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.) - sliding window + attention sinks
+  |
+  | Problem: only recent window is kept; mid-sequence long-range
+  |          dependencies are severed
+  | Fix: rank tokens by contribution, retain the high-contributors
+  v
+[2023] H2O (Zhang et al.) - cumulative attention score selects Heavy Hitters
+  |
+  | Problem: single-step attention is noisy; averaging over
+  |          the entire history dilutes strong local signals
+  | Fix: open an observation window at the query end,
+  |      average within it, then apply pooling
+  v
+[2024] SnapKV (Li et al.) - observation window + pooling; long-running SOTA
+  |
+  | Problem: still only looks at A (attention), ignores V and W_O.
+  |          A token with modest attention can still be critical
+  |          if its value, after W_O projection, produces large output.
+  v
+[2025] CriticalKV / CAOTE / LAVa - attempt to fold V or W_O into scoring
+  |
+  | Problem: all are heuristic patch-ups (rescale, safeguard);
+  |          none derives from the true formula O = A V W_O.
+  |          All make per-head independent decisions, ignoring
+  |          cross-head / cross-layer coupling.
+  v
+[2026] LaProx (Mai & Kim) - reformulates eviction as a matrix approximation problem
+  - Objective: minimize ||AVW_O - A_S V_S W_O||_F over the retained set
+  - Scores tokens globally across heads and layers, not head-by-head
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Formally Posing the "Cost-Saving" Problem
+
+*** What Problem It Saw
+
+Early practitioners simply truncated the KV cache — keeping only the most recent N tokens. Models immediately degraded on long inputs, because the "attention sink" tokens (typically BOS or the first punctuation mark) were discarded, collapsing the softmax denominator and scrambling the entire attention distribution.
+
+*** Its Solution
+
+Elegantly simple: always keep the first few sink tokens plus a sliding recency window. Everything in between is discarded unconditionally. LongFormer, emerging around the same time, offered a variant: in addition to the sliding window, a handful of globally designated positions could be pre-selected.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The attention-sink phenomenon is real; anchoring the opening tokens stabilises the numerics. But the scheme implicitly assumes "the middle doesn't matter," which causes complete failure on genuine long-range tasks (NarrativeQA, Needle-in-a-Haystack) — a fact buried at token 5,000 is long gone once the sliding window has moved past it.
+
+The next step had to address: *drop by contribution, not by position*.
+
+** 2023 | H2O: Quantifying "Contribution" for the First Time
+
+*** What Problem It Saw
+
+StreamingLLM selects tokens by position — it never consults the model's own judgment. But the model actually provides a signal: attention weights. A token that is heavily and repeatedly attended to is obviously important; one that is almost never attended to is likely disposable.
+
+*** Its Solution
+
+Heavy-Hitter Oracle: after processing the prompt, tally the cumulative attention score each token has received across all query steps; retain the high-scorers, evict the low-scorers. Scissorhands, appearing almost simultaneously, uses a nearly identical cumulative-ranking scheme.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Shifting "importance" from position to attention distribution was a genuine paradigm shift — all subsequent work stands on this axiom: *high attention ≈ large contribution*.
+
+New pit: the axiom is only approximate. Single-step attention is noisy; averaging over the entire history dilutes local peaks that may be critical. The deeper, more hidden pit: the axiom implicitly equates "high attention" with "large contribution to final output," yet two more multiplications — by V and by W_O — intervene. That pit would take two more years to excavate seriously.
+
+** 2024 | SnapKV: Smarter About Which Slice to Watch
+
+*** What Problem It Saw
+
+H2O averages from start to finish — stable during generation, but it overlooks a practical pattern: users' queries are usually concentrated at the end of the prompt; instructions and questions are written last. The attention pattern of those trailing tokens carries the strongest signal for deciding what to keep.
+
+*** Its Solution
+
+Open an *observation window* at the prompt's tail (e.g., the last 32 tokens) and score only from the attention produced within that window; then apply 1D pooling along the head dimension to smooth neighbouring-position scores and avoid selecting overly isolated tokens. CAKE layers on top a scheme that allocates per-layer budgets proportional to attention variance. PyramidInfer / PyramidKV / D2O follow a similar "unequal inter-layer allocation" philosophy. AdaKV and HeadKV push the unequal allocation down to the head level.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Observation window + pooling captures the attention patterns users actually care about in instruction-following scenarios, and SnapKV held the LongBench SOTA for an extended period.
+
+Yet the essence of all these methods is still *looking only at A* — they are engineering refinements of how A is aggregated and how budget is allocated, nothing more. The paper's key observation lies precisely here: A is a softmax-compressed probability distribution with a narrow numerical range; V·W_O is unnormalised, with a wide and layer-depth-dependent range. The two distributions are entirely out of sync — positions where A is high are not necessarily where V·W_O is high, and vice versa. In other words: *sorting by A alone is like measuring length with an unmarked ruler*.
+
+** 2025 | CriticalKV / CAOTE / LAVa: First Attempt to Pull V and W_O Into the Picture
+
+*** What Problem It Saw
+
+The blind spot shared by every H2O/SnapKV-lineage method: they measure importance via attention, but the model's actual output is A·V·W_O, and A is only one factor. If a token's V and W_O terms are large, its share of the final output can be significant even with modest attention.
+
+*** Its Solution
+
+Three groups took three partially different — but all halfway — routes:
+
+- *LAVa*: adds value norm to the score. Uses ||V_i||, but ignores W_O.
+- *CAOTE*: similarly incorporates V, bypasses W_O.
+- *CriticalKV*: directly uses V·W_O information to rescale mean attention, with two empirical safeguards to prevent score blow-up.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Acknowledging that "A alone is insufficient" points in the right direction. But all three are *heuristic patch-ups* — they append the extra term as a correction coefficient attached to the attention score, rather than asking from the formula O = A·V·W_O what is actually being approximated.
+
+The deeper pit: every one of these methods makes *per-head independent decisions* about which tokens to retain. The same token might score 0.9 in head 5 and 0.1 in head 6; each head runs its own top-k — resulting in unfair budget allocation across heads, and completely ignoring the fact that W_O sums all heads' outputs before passing them downstream. *A token's final contribution is a cross-head sum*; making the decision head-by-head dismantles that fact. AdaKV experimented with cross-head top-k, but relied on empirical safeguards to hold things together.
+
+All the pieces were now in place: eviction needed to be rewritten as an optimisation problem targeting A·V·W_O directly, and solved globally across heads and layers.
+
+** 2026 | LaProx: Reformulating Eviction as a Matrix Approximation Problem
+
+*** What Problem It Saw
+
+Every preceding method lacks an explicit, well-defined objective — what exactly is being optimised? They all use proxy metrics (attention scores, V corrections, safeguards), but none directly answers: *"After evicting some tokens, how much does the attention layer's output degrade?"*
+
+*** Its Solution
+
+Reformulate eviction as an *optimisation problem*: within a retention budget k, which tokens should be kept so that the post-eviction layer output A_S·V_S·W_O most closely approximates the original A·V·W_O? Equivalently, minimise ||A·V·W_O − A_S·V_S·W_O||.
+
+Two key technical contributions:
+
+1. *Eviction Indicator (LaProx score)*: The paper establishes a Remark — the MHA output can be exactly decomposed as a sum of per-head contributions: Output = Σ_i A^i V^i W_O^i. Based on this decomposition, each token's "contribution" is the product magnitude of its attention probability times V·W_O. Tokens are no longer ranked by A alone; instead their actual impact on the final output term is directly computed.
+2. *Eviction Action (global scoring)*: Because each head's contribution is *summed* in the W_O dimension, comparability across tokens is cross-head — a token with a small contribution in one head but a large one in another should still be retained. LaProx assigns every token across all heads and all layers a *unified, comparable score*, then performs a global top-k selection. This is the first time in the literature that eviction is done *model-wide* rather than *head-wise*.
+
+*** Why It Worked (and What New Pits Remain)
+
+Replacing the proxy with the true objective produces immediate results: across 19 LongBench datasets, LaProx retains 5% of the KV cache (a 20× compression) while preserving performance; under extreme compression it cuts the accuracy loss in half relative to prior SOTA. Needle-in-a-Haystack results are equally strong.
+
+New pits (the paper's Limitations section also flags these):
+
+- *Budget still must be specified*: The total budget k is a hyperparameter, not learned from data.
+- *Distribution drift during decoding*: The optimisation target is a one-shot approximation taken at the end of prompt processing; whether the fixed retention set remains optimal as the generation distribution drifts is an open question.
+- *Hardware implementation*: Global top-k requires sorting across heads and layers, which is slightly more complex than the local top-k of SnapKV-style methods — the paper reports minimal measured overhead, but whether this holds across different inference frameworks remains to be seen.
+
+* Frontier Extensions
+
+LaProx was posted to arXiv on 2026-05-08. As of this note's writing date (2026-05-28) no direct public follow-up work is yet visible. Predictable next steps:
+
+- *Orthogonal combination with KV quantisation*: Eviction and quantisation are presented as two parallel compression routes in the paper (Appendix B explicitly mentions KV Cache Quantization). The global importance scores LaProx produces are a natural prior for mixed-precision storage — high-importance tokens at high precision, low-importance tokens at low precision.
+- *Learned budgets*: Making "how many tokens to keep" data-driven rather than a manually set k.
+- *Online refresh during decoding*: Replacing the one-shot optimisation with a sliding approximation that lets the retention set drift alongside generation.
+- *MoE settings*: Appendix G.3 already presents preliminary MoE experiments, opening a direction from dense to sparse architectures.
+
+If new work appears after LaProx, this section should be updated. The entries above are reasoned extrapolations, not verified citations.
+
+* One Diagram
+
+#+begin_example
+               Evolution of the "token selection" criterion
+  Timeline ---------------------------------------------------------->
+
+  2023       2023         2024              2025                2026
+  ---------  -----------  ----------------  ------------------  ----------
+  Position   Single       Refined           Augmented           Rewritten
+             metric       metric            metric              objective
+  ---------  -----------  ----------------  ------------------  ----------
+  Streaming  H2O          SnapKV            CriticalKV          LaProx
+  LLM        Scissor-     + CAKE            + CAOTE             (this paper)
+  Long-      hands        + PyramidKV       + LAVa
+  Former                  + HeadKV/AdaKV
+
+  Criterion: position  cumulative A  window A + pooling  A * f(V,W_O)     argmin
+                                                         heuristic        ||AVW_O -
+                                                         patch-up          A_S V_S W_O||
+
+  Scope:     global    per-head      per-head             per-head         model-wide
+             fixed     independent   independent          independent      cross-head
+                                     + inter-layer        + safeguard      cross-layer
+                                     budget
+
+  Method-    intuition  empirical    empirical            empirical        optimisation
+  ology:                             + engineering        + heuristic      derived from
+                                                                           the formula
+#+end_example
+
+* Insights
+
+*What has truly been evolving is not "which scoring function is better" but "the distance between the scoring function and the layer output".*
+
+From StreamingLLM to LaProx, each generation has narrowed the gap between "what I am ranking" and "what I actually want to preserve":
+
+- StreamingLLM: no ranking at all; drops by position. Distance = ∞.
+- H2O: ranks by A. Distance = the gap between A and AVW_O.
+- SnapKV: ranks by a smarter A (window + pooling). Distance unchanged; only the quality of A improves.
+- CriticalKV/CAOTE: heuristically splices V (sometimes V·W_O) onto A. Distance shrinks, but the splicing is not derived from the formula.
+- LaProx: directly uses the Frobenius norm of AVW_O as the objective. Distance is, in principle, zero.
+
+This is a textbook research evolution arc — *"start with a cheap proxy → notice proxy distortion → patch the proxy → eventually acknowledge the original problem must be faced directly"*. The cheap proxy always wins early when compute is scarce, but once hardware loosens and benchmarks become more demanding, "original-problem fundamentalism" inevitably returns.
+
+A second insight: *head-wise independent decision-making was a blind spot that persisted for a very long time*. Every KV eviction paper defaulted to head-by-head splitting, because attention is naturally computed per head — but the step where W_O concatenates all heads' outputs was collectively overlooked. A seemingly "natural" implementation habit went unquestioned for three years before a single paper turned it over. This is worth remembering: *the more natural a pipeline's decomposition feels, the more worth questioning it is*.
+
+The most likely next direction: unifying "which tokens to keep" and "at what precision to store them" under a single objective — a *KV compression framework driven by output reconstruction error*. LaProx's scores are its natural prior.
+
+* Takeaways
+
+- *Return to the original formula*: Whenever you are using a proxy metric to make a critical decision — and that proxy's justification is "it intuitively seems right" — watch it closely. The paper that will eventually invalidate your work is almost never one that improves the metric; it is one that rewrites the objective function.
+- *Empirical safeguards are a decay signal*: CriticalKV needed two safeguards to keep its formula from blowing up. Any "if value > X then clip" patch is clear evidence that the formula hasn't been gotten right yet. When you see a safeguard in your own code, first ask whether the formula is wrong before asking whether the guard is necessary.
+- *Seemingly parallel dimensions are not necessarily independent*: Heads and heads, layers and layers — they are implemented in parallel, but they are semantically coupled (W_O sums all heads; residual connections chain all layers). Mistaking "parallel implementation" for "independent decision" is a hidden cognitive error.
+- The practical upshot is actionable: *the next time you design any system that discards information by importance — not just KV caches, but also sparse attention, token pruning, retrieval reranking — first write down the target you truly want to preserve, then count how many nonlinear transformations separate your scoring function from that target. The more layers of separation, the more you need to rewrite the objective rather than patch the score.*

@@ -1,0 +1,234 @@
+#+title:      ReST-KV: Robust KV Cache Eviction with Layer-wise Output Reconstruction and Spatial-Temporal Smoothing
+#+date:       [2026-05-28 Thu 12:28]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T122852-en
+#+source:     https://arxiv.org/abs/2605.08840
+#+authors:    Yongqi An, Chang Lu, Kuan Zhu, Tao Yu, Chaoyang Zhao, Hong Wu, Ming Tang, Jinqiao Wang
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+During long-context LLM inference, KV caches for hundreds of thousands of tokens devour GPU memory entirely. Can we *evict* some KV entries on the fly during inference, keeping memory manageable — without making the model dumber?
+
+The hard part is not "how much to evict" but *whom to evict*. How do you estimate the importance of a token's past contribution? The most naive approach is to retain tokens with high attention weights — but this ignores something critical: once a token is dropped, the attention weights of the remaining tokens *redistribute*. Tokens that previously had low attention may suddenly matter; tokens that "seemed unimportant" may have been serving as crucial semantic aggregation points. Generation after generation of researchers is essentially answering the same question: *what signal should really decide whether to drop a token?*
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNNs are too slow; sequences must be computed step by step
+  | Solution: Pure attention + KV cache linearizes decoding
+  | Debt left: In long contexts, the KV cache itself becomes a memory monster
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem: Long-context KV cache blows up memory;
+  |          naive truncation collapses perplexity
+  | Solution: Retain "attention sinks" (first few tokens) + sliding window
+  | Debt left: Rules are too rigid; critical mid-sequence info is always dropped
+  v
+[2023] Zhang et al. - H2O (Heavy Hitters Oracle)
+  |
+  | Problem: Mid-sequence also has important tokens; fixed patterns miss them
+  | Solution: Dynamically select heavy hitters by cumulative attention weight
+  | Debt left: Cumulative scores are backward-looking; may not reflect what
+  |            future queries will need
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Problem: Cumulative scores are too "past tense"
+  | Solution: Average attention over a final observation window to predict
+  |           which KVs will be used during generation
+  | Debt left: Still uses attention weight as a proxy; ignores value vectors
+  |            and "what happens after deletion"
+  v
+[2024] Feng et al. - AdaKV
+  |
+  | Problem: Different heads vary greatly in importance; uniform budgets waste capacity
+  | Solution: Allocate per-head budget using an *upper bound* on output L1 loss
+  | Debt left: The upper bound is not the true output loss;
+  |            and the eviction indicator is still attention weight
+  v
+[2026] An et al. - ReST-KV  <-- this paper
+        (Output Reconstruction + Spatial-Temporal Smoothing)
+
+  Parallel branch:
+    [2024] Adnan et al. - Keyformer
+      Uses "normalization" to counter distortion after token deletion —
+      sees the same problem as ReST-KV, but fixes the distribution shape
+      instead of directly minimizing output error
+    [2024] Oren et al. - TOVA / [2025] Shi et al. - LaCache
+      Appear as experimental baselines in ReST-KV
+#+end_example
+
+* Evolutionary Narrative
+
+The thread below shows each paper answering what the previous one left unanswered — the same question all along: *how do you estimate the importance of a KV pair so that evicting it causes minimal harm to model output?*
+
+** 2017 | Transformer: KV cache was a debt discovered only later
+
+*** What problem it saw
+
+RNNs compute step by step; they simply cannot run on long sequences.
+
+*** Its solution
+
+Discard recurrence and keep only attention. Every position can compute query/key/value in parallel, sending training throughput up a full tier. To avoid recomputing earlier tokens' keys and values during inference, it introduced the KV cache — once computed, store it for later queries to reuse.
+
+*** Why this worked (and what new debt it buried)
+
+Parallel training plus cached reuse is the foundation that lets Transformers scale. But the KV cache is a *linearly growing debt*: every additional token adds one more key and one more value to store. Nobody cared at the time — context windows were only a few thousand tokens. Once GPT-4 and Llama-3.1 pushed contexts to 128k, the debt collector arrived: a 70B model at 128k context can consume hundreds of gigabytes just from the KV cache alone. The problem shifted from "training throughput" to "can inference memory hold up?"
+
+** 2023 | StreamingLLM: If memory can't hold, keep only both ends
+
+*** What problem it saw
+
+The most naive fix is a fixed window — keep only the most recent N tokens' KV. Sounds reasonable; in practice perplexity collapses immediately. Why? Because the model pays surprisingly high attention to the *very first few tokens*, even when those tokens are semantically empty words like "the" or "<s>". Dropping them throws off the softmax normalization, corrupting the entire distribution.
+
+*** Its solution
+
+Accept this fact: permanently retain the first few tokens (naming them "attention sinks"), then add a sliding window covering recent content. Keep both ends; discard the middle.
+
+*** Why this worked (and what new debt it buried)
+
+This was the first approach that made long-context inference viable under limited memory. But the cost was obvious: *the middle is always dropped*. If the answer to a user's question is buried in the middle (say, a specific fact in an 80k-word report), the model becomes goldfish-brained. The simpler the rule, the more critical information it discards.
+
+** 2023 | H2O: The middle has "important tokens" too — select by cumulative attention
+
+*** What problem it saw
+
+StreamingLLM's two-ends rule is too blunt. In practice, a small cluster of past tokens is attended to repeatedly — these are the "heavy hitters." They sit neither at the start nor in the recent window, yet the model circles back to them every few generation steps. A blanket eviction of the middle buries these heavy hitters with everything else.
+
+*** Its solution
+
+Replace fixed patterns with *dynamic* selection: at each decoding step, accumulate the attention weight each token has received so far; when the budget is exceeded, evict those with the lowest cumulative score.
+
+*** Why this worked (and what new debt it buried)
+
+The first time "importance" was turned into a data-driven signal. But "cumulative attention" is *backward-looking* — it says "how much has this token been attended to in the past," not "will future queries still need it?" In multi-turn dialogue or long generation, once the topic shifts, past heavy hitters become dead weight.
+
+** 2024 | SnapKV: Use an observation window to predict the future
+
+*** What problem it saw
+
+H2O's cumulative scores are too "past tense." When pruning in a single pass at the prefill stage, a more sensible proxy is: *which tokens are the queries in this final stretch attending to?* Because "recent" usually means "generation will continue asking around these positions."
+
+*** Its solution
+
+Reserve an observation window at the end of the prompt (e.g., 32 tokens), pool the attention those queries pay to all historical tokens, and keep the top-K KV pairs. Essentially: let "the most recent queries" run a trial, and what they select is "what will very likely be needed next."
+
+*** Why this worked (and what new debt it buried)
+
+More predictive in nature. But fundamentally the same pattern: *using attention weight as a proxy for importance*. Two obscured facts remain unaddressed:
+1. *Value vectors play no role*. Two tokens may have identical attention weights, but if one value vector has ten times the magnitude, its contribution to the output is entirely different — SnapKV cannot see this.
+2. *Deletion triggers redistribution*. Drop a high-attention token, and the softmax spreads that weight proportionally across the rest; if the remainder can absorb it gracefully, loss is small; if not, output breaks. SnapKV assumes "each token's influence is independent," but softmax does not permit that assumption.
+
+** 2024 | AdaKV: Per-head budget allocation via an output L1 error upper bound
+
+*** What problem it saw
+
+All prior methods conflated "budget allocation" with "which token to keep." AdaKV separates the two: it observes that different attention heads vary enormously in sparsity, so giving each head an equal budget wastes capacity.
+
+*** Its solution
+
+Derive an *upper bound on the output L1 loss* for each head and use that bound to allocate budget — giving more capacity to heads where eviction would hurt more. The actual token selection still uses attention weight ranking.
+
+*** Why this worked (and what new debt it buried)
+
+The first time "output error" was explicitly written into the framework. But it is only used for *budget allocation*, not for *token selection* — selection still relies on attention weight. And the L1 is an upper bound, not the true output error. This left an obvious next step wide open: can "output reconstruction error" be turned directly into the *eviction indicator itself*?
+
+** 2026 | ReST-KV: Make "how much worse will output be after deletion" the indicator itself
+
+*** What problem it saw
+
+The shared blind spot of all prior methods: using *attention weight* as a proxy for *importance*, when the true objective is *output* — you do not care whether the attention distribution looks like the original; you care whether the downstream MHA output still looks like the original. These are not the same thing, because:
+- After deleting an entry, attention *re-normalizes*: the remaining entries receive proportionally amplified weights.
+- The direction of value vectors determines where "after amplification" the output gets pulled.
+- A token with low attention but a large value magnitude can cause the output to collapse catastrophically when evicted.
+
+*** Its solution
+
+Reformulate KV eviction as an *optimization problem*: within budget B, find the KV subset such that the MHA output computed from that subset is *minimized in L2 distance* from the MHA output computed with all KVs retained.
+
+Direct solution is too expensive, so a greedy approach is taken: compute how much output error each KV pair causes when evicted alone, and rank by that error in descending order. After derivation, each token's importance simplifies to a product of two terms (see paper Eq. 7):
+1. =A[n] / (1 - A[n])= — a *nonlinear amplifier*. It preserves the intuition that "higher attention means more important," but uses a monotone convex curve that better differentiates between closely ranked high-attention tokens.
+2. =||MHA(full) - v_n W_O||_2= — *redistribution sensitivity*. If this token is dropped, can the remaining KVs compensate for it through their weighted average? If they cannot, the token is truly important.
+
+A more accurate indicator alone is not enough. The authors push one step further: they observe that this indicator *fluctuates in both time and space* — the importance of the same token can jump between adjacent decoding steps; spatially, importance patterns shift across neighboring positions. So two additional smoothing steps are added:
+- *Temporal*: exponential moving average (EMA), decay-weighting the indicator over recent steps to prevent single-step noise from dominating.
+- *Spatial*: adaptive window-based smoothing, averaging over nearby positions with an adaptively adjusted window offset.
+
+*** Why this worked (and what new debt it buried)
+
+For the first time, "which tokens to keep" is elevated from "ranking by proxy signal" to "optimization against the true objective." LongBench +2.58%, RULER +15.2%, decoding latency at 128k context reduced by 10.61× — this validates the approach.
+
+Remaining debts:
+- Output reconstruction is computed *per-layer, per-head* without accounting for cascading errors across subsequent layers — a small error in one layer may be amplified in higher layers.
+- Greedy selection is a first-order approximation (local linearity assumption); the joint loss of dropping two tokens is not necessarily the sum of dropping them independently.
+- EMA and window smoothing introduce new hyperparameters (decay coefficient, window size) whose generality across tasks remains to be validated.
+
+* Frontier Extensions
+
+ReST-KV was published in May 2026 (ICLR 2026), less than a month ago, and there are no formal follow-up critiques yet. Along the same problem thread, the most likely next directions are:
+
+1. *Cross-layer joint optimization*: Since per-layer reconstruction works, the natural next step is to jointly optimize KV selection across N layers, incorporating cascading error into the indicator — at N times the computational cost.
+2. *Indicator + quantization co-design*: KV cache quantization (e.g., the KIVI family) and eviction are complementary axes; putting "which to keep" and "how many bits to store what is kept" into a unified optimization framework may further reduce memory.
+3. *Training-aware eviction*: All current methods are training-free. The next step may train the model knowing that "some KVs will be evicted at inference time," encouraging representations that are robust to missing entries.
+
+Uncertain items are noted — the above is speculative, not existing papers.
+
+* A Single Diagram
+
+#+begin_example
+           "How to estimate a KV's importance" — evolutionary axis
+
+Time -->  2017            2023               2024               2026
+         Transformer      StreamingLLM       SnapKV             ReST-KV
+         (problem born)   H2O                AdaKV              (problem directly answered)
+
+Signal
+dimension
+          |
+  Rule    | StreamingLLM: fixed positions (start + sliding window)
+          |                     |
+          |                     v
+  Proxy   | H2O:    cumulative attention (backward-looking)
+  signal  | SnapKV: window attention (forward-looking)         ----[blind spot 1: ignores value]
+          | TOVA:   most-recent query attention                 ----[blind spot 2: ignores redistribution]
+          |                     |
+          |                     v
+  Budget  | AdaKV: allocate budget via output L1 upper bound
+  alloc.  |        (but token selection still uses attention)
+          |                     |
+          |                     v
+  Target  | ReST-KV: directly minimize output L2 error
+  optim.  |          + temporal EMA + spatial adaptive window
+          v
+       "proxy -> target" is the most important phase transition on this thread
+
+Parallel branch:
+   Keyformer 2024 ----> sees the same problem, but fixes distribution shape
+                        via "normalization" rather than fixing the indicator
+                        via reconstruction
+#+end_example
+
+* Insights
+
+On the surface this thread is "KV cache eviction getting progressively better." What is actually happening underneath is a *shift in the cognitive coordinate frame*:
+
+1. *From empirical rules to data signals to objective functions.* StreamingLLM used intuition (start is important + recent is important). H2O/SnapKV used empirical signals (attention weights). ReST-KV finally wrote down "what we actually want to optimize" as an equation: preserve the MHA output. Each step forward is one step closer to "what we actually care about."
+2. *Proxy variables have a lifespan.* Attention weight served as an importance proxy for three or four years, until a very plain observation punctured it: deletion causes redistribution, so a static weight is simply not a predictor of post-deletion output. Any research that "uses A as a proxy for B" should take note: *proxies, in long enough use, are forgotten to be proxies.*
+3. *Modeling "deletion" as a perturbation* — ReST-KV is equivalent to performing a leave-one-out influence function estimation. This framing (pruning, quantization, and token drop are all perturbations) as a unified perspective may travel far beyond the specific problem of KV caches.
+
+Where is this most likely heading? See "Frontier Extensions" above — *cross-layer joint optimization* is the most natural continuation, but *baking "dropping KVs" into the training objective* would be the true paradigm leap. The former pushes the same idea to its limit; the latter changes the battlefield.
+
+* Takeaways
+
+If you are doing research that "uses a proxy signal in place of the true target" — not only KV cache, but knowledge distillation, feature selection, pruning, retrieval — this thread offers a very direct methodology:
+
+- *Explicitly write down the loss function for what you ultimately care about.* No matter how expensive it is to compute, write it out first. Then ask: how far is the signal I am currently using from it?
+- *Find the boundary conditions where the proxy breaks.* When does attention weight fail as an importance proxy? When a token has low attention but a large value magnitude. That counterexample is the seed of the next paper.
+- *Using "change in objective after small perturbation" as an indicator* is usually more accurate than "current state." This is something ReST-KV borrowed from the classical Optimal Brain Damage / Molchanov pruning lineage — not new, but applied in the right place, it lets you leap a generation.
+
+Concretely on the engineering side: if you are doing long-context LLM serving, you can now consider replacing SnapKV/H2O-style eviction with reconstruction-based eviction. ReST-KV's code is already open-sourced (=github.com/an-yongqi/rest-kv=); the gains are especially pronounced in low-budget settings (n=64), making it the highest-value switch to make.

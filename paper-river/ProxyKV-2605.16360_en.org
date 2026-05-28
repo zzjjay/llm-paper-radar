@@ -1,0 +1,239 @@
+#+title:      ProxyKV: Cross-Model Proxy Pruning for Efficient Long-Context LLM Inference
+#+date:       [2026-05-28 Thu 12:40]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T124036-en
+#+source:     https://arxiv.org/abs/2605.16360
+#+authors:    Junjie Li, Jiong Lou, Jie Li (Shanghai Jiao Tong University)
+#+venue:      arXiv preprint, 2026-05
+
+* The River of Problems
+
+When an LLM tries to read a 170,000-word novel, an entire codebase, or a long meeting transcript, what stalls it is not compute — it is memory. Every token must store its Key and Value in GPU memory so later steps can look back; the longer the sequence, the more is stored, until the GPU simply runs out.
+
+This gave rise to *KV cache pruning*: discard the "unimportant" tokens, keep only the critical ones. The hard question is — *how do you know which ones matter*?
+
+Why is it hard?
+
+- Aim for accuracy: let the target large model run through the sequence again and see which tokens actually receive attention. Cost: prefilling time doubles — you saved memory but paid it back in latency.
+- Aim for speed: guess with heuristics (attention sink, recency window, cumulative scores). Cost: the guesses are often wrong, and performance collapses on long-context tasks.
+
+For years, generation after generation has charged at this same question: *how do you estimate "which tokens matter" accurately enough, with as little compute as possible*? ProxyKV rewrites the question as: *can a small model guess on behalf of the large model, while both run concurrently, without blocking each other*?
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | KV cache emerges as a by-product: autoregressive decoding
+  | must cache past K/V. No one anticipated contexts of 100k+;
+  | the memory-wall problem is quietly buried.
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem: naïve truncation (sliding window) collapses on long sequences
+  | Finding: models have "attention sinks" — the first few tokens receive
+  |          abnormally high attention
+  | Fix: keep the initial tokens + a recency window. Crude but effective.
+  v
+[2023-2024] Zhang et al. - H2O / Li et al. - SnapKV
+  |
+  | Problem: StreamingLLM relies only on position (head + tail),
+  |          discarding real signals in the middle
+  | Fix: use cumulative attention scores to pick "Heavy Hitters";
+  |      SnapKV clusters important tokens via an observation window
+  |      at the end of the prompt
+  | Still heuristic; global semantic dependencies remain invisible
+  v
+[2025] Kim et al. - KVZip
+  |
+  | Problem: heuristic accuracy hits a hard ceiling;
+  |          long-context reasoning tasks degrade noticeably
+  | Fix: run the large model itself a second time (teacher-forced prefill),
+  |      use true attention as the oracle, then prune by it
+  | High accuracy, but prefilling time doubles — latency eats the memory savings
+  v
+[2025] Zhao et al. - IAM / SmallKV
+  |
+  | Problem: KVZip's oracle is too expensive;
+  |          but within the same model family, attention patterns are
+  |          highly correlated between large and small models
+  | Fix: use the small model's attention directly, mapped to the large model,
+  |      eliminating the large model's second prefill pass
+  | Limitation: "fixed head-to-head mapping" — if head counts differ between
+  |             models, mapping breaks; layer-depth mismatch also causes deadlock
+  v
+[2026] Li et al. - ProxyKV  <-- target paper
+  |
+  | Problem: IAM/SmallKV's hard mapping is brittle;
+  |          small model is still on the critical path — no real time saving
+  | Fix: (1) HybridAxialMapper learns a soft, cross-architecture axial mapping;
+  |      (2) small model is pushed entirely off the critical path — runs async;
+  |      (3) training objective shifts from "regress values" to "preserve ranking"
+  | Result: 98.7% of KVZip accuracy, up to 3.21× prefilling speedup
+#+end_example
+
+Note: StreamingLLM → H2O are concurrent works, not a strict "critique" relationship, but placing them on an evolutionary axis shows how the problem is progressively refined. The KVZip → IAM/SmallKV critique relationship is as relayed in the ProxyKV introduction; citations confirmed.
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Attention Leaves a Cache Behind
+
+To avoid recomputing the attention of all previous tokens every time a new token is generated, the Transformer caches each layer's and each head's Key and Value during decoding. Typical sequence lengths at the time were a few hundred tokens; the cache was a few megabytes — no problem.
+
+Nobody anticipated that eight years later people would ask the model to read a 170,000-token codebase.
+
+*** The Hole It Left
+
+KV cache memory grows *linearly* with sequence length. On a 128k-context Llama-3.1-8B, the KV cache alone consumes tens of gigabytes — exceeding the physical VRAM of a single H100. The problem was born: *something has to be discarded*.
+
+** 2023 | StreamingLLM: Don't Keep Everything — Just the Start and the Recent
+
+The first instinct was a sliding window: keep only the most recent N tokens. Performance collapsed — perplexity exploded.
+
+Why? The Xiao team discovered *attention sinks* — the model inexplicably pours a large portion of its attention onto the very first tokens in the sequence (even semantically unrelated ones). This is a side effect of softmax normalization: scores must sum to 1, so when there is "nothing worth attending to," the probability mass gets dumped on the beginning. Once the beginning is discarded, the distribution collapses.
+
+*** The Fix
+
+Keep the initial 4 tokens + a recent sliding window. Both ends fixed; everything in between discarded.
+
+*** The New Hole It Left
+
+Tokens in the middle that genuinely carry semantic content are thrown away wholesale. Long-document QA, multi-hop reasoning — the critical information for these tasks is often buried in the middle. Position-based heuristics are too blunt.
+
+** 2023–2024 | H2O / SnapKV: Pick by Attention Score
+
+If the middle also contains important tokens, don't cut by position — cut by *importance*.
+
+H2O (Zhang et al.) accumulates each token's total historical attention-received score and keeps the high-scorers ("Heavy Hitters"). SnapKV (Li et al.) is more refined: it uses the final segment of the prompt as an "observation window," identifies which earlier tokens that segment attends to, and selects those.
+
+*** The Fix
+
+Use *locally observed attention patterns* as a proxy for future importance. Cheap, because no extra computation is needed — attention scores are already produced during the forward pass.
+
+*** The New Hole They Left
+
+"Local observation" is the critical weak point. SnapKV's observation window is only the last few dozen tokens of the prompt; it cannot see what the subsequent generation will need. H2O's cumulative scores favor tokens that received attention early, leaving long-tail dependencies invisible. On long-context benchmarks (LongBench, RULER), the accuracy gap versus a true oracle is substantial.
+
+** 2025 | KVZip: Let the Large Model Run Again, Get the True Scores
+
+The accuracy ceiling imposed by heuristics is nailed in place — because they are guessing, while the oracle is right there: run the target model once more on the full sequence with teacher-forced prefill, record the true attention distribution, and prune by it.
+
+*** The Fix
+
+No guessing — compute the ground truth directly.
+
+*** The New Hole It Left
+
+The cost is so high it defeats itself. Pruning is meant to make long-context inference tractable; running prefill twice means the latency and memory savings from decode are erased — or worse, negative. The paper calls this the "*scoring-cost vs. accuracy gap*": the left end of the accuracy axis is heuristics, the right end is KVZip, and between them is a cliff.
+
+** 2025 | IAM / SmallKV: Let a Small Model Guess for the Large One
+
+Zhao et al. observed a key fact: within the *same model family* (e.g., Llama-3.1-8B and Llama-3.1-1B), the attention pattern of each layer and each head is highly correlated — whatever the small model attends to, the large model most likely attends to as well.
+
+So why pay for the expensive large model to compute the oracle? Run the cheap small model for attention, then *transfer* the scores to the large model.
+
+*** The Fix
+
+A fixed head-to-head, layer-to-layer hard mapping: small model head_i score = large model head_i score.
+
+*** The New Holes They Left
+
+Two of them:
+
+1. *Architecture-mismatch deadlock*: Llama-3.1-8B has 32 heads; the 1B version may have only 16. A hard mapping either wastes the small model's heads or fails to cover all of the large model's heads. Switch to a different model pair and the mapping rules must be redesigned from scratch.
+2. *Still on the critical path*: Even though the small model is fast, its forward pass and mapper computation are still serialized before the large model's prefill — the large model must wait for scoring results before it can begin pruning and decoding. Speedup is limited.
+
+** 2026 | ProxyKV: Soft Mapping + Asynchronous Concurrency
+
+ProxyKV solves both outstanding problems at once.
+
+*** The Fix
+
+The "small model as stand-in" idea from IAM/SmallKV is retained, but with two fundamental redesigns:
+
+1. *HybridAxialMapper*: no longer hard-binds head-to-head; instead learns a cross-axis mapping in three stages:
+   - 1D Conv extracts temporal-axis features (each head's attention evolution along the sequence)
+   - Transformer encoder adds context along the time axis
+   - A set of learnable *target queries* pull and recombine features from the small model's head set into the shape of the large model's head set via cross-attention
+   This way, regardless of how many heads the small or large model has, the mapping can be learned — hard binding becomes soft binding.
+2. *Multi-Granularity Hybrid Loss*: prior alignment losses regressed the small model's scores onto the large model's scores (MSE-style). But the pruning task does not care about the *exact score values* — it cares about *who lands in the Top-K*. The loss is therefore reformulated as multi-granularity ranking consistency (Top-K binary, intra-Top-K rank, global mass rank, cosine, and others — five terms in total). The learning objective aligns with the downstream task.
+3. *Asynchronous pipeline*: the small model and mapper run on an independent CUDA stream (single GPU) or a separate GPU (dual GPU), *concurrently* with the large model's prefill. The constraint: =t_score ≤ t_prefill= — as long as scoring finishes before the large model's prefill does, scoring costs nothing extra. The small model's KV cache is released immediately after use; the peak memory overhead is brief and confined to the prefill phase.
+
+*** Why This Works
+
+The three moves reinforce each other:
+
+- Soft mapping makes "cross-architecture" a system-level capability rather than something hand-tuned per model pair.
+- Ranking loss sidesteps the common trap of "scores are accurate but Top-K is wrong."
+- Asynchronous concurrency turns scoring time from an *additive* cost into a *max* — this is the root cause of the qualitative shift in the performance curve. The 3.21× prefill speedup comes primarily from here, not from optimizing any single component.
+
+*** The New Holes It Left
+
+- *Intra-family constraint*: a same-family small model must be available. For a brand-new architecture with no smaller sibling, there is nothing to use.
+- *Scoring-time budget*: if the target model is already very small (say 1B), there is little room to exploit the budget constraint.
+- *Training cost*: a mapper must be trained for each (proxy, target) pair. Cheaper than KVZip, but still a deployment barrier.
+
+* Frontier Extensions
+
+As of May 2026, ProxyKV is freshly posted on arXiv — one of the most recent works on this line. Directions that may push further along the same thread:
+
+- *Unsupervised cross-family alignment*: remove the "intra-family" constraint and pair any small model with any large model — requires more general representation alignment.
+- *Dynamic budget*: the retention ratio ρ is currently a fixed hyperparameter; making it query-difficulty-adaptive could squeeze out further speed.
+- *Orthogonal stacking with quantization / MoE*: ProxyKV answers "which tokens to keep"; quantization answers "how many bits per token." The two are composable. Quark/MXFP4 quantization + ProxyKV pruning is a natural combination.
+
+A concurrent work worth watching: KVzap (Jegou & Jeblick, 2026) takes a different path — using a per-layer surrogate embedded inside the large model's hidden states to predict oracle scores directly. The ProxyKV paper explicitly excludes it as a baseline (training cost is high; protocols are incomparable), but it represents a clear architectural fork: "surrogate embedded inside the target" vs. ProxyKV's "surrogate externalized and async."
+
+* One Diagram to Understand It All
+
+#+begin_example
+                      Accuracy -->
+                      Low               High
+                      |                 |
+       Slow  ---------+-----------------+----------
+       ^             [Vanilla]      [KVZip]
+       |             full cache    2x prefill
+       |                              ^
+       |                              |
+   Time                (nobody here)   | High accuracy but too costly
+   Cost                              [IAM/SmallKV]
+                                    hard mapping + synchronous
+       v                              |
+       Fast  [Streaming] [H2O/SnapKV] +-- [ProxyKV] <-- target
+               heuristic   heuristic    soft mapping + async
+                  /            /          ranking-alignment loss
+            (position)  (cumulative      (cross-architecture)
+                          scores)
+
+  Evolution axis: heuristic --> full reconstruction --> proxy learning --> async proxy
+  Cost axis:      too crude  --> too expensive       --> mapping too rigid --> fully decoupled
+
+  Key turning points:
+    1. StreamingLLM    position -> importance (but still heuristic)
+    2. KVZip           heuristic -> oracle (but cost is unacceptable)
+    3. IAM/SmallKV     single model -> cross-model (but hard mapping + synchronous)
+    4. ProxyKV         hard+sync -> soft+async (architecture-agnostic + time-agnostic)
+#+end_example
+
+* Insights
+
+On the surface this line of work is about "how to discard KV cache entries." At its core it is about *a more general phenomenon in inference systems*:
+
+*When a computation is both expensive and necessary, the first instinct is to avoid computing it (heuristics); the second is to find a cheaper surrogate to compute it (proxy); the third is to pull it off the critical path and let it run concurrently elsewhere (async).*
+
+KV pruning has evolved through almost exactly this sequence:
+- StreamingLLM / H2O / SnapKV = don't compute (replace with heuristics)
+- IAM / SmallKV = let someone else compute (small model as stand-in)
+- ProxyKV = let someone else compute it somewhere else simultaneously (pulled off the critical path)
+
+This "compute → offload → async" pattern is not unique to KV pruning. Speculative decoding (draft model asynchronously producing tokens), prefetching (asynchronously loading the next segment) — both share the same structure: *turning latency from addition into max*. Any inference bottleneck will eventually be cracked open this way.
+
+Looking one step further: after the critical path is decoupled, the next frontier is *whether the surrogate itself can learn to generalize* — not retraining a mapper for every model pair, but a mapper that possesses cross-architecture generalization and can handle unseen (proxy, target) pairs out of the box. That pushes "system optimization" into "universal alignment."
+
+* Takeaways
+
+- *When looking for bottlenecks, don't only ask "how to compute this faster" — ask "can this be computed somewhere else entirely"*. The biggest leap across the whole KV pruning field was not any algorithm getting faster; it was ProxyKV pulling scoring off the critical path.
+- *Misalignment between training objective and downstream task is easily overlooked*. MSE looks standard, but the downstream need is correct Top-K, so a ranking loss is the right choice. Always ask: is what I am training for the same thing as what I actually care about measuring?
+- *Hard constraints (fixed head mapping) often mistake "implementation convenience" for "correct modeling"*. Replacing them with learnable soft alignment frequently unlocks an entirely new class of scenarios at once.
+- *To identify a paper's true contribution, look at which couplings it breaks*. ProxyKV breaks three: the scoring–prefill time coupling, the proxy–target architecture coupling, and the loss–task coupling. Each decoupling is a source of order-of-magnitude improvement.
+
+The practical landing point: the next time you design an LLM inference optimization scheme, start by drawing a "time vs. accuracy" scatter plot with existing methods plotted on it, find the cliff, and then ask whether "proxy + async" can fill it in. That is the genuinely transferable methodology ProxyKV leaves behind.

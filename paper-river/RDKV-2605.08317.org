@@ -1,0 +1,189 @@
+#+title:      RDKV: Rate-Distortion Bit Allocation for Joint Eviction and Quantization of the KV Cache
+#+date:       [2026-05-28 Thu 12:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T120000
+#+source:     https://arxiv.org/abs/2605.08317
+#+authors:    Junkai Zhang, Hang Guo, Luca Benini, Yawei Li
+#+venue:      arXiv 2026-05 (cs.LG)
+
+* 倒读法：从一个问题开始
+
+这一篇叫 RDKV，2026 年 5 月挂上 arXiv。题目长，但意思简单：把 KV cache 压一压，让大模型读长文档不那么憋。
+
+读它之前先别看它怎么做的。先看它在不爽什么。
+
+它说：现在压 KV cache 有两条路，一条叫 *eviction*（扔），一条叫 *quantization*（降精度）。这两条路在前人手里各走各的，偶尔有人把两条拼起来，但拼得很糙——比例是猜的，阈值是离线搜的，没有一个统一目标函数说清楚"为什么 30% 的 token 该留全精度、50% 该量到 2 bit、20% 该直接扔掉"。
+
+它说：这件事本质上是一个 *rate-distortion* 问题（信息论 60 年代就解决了的问题）。扔和量化只是同一根数轴的两个端点。0 bit 就是扔，16 bit 就是留，中间还有 2/4/8 bit 这些档位。统一在一个 bit 分配问题里解。
+
+——这一句"统一在一个问题里解"，正是这条演化线的终点。
+
+那么这条线是从哪开始的？
+
+* 溯源地图
+
+#+begin_src text
+
+  [2023] H2O ----------- 第一次说: 不是所有 token 都重要
+            |             方案: 看累计 attention 分数, 扔掉低分的
+            |             遗留: 只看历史 attention, 没看未来 query
+            v
+  [2024] SnapKV --------- 看到: 不该只看历史, 该看最近窗口预测未来
+            |             方案: 用最后 N 个 query 的 attention 投票
+            |             遗留: 全局一刀切, 每层每头同一个预算
+            v
+  [2024] AdaKV ---------- 看到: 不同 head 的 attention 分布差异巨大
+            |             方案: 把预算在 head 之间动态分配
+            |             遗留: 还是 keep-or-drop, 没有"半留"这一档
+            |
+            |    [2024] ThinK ---- 平行支线: token 不是唯一单位
+            |              |       channel (K 的列) 也可以扔
+            |              v       遗留: 仍然是 0/1 决策
+            v
+  [2024] KIVI ----------- 另一条线: 干脆别扔, 全留, 但降精度到 2-bit
+            |             方案: per-channel K 量化 + per-token V 量化
+            |             遗留: 所有 token 一视同仁, 浪费了"重要 token"
+            v
+  [2025] HqeKV / ARKV --- 看到: 扔和量化不该二选一, 拼起来更好
+            |             方案: 用 TPE / 离线搜索, 给每层定一个比例:
+            |                   "这一层 20% FP16, 50% 4-bit, 30% 扔"
+            |             遗留: 比例是搜出来的, 不是从原理推出来的
+            v
+  [2026] RDKV ----------- 看到: 这两件事可以从一个目标函数同时推出来
+                          方案: rate-distortion 框架 + reverse water-filling
+                          每个 token / channel 拿到自己的 bit 数
+
+#+end_src
+
+注：本图是从 RDKV 的 related work 和它引用的论文中追出来的批判链，不是 100% 的直接引用关系（H2O→SnapKV 是直接继承，AdaKV→ThinK 是平行支线，KIVI 是另一条主线，HqeKV/ARKV→RDKV 是 RDKV 明确点名要超越的对象）。
+
+* 正向叙事：一根问题从哪长出来
+
+** 起点：H2O 看见了什么？(2023)
+
+在 H2O 之前，长上下文推理就一个办法——硬扛。每生成一个 token，就把整个 KV cache 从显存读一遍。8K context 还能忍，128K 就慢到不能用。
+
+H2O 的人盯着 attention map 看了很久，看出一件事：*attention 是稀疏的*。每个 query 真正认真看的，就那么少数几个 token。剩下的，attention 权重接近 0，存它就是浪费带宽。
+
+于是 H2O 提出："Heavy Hitter Oracle"——把每个 token 在所有历史 query 里收到的 attention 加总，分高的留下来，分低的扔掉。
+
+这是一切的起点：*token 不平等*。
+
+但 H2O 留了一个坑：它只看历史 query 的 attention。可是接下来要解码的 token，关心的是什么呢？它们还没出现。
+
+** SnapKV：你不该看所有过去，你该看"刚刚"(2024)
+
+SnapKV 的作者读 H2O，看出这个坑。他们说：解码刚开始的几步，最能代表后面要关注什么。不要把整段历史的 attention 平均一下，而是看 *prefill 末尾那个观察窗口* 里 query 对各个 token 的关注度——那是离"未来"最近的代理信号。
+
+代码上改动很小，效果上有飞跃。SnapKV 成了之后两年所有 budget-driven eviction 的事实基线。
+
+但 SnapKV 还留了一个坑：它给所有 attention head 同一个预算。可是不同 head 的角色非常不同——有的 head 关注 1-2 个关键 token，有的 head 关注一片区域。一视同仁会浪费。
+
+** AdaKV：预算不该平均分，要按 head 自适应 (2024)
+
+AdaKV 直击这个问题：先看每个 head 的 attention 分布，集中（关注少数 token）的 head 给少预算，分散（关注很多 token）的 head 给多预算。同样的总预算，效果显著更好。
+
+PyramidKV、CAKE 是这条线的兄弟——同样是"重新分配预算"，只是切的维度不同（PyramidKV 切层，浅层留多深层留少；CAKE 一起切层和 head）。
+
+到这里，eviction 这条线已经被打磨得很细致了。但它有一个根本限制：*所有决策都是二值的*。一个 token 要么留 FP16，要么直接扔。一个明明很重要但又不是最重要的 token，它该怎么办？
+
+这条线上又出现了一支：ThinK。它说既然 token 可以扔，那 K 矩阵里的 *channel*（列）也可以扔——某些 channel 几乎没贡献。这把"扔"的颗粒度从 token 扩到了 channel，但还是 0/1 决策。
+
+** KIVI：换一条路，别扔，降精度 (2024)
+
+跟 eviction 几乎平行的时间，另一拨人走了完全不同的路：*不要扔任何 token，但把每个 token 的精度从 FP16 压到 2-bit*。
+
+KIVI 看出一个细节：K cache 里 *某些 channel* 持续是离群值（outlier），如果按 channel 量化，离群值就被孤立处理，其他 channel 可以激进压缩；V cache 没有这种 channel 模式，按 token 量化更稳。这种 per-channel K + per-token V 的非对称量化方案，2-bit 几乎不掉点。
+
+KVQuant、ZipCache 后续把这条线继续打磨。
+
+但 KIVI 也有自己的盲点：*它把所有 token 一视同仁，都压到 2-bit*。可是 H2O 那条线已经反复证明了——token 是不平等的。重要的那几个 token，压到 2-bit 就是损失；不重要的那一大堆，压到 2-bit 都嫌奢侈。
+
+** HqeKV / ARKV：把两条线拼起来 (2025)
+
+到了 2025 年，几乎是必然的，有人开始拼接：*为什么不让重要 token 留 FP16，中等 token 用 4-bit，不重要 token 直接扔？*
+
+HqeKV 用 TPE（Tree-structured Parzen Estimator）搜索，每个设置跑 200 次 trial，找到每个 bit 档位下最优的 token 比例。ARKV 走另一条路：先用 prefill 的 attention 统计估出每层的"原始 vs 量化"比例，再离线搜阈值。
+
+它们都得到了比单独扔或单独量化更好的结果。这就是 RDKV 引言里那句"recent analysis shows that combining eviction with quantization outperforms either action alone"——指的就是这两篇。
+
+但它们都留了同一个坑：*那个比例是搜出来的，不是推出来的*。换一个模型、换一个数据集，就得重搜。更深的问题是——*没有一个统一目标函数说清楚为什么*这个比例是对的。
+
+* RDKV：用 rate-distortion 一锤子把它砸定
+
+到这里，RDKV 出场。
+
+它说：你们之前所有人都在猜——猜分数怎么算，猜比例怎么定，猜阈值在哪。但这件事其实早在 1960 年代就被信息论解决了。
+
+把 KV cache 压缩，看成一个标准的 *rate-distortion* 问题：
+
+- *Rate*（成本）：你愿意花多少 bit
+- *Distortion*（代价）：压缩之后 attention 输出偏离原值多少
+- *目标*：给定总 bit budget，让 distortion 最小
+
+如果按这个目标去解，会自动得到什么？答案是：*reverse water-filling*——这是信号处理里的经典解。它告诉你：
+
+- 每个 token / channel 有一个"distortion 权重"（删掉它会引入多少误差）
+- 把所有权重排起来，像往一堆容器里倒水一样分配 bit
+- 权重大的容器（重要 token）会自动分到更多 bit，可能到 FP16
+- 权重小的容器（无关 token）分到 0 bit——也就是被扔掉
+
+*关键的认知突破在这里*：扔和量化不是两件事，它们是同一根 bit 数轴的两个端点。0-bit 就叫 eviction，16-bit 就叫 keep。中间有 2/4/8 bit 这些档位，原来根本不需要"先决定扔哪些再决定量哪些"——直接一次性解 bit 分配就行。
+
+那 distortion 权重怎么算？
+
+- *V cache 的 token 权重*：扔掉 token t 后，attention 分布的 total variation 变化等于 token t 收到的累计 attention。*这就是 H2O 那个分数*——但现在它不是用来排序的 ranking score，而是用来加权的目标函数系数。
+- *K cache 的 channel 权重*：扔掉 channel c 后，logit 矩阵的 spectral norm 偏差等于 Q 和 K 在那一列的 L2 范数乘积。*这就是 ThinK 那个分数*——同样从 ranking 升级成 weighting。
+
+RDKV 不否定前人的分数，它把前人的分数从"排序工具"重新解释为"目标函数权重"。这是这篇论文最优雅的一步——*前人 95% 的工作直接复用*，但用一个新的框架把它们组织起来。
+
+剩下就是工程：解 Lagrangian 松弛得到水位线，把分配结果做成 TriZone packed-decode（在 attention kernel 里融合 dequant），在 LLaMA-3.1-8B 上跑到 4.5× 解码加速、1.9× 显存节省、97.81% FullKV 准确率（只用 2.48% cache）。
+
+* 压缩总览
+
+#+begin_src text
+
+  问题: 长上下文推理被 KV cache 带宽卡死
+
+  解题路径的演化:
+
+    阶段 1 (eviction):   token 不平等, 留重要的扔次要的
+      H2O (累计 attn) -> SnapKV (观察窗口) -> AdaKV (head 自适应) -> ThinK (channel)
+      限制: 0/1 决策, 没有"半留"
+
+    阶段 2 (quantization):  别扔, 都留, 但降精度
+      KIVI (channel-K + token-V) -> KVQuant / ZipCache
+      限制: 一视同仁, 浪费"重要 token"和"无关 token"的差异
+
+    阶段 3 (hybrid by search): 拼起来, 但比例靠搜
+      HqeKV (TPE 搜比例) / ARKV (阈值搜索)
+      限制: 比例是经验, 不是原理
+
+    阶段 4 (hybrid by principle): RDKV
+      把 0 bit (扔) 和 16 bit (留) 看成同一根轴的端点
+      rate-distortion + reverse water-filling 一次解出分配
+      前人的分数 (H2O / ThinK) 从 ranking 变成 weighting
+
+  内核转变:
+    从"决定扔哪些" -> "决定每个单元值多少 bit"
+    从"启发式排序" -> "信息论目标函数"
+    从"两个动作两次决策" -> "一个分配问题一次解"
+
+#+end_src
+
+* 洞见
+
+这条演化线表面在迭代技术（attention 分数→head 自适应→量化→混合），背后真正在发生的是 *把一个工程经验问题逐步收敛回一个有解析框架的数学问题*。
+
+H2O 给了一个朴素的"重要性度量"。后续每一篇都在两个方向上推进：(1) *度量更精细*（SnapKV 用未来代理、AdaKV 拆 head、ThinK 拆 channel）；(2) *动作更丰富*（从扔升级到量化，再升级到混合）。但所有人都停在"分数 + 启发式动作"的层面。
+
+RDKV 的真正贡献不是某个新分数或某个新动作，而是 *把这两个维度统一在一个 rate-distortion 目标函数里*。前人的分数（H2O 的 attention sum、ThinK 的列范数）原来就是这个框架的"最优权重"——它们已经是对的，只是用错了地方（被当成排序而非加权）。这是一种"事后追认"式的统一：用一个更深的框架，证明先前散乱的经验都是它的特例。
+
+*下一步最可能往哪走？*
+
+两个方向：
+
+1. *动态而非一次性*。RDKV 是在 prefill 之后做一次分配，整个 decode 过程不变。但 decode 中 attention 分布会漂移——重要 token 会变。下一步多半是 *online 重分配*，但要解决 reallocation 的开销问题。
+2. *联合训练*。现在 RDKV 是 training-free 的事后压缩。如果在训练时就让模型"知道自己会被这样压"，可能可以让模型主动把信息集中到少数关键 token / channel 上，进一步压低 distortion 下界。
+
+更远一点：rate-distortion 是为"近似还原一个固定信号"设计的。但 LLM attention 不是固定信号——同样的 KV，不同 query 看出不同重要性。真正的下一代框架可能需要 *query-conditioned* 的 rate-distortion，那将是一次更大的重写。

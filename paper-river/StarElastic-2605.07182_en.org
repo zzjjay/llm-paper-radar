@@ -1,0 +1,414 @@
+#+title:      Star Elastic: Many-in-One Reasoning LLMs with Efficient Budget Control
+#+date:       [2026-05-28 Thu 12:08]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T120826-en
+#+source:     https://arxiv.org/abs/2605.07182
+#+authors:    Ali Taghibakhshi, Ruisi Cai, Saurav Muralidharan, Pavlo Molchanov, et al. (NVIDIA)
+#+venue:      arXiv 2026-05-08 (cs.LG)
+
+* The River of Problems
+
+You've trained a 30B reasoning model that "thinks" — it deliberates internally before producing an answer.
+
+Now the product manager arrives:
+- It needs to run on a phone — give me a 12B version;
+- It needs to run on a laptop — give me a 23B version;
+- The server can handle the full thing — keep the 30B.
+
+The most naïve approach: train three separate models. *Each one burns a full training budget* — and the original model's "reasoning ability" might not survive the transfer.
+
+The second most naïve approach: train one large model, then prune/distill down to smaller ones. Cheaper, but each target size still requires its own pruning pass and its own distillation run — *N separate training costs* all the same.
+
+A smarter idea: could a *single training run* simultaneously produce a "30B / 23B / 12B" family? Ideally with shared weights — the larger model is just the outer shell of the smaller ones, and at deployment you simply slice to the desired size.
+
+This intuitive idea has been a quiet undercurrent in deep learning for the past eight years. It grew out of "elastic networks" in computer vision, climbed its way up to LLMs, and each generation fixed one concrete flaw left by the previous one.
+
+Star Elastic asks a sharper question still:
+*Does a reasoning model need the same capacity when it is "thinking" as when it is "answering"?*
+If not, can we *dynamically switch sizes within a single response* — using a larger sub-model for deliberation and a smaller one for writing the final answer?
+
+* Source Map
+
+#+begin_example
+[2018] Yu et al. -- Slimmable Networks
+  |
+  | Problem seen: Deploying one CNN to different phones required
+  |               training separate narrow/wide versions
+  | Solution: One network supports multiple width settings,
+  |           switched at runtime; BN stats stored per setting
+  | Remaining gap: Only one dimension (width) varied;
+  |                CNN-only; switching still manual
+  v
+[2020] Cai, Gan, Han -- Once-For-All (OFA)
+  |
+  | Problem seen: Slimmable only varies width; matching different
+  |               compute budgets also requires depth/resolution changes
+  | Solution: "Progressive Shrinking" training -- train the largest
+  |           network first, then progressively allow smaller
+  |           kernels, shallower depth, narrower width
+  |           One training run yields 10^19 sub-networks;
+  |           pick one per device
+  | Remaining gap: Still CNN-only; heavy interference between
+  |                sub-networks inside the SuperNet
+  v
+[2024] Devvrit et al. -- MatFormer (Matryoshka Transformer)
+  |
+  | Problem seen: In the Transformer era, OFA doesn't transfer --
+  |               FFN hidden dimension is the dominant cost,
+  |               and attention head count can't be changed casually
+  | Solution: Make each layer's FFN hidden dimension *naturally nested*
+  |           (d/8, d/4, d/2, d); during training, sample different
+  |           settings probabilistically and optimize jointly
+  |           At inference, just slice -- the first k dims of the
+  |           large model are the small model
+  | Remaining gap: Only FFN width varies; settings are hand-picked;
+  |               no consideration of the LLM post-training pipeline
+  |               (instruction tuning, distillation)
+  v
+[2024] Muralidharan et al. -- Minitron (Compact LM Pruning + KD)
+  |
+  | Problem seen: Plugging MatFormer into an LLM isn't enough --
+  |               reaching a target size still requires a full
+  |               "importance scoring + distillation recovery" pipeline
+  | Solution: Compute activation importance -> structured pruning
+  |           (depth / width / heads / embedding) ->
+  |           knowledge distillation from the large teacher
+  |           to recover accuracy
+  |           Cost << retraining from scratch (40x savings)
+  | Remaining gap: *Each target size needs its own pruning + distillation
+  |                pass* -- 3 sizes = 3 training runs
+  v
+[2025] Cai et al. -- Nemotron Elastic
+  |
+  | Problem seen: Minitron trains each size separately; MatFormer
+  |               requires hand-picked settings.
+  |               Can we do "one training run, whole model family"?
+  | Solution: Introduce nesting simultaneously across all Transformer
+  |           dimensions (depth / width / heads / FFN); use a
+  |           *trainable router* to learn end-to-end which sub-model
+  |           uses which parameters; curriculum distillation lets
+  |           sub-models learn together, larger teaching smaller
+  | Remaining gap: - Dense Transformer only
+  |               - No MoE / SSM support
+  |               - Same sub-model used throughout the whole sequence
+  |                 (static selection)
+  |               - No consideration of quantization for deployment
+  v
+[2026] Taghibakhshi et al. -- Star Elastic  <-- this paper
+  |
+  | Problem seen: 1. Nemotron Elastic doesn't cover MoE/SSM hybrid
+  |                  architectures (today's flagship models)
+  |               2. In reasoning LLMs, the "thinking" and "answering"
+  |                  phases have very different compute demands,
+  |                  but all prior methods use one sub-model end-to-end
+  |               3. Deployment still requires a separate quantization step
+  | Solution: 1. Extend nested dimensions to SSM + MoE experts +
+  |              embedding channels + FFN
+  |           2. *Elastic Budget Control*: use a large sub-model during
+  |              the thinking phase, switch to a small one for answering
+  |              -> pushes the accuracy-latency Pareto frontier outward
+  |           3. Quantization-Aware Distillation (QAD):
+  |              fold NVFP4/FP8 quantization into training;
+  |              sliced sub-models are deployment-ready
+  |              (360x savings vs. retraining; 7x vs. SOTA compression)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2018 | Slimmable Networks: One CNN, Multiple Widths
+
+*** What problem did it see?
+
+Around 2018, phone manufacturers began squeezing CNNs onto edge devices — beauty filters, face unlock, AR. The problem was immediate: the Apple flagship had 8× the compute of an entry-level Android, yet you needed to ship the same product across all of them. Could you use a single network?
+
+No. Each compute tier required a separately trained network: MobileNet-1.0, MobileNet-0.75, MobileNet-0.5 … Every variant had to be trained from scratch, stored as separate weights, and maintained through separate release pipelines. A maintenance nightmare.
+
+*** Its solution
+
+Yu et al. proposed a simple yet elegant idea: let the *same* network support multiple "width settings."
+
+Concretely: the first layer has 64 channels, but during training you randomly choose to use the first 16 / 32 / 48 / 64 of them. All the resulting losses are summed and back-propagated together.
+
+The only catch was that BatchNorm statistics depend on the channel count, so *each width setting stores its own BN parameters*. All other weights are shared.
+
+At deployment, slice by device compute — the first k channels constitute the k-width model.
+
+*** Why it worked (and what new problems it buried)
+
+Intuition: early channels in a neural network naturally learn more "fundamental" features (conventional wisdom: the first channel learns edges, the last learns high-level semantics). So a sub-network formed by "the first k" is a coherent, self-consistent small model.
+
+Remaining gaps:
+1. Only one dimension — width — was varied. Changing depth or input resolution still required retraining.
+2. CNN-only.
+3. Settings still had to be chosen by hand, and sub-networks interfered with each other (smaller ones got the short end).
+
+** 2020 | Once-For-All (OFA): Train Once, Deploy Everywhere
+
+*** What problem did it see?
+
+Slimmable only varied width. But real deployment differences go further — Apple's A-series chips can run deep layers; IoT chips can only handle shallow ones. A 4K camera input and a 224×224 input are not interchangeable.
+
+Stacking one Slimmable per dimension still resulted in separate training runs when combinations were needed.
+
+*** Its solution
+
+OFA extended nesting to *four dimensions*: depth, width, kernel size, and input resolution. One SuperNet contains 10^19 possible sub-networks.
+
+The key technique was "Progressive Shrinking":
+- Train the largest network to convergence;
+- Then allow smaller kernels;
+- Then allow shallower depth;
+- Then allow narrower width.
+
+At each step, smaller sub-networks are distilled from their larger counterpart, preventing them from fighting over resources from the start.
+
+At deployment, given a target latency budget, search for the optimal sub-network and extract it at zero cost.
+
+*** Why it worked (and what new problems it buried)
+
+Progressive Shrinking = curriculum learning. From large to small, from coarse to fine. Each step introduces only one new degree of freedom, preventing training from diverging.
+
+Remaining gaps:
+- Still CNN-only. No one could directly transplant this to Transformers.
+- SuperNet training cost was actually high (supporting 10^19 sub-networks meant sampling multiple sub-networks per batch).
+- *Interference* between sub-networks — the larger ones could drag the smaller ones down.
+
+** 2024 | MatFormer: Bringing Matryoshka Nesting into Transformers
+
+*** What problem did it see?
+
+In the LLM era, OFA's approach doesn't transfer directly. The dominant compute in a Transformer comes from the *FFN hidden dimension* and *number of attention heads* — but changing head count requires retraining the entire attention mechanism, and the FFN is just width, width, width.
+
+Moreover, training an LLM costs millions of dollars. No one is going to sample 10^19 sub-networks per batch inside a SuperNet.
+
+*** Its solution
+
+MatFormer took a more radical path: make the FFN hidden dimension *naturally nested*.
+
+Set FFN hidden size d = 8192, define settings {1024, 2048, 4096, 8192}. During training, sample a setting per batch and only run the forward pass through the first k dimensions.
+
+Key insight: because training always starts from "the first k dimensions," the earlier neurons are *forced* to learn the most important features — they must be useful at every setting. This is natural importance sorting.
+
+At inference, just slice: want 1024 dimensions? Use the first 1024 FFN neurons.
+
+*** Why it worked (and what new problems it buried)
+
+Intuition: training dynamics force the model to learn an "importance ordering" by itself. This is more principled than post-hoc pruning — pruning looks back to find what's unimportant; MatFormer drives the model to put the important things first, during training.
+
+Remaining gaps:
+1. Only one dimension — FFN width — was varied. Attention heads, layer count, and embedding dimensions were untouched.
+2. The settings {1024, 2048, 4096, 8192} were hand-picked — why not 1536? No one knew.
+3. The model was used as-is after training, with no consideration of whether standard LLM post-training (instruction tuning, RLHF) would disrupt the nested structure.
+
+** 2024 | Minitron: A Complete Pipeline for LLM Compression
+
+*** What problem did it see?
+
+MatFormer is an elegant "during-training" solution. But industry has *already-trained* Llama-70Bs and Nemotron-15Bs — none of which were trained with nesting.
+
+How do you compress an existing large model into a small one, while preserving as much capability as possible (without training from scratch)?
+
+*** Its solution
+
+NVIDIA's Minitron pipeline has three components:
+
+1. *Importance scoring*: run a calibration dataset and measure the activation magnitude of each attention head / FFN neuron / layer.
+2. *Structured pruning*: cut the weakest components — remove layers in the depth direction, prune heads/channels in the width direction, and optionally reduce embedding size.
+3. *Knowledge distillation*: accuracy drops after pruning; use the original model as a teacher and distill over tens of billions of tokens to recover it.
+
+Compared to retraining from scratch: 40× compute savings.
+
+*** Why it worked (and what new problems it buried)
+
+Minitron turned "prune + recover" into a reusable engineering pipeline that no longer depended on any special training-time nesting design.
+
+Remaining gap:
+*Each target size requires running the entire pipeline again.* Wanting both a 23B and a 12B variant means two pruning passes + two distillation runs = two full compute budgets.
+
+The original problem that Slimmable set out to solve had, after a long detour, come back around.
+
+** 2025 | Nemotron Elastic: One Distillation Run, a Whole Model Family
+
+*** What problem did it see?
+
+Minitron trains each size separately; MatFormer requires hand-picked settings. Could these two lines be merged?
+
+The goal was clear:
+- Like Minitron, use *distillation* from an existing large model to recover accuracy;
+- Like MatFormer, let multiple sub-models *nest* inside a single set of weights;
+- Don't hand-pick the settings — let the model *learn* the optimal sub-model layout itself.
+
+*** Its solution
+
+Nemotron Elastic simultaneously introduces nesting across *four Transformer dimensions*: layer count / head count / FFN width / embedding dimension.
+
+The biggest innovation is an *end-to-end trainable router*: given a target size (e.g., "I want 12B"), it outputs how much of each dimension each layer should use. This router is learned jointly with the main model.
+
+Training uses *curriculum distillation*:
+- Large sub-models learn first (more capacity, converge earlier);
+- Medium sub-models use the large ones as teachers;
+- Small sub-models then learn from the medium ones;
+- Losses are weighted and summed for back-propagation.
+
+All sub-models share weights — the large model is the outer shell; the smaller ones live inside it.
+
+*** Why it worked (and what new problems it buried)
+
+Trainable router = no need to guess settings by hand. Curriculum distillation = resolves the interference problem between sub-models.
+
+Remaining gaps:
+1. *Dense Transformer only* — no support for MoE or SSM/Mamba-style architectures (which, by 2025, power the strongest open-source models).
+2. *The same sub-model is used for the entire sequence at inference time* — but in a reasoning model, "thinking" and "answering" clearly have different demands.
+3. *No consideration of quantization* — deploying to edge devices still requires a separate PTQ/QAT pass.
+
+These three gaps are exactly where Star Elastic begins.
+
+** 2026 | Star Elastic: Nesting + Hybrid Architecture + Phase Awareness + Quantization
+
+*** What problem did it see?
+
+Three developments made Nemotron Elastic insufficient:
+
+1. *Modern flagships are hybrid*. NVIDIA Nemotron Nano v3 = Hybrid SSM (Mamba layers) + MoE (Mixture-of-Experts) + attention. The "slice the FFN dimension" approach from MatFormer/Nemotron Elastic simply doesn't cover this:
+   - MoE capacity lives in the number of experts;
+   - SSM capacity lives in state dimensions / SSM hidden size;
+   - Neither of these dimensions had ever been nested before.
+
+2. *Compute demands within a reasoning model are uneven*. A reasoning LLM has two distinct phases within a single response:
+   - "Thinking" (chain-of-thought deliberation) — long, complex, one wrong step ruins everything;
+   - "Answering" (formatted output) — short, templated, comparatively simple.
+   Using the same model size for both phases means either thinking power is insufficient (if using the small one) or the answer-writing step is wasteful (if using the large one).
+
+3. *Deployment requires quantization*. FP16 weights don't fit on edge hardware; NVFP4/FP8 is needed. But does the nested structure survive quantization? No one had verified this.
+
+*** Its solution
+
+Three techniques address three problems:
+
+*Technique 1: Extend nesting to SSM + MoE dimensions.*
+- Nesting along the SSM dimension (state dimensions can be cut large/small);
+- Nesting along the MoE dimension (number of active experts can be cut);
+- Embedding channel / FFN dimension nesting carried over from prior work.
+
+A 30B/3.6A parent model (30B parameters, 3.6B active) produces both a 23B/2.8A and a 12B/2.0A sub-model through a *single post-training run* (160B tokens).
+
+*Technique 2: Elastic Budget Control — phase-aware size switching.*
+
+At inference, instead of using one model for the entire sequence:
+- Detect whether the current phase is "thinking" or "answering";
+- Use the large sub-model during thinking, switch to the small one for answering;
+- *+16% accuracy, -1.9× latency* — the Pareto frontier is pushed outward.
+
+This is the sharpest contribution in the paper: moving from "static nesting" to "dynamic nesting."
+
+*Technique 3: Quantization-Aware Distillation (QAD).*
+
+Quantization is folded into the distillation process:
+- Weight quantization noise (NVFP4/FP8) is simulated during training;
+- Sliced sub-models can be deployed directly at the corresponding precision;
+- The nested structure remains intact under quantization (zero-shot slicing without accuracy degradation).
+
+*** Why it worked (and what new problems it buried)
+
+Star Elastic pushes the "one training run, whole family deployed" story to its logical conclusion:
+- Dimensionally covers all modern architectures (SSM / MoE / FFN / embedding);
+- Temporally covers the inference process (per-phase dynamic switching);
+- Numerically covers the deployment pipeline (QAD produces quantized variants directly).
+
+The numbers are also compelling: 360× savings vs. training from scratch; 7× savings vs. SOTA compression.
+
+Remaining gaps (also the directions ahead):
+1. Phase switching granularity is still at the *sentence level* — could it go down to the token level, where every token decides independently whether to use the large model?
+2. The router is *learned at training time* — could it adapt at inference time based on input difficulty?
+3. Only the thinking / answering two-phase split has been validated. Retrieval, tool-use, self-correction, and other phases also exist — could each receive its own budget?
+
+* Frontier Extensions
+
+As of 2026-05, Star Elastic is the latest public node on this line of development. Several obvious follow-on directions are already visible:
+
+- *Token-level elastic*: current switching is at the phase level. If a router could decide independently for each token (analogous to MoE routing), the accuracy-latency frontier could be pushed further out.
+- *Input-aware router*: the current router only sees the target size, not the input. Letting it read the prompt ("this is simple arithmetic vs. a complex proof") would allow dynamic adjustment of how much small-model capacity to use.
+- *Cross-checkpoint distillation*: all current sub-models come from a single parent. Allowing distillation from multiple specialist parents could give sub-models multiple areas of expertise simultaneously.
+- *Beyond reasoning*: elastic budget control has so far only been validated on reasoning tasks. Agent loops, long-context processing, and code generation all exhibit similar "phase imbalance" phenomena and should be amenable to the same approach.
+
+* One Diagram to See It All
+
+#+begin_example
+        The undercurrent: "train once, deploy a whole family" (2018 -> 2026)
+
+    Dimension coverage
+    ^
+    |                                                  *** Star Elastic
+    | (SSM + MoE)                                     /  + per-phase
+    | (FFN + d + L)                  *** Nemotron     /  + QAD
+    | (FFN width)                Elastic             /
+    | (depth+width+kernel+res)  /
+    | (width)             *** MatFormer
+    |              *** OFA  /
+    | *** Slimmable
+    +----------+----------+----------+----------+----------+----------> Time
+     2018       2020       2024       2024       2025       2026
+     CNN width  CNN multi- Transformer LLM single End-to-   Hybrid arch
+     switchable dim        FFN nesting size       end       + phase
+                SuperNet               prune+KD   Router    switching
+                                                  Curriculum + quantization
+
+    Each generation fixes one concrete flaw left by the previous one:
+
+    Slimmable:       one network, multiple widths              (one dim only)
+       v
+    OFA:             one network, multiple dims (depth/width/kernel/res)
+                                                               (CNN only)
+       v
+    MatFormer:       nested FFN in Transformers                (FFN only, hand-picked settings)
+       v
+    Minitron:        full prune + distillation pipeline        (one run per size)
+       v
+    Nemotron         one training run, whole family            (dense only, static switching)
+    Elastic:         + learned settings
+       v
+    Star             MoE/SSM nested + thinking/               (token-level? input-aware?)
+    Elastic:         answering dynamic switching + QAD
+#+end_example
+
+* Insights
+
+On the surface this evolutionary line is a series of technical iterations; at a deeper level it reflects *a shifting understanding of what a model is*.
+
+*Phase 1 (Slimmable, OFA): a model is a static structure.*
+You train a network; it is what it is. "Multi-size" just means stuffing multiple static networks into one shell.
+
+*Phase 2 (MatFormer): a model is a sliceable tensor.*
+Weights naturally carry an "importance ordering"; a slice is a model. This is a philosophical leap — a model is no longer a discrete "this one vs. that one," but a continuous "the first k dimensions."
+
+*Phase 3 (Nemotron Elastic): a model is a router-controlled family of functions.*
+No longer "cut at one point," but "learn a mapping: (target size) → (sub-model)." The router encodes the meta-structure of the entire family.
+
+*Phase 4 (Star Elastic): a model is a time-varying function.*
+Within a single prompt, each phase — or even each token — can correspond to a different sub-model. The model has shifted from "a fixed-size object" to "a dynamically scheduled resource."
+
+The next step is almost certain: *token-level elastic + input-aware router* — turning the entire inference pass into a *runtime planner*: given an input, decide for each token which sub-model is the most cost-effective choice. This is essentially making the *inference process itself* an optimizable object.
+
+Going further: the boundary between training, inference, and deployment will blur. Today we say "train a model, deploy it to the edge." In the future it may be "train a *resource family*, and deployment means slicing and configuring on demand." A model's lifecycle moves from "fixed once trained" to "alive once trained."
+
+* Takeaways
+
+For people doing research or engineering:
+
+1. *Watch for "repeated labor" signals.* Every generation of papers starts with "the previous generation had to do it N times" — Slimmable eliminated multiple training runs, OFA eliminated multiple runs across multiple dimensions, Nemotron Elastic eliminated multiple distillation runs per size, Star Elastic eliminated "dynamic switching is impossible." *N runs → 1 run* is the hidden master theme behind every breakthrough in this space. Next time you're writing a for-loop to run experiments, ask: can this be collapsed into one?
+
+2. *"Static constraints" are the richest vein to mine.* Every step in this line breaks one static assumption:
+   - Width is fixed → it can be sliced;
+   - Single architecture is fixed → multiple architectures can be nested;
+   - The inference process is fixed → phases can be dynamic.
+   Find something in your domain that "everyone assumes is constant" and ask: why can't it move?
+
+3. *Treat "nesting" as a language.* Nesting is not just about saving cost — it is a structured language for *expressing uncertainty and flexibility*. You don't have to decide at training time which size you'll ultimately use; let the structure itself encode "the choices available in the future." This mindset transfers broadly: nested datasets (one data collection, many tasks), nested losses (one loss, multiple objectives), nested agents (one agent, multiple personas).
+
+4. *Pareto frontiers are meant to be pushed, not admired.* Star Elastic's "+16% accuracy, -1.9× latency" looks great — but what it really demonstrates is this: when everyone is fighting over 0.5% on an existing Pareto frontier, introducing a new dimension ("per-phase switching" is a new axis) can push the entire frontier outward. Next time you're stuck on a Pareto frontier, ask: am I optimizing in the wrong coordinate system?
+
+Concrete landing points:
+- If you've trained or deployed multi-size models → Nemotron Elastic / Star Elastic is now the engineering paradigm for *producing a whole family in a single post-training run*; you can adopt it directly.
+- If you work on inference acceleration → *per-phase model switching* is an open frontier: add "large for thinking, small for answering" to your Reasoning LLM for a free 1.9× speedup.
+- If you work on quantization → *QAD* is the new baseline; compare against PTQ/QAT and measure the gap.
+- If you work on agents or multi-stage workflows → transplant the elastic idea: assign different-sized sub-models to different stages — this is almost certainly a reliable quick win.

@@ -1,0 +1,268 @@
+#+title:      Training Transformers for KV Cache Compressibility
+#+date:       [2026-05-28 Thu 11:55]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T115547-en
+#+source:     https://arxiv.org/abs/2605.05971
+#+authors:    Yoav Gelberg, Yam Eitan, Michael Bronstein, Yarin Gal, Haggai Maron
+#+venue:      arXiv preprint, May 2026 (cs.LG)
+
+* The River of the Problem
+
+The most straightforward question: after a large model reads an entire book and then answers your question — why doesn't it choke?
+
+Where does it choke? Every token the model reads requires it to record "what this token was seen as, at every layer and every attention head" — these notes are called the KV cache. By the hundred-thousandth token, the notes alone have filled the GPU. Generating each new token requires scanning every old note. The longer the context, the slower and more expensive each step becomes.
+
+Nine years ago, KV cache wasn't a problem — sequences were only a few hundred tokens. Now Claude ingests a million tokens in one go, and the KV cache pushes inference costs straight through the ceiling. Generation after generation of researchers has asked: does every single note really have to be kept? Can we compress them? How do we compress without losing anything?
+
+This is a nine-year history of compression. It starts with "throw out the RNN" and arrives at a point where someone now proposes: "We may have had the direction wrong all along — we've been compressing the notes, but nobody thought to train the model to write compressible notes in the first place."
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Gift it brought:     KV cache (cache K, V at inference to avoid recomputation)
+  | Problem it planted:  cache size grows linearly with sequence length
+  v
+[2019] Shazeer - Fast Transformer Decoding (Multi-Query Attention)
+  |
+  | Problem it saw:  every head stores its own KV; memory bandwidth explodes at decode time
+  | Its solution:    all heads share one copy of K and V
+  | New problem:     saves a constant factor, but still explodes as sequences grow longer
+  v
+[2023] Xiao et al. - StreamingLLM (Efficient Streaming LMs)
+  |
+  | Problem it saw:  trained up to 4K, crashes immediately when run at 100K at inference
+  | Its solution:    keep only the first few "attention sink" tokens + the most recent N tokens
+  | New problem:     purely heuristic; discards everything in the middle; breaks long-range QA
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | Problem it saw:  shouldn't drop by position; should drop by importance
+  | Its solution:    track historical attention scores; keep high-attention tokens (heavy hitters)
+  | New problem:     still heuristic; blind to the full context; wrong choices discard real info
+  v
+[2025] Eyuboglu et al. - Cartridges
+  |
+  | Problem it saw:  heuristic token selection has hard limits; can we learn a compressed cache?
+  | Its solution:    use gradient descent to learn a small KV cache that mimics a large one
+  | New problem:     model weights are frozen; how compressible its internal representations are
+  |                  is the ceiling
+  v
+[2026] Gelberg et al. - KV-CAT  <<< this paper >>>
+                Problem it saw: for eight years everyone was compressing something that
+                                was fundamentally hard to compress
+                Its solution:   tell the model during training: "half your cache will be
+                                dropped later — deal with it"
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: An Accidental Burden
+
+*** What Problem Did It See
+
+Nobody was talking about KV cache back then. The Vaswani team was solving a different problem: RNNs process long sequences token by token — the tenth token can't be computed until the ninth is done — leaving GPU compute to sit and wait.
+
+*** Its Solution
+
+Throw out the RNN entirely. Compute attention across all positions simultaneously. Every position sees every other position at once. Training becomes massively parallel; speed takes off.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+It works in training because the entire text arrives at once. Inference is a different story — a large model outputs tokens one by one, and every new token must "look back" at all previous ones. Recomputing K and V from scratch each time is quadratic waste.
+
+The engineering compromise: cache the K and V computed at each position and reuse them. This is the birth of KV cache. It doesn't appear in the paper; it grew naturally as an engineering artifact. But it has one property: the cache is exactly as long as the sequence. When sequences were a few hundred tokens, nobody cared.
+
+** 2019 | Multi-Query Attention: The First "We're Drowning" Moment
+
+*** What Problem Did It See
+
+Shazeer was working on decode-speed for translation models. He noticed a counterintuitive bottleneck: the limit wasn't compute, it was memory bandwidth. Generating each token required hauling the entire KV cache from HBM to SRAM to run attention. Every head has its own copy of K and V; the more heads, the more data to move.
+
+*** Its Solution
+
+Let all heads share one copy of K and V. Q remains per-head (queries aren't cached, so there's no loss there), but K and V are stored only once. Cache volume drops by a factor of the number of heads.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+The bandwidth bottleneck is real, and eliminating the per-head duplication is a free win. But it's a constant-factor optimization — one reduction and you've hit the ceiling. When sequences grow from hundreds to tens or hundreds of thousands of tokens, the cache still grows linearly with length. No constant factor bridges a linear gap.
+
+GQA (grouped-query attention) arrived later as a middle ground. But the root problem remained: cache length equals context length.
+
+** 2023 | StreamingLLM: Trained on 4K, Run at 100K, Crashed
+
+*** What Problem Did It See
+
+By 2023, people wanted models to handle infinitely long streaming input — a chat agent running indefinitely, for example. But models had been trained on at most 4K sequences. Feed 100K tokens and the output instantly degenerates into gibberish.
+
+An interesting observation emerged: the attention weights on the first few tokens were anomalously large, acting like magnets that drew a disproportionate share of attention. These were called "attention sinks." Remove those sink tokens and the model breaks immediately.
+
+*** Its Solution
+
+Simple and blunt: always keep the first 4 tokens (attention sinks) plus the most recent N tokens. Everything in between is discarded.
+
+This keeps cache size fixed at 4 + N, decoupled from actual sequence length.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+It revealed a truth: not all cache contents are equally important. But the cost is that everything in the middle becomes invisible — run a long-range QA task, ask about content at token 5,000, and the cache holds only the first four tokens and the most recent five hundred. This approach works for streaming generation; it fails entirely for long-document QA.
+
+The limits of heuristics were exposed: dropping by position is not smart enough.
+
+** 2023 | H2O: Drop by Importance, Not by Position
+
+*** What Problem Did It See
+
+StreamingLLM assumed the middle doesn't matter — but that's a lie. Which tokens matter depends on the input. A document's critical information might be right in the middle.
+
+*** Its Solution
+
+Track each token's "cumulative attention score" — how many queries have attended to it, and how strongly. High-scoring tokens stay; low-scoring tokens get evicted. These high-scoring tokens are called "heavy hitters."
+
+Cache size is still fixed, but what's retained is chosen by past importance rather than position.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+On average, H2O outperforms StreamingLLM on QA tasks by a meaningful margin. Intuitively it makes sense — the important ones should stay.
+
+But heavy-hitter scores look backward. A token that hasn't been attended to yet might be desperately needed later. A proper noun introduced at the start, ignored for thousands of tokens, asked about only in the final paragraph — by H2O's logic, it was evicted long ago.
+
+A wave of follow-on work (SnapKV, PyramidKV, KVzip, and others) refined this "heuristic token selection" paradigm: smarter scoring functions, layer-adaptive retention, query-conditioned reassessment. But the essence didn't change: select a subset from the existing tokens.
+
+** 2025 | Cartridges: Escaping the "Pick a Subset" Frame
+
+*** What Problem Did It See
+
+Heuristics have a hard ceiling — you can only pick from the K and V vectors that already exist. But what if the information in a 100K-token context could be faithfully packed into 1K *new* KV vectors? You can't select your way there; you have to learn it.
+
+*** Its Solution
+
+Flip the objective: given a context, use gradient descent to directly *learn* a small KV cache (say, 1K slots) such that when the model uses this small cache in place of the large one, its outputs stay as close as possible to those produced with the full cache.
+
+This turns compression into an optimization problem rather than a selection problem. Each context gets its own bespoke small cache (a cartridge) that can be plugged in at inference time.
+
+Concurrent work, Attention Matching, followed a similar spirit: instead of matching outputs, match the attention maps.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+The results handily beat H2O-style methods, especially at high compression ratios. This confirms that KV caches contain genuine redundancy — in principle, they can be compressed aggressively.
+
+But there is a curse: you are optimizing against a *fixed model*. Its weights are frozen; its internal representations are whatever they are. If the model happens to spread information diffusely — every token carries a little bit, none can be dropped — no algorithm can compress it.
+
+Cartridges pushed the algorithmic frontier as far as it could go. But the ceiling isn't in the algorithm; it's in what's being compressed.
+
+** 2026 | KV-CAT: Maybe We've Been Compressing the Wrong Thing
+
+*** What Problem Did It See
+
+Gelberg and team looked back along the nine-year timeline and asked a question nobody had asked:
+
+**Every previous method assumes the model is fixed, immovable, given. But the model's representations were trained — so why can't they be trained to be more compressible?**
+
+They first proved a theoretical result: for almost any sequence-to-vector function, there simultaneously exist two transformer implementations — one whose cache can be compressed to a single slot with almost no loss, and one that collapses the moment you compress even slightly. In other words, compressibility is not determined by the task or the input; it is determined by *which internal representations the model has chosen*.
+
+A concrete example: count how many times each character appears in a text. One implementation encodes each token's character as a one-hot vector in K — every slot must be kept, drop one and the count is off. Another lets tokens communicate and accumulates a global histogram at a few "summary positions" — keep only those summary slots and you're done. Both implementations produce identical outputs, but their compressibility is worlds apart.
+
+Standard training only cares about "is the output correct?" — not about "can the representations be compressed?" As a result, it frequently learns the first kind of implementation.
+
+*** Its Solution
+
+KV-CAT (KV-Compression Aware Training): during a continued-pretraining phase, deliberately mask out a portion of KV slots *at training time* and ask the model to maintain its outputs anyway.
+
+Concretely, each forward pass runs twice: once normally (dense), once with a random half of the slots masked (masked). Three losses jointly update the model:
+- =L_mask=: the masked path must still predict the next token correctly
+- =L_anchor=: self-distillation — align the masked output to the dense output to prevent degradation
+- =L_budget=: regularize the router so the learned mask distribution stays within the specified budget
+
+Consecutive groups of layers share a router that decides which slots to mask. To predict correctly while "reading only half its notes," the model is forced to learn representations that concentrate information into a small number of slots — representations that are compressible by construction.
+
+*** Why It Worked (and Where It Planted a New Problem)
+
+The experimental results are direct: Qwen2.5 trained with KV-CAT and then compressed by Cartridges or Attention Matching performs substantially better than the original model compressed the same way — perplexity retention improves by 3.21×, retrieval accuracy improves by 68%, long-document QA improves by 39%, and Cartridges' optimization time is reduced by 5×.
+
+They didn't replace any post-hoc algorithm. They simply gave those algorithms a *more compressible target model*.
+
+The new problems are also clear: continued pretraining costs compute and data. If you only have an inference budget and the model hasn't been retrained, this path is unavailable. Also, the target compression ratio r must be committed to at training time — supporting many different compression ratios in production may require multiple training runs or a more flexible router design.
+
+* Frontier Extensions
+
+This paper is from May 2026; at the time of writing it is the latest development on this line. The paper itself points to several likely next directions:
+
+- *Joint training*: KV-CAT still follows "train the model, then apply post-hoc compression." The next step may be end-to-end joint training of the model and compression algorithm together, pushing the ceiling further.
+- *Dynamic budgets*: training fixes one compression ratio — can the model adapt to arbitrary budgets at inference?
+- *Cross-task generality*: current experiments focus on QA, retrieval, and perplexity. Whether the gains hold for code, agent tasks, and long-horizon reasoning remains an open question.
+
+Looking further out, the broader idea of "embedding inference-time constraints directly into training objectives" may extend to other bottlenecks — training models that tolerate 4-bit quantization (QAT has done this for a while), training models that tolerate pruning, and so on. KV-CAT is this paradigm's deployment on the specific battlefield of long-context compression.
+
+* One Diagram
+
+#+begin_example
+                  Nine Years of KV Cache Compression
+
+Year   Paper             Lens                  Cache Size     What Gets Changed
+====   ===============   ===================   ============   ====================
+2017   Transformer       cache as byproduct    linear         (nobody cared)
+                         |
+                         | "memory bandwidth explodes at decode time"
+                         v
+2019   MQA               share across heads    linear / heads attention mechanism design
+                         |
+                         | "trained at 4K, crashes at 100K"
+                         v
+2023   StreamingLLM      drop by position      fixed (heur.)  cache at inference time
+                         |
+                         | "the middle isn't necessarily unimportant"
+                         v
+2023   H2O / SnapKV      drop by attn. score   fixed (heur.)  cache at inference time
+                         |
+                         | "subset selection has a hard ceiling"
+                         v
+2025   Cartridges /      learn a small cache   fixed (optim.) cache at inference time
+       AttentionMatching  via gradient descent                (model still frozen)
+                         |
+                         | "the model's representations may simply be incompressible"
+                         v
+2026   KV-CAT (this)     train a               fixed (optim.) *the model itself*
+                         compressible model                   (training objective changed)
+
+        +-----------------------+----------------------+---------------------+
+Axis    | Cache length          | Token-selection      | What gets changed?  |
+        | decoupled from        | strategy gets        |                     |
+        | context length?       | progressively        |                     |
+        |                       | smarter              |                     |
+        +-----------------------+----------------------+---------------------+
+        | MQA: partial          | StreamingLLM         | pre-KV-CAT: algo    |
+        | StreamingLLM onward:  | -> H2O               | KV-CAT: the model   |
+        | fully decoupled       | -> Cartridges                               |
+        |                       | (from selecting to learning)                |
+        +-----------------------+----------------------+---------------------+
+#+end_example
+
+* Insights
+
+On the surface this line looks like a steady technical progression of "compress the KV cache smaller and smaller." Underneath it are *three cognitive reversals*.
+
+*First reversal (2019, MQA)*: from "compute is the bottleneck" to "memory bandwidth is the bottleneck."
+
+*Second reversal (2025, Cartridges)*: from "select existing tokens" to "learn new tokens." An acknowledgment that what lives in a cache is not a discrete set of "important tokens" but a *continuously distributed quantity of information* that can be repackaged.
+
+*Third reversal (2026, KV-CAT)*: from "algorithms should adapt to the model" to "the model should adapt to the algorithm." For eight years everyone took the model as given, because pretraining is expensive. But once post-hoc algorithms were pushed to their limit, going back and changing the training objective turned out to be the cheapest move left.
+
+These three reversals share a common structure: each one *shifted an assumption by one step*. MQA shifted "the bottleneck is compute" to "the bottleneck is bandwidth." Cartridges shifted "compression is selection" to "compression is learning." KV-CAT shifted "the model is a constant" to "the model is a variable."
+
+The end of technical iteration is not a more clever algorithm; it is *renegotiating who is a constant and who is a variable*.
+
+Where will this go next? My guess: toward "packing all inference-time constraints into training together." Today it is cache compression; tomorrow it may be cache compression + quantization + pruning + speculative decoding all considered jointly at training time. "Inference-friendly" will become a responsibility that pretraining must own from the start, not a retrofit applied after the fact.
+
+* Takeaways
+
+For how to do research:
+
+*1. When a field's algorithms grow ever more elaborate but yield ever smaller gains, ask: "Have we been optimizing the wrong thing all along?"* KV cache compression spawned a flood of post-hoc methods between 2023 and 2025, each marginally better than the last. KV-CAT broke out not by building a smarter post-hoc algorithm, but by changing the target.
+
+*2. How you read related work matters.* The most cutting line in this paper is "these post-hoc methods operate on the KV cache of a fixed pretrained model, so their effectiveness is fundamentally limited by how well the model's internal representations can be compressed" — it doesn't invalidate a single predecessor; it places all of them inside the same frame and then points out that the frame rests on a hidden assumption. When reading related work, don't only ask "what did they do?" Ask "what assumption did they all share?"
+
+*3. Theoretical results can be small, but they must be sharp.* The theory section here (any function admits both a compressible and an incompressible transformer implementation) is elementary, but it strikes precisely at the weakness of the empirical work — it moves "compressibility" from a property of the task to a property of the model. A good theoretical result doesn't exist to prove that the new method works; it exists to show clearly *why the old methods hit a wall*.
+
+This suggests a habit: in whatever engineering problem you own, periodically ask "have we been tuning something that's actually a constant? Who implicitly locked the variable we should really be adjusting?" Many seemingly saturated optimizations are saturated only because everyone is bound by a shared hidden assumption.

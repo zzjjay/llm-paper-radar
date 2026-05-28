@@ -1,0 +1,272 @@
+#+title:      LAQuant: A Simple Overhead-free Large Reasoning Model Quantization by Layer-wise Lookahead Loss
+#+date:       [2026-05-28 Thu 12:25]
+#+filetags:   :paper:river:quantization:llm:lrm:en:
+#+identifier: 20260528T122514-en
+#+source:     https://arxiv.org/abs/2605.08755
+#+authors:    Euntae Choi, Sumin Song, Sungjoo Yoo (Seoul National University)
+#+venue:      arXiv preprint, 2026-05-09
+
+* The River of the Problem
+
+How do you compress a model that "thinks at length before answering" — say, Qwen3 writing 32,000 tokens for an olympiad math problem — down to 3-bit, while guaranteeing it can still solve the problems?
+
+This has always been hard. And it harbors a counterintuitive split that nobody anticipated:
+
+- Compressing a model to 4-bit shows almost no degradation on ordinary text generation (perplexity barely moves, short tasks behave normally)
+- The same model asked to perform long chain-of-thought reasoning (AIME competition math) loses half its accuracy
+- Stranger still: applying the industry's strongest E2E QAT method — "align to BF16-teacher logits" — turns out *worse* than the older approach of "align each layer's intermediate outputs"
+
+In other words: invisible in dialogue, catastrophic in reasoning. Why? This line of research is a community repeatedly digging into that gap: from GPTQ's earliest "column-by-column weight calibration," through rotations, scaling, and QAT, each generation solving the previous generation's pain points — yet every new method stumbles on long-chain reasoning. LAQuant is the first paper in this line to clearly explain *why E2E loses to layer-wise on long reasoning*.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  |
+  | Problem: RTN collapses at 4-bit; quantization errors across columns amplify each other
+  | Solution: Quantize column by column; use the inverse Hessian to absorb each
+  |           column's error into the remaining unquantized columns
+  | Residual: Does not handle activation outliers; suffers when outlier channels appear
+  v
+[2023] AWQ (Lin et al.)
+  |
+  | Problem: 1% of weight channels correspond to large activations;
+  |           quantizing them is self-destructive
+  | Solution: Scale "important channels" up, move part of the magnitude onto
+  |           activations, then absorb the scale into the preceding LayerNorm —
+  |           zero runtime overhead
+  | Residual: Scale is one-dimensional; powerless against multi-channel outlier clusters
+  v
+[2024] QuaRot / SpinQuant (Ashkboos / Liu)
+  |
+  | Problem: Multi-channel activation outliers cannot be moved by a per-column scale;
+  |           entire swaths of high-variance channels are the issue
+  | Solution: Insert Hadamard orthogonal rotations before/after Linear layers:
+  |           a few large channels are spread into many medium ones,
+  |           making 4-bit quantization uniformly applicable
+  | Residual: Some rotations cannot be absorbed into weights; each forward pass
+  |           requires an online Hadamard multiply, adding 5–15% latency
+  v
+[2024] EfficientQAT (Chen et al.)
+  |
+  | Problem: PTQ calibration has hit its ceiling; 2–3 bit requires true gradient training
+  | Solution: Block-wise QAT — one transformer block trained at a time for
+  |           scale/zero/weight, low memory, runs on 70B;
+  |           optional follow-up E2E full-model fine-tuning
+  | Residual: Block-wise stage only sees "this block's alignment"; E2E stage only
+  |           sees "final logits alignment"; nobody monitors intermediate hidden-state
+  |           alignment quality
+  v
+[2025] ReasoningQAT  +  ParoQuant
+  |                       |
+  | (Two parallel branches — the first generation of methods targeting LRM quantization)
+  |
+  | ReasoningQAT: Retains EfficientQAT's block-wise + E2E pipeline,
+  |               but swaps calibration data for DeepSeek-R1-style reasoning traces
+  |               -> Residual: still E2E; softmax flattens per-layer gradient signals
+  |
+  | ParoQuant:    Minimal pairwise rotations + channel scaling to minimize per-layer error
+  |               -> Residual: rotation matrices cannot be absorbed into weights;
+  |                  cost is multiplied by tens of thousands of tokens during thinking
+  v
+[2026] LAQuant (target paper)
+  |
+  | Diagnosis: (1) E2E supervision lets KV-cache errors snowball across layers
+  |            (2) ParoQuant's online rotations are too expensive for long decoding
+  | Solution: Return to layer-wise QAT, but change "align this layer's output"
+  |           to "align the next layer's output" (one-layer lookahead);
+  |           calibration data uses R1 reasoning traces so the Hessian subspace
+  |           matches the deployment distribution; zero online transforms
+  | Result:   On Qwen3-4B W3G128, AIME25 is 15.11 pp above ParoQuant;
+  |           decoding is 3.42× faster than FP16 (vs. ParoQuant's 3.01×)
+  v
+[2026-?] Next: KV-cache quantization, activation quantization for long reasoning
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: "Column-by-column calibration — let later columns absorb earlier errors"
+
+*** What problem it saw
+
+The most naive quantization is RTN (Round-To-Nearest): round each weight to the nearest grid point. At 8-bit it is fine; at 4-bit it collapses outright. The reason is that weight columns are not independent — quantize column A, column A's output goes wrong, column B receives the wrong input and produces new errors. With 4096 columns per layer, errors snowball.
+
+*** Its solution
+
+GPTQ starts from a second-order approximation: write the reconstruction error of a layer's output as ½·||W X − Ŵ X||², Taylor-expand it, and the Hessian H = 2 X Xᵀ appears. Quantize column by column — once column 1 is fixed, use H⁻¹ to redistribute "the error introduced by quantizing column 1" onto columns 2, 3, …, n (still unquantized). Column 2 is then quantized on top of this compensated weight.
+
+Analogy: 100 people are queuing to jump a 1-meter hurdle. The first person lands 10 cm to the left; instead of letting the other 99 jump according to the original plan, you tell them "shift slightly to the right." The collective trajectory stays on target.
+
+*** Why it works (and what new problem it buries)
+
+The layer-wise weighted error is minimized analytically, which beats any blind rounding. But GPTQ never touches activation outliers — certain activation channels can be 100× the average magnitude; nudging their corresponding weight columns even slightly has outsized downstream effects. Tolerable at 4-bit, starts failing at 3-bit.
+
+** 2023 | AWQ: "1% of channels decide everything — give them extra quantization headroom"
+
+*** What problem it saw
+
+GPTQ assumes all columns are equally important. Once AWQ profiled the model, it found that 1% of weight channels correspond to the 1% of activation channels with the largest values — this slice determines 99% of downstream accuracy. Quantizing them at 4-bit the same way as ordinary channels is self-destructive.
+
+*** Its solution
+
+Leave weight positions unchanged. For "important channels," pre-multiply by a scale s > 1 (their magnitude grows, so quantization error shrinks relatively), then fold 1/s into the previous LayerNorm's weight. Mathematically equivalent, zero runtime overhead — LayerNorm already multiplies by γ; one extra scalar costs nothing.
+
+Analogy: Three top students' scores determine the class average. During grading, score them on a 1.5× scale (their small fluctuations become visible), then divide by 1.5 at the end. The overall fairness is unchanged, but the top students' precision is preserved.
+
+*** Why it works (and what new problem it buries)
+
+The scale can be "absorbed" into the preceding operator — zero runtime overhead is AWQ's real win. But it is fundamentally one-dimensional: one number per channel. If activations have not 1% but 5% large channels, overlapping each other and correlated with sequence length, a per-channel scale cannot contain them.
+
+** 2024 | QuaRot / SpinQuant: "Spread a few large channels into many medium ones"
+
+*** What problem it saw
+
+In the W4A4 + KV4 full-quantization era, per-channel scaling is insufficient. Activation outliers are not isolated peaks but entire regions of high-variance channels. Linear scaling can only shift amplitudes up or down; it cannot *spread* them.
+
+*** Its solution
+
+Insert orthogonal matrices R (typically Hadamard) before and after Linear layers: x → R x, W → R⁻¹ W. The product is unchanged, but each channel of R x is a random linear combination of all original channels — the energy of a few outliers is spread evenly across thousands of channels, each with roughly equal variance. 4-bit quantization then applies uniformly.
+
+Analogy: A class has 3 people who are 180 cm tall and 27 who are 165 cm. Grouping by height is awkward. Shuffle all 30 people randomly into groups of 6; each group's average is close to 167 cm, and nobody is an outlier.
+
+*** Why it works (and what new problem it buries)
+
+Rotation converts heavy-tailed distributions into approximately Gaussian ones, and quantization error falls accordingly. But some rotation matrices — especially Q/K rotations inside attention — cannot be absorbed into weights in advance; every forward pass requires an online Hadamard multiply. An extra 5–15% latency is tolerable in normal conversation, but when an LRM generates 30,000 tokens per answer, the overhead balloons to 30%+.
+
+** 2024 | EfficientQAT: "Block-wise QAT — making QAT feasible on 70B models"
+
+*** What problem it saw
+
+PTQ has hit a ceiling below 3-bit — further refinement of GPTQ or AWQ cannot recover 3-bit accuracy. Either abandon 3-bit or truly train with gradients. But QAT is blocked by memory in the LLM era: a 70B model + optimizer states + activations simply does not fit on any GPU.
+
+*** Its solution
+
+Slice the model into transformer blocks and train one block at a time. While one block is training, its input is the (frozen) output of the previous block; the target is to match the FP16 teacher's output for that same block. Trainable parameters are only that block's scale/zero (+ optional weights). Memory holds just one block, making 70B tractable. After all blocks are trained, an optional E2E full-model fine-tuning pass can close the residual gap.
+
+Analogy: Renovating a 70-story building floor by floor — each floor's crew sees only the completed floor below and makes their floor match it. A general inspector does a walkthrough at the end to tune the details.
+
+*** Why it works (and what new problem it buries)
+
+Block-wise QAT makes 3-bit competitive with 4-bit for the first time. But EfficientQAT leaves a problem that only surfaces later: the block-wise stage only cares about "this block's input–output alignment"; the E2E stage only cares about "final logit alignment." **Intermediate hidden states — especially the outputs of K and V projections — are never explicitly supervised.** No problem on short tasks, where nobody "repeatedly looks back at the KV cache"; catastrophic on long reasoning.
+
+** 2025 | ReasoningQAT and ParoQuant: "The first generation specifically designed for long reasoning"
+
+*** What problem they saw
+
+The community finally noticed that on long-reasoning tasks like AIME and LiveCodeBench, all 4-bit methods lose accuracy — far more than on short tasks. Two independent lines started simultaneously.
+
+*** ReasoningQAT's solution
+
+Retains EfficientQAT's block-wise + E2E pipeline but swaps calibration data for real DeepSeek-R1 reasoning traces (OpenR1-math, etc.). The intuition: if you want the model to reason, calibrate on reasoning data.
+
+*** ParoQuant's solution
+
+Extends QuaRot's rotation idea but replaces rotation matrices with minimal pairwise rotations — small rotations applied only to the most correlated channel pairs, combined with channel scaling, minimizing per-layer reconstruction error.
+
+*** Residual problems of each
+
+- **ReasoningQAT** ultimately still uses E2E. LAQuant later proves that E2E's softmax flattens gradient signals through the Fisher metric: every layer's learned direction is pushed toward the few principal directions of the logit space. The direction KV cache needs (preserving attention routing) does not lie in those principal directions, so KV-cache error accumulates unchecked.
+- **ParoQuant**'s pairwise rotations cannot be absorbed into weights — they must be computed online at runtime. With 30,000 tokens per answer, each token at each layer triggers one such computation.
+
+** 2026 | LAQuant: "Return to layer-wise QAT, but align the *next* layer's output"
+
+*** What problem it saw
+
+LAQuant placed all preceding lines on one diagram and performed a systematic gradient-direction analysis, arriving at two diagnoses:
+
+1. **E2E QAT is the killer of KV cache**: after passing through softmax, the E2E loss's gradients are weighted by the Fisher metric M_E2E = J⊤ diag(p) − p p⊤ J. This metric has large eigenvalues in the few principal directions of logit space and eigenvalues near zero elsewhere. **The "preserve attention routing" direction needed by KV cache does not lie in those logit principal directions** — so E2E supervision extinguishes the learning signal for it.
+2. **Calibration data quality is about subspace alignment, not volume**: minimizing each layer's reconstruction error is equivalent to aligning within the principal subspace of that layer's activation Hessian. The calibration corpus determines the direction of this subspace. The Hessian principal directions computed from WikiText are in a completely different subspace from the true activation distribution during AIME reasoning. Switching to DeepSeek-R1 traces raises subspace overlap from 0.3 to 0.7 and AIME accuracy from 0 to 22+.
+
+*** Its solution
+
+Layer-wise QAT returns. But it is not EfficientQAT's "align only this layer's own output" — it aligns the **next layer's** output (one-layer lookahead).
+
+Concretely: when training layer l, loss = || f_{l+1}(quantized(W_l) x) − f_{l+1}(W_l x) ||². That is, pass the quantized current layer's output through the fixed next layer and measure how much that next layer's output deviates from the original model.
+
+This modification looks small; its effects are striking:
+
+- **Implicit Jacobian weighting**: expanding the lookahead loss shows it is equivalent to weighting the seven projections of the current layer (q, k, v, o, gate, up, down) by the next layer's Jacobian — how much each projection matters to the next layer automatically determines its training weight.
+- **Cross-layer coordination**: while training the current layer's q, k, v, the optimizer "knows" how their errors will be amplified or suppressed by the next layer's o, gate, up projections, enabling mutual coordination.
+- **K cache is naturally protected**: the next layer's attention will "use again" the current layer's K — so the lookahead loss inherently contains a K-cache error term; no separate KV loss needs to be written.
+
+Calibration data uses R1 reasoning traces, aligning each layer's Hessian subspace with the deployment distribution. Zero online transforms — the artifact is a standard W3G128 model that runs directly on existing INT3 GEMV kernels.
+
+*** Why it works (and what new problem it buries)
+
+LAQuant's core insight is: **E2E is not a smarter form of layer-wise — it is a different tool**. E2E cares about "getting the final answer right"; layer-wise cares about "getting every step right." Long reasoning needs every step to be right (because each token attends back to all KVs), so returning to layer-wise is correct; but purely block-wise (EfficientQAT) only looks inside one block and misses inter-block coupling. Lookahead is the middle path — one level deeper than block-wise, N levels shallower than E2E — and that depth happens to cover the scale that KV cache actually needs.
+
+New problems left behind: lookahead only looks one layer ahead. If long-range dependencies like attention sinks span 5 or 10 layers, is lookahead-1 still sufficient? Can the lookahead idea be applied to activation quantization and KV-cache quantization?
+
+* Frontier Extensions
+
+LAQuant appeared in May 2026 and has no direct public successors yet. Foreseeable extensions (the paper's Limitations section points to some):
+
+** Direction A: Generalizing Lookahead Depth
+
+Extending one-layer lookahead to multi-layer lookahead would theoretically cover longer-range inter-layer coupling, but compute and memory scale linearly with depth. LAQuant's ablation already shows diminishing returns from lookahead-1 to lookahead-2, but no one has systematically studied whether it is worthwhile on larger models (70B+).
+
+** Direction B: Extending Lookahead to KV-Cache and Activation Quantization
+
+LAQuant only performs weight quantization (W3G128). Once activations and KV cache also need to be quantized (e.g., W3A3KV3), KV-cache errors will accumulate far more aggressively. The Jacobian-weighted lookahead loss theory could in principle be applied directly to activation/KV quantization — but nobody has tried yet.
+
+** Direction C: Using LAQuant's Diagnostic Framework to Examine RL Training
+
+The gradient-direction + Hessian-subspace analysis framework LAQuant provides can itself be used to answer "why do models become more sensitive to quantization after GRPO/RLHF?" As of May 2026, this direction appears only as a sparse mention in reference [25] — it is wide open.
+
+* One Diagram
+
+#+begin_example
+                          Time
+   2022 ------ 2023 ------ 2024 -------------- 2025 ----------- 2026
+
+GPTQ        AWQ       QuaRot/SpinQuant    ReasoningQAT      LAQuant
+Column-wise  Scale     Hadamard spread      E2E QAT          Lookahead layer-wise
+error absorb channels  (online overhead)   + R1 calibration  + R1 calibration
+                                                              (zero overhead)
+                                           ParoQuant
+                                           Pairwise rotation
+                                           (online overhead)
+                           \             /               /
+                            \           /               /
+                             \         /               /
+                              v       v               v
+                         EfficientQAT
+                         Block-wise QAT pipeline
+                         (intermediate alignment missing)
+
+   Solves: outlier   Solves: multi-    Solves: 3-bit    Solves: reasoning    Solves: KV-cache
+           weight    channel           accuracy          domain               error snowball
+           columns   outliers          floor             calibration          + zero runtime
+                                                                              overhead
+
+   Leaves: activation  Leaves: multi-  Leaves: online   Leaves: E2E kills    Leaves: activation
+           outliers    channel         rotation          KV cache via         + KV quant,
+                       outliers        non-absorbable    softmax flattening   cross-layer
+                                       rotations                              coupling > 1 layer
+#+end_example
+
+* Insight
+
+Reading the whole line, the most counterintuitive thing is: **"more end-to-end" is the wrong direction for long reasoning**.
+
+For the past three years, the unspoken rule of LLM quantization was "the closer to the final objective, the better" — E2E QAT beat PTQ, KL-against-teacher beat layer-wise alignment, logit-matching was the gold standard. But this entire "logic" rests on a hidden assumption: the evaluation signal (perplexity, short tasks) and the training signal (logit alignment) live in the same subspace.
+
+Long reasoning breaks that assumption, and the whole "more end-to-end = better" doctrine immediately inverts: every token must reach back and attend to all KVs, but the KV-cache direction does not lie in the logit principal subspace, so E2E supervision is blind to it and extinguishes its gradient signal. **Layer-wise QAT is not technically backward — its inductive bias ("every intermediate representation matters") happens to be exactly right for long reasoning.**
+
+Generalizing: **however long-range the evaluation's dependencies are, supervision should look that many layers shallower**. Short tasks call for E2E; long reasoning calls for layer-wise + lookahead; ultra-long agent traces may need block-wise + multi-layer lookahead. This is not "which is superior" — it is "the evaluation distribution determines the correct supervision granularity."
+
+Where will things go next? My bets are two:
+1. Someone will port LAQuant's lookahead idea to KV-cache quantization and activation quantization (W3A3KV3), pushing "long-reasoning-friendly ultra-low-bit full quantization" another step down.
+2. Someone will use LAQuant's gradient-direction diagnostic framework to examine RL training — why does quantization lose more accuracy after GRPO? Most likely another "subspace misalignment" problem somewhere.
+
+* Implications
+
+What this suggests about how to do research:
+
+**When a consensus method repeatedly fails in a new setting, examine its inductive biases rather than its hyperparameters.** For two years, the entire field tweaked the learning rate, temperature, and teacher choice for E2E QAT; nobody stopped to ask whether the shape of the E2E loss itself is appropriate for long reasoning. LAQuant's real contribution is not the lookahead design per se — it is drawing out the softmax Fisher metric. Once drawn, it is mathematically inevitable that "E2E cannot see the KV-cache direction"; no amount of tuning will fix it.
+
+**In comparative experiments, make "why does the old method fail in the new setting" the core motivation of the paper**, rather than leading with the new method's SOTA numbers. LAQuant devotes Section 3 to plotting KV-cache RMSE against AIME Pass@1 for 24 checkpoints × 6 methods, with a correlation coefficient of −0.85. That single figure is more persuasive than any formula in the methods section — it visually locks in "why a new approach is necessary."
+
+**Layer-wise regression is not a step backward — it is recovering fine-grained alignment that was buried under the E2E wave, and evolving it further.** Each generation of new methods discards something from the previous generation, but the discarded thing is not necessarily wrong — it may simply be needed again by a new evaluation setting.
+
+The takeaway: in your own field you can ask the same-shaped question — "In which new evaluation setting or new scenario is the SOTA approach we have taken for granted these past two years (end-to-end, large model, single loss) actually the wrong direction?" Answer that once, and you have a LAQuant.

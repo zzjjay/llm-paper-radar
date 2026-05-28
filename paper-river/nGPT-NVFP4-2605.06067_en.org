@@ -1,0 +1,368 @@
+#+title:      Normalized Architectures are Natively 4-Bit
+#+date:       [2026-05-28 Thu 11:59]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T115925-en
+#+source:     https://arxiv.org/abs/2605.06067
+#+authors:    Maxim Fishman, Brian Chmiel, Ron Banner, Daniel Soudry, Boris Ginsburg (NVIDIA + Technion)
+#+venue:      arXiv 2605.06067, May 2026
+
+* The Problem River
+
+One question: can we train large language models in 4 bits?
+
+That sounds miserly. A BF16 number takes 16 bits; FP4 takes only 4. Compress all weights and activations from 16 bits down to 4, and you save 4× in memory while gaining several times the compute throughput on hardware that supports FP4. In the era of trillion-parameter models, this is not merely about saving money — it is a question of whether training is feasible at all.
+
+But 4 bits can represent only 16 distinct values. Forcing a continuous floating-point world into 16 slots — what goes wrong? The most lethal thing: certain activations inside a Transformer can be enormous — hundreds or even thousands of times larger than typical values. Once these *outlier features* are crudely quantized to 4 bits, the entire matrix multiplication is corrupted.
+
+For the past four years, the entire research river has been wrestling with outliers: first observing them, then routing around them, then scattering them, then calibrating for them. Each trick buys a bit more headroom in 4 bits, but every trick adds another patch — rotations, sweeps, stochastic rounding, per-layer exceptions. "4-bit training" became a fragile tower of hacks stacked on top of each other.
+
+This paper (Fishman 2026) asks a counterintuitive question: if it is the *architecture itself* that is ill-suited for quantization, are all these patches just treating symptoms? Conversely, can we find an architecture that is natively *compatible* with 4 bits, requiring none of these patches?
+
+The answer is yes. nGPT — which constrains both weights and hidden states to the unit hypersphere — trains stably end-to-end in NVFP4, without Hadamard rotation, without per-tensor dynamic scaling. And the deeper explanation is surprising: the advantage does not come from "less noise," but from "signal that accumulates more coherently."
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Legacy: the combination of LayerNorm + residuals + softmax
+  |         plants the seed for future outlier phenomena
+  v
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem observed: once LLMs scale past 6.7B parameters,
+  |         a few hidden dimensions develop massive outlier
+  |         features; ordinary INT8 fails
+  | Fix: keep outlier columns in FP16, quantize the rest to INT8
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Problem observed: keeping outlier columns in FP16 is only
+  |         a workaround; full INT8 inference is impossible
+  | Fix: use a diagonal scaling to "migrate" activation
+  |       difficulty onto weights
+  |       (activations become flatter, weights become spikier)
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Problem observed: diagonal scaling only locally suppresses
+  |         outliers; 4-bit still collapses
+  | Fix: use random Hadamard rotation to scatter every feature
+  |       across all dimensions (rotation invariance + Gaussianization)
+  v
+[2025] Chmiel et al. - FP4 all the way
+  |
+  | First proof: end-to-end pretraining of LLMs in NVFP4 is
+  |              feasible in principle (forward, backward,
+  |              optimizer all in FP4)
+  v
+[2025] NVIDIA - Pretraining LLMs with NVFP4  <-- most direct target of this paper
+  |
+  | Problem observed: at large scale NVFP4 training still diverges
+  | Fix: pile on all patches — RHT + per-tensor dynamic scaling
+  |       + stochastic rounding + high-precision last 15% of layers.
+  |       It runs, but overhead is heavy and patches are deeply coupled.
+  v
+[2026] Fishman et al. - Normalized Architectures are Natively 4-Bit  <-- [this paper]
+  |
+  | Problem observed: all patches are after-the-fact remedies for
+  |         a problem that should not exist in the first place —
+  |         can the architecture eliminate it at the root?
+  | Fix: change the architecture. Use nGPT (Loshchilov 2025),
+  |       constrain weights and hidden states to the unit hypersphere;
+  |       none of the patches are needed.
+  |
+  v
+[2026+] Quartet II / Hypersphere Scaling and other follow-on work (frontier extensions)
+
+Side lineage (architecture line):
+
+  [2016] Salimans & Kingma - Weight Normalization
+    |
+    | Re-parameterize weights as direction × magnitude
+    | for more stable training
+    v
+  [2025] Loshchilov et al. - nGPT (ICLR)
+    |
+    | Takes "direction × magnitude" to the extreme: weights and
+    | hidden states are all forced onto the unit hypersphere;
+    | magnitude is controlled by a learnable scalar
+    v
+  Feeds into this paper (Fishman 2026)
+#+end_example
+
+* Evolutionary Narrative
+
+The entire river has one master question: *what do you do about outliers in 4 bits?* Each paper sees an angle the previous one missed.
+
+** 2022 | LLM.int8°: Large Models Contain a Small Cluster of "Super-Large" Activations That Dominate Quantization
+
+*** What problem did it see?
+
+Before this work, the assumption was that quantization meant "find a good scale and linearly map everything to integers." This worked fine for small models. But when the Dettmers team scaled to 6.7B parameters, they found something strange: a handful of hidden dimensions (say, indices 137, 892, 1023 — specific, consistent positions) always produced activation values orders of magnitude larger than everything else in the same layer — sometimes hundreds of times larger.
+
+These are *outlier features*. Once you compute an INT8 scale based on the global maximum, the entire quantization range is blown out by these few giants, and all the normal-scale dimensions collapse to 0 or 1. The model is effectively broken.
+
+*** Its fix
+
+Blunt but effective: pull out the outlier columns, compute them in FP16; quantize the rest in INT8. Merge the two results at the end. Mixed precision, but 99% of weight volume is still INT8.
+
+*** Why it works — and what it buries
+
+It works because outliers are genuinely rare — typically fewer than 0.1% of features account for the bulk of quantization error. But the downsides are clear:
+
+- You must detect which dimensions are outliers at runtime; hardware dislikes dynamic branching
+- You must keep the FP16 path alive; pure low-precision inference is impossible
+- During training, both forward and backward passes have outliers, and every gradient must be split
+
+It nailed down the fact that "outliers are a real problem." But routing around ≠ solving.
+
+** 2023 | SmoothQuant: Don't Keep FP16 — Shift the Activation Difficulty onto Weights
+
+*** What problem did it see?
+
+The FP16 path left by LLM.int8° is a burden — especially when you want full INT8 inference (INT8 GEMM units are much faster in hardware than mixed-precision paths). Xiao et al. noticed that the difficulty is asymmetric: *activations* have rampant outliers, but *weights* almost never do.
+
+Why? Because weights are explicitly regularized during training and have relatively well-behaved distributions. Activations emerge from data; they are data-dependent and go unchecked.
+
+*** Its fix
+
+Mathematically, a matrix multiplication Y = X·W can be rewritten equivalently as Y = (X·diag(1/s)) · (diag(s)·W), where s is a per-channel diagonal scaling vector. If you choose s so that channels with outliers in the activations get large entries, the effect is:
+
+- X·diag(1/s) becomes flat: outliers in the activations are suppressed
+- diag(s)·W becomes spiky: weights expand in those directions, but they were flat to begin with and can absorb it
+
+The activation difficulty is *migrated* onto the weights, and both sides can now be INT8-quantized.
+
+*** Why it works — and what it buries
+
+The insight is that quantization difficulty is not absolute — it is a "split" between activations and weights. If you can shift the split so neither side is too hard, you can compress further.
+
+But the limitations are clear:
+
+- Scaling is done independently per feature channel; cross-channel coupling is untouched
+- At 4 bits, simply flattening channel-wise is not enough; within each channel values can still blow up
+- This is a *linear* operation; for truly extreme outliers, linear suppression is limited
+
+The next step must be more aggressive: not just "flatten each channel," but *scatter outliers across all channels*.
+
+** 2024 | QuaRot: Use Random Rotation to "Spread" Outliers into a Gaussian Blur
+
+*** What problem did it see?
+
+SmoothQuant flattened outliers within each channel, but outliers remained concentrated in the same few channels. Ashkboos et al. realized: if you can *scatter outliers across all channels*, the per-channel maximum drops, while the matrix-multiplication result remains unchanged.
+
+Key observation: in a Transformer, certain positions in the residual stream have *rotation invariance* — you can left-multiply every hidden-dimension vector by an orthogonal matrix Q, as long as you right-multiply by Q^T elsewhere to cancel it out, and the network output is exactly preserved.
+
+*** Its fix
+
+Pick a *random Hadamard matrix* H (a special ±1 orthogonal matrix that is extremely fast to compute) as the rotation. Left-multiply both activations and weights in the hidden dimension by H:
+
+- H·X *uniformly spreads* the outliers that were concentrated in a few dimensions across all dimensions
+- After spreading, each dimension is approximately Gaussian and its maximum is drastically reduced
+- 4-bit quantization now works well for every group
+
+This is the core of the *RHT (Randomized Hadamard Transform)*.
+
+*** Why it works — and what it buries
+
+Mathematically elegant: orthogonal transforms preserve L2 norms and angles, so model output is unchanged. Statistically sound: rotation "Gaussianizes" any outlier distribution — a direct application of the central limit theorem.
+
+But the costs arrive:
+
+- RHT is not free: every forward pass requires an extra Hadamard multiplication (O(n log n), but still overhead)
+- The backward pass also needs the corresponding RHT; cost doubles
+- It must be paired with per-tensor dynamic scaling, because peak values after rotation still shift
+- You are using a collection of runtime operations (rotation + rescaling + stochastic rounding) to compensate for the architecture's "original sin" — this is the apex of the patch philosophy
+
+** 2025 | FP4 All the Way: First End-to-End FP4 Training That Actually Runs
+
+*** What problem did it see?
+
+By late 2024, FP4 *inference* could barely work with QuaRot + GPTQ-style methods, but nobody had dared to tackle *training* — the dynamic range of gradients in a backward pass far exceeds that of activations, and the FP4 representable range simply cannot hold them.
+
+*** Its fix
+
+Chmiel et al. (several of whom are co-authors of the present paper, also from NVIDIA / Technion) proved that, as long as every FP4 operation in the forward pass, backward pass, and optimizer step uses an *unbiased stochastic rounding* strategy, combined with very fine-grained group scaling (NVFP4's standard block size of 16), FP4 training is feasible in principle.
+
+NVFP4 = FP4 values + one FP8 scale shared by every 16 values. This format means the dynamic range is no longer a rigid [-6, 6] but adapts per block.
+
+*** Why it works — and what it buries
+
+It pushed FP4 training from 0 to 1. But *runs* ≠ *runs stably* — once model size exceeds ~30B, block-level outliers still cause some blocks to saturate completely and the loss curve diverges.
+
+More patches still needed.
+
+** 2025 | NVIDIA's NVFP4 Training Recipe: Most Elaborate, Most Stable, and Most Burdensome
+
+*** What problem did it see? (The most direct target of this paper)
+
+By mid-2025, the NVIDIA team published "Pretraining LLMs with NVFP4" (arXiv:2509.25149), bringing large-scale NVFP4 pretraining engineering to SOTA. The cost:
+
+- RHT (Hadamard rotation) required in both forward and backward passes
+- Per-tensor dynamic scaling requiring per-step maximum (amax) computation
+- Stochastic rounding required to ensure unbiased gradients
+- The last 15% of layers required to remain in high precision
+- Careful learning-rate warmup and batch-size schedules throughout
+
+This "deluxe recipe" allows NVFP4 to match BF16 results closely on 1B–30B models.
+
+*** Its fix
+
+Stack every known patch simultaneously: RHT + amax scaling + SR + selective high-precision layers. The pipeline is long, each component has runtime overhead, but it is stable.
+
+*** Why it works — and what it buries
+
+It works because each patch precisely addresses its target: rotation handles structural outliers, dynamic scaling handles block-level outliers, stochastic rounding handles gradient bias, high-precision layers handle boundary cases.
+
+But the cost is *meta-level*:
+
+- This is a victory for patch engineers, not a research victory
+- Each additional patch means the next generation of chips must support one more runtime operation
+- The whole pipeline is long and tightly coupled: remove any single component and training diverges
+- You are paying the debt accumulated by the standard GPT architecture's "original sin"
+
+At this point, reading backwards naturally produces the question Fishman et al. raise: *If the architecture itself never grew outliers, would all these patches be unnecessary?*
+
+** 2026 | nGPT-NVFP4 (This Paper): Replace the Architecture at the Root — Every Patch Disappears
+
+*** What problem did it see?
+
+Five generations of researchers fought to suppress outliers, but outliers are a *product of standard Transformer training dynamics* — LayerNorm + residuals + softmax + unconstrained hidden-state magnitudes combine to produce a tendency: the model prefers to dominate dot products via *a handful of very large coordinates*.
+
+That is an architectural choice, not a failure of 4-bit precision.
+
+*** Its fix
+
+Change the architecture. Use nGPT (Loshchilov et al. 2025, ICLR):
+
+- All weights and all hidden states are forced onto the *unit hypersphere* (L2-normalized)
+- The magnitude degree of freedom is factored out and controlled by a learnable scalar
+- No LayerNorm; residuals are implemented as geodesic interpolation on the sphere
+
+The immediate consequence: no single coordinate can be large, because the model cannot "cheat" by inflating one number to dominate the dot product.
+
+So how does it drive dot products? *Only by having all dimensions contribute together* — coherently, collectively, aligned.
+
+*** Why it works — the key insight
+
+A naive intuition says: stronger constraint = weaker model = harder to quantize. Fishman et al. find the opposite — *stronger constraint actually causes quantization noise to be overwhelmed by signal*.
+
+The mechanism:
+
+1. Quantization *noise* in both architectures is *uncorrelated* (each coordinate receives an independent noise injection). Summing n independent noise terms: amplitude grows as √n (an incoherent random walk).
+
+2. The *signal* in nGPT is different. Because the model is forced into "all-dimension alignment," the element-wise products wᵢ·xᵢ develop a weak but *systematic positive correlation* (ρ ≈ +0.04; in standard GPT it is only ≈ +0.005). Summing n positively correlated terms: amplitude grows closer to n (a coherent walk).
+
+3. Signal grows faster; noise grows slower; SNR rises naturally.
+
+Measured result: on a 3.6B model, nGPT's dot-product SNR is *7 dB higher* than GPT's (roughly 5×), and the loss landscape is 3.5× smoother.
+
+The wider the model, the larger the advantage — theory predicts that at 405B scale the SNR ratio approaches √n. This is a *structural dividend that scales with model size*.
+
+*** What it leaves open (naturally motivating the next generation)
+
+- nGPT sacrifices some degrees of freedom; under BF16 it lags standard GPT slightly on some tasks (GSM8K and similar metrics do show small regressions in the paper)
+- It depends on the specific NVFP4 format (per-block scaling); whether the same holds for pure FP4 or INT4 is unverified
+- Why the correlation coefficient ρ settles to a constant remains an open question worth digging into
+- Deployment at inference time is not fully discussed
+
+But the largest open question is actually meta-level: *How far can this "architecture–hardware co-design" philosophy go?*
+
+* Frontier Extensions
+
+The river's newest tributaries (as of May 2026):
+
+- *Quartet II (Panferov et al. 2026)*: continues optimizing *unbiased gradient estimators* for NVFP4 training, still in the spirit of "patching a standard GPT." This is a parallel attack on the same problem, running alongside the nGPT route.
+
+- *Rethinking LM Scaling under Hypersphere Optimization (Ren et al. 2026)*: further validates the scalability and hyperparameter transferability of the nGPT family at large scale. It corroborates this paper — finding that nGPT makes scaling laws more predictable and allows hyperparameters to transfer directly across model sizes.
+
+- *Adaptive block scaling (Cook et al. 2025, "Four over Six")*: continues pushing the traditional patch route, making NVFP4 representation more accurate near saturation.
+
+Over the next 12 months we can expect:
+
+1. Work on nGPT × inference-time quantization (this paper covers training only)
+2. nGPT × INT4 / binarization and other more aggressive precisions
+3. Other architectures with "native quantization friendliness" (e.g., norm + rotation internalized into the architecture)
+4. Reverse hardware influence: knowing nGPT does not need an RHT path, the next GPU generation may drop the RHT unit
+
+* A Single Diagram
+
+#+begin_example
+              Evolution of "How to Survive in 4 Bits"
+
+         ABS_VALUE  (how are outliers handled?)
+            ^
+    +20 db  |
+   outlier  |  [LLM.int8°]              [QuaRot]
+   massive  |   split to FP16           rotate & scatter
+            |       *                       *
+            |       |                      / \
+            |       |                     /   \
+            |  [SmoothQuant]   [NVFP4 recipe]
+            |   per-channel      all patches stacked
+            |   migration               *
+            |       *                  |
+            |       |                  v
+            |       v
+            |   ........... patch route ...........
+            |
+   -7 db    |  ----------------------------------------------
+            |               [nGPT-NVFP4]  <-- this paper
+   no       |               resolved at the architecture level
+   outlier  |               (signal accumulates coherently)
+            |
+            +---->---->---->---->---->---->---->----> time
+                2022      2023     2024     2025     2026
+
+   x-axis: time                    y-axis: severity of outlier problem
+
+   * Patch route (upper half): see outliers -> route around / scatter / rescale
+   * Architecture route (lower half): redesign so outliers never appear
+   * Key turning point: 2026, the first time the "4-bit training" problem
+     was pushed back from the "quantization" discipline into the
+     "architecture" discipline
+#+end_example
+
+* Insights
+
+After reading the whole river, what is most worth remembering is not any specific technique — it is the *migration of disciplinary boundaries*.
+
+1. *Patch philosophy vs. architecture philosophy.* For a full four years (2022–2025), "4 bits" was treated as a *quantization* problem: given a standard Transformer, figure out how to compress it. What Fishman et al. do is kick the problem back into the *architecture* discipline: choose an architecture that never grows outliers and quantization is not a problem at all. This kind of "reclassification of a problem across disciplines" is frequently the hallmark of a genuine breakthrough.
+
+2. *Constraint as liberation.* The usual intuition: stronger constraint → more restricted model → less capable. In the low-precision world it is reversed — constraint (the hypersphere) replaces *a handful of dominant outliers* with *distributed coherent cooperation*, and the latter is naturally noise-resistant. This echoes another old observation in machine learning: *regularization does not limit capability — it channels capability into more robust forms*.
+
+3. *The asymmetry of signal and noise.* The truly deep insight is not "nGPT reduces noise" — it does not. The deep insight is "nGPT makes the *signal coherent*." In every system that has to contend with noise (radar, communications, SETI, neuroscience), the optimal strategy is often not noise reduction but making the signal carry its own coherence. Compressed sensing, matched filtering, phased arrays — all of these live on that same principle. Deep learning has simply climbed that same staircase one more step.
+
+4. *Bidirectional causality between hardware and algorithms.* NVFP4 was designed for Blackwell; this architectural breakthrough will in turn influence the design of the next chip generation. "Hardware provides new primitives → algorithms find new uses → algorithms push hardware to simplify" — this is a complete cycle, and the next round may not need an RHT unit at all.
+
+Where is the river most likely to flow next?
+
+- *Inference-side nGPT*: training has won; how to preserve nGPT's advantages at inference time is the open engineering problem
+- *More aggressive low precision*: FP3, binary, ternary — per the paper's theory, nGPT's advantage should be even larger
+- *Other architectures with native quantization friendliness*: new combinations of normalization + rotation + geometric constraint
+- *Geometrization of training dynamics*: formally characterizing which training-dynamic properties make a representation naturally noise-resistant
+
+* Implications
+
+For researchers:
+
+- When a problem is wrapped in layers of patches — each one working but the whole thing ugly — *the problem has almost certainly been assigned to the wrong discipline*. Step back and ask whether the issue originates one layer upstream from where you are patching.
+
+- The classic "architecture-agnostic / universally applicable" methodological stance is admirable, but sometimes *deliberately committing to one specific architecture* is the higher-expected-value bet. Fishman et al. did not propose "a general 4-bit training algorithm." They said: "You want 4 bits? Use nGPT." That is a very specific, very constraining claim — and precisely because the constraint is strong, the leverage it provides is large.
+
+- *Mechanistic explanation is worth far more than benchmark scores.* The most powerful part of this paper is not "we trained a 30B model." It is the SNR decomposition + correlation measurement + three-regime analysis that explains *why* this works. That kind of mechanistic argument generalizes, predicts scaling behavior, and guides the next design decision.
+
+For engineers:
+
+- How long have you been stacking patches on a standard Transformer? Take inventory: RHT + amax scaling + SR + high-precision layers + warmup schedules … If removing any single component causes divergence, you are living inside a *brittle recipe*. The cost of switching architectures may be lower than the cost of continuing to patch.
+
+- nGPT is not a free lunch: under BF16 it shows small regressions versus standard GPT on several benchmarks. But under NVFP4 it pulls ahead. If your target precision is 4 bits, *choosing nGPT is a direct engineering decision* — no further ablation required.
+
+- Watch the follow-on: does a model trained as nGPT retain its low-precision advantages at inference time? That is the most important engineering question to track over the next 12 months.
+
+Bottom line: "ready to use" — meaning you can:
+
+1. If you are pretraining an LLM and preparing to deploy on Blackwell, *right now* switch your architecture from standard GPT to nGPT and eliminate the entire RHT + per-tensor scaling pipeline
+2. If you are researching quantization algorithms, *pause your patch work* and instead study "which architectural choices are inherently quantization-friendly"
+3. If you are writing a low-precision framework (vLLM / TensorRT-LLM and similar), adding first-class nGPT support may be the most valuable optimization of the next six months

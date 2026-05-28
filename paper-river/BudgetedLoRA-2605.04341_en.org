@@ -1,0 +1,300 @@
+#+title:      Budgeted LoRA: Distillation as Structured Compute Allocation for Efficient Inference
+#+date:       [2026-05-28 Thu 11:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T114654-en
+#+source:     https://arxiv.org/abs/2605.04341
+#+authors:    Mohammed Sabry, Anya Belz (Dublin City University / ADAPT Centre)
+#+venue:      arXiv 2026-05-05 (cs.LG)
+
+* The River of the Problem
+
+You have a massive language model (say, 7B or 70B parameters) that cost millions of dollars to train. Now you want it smaller and faster — runnable on a consumer GPU.
+
+The most naïve approach: train a small model from scratch. Too expensive.
+
+The next most naïve: use the big model as a teacher, "distilling" a smaller student. But you still have to decide in advance what the student looks like — how many layers, how wide each one, which modules to include — all set *by hand*. One decision, fixed forever.
+
+One step cleverer: leave the original model untouched and attach small patches alongside it (adapters / LoRA). Training is cheap, but at inference time *the huge backbone is still there* — no speed savings whatsoever.
+
+For a full decade, everyone was stuck at the same contradiction:
+- *Training side*: how do you learn with fewer trainable parameters? (adapter, LoRA, prefix-tuning …)
+- *Inference side*: how do you make the model run faster? (pruning, quantization, distillation …)
+
+The two sides evolved independently — until someone asked: can a *single knob* control both at once?
+
+* Source Map
+
+#+begin_example
+[2015] Hinton, Vinyals, Dean -- Distilling the Knowledge in a NN
+  |
+  | Problem seen: large-model inference is too expensive,
+  |               but small models learn poorly from hard labels
+  | Solution: have the student learn the teacher's *soft probability
+  |           distribution* (dark knowledge)
+  | Limitation left: student architecture is hand-designed,
+  |                  training starts from scratch
+  v
+[2019] Houlsby et al. -- Parameter-Efficient Transfer Learning (Adapter)
+  |
+  | Problem seen: fine-tuning for every downstream task means
+  |               storing a full copy of weights per task -- storage explosion
+  | Solution: freeze the backbone; insert a small bottleneck module
+  |           after each Transformer FFN; train only those adapters
+  | Hole left: serial insertion -> one extra forward pass per layer,
+  |            real latency increase at inference
+  v
+[2021] Hu et al. -- LoRA: Low-Rank Adaptation
+  |
+  | Problem seen: Adapter's serial architecture cannot be bypassed
+  |               at inference time
+  | Solution: express adaptation as a *parallel low-rank residual*
+  |           dW = B A  (rank r << d); after training, *merge back*
+  |           into the original weight  W' = W + BA
+  |           -> zero extra inference cost
+  | Hole left: backbone W is still exactly as large and slow as before.
+  |            "cheap training" != "cheap inference"
+  v
+[2023] Zhang et al. -- AdaLoRA
+  |
+  | Problem seen: LoRA assigns the same rank r to every layer,
+  |               wasting budget on unimportant ones
+  | Solution: parameterize in SVD form; use importance scores to
+  |           dynamically redistribute rank budget across layers
+  | Hole left: still only touching the *low-rank side*.
+  |            The backbone is treated as an untouchable sacred object
+  v
+[2026.05] Sabry & Belz -- Budgeted LoRA  <-- this paper
+  |
+  | Problem seen: treating "backbone + low-rank patch" as two separate
+  |               quantities fundamentally cannot save inference compute
+  | Solution: assign a *global compute budget* alpha in [0,1] per layer;
+  |           let the optimizer decide how much stays dense and how much
+  |           is compressed into low-rank paths.
+  |           The backbone itself changes from "constant" to "variable"
+  v
+[2026+] (open) Distillation-aware structured pruning, dynamic budgets...
+#+end_example
+
+* Evolutionary Narrative
+
+** 2015 | Hinton Distillation: the teacher's softmax is more nutritious than hard labels
+
+*** What problem did it see?
+
+By 2015, ImageNet models could recognise over a thousand classes. Deploy one on a phone? It doesn't fit in memory, and inference is far too slow.
+
+You could train a small model directly, but a small model has limited capacity and hard (one-hot) labels carry too little information — "this is a cat" tells the student nothing about *why* this image looks more like a cat than another one.
+
+*** Its solution
+
+Have the student learn the *full probability distribution* over the teacher's final softmax, with temperature T raised to flatten the distribution:
+
+   p_i = exp(z_i / T) / sum_j exp(z_j / T)
+
+This distribution encodes so-called "dark knowledge" — for instance, "this image is 90% cat, 9% dog, 0.5% car." That 9% dog signal tells the student that cats and dogs are visually similar, while cats and cars are not. Hard labels can never convey this.
+
+The student only needs to align its own soft distribution with the teacher's (via KL divergence), and it inherits the teacher's "judgment habits."
+
+*** Why it works — and what new hole it digs
+
+Distillation is fundamentally about *using the teacher's compressed similarity structure to regularise the student*. This idea spread from images to NLP to LLMs, and remains in use today.
+
+But it leaves two root problems:
+1. *The student architecture is hand-designed.* Number of layers, width, choice of operators — all decided by human intuition.
+2. *Training starts from scratch.* Distillation saves inference compute, not training compute — and only if *the student really is smaller.*
+
+The next ten years of work would slowly chip away at both.
+
+** 2019 | Houlsby Adapter: freeze the backbone, attach small patches
+
+*** What problem did it see?
+
+BERT arrived in 2018. Fine-tuning one BERT on 10 GLUE tasks means storing 10 copies of ~110M parameters — obviously wasteful.
+
+Distillation doesn't solve this: you'd still need to distil a separate student per task.
+
+The question became: can we *touch only a small subset of parameters*, localising the per-task "difference"?
+
+*** Its solution
+
+After each Transformer FFN, insert an *adapter module*: project down to a bottleneck of dimension r, apply a non-linearity, project back up to d. The whole adapter has only ~2dr parameters, far fewer than a full FFN layer.
+
+During training the backbone is frozen; only the adapter is updated. Each task stores a tiny adapter (a few MB) while sharing the backbone.
+
+*** Why it works — and what new hole it digs
+
+It revealed a key insight: *downstream task variation really can be captured by a low-dimensional transformation.* The backbone has already learned "general language ability"; task specialisation is just a lightweight adjustment.
+
+But the cost was immediately visible: adapters are inserted *serially* into the backbone — every Transformer layer must also run the adapter's forward pass. This adds inference latency, a real burden for deployment.
+
+The next question became clear: can we keep "training only a small number of parameters" while *not lengthening the inference path*?
+
+** 2021 | LoRA: make the patch "dissolvable" — a low-rank residual
+
+*** What problem did it see?
+
+Redraw Houlsby's diagram: the backbone is a main highway, the adapter is a serial detour — you must pass through the adapter before reaching the next layer.
+
+What if the adapter were *parallel*? During training it is an independent branch, but *after training it can be mathematically merged into the backbone weight* — making it as if it never existed at inference time.
+
+*** Its solution
+
+For any weight matrix W ∈ R^{d×d}, LoRA does not update W directly; instead it learns a low-rank residual:
+
+   delta W = B A,   B in R^{d×r},  A in R^{r×d},  r << d
+
+During training the forward pass is y = Wx + BAx (parallel). After training, merge: W' = W + BA, and at inference use only W' — *exactly the same compute as the original model*.
+
+Trainable parameters number only 2dr, far less than d^2. On GPT-3 175B, LoRA reduced trainable parameters to 0.01% of total while matching near-full fine-tuning quality.
+
+*** Why it works — and what new hole it digs
+
+LoRA's elegance lies in turning the adapter from a *serial module* into a *parallel residual* — a small architectural move that yields zero inference overhead and extremely low training cost. It became the de-facto standard from 2022 to 2025.
+
+But this paradigm simultaneously *hardcoded* one constraint:
+
+   The backbone W is sacred and immovable.
+
+What is saved is only *training and storage*. At inference you still carry the full dense matrix multiplication of 7B or 70B parameters. The claimed "efficiency" is *adaptation efficiency*, not *inference efficiency*.
+
+The next generation needed to ask: can "which parts to move and by how much" also become *learnable*?
+
+** 2023 | AdaLoRA: the same rank budget, allocated more intelligently
+
+*** What problem did it see?
+
+LoRA in practice has one inelegant setting: all layers and all modules share the same rank r (e.g. r = 8). But obviously, the Q/K/V projections of attention and the two matrices of FFN contribute differently to task performance; shallow and deep layers differ too.
+
+Uniform allocation = wasting rank on unimportant positions and being stingy at important ones.
+
+*** Its solution
+
+Parameterise each LoRA residual in SVD form as delta W = P Lambda Q; introduce importance scores to assess each singular direction's contribution; dynamically prune unimportant directions during training and reallocate their budget to important ones.
+
+The result: better accuracy under the same *total rank budget*.
+
+*** Why it works — and what new hole it digs
+
+AdaLoRA was the first to put "budget allocation" on the table explicitly: trainable parameters are a scarce resource and should be distributed according to need.
+
+But it still respected the same boundary:
+
+   The budget is only reallocated *within the low-rank side.* The backbone has no seat at the negotiating table.
+
+Intuitively you would ask: if one layer's backbone is critically important (deleting any of it causes collapse) but another layer's backbone could lose half its capacity with little harm — why not let *the backbone itself participate in budget allocation*?
+
+That question would not be formally answered until 2026.
+
+** 2026 | Budgeted LoRA: let the backbone join the negotiation
+
+*** What problem did it see?
+
+Lay out a decade of effort in a table:
+
+| Era          | What can be moved        | Inference cost                      |
+|--------------+--------------------------+-------------------------------------|
+| Distillation | Entire student arch      | Determined by student (hand-designed) |
+| Adapter      | Side-branch modules      | Backbone + side branch              |
+| LoRA         | Parallel low-rank residual | Backbone only                     |
+| AdaLoRA      | Low-rank rank allocation | Backbone only                       |
+
+The contradiction is glaring: LoRA makes training cheap, but inference still carries the full W; AdaLoRA can optimise allocation as finely as it likes, yet that large stone of a backbone never moves.
+
+If your goal is *cheap inference* — the LoRA paradigm is fundamentally unable to reach it.
+
+*** Its solution
+
+Treat "backbone + low-rank" as a unified *total compute budget alpha ∈ [0, 1]*, where alpha is the fraction of dense computation retained in the final model. Under this constraint, let the model simultaneously learn three things:
+
+1. *Module-level dense retention coefficients* — each module independently decides how much dense compute to keep (some layers retain 80%, others 10%)
+2. *Adaptive low-rank allocation* — the dense capacity that is compressed away is recovered through low-rank paths (similar to AdaLoRA, but crossing the dense/low-rank boundary)
+3. *Post-training compression* — after training, one more round of decisions: dense blocks that should be dropped are dropped; those amenable to low-rank approximation are approximated; those that must be kept are kept
+
+The entire process is supervised by a *distillation loss* — the teacher tells the student which behaviours must be preserved.
+
+In the end, turning a single knob alpha yields a family of students: alpha = 1.0 ≈ standard LoRA; smaller alpha means faster inference with gradually degrading accuracy.
+
+Measured results:
+- At moderate budget: perplexity matches standard LoRA, compressed modules run 1.74× faster
+- At aggressive budget: perplexity degrades modestly, compressed modules run 4.05× faster
+- On functional in-context learning probes: accuracy is actually *higher* than a baseline with the same perplexity
+
+*** Why it works — and what new holes it digs
+
+What it gets right is *turning a constraint into a variable*. For a decade everyone assumed "the backbone cannot be touched," so all effort went into optimising the patch; this work makes "how much of the backbone to move" learnable too, opening up one entire new dimension of the optimisation space.
+
+Distillation is no longer "train an independent small student," but rather *deciding block by block whether each piece of the teacher's compute stays dense or collapses into low-rank* — what is being distilled is no longer parameter values, but *the layout of compute allocation*.
+
+New holes left open:
+- A single scalar alpha is coarse — real deployment may want compound constraints like "latency < 50 ms" or "VRAM < 8 GB"
+- The functional ICL probes send an interesting signal: two students with the same perplexity can behave very differently. This implies that perplexity as a distillation objective may itself be biased
+
+* Frontier Extensions
+
+As of 2026-05, Budgeted LoRA sits at the leading edge of this line of work. Several related forces are simultaneously converging toward the same destination:
+
+- *Distillation-aware pruning* (successors to SparseGPT): approaching from the compression side, they have started using distillation loss rather than reconstruction error as the pruning objective
+- *Mixture-of-Depths / token-adaptive compute*: allocating compute at the *per-token* level rather than the per-module level
+- *Joint quantization × LoRA optimisation* (the generations after QLoRA): pulling bit-width into the budget as well
+
+The next step is predictable: upgrade alpha from a *scalar* to a *vector* (an independent budget per module) or a *function* (an input-dependent dynamic budget), while supporting multiple simultaneous budget constraints (latency + VRAM + energy).
+
+* One Diagram
+
+#+begin_example
+
+Timeline ----> 2015 ----- 2019 ----- 2021 ----- 2023 ----- 2026
+
+What can       Entire     Adapter    Low-rank   Rank        Backbone +
+be moved:      student    (serial)   residual   realloc.    low-rank
+               (from      modules    (parallel)             (joint budget)
+               scratch)
+
+Inference      Set by     Backbone   Backbone   Backbone    *Backbone itself
+cost:          student    + branch                          is compressible*
+
+Distillation   Soft         --         --        --         Compute
+target:        labels                                       allocation
+
+Core sentence:
+  Hinton:    "The teacher's probability distribution is data"
+  Adapter:   "Differences can be localised"
+  LoRA:      "Dissolve the patch into the backbone"
+  AdaLoRA:   "Allocate the budget intelligently"
+  Budgeted:  "The backbone is part of the budget too"
+
+Who handles             | Train eff. | Storage eff. | Inference eff.
+------------------------+------------+--------------+---------------
+Hinton distillation     |     -      |      Y       |       Y
+Adapter                 |     Y      |      Y       |       -
+LoRA                    |     Y+     |      Y+      |       -
+AdaLoRA                 |     Y+     |      Y+      |       -
+Budgeted LoRA           |     Y      |      Y+      |       Y
+#+end_example
+
+* Insight
+
+Surveying this whole arc from beginning to end, a pattern emerges: *the essence of each generation's advance is turning something that was "hard-coded design choice" into a "learnable variable"*:
+
+| Generation     | What was made learnable instead of hard-coded          |
+|----------------+--------------------------------------------------------|
+| Hinton distill.| Student learns from hard labels → learns from soft dist. |
+| Adapter        | Full fine-tuning → move only a small piece (position still fixed) |
+| LoRA           | Adapter serial/parallel structure → parallel and mergeable |
+| AdaLoRA        | Equal rank per layer → allocated by importance         |
+| Budgeted LoRA  | Backbone must be preserved → how much to preserve is decided by the optimiser |
+
+Each step hands one more *researcher decision* over to the *optimisation process*. This is, in fact, the "Bitter Lesson" that keeps recurring throughout deep learning — the paradigm of *replacing hand-crafted features and structures with computation and data* — and it is spreading, thread by thread, from model fine-tuning into *compression itself*.
+
+The next destination is almost predictable: *token-level, layer-level, and bit-level budgets will be jointly managed by a single optimiser*. Compression will cease to be an "engineering art" and become "a differentiable submodule."
+
+* Takeaways
+
+This arc offers a clear template for how to find problems worth working on:
+
+1. *Look for what everyone treats as a constant.* During the LoRA era, everyone assumed "backbone W is a constant." The more solid a constant feels, the more it is taken for granted — and the more worth asking "why can't this be touched?"
+2. *Turn constraints into variables.* Take what others treat as a boundary condition and make it part of the optimisation objective — this almost always opens up a new dimension.
+3. *Small move, grand narrative.* LoRA's core trick (BA in place of delta W) can be explained in ten minutes, yet it shifted an entire paradigm. Look for moves that are "a few lines of code at the implementation level, one new axis at the conceptual level."
+4. *Extend distillation from "copying behaviour" to "allocating resources."* Budgeted LoRA's genuinely novel contribution is not any particular algorithmic detail — it is *redefining what distillation is supposed to transfer*: shifting from transmitting parameter values to transmitting *the layout of compute*.
+
+The practical takeaway: in your own research, list everything in your field that is currently *fixed by default*, and ask one by one "what if this were learnable?" — odds are, one or two of those questions can sustain a paper.

@@ -1,0 +1,242 @@
+#+title:      Finer is Better (with the Right Scaling)
+#+date:       [2026-05-28 Thu 12:16]
+#+filetags:   :paper:river:quantization:microscaling:fp4:en:
+#+identifier: 20260528T121619-en
+#+source:     https://arxiv.org/abs/2605.08565
+#+authors:    Clemens Schaefer, Gil Tabak (Google)
+#+venue:      arXiv preprint, 2026-05-08
+
+* The River of Problems
+
+A small intuition that really should not be wrong: the finer you slice a block of weights — giving each sub-block its own dedicated scale factor — the smaller the quantization error ought to be. Yet with FP4, smaller blocks actually make models worse. This is the *microscaling block size paradox* — a head-scratcher for everyone doing low-precision deployment.
+
+Why is it hard? Because it punches the intuition in the face. Chip vendors are racing toward 4-bit (NVIDIA Blackwell, AMD MI), chasing compression and speed, so they slice tensors into blocks of 32, 16, even 4 values and assign each block its own scale. In theory: finer = more accurate. In practice, on Granite and Llama, cutting the block size from 32 down to 4 sends perplexity climbing. Generation after generation has charged at this wall: the first wave defined the microscaling format (MX); the second wave swapped the scale representation (E8M0 → E4M3 / UE5M3); the third wave discovered the paradox; the fourth wave proposed improved algorithms; and this paper, FiB, is the first to actually explain *why*.
+
+* Source Map
+
+#+begin_example
+[2023] Rouhani et al. - OCP MX v1.0 spec
+  |
+  | What it did: Defined "microscaling" — slice a tensor into blocks,
+  |              give each block one scale, store the scale as E8M0
+  |              (pure exponent, powers of 2). Hardware can run it cheaply.
+  | Pit left behind: E8M0 has wide range but very coarse granularity;
+  |                  for the narrow FP4 (E2M1) format the per-block scale
+  |                  is too imprecise.
+  v
+[2025] NVIDIA / Abecassis et al. - NVFP4
+  |
+  | Problem seen: E8M0's 2× step is too coarse for each individual block.
+  | Fix: Replace the scale from E8M0 with E4M3 (adds a mantissa),
+  |      shrink block size to 16, and add a per-tensor global scale
+  |      on top (hierarchical scaling). Higher precision.
+  | Pit left behind: E4M3 has a narrower range; tiny blocks can underflow
+  |                  to 0. Also clashes with FP4's sparse upper bins
+  |                  (4 and 6 are far apart).
+  v
+[2026.01] Fasoli et al. - "Is finer better?" (arXiv:2601.19026)
+  |
+  | Problem seen: Empirically, with NVFP4 + E4M3 scales, smaller blocks
+  |               yield worse perplexity. The paradox.
+  | Fix: No complete explanation given. Proposes switching to UE5M3
+  |      (wider exponent) as a format-swap workaround.
+  | Pit left behind: Only surfaces the paradox without explaining it;
+  |                  the remedy is "use a more expensive format."
+  v
+[2025] Cook et al. - Four over six (arXiv:2512.02010)
+  |
+  | Problem seen: FP4's two largest bins are 4.0 and 6.0, widely spaced.
+  |               Abs-max scaling forces large values into the 6 bin,
+  |               wasting precision.
+  | Fix: Compute MSE twice per block — once mapping the max to 4,
+  |      once to 6 — and pick the better one.
+  | Pit left behind: The algorithm works, but it's an engineering patch.
+  |                  The root cause of why 4-over-6 beats abs-max is not given.
+  v
+[2026.05] FiB (this paper) - "Finer is Better (with the Right Scaling)"
+  |
+  | What it did: Dissects the *mechanism* behind the whole story.
+  |   (1) Uses numerical experiments + brute-force search to show that
+  |       theoretically MSE strictly decreases as blocks get finer;
+  |   (2) Splits the paradox into Region A / B / C, attributing each to
+  |       "scale underflow to 0" (A) and "large values trapped in sparse
+  |       FP4 upper bins" (B);
+  |   (3) prevent-zero + 4-over-6 + hierarchical = standard E4M3 matching
+  |       the expensive UE5M3. I.e., "algorithm substitutes for format."
+  v
+[Future] Better scale-selection algorithms (brute-force still beats all
+         heuristics → left for the next paper)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | OCP MX v1.0: Turning "one scale per block" into an open standard
+
+*** The problem it saw
+
+Earlier low-precision quantization used per-tensor or per-channel scales — one scale shared across an entire matrix. FP8 could survive that; FP4 cannot. FP4 (E2M1) can only represent ±{0, 0.5, 1, 1.5, 2, 3, 4, 6} — a laughably narrow dynamic range. Sharing a single scale across the whole tensor means rescuing large values kills small ones, and vice versa.
+
+*** Its solution
+
+Slice the tensor into small blocks (16 or 32 values each), compute an independent scale per block. The scale itself is also stored in low precision — E8M0 (8 bits all for the exponent, powers of 2), which hardware handles with a single shift at nearly zero cost.
+
+How is the scale computed? The simplest option: abs-max. Take the largest absolute value in the block, divide by 6.0 (the maximum FP4 representable value), and round down to the nearest power of two. This places the maximum value right at the top of FP4's range.
+
+*** Why it worked (and what pit it dug)
+
+Block decomposition solves the one-size-fits-all granularity problem — each small block quantizes on its own scale; neighbors don't contaminate each other. But a new pit opened: E8M0's step size is a factor of 2, which is very coarse. For a block of only 16 numbers with a narrow value range, neither of the two adjacent E8M0 scales is precise enough. To do better, the scale needs a mantissa.
+
+** 2025 | NVFP4: Adding a mantissa to the scale, plus a global second layer
+
+*** The problem it saw
+
+The 2× step of E8M0 is too coarse for many blocks. Suppose the largest value in a block is 3.2. Should the scale be 1 (block range 0–6) or 0.5 (block range 0–3)? Choosing 1 preserves the large value but loses precision on small values; choosing 0.5 clips the large value. One step difference is a factor of two.
+
+*** Its solution
+
+Replace the scale format from E8M0 with E4M3 (4-bit exponent + 3-bit mantissa). The scale step is now roughly 1/8 ≈ 9% — much finer. Block size is also reduced to 16.
+
+But E4M3 has only a 4-bit exponent, so its dynamic range is much smaller than E8M0. The fix: add a per-tensor global scale. First compute a tensor-level scale from the tensor's abs-max to roughly normalize the tensor into E4M3's representable range; then apply a local E4M3 scale inside each block for fine adjustment. Stacked together, this is *hierarchical scaling*.
+
+*** Why it worked (and what pits it dug)
+
+NVFP4 is indeed more accurate in most cases — scale precision improved. But two new pits appeared.
+
+First, E4M3's smallest nonzero value is 2^{-9}. When a block's values are very small, abs-max/6 rounds down to 0, zeroing out the entire block and destroying all information.
+
+Second, more subtly: FP4's 8 representable values are dense near 0 and sparse in the 4–6 range. The smaller the block, the higher the chance that a few large values happen to land in that sparse [4, 6] region. Abs-max maps the maximum to 6, crowding all near-maximum values into the 6 bin — and precision collapses.
+
+These two pits would not be surfaced systematically until the next paper.
+
+** 2026.01 | Fasoli et al. "Is finer better?": Putting the paradox on the table
+
+*** The problem it saw
+
+Neither of the two pits above had been systematically benchmarked. Fasoli et al. ran experiments across multiple LLMs with fixed NVFP4 + E4M3 scales, sweeping block size from 32 down to 4. Intuition says smaller is better; on Llama and Granite, smaller is catastrophically worse — perplexity rises. This is the paradox.
+
+*** Its solution
+
+No root-cause explanation is given. The workaround proposed: swap the scale format from E4M3 to *UE5M3* (5-bit exponent + 3-bit mantissa, unsigned). UE5M3's wider dynamic range can cover the full tensor without underflowing, alleviating the paradox.
+
+*** Why it worked (and what pit it dug)
+
+UE5M3 is a "use a more expensive format" solution — hardware must support an additional numeric type, adding circuit cost. And it only treats the symptom, not the cause. The reader finishes the paper wondering: is E4M3 fundamentally broken, or is the scaling algorithm broken? The paper does not answer.
+
+** 2025 | Four over six (Cook et al.): A clever patch
+
+*** The problem it saw
+
+Cook et al. noticed the sparsity in FP4's upper range: there is a 50% gap between 4.0 and 6.0, while the gap from 0 to 0.5 is only 0.5. The abs-max algorithm maps each block's maximum to 6.0, meaning every value that is "past 4 but not yet 6" gets crammed into the 6 bin — enormous quantization error.
+
+*** Its solution
+
+For each block, compute quantization MSE twice: once mapping the maximum to 4 (scale = max/4), once mapping it to 6 (scale = max/6), and choose the lower MSE. Simple and direct. This is *four-over-six*.
+
+The intuition: if the block has many large values, mapping to 6 lets them all land in the 6 bin cleanly; if the block has few large values, mapping to 4 lets those values land in the 4 bin while small values stay in the dense region — overall better.
+
+*** Why it worked (and what pit it dug)
+
+Empirically very effective: on Llama at block=4, the perplexity gap shrinks from 0.725 to 0.270. But Cook et al. did not trace the root: why does 4-over-6 beat abs-max? Is it the sparsity of FP4's upper range, or a scale-format issue, or something else entirely? The paper cleanly separates "works in practice" from "we know why" — and the root cause was not yet obtained.
+
+** 2026.05 | FiB (this paper): Dissecting the mechanism, proving algorithm can replace format
+
+*** The problem it saw
+
+FiB places Fasoli's paradox and Cook's patch side by side and asks:
+
+- Is the paradox an intrinsic "original sin" of FP4? Or just a consequence of a poorly chosen scaling algorithm?
+- Among prevent-zero, 4-over-6, UE5M3, and hierarchical scaling — which fix addresses which problem? Can cheap algorithms replace expensive formats?
+
+*** Its solution
+
+Three steps, each targeting one mechanism:
+
+1. *Numerical slicing.* Sweep different σ values on a normal distribution, plotting the "smaller block → larger MSE" curve. The curve splits into three regimes: Region A (very small σ), Region B (small σ), Region C (moderate σ), each with a distinct cause.
+
+2. *Attribution.* Region A is a *scale underflow* problem — σ is so small that abs-max/6 rounds to 0, zeroing the entire block. Fix: forbid scale from being 0; force it to E4M3's smallest positive value 2^{-9} (=prevent-zero). Region B is an *upper sparse bin* problem — large values are forcibly pushed into 6.0, causing clipping errors to explode. Fix: 4-over-6, giving large values the option to land on 4.0 rather than 6.0.
+
+3. *Upper bound.* Use brute-force search to find the optimal scale per block, tracing the "theoretically lowest MSE curve." This curve is *strictly monotonically decreasing* — meaning that finer blocks are theoretically always better. The paradox is an algorithm failure, not a format failure.
+
+The final conclusion has real impact: E4M3 + prevent-zero + 4-over-6 + hierarchical matches — and sometimes exceeds — UE5M3 + 4-over-6. In other words, *the right algorithm ≈ the right format*.
+
+*** Why it worked (and what pits remain)
+
+It works because it aligns *phenomenon* with *mechanism*: each anomalous σ regime is attributed to a concrete physical cause (underflow / sparse upper bin), which in turn maps to a concrete fix. For the first time, a reader can clearly articulate "why I should choose this approach over that one."
+
+The remaining pits are equally clear:
+
+- Brute-force search still significantly outperforms the prevent-zero + 4-over-6 combination. The *optimal scale-selection algorithm* has not yet been found — this is the starting point for the next paper.
+- 4-over-6 requires computing MSE twice, making it too costly for dynamic activation quantization. A low-overhead approximation has not yet been proposed.
+- Only weight and MLP activation quantization were tested. Microscaling for attention and KV cache remains untouched.
+
+* Frontier Extensions
+
+As of this writing (2026-05), FiB is the most recent published work on this line. No clear follow-up papers have appeared in the past month or two. But FiB itself points to three natural extensions:
+
+1. *Better scale-selection heuristics.* FiB's brute-force search defines the upper bound; 4-over-6 is the engineering patch. A large gap remains — for instance, an adaptive algorithm that chooses the scale based on the shape of the within-block distribution (heavy-tailedness, fraction of large values).
+
+2. *Low-overhead 4-over-6.* The current approach computes MSE twice, which is too expensive for dynamic activations. Could a lightweight predictor (reading a few statistics to decide "map to 4 or 6") approximate this cheaply?
+
+3. *Differentiated strategies across tasks and layers.* FiB observes that Granite and Qwen react in completely opposite ways to small blocks — Granite relies heavily on small values and suffers severely from the paradox; Qwen is dominated by large values and is naturally robust. This implies scale selection should be model- and layer-adaptive, rather than one configuration for everything.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                     [Problem: FP4 smaller blocks → worse models]
+                                        |
+       --------------------------------------------------------------
+       |               |                |                |          |
+  Block scheme     Scale format    Scale algorithm   Scale range  FP4 shape
+
+  [2023] MX v1.0      E8M0            abs-max          per-block   E2M1 sparse upper
+   per-block scale   (powers of 2,    (max/6)                      (4 → 6 large gap)
+                      coarse)
+       |                |                |                |
+       v                v                v                v
+  [2025] NVFP4      E4M3 (mantissa)  abs-max + Hier.   per-block   same
+   block=16,         fine but         (two-level        + per-tensor
+   added level        narrow range     stacked scale)
+       |                |                |                |
+       v                v                v                v
+  [2026.01]                            (unchanged)               (unchanged)
+   Fasoli: paradox!  Switch to UE5M3
+                     (wider range)
+       |                |
+       |                +-- Use pricier format --------+
+       v                                               |
+  [2025]                                          4-over-6          +-- Exploit 4 and 6
+   Cook: patch        (unchanged)               (2× MSE, take min)  upper bins
+                                                     |
+       v                                             v
+  [2026.05] FiB                              prevent-zero + 4o6 +
+   Dissect mechanism                         Hier. + E4M3
+   + prove                                  = matches UE5M3 + 4o6
+   "algorithm replaces format"
+       |
+       v
+   [Insight]
+   Paradox = algorithm failure, not format failure
+   Theoretical MSE curve is strictly monotonically decreasing
+#+end_example
+
+* Insight
+
+What is really happening in this river is not technical iteration — it is a *downward shift in the level of attribution*.
+
+The first wave (MX, NVFP4) only looked at "format" — how to encode the scale, whether to include a mantissa. The second wave (Fasoli) noticed strange behavior at the format level but did not descend to mechanism; the conclusion was "use a more expensive format." The third wave (Cook) descended to the "algorithm" level, produced a workable patch, but did not return to "why." FiB is the first to decompose the entire story down to *mechanism*: the paradox is the superposition of two independent physical phenomena (scale underflow + sparse upper bins), each with its own independent fix.
+
+Once you can articulate the *mechanism*, you can play the game of equivalent substitution — which is exactly this paper's core conclusion: "the right algorithm = the right format." This is an expensive conclusion in the best sense: hardware vendors can drop the circuit cost of supporting UE5M3 and run standard E4M3 with a few extra lines of algorithm. At LLM-inference scale, "algorithm replaces circuit" saves on the order of billions of square microns of silicon.
+
+The most likely next step: moving from a "two-patch" approach (prevent-zero fixes Region A, 4-over-6 fixes Region B) toward a *unified, distribution-adaptive scale selector*. FiB has already drawn the brute-force upper bound — the remaining gap is clearly visible. Whoever first uses lightweight learning or analytic methods to approach that upper bound will write the next paper.
+
+* Takeaways
+
+The lesson this evolutionary line offers for how to do research condenses to one sentence: *Do not stop at "a more expensive solution makes it work" — chase "why the cheap solution does not."*
+
+Fasoli discovered the paradox and stopped at "switch to UE5M3." Cook proposed 4-over-6 without explaining it. FiB clarified the mechanism and immediately obtained the commercially valuable lever of "match UE5M3 quality with E4M3 hardware." Three papers of comparable effort; FiB has far greater impact — because it descended one level of attribution further than anyone else had.
+
+The practical upshots are concrete. You can —
+
+- Look at any "empirically effective but unexplained patch" in your own field and treat it as an *unmined vein*, not a *solved problem*. Unpacking "why it works" usually reveals a cheaper equivalent.
+- In domains where attribution is murky (quantization, pruning, inference acceleration, fine-tuning), clearly separate *phenomenon* / *mechanism* / *fix*. Most papers conflate the three; whoever disentangles them owns the next paper.
+- Whenever you see a paper that solves a problem by switching to more expensive hardware, formats, or models, immediately ask: could a cheaper algorithm achieve the same? If yes, that is your next paper.

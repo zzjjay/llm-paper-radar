@@ -1,0 +1,202 @@
+#+title:      Reformulating KV Cache Eviction Problem for Long-Context LLM Inference
+#+date:       [2026-05-28 Thu 12:11]
+#+filetags:   :paper:river:
+#+identifier: 20260528T121130
+#+source:     https://arxiv.org/abs/2605.07234
+#+authors:    Tho Mai, Joo-Young Kim (KAIST)
+#+venue:      arXiv 2605.07234 (2026-05-08)
+
+* 问题之河
+
+长上下文 LLM 推理时，KV 缓存随序列线性膨胀，几万 token 后显存就爆了。最直接的省钱办法是「扔掉一些 token」——可哪些 token 能扔、哪些不能？
+
+这个问题听起来简单，做了三年还没解决。难点在于：注意力机制是个多头、多层、最后还要经过输出投影的复合操作，"一个 token 重要不重要"取决于它在整个 forward pass 里的贡献，而不是某一层某一个 head 的注意力分数。可绝大多数方法只看 attention 权重——因为它便宜、好算。这就埋下了一条"用代理指标做关键决策"的隐患，每代论文都在和这条隐患搏斗。
+
+* 溯源地图
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.) - 窗口 + 注意力 sink
+  |
+  | 问题: 只保留最近窗口，中段长依赖被砍掉
+  | 解法: 改成"按贡献排序，留下贡献大的"
+  v
+[2023] H2O (Zhang et al.) - 累计注意力分数选 Heavy Hitter
+  |
+  | 问题: 单步 attention 噪音大，整段平均又会漏掉局部强信号
+  | 解法: 在 query 端开一个观察窗口，做窗口内平均 + pooling
+  v
+[2024] SnapKV (Li et al.) - 观察窗 + 池化，长一段时间的 SOTA
+  |
+  | 问题: 还是只看 A (attention)，没看 V 也没看 W_O
+  |       一个 token 即使 attention 不高，
+  |       如果它的 value 经 W_O 投影后产生大输出，照样关键
+  v
+[2025] CriticalKV / CAOTE / LAVa - 试图把 V 或 W_O 塞进打分
+  |
+  | 问题: 都是启发式拼接 (rescale, safeguard)，
+  |       没有从注意力层的真实公式 O = A V W_O 出发
+  |       而且全部是 per-head 独立决定，忽略跨头/跨层耦合
+  v
+[2026] LaProx (Mai & Kim) - 把驱逐重新写成矩阵近似问题
+  - 以 ||AVW_O||_F 为优化目标，让保留 token 最小化层输出误差
+  - 同时跨 head 跨 layer 全局打分，不再按头单算
+#+end_example
+
+* 演化叙事
+
+** 2023 | StreamingLLM: 把"省钱"问题正式立起来
+
+*** 它看到了什么问题
+
+最早人们干脆把 KV 缓存截短——只保留最近的 N 个 token。结果模型在长输入上立刻退化，因为开头那些"attention sink" token (常是 BOS、第一个标点之类) 被丢了之后，softmax 的分母塌了，整个 attention 分布乱套。
+
+*** 它的解法
+
+非常朴素：永远保留最开头几个 sink token + 最近的滑动窗口。中间一律不要。LongFormer 同期是另一种窗口变种——除了滑窗，还允许人为预选几个全局位置。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+attention sink 现象是真的，留住开头能稳住数值。可这个方案默认"中段不重要"，对真正的长依赖任务 (NarrativeQA、Needle-in-a-Haystack) 完全失效——你想问一个埋在第 5000 个 token 处的事实，它早被滑窗推走了。
+
+下一步必须解决: *别按位置丢，要按贡献丢*。
+
+** 2023 | H2O: 第一次把"贡献"量化
+
+*** 它看到了什么问题
+
+StreamingLLM 是按位置选 token，本质上没用模型自己的判断。但模型其实给过线索——attention 权重。如果一个 token 长期被高频访问，它显然重要；如果几乎没人看它，多半可丢。
+
+*** 它的解法
+
+Heavy-Hitter Oracle: 在 prompt 处理完之后，统计每个 token 在所有 query step 累计获得的 attention 分数，分高者留，分低者驱逐。Scissorhands 几乎同期，用的是类似的累计排序思路。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"重要性"从位置转到了 attention 分布上，是一次真正的范式转移——所有后续工作都站在这个公理上：*attention 高 ≈ 贡献大*。
+
+新坑：这个公理只是近似。单步 attention 噪音很大，把整段历史一锅平均又会把局部的关键瞬间稀释掉。更隐蔽的坑是——它默认"attention 高一定意味着对最终输出贡献大"，但中间还隔着 V 和 W_O 两次乘法。这条坑要再过两年才被认真挖。
+
+** 2024 | SnapKV: 让"看哪段"更聪明
+
+*** 它看到了什么问题
+
+H2O 是"从头到尾平均"，对生成阶段稳定，但忽略了一个常识：用户的 query 往往集中在 prompt 末尾——指令、提问通常写在最后。末尾 token 的 attention 模式对决定"什么该留"是最有信号的。
+
+*** 它的解法
+
+在 prompt 末尾开一个 *观察窗口* (observation window，例如最后 32 个 token)，只用这窗口内的 attention 去打分；再在 head 维度做一次 1D pooling，让相邻位置的分数互相平滑，避免选出过于孤立的 token。CAKE 在这之上再叠一层"按 attention 方差分配预算"，把不同层的预算调成不等。PyramidInfer/PyramidKV/D2O 走的也是类似的"层间不均分配"思路。AdaKV 与 HeadKV 则把不均推到 head 这一级。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+观察窗 + pooling 抓住了 instruction-following 场景下用户真正关心的注意力模式，长期是 LongBench 上的 SOTA。
+
+但所有这些方法的本质还是 *只看 A*——只是 A 怎么聚合、给谁分预算的工程改良。论文里指出的关键观察就埋在这里：A 是被 softmax 压扁的概率，数值范围窄；V·W_O 是没归一化的，数值范围宽，而且越深的层差距越大。两个分布完全不同步——A 高的位置不一定是 V·W_O 高的位置，反之亦然。换句话说：*只用 A 排序，等于在用一把没刻度的尺子量长度*。
+
+** 2025 | CriticalKV / CAOTE / LAVa: 第一次把 V 和 W_O 拽进来
+
+*** 它看到了什么问题
+
+H2O/SnapKV 系所有方法的盲区: 它们用 attention 衡量重要性，但模型最终输出是 A·V·W_O，A 只是其中一项。如果某个 token 的 V 和 W_O 项很大，即便 attention 一般，它在最终输出里的份额也可能很高。
+
+*** 它的解法
+
+三家走了三条不太一样但都"半路"的路：
+
+- *LAVa*: 在打分里加入 value 范数。看 ||V_i||，但忽略 W_O。
+- *CAOTE*: 同样用 V，绕过 W_O。
+- *CriticalKV*: 直接用 V·W_O 信息去 rescale mean attention，套上两个经验 safeguard 防止打分爆掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+承认了"光看 A 不够"，方向是对的。但全部都是 *启发式拼接*——把额外项作为修正系数附在 attention 分数上，没有从 O = A·V·W_O 这个公式出发去问"我到底要近似什么"。
+
+更深的坑是：这些方法清一色 *per-head 独立决定哪些 token 留下*。同一个 token 在第 5 个 head 可能被打 0.9 分、在第 6 个 head 被打 0.1 分，每个 head 各自做 top-k——结果是 head 之间分配预算不公平，而且彻底忽略了一个事实：W_O 把所有 head 的输出加在一起送下游，*token 的最终贡献是跨 head 加和的*，按头切就是把这件事拆碎。AdaKV 试过 top-k 跨 head，但靠经验 safeguard 撑着。
+
+至此万事俱备：要把驱逐重新写成一个针对 A·V·W_O 的优化问题，并且要从 head/layer 抽出来全局看。
+
+** 2026 | LaProx: 把驱逐写成矩阵近似问题
+
+*** 它看到了什么问题
+
+前面所有方法都缺一个"我到底在优化什么"的明确目标。它们都在用代理指标 (attention 分、加 V 修正、加 safeguard)，但没人正面回答：*"驱逐一些 token 之后，attention 层的输出会损失多少？"*
+
+*** 它的解法
+
+把驱逐重新表述为一个 *优化问题*：在保留预算 k 内，选哪些 token 才能让保留后的层输出 A_S·V_S·W_O 最接近原始的 A·V·W_O？也就是把 ||A·V·W_O − A_S·V_S·W_O|| 最小化。
+
+关键技术点两条：
+
+1. *Eviction Indicator (LaProx 打分)*: 论文给出一个 Remark——MHA 的输出可以精确分解为各 head 贡献之和: Output = Σ_i A^i V^i W_O^i。基于这个分解，每个 token 的"贡献"就是 attention 概率 × (V·W_O) 的乘积模长。不再用 A 单独排序，而是真正算它对 final output 那一项的影响。
+2. *Eviction Action (全局打分)*: 因为各 head 贡献在 W_O 维度上是"加在一起"，所以 token 之间的可比性是跨 head 的——一个 head 里贡献小但另一个 head 里贡献巨大的 token，也应该留。LaProx 给所有 head/layer 内的所有 token 一个 *统一可比的 score*，然后全局 top-k 选择。这是文献里第一次做到"model-wide" 而不是 "head-wise" 的驱逐。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把代理换成了真目标，结果立竿见影：LongBench 19 个数据集，5% 的 KV 缓存 (压到 1/20) 还能保住性能；极端压缩下相对 SOTA 把 accuracy loss 砍掉一半。Needle-in-a-Haystack 上同样领先。
+
+新坑（论文 Limitations 也提到）：
+
+- *预算依然要给定*: 总预算 k 是个超参，不是从数据里学出来的。
+- *Decoding 阶段的动态变化*: 优化目标是 prompt 处理结束时的"一次性"近似，长生成过程中分布会漂移，固定保留集是否还最优是开放问题。
+- *硬件实现*: 全局 top-k 需要跨 head/layer 排序，比 SnapKV 类的局部 top-k 略复杂——论文给了实测开销 minimal 的数据，但是否在不同推理框架里都成立还要看。
+
+* 前沿延伸
+
+LaProx 2026-05-08 才挂上 arXiv，截至本笔记成稿日 (2026-05-28)，公开的直接后续工作还看不到。可以预判的下一步:
+
+- *与 KV 量化的正交结合*: 驱逐和量化在论文中被并列为两条压缩路线 (Appendix B 也明确提及 KV Cache Quantization)。LaProx 给出的全局重要性 score 天然适合做 mixed-precision——重要 token 高精度、次要 token 低精度。
+- *学出来的预算*: 把"留多少"也变成从数据驱动的，而不是手动给 k。
+- *Decoding 阶段在线刷新*: 把"一次性优化"改成滑动近似，让保留集随生成漂移。
+- *MoE 场景*: 论文 Appendix G.3 已经做了 MoE 上的初步实验，这是 dense → sparse 的一个开放方向。
+
+如果有人在 LaProx 之后做出新工作，本节应补充。当前条目仅做合理外推，未做引用确认。
+
+* 一张图看懂
+
+#+begin_example
+                  "选 token" 的判据演化
+  时间轴 ---------------------------------------------------->
+
+  2023    2023        2024            2025                2026
+  ------  ----------  --------------  ------------------  ----------
+  位置    单一指标    指标精炼        指标加项            重写目标
+  ------  ----------  --------------  ------------------  ----------
+  Streaming  H2O      SnapKV          CriticalKV          LaProx
+  LLM       Scissor-  + CAKE          + CAOTE             (本文)
+  Long-     hands     + PyramidKV     + LAVa
+  Former              + HeadKV/AdaKV
+
+  指标:   按位置   累计 A    窗口 A + pooling   A * f(V,W_O)        argmin
+                                                启发式拼接          ||AVW_O -
+                                                                     A_S V_S W_O||
+
+  视野:   全局     per-head  per-head            per-head             model-wide
+          固定     独立      独立 + 层间预算     独立 + safeguard     跨 head 跨 layer
+
+  方法学: 直觉     经验      经验 + 工程         经验 + 启发式        从公式出发的
+                                                                     优化问题
+#+end_example
+
+* 洞见
+
+*真正在演化的不是"哪种打分函数更好"，而是"打分函数和层输出之间的距离"。*
+
+从 StreamingLLM 到 LaProx，每一代都在缩短"我在排序什么"和"我真正想保住什么"之间的距离：
+
+- StreamingLLM: 不排序，按位置丢。距离=∞。
+- H2O: 用 A 做排序。距离 = A 和 AVW_O 的差。
+- SnapKV: 用更聪明的 A (窗口+池化) 做排序。距离没变，只是用更高质量的 A。
+- CriticalKV/CAOTE: 把 V (有时是 V·W_O) 启发式拼到 A 上。距离缩短，但拼接方式不是从公式来的。
+- LaProx: 直接以 AVW_O 的 Frobenius 范数做目标。距离原则上为零。
+
+这是一条非常典型的研究演化路径——*"先用便宜代理 → 发现代理失真 → 修补代理 → 最终承认得直接面对原问题"*。便宜代理在算力紧张的早期一定会赢，但一旦硬件松动、benchmark 越卷越细，"原问题主义" 终将回来。
+
+另一个洞见: *方法论上 head-wise 独立决定是一个埋了很久的盲区*。所有 KV 驱逐论文都默认按 head 切，因为 attention 本来就是 per-head 算的——但 W_O 把所有 head 合到一起这一步被集体忽略了。一个看似"自然"的实现习惯，憋了 3 年才被一篇论文翻出来。值得提醒：*pipeline 中越自然的切分越值得怀疑*。
+
+下一步最可能的方向: 把"留哪些 token"和"用什么精度存它们"合到一个优化目标里，做 *driven by output reconstruction error 的统一 KV 压缩框架*。LaProx 的 score 是它的天然先验。
+
+* 启发
+
+- *研究问题的回归原始公式*: 一旦你在用"代理指标"做关键决策，而那个指标的根据是"直觉上像"，盯紧它——大概率有人会从原始公式出发把它击穿。下一篇能击穿你的论文，从来不是"指标改良"，而是"重新写目标函数"。
+- *经验 safeguard 是腐烂信号*: CriticalKV 用了两个 safeguard 让公式不爆掉，这种 "if value > X then clip" 的补丁，是这个公式还没找对的明确证据。看到自己代码里有 safeguard，先问公式是不是错了，再问要不要加保护。
+- *看似平行的维度未必平行*: head 和 head、layer 和 layer，在实现上是并行的，但在语义上是耦合的（W_O 把所有 head 加起来；残差把所有 layer 串起来）。把"并行实现"误当成"独立决策" 是隐藏的认知错误。
+- 落点在"能用": 这意味着你可以——*下次设计任何"按重要性丢弃信息"的系统 (不只是 KV 缓存，还有 sparse attention、token pruning、retrieval reranking)，第一件事就是写下你真正想保住的 target，然后看你的打分函数和这个 target 之间隔了几次非线性变换；隔得越远，越要重写目标，不要在打分上修补*。

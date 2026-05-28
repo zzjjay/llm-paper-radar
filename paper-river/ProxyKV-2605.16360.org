@@ -1,0 +1,232 @@
+#+title:      ProxyKV: Cross-Model Proxy Pruning for Efficient Long-Context LLM Inference
+#+date:       [2026-05-28 Thu 12:40]
+#+filetags:   :paper:river:
+#+identifier: 20260528T124036
+#+source:     https://arxiv.org/abs/2605.16360
+#+authors:    Junjie Li, Jiong Lou, Jie Li (Shanghai Jiao Tong University)
+#+venue:      arXiv preprint, 2026-05
+
+* 问题之河
+
+LLM 想读 17 万字的小说、整库代码、长会议纪要的时候，卡住它的不是算力，是内存——每个 token 都要把它的 Key 和 Value 存进显存里供后面回头看，序列越长存得越多，最后撑爆 GPU。
+
+于是有了 *KV cache 剪枝*：扔掉那些“不重要”的 token，只留关键的。问题是——*怎么知道哪些重要*？
+
+这件事难在哪？
+
+- 想算准：得让目标大模型自己再跑一遍，看哪些 token 真的被关注到了。代价：prefilling 时间翻倍，等于白省了内存还赔上时间。
+- 想算快：用经验法则猜（attention sink、最近窗口、累积分数）。代价：经常猜错，长上下文任务性能崩。
+
+十年来这条线一代一代人前赴后继，本质就是同一句问句：*怎么用更少的算力，估出更准的"哪些 token 重要"*。ProxyKV 把这个问句改写成：*能不能让一个小模型替大模型猜，而且边猜边让大模型跑，互不阻塞*。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | KV cache 作为副产物诞生：自回归解码必须缓存过去的 K/V
+  | 没人预料到上下文会长到 100k+，内存墙问题被埋下
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | 问题: 长序列下，朴素截断 (sliding window) 性能崩盘
+  | 发现: 模型有 "attention sink"——前几个 token 被异常关注
+  | 解法: 保留开头 + 最近窗口。简单粗暴但有效
+  v
+[2023-2024] Zhang et al. - H2O / Li et al. - SnapKV
+  |
+  | 问题: StreamingLLM 只靠位置 (开头+末尾)，丢掉中间的真信号
+  | 解法: 用累积 attention 分数挑 "Heavy Hitters"；
+  |       SnapKV 用 prompt 末尾的观察窗口聚类关键 token
+  | 仍是启发式，看不到全局语义依赖
+  v
+[2025] Kim et al. - KVZip
+  |
+  | 问题: 启发式精度天花板低，长上下文推理任务退化明显
+  | 解法: 让大模型自己再跑一次 (teacher-forced prefill)，
+  |       拿真 attention 当 oracle，按它来剪枝
+  | 精度高，但 prefilling 时间翻倍——把省下的内存换成了延迟
+  v
+[2025] Zhao et al. - IAM / SmallKV
+  |
+  | 问题: KVZip 的 oracle 太贵；
+  |       但同家族大小模型的 attention 模式其实高度相关
+  | 解法: 用小模型的 attention 直接对齐到大模型，
+  |       省掉大模型的二次 prefill
+  | 局限: 用 "head 到 head 固定映射"——两个模型 head 数不一样
+  |       就配不上，layer 深度差距也死锁
+  v
+[2026] Li et al. - ProxyKV  <-- 目标论文
+  |
+  | 问题: IAM/SmallKV 的硬映射太脆；
+  |       而且小模型还是串在大模型推理路径上，没真省下时间
+  | 解法: (1) HybridAxialMapper 学习一个软的、跨架构的轴间映射；
+  |       (2) 把小模型彻底踢出关键路径——异步并发跑；
+  |       (3) 把训练目标从 "回归数值" 改成 "排序一致"
+  | 结果: 拿到 KVZip 98.7% 的精度，prefilling 提速最高 3.21x
+#+end_example
+
+注：StreamingLLM → H2O 是同期工作，并非严格"批判"关系，但放在演化轴上更易看到问题如何被逐步精化。KVZip → IAM/SmallKV 的批判关系是 ProxyKV 引言中转述的，确认引用。
+
+* 演化叙事
+
+** 2017 | Transformer: 注意力机制顺手留下了一个 cache
+
+为了让生成下一个 token 时不重复计算前面所有 token 的 attention，Transformer 解码时把每层每个 head 的 Key 和 Value 缓存下来。当时的序列长度通常几百 token，cache 几兆——不是问题。
+
+谁也没想到 8 年后，大家要让模型读 17 万 token 的代码库。
+
+*** 它留下的坑
+
+KV cache 的内存随序列长度 *线性* 增长。Llama-3.1-8B 在 128k 上下文下，KV cache 单独就吃掉几十 GB——超过单卡 H100 的物理显存。问题就此诞生：*必须扔东西*。
+
+** 2023 | StreamingLLM: 别全保，留开头和最近就够
+
+第一反应是滑动窗口：只留最近 N 个 token。结果性能崩——困惑度爆炸。
+
+为什么？Xiao 团队发现了 *attention sink*——模型把大量注意力莫名其妙倒灌给序列开头的几个 token (即使语义无关)。这是 softmax 归一化的副作用：总分必须是 1，那些"没什么好看的" token 就把分数甩给了开头。一旦把开头扔了，分数没处去，整个分布崩塌。
+
+*** 它的解法
+
+留开头 4 个 token + 最近的滑动窗口。两端固定，中间全丢。
+
+*** 留下的新坑
+
+中间真正承载语义的 token 也被一刀切掉了。长文档问答、多跳推理——这些任务的关键信息常常埋在中间。位置启发式过于粗暴。
+
+** 2023-2024 | H2O / SnapKV: 看 attention 分数挑
+
+既然中间也有重要 token，那就别按位置切，按 *重要性* 切。
+
+H2O (Zhang et al.) 累积每个 token 历史上被 attend 的总分，留分高的 ("Heavy Hitters")。SnapKV (Li et al.) 更精细：用 prompt 最后一段作为"观察窗口"，看这段在 attend 哪些前文，把那些 token 选出来。
+
+*** 它们的解法
+
+用 *局部观察到的 attention pattern* 当作未来重要性的代理。便宜，因为不需要额外算什么——attention 分数本来就在 forward 过程中。
+
+*** 留下的新坑
+
+"局部观察"是关键软肋。SnapKV 的观察窗口只是 prompt 末尾几十个 token，看不到后续 generation 会需要什么。H2O 累积分数偏向早期被关注过的 token，对长尾依赖盲。长上下文 benchmark (LongBench, RULER) 上和真 oracle 比，精度差距明显。
+
+** 2025 | KVZip: 让大模型自己再跑一遍，拿真分数
+
+启发式的精度天花板被钉死了——因为它在猜，而 oracle 就摆在那里：让目标模型对完整序列再做一次 teacher-forced prefill，记录真实 attention 分布，按这个剪。
+
+*** 它的解法
+
+不猜，直接算 ground truth。
+
+*** 留下的新坑
+
+代价大到自相矛盾。剪枝是为了让长上下文跑得动，结果 prefill 跑两次——你省下的 decode 时间和内存，被翻倍的 prefill 吃光甚至倒亏。论文里把这叫 "*scoring-cost vs accuracy gap*"：精度的左端是启发式，右端是 KVZip，中间是悬崖。
+
+** 2025 | IAM / SmallKV: 让小模型替大模型猜
+
+Zhao 等人观察到一件关键的事：*同家族* 的大小模型 (比如 Llama-3.1-8B 和 Llama-3.1-1B)，每一层每个 head 的 attention 模式是高度相关的——小模型关注什么，大模型也大概率关注什么。
+
+那为什么还要让贵的大模型自己跑 oracle？让便宜的小模型算 attention，把分数 *搬* 给大模型用。
+
+*** 它们的解法
+
+固定 head-to-head, layer-to-layer 的硬映射——小模型 head_i 的分数 = 大模型 head_i 的分数。
+
+*** 留下的新坑
+
+两个：
+
+1. *架构不匹配的死锁*: Llama-3.1-8B 有 32 个 head, 1B 版本可能只有 16 个；层数也不同。硬映射要么浪费小模型的 head，要么没法覆盖大模型的所有 head。换一对模型就要重新设计映射规则。
+2. *仍在关键路径上*: 即使小模型快，它的 forward 和 mapper 计算还是串在大模型的 prefill 前面——大模型必须等评分结果出来才能开始剪枝-decode。提速效果有限。
+
+** 2026 | ProxyKV: 软映射 + 异步并发
+
+ProxyKV 一次解决两个遗留问题。
+
+*** 它的解法
+
+把 IAM/SmallKV 的"小模型替算"思路保留，但做两个根本性的改造：
+
+1. *HybridAxialMapper*: 不再硬绑 head-to-head，而是学一个跨轴的映射。三阶段：
+   - 1D Conv 提时间维特征 (每个 head 沿序列的 attention 演化)
+   - Transformer encoder 在时间轴上加上下文
+   - 一组可学习的 *target queries* 通过 cross-attention 从小模型的 head 集合里"拉取"重组成大模型形状的 head 集合
+   这样无论小模型多少 head, 大模型多少 head，映射都能学到——把硬绑变成软绑。
+2. *Multi-Granularity Hybrid Loss*: 之前的对齐损失是回归小模型的分数到大模型的分数 (MSE 之类)。但剪枝任务关心的不是 *分数本身*，而是 *谁排在 Top-K*。所以损失函数被改写成多颗粒的排序一致性 (Top-K binary、intra-Top-K rank、global mass rank、cosine 等 5 项)。学习目标和下游任务对齐。
+3. *异步流水线*: 小模型和 mapper 跑在独立的 CUDA stream (单卡) 或独立 GPU (双卡)，和大模型的 prefill *并发*。约束: =t_score ≤ t_prefill=——只要评分时间不超过大模型 prefill 时间，评分就是"白送"的。小模型用完 KV cache 立即释放，内存峰值只在 prefill 阶段短暂上涨。
+
+*** 为什么这招管用
+
+三处妙手互相加强：
+
+- 软映射让"跨架构"成为系统级能力，而不是每对模型手工调；
+- 排序损失避开了"分数精确但 Top-K 错乱"的常见陷阱；
+- 异步并发把评分时间从"加法"变成"max"——这是性能曲线发生质变的根因，3.21× 的 prefill speedup 主要来自这里，不是来自任何单个组件的优化。
+
+*** 留下的新坑
+
+- *intra-family 约束*: 必须有同家族小模型。如果是冷启动的新模型架构，无小模型可用。
+- *评分时间预算*: 极小的 target 模型 (比如已经 1B) 没多少可压榨空间，预算约束失效。
+- *训练成本*: mapper 要为每对 (proxy, target) 训一次，虽然比 KVzap 便宜，但仍是部署门槛。
+
+* 前沿延伸
+
+2026 年 5 月 ProxyKV 刚挂上 arXiv，是这条线上最新的工作之一。沿同一思路可能继续推进的方向：
+
+- *无监督跨家族对齐*: 去掉 "intra-family" 约束，把任何小模型和任何大模型配对——需要更通用的 representation alignment。
+- *动态预算*: 现在 ρ (保留比例) 是固定超参，可以按 query 难度动态调，进一步榨速度。
+- *与量化/MoE 正交叠加*: ProxyKV 解决"哪些 token 留"，量化解决"每个 token 占多少 bit"，两者可叠加。Quark/MXFP4 量化 + ProxyKV 剪枝是自然组合。
+
+同期值得看的工作: KVzap (Jegou & Jeblick, 2026) 走了另一条路——用 per-layer surrogate 直接在大模型隐状态上预测 oracle 分数, ProxyKV 论文里明确不把它当 baseline (训练成本高、协议不可比)，但它代表"surrogate 嵌入 target 内部"vs ProxyKV"surrogate 外置异步"的路线分歧。
+
+* 一张图看懂
+
+#+begin_example
+                      精度 -->
+                      低                高
+                      |                 |
+       慢   ----------+-----------------+----------
+       ^             [Vanilla]      [KVZip]
+       |             full cache    2x prefill
+       |                              ^
+       |                              |
+   时间               (没人在这)        | 高精度但太贵
+   开销                              [IAM/SmallKV]
+                                    硬映射 + 同步
+       v                              |
+       快   [Streaming]  [H2O/SnapKV] +-- [ProxyKV] <-- 目标
+                启发式      启发式      软映射 + 异步
+                  /            /         排序对齐损失
+            (位置)      (累积分数)      (跨架构)
+
+  演化轴: 启发式  -->  全局重建  -->  代理学习  -->  异步代理
+  代价轴: 算太粗  -->  算太贵    -->  对齐太死  -->  彻底拆解
+
+  关键转折:
+    1. StreamingLLM    位置 -> 重要性 (但还是启发式)
+    2. KVZip          启发式 -> oracle (但代价不可接受)
+    3. IAM/SmallKV   单模型 -> 跨模型 (但硬映射 + 同步)
+    4. ProxyKV       硬同步 -> 软异步 (架构无关 + 时间无关)
+#+end_example
+
+* 洞见
+
+这条线表面在讲"怎么扔 KV cache"，骨子里讲的是 *推理系统里一个更普遍的现象*：
+
+*当一个计算又贵又必要时，第一反应是想办法不算它 (启发式)；第二反应是找便宜的替代品算它 (surrogate)；第三反应是把它从关键路径上拆下来，让它在别处并发 (异步)。*
+
+KV 剪枝的演化几乎按这个顺序走完了：
+- StreamingLLM/H2O/SnapKV = 不算 (用启发式代替)
+- IAM/SmallKV = 别人算 (小模型代替)
+- ProxyKV = 别人在别的地方同时算 (拆出关键路径)
+
+这种"算-拆-异步"的演化模式不只发生在 KV 剪枝。speculative decoding (起草模型异步出 token)、prefetch (异步加载下一段) 都是同一种结构——*把延迟从"加法"变成"max"*。任何一个推理瓶颈，最后都会被人这么拆。
+
+往下一步看：拆完关键路径之后，下一关是 *能不能让 surrogate 也学会自我演化*——不是每对模型重新训一个 mapper，而是 mapper 本身具备跨架构泛化能力，看到没训练过的 (proxy, target) 也能开工。这就把"系统优化"推到"通用对齐"层面。
+
+* 启发
+
+- *找瓶颈不要只问"怎么算更快"，要问"能不能不在这里算"*——KV 剪枝整个领域的最大跃迁不是某个算法变快，是 ProxyKV 把评分从关键路径拆出去。
+- *损失函数和下游任务的对齐常常被忽视*——MSE 看着标准，但下游要的是 Top-K 正确，所以 ranking loss 才是对的。研究里要常问：我训的目标和真正想要的指标是同一件事吗？
+- *硬约束 (固定 head 映射) 经常是误把"实现简便"当成了"正确建模"*——把它换成可学习的软对齐，往往一下解锁一片新场景。
+- *看一篇论文的真正贡献，要看它把哪个"耦合"拆开了*——ProxyKV 拆开了三处耦合: 评分-prefill 时间耦合、proxy-target 架构耦合、损失-任务耦合。每一处都是一个量级的提升来源。
+
+落点在"能用"：这意味着你下次设计一个 LLM 推理优化方案时，先画一张 "时间-精度" 散点图把现有方法画上去，看悬崖在哪儿——然后问能不能用"代理 + 异步"把悬崖填上。这是 ProxyKV 留下的真正可迁移的方法论。

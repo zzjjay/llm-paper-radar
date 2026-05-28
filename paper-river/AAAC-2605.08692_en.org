@@ -1,0 +1,240 @@
+#+title:      AAAC: Activation-Aware Adaptive Codebooks for 4-bit LLM Weight Quantization
+#+date:       [2026-05-28 Thu 12:22]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260528T122228-en
+#+source:     https://arxiv.org/abs/2605.08692
+#+authors:    Beshr IslamBouli, David Jin (MIT)
+#+venue:      arXiv preprint, 2026-05-09
+
+* The Problem River
+
+Squeezing a 7-billion-parameter model into a consumer GPU means each weight gets only 4 bits — only 16 possible values. Which 16 values do you pick, and how, so the model stays as smart as before?
+
+The difficulty comes from three forces pulling against each other:
+- Weight distributions have long tails — a handful of large outliers determine model quality, but if those 16 slots are claimed by outliers, the densely packed small values all blur together
+- Different layers, channels, and even sub-groups have completely different distribution shapes — a single fixed grid is bound to shortchange one end
+- If you actually want to *learn* an optimal grid, the classical approach requires backpropagation or a Hessian, starting at hours of compute with memory ballooning 2–4×
+
+The entire research thread is a series of negotiations among these three forces: either tolerate a fixed grid, or pay heavily to learn one, or find a middle path. AAAC is one attempt along that thread to have the best of both worlds.
+
+* Provenance Map
+
+#+begin_example
+[2023] GPTQ (Frantar et al.)
+  |
+  | Problem: Direct round-to-nearest (RTN) at 4-bit collapses — weights
+  |          are strongly correlated, so rounding one column off skews all
+  |          the others that depended on it
+  | Solution: Quantize column by column; after each column, use the
+  |           inverse Hessian to "spread" the error onto the not-yet-
+  |           quantized columns, minimizing total error
+  | Residual: The 16 grid-point positions are fully fixed (INT4 / FP4
+  |           tables); everything happens around the grid, not to it
+  v
+[2024] AWQ (Lin et al.)
+  |
+  | Problem: GPTQ's inverse Hessian is heavy; most weights don't matter —
+  |          a small number of "salient channels" decide quality
+  | Solution: Before quantization, multiply important channels by a large
+  |           scale (per activation magnitude) so they land in the "good
+  |           zone" of the grid; divide back out after
+  | Residual: Still doesn't touch the 16 grid points themselves.
+  |           All layers share the same fixed table
+  v
+[2024] SqueezeLLM (Kim et al.)
+  |
+  | Problem: Both AWQ and GPTQ treat the 16 grid positions as given;
+  |          that is clearly suboptimal — why not learn them?
+  | Solution: Fisher-information-weighted k-means to learn a per-channel
+  |           non-uniform lookup table (LUT), placing grid points where
+  |           weights are dense
+  | Residual: Fisher information requires a full-model backward pass —
+  |           peak memory grows 2–4× (292 GB for a 70B model);
+  |           fast algorithm, but the hardware isn't there
+  v
+[2025] GPTVQ (van Baalen et al.)
+  |
+  | Problem: SqueezeLLM is "one scalar table per channel" — still coarse;
+  |          and if we're learning codebooks, why not learn vector codebooks?
+  | Solution: Extend GPTQ to vector quantization — each sub-group learns a
+  |           vector codebook via Hessian-weighted EM + gradient refinement
+  | Residual: Finer learning → slower — 0.5 h for 7B, 11 h for 70B
+  v
+[2026] AAAC (this paper, IslamBouli & Jin)
+  |
+  | Observed problem: Both SqueezeLLM and GPTVQ tie "learning a table"
+  |                   to gradients — Fisher or backprop — and never escape
+  |                   the "2× memory + hours" curse.
+  |                   IF4 (Cook et al. 2026) hints at a direction: instead
+  |                   of learning one table, keep several and pick per group
+  | Solution: Learn only two 4-bit scalar codebooks per layer (64 bytes
+  |           total); each weight group picks the one that minimizes
+  |           activation-weighted reconstruction error. The selection bit
+  |           is stored in the sign bit of the scale (which is always
+  |           positive anyway) — zero storage overhead
+  | Training: Purely forward — activation-weighted k-means + alternating
+  |           assignment; 3–30 min, memory ≤ model footprint
+#+end_example
+
+Note: AWQ and GPTQ are two parallel improvement tracks (one does scaling, the other does error compensation); SqueezeLLM is the true watershed that shifts the lens from "adjust the weights" to "adjust the codebook."
+
+* Evolutionary Narrative
+
+** 2023 | GPTQ: Quantization Is a Column-Wise Problem, Not a Weight-Wise One
+
+*** What Problem It Saw
+
+The most naïve approach, RTN (round-to-nearest), rounds each weight independently to the nearest 4-bit grid point. At 8-bit this is fine; at 4-bit it collapses — LLM weights are strongly correlated, so forcing one weight to a wrong grid point breaks the mutual-compensation relationships among neighbors, and the accumulated output error far exceeds the sum of individual rounding errors.
+
+*** Its Solution
+
+It borrows an old trick from 1990s neural-network pruning: Optimal Brain Surgeon. The idea — since we must perturb weights, use the Hessian (second-order derivatives) to identify the most sensitive directions and compute exactly how the remaining weights should be adjusted to pull the loss back after the perturbation.
+
+GPTQ adapts this idea to LLM scale: quantize column by column; after each column, write the "error this column's mis-rounding introduces" back into the not-yet-quantized columns via the inverse Hessian. The next column's quantization naturally compensates for the previous one's mistake.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+It upgrades "quantization" from an isolated rounding operation to a memory-carrying optimization process. But two implicit assumptions are left untouched: first, the 16 grid-point positions are fixed by the INT4 format; second, all columns and all layers share the same table. GPTQ only teaches weights how to *align to* that table — nobody asks whether the table itself could be better.
+
+** 2024 | AWQ: Forget the Hessian — It's All About a Few Salient Channels
+
+*** What Problem It Saw
+
+GPTQ's inverse Hessian is slow and memory-hungry, and worse, it treats all weights equally. But LLM weights are not uniformly important: a small number of channels activated by large activation magnitudes (salient channels) determine almost all of the output quality. Spending compute on every weight uniformly is wasteful.
+
+*** Its Solution
+
+Embarrassingly simple: multiply important channels by a scale > 1 before quantization (so they land in the "safe zone" of the grid, far from boundaries), then divide the scale back out during dequantization. "Important" is determined by activation magnitude on a calibration set.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+It reframes the problem from "how to represent each weight precisely" to "how to protect the critical weights from being crushed," finishes in minutes, and often beats GPTQ. But like GPTQ, it never touches the 16 grid points. The entire research path is still revolving around a fixed table.
+
+** 2024 | SqueezeLLM: Why Is That Table Fixed in the First Place?
+
+*** What Problem It Saw
+
+AWQ and GPTQ are two variants of the same thing — circling a fixed INT4/FP4 grid, adjusting everything around it (scaling, error compensation, clipping). But weight distributions are bell-shaped; scattering 16 grid points uniformly is obviously suboptimal — most points fall on the sparse tails while the dense core gets too few.
+
+*** Its Solution
+
+Learn a non-uniform 16-value lookup table (LUT) for each channel via k-means clustering, with weights weighted by Fisher information — Fisher information is roughly "the second-order effect of perturbing this weight on the final loss," so important weights pull k-means centers toward them.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+For the first time, the grid points themselves become optimization variables. Results are good — but Fisher information requires backpropagation through the entire model, so peak memory grows 2–4× of model size. A 70B model needs 292 GB — doesn't fit on one node. The algorithm is fast; the hardware requirement is not.
+
+** 2025 | GPTVQ: Go Further — Learn Per-Group, Learn Vectors
+
+*** What Problem It Saw
+
+SqueezeLLM is "one scalar table per channel" — still coarse. And since we're already learning codebooks, why not learn *vector* codebooks? Group g consecutive weights into a vector, quantize the vector as a unit, exploit inter-dimension correlations — theoretically tighter.
+
+*** Its Solution
+
+Port GPTQ's Hessian-weighted error-propagation framework to vector quantization. Each sub-group learns a vector codebook using Hessian-weighted EM combined with gradient descent to refine codebook entries. Inherits GPTQ's column-to-column mutual compensation.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+Accuracy climbs another notch. The price is speed — 0.5 h for 7B, 11 h for 70B. Looking back at this thread: from GPTQ's Hessian, to SqueezeLLM's Fisher, to GPTVQ's EM+gradients — every step of "learning better" means "computing longer / consuming more memory." It's a bill that keeps growing.
+
+** 2026 | AAAC (This Paper): Learn Just a Little; Select Using Activations
+
+*** What Problem It Saw
+
+By early 2026 the landscape was: use AWQ/GPTQ (fast but fixed table) or use SqueezeLLM/GPTVQ/OmniQuant (learnable table but hours and hundreds of GB of memory). Nothing in between.
+
+There was also a provocative signal: IF4 (Cook et al. 2026) did something bold — it doesn't learn any codebook at all, it just picks, per group, the one between FP4 and INT4 that yields lower MSE. This implied a possibility: the *selection* dimension of codebooks is more cost-effective than the *learning* of codebooks.
+
+*** Its Solution
+
+Do both "learning" and "selecting," but reduce each to its bare minimum:
+
+1. Learn only two scalar codebooks T_0, T_1 per layer — 16 BF16 values each, 64 bytes total
+2. Each group of g=16 (NVFP4) or g=128 (INT4) weights picks the one that minimizes activation-weighted reconstruction error
+3. The selection bit σ is stored in the sign bit of the scale (scale is always positive, so the sign bit is free) — zero storage overhead
+4. Learning algorithm: purely forward — alternate between "assign (which group uses which table)" and "update (activation-weighted k-means to refine the table)"
+
+The key simplification: no Fisher, no backprop, no Hessian. The activation weight I_k = Σ x_k² is obtained from a single forward pass on the calibration set as a diagonal approximation, and is proven to be a valid objective for minimizing output error (per-column importance).
+
+*** Why It Works (and Where It Plants New Seeds)
+
+The intuition: weight distributions are often bimodal — most weights cluster in a small-value core, a minority scatter in the tails. One table trying to cover both ends must sacrifice one of them. Two tables divide the labor: one optimizes the dense small-value region, one optimizes the long-tail large-value region, and each group picks the one matching its shape — naturally a better fit than any single table.
+
+The critical cost saving comes from one insight: the assignment action is more impactful than the fine-tuning of the table itself — the paper reports that one outer iteration captures 82% of total improvement. So the core cost is one pass through the data to do assignment: done in minutes.
+
+What's left open: two tables is "good enough," not "optimal." Should it be 4? 8? When the selection granularity S and scale granularity g are decoupled, how small should S go before diminishing returns? And per-layer learning means no cross-layer sharing — could it be done per-block? These are the openings AAAC leaves for future work.
+
+* Frontier Extensions
+
+AAAC is a May 2026 paper; there is no published follow-up work critiquing or superseding it yet. But the most relevant concurrent developments are worth noting:
+
+- *IF4* (Cook et al. 2026): A sibling from the same year — also "per-group, pick one of two tables," but IF4 picks between existing FP4 vs INT4; it learns no new tables. AAAC takes one step beyond IF4: the tables themselves are also learned
+- *NVFP4 hardware support*: NVIDIA's Blackwell architecture provides native FP4 tensor-core support; the whole research thread is converging toward a "hardware-supported fixed format + software-learned codebook" hybrid form
+- Likely next steps: AAAC uses 2 tables + 1 selection bit (hidden in the scale sign); the natural extension is 4 tables + 2 selection bits, or applying the same two-codebook idea to activations in W4A4 settings
+
+As of now (2026-05), this is the latest advance on the "scalar codebook learning" thread.
+
+* One Diagram to Understand It All
+
+#+begin_example
+               "Adjust Weights" Camp          "Adjust Codebook" Camp
+               --------------------           ----------------------
+ [2023] GPTQ   Inverse Hessian column comp.   (fixed grid)
+                     |
+ [2024] AWQ    Activation-aware channel scaling (fixed grid)
+                     |                                |
+                     |                                v
+ [2024] SqueezeLLM  |              Per-channel LUT (Fisher k-means)
+                     |              Cost: memory x2–4
+                     |                                |
+                     |                                v
+ [2025] GPTVQ       |              Per-group vector codebook (Hessian EM + grad)
+                     |              Cost: 7B 0.5 h, 70B 11 h
+                     |                                |
+                     +---------------+----------------+
+                                     |
+                                     v
+ [2026] IF4 (sibling)   Per-group selection between fixed FP4 / INT4 tables
+                                     |
+                                     v
+ [2026] AAAC (this)    Learn 2 scalar codebooks per layer (activation-weighted k-means)
+                       + Per-group selection (selection bit hidden in scale sign)
+                       Cost: 3–30 min, memory = model footprint
+                       Zero extra storage, fully forward
+
+ Time --------------------------------------------------------->
+
+ The true spine of the evolution: the core tension in 4-bit quantization
+ is "fit the data" vs "computational cost."
+ Each generation finds a new fulcrum in this trade-off.
+ AAAC's fulcrum = "minimum learning + cheapest possible selection mechanism"
+#+end_example
+
+* Insight
+
+Reading this thread end to end, the deepest observation is: *the cost of learning lies not in the algorithm itself, but in its dependence on gradient information.*
+
+- GPTQ needs the inverse Hessian — heavy, but computed once at quantization time
+- SqueezeLLM needs Fisher information — requires full-model backpropagation, so memory explodes
+- GPTVQ needs EM + gradients — so 70B takes 11 hours
+
+Every step of "learning more finely" means deeper entanglement with backpropagation. What AAAC does is ask a pointed question: *do we actually need gradients? Can forward activation statistics + k-means get the job done?*
+
+Its answer is "yes, and it's good enough." This is not a new algorithm — k-means is from the 1950s — but rather *taking a signal that had always been dismissed as "not good enough" and placing it back where it belongs*. The activation-weighted reconstruction error objective is a diagonal approximation of the OBS/OBQ second-order Hessian — theoretically suboptimal. Yet AAAC demonstrates that, in the engineering practice of 4-bit quantization, this suboptimal signal is sufficient — because the true lever is *per-group codebook selection*, not *precise codebook learning*.
+
+More generally: *when a field sees several consecutive generations of papers all pushing in the direction of "add stronger tools"* (GPTQ → SqueezeLLM → GPTVQ, each adding heavier compute dependencies), *there is usually a paper waiting in the wings that goes the opposite direction — strips the tools away and returns to the most primitive statistics*. AAAC is a clear specimen of that pattern.
+
+The most likely next directions: extending the "minimal learning + cheap selection" paradigm to activation quantization (W4A4), KV cache compression, and on-device deployment. The "learned hybrid codebooks + per-group selection" pattern is far from exhausted.
+
+* Takeaways
+
+Three practical lessons for researchers:
+
+1. *Break out of the "tool upgrade" arms race.* When a thread sees three consecutive generations all adding stronger tools (Hessian → Fisher → EM+gradients), pause and ask: was the previous generation's tool actually sufficient? Is there still room in the first-order or forward statistics that everyone overlooked? AAAC never uses backpropagation — that choice is itself a statement.
+
+2. *Find the "zero-storage" fulcrum.* AAAC hides the selection bit in the sign bit of the scale — this trick transforms "per-group selection" from "metadata that costs storage" into "a feature that comes for free." Many engineering problems contain these kinds of unused bits; once you find one, the entire trade-off gets redrawn.
+
+3. *"Learn a little + select" is far cheaper than "learn a lot."* AAAC learns 2 tables; IF4 learns zero tables and just selects. Selection is cheap; assignment is cheap; retraining is expensive. Whenever a problem looks like it requires "learning a big thing," first ask whether it can be recast as "selecting a small thing."
+
+In practice: the next time you design a 4-bit or 3-bit quantization method, ask yourself — can I avoid backpropagation? Can I hide the metadata in an existing field? Can I let "selection" carry more of the load and "learning" carry less? Odds are you can land on a method that finishes in 3–30 minutes and still beats a multi-hour baseline.

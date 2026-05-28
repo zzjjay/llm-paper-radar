@@ -1,0 +1,325 @@
+#+title:      Uncovering Intra-expert Activation Sparsity for Efficient Mixture-of-Expert Model Execution
+#+date:       [2026-05-28 Thu 12:19]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T121925-en
+#+source:     https://arxiv.org/abs/2605.08575
+#+authors:    Jongseok Park, Sunga Kim, Zhenyu Gu, Ion Stoica, Alvin Cheung (UC Berkeley / AMD)
+#+venue:      arXiv 2026-05-09 (cs.LG)
+
+* The Problem River
+
+Inside a language model, the most expensive component is not attention — it's the FFN (feed-forward network): a pile of dense matrix multiplications that account for the majority of parameters, and that every token must traverse from scratch.
+
+For more than a decade, everyone has been asking the same question: *Do we really have to compute every single neuron in this massive stack?*
+
+The answer has always been obvious — most neurons contribute nothing to the current token; their output values are essentially zero. The challenge is: *How do you know in advance which ones can be skipped?* You can't compute first and then say "oh, that was zero" — that saves nothing.
+
+Generation after generation has worked on the same river: finding cheap signals that tell you which computations can be skipped. From the earliest days of ReLU producing natural zeros, to splitting the entire FFN into multiple experts and letting a router pick a few (MoE), to discovering that even the selected expert contains mostly redundant computation — sparsity keeps moving to ever finer granularity.
+
+This paper is the latest station on that river: the expert selected by the router inside a MoE model still hides *90% sparsity internally* that nobody has mined. And — the surprise — no retraining is needed; off-the-shelf pretrained MoE models already have it.
+
+* Source Map
+
+#+begin_example
+[2011] Glorot et al. -- Deep Sparse Rectifier Networks (ReLU)
+  |
+  | Problem observed: tanh/sigmoid are nonzero everywhere — no way to skip computation
+  | Solution: Use ReLU; negative values are hard-clamped to 0 — natural sparsity
+  v
+[2017] Shazeer et al. -- Outrageously Large Networks (Sparsely-Gated MoE)
+  |
+  | Problem observed: want to scale models up without charging every token the full cost
+  | Solution: Split the FFN into N experts; each token passes through only K of them
+  |           (inter-expert sparsity)
+  v
+[2022] Fedus et al. -- Switch Transformer
+  |
+  | Problem observed: K=2 is still too much; routing is unstable
+  | Solution: top-1 routing, pushing expert count into the thousands
+  |           but exposed expert collapse / load imbalance training difficulties
+  v
+[2023] Liu et al. -- DejaVu
+  |
+  | Problem observed: dense LLMs (OPT, ReLU) have mostly-zero neurons every step,
+  |                   yet they are still computed
+  | Solution: train a small predictor that determines which neurons will activate
+  |           before the FFN runs, and skip the rest
+  |           Demonstrated ~90% activation sparsity usable for speedup
+  v
+[2023-2025] Mirzadeh / Szatkowski / Lee / Cheng et al.
+  |
+  | Problem observed: modern LLMs switched to SwiGLU/GeLU — no *exact* zeros anymore
+  |                   DejaVu's assumption of ReLU-induced zeros collapsed
+  | Solution: redefine sparsity — look at activation *magnitude*;
+  |           the small ones make negligible difference whether computed or not.
+  |           Soft sparsity (magnitude-based)
+  v
+[2024] Luo et al. -- Sparsing Law
+  |
+  | Problem observed: is this "soft sparsity" a coincidence or a law?
+  | Solution: empirical law: the fraction of activated neurons *decreases* with model scale.
+  |           Larger models are sparser. Not a bug — a feature.
+  v
+[2025] Cheng et al. -- Bringing activation sparsity into MoE
+  |
+  | Problem observed: all prior work targeted dense models. What about MoE?
+  | Solution: apply magnitude thresholding inside selected experts;
+  |           demonstrated intra-expert sparsity on Qwen3-30B, Mixtral, etc.
+  |           But: validated only on small models; only research-level baselines;
+  |           never integrated into a production inference engine
+  v
+[2026] Park et al. -- IEAS (this paper)
+  |
+  | Problem observed: 1) Cheng's coverage too narrow — unknown if large models
+  |                      (122B/400B) behave the same
+  |                   2) Nobody proved real speedup inside a heavily optimized engine
+  |                      like vLLM
+  |                   3) shared expert vs. routed expert never examined separately;
+  |                      their sparsity behavior may differ completely
+  | Solution: systematic evaluation across 8 MoE models (1B–400B);
+  |           finds routed experts are extremely sparse (98% deletable),
+  |           shared experts must be preserved;
+  |           integrates into vLLM's fused MoE kernel:
+  |           end-to-end 1.2×, MoE layer 2.5×, 95% accuracy retained
+#+end_example
+
+* Evolutionary Narrative
+
+** 2011 | Glorot et al.: Installing a "Hard-Zero Switch" on Neurons
+
+*** What Problem It Saw
+
+Early neural networks used sigmoid or tanh — outputs are never exactly 0, just very small numbers. That might seem close enough, but it's different for hardware: you cannot "skip" a multiplication by 0.0001 because it is genuinely nonzero and contributes to subsequent accumulations.
+
+These activation functions also had a worse problem: near-zero gradients in their saturation regions made deep networks nearly untrainable.
+
+*** Its Solution
+
+Switch the activation function: clamp negative values hard to 0 (ReLU). It sounds crude, but it brings two benefits:
+- Gradient in the positive region is always 1, enabling deep networks to train
+- Half of all neurons are naturally 0 and can be skipped at the hardware level
+
+*** Why It Worked (and What New Problem It Buried)
+
+The "hard zero" gives hardware a clean signal: this path does not need to be computed. But that zero is only visible *after* the computation — unless you can *predict* which neurons will produce zero. Doing that prediction properly would take another decade, waiting for DejaVu.
+
+ReLU itself also carried costs: dying ReLU, information loss. Later LLMs switched to SwiGLU/GeLU — "leaky" activations where exact zeros vanish — and this line of reasoning temporarily broke.
+
+** 2017 | Sparsely-Gated MoE: Instead of Skipping One Neuron, Skip an Entire FFN Block
+
+*** What Problem It Saw
+
+ReLU sparsity is fine-grained — one neuron at a time. The problem is that modern accelerators (GPUs) love matrix multiplications; they do not love "skip this zero." Even if half the neurons are zero, the hardware still computes the full matrix and then discards half the results.
+
+Even more critically: models kept growing, yet *every token* still paid the cost of all parameters.
+
+*** Its Solution
+
+Split the FFN directly into N independent small FFNs (called experts). Add a small router network that decides which K experts each token should use (typically K=2, N=8 or more).
+
+An expert not selected → the entire block is skipped. This is *coarse-grained* sparsity, hardware-friendly.
+
+*** Why It Worked (and What New Problem It Buried)
+
+Coarse-grained sparsity matches hardware preferences. Skipping one expert means skipping one large matrix multiplication — clean and decisive.
+
+But a poorly trained router causes disasters — all tokens flood the same few experts (load imbalance), or many experts are never selected (expert collapse). These two problems became the central training challenge for MoE over the following decade.
+
+** 2022 | Switch Transformer: Pushing Expert Count into the Thousands
+
+*** What Problem It Saw
+
+Shazeer's top-K routing (K=2) still wasted computation — each token had to run two experts. Could this be reduced further?
+
+Also, the expert count was still small (8, 16), not enough for each expert to become truly specialized.
+
+*** Its Solution
+
+Top-1 routing: each token visits exactly one expert. This simplified a lot of training complexity and pushed the expert count past 1000.
+
+*** Why It Worked (and What New Problem It Buried)
+
+With K=1, sparsity approaches 1/N. More experts means more sparsity.
+
+But Fedus was honest: pushing further makes *training increasingly hard*. Expert collapse and load imbalance became hard walls. People eventually realized: "The road of squeezing inter-expert sparsity further is running into a dead end."
+
+That realization is the starting gun for IEAS — if you cannot go wider, dig inward.
+
+** 2023 | DejaVu: Digging Back into FFN Activation Sparsity
+
+*** What Problem It Saw
+
+MoE was one path, but dense LLMs (like OPT) were still widely used. In these models, ReLU-induced zeros were natural — but *nobody exploited them at inference time*, because you could not know in advance which tokens would zero out which neurons.
+
+*** Its Solution
+
+Train a *small predictor*: given the input, determine in advance which FFN neurons will activate. Those predicted to be zero are never computed.
+
+Tested on OPT: ~90% of FFN neurons can be skipped with negligible accuracy loss.
+
+*** Why It Worked (and What New Problem It Buried)
+
+It proved that "fine-grained activation sparsity" is not merely a side effect of ReLU — it is an optimization axis that can be actively exploited at inference time.
+
+But DejaVu was tightly bound to ReLU — its oracle assumption was a binary "this activation is either zero or nonzero." The moment you switch to SwiGLU or GeLU, which never produce exact zeros, DejaVu's entire framework collapses.
+
+And post-2023 LLMs — Llama, Qwen, Mixtral — all use SwiGLU.
+
+** 2023–2025 | The Discovery of Soft Sparsity: No Zeros, but "Nearly Zero"
+
+*** What Problem It Saw
+
+DejaVu could no longer be applied because SwiGLU outputs are never exactly 0. It appeared that the sparsity path was closed for new LLMs.
+
+*** Its Solution
+
+Mirzadeh, Szatkowski, Cheng, and others approached from a different angle: don't require zero, only require *small*.
+
+Sort activations by absolute magnitude and drop the smallest fraction. Experiments showed: dropping 80–90% of small activations causes almost no perceptible degradation.
+
+Luo et al.'s *Sparsing Law* elevated this observation to a law: the larger the model, the lower the fraction of important neurons. Activation sparsity is not a coincidence — it is a byproduct of scaling.
+
+*** Why It Worked (and What New Problem It Buried)
+
+This step freed "activation sparsity" from dependence on any specific activation function — any LLM could have it, as long as you sort by magnitude.
+
+But most of this work was done on *dense* LLMs (dense variants of Llama, Qwen, etc.). MoE models are already sparse architectures — what happens if you dig deeper? Nobody had systematically verified this.
+
+** 2025 | Cheng et al.: The First to Bring Activation Sparsity into MoE
+
+*** What Problem It Saw
+
+MoE models split the FFN into multiple experts; inter-expert sparsity was already there. But each selected expert is still a complete small FFN — *the activation sparsity inside it had never been mined*.
+
+*** Its Solution
+
+Apply magnitude thresholding inside each routed expert. Demonstrated that intra-expert sparsity exists in models like Qwen3-30B and Mixtral.
+
+*** Why It Worked (and What New Problem It Buried)
+
+Confirmed that intra-expert sparsity is a real phenomenon in MoE models.
+
+But three gaps remained:
+1. Only validated on small-to-medium MoE models (3B–7B active parameters). What about 100B+ MoE models? Unknown.
+2. The implementation was a research-level baseline — a standalone prototype, not integrated into a production inference engine. Would there still be gains on top of a *heavily* optimized system like vLLM? Unknown.
+3. No distinction was made between *shared experts* (traversed by every token) and *routed experts* (selected by the router). The sparsity behavior of these two classes could be completely different — and nobody had looked.
+
+These three gaps are IEAS's starting point.
+
+** 2026 | IEAS (This Paper): Eight Models, 1B to 400B, All Tested, Integrated into vLLM
+
+*** What Problem It Saw
+
+Cheng et al. opened the door, but the question was far from answered. Specifically:
+
+- Coverage too narrow: Does this hold for modern flagship MoEs (Qwen3.5-397B, Llama-4-Maverick-400B, GPT-OSS-20B)?
+- Integration too weak: When combined with the fused MoE kernels, HIP/CUDA Graphs, and expert parallelism inside a production engine like vLLM, do things conflict — or can they genuinely stack?
+- Missing distinction: Are shared and routed experts equally important, or is one class critical to accuracy while the other is almost entirely redundant?
+
+*** Its Solution
+
+Three things done together:
+
+1. *Systematic sparsity measurement*: Run 8 MoE models (1B–400B) across five benchmarks (ARC-C/E, HellaSwag, Winogrande, TruthfulQA-mc2), plotting "sparsity vs. fidelity" curves.
+
+2. *Separate shared vs. routed experts*: Examine the two expert classes independently. The result is clear — shared expert neurons are almost entirely important (cannot be touched), whereas routed expert neurons are *98% deletable* with no accuracy drop (on Qwen3.5-122B).
+
+3. *Integration into vLLM*: Built on vLLM's expert-batched fused MoE kernel, adding intra-expert skip paths while preserving all existing optimizations (kernel fusion, HIP Graph, expert parallelism).
+
+*** Why It Worked (and What New Problem It Buried)
+
+Why it works:
+- The Sparsing Law says "larger models are sparser" — in MoE, each expert is more specialized than an equivalently sized dense FFN, so individual experts are internally even sparser, consistent with the law.
+- Routed experts can shed 98% of neurons because they are by design "niche specialists" — most neurons activate only for a narrow slice of inputs. When a given token is routed to an expert, the vast majority of that expert's neurons are simply irrelevant to it.
+- Compatibility with vLLM comes from IEAS modifying paths *inside* the kernel, without disturbing the outer batching, graph capture, and parallelism assumptions.
+
+New problems buried:
+- How do you *predict* which neurons to skip? Currently, magnitude-sorting requires computing activations first and then ranking — this step itself has overhead.
+- Different tokens have different sparsity patterns; in batched inference, tokens in the same batch each skip different sets, making perfect load balancing inside the kernel difficult.
+- Is the shared/routed difference structural or a training artifact? Would a different training objective make routed experts non-skippable too?
+
+* Frontier Extensions
+
+This paper was posted in May 2026 and no formal follow-up work is yet visible. But several directions are foreseeable:
+
+1. *Joint sparsity*: Stack inter-expert sparsity (router selection) + intra-expert sparsity (this paper) + quantization (FP4/MXFP4) together and measure compound speedup.
+2. *Sparsity-aware training*: Since 98% of routed expert neurons are deletable, could training explicitly *encourage* this sparsity (analogous to ReLU's hard threshold)? Making "deletability" an intrinsic model property rather than something discovered at runtime.
+3. *Router redesign*: Let the router not just select experts but also pre-estimate sparsity of each expert for the current token — preferring high-sparsity experts when accuracy allows.
+4. *Reassessing the role of shared experts*: This paper finds shared experts are "almost entirely necessary." This implies shared experts are carrying far more workload than architects intended. Future MoE designs may rethink the shared/routed ratio.
+
+* One Diagram
+
+#+begin_example
+               Evolution of Sparsity Granularity                       When Discovered
+
+  Coarse +-------------------+
+         |  Entire FFN block  |   inter-expert (top-K, top-1)         2017 (Shazeer)
+         |  cut away (MoE     |     N experts, select K               2022 (Switch)
+         |  routing layer)    |     Problem: training wall
+         +-------------------+
+                   |
+                   | "Too hard to push further at this granularity"
+                   v
+  Medium +-------------------+
+         |  Neurons inside    |   activation sparsity (ReLU)          2011 (Glorot)
+         |  a single FFN      |     DejaVu: predictor-based skipping  2023 (Liu)
+         |  produce 0         |     Problem: SwiGLU has no zeros
+         +-------------------+
+                   |
+                   | "Switch from exact zeros to magnitude"
+                   v
+  Medium +-------------------+
+         |  Soft sparsity:    |   soft activation sparsity            2023-25 (Mirzadeh,
+         |  drop small        |     Sparsing Law (larger → sparser)   Szatkowski, Cheng,
+         |  activations       |                                        Luo, Lee)
+         +-------------------+
+                   |
+                   | "Validated on dense models — what about MoE?"
+                   v
+    Fine +-------------------+
+         |  Mine inside MoE   |   intra-expert sparsity               2025 (Cheng et al.)
+         |  experts           |     research baseline proves concept
+         +-------------------+
+                   |
+                   | "Does it hold on large models? Can it plug into production?"
+                   v
+    Fine +-------------------+
+    +    | IEAS (this paper)  |   intra-expert × production system    2026 (Park et al.)
+    v    | 1B–400B systematic |     vLLM integration, 2.5× MoE /
+         | shared vs. routed  |     1.2× end-to-end
+         |                    |     routed experts: 98% deletable
+         +-------------------+
+#+end_example
+
+* Insights
+
+Looking across the entire river, what is *truly* evolving is not "algorithms getting smarter" — it is *sparsity granularity becoming ever finer, with ever deeper hardware cooperation*:
+
+| Era             | Unit of Sparsity | Who Discovers Sparsity | Hardware Hook              |
+|-----------------+------------------+------------------------+----------------------------|
+| ReLU era        | Neuron           | Activation fn, free    | Skip zero multiply-adds    |
+| MoE era         | Whole expert     | Router decides         | Skip entire matrix block   |
+| DejaVu era      | Neuron           | Trained predictor      | Sparse GEMM path           |
+| Soft-sparsity   | Neuron           | Magnitude sort         | Top-k selection            |
+| IEAS era        | Neuron           | Sort (inside MoE)      | Skip inside fused kernel   |
+
+Two patterns emerge:
+
+1. *The cost of discovering sparsity keeps rising.* In the ReLU era it was free. In the MoE era you had to train a router. In the DejaVu era you had to train a predictor. In the soft-sparsity era you sort online. *We are spending more computation to discover which computation can be saved.* This is a genuine paradox: finding sparsity is not free. The next frontier is not just "find finer sparsity" but "find it more cheaply."
+
+2. *Sparsity dimensions accumulate, they do not replace each other.* Inter-expert sparsity does not make intra-expert sparsity redundant — they are *orthogonal*. This means more orthogonal sparsity axes may yet be discovered: cross-layer sparsity? Cross-batch sparsity? Cross-sequence-position sparsity? Each one can add another multiplicative speedup.
+
+The deepest insight may be this: *redundancy in neural networks is fractal.* Peel away one layer of redundancy and another lies beneath. The river is nowhere near its end at IEAS — as long as models keep growing, sparsity rates will keep rising (Sparsing Law), and the next sparsity axis is certainly still out there.
+
+* Takeaways
+
+If you work on ML systems:
+- Don't assume "upstream optimizations are already saturated." vLLM has been squeezed by countless engineers; IEAS still extracts an additional 20–150% speedup on the MoE layers. The ceiling on systems optimization is higher than you think.
+- *Orthogonal optimizations stack multiplicatively.* Every time you find a new optimization that is independent of existing ones, you gain a free multiplicative win.
+
+If you do ML research:
+- *Re-validating a known phenomenon in a new setting can itself be a contribution.* Activation sparsity in dense LLMs was well-established; applying it to MoE produced 2025 papers. Taking it from small-to-medium MoE to flagship 100B+ MoE and separating shared from routed experts produced IEAS in 2026.
+- *Splitting one binary variable into two subcategories often reveals something new.* Breaking experts into shared/routed and examining them separately immediately exposed that routed experts are 98% deletable — something completely invisible when the two are treated as one.
+
+If you are choosing an optimization direction:
+- *Follow the scaling law.* The Sparsing Law already tells you that larger models are sparser — meaning this optimization's payoff *automatically grows* as models scale. Optimizations that ride scaling are far more valuable than those that fight it (such as compressing something that is already small).

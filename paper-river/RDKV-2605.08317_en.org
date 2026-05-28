@@ -1,0 +1,189 @@
+#+title:      RDKV: Rate-Distortion Bit Allocation for Joint Eviction and Quantization of the KV Cache
+#+date:       [2026-05-28 Thu 12:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T120000-en
+#+source:     https://arxiv.org/abs/2605.08317
+#+authors:    Junkai Zhang, Hang Guo, Luca Benini, Yawei Li
+#+venue:      arXiv 2026-05 (cs.LG)
+
+* Reverse Reading: Starting from a Question
+
+This paper is called RDKV, posted to arXiv in May 2026. The title is long, but the idea is simple: compress the KV cache so that large models can handle long documents without running out of breath.
+
+Before diving into what it does, look first at what it is unhappy about.
+
+It says: there are currently two paths for compressing the KV cache — one called *eviction* (throw away tokens), and one called *quantization* (reduce precision). Prior work has pursued these two paths separately, and occasionally someone stitches them together, but the stitching is crude — the ratio is guessed, the threshold is searched offline, and there is no unified objective function that explains "why 30% of tokens should stay at full precision, 50% should be quantized to 2 bits, and 20% should be dropped entirely."
+
+It says: this is fundamentally a *rate-distortion* problem — one that information theory solved in the 1960s. Eviction and quantization are simply two endpoints on the same number line of bits. 0 bits means drop; 16 bits means keep; and 2/4/8 bits are the stops in between. Solve them all together inside a single bit-allocation problem.
+
+— That phrase "solve them all inside one problem" is precisely the terminal point of this evolutionary line.
+
+So where does that line begin?
+
+* Source Map
+
+#+begin_src text
+
+  [2023] H2O ----------- First to say: not all tokens matter equally
+            |             Approach: track cumulative attention scores, drop low scorers
+            |             Limitation: only looks at historical attention, not future queries
+            v
+  [2024] SnapKV --------- Insight: don't just look at history — use the recent window to predict the future
+            |             Approach: vote across attention from the last N queries
+            |             Limitation: one global budget for all layers and heads
+            v
+  [2024] AdaKV ---------- Insight: attention distributions differ enormously across heads
+            |             Approach: dynamically allocate budget across heads
+            |             Limitation: still keep-or-drop, no "half-keep" option
+            |
+            |    [2024] ThinK ---- Parallel branch: token is not the only unit
+            |              |       Channels (columns of K) can also be pruned
+            |              v       Limitation: still a 0/1 decision
+            v
+  [2024] KIVI ----------- Alternative line: keep everything, but reduce precision to 2-bit
+            |             Approach: per-channel K quantization + per-token V quantization
+            |             Limitation: treats all tokens equally, wastes the "important token" signal
+            v
+  [2025] HqeKV / ARKV --- Insight: eviction and quantization shouldn't be mutually exclusive
+            |             Approach: use TPE / offline search to set a per-layer ratio:
+            |                   "this layer: 20% FP16, 50% 4-bit, 30% dropped"
+            |             Limitation: ratios are searched, not derived from principle
+            v
+  [2026] RDKV ----------- Insight: both actions can be derived simultaneously from one objective
+                          Approach: rate-distortion framework + reverse water-filling
+                          Every token / channel receives its own bit count
+
+#+end_src
+
+Note: this map is reconstructed from RDKV's related-work section and the papers it cites; it reflects a chain of critique, not 100% direct inheritance. (H2O→SnapKV is direct; AdaKV→ThinK is a parallel branch; KIVI is a separate main line; HqeKV/ARKV→RDKV is the target RDKV explicitly names as what it aims to surpass.)
+
+* Forward Narrative: How the Problem Grew
+
+** The Starting Point: What Did H2O See? (2023)
+
+Before H2O, the only approach to long-context inference was brute force. Every time a new token was generated, the entire KV cache had to be read from GPU memory. An 8K context was manageable; at 128K it became unusably slow.
+
+The H2O authors stared at attention maps for a long time and noticed one thing: *attention is sparse*. Each query genuinely attends to only a small handful of tokens. The rest receive near-zero attention weights — storing them wastes bandwidth.
+
+So H2O proposed the "Heavy Hitter Oracle": sum up, for each token, all the attention it receives across historical queries; keep the high scorers, discard the low scorers.
+
+This is the origin of everything: *tokens are not equal*.
+
+But H2O left a hole: it only looks at the attention from past queries. What do the tokens that will be decoded next care about? They haven't appeared yet.
+
+** SnapKV: Don't Look at All the Past — Look at "Just Now" (2024)
+
+SnapKV's authors read H2O and spotted this hole. Their argument: the first few decoding steps are the best proxy for what comes later. Instead of averaging attention over the entire history, look at the *observation window at the end of prefill* — the attention those queries pay to each token is the closest available signal to "what the future will need."
+
+The code change is small; the effect is a significant leap. SnapKV became the de facto baseline for all budget-driven eviction work over the next two years.
+
+But SnapKV left its own hole: it assigns the same budget to every attention head. Yet different heads play very different roles — some focus on one or two key tokens, others spread attention broadly. Treating them identically wastes the budget.
+
+** AdaKV: Budget Should Not Be Split Evenly — Adapt to Each Head (2024)
+
+AdaKV attacks this directly: first examine each head's attention distribution; give a smaller budget to concentrated heads (attending to few tokens) and a larger budget to dispersed heads (attending to many). With the same total budget, the result is substantially better.
+
+PyramidKV and CAKE are siblings on this branch — both "redistribute the budget" but along different dimensions (PyramidKV slices by layer, keeping more in shallow layers; CAKE slices across both layers and heads simultaneously).
+
+By this point, the eviction line had been refined into something quite sophisticated. But it has one fundamental limitation: *every decision is binary*. A token either stays at FP16 or gets dropped entirely. What should happen to a token that is genuinely important — just not the most important?
+
+A side branch appeared here: ThinK. Since tokens can be dropped, why not also drop *channels* (columns of K)? Some channels contribute almost nothing. This extends the granularity of "dropping" from tokens to channels, but it is still a 0/1 decision.
+
+** KIVI: Take a Different Road — Don't Drop, Reduce Precision Instead (2024)
+
+Running nearly in parallel with the eviction line, a different group went in a completely different direction: *keep every token, but reduce each token's precision from FP16 to 2 bits*.
+
+KIVI observed a subtle detail: certain *channels* in the K cache are persistently outliers. If you quantize per-channel, the outliers are handled in isolation and the remaining channels can be compressed aggressively. The V cache has no such channel-level pattern, so per-token quantization is more stable there. This asymmetric per-channel-K + per-token-V scheme achieves 2-bit compression with almost no accuracy drop.
+
+KVQuant and ZipCache continued to refine this line.
+
+But KIVI has its own blind spot: *it treats all tokens identically, compressing everything to 2 bits*. Yet the eviction line had repeatedly proven that tokens are not equal. Compressing the few truly important tokens to 2 bits is a real loss; compressing the vast majority of irrelevant tokens to 2 bits is still too generous.
+
+** HqeKV / ARKV: Stitch the Two Lines Together (2025)
+
+By 2025, the inevitable happened: someone began combining them. *Why not let important tokens stay at FP16, moderately important tokens use 4-bit, and unimportant tokens get dropped entirely?*
+
+HqeKV uses TPE (Tree-structured Parzen Estimator) search, running 200 trials per configuration to find the optimal token ratio for each bit-level. ARKV takes a different path: use prefill attention statistics to estimate a per-layer "full-precision vs. quantized" ratio, then search for the thresholds offline.
+
+Both achieve better results than eviction or quantization alone. This is what RDKV's introduction refers to when it says "recent analysis shows that combining eviction with quantization outperforms either action alone" — it is pointing to exactly these two papers.
+
+But they both leave the same hole: *those ratios are searched for, not derived*. Change the model or the dataset and you have to search again. The deeper problem is that *there is no unified objective function explaining why* that ratio is correct.
+
+* RDKV: Hammering It Down with Rate-Distortion
+
+At this point, RDKV enters.
+
+It says: everyone before was guessing — guessing how to compute the score, guessing what ratio to set, guessing where the threshold belongs. But this problem was actually solved by information theory back in the 1960s.
+
+Compressing the KV cache is a standard *rate-distortion* problem:
+
+- *Rate* (cost): how many bits you are willing to spend
+- *Distortion* (penalty): how much the attention output deviates from its original value after compression
+- *Objective*: given a total bit budget, minimize distortion
+
+What does solving this objective automatically yield? The answer is *reverse water-filling* — the classical solution from signal processing. It tells you:
+
+- Every token / channel has a "distortion weight" (how much error is introduced by removing it)
+- Line all the weights up and allocate bits the way you would pour water into a row of containers
+- Containers with large weights (important tokens) automatically receive more bits — possibly FP16
+- Containers with small weights (irrelevant tokens) receive 0 bits — which is exactly eviction
+
+*The key conceptual breakthrough is here*: eviction and quantization are not two separate things. They are two endpoints of the same bit-count number line. 0-bit is called eviction; 16-bit is called keep. There are 2/4/8-bit stops in between, and there was never any need to "first decide what to evict and then decide what to quantize" — just solve the bit allocation once and everything follows.
+
+How are the distortion weights computed?
+
+- *Per-token weight for the V cache*: dropping token t changes the total variation of the attention distribution by exactly the cumulative attention that token t received. *This is the H2O score* — but now it is not a ranking metric; it is a coefficient in the objective function.
+- *Per-channel weight for the K cache*: dropping channel c shifts the spectral norm of the logit matrix by the product of the L2 norms of Q and K along that column. *This is the ThinK score* — likewise promoted from ranking to weighting.
+
+RDKV does not reject the prior scores; it reinterprets them from "sorting tools" to "objective-function weights." This is the most elegant move in the paper: *95% of prior work is reused directly*, but a new framework organizes it all into a coherent whole.
+
+The rest is engineering: solve a Lagrangian relaxation to find the water level, pack the allocation results into a TriZone packed-decode (fusing dequantization into the attention kernel), and run on LLaMA-3.1-8B to achieve 4.5× decode speedup, 1.9× memory reduction, and 97.81% of FullKV accuracy (using only 2.48% of the cache).
+
+* Compression Overview
+
+#+begin_src text
+
+  Problem: long-context inference bottlenecked by KV cache bandwidth
+
+  Evolution of solution approaches:
+
+    Phase 1 (eviction):   tokens are unequal — keep important ones, drop the rest
+      H2O (cumulative attn) -> SnapKV (observation window) -> AdaKV (head-adaptive) -> ThinK (channel)
+      Limitation: 0/1 decisions, no "half-keep" option
+
+    Phase 2 (quantization):  keep everything, but reduce precision
+      KIVI (channel-K + token-V) -> KVQuant / ZipCache
+      Limitation: treats all tokens equally, ignores the gap between important and irrelevant
+
+    Phase 3 (hybrid by search): stitch them together, but ratios found by search
+      HqeKV (TPE search for ratio) / ARKV (threshold search)
+      Limitation: ratios are empirical, not principled
+
+    Phase 4 (hybrid by principle): RDKV
+      Treat 0-bit (evict) and 16-bit (keep) as endpoints of the same axis
+      rate-distortion + reverse water-filling solves the allocation in one shot
+      Prior scores (H2O / ThinK) promoted from ranking to weighting
+
+  Core conceptual shift:
+    From "decide what to evict"      -> "decide how many bits each unit deserves"
+    From "heuristic ranking"         -> "information-theoretic objective function"
+    From "two actions, two decisions" -> "one allocation problem, one solution"
+
+#+end_src
+
+* Insights
+
+On the surface, this evolutionary line iterates on techniques (attention scores → head-adaptive → quantization → hybrid). Underneath, what is really happening is *the gradual convergence of an engineering heuristic into a mathematically principled, analytically solvable problem*.
+
+H2O provided a naive "importance measure." Every subsequent paper advanced along two axes: (1) *refining the measure* (SnapKV uses a future proxy, AdaKV splits by head, ThinK splits by channel); and (2) *expanding the action space* (from eviction, to quantization, to the combination). Yet everyone stopped at the level of "a score plus a heuristic action."
+
+RDKV's real contribution is not a new score or a new action — it is *unifying both axes inside a single rate-distortion objective function*. The prior scores (H2O's attention sum, ThinK's column norms) turn out to be exactly the optimal weights for that framework. They were already correct; they were just used in the wrong way (as ranking rather than weighting). This is a kind of "retroactive unification": a deeper framework reveals that the previously scattered empirical methods are all special cases of it.
+
+*Where is the most likely next step?*
+
+Two directions:
+
+1. *Dynamic rather than one-shot allocation.* RDKV performs a single allocation after prefill and holds it fixed throughout decoding. But the attention distribution drifts during decoding — which tokens matter most changes over time. The likely next move is *online reallocation*, which will require solving the overhead problem that comes with it.
+2. *Joint training.* RDKV is a training-free post-hoc compression method. If a model were trained knowing it would be compressed in this way, it could learn to concentrate information into fewer key tokens and channels, further lowering the distortion floor.
+
+Looking further ahead: rate-distortion theory was designed to approximately reconstruct a *fixed* signal. But LLM attention is not a fixed signal — the same KV cache yields very different importance patterns depending on the query. A true next-generation framework will likely need *query-conditioned* rate-distortion, and that would require a much more substantial rewrite.

@@ -1,0 +1,288 @@
+#+title:      TileQ: Efficient Low-Rank Quantization of Mixture-of-Experts with 2D Tiling
+#+date:       [2026-05-28 Thu 22:30]
+#+filetags:   :paper:river:quantization:moe:llm:en:
+#+identifier: 20260528T223000-en
+#+source:     https://arxiv.org/abs/2605.09281
+#+authors:    Hongyaoxing Gu, Xinzhe Chen, Lijuan Hu, Fangfang Liu
+#+venue:      arXiv preprint, 2026-05-10 (ICML submission)
+
+* The Problem River
+
+Compress a Mixture-of-Experts model until it fits on a small GPU — but a MoE has hundreds of experts, each activated on only a handful of tokens. How do you save memory without killing inference throughput?
+
+The story starts simply enough: all LLMs need quantization, MoE included, so just plug in GPTQ/AWQ. But MoE differs from ordinary LLMs in three important ways:
+
+- *Many small experts*. Mixtral has 8, DeepSeek has 256, and each is noticeably smaller than a standard MLP. The overhead of quantization methods themselves — low-rank factors, lookup tables, scales — is negligible on large models but becomes impossible to ignore here.
+- *Each token activates only a few experts*. Inference is theoretically cheap, yet the low-rank compensation path must compute factor matrices for every expert, handing back all the compute you saved.
+- *Experts are not independent*. Hundreds of experts in the same layer share massive redundancy; treating each one with its own separate SVD completely misses this opportunity.
+
+The whole story is a repeated negotiation inside the "compression ratio / accuracy / inference latency" triangle. GPTQ addresses accuracy, AWQ addresses activation distribution, per-expert low-rank compensation recovers accuracy at extreme low bit-widths, MiLo tackles half of the cross-expert redundancy, and TileQ aims to eat the other half — while also fusing the inference kernel along the way.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  |
+  | Problem: 4-bit round-to-nearest (RTN) collapses models; columns are
+  |          strongly correlated, so quantizing one column throws off the rest.
+  | Solution: Quantize column by column; after quantizing each column,
+  |           use the inverse Hessian to spread the error across all
+  |           remaining unquantized columns, minimizing total reconstruction loss.
+  | Residual: All weight channels are treated equally. But activation
+  |           distributions are uneven — a few "salient channels" determine
+  |           model quality.
+  v
+[2023] AWQ (Lin et al.)
+  |
+  | Problem: GPTQ does not distinguish between channels; the few channels
+  |          propped up by large activation values are crushed during
+  |          quantization, causing accuracy degradation.
+  | Solution: Before quantizing, multiply each channel by a scale derived
+  |           from activation magnitude so that salient channels land on
+  |           favorable grid points; the scale is equivalently absorbed
+  |           into the upstream matrix afterward.
+  | Residual: Quantization error still exists; sub-4-bit is still painful.
+  |           The special structure of MoE is never touched.
+  v
+[2024-25] Per-Expert Low-Rank PTQ (Zhang 2024a, Li 2025b, Yang 2024, etc.)
+  |
+  | Problem: MoE experts are crushed by extreme low-bit quantization;
+  |          applying GPTQ/AWQ directly causes severe accuracy loss.
+  | Solution: W ≈ Q(W - UV) + UV — each expert gets its own 16-bit
+  |           low-rank compensation via SVD; the residual is quantized
+  |           to 4-bit. Accuracy is recovered.
+  | Residual: K experts → K independent pairs of U and V, all in 16-bit.
+  |           More experts means the "extra memory" approaches a second
+  |           full model; inference has K separate small GEMMs per expert,
+  |           all fragmented.
+  v
+[2025] MiLo (Huang et al.)
+  |
+  | Problem: Per-expert low-rank ignores the core MoE property that experts
+  |          are largely similar to one another; 16-bit full-precision factors
+  |          account for ~50% of model size in sparse MoE.
+  | Solution: Share a single left-singular-vector matrix U across all experts
+  |           — one U for the whole model, V still per-expert (1D-tiling).
+  |           Includes GPU kernel optimizations that fuse the shared U path.
+  | Residual: Only half is shared. V is still K independent copies;
+  |           the V path still launches K separate GEMMs at inference time.
+  |           On Mixtral-8x7B overhead can be pushed to ~10%, but on
+  |           Qwen3-30B-A3B (very sparse) it shoots back above 50%.
+  v
+[2026-05] TileQ (Gu et al., this paper)
+  |
+  | Problem: Sharing one side is not enough. After sharing U, V remains
+  |          K-fold; kernels cannot be fused in sparse MoE, causing
+  |          latency collapse.
+  | Solution: Arrange K experts on an M×N 2D grid; experts in the same
+  |           row share U, experts in the same column share V. Which expert
+  |           goes in which cell is decided by biclustering + greedy placement.
+  |           A single fused kernel handles the entire low-rank path for
+  |           all experts in one shot.
+  | Result: Extra memory reduced 10×, low-rank inference overhead down to
+  |         ~5%, accuracy on par with SOTA.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Making 4-bit LLM Quantization "Usable" for the First Time
+
+*** What Problem It Saw
+
+Before GPTQ, quantizing an LLM to 4-bit meant straightforward round-to-nearest (RTN). It sounds simple, but models almost always collapsed — perplexity would spike from 10 to tens or even hundreds.
+
+The culprit was not having too few bits; it was strong correlations between weights. Thousands of weights in the same row jointly determine the distribution of one output dimension. Crush one column and the remaining columns, still using their original values, produce a distorted output. RTN treats every weight independently, implicitly assuming they have nothing to do with one another.
+
+*** Its Solution
+
+GPTQ treats quantization as a "column-by-column chopping" process. When quantizing column i, instead of rounding naively it computes the quantization error for that column and then uses the inverse Hessian matrix to "spread" the error across all subsequent unquantized columns — their values are nudged slightly to compensate for the loss already incurred.
+
+The intuition: you press the first crease into a laid-out tablecloth, and the rest of the cloth needs to be pulled to prevent other areas from buckling. The inverse Hessian is the instruction for how to pull.
+
+*** Why It Works (and What New Pitfall It Created)
+
+Mathematically, GPTQ minimizes the per-layer reconstruction loss ‖WX - Ŵ X‖², and the inverse Hessian gives the optimal direction for error redistribution. The result: 4-bit OPT-175B loses almost no accuracy — the first time "4-bit LLM" felt viable.
+
+But GPTQ treats all channels equally. It does not know that some channels have intrinsically large activation values, so quantization errors on those channels get amplified by a factor of tens. That is the next step AWQ is about to climb.
+
+** 2023 | AWQ: Not All Weight Channels Are Created Equal
+
+*** What Problem It Saw
+
+Running GPTQ and looking closely at which channels lose the most accuracy, you find a small cluster of channels that, once crushed under 4-bit, take the whole model down with them. Their shared characteristic: their corresponding activation values are exceptionally large.
+
+The logic is straightforward: error = weight quantization error × activation value. A channel whose activation is 10× larger than others has its quantization error amplified 10×, with proportionally more severe consequences. GPTQ's inverse-Hessian optimization is weight-centric and never inspects activation distributions.
+
+*** Its Solution
+
+Before quantizing, AWQ does one extra thing: for each channel it computes a scale based on some power of the activation magnitude, multiplies it into the weights, and divides it back out on the activation side (mathematically equivalent; output is unchanged). The effect: "important channel" weights are stretched into favorable positions on the 4-bit grid; "unimportant" channels are compressed — losing a little precision there doesn't matter.
+
+How is the scale found? AWQ doesn't train it; it searches a small calibration dataset for the exponent that minimizes reconstruction error. The whole process completes in minutes with no backpropagation.
+
+*** Why It Works (and What New Pitfall It Created)
+
+AWQ ties "weight importance" to "activation distribution" — the axis GPTQ was missing. Combining the two (first AWQ to set scales, then GPTQ to quantize) became the standard recipe for the next several years.
+
+But AWQ still operates only at the level of "how to position values within the 4-bit grid." When you need to push a model to 3-bit, 2-bit, or when you face a MoE structure with many small experts, no amount of scale tuning can save you — you need to add a "compensation module" on top of quantization. Low-rank compensation is the next step.
+
+** 2024–2025 | Per-Expert Low-Rank PTQ: Giving Each Expert Its Own Error Corrector
+
+*** What Problem It Saw
+
+When MoE models first started being quantized, the approach was natural: treat the whole model as a regular LLM and apply GPTQ + AWQ. The result: 4-bit was fine, but below 3-bit accuracy fell off a cliff — far faster than for dense LLMs.
+
+Two layers of explanation. First, each MoE expert is smaller than a dense LLM's MLP; a single expert's weight statistics are less stable, making quantization errors harder to control. Second, experts are sparsely activated — a given expert might be lit up on only 1% of tokens, so calibration data gives it thin coverage.
+
+*** Its Solution
+
+Borrowing ideas from LQ-LoRA / LoftQ on dense LLMs: decompose each weight matrix into "quantized part + low-rank compensation":
+
+  W ≈ Q(W - UV) + UV
+
+Each expert independently runs SVD to extract the top-r singular values and get U and V (kept in 16-bit full precision); the residual W - UV is quantized to 4-bit. At inference, compute Q(...) × x and add (UV) × x, summing the two paths.
+
+Intuition: the low-rank path captures the "principal-component" signal in the weights; the quantized path only needs to handle "detail noise." With a narrower quantization range, quantization error naturally falls.
+
+*** Why It Works (and What New Pitfall It Created)
+
+Accuracy does recover — many papers show that with low-rank compensation, 3-bit MoE quantization can match 4-bit without it.
+
+But there is an awkward bill to pay: MoE has K experts (K might be 8, 64, or even 256), and each now carries an extra pair of 16-bit U and V matrices. On Mixtral-8x7B the overhead is roughly 10–15%, tolerable; on DeepSeek or Qwen3-30B-A3B with hundreds of sparse experts, the extra memory can reach 50% or more of the base model size — you hand back all the memory you just saved.
+
+Inference is even worse: K experts means K distinct UV pairs, so every time a batch of experts is activated you launch a separate small GEMM per expert. More experts, more sparsity, more fragmented kernels, lower GPU utilization. MiLo saw both of these problems.
+
+** 2025 | MiLo: Let All Experts Share a Single U
+
+*** What Problem It Saw
+
+MiLo noticed a core MoE fact: hundreds of experts in the same layer are actually highly similar — they all perform "similar transformations on similar inputs," differing only in emphasis. Running a separate SVD per expert treats this shared structure as noise and discards it.
+
+Concretely: line up the left singular matrices U from all experts and their mutual correlation is extremely high. Yet per-expert methods store a separate 16-bit copy of each U, yielding K redundant copies.
+
+*** Its Solution
+
+MiLo has all experts share a single U matrix (shape i×r) while each expert keeps its own V (shape r×o, K copies total). The low-rank compensation for all K experts is then expressed as a large tiled matrix: U is universal, and the Vs are concatenated horizontally. This is called *1D-tiling* — sharing along only one dimension.
+
+It also comes with a kernel redesign: because U is shared, the "input → U → intermediate vector" step for all experts can be merged into a single large GEMM and then distributed to the individual Vs. The left-side kernel is fused.
+
+*** Why It Works (and What New Pitfall It Created)
+
+On Mixtral-8x7B, MiLo roughly halves the extra memory and brings the low-rank inference overhead down to around 10% — a handsome result that made low-rank MoE quantization feel genuinely viable.
+
+But MiLo left two new problems:
+
+1. *Only half is shared.* The V matrices are still K independent copies, so storage savings are limited.
+2. *Only half the kernel is fused.* The right-side Vs still launch K independent GEMMs. On Qwen3-30B-A3B (128 experts, 8 activated per token), MiLo's inference overhead shoots above 50% — far slower than having no low-rank compensation at all.
+
+TileQ is aimed squarely at the V side.
+
+** 2026-05 | TileQ: Arrange Experts on a 2D Grid and Share Both U and V
+
+*** What Problem It Saw
+
+TileQ's core observation: MiLo arranges all experts in a single row (1D-tiling) and shares U, implicitly assuming "all experts are similar on the input side." But expert similarity is *bidirectional* — some experts are similar in input space (close left-singular subspaces), others are similar in output space (close right-singular subspaces). A one-dimensional arrangement can only capture one of these.
+
+If experts similar on the input side could share U, and experts similar on the output side could share V, the redundancy could be wrung out more thoroughly — saving memory in both directions and giving V a shared structure that also allows kernel fusion.
+
+*** Its Solution
+
+TileQ arranges K experts on an *M×N 2D grid*. Experts in the same row share a common U_m (M distinct Us total); experts in the same column share a common V_n (N distinct Vs total). When M×N ≥ K, what formerly required K copies of UV now requires only M + N copies — compression ratio changes from linear in K to "rows + columns."
+
+Which expert goes in which cell? Three steps:
+
+1. *Extract*: Run a small SVD on each expert to get U_k, V_k; vectorize and normalize.
+2. *Cluster*: Run KMeans on the U_k vectors to form M clusters, and on the V_k vectors to form N clusters, yielding an "ideal coordinate" (m_k, n_k) for each expert.
+3. *Place*: Because multiple experts may compete for the same cell, a greedy algorithm (searching outward in Chebyshev-distance concentric rings) places experts one by one into the closest available empty cell, minimizing total displacement.
+
+After placement, the full 2D grid's weight matrix W_big has a regular "block low-rank" structure that can be expressed with a shared U (M×i×r) and a shared V (r×N×o) covering all experts' low-rank compensation.
+
+At inference, the entire low-rank path for the 2D grid can be fused into a single "input → all U → all V → aggregate by routing" fused kernel — permanently eliminating per-expert fragmented GEMMs.
+
+To prevent the SVD step from becoming a new bottleneck, TileQ replaces exact SVD with a Gaussian Sketch approximation. To save further memory, U and V are stored in fp8 while Σ is kept in fp16.
+
+*** Why It Works (and What New Pitfall It Left)
+
+TileQ extends "expert similarity" from one dimension to two — a natural generalization of MiLo's idea. If you accept that MiLo sharing U is beneficial, it is hard to argue against sharing V as well. The result: extra memory is reduced another order of magnitude compared to MiLo (10× reduction), low-rank inference overhead falls to ~5%, and accuracy is on par with SOTA.
+
+New pitfalls:
+
+- The 2D placement depends on biclustering quality and is sensitive to the structural similarity among experts. If experts are highly heterogeneous with no 2D cluster structure, forcing a tile layout will hurt accuracy.
+- The row and column counts M and N are hyperparameters; how to choose them optimally remains an engineering question (the paper provides ablations but no theoretical guidance).
+- When K is small (e.g., Mixtral-8x7B has only 8 experts), the gains from 2D tiling are less dramatic than on sparse MoE — TileQ's largest benefit shows up on next-generation densely-specialized MoE architectures.
+
+* Frontier Extensions
+
+TileQ appeared on arXiv on May 10, 2026 (submitted to ICML 2026) and has no direct public follow-ups yet. Reading the evolutionary trajectory, likely next directions include:
+
+- *Learned 2D layout*: The current biclustering + greedy placement is heuristic; a learnable end-to-end version (jointly learning expert placement) is a natural next step.
+- *3D / hierarchical tiling*: When expert counts continue to grow into the thousands (DeepSeek-V4 scale), a 2D grid will saturate; structured sharing may need to move to higher dimensions or a tree hierarchy.
+- *Cross-layer sharing*: TileQ shares U/V only among experts in the same layer; sharing across layers is already explored in LoRA-style work but has not been thoroughly pursued in PTQ.
+- *Co-design with dynamic routing*: The router knows which experts are likely to be co-activated; feeding that information back into the tiling placement algorithm could further reduce V-slice fragmentation at inference time.
+
+* One Diagram
+
+#+begin_example
+              Evolution of Compression Ratio (MoE low-rank quantization branch)
+              ------------------------------------------------------------------
+
+  GPTQ            Per-weight 4-bit                    Baseline, no low-rank
+  (2022)          Loss-aware error redistribution      No MoE specialization
+                  -------------------
+                          |
+                          v
+  AWQ             Activation-aware scale               Baseline, no low-rank
+  (2023)          Per-channel importance weighting     No MoE specialization
+                  -------------------
+                          |
+                          v
+  Per-Expert LR   Per-expert independent SVD           K copies of UV — fully redundant
+  (2024-25)       4-bit residual + 16-bit UV
+                  ---------------------
+                                                        +50% extra memory
+                                                        +50% inference latency
+                          |
+                          v
+  MiLo            Shared U + independent V (1D)        K copies of V still redundant
+  (2025)          Left-side kernel fused               Right side: K fragmented GEMMs
+                  -----------------------
+                                                        +25% extra memory (dense MoE)
+                                                        +50% latency (sparse MoE)
+                          |
+                          v
+  TileQ           Shared U + shared V (2D)             M+N copies replace K copies
+  (2026.05)       Biclustering to place experts        Fully fused kernel
+                  ------------------------
+                                                        +2.5% extra memory (10×↓)
+                                                        +5% latency
+
+
+  Sharing dimension:  none ---> 1D (U side) ---> 2D (both U and V)
+
+  Core pattern:    Each generation "acknowledges more inter-expert commonality" —
+                   independent -> input-space similarity -> input & output similarity
+#+end_example
+
+* Insights
+
+Reading through this lineage, one recurring pattern stands out: *each generation acknowledges structure that the previous generation pretended not to see.*
+
+- GPTQ assumed weight channels were mutually independent; AWQ acknowledged that their activation distributions differ.
+- Early MoE quantization assumed experts were mutually independent; MiLo acknowledged that they share similarity in input space.
+- MiLo still assumed experts were independent in output space; TileQ acknowledged that they share similarity there too.
+
+This is not an accumulation of technical details — it is a *repeated refinement of our understanding of the internal structure of model weights*. Each time a new structure is acknowledged, another layer of redundancy can be extracted.
+
+At a deeper level, progress in MoE quantization is essentially chasing the evolution of MoE architectures themselves. The core selling point of MoE is "large capacity via sparse activation," but sparse activation pushes all engineering difficulty onto the inference engine — more experts, smaller experts, sparser activation means worse kernel fragmentation. Early low-rank compensation didn't realize it was making this problem worse (K independent Vs = K fragmented kernels). MiLo fixed half of it; TileQ consumed the other half.
+
+It is reasonable to predict that *the central battleground of future MoE quantization will shift from "compression ratio" to "activation patterns"* — specifically, how the expert sharing structure can be co-designed with routing. TileQ has already planted the seed for this thread (the paper mentions "coupling with the router" as a future direction in its closing remarks).
+
+* Takeaways
+
+This lineage offers several concrete lessons for researchers:
+
+- *Find the structure others "pretended not to see."* Every breakthrough from GPTQ → AWQ → MiLo → TileQ was not about inventing new mathematics — it was about acknowledging a similarity / redundancy / distributional feature that the previous generation had ignored. The seed of the next paper is almost always buried in the independence assumptions of the current one: wherever a method assumes "these things are unrelated, but they actually are," the door is open.
+- *Compression ratio and inference latency are conjoined twins.* Per-expert low-rank proved "accuracy alone is not enough"; MiLo proved "memory alone is not enough"; TileQ proved "kernel-level co-design is mandatory." System–algorithm co-design papers are increasingly dominant; work that is purely algorithmic or purely systems has a low ceiling.
+- *2D grids / biclustering are an underrated tool.* They have been used in recommendation systems and bioinformatics for a long time, but have only just begun to appear in MoE / neural network structural design. Any scenario involving "classifying a set of objects along two independent dimensions" is worth trying this approach — shared experts, shared prompt caches, shared LoRA adapters are all plausible candidates.
+- *MoE quantization is far from finished.* Current SOTA extra-memory overhead is still 2–5%; the theoretical lower bound may be far lower (if cross-layer sharing, tree structures, and learned layouts are all combined, it may approach 0). There is still a deep valley to explore here.
+
+The practical implication: take any method that still uses "per-X independent processing" — per-layer, per-head, per-token, per-rank — and look for the dimension along which there is cross-sample similarity. Then generalize with TileQ's 2D-tile approach. The odds of producing a competitive paper are good.

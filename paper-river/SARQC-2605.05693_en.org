@@ -1,0 +1,327 @@
+#+title:      Saliency-Aware Regularized Quantization Calibration for Large Language Models
+#+date:       [2026-05-28 Thu 11:53]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T115301-en
+#+source:     https://arxiv.org/abs/2605.05693
+#+authors:    Yanlong Zhao, Xiaoyuan Cheng, Huihang Liu, Baihua He, Xinyu Zhang, Harrison Bo Hua Zhu, Wenlong Chen, Li Zeng, Zhuo Sun
+#+venue:      arXiv 2026-05-07 (cs.AI), v2 2026-05-08
+
+* The Problem River
+
+Take a floating-point LLM with tens of billions of parameters and compress it down to 4-bit integers. You used only 128 "calibration texts" to select your quantization parameters, yet this model must answer every question the world throws at it. How do you guarantee it still works on the real test distribution?
+
+Everyone working on PTQ has spent eight years answering two nested questions:
+
+Layer one: How do you compress weights to low bits while keeping each layer's output close to the original model's? (Reconstruction-error minimization.)
+
+Layer two: You only have a few hundred calibration samples. Why should "reconstructing well on the calibration set" be equivalent to "performing well on real tasks"?
+
+Answers to layer one have grown increasingly sophisticated — OBD scores importance with second-order derivatives, OBS adds a compensatory update, GPTQ quantizes one column at a time, AWQ absorbs scaling factors into the weights. But everyone has been silently assuming: *minimizing reconstruction error on the calibration set is the right objective for quantization*.
+
+SARQC's contribution is to puncture that assumption. It argues: no matter how low you drive the reconstruction error, the weights themselves have drifted — and they will fail outside the calibration distribution.
+
+* Source Map
+
+#+begin_example
+[1989] LeCun, Denker, Solla -- Optimal Brain Damage (OBD)
+  |
+  | Problem seen: pruning weights by intuition, wrong cuts destroy accuracy
+  | Solution: use diagonal second-order terms to score "importance,"
+  |           prune the least important
+  v
+[1993] Hassibi & Stork -- Optimal Brain Surgeon (OBS)
+  |
+  | Problem seen: OBD ignores coupling between weights
+  | Solution: use the full inverse Hessian; removing one weight triggers
+  |           a closed-form compensatory update for all others
+  v
+[2022] Frantar & Alistarh -- OBQ (Optimal Brain Quantization)
+  |
+  | Problem seen: OBS was designed for pruning; quantization is
+  |               a different kind of perturbation
+  | Solution: replace "snap weight to 0" with "snap to nearest grid point";
+  |           borrow the entire OBS framework
+  v
+[2023] Frantar et al. -- GPTQ
+  |                                  A parallel line
+  | Problem seen: OBQ is intractable at LLM scale        ↓
+  | Solution: fix column order, use Cholesky        [2022] Dettmers -- LLM.int8()
+  |           updates, lazy batch processing;             |
+  |           quantize a full LLM on a single A100        | Problem: LLM activations
+  |           in a few hours                              |   have extreme outliers
+  |                                                       | Solution: keep outlier
+  |  +-----------(unified by SARQC)-------------------+  |   channels in FP16
+  |                                                   |  v
+  |                                              [2023] Xiao et al. -- SmoothQuant
+  |                                                   |
+  |                                                   | Problem: keeping FP16
+  |                                                   |   channels splits matmuls
+  |                                                   | Solution: migrate outlier
+  |                                                   |   difficulty from activations
+  |                                                   |   to weights (absorbable scaling)
+  |                                                   v
+  |                                              [2024] Lin et al. -- AWQ
+  |                                                   |
+  |                                                   | Problem: SmoothQuant's alpha
+  |                                                   |   is a single global value,
+  |                                                   |   ignores per-channel saliency
+  |                                                   | Solution: search alpha per
+  |                                                   |   channel by activation magnitude;
+  |                                                   |   preserve top-1% salient weights
+  +------------+         +-------------------------+--+
+               v         v
+        [2026] Zhao et al. -- SARQC (this paper)
+               |
+               | Problem seen: GPTQ/AWQ both minimize only calibration
+               |   reconstruction error — when calibration data is
+               |   limited or unrepresentative, weights drift to a
+               |   point with worse generalization
+               | Solution: add a saliency-aware regularization term
+               |   to the reconstruction objective, explicitly anchoring
+               |   weights near the full-precision reference
+               |
+               | Follow-on work (no clear single successor as of 2026-05)
+               v
+        [2024] OmniQuant / [2024] QuaRot / [2025] SpinQuant
+               (rotation / learnable quantizers; orthogonal to SARQC, composable)
+#+end_example
+
+Note: OBD→OBS→OBQ→GPTQ is a confirmed citation chain; LLM.int8→SmoothQuant→AWQ is a confirmed citation chain. SARQC takes both chains as baselines and subsumes them in a unified regularized framework — as explicitly stated in the paper.
+
+* Evolutionary Narrative
+
+** 1989 | OBD: First Use of Second-Order Information to Guide Weight Changes
+
+*** What problem did it see?
+
+There was no concept of "quantization" yet. The pain point was *pruning* — networks were too large and weights had to be removed. But engineers pruned by gut feeling: "this one looks small, cut it." The result was immediate accuracy collapse.
+
+*** Its solution
+
+LeCun proposed: the true "importance" of a weight is not its magnitude but how much the loss rises if you remove it. Expanding the loss around its optimum with a second-order Taylor series shows that *the loss increase from deleting a weight is proportional to the square of that weight times its Hessian diagonal entry*.
+
+To keep computation tractable, he made a blunt assumption: the Hessian is diagonal — weights do not influence one another.
+
+*** Why it worked, and what new problem it buried
+
+It worked because it was the first time "which weight to cut" became a computable score rather than intuition. But the diagonal assumption is a real problem — *weights are coupled*; removing one shifts the optimal value of the others. OBD makes no compensatory update, so cutting many weights cascades into collapse. That hole was left for the next paper to fill.
+
+** 1993 | OBS: Adding Compensation
+
+*** What problem did it see?
+
+Hassibi looked at OBD: you assumed a diagonal Hessian when scoring importance, and after cutting you left all other weights untouched — both of those are too crude.
+
+*** Its solution
+
+Use the *full* inverse Hessian. When removing weight i, compute not just its true cost (accounting for coupling) but also give every other weight a *closed-form compensatory update* — they automatically adjust to cancel the perturbation caused by removing i.
+
+*** Why it worked, and what new problem it buried
+
+Mathematically exact: after each removal, the loss barely moves. The cost is storing the inverse Hessian — O(n²) memory and O(n³) computation for a layer with n parameters. In 1993, "large networks" had a few thousand parameters; that was manageable.
+
+Applied to a 10-billion-parameter LLM in 2022, even storing a single layer's inverse Hessian becomes impossible.
+
+** 2022 | OBQ: Porting the Pruning Framework to Quantization
+
+*** What problem did it see?
+
+Frantar & Alistarh looked at OBS: it solves "snapping a weight to zero." But *quantization is also a perturbation* — snapping a weight from −0.3142 to the nearest grid point −0.3125. Formally identical.
+
+*** Its solution
+
+Change two words in OBS's objective: "snap to zero" becomes "snap to the nearest quantization grid point." Hessian, compensatory update — everything else carries over.
+
+*** Why it worked, and what new problem it buried
+
+Theoretically elegant: pruning and quantization unified under one framework. But it inherited OBS's complexity — on a GPT-scale model, following the algorithm as written takes days to weeks, and a single layer's Hessian may not even fit in memory.
+
+** 2023 | GPTQ: Making OBQ Actually Run on LLMs
+
+*** What problem did it see?
+
+OBQ's math is right, but it cannot run on LLMs. The Frantar team's core observation: OBQ dynamically selects "the column with the smallest current error" at each step, which causes constant Hessian reordering and numerical instability.
+
+*** Its solution
+
+Three engineering-level simplifications:
+
+- *Fixed column order* — process columns in a predetermined sequence, no dynamic selection
+- *Cholesky decomposition* — reformulate the inverse-Hessian update in a numerically stable form
+- *Lazy batch updates* — update a whole block of columns at once to increase parallelism
+
+Mathematically equivalent to an "approximate greedy + closed-form compensation" algorithm. GPT-175B quantizes on a single A100 in a few hours.
+
+*** Why it worked, and what new problem it buried
+
+GPTQ was the first time the OBS/OBQ line actually landed on LLMs. The cost: both the column order and each per-column rounding decision implicitly assume that "minimizing reconstruction error on the calibration set is correct."
+
+The calibration set is 128 lines of WikiText, but the model must answer math problems, write code, and do translation. The gap between reconstruction-error minimization and real-task performance was left unaddressed.
+
+In parallel, a completely different line was growing —
+
+** 2022 | LLM.int8(): Seeing the Outliers
+
+*** What problem did it see?
+
+Dettmers tried naively quantizing GPT to INT8 and watched the model blow up. The culprit was not the algorithm but the *data*: LLM activations contain a small number of "Bund-channel outliers" — most dimensions stay in [−1, 1], but a handful reach values of 100.
+
+INT8's resolution is consumed entirely by these outliers, compressing every other channel to zero.
+
+*** Its solution
+
+Mixed precision: identify outlier channels, keep them in FP16, and run the rest in INT8.
+
+*** Why it worked, and what new problem it buried
+
+It directly fixed the collapse. But mixed precision splits one compact matrix multiply into two separate paths, hurting hardware efficiency and latency.
+
+** 2023 | SmoothQuant: Migrating the Outlier Difficulty to the Weights
+
+*** What problem did it see?
+
+Xiao looked at LLM.int8(): outlier channels blow up activation quantization because a few channels dominate the dynamic range. But — *weight distributions are smooth*, so weight-side quantization error is much smaller.
+
+Could some of the activation difficulty be shifted to the weight side?
+
+*** Its solution
+
+For each channel j, define a scaling factor s_j, divide activations by s_j and multiply weights by s_j. The output is mathematically unchanged (function-preserving), but the activation dynamic range is flattened and the weight difficulty grows slightly.
+
+s_j is set to the geometric mean of the activation and weight magnitudes, controlled by a hyperparameter α ∈ [0, 1].
+
+*** Why it worked, and what new problem it buried
+
+Elegant: the problem of "activations have outliers" is transformed into "activations and weights each give a little." The matrix multiply remains a single path — hardware-friendly.
+
+But α is *a single globally chosen scalar*, shared across all channels. Different channels have wildly different outlier severity; one-size-fits-all is obviously suboptimal.
+
+** 2024 | AWQ: Per-Channel Saliency-Based Adjustment
+
+*** What problem did it see?
+
+Lin looked at SmoothQuant: your α is one global number. But in LLMs roughly 1% of weight channels are "salient" — they contribute enormously to the final output, while the other 99% are largely redundant.
+
+*Treating all channels with the same α* means the 99% redundant channels are subsidized at the expense of the critical 1%.
+
+*** Its solution
+
+Determine scaling factors based on *per-channel activation magnitudes*, giving salient channels a larger scale so they are represented more precisely under quantization. Equivalent to promoting α from a scalar to a vector in SmoothQuant's framework, then searching for the optimal vector via grid search.
+
+*** Why it worked, and what new problem it buried
+
+In practice AWQ outperforms all prior methods at INT4. But it shares a hidden assumption with GPTQ —
+
+*The smaller the per-layer reconstruction error on the calibration set, the better the model.*
+
+That assumption is exactly what the next paper attacks.
+
+** 2026 | SARQC: Puncturing "Reconstruction Error Supremacy"
+
+*** What problem did it see?
+
+The SARQC authors ran a simple experiment on LLaMA2-7B: after driving calibration reconstruction error nearly to zero, they measured how far the weights had drifted from the original FP values — *they had wandered far*.
+
+Worse: they plotted a curve — x-axis is weight deviation from the FP reference, y-axis is average downstream task accuracy. The curve *is not monotone*. Peak accuracy sits at some intermediate point — neither minimum reconstruction error nor minimum weight drift, but a balance between the two.
+
+Formally, they prove a *generalization bound*: because the calibration set is small and biased, the true expected reconstruction error decomposes into two terms — the empirical error on the calibration set plus a generalization penalty proportional to the *distance the weights have traveled from the FP reference*. GPTQ/AWQ minimize only the first term; the second is left unchecked.
+
+*** Its solution
+
+Add an *explicit weight regularization term* to the per-layer reconstruction objective:
+
+  min ||W·X - W_hat·X||² + λ · R(W, W_hat)
+
+R is a "weight deviation measure." The simplest choice is Frobenius distance (RQC). The paper's main proposal, *SARQC*, makes R *saliency-aware* — weighted by second-order activation statistics so that important weight positions are penalized more heavily.
+
+Crucially, this framework plugs into both lines.
+
+- For the grid-search camp (AWQ): incorporate the regularization term into the scoring function while searching α. Called SARQC-GS.
+- For the Gram-based camp (GPTQ): the paper derives a closed-form "GPTQ-style" compensatory update formula and proves that GPTQ is the special case with λ = 0. Called SARQC-GBS.
+
+*** Why it worked, and what new problem it buried
+
+It promotes PTQ optimization from a single objective to a dual objective. The tradeoff between the two is explicitly controlled by λ, enabling curve-plotting and a theoretical proof that an optimal λ exists.
+
+Experimentally, LLaMA, Mistral, Qwen, and MoE models all improve; both PPL and zero-shot accuracy increase with no added inference overhead.
+
+New holes: How do you choose λ? Currently tuned per-model — can it be made per-layer adaptive? Are there better definitions of saliency (Fisher information? Gradients?) — each of these is a seed for a future paper.
+
+* Frontier Extensions
+
+As of 2026-05-28, SARQC is at v2, published only 20 days ago. No paper clearly "criticizes SARQC and improves upon it" has appeared yet.
+
+But several *parallel* neighboring lines are orthogonal to SARQC and may be combined with it:
+
+- *Rotation camp* (QuIP 2023, QuaRot 2024, SpinQuant 2025): instead of modifying the quantization objective, apply orthogonal transformations to weights and activations before quantization to spread outliers across dimensions. SARQC changes the *objective function*; rotation changes the *input space*. The two lines do not conflict.
+- *OmniQuant 2024*: makes quantization parameters (clipping thresholds, scales) learnable and optimizes them with gradient descent. The SARQC paper itself implements SARQC-with-OmniQuant, confirming the two can be combined.
+- *MoE quantization* (Liang et al. 2026, concurrent work): focuses on expert-level quantization of MoE models. SARQC is already validated on MoE architectures in the paper, showing robustness to architectural variation.
+
+* One Diagram
+
+#+begin_example
+
+  Time axis -->
+
+  1989    1993        2022           2023            2024       2026
+  ----------------------------------------------------------------------
+
+  Second-                                                          Gram-
+  order       OBD --> OBS --> OBQ ------> GPTQ ---------------+   based
+  compensation                                                 |   line
+                                   Minimize calibration        |
+                                   reconstruction error        |
+                                                               v
+                                                           +-------+
+                                                           | SARQC |  Unified framework:
+                                                           |       |  + explicit
+                                                           |       |    weight regularization
+                                                           +-------+
+                                                               ^
+                                                               |
+  Outlier           LLM.int8 -> SmoothQuant --> AWQ -----------+   Grid-
+  scaling                                                          search
+  camp                         Minimize calibration               line
+                               reconstruction error
+
+  ----------------------------------------------------------------------
+
+  Conceptual shift:
+  [1989-2022]              [2022-2024]               [2026]
+  "How to move weights  →  "How to dodge          →  "Reconstruction
+   without collapse"        outliers"                  error is not the
+                                                        only goal —
+                                                        generalization is"
+
+#+end_example
+
+* Insights
+
+Decades of researchers advancing this line show that each leap was not about "computing faster" but about *seeing the blind spot inside the previous generation's default assumption*.
+
+- OBD assumed a diagonal Hessian → OBS punctured it.
+- OBS assumed you had sufficient compute → GPTQ punctured it (via engineering workarounds).
+- GPTQ/AWQ assumed "calibration reconstruction is enough" → SARQC punctured it.
+
+At a deeper level: the entire PTQ line has continuously pushed "what should be optimized" from a naive answer toward an increasingly refined one.
+
+- 1989–2022: the optimization target is a *point-wise loss*.
+- 2022–2024: *outlier robustness* is introduced — certain dimensions need special treatment.
+- 2026: *generalization* is introduced — the calibration set is just a small sample; out-of-distribution behavior must be addressed.
+
+The most likely next directions: *adaptive λ* (automatically setting regularization strength per layer, per channel, or even per weight), and expanding the definition of "saliency" from activation statistics to *task-aware* measures (using a small set of task examples to identify which weights truly matter downstream).
+
+A more ambitious direction: since SARQC reveals a gap between "empirical reconstruction error" and "real task performance," could we simply *replace the calibration objective with a proxy loss from downstream tasks*? QAT (quantization-aware training) has gone down that road at the cost of full training data and long training time. SARQC hints at a middle ground — *no retraining required, but the objective is smarter than pure reconstruction*.
+
+* Takeaways
+
+Reading the PTQ line yields two plain lessons about how research works:
+
+1. *Every paper that looks like "engineering optimization" is standing on a tacitly accepted assumption.* Find the assumption — not by reading what the paper says, but by noticing what it doesn't say — and you often have the topic of the next paper.
+2. *Don't be seduced too quickly by SOTA numbers.* GPTQ and AWQ both posted beautiful PPL figures, yet both silently assumed "calibration reconstruction is enough." That hidden assumption went unquestioned until SARQC made it explicit. Impressive numbers can numb your sense of what questions remain.
+
+Practically:
+
+- If you deploy LLMs and use PTQ, SARQC is worth trying alongside AWQ/GPTQ — it does not replace those methods, it *hangs a regularization term on top of them*. Code is open-sourced at github.com/Riceormice/SARQC.
+- If you work on your own optimization problems and face "small training set, broad test distribution," *explicitly controlling parameter deviation* is a more geometric alternative to dropout or weight decay: it does not penalize large parameters — it penalizes parameters that *deviate from a meaningful reference point*.
+- When reading new PTQ papers, ask first: is the objective function fundamentally different from GPTQ/AWQ? If not, the paper is at most an engineering improvement. If yes, invest time in understanding how the objective moved — that is where the genuinely new direction lives.

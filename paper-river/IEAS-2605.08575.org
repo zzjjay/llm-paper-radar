@@ -1,0 +1,313 @@
+#+title:      Uncovering Intra-expert Activation Sparsity for Efficient Mixture-of-Expert Model Execution
+#+date:       [2026-05-28 Thu 12:19]
+#+filetags:   :paper:river:
+#+identifier: 20260528T121925
+#+source:     https://arxiv.org/abs/2605.08575
+#+authors:    Jongseok Park, Sunga Kim, Zhenyu Gu, Ion Stoica, Alvin Cheung (UC Berkeley / AMD)
+#+venue:      arXiv 2026-05-09 (cs.LG)
+
+* 问题之河
+
+一个语言模型里，最贵的不是注意力，是 FFN（前馈网络）——一堆全连接矩阵乘法，参数占了模型大半，每个 token 都要从头跑一遍。
+
+十多年来，所有人都在问同一个问题：*这一大堆神经元，真的每个都得算吗？*
+
+答案早就明显了——大多数神经元对当前这个 token 根本没贡献，输出值接近零。问题在于：*怎么提前知道哪些可以不算？* 你不能先算完再说"哦它是零"——那等于没省。
+
+这条河上一代又一代人在做同一件事：找到"哪些计算可以跳过"的便宜信号。从最早的 ReLU 天然出零，到把整个 FFN 拆成多个 expert 让 router 选少数几个（MoE），再到回头发现就算选中的那个 expert 里面也大半是冗余——稀疏不停地往更细的颗粒度走。
+
+这篇论文就是这条河的最新一站：MoE 里被 router 选中的那个 expert，*内部* 还藏着 90% 的稀疏没人挖。而且——惊喜——不用重训，现成的预训练 MoE 模型直接就有。
+
+* 溯源地图
+
+#+begin_example
+[2011] Glorot et al. -- Deep Sparse Rectifier Networks (ReLU)
+  |
+  | 看到的问题: tanh/sigmoid 处处非零，没法跳算
+  | 解法: 用 ReLU，负数直接砍成 0 —— 天然稀疏
+  v
+[2017] Shazeer et al. -- Outrageously Large Networks (Sparsely-Gated MoE)
+  |
+  | 看到的问题: 想把模型做大但不想让每个 token 都付全部代价
+  | 解法: 把 FFN 拆成 N 个 expert，每个 token 只走其中 K 个
+  |       (inter-expert sparsity，专家间稀疏)
+  v
+[2022] Fedus et al. -- Switch Transformer
+  |
+  | 看到的问题: K=2 还是太多，路由不稳定
+  | 解法: top-1 路由，把 expert 数推到上千
+  |       但暴露出 expert collapse / load imbalance 的训练难题
+  v
+[2023] Liu et al. -- DejaVu
+  |
+  | 看到的问题: 稠密 LLM (OPT, ReLU) 里大半神经元天天出零，还在算
+  | 解法: 训练一个小预测器，提前判断哪些神经元会激活，跳过其余的
+  |       证明 ~90% activation sparsity 可用于加速
+  v
+[2023-2025] Mirzadeh / Szatkowski / Lee / Cheng et al.
+  |
+  | 看到的问题: 现代 LLM 改用 SwiGLU/GeLU，没有 *exact* zero 了
+  |             DejaVu 那套基于 ReLU 出零的假设崩了
+  | 解法: 重新定义稀疏 —— 看激活的"重要性"(magnitude)，
+  |       小的那些算不算都不影响输出。软稀疏（soft sparsity）
+  v
+[2024] Luo et al. -- Sparsing Law
+  |
+  | 看到的问题: 这种"软稀疏"到底是偶然还是规律？
+  | 解法: 实证规律：激活神经元的占比随模型规模 *下降*。
+  |       模型越大，越稀疏。这不是 bug，是 feature。
+  v
+[2025] Cheng et al. -- 把激活稀疏搬进 MoE
+  |
+  | 看到的问题: 前面这些都是稠密模型的稀疏。MoE 模型呢？
+  | 解法: 在被选中的 expert 内部应用阈值化，
+  |       证明 intra-expert sparsity 也存在
+  |       但: 只在小模型上验证、只跑研究级 baseline、没接入生产推理引擎
+  v
+[2026] Park et al. -- IEAS (本文)
+  |
+  | 看到的问题: 1) Cheng 的覆盖太窄，没人知道大模型 (122B/400B) 上能不能用
+  |             2) 没人在 vLLM 这种高度优化的引擎里证明能真加速
+  |             3) shared expert vs routed expert 的差异从没被分开看
+  | 解法: 在 8 个 MoE 模型 (1B-400B) 上系统测，
+  |       发现 routed expert 极度稀疏 (98% 都可删)，shared expert 必须保留；
+  |       把这套塞进 vLLM 的 fused MoE kernel，
+  |       端到端 1.2x，MoE 层 2.5x，保留 95% 精度
+#+end_example
+
+* 演化叙事
+
+** 2011 | Glorot et al.: 给神经元装一个"硬零"开关
+
+*** 它看到了什么问题
+
+早期神经网络用 sigmoid 或 tanh，输出永远不会是精确的 0——只是很小的数。看起来好像差不多，但对硬件不一样：你没法"跳过"一个 0.0001 的乘法，因为它真的是非零，参与后面的累加。
+
+而且这些激活函数有个更糟的问题：饱和区梯度接近 0，深层网络训不动。
+
+*** 它的解法
+
+换激活函数：把负数直接砍成 0（ReLU）。看起来粗暴，但带来两件好事：
+- 梯度在正区永远是 1，深网络能训起来
+- 一半的神经元天然是 0，可以从硬件层面跳过
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+"硬零"给硬件提供了一个清晰的信号：你不必算这条路径。但这个 0 只有在算完之后才看得到——除非你能 *预测* 哪些神经元会出零。预测这件事，要等十几年后 DejaVu 才有人正经做。
+
+而 ReLU 本身也有它的代价：dying ReLU、信息丢失。后来 LLM 圈子改用 SwiGLU/GeLU 这种"漏"的激活，零就消失了——这条线一度断掉。
+
+** 2017 | Sparsely-Gated MoE: 别在一个神经元上抠，直接整块 FFN 切走
+
+*** 它看到了什么问题
+
+ReLU 的稀疏是细粒度的——一个神经元一个神经元地零。问题是：现代加速器（GPU）爱矩阵乘法，不爱"跳过零"。哪怕一半神经元出零，硬件还是要把整个矩阵乘出来，再扔一半。
+
+更要命的：模型越来越大，但 *每个 token* 还是要付全部参数的代价。
+
+*** 它的解法
+
+直接把 FFN 拆成 N 个独立的小 FFN（叫 expert）。再加一个小 router 网络，看每个 token 应该走哪 K 个 expert（通常 K=2，N=8 或更多）。
+
+整块 expert 没被选中 → 整块跳过。这是 *粗粒度* 稀疏，硬件友好。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+粗粒度稀疏匹配硬件偏好。你跳过一个 expert 就是跳过一大块矩阵乘法，干净利落。
+
+但 router 学不好就出大事——所有 token 都涌向同几个 expert（load imbalance），或者一堆 expert 从来没被选中（expert collapse）。这两个问题成了未来十年 MoE 训练的主线难题。
+
+** 2022 | Switch Transformer: 把 expert 数推到上千
+
+*** 它看到了什么问题
+
+Shazeer 那套 top-K 路由（K=2）还是浪费——每个 token 还得算两个 expert。能不能再降？
+
+而且 expert 数还是太少（8 个、16 个），没法做到"每个 expert 都极度专精"。
+
+*** 它的解法
+
+top-1 路由：每个 token 只走一个 expert。简化了大量训练上的麻烦，把 expert 数推到 1000+。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+K=1 时稀疏度逼近 1/N。expert 越多越稀疏。
+
+但 Fedus 也老实承认：再往上推，*训练越来越难*。expert collapse 和 load imbalance 成了硬墙。后来人意识到："靠 inter-expert 稀疏继续往细走，路要走死了。"
+
+这句话就是本文 (IEAS) 的起跑信号——既然横着走不动了，就往里挖。
+
+** 2023 | DejaVu: 回头挖 FFN 里的活化稀疏
+
+*** 它看到了什么问题
+
+MoE 是一条路，但稠密 LLM (像 OPT) 还有大半人在用。这些模型里，ReLU 出零是天然的，但 *没人在推理时利用* —— 因为你不知道哪个 token 会让哪些神经元出零。
+
+*** 它的解法
+
+训一个 *小预测器*：给定输入，提前判断 FFN 里哪些神经元会激活。预测出来是 0 的，直接不算。
+
+实测 OPT 上，~90% 的 FFN 神经元可以跳过，几乎不掉精度。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+证明了"细粒度激活稀疏"不只是 ReLU 自己的副作用，而是可以在推理时主动利用的优化轴。
+
+但 DejaVu 死死绑在 ReLU 上——它的 oracle 假设是"激活值就是 0 或非 0 的二元判断"。一旦换成 SwiGLU、GeLU 这种永远不出精确 0 的激活，DejaVu 整套就崩了。
+
+而 2023 年之后的 LLM——Llama、Qwen、Mixtral——全用 SwiGLU。
+
+** 2023-2025 | 软稀疏的发现: 没有"零"，但有"几乎为零"
+
+*** 它看到了什么问题
+
+DejaVu 不能用了，因为 SwiGLU 的输出永远不是 0。看起来稀疏这条路在新 LLM 上断了。
+
+*** 它的解法
+
+Mirzadeh、Szatkowski、Cheng 等人换个角度：不要求 0，只要求 *小*。
+
+把激活按绝对值排序，砍掉最小的那一批。实验显示：砍 80%-90% 的小激活，模型几乎察觉不到。
+
+Luo et al. 的 *Sparsing Law* 把这个观察拔到规律层面：模型越大，重要神经元的占比越低。激活稀疏不是巧合，是 scaling 的副产品。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这一步把"激活稀疏"从依赖特定激活函数解放出来——任何 LLM 都可能有，只要你按 magnitude 排序。
+
+但这堆工作大多在 *稠密* LLM 上做（Llama、Qwen 这种 dense 变体）。MoE 模型本来就是稀疏架构，再往里挖会怎样？没人系统验证过。
+
+** 2025 | Cheng et al.: 第一次把激活稀疏搬进 MoE
+
+*** 它看到了什么问题
+
+MoE 模型把 FFN 拆成多个 expert，inter-expert 已经稀疏了。但被选中的那个 expert 里面，依然是个完整的小 FFN——*它自己内部的激活稀疏，没人挖*。
+
+*** 它的解法
+
+在被路由命中的 expert 内部应用 magnitude 阈值。验证了 Qwen3-30B、Mixtral 等 MoE 上确实存在 intra-expert sparsity。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+确认了 intra-expert sparsity 这个概念在 MoE 上成立。
+
+但留下三个空洞：
+1. 只在中小规模 MoE (3B-7B 活跃参数) 上验证。100B+ 的大 MoE 上呢？不知道。
+2. 实现是研究级 baseline——独立的 prototype，没接进生产推理引擎。挂在 vLLM 这种 *已经* 高度优化的系统上还有没有收益？不知道。
+3. 没区分 *shared expert*（每个 token 都过）和 *routed expert*（router 选的）。这两类的稀疏行为可能完全不同——也没人看。
+
+这三个空洞就是 IEAS 的起点。
+
+** 2026 | IEAS (本文): 八个模型，从 1B 到 400B，全跑一遍，塞进 vLLM
+
+*** 它看到了什么问题
+
+Cheng et al. 的工作开了头，但远远没把这个问题答完。具体地：
+
+- 范围太窄：现代旗舰 MoE（Qwen3.5-397B、Llama-4-Maverick-400B、GPT-OSS-20B）上行不行？
+- 集成太弱：和 vLLM 这种生产引擎里的 fused MoE kernel、HIP/CUDA Graph、expert parallelism 加在一起，会不会冲突？还是真能叠加？
+- 区分缺失：shared expert 和 routed expert 同等重要吗？还是其中一类对精度至关重要、另一类纯冗余？
+
+*** 它的解法
+
+三件事一起做：
+
+1. *系统测稀疏*：在 8 个 MoE（1B-400B）上跑五个 benchmark (ARC-C/E、HellaSwag、Winogrande、TruthfulQA-mc2)，画出"稀疏度 vs. 保真度"曲线。
+
+2. *拆开 shared vs routed*：分别看两类 expert。结论很硬——shared expert 的神经元几乎全部重要（不能动），但 routed expert 的神经元 *98% 都可以删* 而不掉精度（在 Qwen3.5-122B 上）。
+
+3. *塞进 vLLM*：基于 vLLM 的 expert-batched fused MoE kernel，加上 intra-expert skip 的路径，同时保留所有现有优化（kernel fusion, HIP Graph, expert parallelism）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+为什么管用：
+- Sparsing Law 说"模型越大越稀疏"——MoE 里每个 expert 都比同等大小的稠密 FFN 更专精，所以单个 expert 内部更稀疏，正符合规律。
+- routed expert 之所以可以删 98%，是因为它本来就被设计成"小众专精"——多数神经元只在窄域的输入下激活。当前 token 走到它头上时，绝大多数神经元和这个 token 无关。
+- 和 vLLM 兼容是因为 IEAS 在 *kernel 内部* 改路径，不破坏外层的 batching、graph capture、parallelism 假设。
+
+埋下的新坑：
+- 怎么 *预测* 哪些神经元该跳？目前是按 magnitude 排序，需要先算出激活再排——这部分本身有开销。
+- 不同 token 的稀疏 pattern 不同，batched 推理时 batch 内 token 各跳各的，kernel 难做完美的负载均衡。
+- shared/routed 的差异是结构性的还是训练偶然？换一种训练目标会不会让 routed expert 也变得不能删？
+
+* 前沿延伸
+
+这篇 2026-05 才挂出，还没看到正式的后续工作。但可以预期接下来几个方向：
+
+1. *联合稀疏*：把 inter-expert (router 选) + intra-expert (本文) + 量化 (FP4/MXFP4) 叠在一起，看复合加速。
+2. *训练时引入意识*：既然 routed expert 内部 98% 可删，能不能在训练时就显式 *鼓励* 这种稀疏（类似 ReLU 的硬阈值）？让"可删"成为模型自带属性，不再依赖运行时排序。
+3. *Router 改造*：让 router 不只挑 expert，还提前预估这个 expert 在当前 token 上的稀疏度——稀疏度高的优先选。
+4. *Shared expert 的角色重新评估*：本文发现 shared expert "几乎全是必要的"。这暗示 shared expert 实际承担了远超架构师设计的工作量。未来 MoE 设计可能会重新分配 shared/routed 比例。
+
+* 一张图看懂
+
+#+begin_example
+                  稀疏的颗粒度变迁                                     何时被挖出来
+
+       粗 +-------------------+
+          |  整块 FFN 切走     |   inter-expert (top-K, top-1)        2017 (Shazeer)
+          |  (MoE 路由层)      |     N expert 选 K                    2022 (Switch)
+          +-------------------+     问题: 训练难度成硬墙
+                    |
+                    | "再往细走不动了"
+                    v
+       中 +-------------------+
+          |  单个 FFN 内       |   activation sparsity (ReLU)         2011 (Glorot)
+          |  神经元出 0        |     DejaVu: 预测器跳算                2023 (Liu)
+          +-------------------+     问题: SwiGLU 没有 0
+                    |
+                    | "改看 magnitude，不看 0"
+                    v
+       中 +-------------------+
+          |  软稀疏：按重要性  |   soft activation sparsity           2023-25 (Mirzadeh,
+          |  砍小激活          |     Sparsing Law (模型越大越稀疏)     Szatkowski, Cheng,
+          +-------------------+                                       Luo, Lee)
+                    |
+                    | "稠密验证了，MoE 呢？"
+                    v
+       细 +-------------------+
+          |  MoE 的 expert     |   intra-expert sparsity              2025 (Cheng et al.)
+          |  内部再挖          |     research baseline 验证概念
+          +-------------------+
+                    |
+                    | "大模型上行不行？接进生产引擎呢？"
+                    v
+       细 +-------------------+
+       +  | IEAS (本文)        |   intra-expert × production system   2026 (Park et al.)
+       v  | 1B-400B 系统验证   |     vLLM 集成, 2.5x MoE / 1.2x e2e
+          | shared vs routed   |     routed expert 可删 98%
+          +-------------------+
+#+end_example
+
+* 洞见
+
+把整条河看下来，*真正* 在演化的不是"算法越来越聪明"，而是 *稀疏的颗粒度越来越细，对应的硬件配合越来越深*：
+
+| 阶段       | 稀疏单位 | 谁来发现稀疏     | 硬件配合点          |
+|------------+----------+------------------+---------------------|
+| ReLU 时代  | 神经元   | 激活函数自动     | 跳过 0 乘加         |
+| MoE 时代   | 整个专家 | router 决定      | 整块矩阵 skip       |
+| DejaVu 时代| 神经元   | 预测器           | 稀疏 GEMM 路径      |
+| 软稀疏时代 | 神经元   | magnitude 排序   | top-k 选择          |
+| IEAS 时代  | 神经元   | 排序 (在 MoE 内) | fused kernel 内 skip|
+
+可以看出两条规律：
+
+1. *稀疏的发现成本越来越高*。ReLU 时代是"白送"，MoE 时代要训练 router，DejaVu 时代要训预测器，软稀疏时代要在线排序——*我们在用更多的计算去发现哪些计算可以省*。这是个有趣的悖论：发现稀疏本身不是免费的。下一步的关键不只是"找到更细的稀疏"，而是"用更便宜的方式找到"。
+
+2. *稀疏维度在累加，不是替换*。inter-expert 稀疏并没有让 intra-expert 稀疏变得多余——它们是 *正交* 的。这意味着未来还可能有更多正交的稀疏轴被发现：跨 layer 的稀疏？跨 batch 的稀疏？跨 sequence position 的稀疏？每一个都能再叠一层加速。
+
+最深的洞见也许是：*神经网络里的冗余是分形的*。砍掉一层冗余，下面又一层。这条河走到 IEAS 还远没到尽头——只要 model 还在变大，稀疏率就会继续涨（Sparsing Law），下一根稀疏轴一定还在。
+
+* 启发
+
+如果你做 ML 系统：
+- 不要假设"上游优化已经很饱和了"。vLLM 已经被无数人压榨过，IEAS 还能在它上面再榨 20-150% MoE 层加速。系统优化的天花板比想象的高。
+- *正交的优化能叠加*。每次找到一个新的、和现有维度独立的优化点，就是一个免费的乘性收益。
+
+如果你做 ML 研究：
+- *别人验证过的现象，换一个 setting 再验证一遍可能是新论文*。激活稀疏在稠密 LLM 上早就成熟了，搬到 MoE 上就是 2025 的工作；从中小 MoE 搬到 100B+ 的旗舰 MoE 上、并区分 shared/routed，就是 2026 的 IEAS。
+- *把一个二分变量拆成两类，往往能看到新东西*。本文把 expert 拆成 shared/routed 单独看，立刻发现 routed 可删 98%——这是直接合在一起看时永远看不到的。
+
+如果你在选优化方向：
+- *看 scaling law*。Sparsing Law 已经告诉你模型越大越稀疏——也就是说，这个优化的收益会随模型增大而 *自动放大*。这种"顺着 scaling 跑"的优化，价值远超"和 scaling 对抗"的优化（比如把已经小的东西再压缩）。
