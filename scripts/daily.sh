@@ -20,6 +20,18 @@
 
 set -uo pipefail
 
+# Wall-clock start; reported on EXIT so even early `exit N` paths log total.
+DAILY_START=$SECONDS
+_fmt_duration() {
+    local s=$1
+    if (( s < 60 )); then
+        echo "${s}s"
+    else
+        printf '%dm%02ds\n' $((s / 60)) $((s % 60))
+    fi
+}
+trap 'echo "[$(date -Is)] daily.sh total: $(_fmt_duration $((SECONDS - DAILY_START)))"' EXIT
+
 DAYS="${DAYS:-1}"
 DATE=""
 
@@ -214,3 +226,4 @@ else
 fi
 
 echo "[$(date -Is)] daily.sh done"
+# Trap fires next and prints total wall-clock.
