@@ -1,0 +1,314 @@
+#+title:      MCAP: Deployment-Time Layer Profiling for Memory-Constrained LLM Inference
+#+date:       [2026-05-28 Thu 14:46]
+#+filetags:   :paper:river:quantization:llm:inference:offload:
+#+identifier: 20260528T144611
+#+source:     https://arxiv.org/abs/2604.21026
+#+authors:    Anurita Das (Genovation Technological Solutions)
+#+venue:      arXiv preprint, 2026-04-22 (v2 2026-04-24)
+
+* 问题之河
+
+把一个 80 亿参数的大模型，塞进一台只有 4 GB 显存的旧显卡里——而且不许重新训练，不许重新做量化校准。怎么做？
+
+这个问题分成两件事，过去十年这两件事一直被分开做：
+- *精度* — 一个权重该用 4 比特、8 比特，还是 16 比特？每层一不一样？
+- *位置* — 这个权重该放 GPU、CPU 内存，还是 SSD？什么时候搬？
+
+传统做法：精度在校准时（offline）就定死了，定完就烧进权重文件——给一台机器做的量化，换台机器就要重做。位置由 LRU 或者预取启发式管理，不知道哪些权重重要。两件事各管各的，从来没人用同一个信号同时驱动它们。
+
+MCAP 这篇文章是这条"内存受限 LLM 部署"线上的一次合流尝试：用 60 秒、12 个校准提示词、纯前向算出来的一个 per-layer 重要性向量，同时驱动精度调度（W4A8 还是 W4A16）和驻留分层（GPU/RAM/SSD）。
+
+要看懂它在做什么，得先回到这条线最早的源头——一个被多次重新发现的事实：*LLM 里的每个数字、每个通道、每个神经元、每一层，重要性都不一样*。
+
+* 溯源地图
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | 问题: 把 LLM 整体量化到 INT8，质量会崩——尤其在 6.7B 以上规模
+  | 发现: 不是所有维度都一样：极少数 outlier 特征（> 6 sigma）
+  |       决定了量化误差的大头
+  | 解法: 混合精度——outlier 维度走 FP16，剩下 99.9% 走 INT8
+  | 关键: 第一次明确告诉社区，"LLM 里的数字不是均匀重要的"
+  v
+[2022] GPTQ (Frantar et al.)
+  |
+  | 问题: LLM.int8 只到 8-bit；想压到 4-bit，靠 outlier 隔离不够
+  | 解法: 用逆 Hessian 一列一列量化，让误差在列之间互相补偿
+  | 关键: "重要性"被定义为权重对损失的二阶敏感度，per-column
+  v
+[2023] AWQ (Lin et al.)
+  |
+  | 问题: GPTQ 的 Hessian 算起来重；其实只有 ~1% 的权重通道
+  |       因为高激活而真正重要
+  | 解法: 用激活统计找出"显著通道"，量化前先放大 scale 保护它们
+  | 关键: 第一次用 *激活信号* 而不是权重信号判断重要性
+  v
+[2023] FlexGen (Sheng et al.)
+  |
+  | 问题: 量化解决"塞得下"；可 70B 全精度根本塞不下，怎么办？
+  | 解法: 把权重分到 GPU/CPU/SSD 三层，调度数据搬运
+  | 残留: 三层放置完全是数据流问题，所有权重一视同仁——
+  |       没有"哪些重要、应该留 GPU"的信号
+  v
+[2024] PowerInfer (Song et al.)
+  |
+  | 问题: FlexGen 把所有权重平等对待，浪费了 LLM 激活稀疏性
+  |       这个先验——大部分神经元根本不激活
+  | 解法: 训练一个 per-model 的 MLP 预测器，运行时预测哪些
+  |       neuron 会激活；"hot neuron"留 GPU、"cold neuron"扔 CPU
+  | 残留: 预测器要为每个模型单独训，base 模型一变就要重训；
+  |       而且只管放置，不管精度——精度还是另一套（GPTQ/AWQ）做的
+  v
+[2024] LLM-in-a-Flash (Alizadeh et al.)
+  |
+  | 问题: 手机上根本没 CPU RAM 余量，只有闪存
+  | 解法: 把权重流式从 flash 加载，配合稀疏激活预取
+  | 残留: 还是预测器 + 启发式那一套，没有统一的"重要性信号"
+  v
+[2026] MCAP / NVE (本文, Anurita Das)
+  |
+  | 看到的问题:
+  |   - PowerInfer 的预测器是"per-model 训出来的额外组件"——
+  |     base 权重一更新就废，跨设备还要重训
+  |   - AWQ/GPTQ/EXL2 的精度决策都钉死在 offline 校准时，
+  |     设备一变就得重做
+  |   - 精度和位置是两件事，被两套独立系统决定，从未耦合
+  | 解法:
+  |   1. 一个 60 秒、12 个校准提示词的纯前向 profiler，
+  |      算出 per-layer 重要性分数（一个 338 字节的 JSON）
+  |   2. 同一个分数同时决定 *两件事*:
+  |      - 精度: 重要层走 W4A16，不重要层走 W4A8
+  |      - 位置: 重要层留 GPU, 次要留 RAM, 最不重要扔 SSD
+  |   3. 校准结果是 architecture-keyed 不是 weight-keyed——
+  |      同一个 JSON 在 T4 / A10G 上 SHA-256 完全一致
+  | 关键: "重要性"的载体从 "trained predictor" 退回到
+  |       "deterministic forward-pass statistic"
+#+end_example
+
+注：LLM.int8 / GPTQ / AWQ 是 PTQ 这条 *精度* 线；FlexGen / PowerInfer / LLM-in-Flash 是 *位置* 线。MCAP 的真正贡献是把这两条线接上——用一个信号驱动两个决策。EXL2（Turboderp, 2024）已经做了 per-layer bit allocation，但 *是 offline 算的*；MCAP 把它搬到 load-time。
+
+* 演化叙事
+
+** 2022 | LLM.int8(): LLM 里的数字不是均匀重要的
+
+*** 它看到了什么问题
+
+把 OPT-175B 这种规模的模型整体量化到 INT8，期望能不掉精度——结果直接崩了。困惑的研究者发现：6.7B 是一个相变点，更小的模型 INT8 没事，更大的模型 INT8 灾难。
+
+*** 它的解法
+
+诊断后发现，6.7B 以上的模型在某些特征维度上出现了远超平均的极端值（outliers，>6σ）。这些维度只占不到 0.1%，但承载了绝大部分信息。INT8 的 256 个格子根本盛不下它们。
+
+解法是混合精度："正常"维度走 INT8，"outlier"维度单独抠出来走 FP16。每个矩阵乘法变成两次：大头 INT8，小头 FP16，再加起来。
+
+*** 它为什么管用，又留下了什么
+
+这是第一篇明确告诉大家："*LLM 里不是所有维度都一样重要*"的论文。它埋下了之后所有"importance-aware"工作的种子。
+
+但它的 outlier 检测发生在 *运行时、特征维度上*——每次推理都要扫一遍激活找 outlier。它没问一个更深的问题：能不能 *离线* 就知道哪些通道是 outlier？这个问题让 AWQ 接了过去。
+
+** 2022 | GPTQ: 把"重要性"做成可计算的标量
+
+*** 它看到了什么问题
+
+LLM.int8() 只到 8 比特。但实践需要 4 比特——能把模型缩小一半再一半。在 4 比特下，outlier 隔离根本不够：16 个格子盛不下那么宽的分布。
+
+*** 它的解法
+
+借用 90 年代的 Optimal Brain Surgeon：每个权重对损失的二阶敏感度可以用 Hessian 量化出来。GPTQ 一列一列地量化权重，每量完一列，就用逆 Hessian 把"这列没量准的误差"摊到后面未量化的列里——下一列在量化时就会去补偿前一列的偏差。
+
+*** 它为什么管用，又留下了什么
+
+第一次给"重要性"一个数学化的定义：*per-column second-order sensitivity*。但 Hessian 算起来重，而且 GPTQ 还是按照"所有权重都值得仔细对待"的假设在做。
+
+留下的问题：如果只有 1% 的权重真重要，剩下 99% 都该被"草率对待"，那何必算 Hessian？
+
+** 2023 | AWQ: 重要性其实就写在激活上
+
+*** 它看到了什么问题
+
+GPTQ 的逆 Hessian 算一次要几小时。但 LLM 的真相是——绝大部分权重无所谓，少数被高激活"激活"的通道才决定输出质量。能不能直接看激活，不算 Hessian？
+
+*** 它的解法
+
+校准时跑一遍前向，看每个通道的激活幅度。激活幅度大的通道（约 1%）就是"显著通道"。量化前给它们乘一个大于 1 的 scale，让它们落进格子的"好位置"，量化后再除回去。
+
+*** 它为什么管用，又留下了什么
+
+它把"重要性"的载体从权重信息（Hessian）转到了激活信息——一个 *前向就能算* 的廉价信号。这是关键的范式转移。
+
+但 AWQ 还是 offline。它依旧产生一份新的量化权重文件，依旧 per-target 校准。"重要性" 的概念现在被理解为 *per-channel activation magnitude*，但它仍然是装在固定的权重文件里部署出去的。
+
+接下来要做的事情，从 AWQ 看起来其实就两个方向：要么把重要性做得 *更细*（每个权重一个），要么把它做得 *更晚*（推到 runtime）。第一个方向走出去就是 SqueezeLLM/SpQR；第二个方向走出去——就是 PowerInfer 和最终的 MCAP。
+
+** 2023 | FlexGen: 但当模型连塞都塞不下呢？
+
+*** 它看到了什么问题
+
+PTQ 线的所有努力都假设"模型能塞进 GPU 内存"。但 70B 模型 BF16 要 140 GB，4-bit 还要 35 GB——多数 GPU 装不下。这是一个不同的问题。
+
+*** 它的解法
+
+把模型拆到三层存储——GPU VRAM、CPU RAM、SSD——按线性扫描调度数据搬运。优化目标是吞吐：让 GPU 永远在算，让搬运永远不阻塞计算。
+
+*** 它为什么管用，又留下了什么
+
+它证明了 *跨层级存储* 是一个可行的部署模式。但它对所有权重一视同仁——只是按时间顺序流过 GPU。
+
+留下的问题：既然有些权重比另一些重要（AWQ 已经告诉我们了），为什么不让重要的留在 GPU、不重要的扔到 SSD？*精度* 线告诉了我们"什么重要"，*位置* 线却没用上。这两条线必须接起来。
+
+** 2024 | PowerInfer: 把重要性和位置接起来——但用了重武器
+
+*** 它看到了什么问题
+
+LLM 推理时大部分 ReLU/SiLU 神经元根本不激活——激活稀疏性高达 80%+。FlexGen 把所有权重平等对待是浪费。如果能预测哪些 neuron 会被激活，把"hot neuron"留 GPU、"cold neuron"扔 CPU，整体就能跑得更快。
+
+*** 它的解法
+
+为每个 base model 训练一个小 MLP 预测器，在每个 token 推理之前预测哪些 neuron 会激活。预测出来的 hot neuron 跑 GPU 上的稠密 kernel，cold neuron 跑 CPU 上的稀疏 kernel。
+
+*** 它为什么管用，又留下了什么
+
+它第一次实现了"importance-driven placement"——重要性 *决定* 数据放在哪。这是 MCAP 直接继承的范式。
+
+但代价是一笔大账：
+- *预测器是 per-model 训出来的*——base 模型一更新，预测器就废
+- *预测器是一个额外组件*——必须和权重保持同步，多一份配置就多一处出错
+- *只管放置，不管精度*——精度还得另外用 AWQ/GPTQ 做
+- *神经元级别的细粒度，要求 runtime 预测开销*——每个 token 都要算一次
+
+MCAP 接过来的问题就是：能不能不要这个预测器？
+
+** 2026 | MCAP / NVE（本文）: 一个 60 秒的前向，同时决定精度和位置
+
+*** 它看到了什么问题
+
+2026 年初的局面是：
+- PTQ 线（GPTQ / AWQ / EXL2）把精度决策钉死在 offline——一台机器一份权重
+- 放置线（FlexGen / PowerInfer / LLM-in-Flash）把位置决策做活了——但要么没重要性，要么要训预测器
+- 两条线的"重要性"信号从未共用过
+
+更细看 PowerInfer 这个最近的邻居：它的 MLP 预测器是 *模型相关的额外学习组件*——这意味着 base 权重一变它就要重训，跨设备校准它就要重算，整个部署链多一处脆弱点。
+
+而事实是：要判断哪些层重要，根本不需要训东西。跑一遍前向，看每层的激活幅度，统计 12 个 prompt 的平均值——就够了。
+
+*** 它的解法
+
+四个小决定，加起来是一次范式收敛：
+
+1. *Monte Carlo Activation Profiling*：60 秒，12 个校准 prompt，纯前向，无梯度。算出每层的平均激活幅度 ‖a_i‖。这就是 per-layer importance score。
+2. *一个信号两个决策*：
+   - 高分数层走 W4A16（精度高），低分数层走 W4A8（精度低但快）
+   - 高分数层留 GPU，中分数扔 RAM，低分数扔 SSD
+3. *Architecture-keyed, not weight-keyed*：profile 不绑定权重，只绑定架构。同一份 338 字节 JSON 在 T4 和 A10G 上跨 6 个并行容器 SHA-256 完全相同。一次算，到处用。
+4. *Rust + 1413 行手写 CUDA*：W4A8 dp4a 内核 + flash decode attention + 三层 pager，把信号变成实际的吞吐和可用性。
+
+*** 它为什么管用，又留下了什么
+
+它管用是因为做对了三个收缩：
+- *把"重要性"从训练阶段收缩到 load-time*——比 PowerInfer 的训练预测器轻几个数量级
+- *把"重要性"的粒度从 neuron-level 提到 layer-level*——粗，但每个 token 不再付预测开销
+- *把"重要性"的用途从单轴扩到双轴*——同一个分数管精度也管位置，省掉一整套独立量化系统
+
+效果：Llama-3.1-8B（BF16 16 GB）跑在 4 GB GPU 上，1.25 tok/s——这是 4-bit 量化都做不到的内存区域（4-bit 8B 仍要 5-6 GB）。同时 W4A8 路径比 llama.cpp Q4_0 快 1.5-1.8 倍。
+
+留下的口子：
+- per-layer 粒度还是太粗——PowerInfer 在 neuron 级别证明了更细粒度的稀疏性是真实存在的，MCAP 主动放弃了这一部分
+- 静态阈值——校准一次后阈值就定了，无法适应运行时负载变化（ActiveFlow 等动态调度器正在攻这个口）
+- 只在 Turing/Ampere 验证——Jetson、Apple Silicon、消费级 RTX 都还是 future work
+- 1B 模型上激进配置会失效——重要性 prior 在小模型上信噪比不够
+
+* 前沿延伸
+
+MCAP 是 2026 年 4 月的论文，目前没有直接"批 MCAP"的后续。但同时期几条线值得注意：
+
+- *PowerInfer-2*（Xue et al., 2024）：把 PowerInfer 搬到手机上，仍然是 per-model 预测器；MCAP 的"无预测器"路线在边缘设备上的潜力还没展开
+- *HeadInfer*（Luo et al., 2025）：把 KV cache 按 attention head 卸载，KV 内存减 92%。这是正交方向——MCAP 管权重，HeadInfer 管 KV，两者可以叠加
+- *ActiveFlow*（Zhang et al., 2025）和 *NEO*（Jiang et al., 2025）：动态调度器，按运行时负载动态搬运权重。MCAP 的静态 importance score 正好可以作为它们的输入——把"什么重要"和"什么时候搬"解耦
+- *BitNet / 1.58-bit*（Ma et al., 2024）：训练时改表示，从根上压缩。这是另一条路；MCAP 的 deployment-time 路线和 BitNet 的 training-time 路线不冲突——BitNet 模型也可以被 MCAP profile 后再差异化部署
+
+可以预见的下一步：
+- *MCAP-guided KV quantization*——把同一个 per-layer 信号扩展到 KV cache 的精度选择（论文 Conclusion 也提到）
+- *Live re-profiling*——把 12 个固定校准 prompt 换成滑动窗口的真实流量，让重要性信号跟着工作负载漂移
+- *Edge silicon 验证*——Jetson / Apple Silicon / 消费级 RTX 上验证 architecture-keyed profile 的可移植性
+
+* 一张图看懂
+
+#+begin_example
+       "精度"线 (PTQ)                    "位置"线 (Offload)
+       ----------------                   --------------------
+[2022] LLM.int8()                          (尚未出现)
+       outlier 维度走 FP16
+       "数字不是均匀重要的"
+              |
+              v
+[2022] GPTQ
+       Hessian per-column 重要性
+       (offline, 重计算)
+              |
+              v
+[2023] AWQ                             [2023] FlexGen
+       激活幅度 per-channel             GPU/CPU/SSD 三层调度
+       (offline, 轻计算)                (无重要性, 数据流问题)
+              |                                 |
+              |                                 v
+[2024] EXL2                            [2024] PowerInfer
+       per-layer bit allocation         per-neuron hot/cold
+       (offline)                        (训 MLP 预测器, 仅位置)
+              |                                 |
+              |                          [2024] LLM-in-a-Flash
+              |                                 闪存流式加载
+              |                                 |
+              +----------+----------------------+
+                         |
+                         v
+                  +-------------+
+                  | "重要性信号" |  <--- 两条线一直在用，但从未共用
+                  +-------------+
+                         |
+                         v
+[2026] MCAP / NVE (本文)
+       60 秒前向 -> per-layer importance score (338 字节 JSON)
+       一个信号  -> 同时驱动 *精度*（W4A8/W4A16） + *位置*（GPU/RAM/SSD）
+       无预测器, architecture-keyed, load-time, deterministic
+       效果: Llama-8B 跑在 4 GB GPU, W4A8 比 llama.cpp 快 1.5-1.8x
+
+  时间 ------------------------------------------------------>
+
+  真正的主线: "什么决定 LLM 里的什么重要?"
+            权重 Hessian  -> 激活幅度  -> 训练出的预测器  -> 前向统计量
+            (GPTQ)         (AWQ)        (PowerInfer)       (MCAP)
+  载体的迁移: offline file -> offline file -> trained model -> 60s forward
+  控制时点:   calibration -> calibration -> inference     -> load-time
+#+end_example
+
+* 洞见
+
+这条线读下来，最深的一个观察是：*"什么决定 LLM 里的什么重要"这个问题，载体一直在退化——从重型工具（Hessian、训练预测器）退回到轻型统计量（前向激活均值）*。
+
+每一代都在做同一件事：找到下一个"够便宜还够好"的重要性信号。
+
+- LLM.int8 用了 *运行时 outlier 检测*——每次推理算
+- GPTQ 用了 *Hessian per-column*——离线一次算，很重
+- AWQ 用了 *激活幅度 per-channel*——离线一次算，轻
+- PowerInfer 用了 *训练出来的稀疏预测器*——为每个模型训一次，依赖梯度
+- MCAP 用了 *60 秒前向激活均值 per-layer*——load-time 一次算，无梯度，无训练
+
+每一步退化都伴随着两件事：粒度变粗，但 *决策权力变强*。MCAP 是粒度最粗的（layer），却是 *决策权力最大的*——它同时决定精度和位置，是前面任何一代都没尝试过的。
+
+这暗示了一个一般规律：*一个 ML 系统能用多简单的信号驱动多少决策，比信号本身有多精巧重要得多*。AWQ 的 per-channel 信号其实信息量更大，但它只驱动了一件事（精度），所以发挥空间小；MCAP 用更粗的 per-layer 信号，但驱动了两件事（精度 + 位置），所以撬动的工程价值反而更大。
+
+进一步：*PowerInfer 和 MCAP 的核心分歧，是"重要性需要被学习"还是"重要性可以被观察"*。PowerInfer 押了前者——训一个预测器；MCAP 押了后者——前向跑一遍看激活。MCAP 赢的不是预测精度（确实粗），赢的是 *部署链条变短*——少一个组件、少一份依赖、少一次同步。这是工程美学的胜利，不是算法美学的胜利。
+
+下一步最可能的方向：把这个"load-time deterministic signal"的范式推到其他决策上——KV cache 精度、speculative decoding 的 draft model 选择、prefill 阶段的 batch 调度。一旦你接受"60 秒前向就够了"，可以贴上去的决策面就一下子打开了。
+
+* 启发
+
+对做系统/部署的人，三件事：
+
+1. *先问"能不能少一个组件"，再问"能不能优化一个组件"*。PowerInfer 的预测器是一个完整、合理、技术上成熟的组件——MCAP 直接把它砍了。砍组件比优化组件影响大得多，因为它简化的是 *部署链条* 而不仅仅是某个数字
+2. *找"一个信号驱动多个决策"的机会*。如果你的系统里有两个看起来无关的决策都需要"某种重要性"，先怀疑它们其实是同一个信号——只是被两套独立的系统分别推导了。把它们接上往往能省掉一整套基础设施
+3. *把"训练"换成"观察"是最便宜的简化*。任何"我要训一个小模型来预测 X"的设计，先问一句："如果直接前向跑一遍数据，看 X 的实际分布，行不行？"。很多情况下，answer 是 yes——而你省下了训练管道、版本同步、模型漂移这一长串麻烦
+
+这意味着，你下次面对 LLM 部署里的"per-something allocation"问题（per-layer、per-head、per-expert、per-token），先不要急着设计算法。先跑一遍前向，把每个 something 的激活分布画出来——很可能你看完图就知道该怎么分了，根本不用学。MCAP 全文 22000 行 Rust，但核心算法是 "mean of activation norm over 12 prompts"，就这么简单。

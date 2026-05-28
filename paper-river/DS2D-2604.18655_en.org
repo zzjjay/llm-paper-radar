@@ -1,0 +1,274 @@
+#+title:      Unlocking the Edge deployment and ondevice acceleration of multi-LoRA enabled one-for-all foundational LLM
+#+date:       [2026-05-28 Thu 14:27]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T142735-en
+#+source:     https://arxiv.org/abs/2604.18655
+#+authors:    Sravanth Kodavanti, Sowmya Vajrala, Srinivas Miriyala, et al. (Samsung Research)
+#+venue:      ACL 2026
+
+* The Problem River
+
+Squeezing a model that writes in eight styles and speaks nine languages into the mobile chip in your pocket — and making it generate tokens faster than a person can type.
+
+Three difficulties collide all at once:
+- A phone's memory is strictly limited; running one model is already taxing, let alone running eight;
+- A phone's compute is nowhere near a server's; waiting tens of milliseconds per token adds up fast;
+- Once a model's inference graph is compiled for a phone it cannot be changed, yet use cases are endlessly varied — grammar correction, summarization, style transfer, health reminders… every scenario wants its own fine-tuned specialization.
+
+The standard server-side trick is: train a small patch per task (LoRA), swap it in dynamically at inference time. But on a phone, "dynamic swapping" is nearly a death sentence — swapping means recompiling, re-quantizing, and reallocating memory. And token generation is inherently sequential: only one token can be emitted at each step.
+
+Every milestone along this river is really asking the same question: *Can a single forward pass emit multiple tokens without adding any burden to the model itself?*
+
+* Source Map
+
+#+begin_example
+[2023] Leviathan et al. / Chen et al. - Speculative Decoding
+  |
+  | Problem: LLM decoding is sequential; a full model pass is required per token
+  | Solution: a small model drafts k tokens; the large model verifies all at once;
+  |           every accepted draft token is kept
+  v
+[2024.01] Cai et al. - Medusa
+  |
+  | Problem: the draft model itself must be trained, deployed, and kept in memory
+  | Solution: drop the draft model — attach a few "Medusa heads" to the last layer
+  |           of the large model; head i predicts the i-th future token;
+  |           tree-attention verifies all candidate paths in one forward pass
+  v
+[2024.02] Li et al. - EAGLE
+  |
+  | Problem: Medusa heads are independent; head i+1 cannot see what head i will
+  |           produce, which caps accuracy
+  | Solution: perform autoregression at the feature level — a lightweight
+  |           autoregressive head consumes hidden states rather than token ids,
+  |           yielding a significantly longer acceptance length
+  v
+[2025] Lin et al. - BiTA (Bi-directional Tuning for lossless Acceleration)
+  |
+  | Problem: still bolt-on thinking — extra heads/networks are unfriendly to
+  |           quantization and NPU compilation
+  | Solution: use prefix tuning to bake "predict future tokens" directly into
+  |           the original model; learn a set of forecast embeddings as a prefix
+  |           so that the frozen LLM itself becomes semi-autoregressive
+  v
+[2026.04] Kodavanti et al. - DS2D (this paper)
+        + Multi-LoRA-as-Input + CTG
+  |
+  | Problem: BiTA works on servers, but its branching tree is fixed —
+  |           the optimal tree shape differs across tasks (correction vs.
+  |           summarization vs. health reminders), and NPUs strongly prefer
+  |           batch=32 inputs
+  | Solution: treat the hardware constant 32 as a hard constraint; for each
+  |           use case pick the branching configuration whose row count fills
+  |           exactly 32; pair with LoRA-as-input so a single static graph
+  |           serves eight tasks
+  v
+[2026.+] To be determined (see §Future Directions)
+#+end_example
+
+Note: Leviathan and Chen et al. are independent concurrent works; this paper's
+"Reported Works" does not cite them directly, but the citation chain
+DS2D → BiTA → Medusa → speculative decoding is explicitly stated in the paper
+and is unambiguously traceable.
+
+* Evolutionary Narrative
+
+** 2023 | Speculative Decoding: Let the Small Model Draft, the Large Model Only Supervise
+
+*** What Problem It Saw
+
+The root cause of slow LLM inference is not compute volume but *memory bandwidth*. Generating token t must wait for token t-1 to finish — a hard constraint of autoregression. The result is that the GPU spends most of its time waiting for data to be moved from memory, wasting more than ninety percent of compute. Every "acceleration" effort at the time optimized at the operator level; nobody touched the sequential chain itself.
+
+*** Its Solution
+
+Introduce a *small model* (draft model) as a scout: let it speculatively generate k tokens in a row, then feed all k tokens into the large model for parallel verification in a single forward pass. The large model can determine in one shot how many of the k tokens are acceptable. It is mathematically provable that the output distribution is strictly identical to "the large model running k steps by itself" — *lossless acceleration*.
+
+*** Why It Works (and Where It Buries a New Problem)
+
+It works because: verifying k tokens uses one forward pass of the large model, and that forward pass is already bottlenecked by memory bandwidth; stuffing a few more tokens in barely increases the time.
+
+New problem: you now have to *maintain two models*. The small model must be trained separately, stored separately, and loaded separately. On a server this is manageable, but on a phone "add another model" is essentially a death sentence.
+
+** 2024.01 | Medusa: Grow the "Small Model" On Top of the Large One
+
+*** What Problem It Saw
+
+The draft model in speculative decoding is fundamentally a design of "approximate the large model with cheaper compute" — but if the approximation is too crude, acceptance rate collapses; if it is too accurate, the model becomes heavy. Finding the right size is tedious. Worse, if the small and large models drift even slightly in distribution, the lossless guarantee starts to leak.
+
+*** Its Solution
+
+Simply *drop the draft model*. Attach several parallel prediction heads to the last layer of the large model (called "Medusa heads," after Medusa's snake-hair), where head i is dedicated to predicting the i-th future token. Because they consume the large model's final hidden state, their output distribution is naturally aligned with the large model.
+
+The multiple candidate tokens predicted by all heads are arranged into a tree, and a *tree attention* mask lets every candidate path be verified in parallel within a single forward pass.
+
+*** Why It Works (and Where It Buries a New Problem)
+
+It works because: "speculation" is internalized into the model itself, eliminating the maintenance cost of an external model. Tree attention upgrades verification from "linear k tokens" to "tree O(k roots × tree depth)" — far more combinations verified per pass.
+
+New problem: each head works independently; head 2 predicts without seeing what head 1 will output. This makes predictions increasingly unreliable further ahead. Additionally, training the heads adds weights on top of the original model — extra variables when quantizing and compiling.
+
+** 2024.02 | EAGLE: Do Autoregression on Features, Not on Tokens
+
+*** What Problem It Saw
+
+The disconnection between Medusa heads is a serious issue. "Independently guessing 4 future tokens" is fundamentally much harder than "knowing the first 3 and guessing the 4th" — this is an information-theoretic gap. Medusa's acceptance length plateaus around 2-3, and that is exactly why.
+
+*** Its Solution
+
+EAGLE's key insight: bring autoregression back, but *don't do it at the token level* — do it at the feature level.
+
+Specifically: use a lightweight autoregressive module whose input at each step is not the previously predicted token id but the corresponding hidden state (feature vector) from the previous step. A feature vector carries vastly more information than a token id (a token id is one integer; a feature is a 4096-dimensional vector), so this lightweight autoregressive head can "think deeper," and its prediction accuracy is markedly better than Medusa's.
+
+*** Why It Works (and Where It Buries a New Problem)
+
+It works because: features carry an order of magnitude more information than tokens. A prediction module of the same size, fed features, can learn a much more accurate distribution. On mainstream benchmarks, acceptance length climbs from Medusa's ~2.5 to ~4.
+
+New problem: there is still an external network attached. For on-device deployment, even "lightweight" is a burden — extra weights to quantize, an extra subgraph to compile, and an extra block of memory to allocate. NPU compilers are also picky about non-standard structures.
+
+** 2025 | BiTA: No More Bolt-Ons — *Weld* the Prediction Ability Into the Original Model
+
+*** What Problem It Saw
+
+By the time we reach EAGLE, the method is already quite elegant, but the thinking is still *bolt-on* — something is grown beside or on top of the original model. For resource-constrained deployment (phones, embedded devices, quantized static graphs), any bolt-on is a liability.
+
+BiTA flips the question: can the *original model itself* learn to emit multiple tokens at once? Without any extra parameters — purely through parameter-efficient prefix tuning?
+
+*** Its Solution
+
+Drawing on prefix tuning: prepend a set of *learnable forecast embeddings* before the prompt. During training the model learns that, upon receiving these forecast embeddings, the corresponding positions should output the distribution of the m-th future token.
+
+At inference time, m forecast embeddings are appended after the prompt, and the frozen LLM produces 1+m tokens in one forward pass — one genuine autoregressive token and m "predicted" draft tokens — followed by speculative parallel verification.
+
+The entire process *does not touch a single weight of the model*; all "predict the future" capability is compressed into the prefix embeddings and attention masks. The name BiTA stands for Bi-directional Tuning for lossless Acceleration.
+
+*** Why It Works (and Where It Buries a New Problem)
+
+It works because: prefix tuning has already demonstrated that a few hundred learnable vectors can steer a large model to perform new tasks. Learning to "predict future tokens" is just another new task. Unchanged model weights mean the *quantized binary is fully reused*, which is enormously deployment-friendly.
+
+New problem: the branching configuration in the BiTA paper (e.g., 1+m=3 means simultaneously predicting 2 future tokens, each with several candidates) is *fixed*. But the prediction difficulty varies enormously across tasks — in a grammar-correction task the next token is almost certain, so predicting 4 ahead might all hit; in a summarization task the next token has high entropy, so predicting 2 ahead might miss. A fixed configuration is a one-size-fits-all stew. BiTA also ignores hardware batch shape, whereas for an NPU the difference between "30 input rows" and "32 input rows" is an order of magnitude.
+
+** 2026.04 | DS2D (This Paper): Treat the Hardware Constant 32 as a Design Constraint
+
+*** What Problem It Saw
+
+The DS2D authors ported BiTA directly onto Qualcomm SM8650/SM8750 NPUs and found two concrete issues:
+
+1. *NPUs are extremely sensitive to input shape.* NPUs prefer batch dimensions that are powers of two, most commonly 32. If your branching configuration produces 30 rows per step, the NPU will compute it as 32 rows — the 2 extra rows are wasted cycles. "Filling 32" and "filling 30" cost nearly the same time on the NPU, but the former verifies 2 more tokens per step, yielding a higher acceptance rate for free.
+
+2. *The optimal branching configuration is completely different per use case.* Table 7 in the paper benchmarks 9 branching configurations across 8 tasks: the grammar-correction task peaks at configuration (3,2), but that same (3,2) configuration applied to "Smart Energy" yields almost no speedup. This means BiTA's "one configuration for everything" is a serious waste at the edge.
+
+*** Its Solution
+
+Two steps, highly engineering-focused and straightforward:
+
+1. *Treat 32 as a hard constraint.* Enumerate in advance all branching configurations whose total input row count equals exactly 32 — e.g., (3,2) corresponds to 3+2 draft tokens plus some prefix residue plus prompt padding that fills exactly 32 rows. All candidate configurations carry nearly identical hardware cost.
+
+2. *Select the optimal branching configuration per use case offline.* Run all candidate configurations on each task, pick the one with the highest acceptance rate, and record it. At deployment time, look up the configuration for the current task — one static graph, eight configurations, zero extra compute.
+
+Also introduced: *Multi-LoRA-as-Input*, which encodes each task's LoRA weights as input tensors to the graph rather than embedding them into the graph itself, letting a single frozen graph serve eight tasks. Plus *Concurrent Token Generation (CTG)*: for use cases that generate 8 style variants simultaneously, once the first token fixes the style the subsequent token distributions are close enough across streams to share a KV cache, so 8 streams decode in parallel, collapsing 8 serial passes into 1.
+
+*** Why It Works (and Where It Buries a New Problem)
+
+It works because: DS2D invents nothing new algorithmically — it performs an exhaustive search over the Cartesian product of "hardware constants × task statistics" and bakes the results into a configuration table. This approach is frequently undervalued in academic circles, but in industrial deployment it is exactly the kind of thing that genuinely doubles throughput. The end result: a 3B model on a Galaxy S25 goes from roughly 20 tok/s to roughly 40 tok/s.
+
+New problem: branching configurations are chosen *offline* — meaning if the user's actual input distribution drifts (e.g., the user's correction style differs substantially from the training set), acceptance rate will fall, but the configuration will not adapt. Another latent issue: as the NPU's preferred shape evolves from 32 to something else (the next-generation SM may use 64), the entire lookup table must be rebuilt.
+
+* Future Directions
+
+DS2D is from April 2026; as of this writing (2026-05-28) no work explicitly targeting it as a predecessor has yet appeared. But following the directions it points to, several lines can be anticipated as already in motion:
+
+** Adaptive Branching Configuration
+
+DS2D's offline optimal configuration selection is a static scheme. A possible successor: use a tiny predictor (or even just the first few layers of the LLM itself) to determine online which task class the current prompt belongs to and which configuration to use. The runtime overhead would be negligible, yet it would solve the distribution-drift problem.
+
+** Portability Across NPU Shape Preferences
+
+Parameterize the "hardware batch constant" so that branching configurations are automatically regenerated at compile time for the target chip. This is a compiler/toolchain direction rather than a model innovation.
+
+** The Limits of LoRA-as-Input
+
+LoRA-as-Input assumes all tasks share the same LoRA rank. When a 9th or 10th use case arrives requiring a higher rank, how do you handle it? This is the scalability bottleneck of the multi-LoRA framework, and no clear solution has yet appeared.
+
+Disclaimer: this section is reasoned speculation based on the limitations of the methods in this paper, not citations of specific published follow-up work.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                      The Speculative Decoding River (problem: autoregression is too slow)
+                      -------------------------------------------------------------------
+
+  Dimension: degree of bolt-on attachment
+  ^
+  |
+  | High         Speculative   Medusa      EAGLE
+  | bolt-on      Decoding      (heads)     (autoreg
+  |              (small model)              on features)
+  |    +----------*-------------*-----------*
+  |    |          |             |           |
+  |    |          v             v           v
+  |    | remove small model  connect heads  weld "bolt-on" into original model
+  |    |
+  | Low +------------------------------------*-----------*------------>
+  |                                        BiTA        DS2D       time
+  |                                     (prefix     (BiTA + hardware
+  |                                      tuning,     constant + per-task
+  |                                      semantic     optimal branching
+  |                                      lossless)    + multi-LoRA)
+  |
+  v  deployment-friendly (zero extra weights, quantization-compatible, NPU-ready)
+
+  Key transitions:
+    Speculative Decoding --[remove draft model]--> Medusa
+    Medusa               --[connect head dependencies]--> EAGLE
+    EAGLE                --[eliminate all bolt-ons]--> BiTA
+    BiTA                 --[hardware constants × task statistics]--> DS2D
+
+  A parallel tributary (adaptability / multi-task):
+    LoRA --> QLoRA/QA-LoRA --> [this paper] LoRA-as-Input
+                                  (from "training trick" to "deployment interface")
+#+end_example
+
+* Insights
+
+** The Real Revolution Is "Subtracting the Bolt-Ons"
+
+Stretched out in a line, every generation's core move is *cutting away what the previous generation added*:
+
+- Speculative decoding added a small model → Medusa cuts it, replaces it with heads
+- Medusa added multiple heads → EAGLE simplifies to a single autoregressive head
+- EAGLE still has one head → BiTA cuts to zero, everything compressed into the prefix
+- BiTA's configuration is fixed → DS2D stuffs "flexibility" into an offline table so runtime overhead remains zero
+
+This is not a coincidence. The deployment logic of mobile devices is: *any runtime flexibility has a cost* — memory, compilation, quantization compatibility. The true direction of "innovation" is to *push flexibility into training time or compile time* and let runtime be as dumb as possible.
+
+** "Hardware Constants" Are an Overlooked Design Variable
+
+DS2D's most underappreciated contribution is treating *NPU batch size 32* as a first-order design constraint. In the model/algorithm research community, this kind of detail is usually dismissed as "an implementation detail, not worth putting in a paper." But in practice, industrial deployment bottlenecks live exactly here — an algorithmic invention that cannot fit into the hardware's preferred shape remains paper-only.
+
+This is a hint for researchers: *keep your eyes on the hardware constants on the deployment side* (batch shape, alignment bytes, tile size). You will find that many directions that seem "fully explored" actually still have a factor-of-two speedup lying in wait.
+
+** Semi-Autoregression Is "Precision Recovered Through Compromise"
+
+The semi-autoregressive (SAR) line has always been doing the same thing: *relax the strict autoregressive constraint slightly, gain enormous acceleration, then use a verification mechanism to recover the "lossless" guarantee*. Speculative decoding, Medusa, EAGLE, BiTA, and DS2D all follow the same two-phase skeleton: draft + verify. The more aggressively you draft, the more the verification step is needed to prevent drift.
+
+This is an elegant epistemological stance: *you don't need to be right at every step — you only need to be able to recognize when you are wrong*. This idea should transfer cleanly to many other domains (program synthesis, model-based rollouts in reinforcement learning).
+
+* Takeaways
+
+** For People Doing Deployment / Systems Work
+
+If you are working on on-device LLM deployment, *do not start by picking the newest algorithm from the literature*. First measure your hardware's preferences (batch shape, supported ops, memory alignment), then look back at which algorithms' structures fit inside. DS2D invented no new algorithm; it did what others had not bothered to do seriously: treat hardware preferences as one of the design constraints.
+
+Concrete starting point: for the NPU in front of you, run the DS2D-style enumeration of "input rows = hardware constant" branching configurations. The code is tiny; the speedup is often substantial.
+
+** For People Doing Algorithm Research
+
+Observe the evolutionary rhythm of this river: every generation *removes something the previous generation added*. The next time you see a paper where "new method = prior method + extra module," your first instinct should be "how will the next generation cut that extra module?" Think it through in advance, skip the intermediate form, and build the next generation directly.
+
+Concrete starting point: take any acceleration method with a "head," "adapter," or "draft model," and ask one question — *can its functionality be internalized into the original model through prefix tuning or mask design?* If yes, that is a paper.
+
+** For People Learning This Field
+
+Reading through this river, notice that none of these papers "thought up a great idea from scratch" — each one found a specific gap left by the previous generation and filled it. That is the true rhythm of research. The next time you agonize over "what direction should I work on," go read the limitations sections of the latest papers — somebody has already dug your hole for you.
+
+Concrete starting point: develop the habit of archiving each paper's limitations separately as you read. Come back three to five months later and you will often be able to piece together a roadmap of what the next paper should look like.

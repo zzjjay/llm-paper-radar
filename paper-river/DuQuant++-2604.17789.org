@@ -1,0 +1,293 @@
+#+title:      DuQuant++: Fine-grained Rotation Enhances Microscaling FP4 Quantization
+#+date:       [2026-05-28 Thu 14:18]
+#+filetags:   :paper:river:quantization:llm:mxfp4:rotation:
+#+identifier: 20260528T141808
+#+source:     https://arxiv.org/abs/2604.17789
+#+authors:    Haokun Lin, Xinle Jia, Haobo Xu, Bingchen Yao, Xianglong Guo, Yichen Wu, Zhichao Lu, Ying Wei, Qingfu Zhang, Zhenan Sun (CASIA / NJU / THU / ZJU / Harvard / CityU)
+#+venue:      arXiv preprint, 2026-04-21
+
+* 问题之河
+
+要把一个 70 亿参数的大模型塞进 4 比特里跑起来，最大的拦路虎不是权重——是激活。LLM 的激活值里总会冒出几个离谱的大数（outliers），比周围邻居大几十倍上百倍。你只有 16 个格子可用，一个 outlier 把刻度拉到天上去，剩下 31 个格子全挤在底下，每一个都被压扁。
+
+这条研究线就是在追着 outlier 跑。从 2022 年发现这个现象开始，每一代论文都在问同一个问题的变体：
+
+- 怎么让 outlier 不再"独占"刻度？
+- 能不能把 outlier 从一个地方"搬"到另一个地方？
+- 能不能让 outlier 在数学上"散开"，被分摊到多个通道里？
+- 当硬件本身（MXFP4 这种带 per-block scale 的格式）改变游戏规则时，旧的解法是不是过度设计了？
+
+DuQuant++ 是这条线上"硬件吃掉了一半问题，方法跟着简化一半"的一次清算。
+
+* 溯源地图
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | 问题: LLM 激活里有"涌现 outlier"——少数维度数值
+  |       是其他维度的 20-100 倍。INT8 一来就崩
+  | 解法: 把 outlier 通道单独抽出来用 FP16 算，
+  |       剩下的走 INT8——混合精度凑合
+  | 残留: 4-bit 完全做不了；outlier 只是被"绕过"，
+  |       没被"解决"
+  v
+[2023] SmoothQuant (Xiao et al.)
+  |
+  | 问题: 既然 outlier 都在固定通道里，能不能把它们
+  |       从激活"挪"到权重里？权重的分布平滑得多
+  | 解法: 在 X*W 之前插一个对角矩阵 diag(s): X/s * s*W
+  |       数学等价，但 s 选得好可以让 X/s 变温顺，
+  |       代价是 s*W 略微变难（但权重本来就容易压）
+  | 残留: 对 "massive outlier"（极端尖峰）不够用；
+  |       到了 W4A4 完全顶不住
+  v
+[2024] QuaRot (Ashkboos et al.)
+  |
+  | 问题: SmoothQuant 只能"挪"outlier，不能"消灭"它。
+  |       且某些层的 outlier 太极端，挪到权重那边
+  |       权重也救不回来
+  | 解法: 用 Hadamard 旋转矩阵——一个所有元素是 ±1/sqrt(d)
+  |       的正交矩阵——乘在激活前。旋转有 energy-spreading
+  |       性质，一个 spike 会被摊到所有通道上变成均匀涨幅。
+  |       旋转矩阵可以离线吸收进相邻权重，推理时几乎免费
+  | 残留: Hadamard 是 *data-agnostic* ——它不看 outlier
+  |       在哪里，无差别摊。如果 outlier 集中在少数通道，
+  |       它会"浪费"一部分摊均能力在没问题的通道上
+  v
+[2024] DuQuant (Lin et al.)
+  |
+  | 问题: Hadamard 不看数据，纯靠概率打散。但工程上
+  |       我们其实知道 outlier 在哪些通道（前向跑一次校准
+  |       集就能拿到）。为什么不构造"针对性"的旋转？
+  | 解法: 贪心搜索一个 block-diagonal 旋转 R，专门把
+  |       最大 outlier 通道的能量分散到块内其他通道。
+  |       但 block-diagonal 只能管块内，块与块之间的
+  |       outlier 分布仍然不均——于是再加一个 zigzag
+  |       permutation P 把高能量块和低能量块交错，
+  |       再来第二个 block-diagonal 旋转: R1 -> P -> R2
+  | 残留: 三步 pipeline 在推理时要算两次块对角矩阵
+  |       乘法 + 一次置换。开销不小。且整个设计是
+  |       为了对付"per-token 或 per-channel scaling
+  |       下的跨块方差"——是 INT4 时代的产物
+  v
+[2026] DuQuant++ (本文)
+  |
+  | 看到的问题:
+  |   1. 硬件变了——MXFP4 (NVIDIA Blackwell 原生支持)
+  |      每 32 个元素自带一个独立的 E8M0 scale。
+  |      这意味着 "跨块方差" 在 MXFP4 里根本不是问题
+  |      ——每个块自己管自己的 scale
+  |   2. MR-GPTQ / BRQ 这些方法把 Hadamard 旋转
+  |      搬到 MXFP4 块上 (block_size=32)，但又退回到
+  |      data-agnostic——丢掉了 DuQuant 的 outlier-aware 优势
+  | 解法: 把 DuQuant 的 outlier-aware 旋转适配到 MXFP4——
+  |       让旋转块大小 B 等于 MXFP4 group size (B=32)。
+  |       因为每个 MXFP4 group 有自己的 scale，
+  |       *跨块方差不再是问题，zigzag + 第二个旋转
+  |       直接砍掉* 。只剩一个 outlier-aware 旋转 + smooth
+  | 收益: 在线旋转成本减半；同时旋转也作用到权重上
+  |       自然平滑权重分布
+#+end_example
+
+注：SmoothQuant 之后其实分了三条支线——AWQ / GPTQ 那条做"权重精修"，QuaRot/DuQuant 这条做"旋转处理 outlier"。本条线只追"旋转"这一支，因为 DuQuant++ 是这一支的延续。
+
+* 演化叙事
+
+** 2022 | LLM.int8(): outlier 是 LLM 的"原生病"
+
+*** 它看到了什么问题
+
+把训练好的 GPT-style 模型压到 INT8，按理说应该没问题——8 个 bit 有 256 个值，正态分布下绰绰有余。但 Dettmers 一跑就发现：模型崩了。检查发现，每个 transformer 层的激活里都有几个维度的值大得离谱——比同层中位数大 50-100 倍。这些"涌现 outlier"会把 INT8 的刻度拉到极端，剩下的值挤在零附近一个点上。
+
+*** 它的解法
+
+干脆别量化 outlier。论文做了个混合精度的实现：扫一遍找到 outlier 通道（大约占 0.1%），这些通道走 FP16；其他 99.9% 走 INT8。算完再把结果拼回去。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它第一次把 outlier 作为一个"现象"显式拎出来命名。代价是工程复杂度——你的 matmul kernel 现在得处理两种精度。更要命的是：到 4-bit 这招根本走不通——4-bit 一共就 16 个值，你抽走 0.1% 通道走 FP16，剩下 99.9% 还是塞不进 16 个格子。
+
+它给整条线留下的真正问题不是技术问题，是哲学问题：*outlier 是必须接受的客观存在，还是一个可以被"变换"消除的表面现象* ？
+
+** 2023 | SmoothQuant: 把 outlier 从激活搬到权重
+
+*** 它看到了什么问题
+
+LLM.int8() 的混合精度路子在 W4A4（权重 4 位，激活 4 位）下完全行不通。但 Xiao 注意到一个不对称：outlier 在 activations 里到处是，weights 的分布却平滑得多。如果能把 activation 的难度"挪"一些到 weights 上，可能就能让两边都活下来。
+
+*** 它的解法
+
+数学等价变形：把 Y = X @ W 重写成 Y = (X * diag(s)^-1) @ (diag(s) * W)，结果完全一样。但你可以选 s_j——比如让 s_j = max(|X_j|)^α / max(|W_j|)^(1-α)，把 X 这一列除小一点（outlier 被压下去），W 这一列乘大一点（反正 W 本来就温顺）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"outlier 处理"从 LLM.int8() 的"切开来用不同精度"，升级成"数学上等价地搬运"。这是一次范式跃迁——告诉大家 outlier 是可以被"操作"的，不是必须接受的。
+
+但它有两个硬伤：第一，对那种极少数极端尖峰（论文里叫 massive outliers）不够用，再怎么搬权重那边也吸收不了；第二，diag(s) 只能做 *per-channel* 的尺度调整，不能改变通道间的相对关系。outlier 只是被"按住"了，没有真正被"散开"。
+
+** 2024 | QuaRot: 让 outlier 在数学上"散开"
+
+*** 它看到了什么问题
+
+SmoothQuant 的搬运是线性的——你把一个通道的 outlier 按住，它就老老实实变小。但你按不住超级离群点。怎么办？Ashkboos 注意到一个性质：如果你把激活向量 x 乘上一个正交矩阵 R，得到 x' = R @ x，那么 x' 在每个维度上的方差更均匀——energy spreading。
+
+如果这个 R 是 Hadamard 矩阵（所有元素是 ±1/sqrt(d)），那么一个 spike 在 x 里集中在某个维度，在 x' = H @ x 里会被均匀摊到所有维度——variance 从极端集中变成均匀分布。
+
+*** 它的解法
+
+在 X @ W 之前插入 H 和 H^T：Y = (X @ H) @ (H^T @ W)。H^T @ H = I，所以数学等价。但 X @ H 现在每个维度都温顺了，可以 4-bit 量化；H^T @ W 可以离线算好然后存——推理时根本看不到 H。
+
+唯一在线的开销是 X @ H。但 Hadamard 矩阵的特殊结构使得这个乘法可以用 O(d log d) 算法（类似 FFT），代价小。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+第一次让 W4A4 真正可用——LLaMA 4-bit 跑到接近 FP16 的精度。这是质变。
+
+但 H 是 *data-agnostic* 的——它和任何 4096 维向量都一样地"摊"。问题是 LLM 的 outlier 不是随机分布的，而是集中在某些固定通道上（往往是 down projection 的输入）。把一个 spike 摊到 4096 个维度上，听起来很好，但你也"占用"了那 4096 个维度的部分动态范围。如果 outlier 只集中在 100 个通道里，你完全可以只动用那 100 个通道的能力——为什么要打扰另外 3996 个？
+
+** 2024 | DuQuant: 不要打扰好通道，针对性旋转
+
+*** 它看到了什么问题
+
+QuaRot 用 Hadamard 是"撒网式"摊均——不看 outlier 在哪。但 Lin 注意到：跑一次校准集，你能精确知道哪些通道有 outlier。为什么不构造一个 *专门针对那些通道* 的旋转？
+
+*** 它的解法
+
+贪心搜索一个 block-diagonal 旋转矩阵 R——每个块是 B×B 的正交矩阵（一般 B = 128 或 256），针对块内最大 outlier 设计。算法是反复迭代：找到当前最大的 outlier 维度，构造一个旋转把它的能量分散到块内其他维度，再找下一个最大的，再分散……直到收敛。
+
+但这里有个严重问题：block-diagonal 旋转 *只能管块内* 。块与块之间的能量分布仍然不均——有些块自带很多 outlier，有些块本来就温顺。你只在块内做了功课，跨块差异没解决。
+
+DuQuant 的补救：在两次块对角旋转之间插一个 zigzag permutation P——把 outlier 多的块和 outlier 少的块交错配对，重新分块后再做第二次块对角旋转。整个 pipeline 变成: =R1 -> P -> R2= ，三步走。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"data-agnostic 摊均"升级成"data-aware 针对性摊均"，理论上更高效——不浪费能力在没问题的通道上。
+
+但代价显眼：在线推理时要算两次块对角矩阵乘法 + 一次置换。block 越小（比如 32），开销越大；block 越大（比如 256），block-diagonal 越接近 dense rotation，能效优势越弱。
+
+更关键的：*为什么需要 zigzag + 第二个旋转* ？深层原因是——integer quantization 用的是 per-token 或 per-channel scaling，整个张量共用一个或一组 scale，所以一个块里的极端值会"污染"整个 scale 范围。跨块方差必须压平。这是 INT4 时代的语境下做出的设计——当时还没有 per-block scale 的硬件。
+
+** 2026 | DuQuant++（本文）: 硬件变了，砍掉一半步骤
+
+*** 它看到了什么问题
+
+到 2025-2026，硬件局面变了。NVIDIA Blackwell tensor core 原生支持 MXFP4——一种把张量分成 32 元素一块、每块带一个独立 E8M0 scale 的 FP4 格式。这意味着：
+
+- 每个块自己管自己的 scale——一个块的 outlier 只影响这个块的 31 个邻居，不影响下一个块
+- 跨块方差不再是问题——本来就是每块独立 scale
+
+DuQuant 设计里的 zigzag permutation + 第二次旋转，整个目的就是为了对付跨块方差。但在 MXFP4 下，*这个问题根本不存在了* ——你为不存在的问题付了一份开销。
+
+同时另一边：MR-GPTQ / BRQ 这些 2025 年的工作把 Hadamard 旋转搬到 MXFP4 块上（block=32），用对了硬件粒度，但又退回到 data-agnostic——丢掉了 DuQuant 的 outlier-aware 优势。
+
+整个局面是：DuQuant 有正确的 outlier-aware 思路但 pipeline 过度；MR-GPTQ 用了正确的块大小但又是 data-agnostic。两边都没把对方的好处拿全。
+
+*** 它的解法
+
+把 DuQuant 的 outlier-aware 块对角旋转，块大小直接对齐 MXFP4 group size: =B = 32= 。然后：
+
+1. *扔掉 zigzag permutation* ——MXFP4 自带跨块隔离，不需要跨块摊
+2. *扔掉第二个旋转* ——一个块就是一个 MXFP4 group，一次摊均就够了
+3. 加上一个 SmoothQuant 风格的对角 smooth 矩阵 Λ，先把 normal outliers 搬一部分到权重——再用 outlier-aware 旋转处理 massive outliers
+
+最终公式: =Y = (X * Λ^-1 * R) @ (R^T * Λ * W)= ——一次 smooth + 一次旋转。
+
+R 的构造和原 DuQuant 一样：贪心找最大 outlier 通道，构造旋转分散其能量，迭代。但因为 B=32 比原来的 B=128/256 小得多，单次旋转矩阵乘法本身也便宜。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉上是这样：
+- DuQuant 的"针对性旋转"是真有用的核心
+- DuQuant 的"双旋转 + 置换"是为 INT4 时代的跨块方差打的补丁
+- MXFP4 自带 per-block scale，补丁不需要了
+- 砍掉补丁，留下核心——半成本，全收益
+
+实验上：LLaMA-3-8B 在 MXFP4 W4A4 下做到 6.88 perplexity（FP16 是 6.14），平均 zero-shot 67.1%，比最强 baseline MR-GPTQ 高 1.0%；在 LLaMA-3.2-3B 上把 QuaRot 的 17.95 perplexity 压到 8.87，相对改进 50%+。
+
+留下的口子：
+- 旋转 R 是从校准集贪心找的——能不能进一步学习（learnable rotation）？
+- B=32 是 MXFP4 钉死的，未来如果出现 NVFP4 (B=16) 或者其他粒度，需要重新设计
+- smooth + rotation 是顺序的——能不能联合优化？
+
+* 前沿延伸
+
+DuQuant++ 是 2026-04 的论文，正在被同时代多个工作并列改进/对比：
+
+- *MR-GPTQ* (Egiazarian et al. 2025)：把 GPTQ 的误差补偿和 block-wise Hadamard 旋转结合，专为 MXFP4 优化。DuQuant++ 论文里把它当作最强 baseline 来超越
+- *BRQ* (Shao et al. 2025)：调研了把 PTQ pipeline 适配到 MXFP4 的标准做法，建议用块对角 Hadamard——和 MR-GPTQ 同一条路子
+- *MicroMix* (Liu et al. 2025)：另一个方向——识别敏感通道，给它们用更高精度的 MXFP kernel。和"旋转打散"思路互补，可以叠加
+- *FlatQuant* (Sun et al. 2024b)：学习端到端旋转矩阵——比 DuQuant 的贪心搜索更激进，但训练开销大。在 MXFP4 上的适配还是 open question
+- *NVFP4* (Alvarez et al. 2025)：另一种微缩放格式，block=16，scale 用 FP8 (E4M3) 表示。比 MXFP4 更细，理论上 outlier 影响更小——但 DuQuant++ 的思路应该可以平移
+
+下一步最可能的方向：
+1. *学习的 outlier-aware 旋转* ——把贪心搜索换成可微优化，在校准集上端到端训
+2. *跨格式统一的旋转设计* ——一个方法同时支持 MXFP4 / NVFP4 / MXFP6 / 自定义块大小
+3. *和 KV cache 量化的联动* ——KV cache 用 MXFP4 时也有同样的 outlier 问题，旋转思路可以平移
+
+* 一张图看懂
+
+#+begin_example
+        outlier 的视角                 工具的视角
+        -------------                  -----------
+[2022] LLM.int8()       "outlier 是不可解决的"        混合精度 (FP16+INT8)
+                                |                       拒绝量化 outlier
+                                v
+[2023] SmoothQuant      "outlier 可以挪到权重"        per-channel 对角缩放
+                                |                       数学等价的搬运
+                                v
+[2024] QuaRot           "outlier 可以摊到所有通道"     Hadamard 旋转
+                                |                       data-agnostic 摊均
+                                v
+[2024] DuQuant          "outlier 可以针对性摊均"       块对角旋转 R1 + P + R2
+                                |                       data-aware, 但三步走
+                                |                       (P + R2 是为了跨块方差)
+                                v
+[2025] MR-GPTQ / BRQ    "把 Hadamard 搬到 MXFP4 块"   block-Hadamard (B=32)
+                                |                       退回 data-agnostic
+                                v
+[2026] DuQuant++ (本文)  "MXFP4 让跨块方差自动消失"     单次 outlier-aware 旋转
+                         "DuQuant 的 P+R2 是过度设计"   (B=32) + smooth
+                                                       data-aware + 半成本
+
+时间 ------------------------------------------------------------>
+
+演化主线: outlier 处理一路从"绕开" -> "搬运" -> "摊均" -> "针对性摊均"
+         每代往前一步，但 DuQuant++ 是一次反向操作——
+         意识到上一代的复杂度是被淘汰的硬件假设逼出来的，
+         硬件变了，复杂度就该卸掉
+#+end_example
+
+* 洞见
+
+这条线读到最后，能看到两个并行的演化：*算法在变聪明，硬件在变贴合* 。而最有意思的事情发生在这两条线交叉的时候——*算法过去为了弥补硬件粗糙做的复杂设计，会因为硬件变细而显得过度* 。
+
+DuQuant 的 zigzag permutation + 双旋转，本质上是在 INT 量化时代用一个全局 scale 的语境下"自找补救"的设计。当 MXFP4 把 scale 切到 32 元素一块时，这个补救的前提就消失了。整个 pipeline 必须重新审视——而不是机械地"把 DuQuant 套在 MXFP4 上"。
+
+这指向一个更普遍的现象：*算法的复杂度往往是当时硬件假设的影子* 。当你看到一个解决方案有多个步骤时，先去问一个问题：每一步是在解决什么子问题？这些子问题在新硬件/新格式下是否还存在？经常会发现一半的步骤是"为不存在的问题付的税"。
+
+具体到 LLM 量化这条线，深层的认知转变是：
+
+- *2022* : outlier 是病，能避就避
+- *2023* : outlier 是可搬运的对象，挪一挪就好
+- *2024* : outlier 可以被数学操作消解（旋转 = 散开）
+- *2026* : outlier 的"破坏力"取决于 scale 的粒度——硬件给细粒度 scale，算法就该简化
+
+第三层（QuaRot/DuQuant）是真正的算法突破。第四层（DuQuant++）是硬件让算法变得更简单的清算。
+
+下一步要发生的事情大概率是：
+
+1. 硬件 scale 粒度继续细化（NVFP4 已经 B=16），算法侧的复杂度会继续被卸掉
+2. 在 W4A4 已经被攻克的基础上，下一战场是 W3A3 或 W4A4-KV4（KV cache 也量化）
+3. "可学习的 outlier-aware 旋转" + "硬件友好的 block 对齐"会合并成一个新的标准做法
+
+* 启发
+
+对做研究的启发，三件事：
+
+1. *重新审视前一代的复杂度* 。看到一个 pipeline 有多个步骤时，问每一步在补救什么。新硬件/新格式很可能让一些补救变得多余。DuQuant++ 的全部贡献，本质上是 "看见 P 和 R2 不再被需要"，而这是因为 MXFP4 这个外部条件变了
+
+2. *把硬件原语当作设计变量* 。MXFP4 的 B=32 不是"约束"，是"杠杆"——它让块内独立 scale 成为免费功能。设计算法时，不要假设硬件是固定的；问"如果我的算法块大小和硬件块大小对齐，会发生什么"。常常会发现一些以前要靠软件解决的事情，硬件本来就管了
+
+3. *Data-agnostic 是退步* 。这条线上的真正高水位是 DuQuant 的 outlier-aware 设计；MR-GPTQ / BRQ 用 Hadamard 是"为了适配新硬件而退回到简单方法"——但 DuQuant++ 证明你完全可以同时拿到 outlier-aware 的精度和硬件友好的简洁。任何时候看到"为了用新工具，先放弃以前学到的细致信号"，几乎一定有空间把那个信号加回来
+
+这意味着你可以——下一次面对"用新硬件格式重做老问题"时，不要把老方法机械搬过来，也不要重起炉灶。把老方法拆成"核心 idea"和"为旧硬件做的补丁"，砍掉补丁，把核心 idea 装到新硬件原语上。这个动作本身就是一篇好论文。

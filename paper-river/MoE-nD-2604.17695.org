@@ -1,0 +1,226 @@
+#+title:      MoE-nD: Per-Layer Mixture-of-Experts Routing for Multi-Axis KV Cache Compression
+#+date:       [2026-05-28 Thu 14:15]
+#+filetags:   :paper:river:
+#+identifier: 20260528T141502
+#+source:     https://arxiv.org/abs/2604.17695
+#+authors:    Libo Sun, Peixiong He, Po-Wei Harn, Xiao Qin
+#+venue:      arXiv 2604.17695 (cs.LG), Apr 2026
+
+* 问题之河
+
+一个开了上下文窗口的大模型，往里塞个 16k token 的文档，显存就被一坨叫 *KV cache* 的东西吃光了。这玩意是模型在算注意力时缓存下来的「我刚才看过哪些字」，序列越长它越胖，胖到 OOM。问题是：你怎么把这块缓存压缩 10 倍、20 倍，又不让模型变傻？
+
+这条线难就难在它有 *四个方向* 可以压：
+1. 沿 *序列* 方向砍——扔掉一些 token，叫 eviction
+2. 沿 *精度* 方向砍——每个数从 16 位变成 4 位，叫 quantization
+3. 沿 *头维度* 方向砍——把 head 投影到低秩
+4. 沿 *层* 方向砍——相邻层共享 KV
+
+每一代研究都在某一个方向上挖到底，挖完发现单挖一个方向有上限。然后下一代人就跳到下一个方向。这条河流到 2026 年，终于有人问：*为什么每层都用同一种压法？不同层难道不该用不同的压法吗？*
+
+* 溯源地图
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | 看到的问题: 长序列推理 OOM，sliding window 一旦丢了开头的几个
+  |           token，整个注意力崩盘
+  | 解法: 永远保留头 4 个 token (attention sinks) + 最近的窗口
+  | 留下的坑: 中间内容全丢，问答类任务做不了
+  v
+[2023] H2O (Zhang et al., NeurIPS)
+  |
+  | 看到的问题: 不能只看位置，得看哪些 token 真的"有用"
+  | 解法: 用历史 attention score 累加，挑出"重击者" (heavy hitters)
+  | 留下的坑: 累加到当前位置才知道谁重要，但那时已经晚了
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | 看到的问题: H2O 用所有历史 query 打分，噪声大；其实只有
+  |           "靠近 query 的最近一段"能预测哪些 KV 重要
+  | 解法: 用一个"观察窗"在 prefill 末尾打分，一次决定整段历史的留弃
+  | 留下的坑: 全模型用同一个 budget——但深层和浅层需求根本不同
+  v
+[2024-25] AdaKV / PyramidKV / KVTuner (并行三股)
+  |        +-- AdaKV/PyramidKV: 每层不同的"留多少 token" (eviction 上做)
+  |        +-- KIVI/KVQuant:     KV 量化到 INT4/INT8 (所有层统一 bit 数)
+  |        +-- KVTuner:          每层不同的"量化几 bit" (quantization 上做)
+  |
+  | 共同看到: 每层敏感度不一样，统一配方是浪费
+  | 各自的坑: 只在自己那条轴上做 per-layer 路由，
+  |          eviction 和 quantization 两条轴还是各管各的
+  v
+[2026] MoE-nD (Sun et al.)  <-- 本文
+         联合路由：每层同时决定 (留多少 token, K 几 bit, V 几 bit)
+         在一个全局显存预算下，由一个 greedy solver 解出来
+#+end_example
+
+注：本图只画"直系祖先"链。MoE-nD 还引用了 Scissorhands、R-KV、TriAttention、MiniKV、ASVD、CLA、Shazeer 的 MoE 等旁系，省去不画。
+
+* 演化叙事
+
+** 2023 | StreamingLLM: 抓两头，扔中间
+
+*** 它看到了什么问题
+
+最朴素的长序列推理做法是 *sliding window* —— 只保留最近的 N 个 token 的 KV cache。听起来很对：人读到第 10000 字，大概率也忘了第 1 字。但 StreamingLLM 的作者发现，一旦 window 滑过开头的前几个 token，整个模型的 perplexity 直接爆掉。
+
+原因有点反直觉：transformer 训练时，开头那几个 token 因为没有更早的 context 可以注意，被迫成为了一个"注意力垃圾桶"——后面所有层都在偷偷把多余的 attention 倒给它们。这几个 token 一丢，每层都失去了泄压阀，注意力分布整个塌方。
+
+*** 它的解法
+
+简单粗暴：永远保留前 4 个 token (=attention sinks=) + 最近的 N 个 token，中间全扔。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它直接利用了 transformer 的一个机制 bug——把垃圾桶留住，模型就稳了。问题也很明显：*中间内容全丢*。你能流式聊天，但你不能问"文档第 3000 字讲了什么"。下一步必须想办法识别"中间哪些 token 值得留"。
+
+** 2023 | H2O: 让分数说话
+
+*** 它看到了什么问题
+
+StreamingLLM 用 *位置* 决定留谁——这是个粗糙的代理。真正应该留的是"对未来生成有用"的 token，跟位置没必然关系。
+
+*** 它的解法
+
+H2O 提出：在生成过程中，*持续累加每个 KV 收到的 attention score*。分数高的就是"重击者" (heavy hitters)。当 cache 超过预算，扔分数最低的。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+attention score 本身就是"模型认为这个 KV 多重要"的信号——比位置直接得多。但 H2O 是 *在线* 决定的：得等到第 t 步才能用前 t-1 步的累加分数来决定第 t 步要不要扔。一段长 prompt 一进来你就得做决定，但你还没开始生成，根本没有 attention 历史。
+
+** 2024 | SnapKV: 一次定生死
+
+*** 它看到了什么问题
+
+H2O 累加全部历史 query 的 attention 分数，把"很久以前的 query 觉得这个 token 重要"也算进去。SnapKV 的发现是：*只有靠近当前 query 的最近一小段*，对"未来哪些 KV 会被用到"有预测能力。更早的累加分数纯属噪声，反而拖低准确率。
+
+*** 它的解法
+
+在 prefill 结束时，留一个长度大约 32 的"观察窗" (observation window)，用这段窗口对前面所有 KV 算 attention，*一次性决定整段历史里谁留谁扔*。决定完就冻结，generation 阶段不再改。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"在线累加"变成"prefill 末尾一次拍板"，又快又准。但 SnapKV 给每一层用同一个 keep ratio——比如全模型都"留 25%"。深层 transformer 处理的是更抽象的全局信息，浅层处理 token 级局部模式，凭什么用同一个预算？
+
+** 2024-25 | AdaKV / PyramidKV / KVTuner: 三股力量同时撬动"per-layer"
+
+这三篇并行出现，从不同角度撬动同一个假设：*所有层一视同仁是错的*。
+
+*** AdaKV / PyramidKV: eviction 端的 per-layer
+
+它们都观察到 transformer 越深的层注意力越集中（attention entropy 越低），需要的 token 数越少。于是把全模型预算 *按层分配* —— 浅层留多，深层留少，金字塔状递减。比 SnapKV 一刀切高出几个点。
+
+*** KIVI / KVQuant: 另一条轴上的努力
+
+完全不在 eviction 上做文章，而是 *把每个 KV 数值从 16 位压到 4 位*。配合一些精巧的 channel-wise 量化技巧，能把缓存压 4 倍，精度几乎不掉。但所有层用同一个 bit 数。
+
+*** KVTuner: 把 per-layer 思路搬到 quantization
+
+既然 eviction 上不同层敏感度不同，quantization 上是不是也这样？KVTuner 离线测一遍每层对不同 bit 数的敏感度，然后用一个 *greedy solver* 在全局显存预算下，给每层分配 K 几 bit、V 几 bit。
+
+*** 这三股力量共同留下的坑
+
+每个人都在自己的一条轴上做了 per-layer 路由，但 *没有任何人把两条轴放在一起路由*。AdaKV 只动 eviction，KVTuner 只动 quantization。如果某一层"用 50% eviction"和"用 INT4 quantization"占的内存差不多，但 *准确率代价天差地别* —— 这时候你需要联合决策，而不是各管各的。
+
+这就是 MoE-nD 的出发点。
+
+** 2026 | MoE-nD: 把所有轴打进同一个路由器
+
+*** 它看到了什么问题
+
+作者做了一个关键的离线实验——在 DeepSeek-R1-Distill-Qwen-7B 28 层上，对每一层 *单独* 应用一种压缩操作（比如"只给第 6 层做 50% eviction"），测量这一层造成的 attention 输出 L2 误差。结果震撼：
+
+- *aggressive eviction (75%, 90%)*: 最敏感的层和最不敏感的层，误差差 ~548-689 倍
+- *K 量化到 4 bit*: 跨层差 15 倍
+- *V 量化*: 跨层差只有 1.2-1.6 倍 (V 几乎可以无脑统一量化)
+- *最关键的*: 同样占一半内存的 evict_50% 和 K_quant_4，在 L00 上"eviction 比 quant 便宜 2.2 倍"，在 L06 上"quant 比 eviction 便宜 10 倍"——*两条轴的偏好在不同层完全反过来*
+
+这意味着：单轴 per-layer 路由（AdaKV / KVTuner）能利用一条轴的层间差异，但 *没法处理"这层该用 eviction，那层该用 quant"这个跨轴的判断*。
+
+*** 它的解法
+
+把它包装成一个 *mixture-of-experts*：每层有三个旋钮——keep_ratio (eviction 强度)、K_bits、V_bits，每个旋钮就是一个"expert"。
+
+离线阶段：跑一遍 sensitivity table，记录"在层 ℓ 上用配置 c，造成多少 attention 误差"。
+
+在线阶段：用一个 *greedy solver*（其实就是 KVTuner 的 greedy 拓展到三轴），从最便宜的配置开始，每次给"性价比最高的层"升级一档——单位内存换来的误差下降最大的那一层。直到打满全局预算。
+
+推理阶段：每层用自己的配置压一次，整个塞进一个 *统一的 attention patch* —— 因为不同层 cache 长度不同，positions 也不同，需要特殊处理 RoPE。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+关键在于它 *承认了两条轴在每层的耦合性*。在 LongBench 16k 上，MoE-nD 的 hetero 变体在 14 倍压缩 (136MB) 下匹配 1.9GB 的全精度 baseline；其他单/双轴方法在相近预算下掉到 8/100 以下。AIME 推理测试上比最强的 per-layer-quantization baseline 高 +6 到 +27 分。
+
+但作者诚实标了两个 *null result*：MATH-500 和 LongBench-TREC 上 MoE-nD 没赢。原因有原则性：这两个任务输入短，预算松，greedy solver 在大多数层都选 keep=1.0——hetero 退化成 uniform，自然没优势。这个 null result 反而干净地划定了方法的适用边界：*per-layer 路由的红利只在"预算紧"时才出现*。
+
+留下的新坑：solver 是 greedy 的，不是全局最优；sensitivity table 用单个 27-token 短 prompt 校准（虽然他们 post hoc 验证了和 8 条 2048 序列的 KL 校准 Pearson 0.945 相关），但跨模型、跨任务是否稳健没说清；low-rank (ASVD) 和 cross-layer sharing (CLA) 这两轴还没纳入路由。
+
+* 前沿延伸
+
+截至 2026 年 5 月，MoE-nD 刚于 4 月放出 (v1)，*还没有公开的后续工作直接批判或改进它*。可能的下一步方向（推测，非引用）：
+
+1. *把 low-rank 和 cross-layer 也纳入路由* —— 作者自己说"内部实验中这两轴和 GQA 配合不好"，但这本身是个待解的工程问题，不是终极理论限制
+2. *把 greedy 换成 learned router* —— sensitivity table 只反映"单层单配置"的局部敏感度，没建模"层间交互"。一个学到的路由器可能能跨层联合优化
+3. *动态 routing* —— 当前路由是离线静态决定，未来可能根据当前 query 动态调整每层预算
+
+* 一张图看懂
+
+#+begin_example
+                              KV cache 压缩这条河的演化
+   时间 -->
+   2023 ............ 2024 ............ 2025 ............ 2026
+
+   StreamingLLM     SnapKV          AdaKV/PyramidKV     MoE-nD
+   "位置粗暴留"   "观察窗一次定"  "每层不同 budget"   "每层联合多轴"
+       |               |                |                  |
+       v               v                v                  v
+   +-------+       +-------+        +-------+         +---------+
+   |sink   |       |obs win|        | layer |         | layer + |
+   |+window|       |  +    |        |aware  |         | axis    |
+   |       |       |snap   |        |evict  |         |joint    |
+   +-------+       +-------+        +-------+         |routing  |
+                                                      +---------+
+                                          ^                ^
+   H2O ----------------------------------+                 |
+   "attention score 累加"                                  |
+                                                           |
+   KIVI/KVQuant ---------> KVTuner ------------------------+
+   "统一 INT4/8 量化"      "每层不同 bit 量化"
+
+
+   ===================== 维度演化 =====================
+
+   留谁 (sequence):  位置 ---> score ---> obs-win ---> per-layer keep
+   多少位 (precision):  16 bit -------------------> per-layer K/V bit
+   联合 (cross-axis):              没人做       <- MoE-nD: 单一 solver
+
+   ===================== 核心赌注 =====================
+
+   旧赌注: "压一个轴，所有层都用同一配方"
+   MoE-nD: "在所有轴上，每层自己挑配方，由全局预算统一约束"
+#+end_example
+
+* 洞见
+
+这条河流到 MoE-nD 这里，*表面上*是"又多了一篇 KV 压缩的论文"，*骨子里*是一个深刻的认知转变：
+
+*从"找最好的统一配方"到"承认配方本来就该不统一"*。
+
+整条线 2023-2025 都在一个隐含假设下做事：*存在一个最好的 KV 压缩配方*，我们的任务是找到它。StreamingLLM 找到"sink+window"，H2O 找到"heavy hitter"，SnapKV 找到"observation window"，KIVI 找到"channel-wise INT4"。每个都在赌"这个机制是普适的"。
+
+直到 AdaKV/KVTuner 开始动摇这个假设：*也许不同层就是要不同对待*。但他们还半信半疑——只敢动一条轴。
+
+MoE-nD 把假设彻底掀了：不只是"不同层要不同对待"，而是 *"不同层不仅留多少不同，连用哪种压法都不同"*。模型不再是一个等价的层堆叠，而是 *28 个性格迥异的专家*，每个专家需要不同的减肥方案。
+
+这个转变其实和 *Mixture-of-Experts 在模型架构层面发生的事一模一样* —— 都是承认"一刀切是优化的偷懒"。MoE-nD 名字里带 MoE 不是凑热闹，是在做 *推理时的 MoE*：把"每层的压缩配置"当作 expert，由一个 router 在全局预算下分配。
+
+下一步会去哪？最有可能的是 *router 本身变得可学*。当前 greedy solver 是基于"单层单操作"的局部敏感度，没建模"压了第 6 层之后第 7 层的敏感度会怎么变"。一旦把跨层交互、跨任务自适应建进来，就是 *learned dynamic KV compressor* —— 那大概会催生下一代 baseline。
+
+* 启发
+
+*能用的启发：* 在你做任何"全局统一参数"的优化时，停下来问一次："这个参数真的应该全局统一吗？" 整个 ML 系统里 *全局统一参数* 是个最大的偷懒——learning rate、weight decay、batch norm momentum、prune ratio、quantization bit... 每一个都是 MoE-nD 故事在不同领域的重演。
+
+*怎么找问题的启发：* 这篇论文的 *出发点不是新方法，是一个观察实验* —— "我把同一种压法逐层施加，每层造成多少误差？" 这个实验做完，新方法几乎是自动浮现的。*先做实验暴露异质性，再设计方法利用异质性* —— 这是个比"读论文找 gap"更高产的研究模式。
+
+*关于诚实的启发：* 这篇论文给两个 null result 留了一节，并解释清楚为什么。这不是"自曝其短"——这是 *划定方法的适用域*。一个被划定了边界的方法，比一个"什么都能赢"的方法更可信，也更可被引用。

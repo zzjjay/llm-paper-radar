@@ -1,0 +1,273 @@
+#+title:      SAW-INT4: System-Aware 4-Bit KV-Cache Quantization for Real-World LLM Serving
+#+date:       [2026-05-28 Thu 14:30]
+#+filetags:   :paper:river:quantization:kvcache:serving:
+#+identifier: 20260528T143000
+#+source:     https://arxiv.org/abs/2604.19157
+#+authors:    Jinda Jia, Jisen Li, Zhongzhu Zhou, Jung Hwan Heo, Jue Wang, Tri Dao, Shuaiwen Leon Song, Ben Athiwaratkun, Chenfeng Xu, Tianyi Zhang, Xiaoxia Wu (Together AI)
+#+venue:      arXiv preprint, 2026-04-21
+
+* 问题之河
+
+LLM 推理服务里有个越来越疼的瓶颈：KV cache。每生成一个 token，模型都要把之前所有 token 的 key 和 value 缓存起来，下一步才能算 attention。上下文越长，这块缓存越大——Llama 4 Scout 模型本身只有 218GB，跑一个 10M token 的请求要 1.8TiB 的 KV cache，是模型本身的 8 倍。
+
+很自然的想法：把 KV cache 量化到 4-bit，省 4 倍内存，能并发服务更多用户。但这条路上有一系列拧巴的问题：
+
+- 直接 INT4 量化（naive RTN）一上来就崩——某些模型直接吐零分
+- 学术界提出了一堆补救方法，offline 跑 benchmark 漂亮——但塞进真实的 serving 系统（vLLM、SGLang、TensorRT-LLM）后，要么和 PagedAttention 的分页内存打架，要么破坏 FlashAttention 的融合 kernel，端到端 throughput 反而掉
+- 越来越复杂的方法（vector quantization、Hessian-aware、learned codebook）在论文里继续刷点，但和"能在生产环境跑"渐行渐远
+
+这条线就是在反复绕一个问题：*offline 精度*、*压缩率*、*serving 系统约束* 这三件事怎么同时满足。SAW-INT4 是这条线上一篇"反卷"的论文——它不发明新方法，它去问：在 serving 约束下，到底哪个方法真的能用？答案出人意料地朴素。
+
+* 溯源地图
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | 问题: 直接量化 LLM 到 8-bit 会崩。原因不是权重，
+  |       是少数几个激活通道有几百倍于其他通道的"异常值"
+  | 解法: 把异常值通道挑出来用 FP16 算，其他用 INT8
+  | 残留: 混合精度破坏 GPU 算子规整性；只解决到 8-bit
+  v
+[2023] SmoothQuant (Xiao et al.)
+  |
+  | 问题: LLM.int8() 的混合精度太丑——能不能让所有
+  |       激活都规规矩矩地 INT8？
+  | 解法: 把激活的"难"按通道迁到权重上——给激活除一个
+  |       per-channel scale，给权重乘回来。激活变温顺，
+  |       权重虽然变难一点但反正是离线的
+  | 残留: 仍然是 weight + activation 量化的思路，
+  |       KV cache 这块没专门处理。而且只解到 8-bit
+  v
+[2024] KIVI (Liu et al.)
+  |
+  | 问题: KV cache 有自己的特点：key 的异常值沿"通道"
+  |       分布，value 的异常值沿"token"分布。
+  |       一套量化粒度不可能两边都好
+  v 解法: key 用 per-channel 量化，value 用 per-token
+  |       量化；再加一个固定长度的 FP16 residual buffer
+  |       缓冲最近的 token，等攒够一个 group 再量化
+  | 残留: residual buffer = 同一块 KV cache 里有
+  |       FP16 + INT2/INT4 两种精度，和 PagedAttention
+  |       的"每页统一精度"前提冲突
+  v
+[2024] QuaRot (Ashkboos et al.) + SpinQuant (Liu et al.)
+  |
+  | 问题: 异常值其实是"分布形状不好"造成的——能不能
+  |       直接换一个坐标系，把分布从尖刺变成均匀？
+  | 解法: 在量化前对激活/权重/KV 做一个正交 Hadamard
+  |       旋转。旋转后分布趋近高斯，异常值被"摊平"。
+  |       SpinQuant 进一步在 Stiefel 流形上学最优旋转
+  | 残留: 用的是 full Hadamard——对一整个 head_dim
+  |       维度做旋转。在 head_dim = 128 时还行，但是
+  |       (1) 没考虑融进 FlashAttention 的开销，
+  |       (2) 没考虑 PagedAttention 的分块布局
+  v
+[2026] SAW-INT4 (本文, Together AI)
+  |
+  | 看到的问题: QuaRot 的 full Hadamard 旋转、KIVI 的
+  |             mixed-precision residual、各种 vector
+  |             quantization——offline benchmark 漂亮，
+  |             一塞进 vLLM 就出事：要么 throughput 没
+  |             改善，要么直接破坏 fused kernel
+  | 解法: (1) 用 block-diagonal Hadamard——只在小块
+  |       (16-64 维) 内旋转，开销几乎为零
+  |       (2) 旋转和 INT4 量化融成一个 CUDA kernel，
+  |       直接嵌进 PagedAttention 的分页布局
+  |       (3) 砍掉 residual buffer、砍掉 codebook 查表、
+  |       砍掉 Hessian——只留旋转 + 简单 token-wise INT4
+  | 立场: 与其再造新方法，不如证明"在 serving 约束下，
+  |        最简单的可行方法就是最好的"
+#+end_example
+
+注：QuaRot 和 SpinQuant 是同一思路的两个版本（randomized vs learned rotation），SAW-INT4 把它们打包成"rotation"这一类来对比。KIVI 和 QuaRot 是 KV 量化的两条平行路线——一条加复杂度（mixed-precision + per-channel/per-token），一条做几何变换（旋转）。SAW-INT4 的实验结论是后者赢。
+
+* 演化叙事
+
+** 2022 | LLM.int8(): 量化不崩的关键，是认识到"异常值"这件事
+
+*** 它看到了什么问题
+
+在 LLM.int8() 之前，大家以为 INT8 量化是个解决了的问题——CNN 早就这么干了。等到把 OPT-175B 这种大模型量化下来，崩了。崩的原因不是大家预期的"模型太大太敏感"，而是一件具体的事：随着模型规模上去，少数几个激活通道的幅度会涨到其他通道的几百倍。INT8 把整个张量映射到 256 个格子里，这几个异常通道吃掉了所有的动态范围，其他通道全被压成 0。
+
+*** 它的解法
+
+朴素到极致：把这些异常通道挑出来，用 FP16 单独算；剩下的用 INT8。两边算完结果相加。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它第一次把"LLM 量化的核心难点"定位到了一个具体的物体上——*激活异常值*。后面所有相关工作都在围绕这件事打转。但它留了一个尴尬的尾巴：mixed-precision。GPU 喜欢规整的、统一精度的张量运算，里面突然冒出几列 FP16 是非常难融进 fused kernel 的。所以 LLM.int8() 实测起来经常比 FP16 还慢。
+
+** 2023 | SmoothQuant: 别挑异常值——把"难"转移走
+
+*** 它看到了什么问题
+
+LLM.int8() 把异常通道单独处理，方法很笨——能不能让所有激活都规规矩矩落进 INT8？观察：异常值集中在激活上，权重是平的。如果两边的量化难度可以互换，把激活的难度匀一点给权重，激活就能均匀起来。
+
+*** 它的解法
+
+给每个通道引入一个 scale s。激活除以 s，权重乘以 s——数学上等价（矩阵乘法不变），但激活变温顺了，权重变难一点（但反正是离线量化的，多花点功夫无所谓）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"异常值是个属性"变成了"异常值是可以搬运的"。这个观点很重要——它打开了"通过数学变换让分布变好"的思路，后来的 QuaRot 是这条思路的极致版。但 SmoothQuant 只解到 8-bit、只关心 weight + activation，KV cache 的特殊问题还没人专门处理。
+
+** 2024 | KIVI: KV cache 不是激活——key 和 value 的"难"长在不同方向上
+
+*** 它看到了什么问题
+
+KV cache 量化和 weight/activation 量化不一样。KIVI 的核心观察：key 的异常值集中在某些 channel（embedding 维度）上，沿着 channel 排成一列；value 的异常值集中在某些 token 上，沿着序列方向排成一行。两个张量异常值的"几何方向"是正交的。
+
+那如果你用同一种量化粒度（比如都 per-token），key 那一边的 channel 异常值会撑爆整个 token 的动态范围。反过来 per-channel 也是一样。
+
+*** 它的解法
+
+把粒度拆开：*key 用 per-channel 量化*（沿 channel 维度独立），*value 用 per-token 量化*（沿 token 维度独立）。再加一个 trick——保留最近的几个 token 不量化，先在一个 FP16 的 *residual buffer* 里攒着，等攒够一个 group 才量化进低精度池。这样可以做到 2-bit。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度上确实漂亮。但 KIVI 是 *offline 思维* 的产物——它没考虑 serving 系统怎么管 KV cache。vLLM 这种系统用 PagedAttention：把 KV cache 切成固定大小的 page，每个 page 内必须是统一精度，page 之间可以拼接复用。
+
+KIVI 一上来就违反这个前提：一份 KV cache 里同时有 INT2 的"主体"和 FP16 的"residual"——要么两种精度共用一个 page pool（fragmentation 爆炸），要么各自一个 page table（管理复杂度爆炸）。fused attention kernel 也得重写——它本来假设输入是单一精度。
+
+结论：KIVI 在 offline benchmark 上很好看，但塞不进生产 stack。
+
+** 2024 | QuaRot / SpinQuant: 既然异常值是分布形状的问题，就直接换坐标系
+
+*** 它看到了什么问题
+
+回看 LLM.int8()、SmoothQuant、KIVI——它们都在 *管理* 异常值（隔离、迁移、按维度切粒度）。但异常值的根本原因是分布形状不好——少数维度上幅度极大，大部分维度上接近零。能不能直接 *消除* 这种形状？
+
+数学上的答案是：可以。如果你对一个张量乘一个正交矩阵 R（比如 Hadamard 矩阵），它在每个新维度上的分量近似是原来各维度的随机线性组合——根据中心极限定理，会趋近高斯分布。异常值被"摊平"到所有维度上，每个维度都变得温顺。
+
+而且因为 R 是正交的，attention 的内积 q·k 计算在数学上完全不变（如果 q 和 k 都做同样的旋转）。
+
+*** 它的解法
+
+在量化前，对 Q、K、V（以及部分权重）做一次 Hadamard 旋转 R。旋转后做 INT4 量化。计算 attention 时，因为 Q 和 K 都被同一个 R 旋转过，q·k = q'·R^T·R·k' = q'·k'，结果不变。
+
+SpinQuant 更进一步：R 不一定要是固定的 Hadamard，可以在 Stiefel 流形上学一个更优的旋转。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是一次思路上的真正升级：从"处理异常值"到"让异常值不再存在"。在 4-bit weight + activation + KV 这个最难的设置下，QuaRot/SpinQuant 把精度拉回到接近 BF16。
+
+但留下两个工程口子：
+1. *Full Hadamard 的开销*。整个 head_dim（通常 128）维度都参与旋转——decoding 阶段每个 token 都要做一次 128×128 矩阵乘，attention 本来是 memory-bound 的，多这一刀让 latency 涨。
+2. *没考虑 PagedAttention 的分块布局*。论文里的实现是 standalone 的旋转算子，不是融进生产 kernel 的。
+
+** 2026 | SAW-INT4 (本文): 把旋转切小，把它融进系统
+
+*** 它看到了什么问题
+
+到 2026 年初的局面是：KV cache 量化的方法已经一大堆——KIVI 系（mixed-precision + 异粒度）、vector quantization 系（codebook 查表）、Hessian-aware 系（用二阶信息细调）、QuaRot 系（rotation）——offline benchmark 表越填越满。但作者跑了一圈实测，发现：
+
+- KIVI/Kitty 的 residual buffer 跟 PagedAttention 打架
+- Vector quantization 的 codebook 查表带来不规则内存访问，GPU 不喜欢，每个 decoding step 都加 latency
+- Hessian-aware 要 calibration 数据 + 离线 EM，部署复杂度高，最终精度只比旋转好一点点
+- QuaRot 的 full Hadamard 在 head_dim=128 上虽然不大，但 fused 不进 FlashAttention 就是性能损失
+
+更刺眼的对比：*table 1 显示，naive INT4 直接拿 0 分（模型完全崩），但 BDR (block-diagonal rotation) + INT4 就能拿到 73.78 的精度，接近 BF16 的 75.64*。也就是说：rotation 这一个东西就把所有问题的 90% 解决了。再加 vector quantization、再加 Hessian-aware，多的那点精度都是边际收益，但部署复杂度全是真的。
+
+*** 它的解法
+
+如果你把 QuaRot 拿过来，把 head_dim 维度的 Hadamard 切成几个小块（比如把 128 维切成 8 个 16 维的小块），每个小块内部独立旋转——你就得到 *block-diagonal Hadamard*。整体仍然是正交矩阵，旋转效果几乎不变（因为异常值多半也是局部的），但矩阵乘从 128×128 降到 16×16 八次——开销可以忽略。
+
+然后做三件 system-level 的事：
+1. 把 *rotation + INT4 quantization* 融成一个 CUDA kernel
+2. 让这个 kernel 直接吃 PagedAttention 的 paged KV layout
+3. 把它接进 FlashAttention 的 decoding 路径
+
+最后端到端测试：throughput 和 plain INT4 一致（measurement noise 内），精度恢复到接近 BF16。这是 KV cache 量化第一次做到"精度回来 + throughput 不掉"。
+
+*** 它的立场（也是它最值得读的地方）
+
+SAW-INT4 不发明新方法。它的核心论证是：*existing literature 已经把方法走过头了*。在 serving 系统的真实约束下，最简单的可行方案就是最好的——
+
+- 不需要 mixed-precision（坏 PagedAttention）
+- 不需要 codebook 查表（坏 memory access pattern）
+- 不需要 Hessian calibration（边际收益 < 部署复杂度）
+- 只需要 block-diagonal Hadamard rotation + token-wise INT4 + 一个融合 kernel
+
+这是一篇 *"砍掉一切非必要复杂度"* 的论文。
+
+*** 它留下的口子
+
+- *Block size 怎么选*？16、32、64 都有，论文给了消融，但跨模型/跨 head_dim 的最优 block size 是不是稳定？
+- *Block-diagonal 之外更高级的稀疏旋转*？比如 Butterfly transform、Walsh-Hadamard variants——能不能在同样开销下更好地"摊平"异常值？
+- *MLA / GQA 的特殊处理*？MLA 把 K 和 V 共享一个 latent space，rotation 的最优形状会不同
+- *FP8 KV 时代怎么办*？Blackwell 上 FP8 已经原生支持，rotation 是否还需要
+
+* 前沿延伸
+
+SAW-INT4 是 2026-04 的论文，目前还没出现明确"批 SAW-INT4"的后续工作。但同时期的几个动向值得跟：
+
+- *FP4 / NVFP4 硬件原生支持*：Blackwell 上 4-bit 浮点的 tensor core 已经落地，KV cache 量化从 INT4 转向 FP4 的趋势明确。SAW-INT4 的 block-diagonal rotation 框架可以直接套到 FP4 上
+- *Hadamard 替代品的探索*：Butterfly transform、structured sparse rotation 都在被研究——核心是想找到"开销更小、摊平效果更好"的旋转矩阵
+- *Attention sink / KV eviction 的复兴*：随着上下文长度突破 10M，纯量化已经不够了，需要和 eviction、selective attention 组合。SAW-INT4 是"per-token 都保留"的设计，eviction 是正交方向
+- *MLA-specific 的 KV 量化*：DeepSeek 系列推广 MLA 后，KV cache 的物理形状变了——latent 维度的 rotation 需要重新设计
+
+预测：下一步最可能的方向是 *block-diagonal rotation + FP4 + selective KV*——三件事在系统层组合，把"长上下文推理"的成本再砍一个数量级。
+
+* 一张图看懂
+
+#+begin_example
+                "管理异常值"派              "消除异常值"派
+                ----------------            ----------------
+ [2022] LLM.int8()  把异常 channel 挑出来用 FP16
+                       |        (mixed-precision: GPU 不爱)
+                       v
+ [2023] SmoothQuant  把激活的"难"按 channel 迁到权重
+                       |        (仍然 8-bit; 没碰 KV)
+                       v                              |
+ [2024] KIVI         KV 专用: key per-channel +       |
+                     value per-token + FP16 residual  |
+                     buffer                           |
+                       |   (residual 撞 PagedAttn)    |
+                       |                              |
+                       |                              v
+ [2024] QuaRot                            full Hadamard 旋转
+                       |                  让分布趋高斯
+                       |                  (开销没融进 kernel)
+                       |                              |
+                       +---------------+--------------+
+                                       |
+                                       v
+ [2026] SAW-INT4 (本文)   把 Hadamard 切成 16x16 小块 (block-diagonal)
+                          + 融成一个 CUDA kernel
+                          + 直接吃 PagedAttention 的分页布局
+                          + 砍掉所有 mixed-precision / codebook / Hessian
+
+                          结果: 精度从 0 -> 73.78 (BF16 是 75.64)
+                                throughput 和 naive INT4 一致
+
+ 时间 ---------------------------------------------------->
+
+ 演化的真正主线: KV cache 量化的核心矛盾是「offline 精度」 vs
+                「serving 系统约束」。前面几代一路加复杂度刷精度，
+                SAW-INT4 反向砍——证明 *rotation 一件事* 就够,
+                其他都是边际,而且都跟 serving stack 打架
+#+end_example
+
+* 洞见
+
+这条线读下来，最锋利的一个观察是：*学术 benchmark 的进步方向和工程 deployment 的进步方向，已经偏离了*。
+
+KIVI、vector quantization、Hessian-aware——每一代都在 offline benchmark 上多刷一两个点。但这些方法都假设你可以自由地：用 mixed-precision、做 codebook 查表、保留 residual buffer、跑 calibration 数据。这些假设在论文环境里是免费的，在 vLLM/SGLang/TensorRT-LLM 这种生产 stack 里全是禁词——因为它们都会破坏 PagedAttention 的分页前提，或者破坏 FlashAttention 的融合 kernel，或者两者都破坏。
+
+于是出现了一个尴尬的现象：*offline 精度更高的方法，end-to-end throughput 反而更低*。SAW-INT4 的 Table 1 把这个尴尬展示得很直白：KMeans (vector quantization) 在精度上漂亮，但 TPS/GPU 只有 366，是 naive INT4 的 30%；Hessian+BDR 比 BDR 多花了一倍的 calibration，端到端 throughput 还少一点。
+
+更深一层的观察：*正交旋转*这件事是一个非常优雅的"几何变换打败局部技巧"的样本。LLM.int8() 是局部技巧（挑异常值），SmoothQuant 是局部技巧（迁移异常值），KIVI 是局部技巧（异粒度量化）——它们都在"处理"异常值。QuaRot 引入正交旋转，是第一次直接换坐标系——异常值不存在了。SAW-INT4 进一步说：旋转还可以是稀疏的（block-diagonal），开销几乎为零。
+
+一般规律：*一个领域如果出现"系统层约束 vs 学术指标"的撕裂，往往就有一篇"把系统约束当作第一性原理"的论文等着颠覆*。SAW-INT4 就是这个模式的清晰样本——它的论证不是"我比 baseline 精度更高"，是"在系统约束下，baseline 们其实都不能用，最简单的方法反而最好"。
+
+下一步最可能的方向：把"system-aware"作为方法论而不是这一篇论文的标签，传播到 weight quantization、speculative decoding、agentic workflow scheduling——这些领域同样存在"学术 benchmark 和生产 deployment 已经偏离"的张力。
+
+* 启发
+
+对做研究/工程的启发，三件事：
+
+1. *系统约束不是事后考虑，是设计变量*。SAW-INT4 的方法论从一开始就把 PagedAttention 和 FlashAttention 的存在作为硬约束——这反而让方法变简单了（因为一大堆复杂方案直接被排除）。如果你在做 ML systems 工作，把生产 stack 的约束写进 method section 第一段，不要写进 limitations section
+2. *砍方法比加方法更值钱*。当一条研究线连续几年在加复杂度（KIVI 的 residual + 异粒度 + 异 bitwidth、vector quantization 的 codebook、Hessian-aware 的 calibration），停下来问：上一代的某个简单想法（比如 rotation），是不是只要工程化得好就已经够用？SAW-INT4 就是这个反问的产物
+3. *正交旋转是个被低估的工具*。在 ML systems 里，"换坐标系让分布变好"的思路远没穷尽——KV cache 是 SAW-INT4 的应用，activation 量化是 QuaRot 的应用，但 gradient compression、low-rank attention、sparse computation 都还有空间。任何看起来"分布形状很差"的地方，先试一下 Hadamard 旋转，再问下一步
+
+这意味着你可以——在做下一个 quantization / compression / sparsification 方法时，先问自己：(a) 我能不能砍掉一件事？(b) 这件事在生产 stack 里跑得动吗？(c) 有没有一个正交变换让问题变简单？这三个问题答对一个，就已经领先大多数 paper。

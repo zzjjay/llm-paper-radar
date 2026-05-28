@@ -1,0 +1,332 @@
+#+title:      MCAP: Deployment-Time Layer Profiling for Memory-Constrained LLM Inference
+#+date:       [2026-05-28 Thu 14:46]
+#+filetags:   :paper:river:quantization:llm:inference:offload:en:
+#+identifier: 20260528T144611-en
+#+source:     https://arxiv.org/abs/2604.21026
+#+authors:    Anurita Das (Genovation Technological Solutions)
+#+venue:      arXiv preprint, 2026-04-22 (v2 2026-04-24)
+
+* The River of the Problem
+
+How do you squeeze an 8-billion-parameter model into a GPU with only 4 GB of VRAM — without retraining, without re-running quantization calibration?
+
+The challenge splits into two sub-problems that have been addressed separately for the past decade:
+- *Precision* — Should a given weight use 4-bit, 8-bit, or 16-bit? Does it vary per layer?
+- *Placement* — Should this weight live in GPU VRAM, CPU RAM, or on an SSD? When should it be moved?
+
+The traditional approach: precision is fixed at calibration time (offline) and baked into the weight file — quantization done for one machine must be redone for another. Placement is managed by LRU or prefetch heuristics, with no signal about which weights actually matter. The two problems are solved by independent systems that have never been coupled.
+
+MCAP is an attempt at convergence along this "memory-constrained LLM deployment" line: a 60-second, 12-prompt, pure-forward-pass profiler computes a per-layer importance vector, which then drives both precision scheduling (W4A8 vs. W4A16) and residency tiering (GPU / RAM / SSD).
+
+To understand what it is doing, we need to return to the earliest source of this line — a fact that has been rediscovered many times: *in an LLM, every number, every channel, every neuron, every layer has a different level of importance*.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | Problem: Quantizing an LLM wholesale to INT8 collapses quality —
+  |          especially above the 6.7B scale
+  | Finding: Not all dimensions are equal: a tiny fraction of outlier
+  |          features (> 6 sigma) account for the bulk of quantization error
+  | Solution: Mixed precision — outlier dimensions in FP16,
+  |           the remaining 99.9% in INT8
+  | Key: First paper to tell the community clearly:
+  |      "Numbers in an LLM are not uniformly important"
+  v
+[2022] GPTQ (Frantar et al.)
+  |
+  | Problem: LLM.int8 only reaches 8-bit; practical need is 4-bit —
+  |          outlier isolation alone is insufficient at that level
+  | Solution: Quantize weights column-by-column using the inverse Hessian,
+  |           so each column's error compensates the next
+  | Key: "Importance" is formalized as per-column second-order sensitivity
+  v
+[2023] AWQ (Lin et al.)
+  |
+  | Problem: GPTQ's Hessian is expensive; in practice only ~1% of weight
+  |          channels truly matter, because of high activations
+  | Solution: Use activation statistics to find "salient channels";
+  |           scale them up before quantization to protect them
+  | Key: First to use *activation signal* rather than weight signal
+  |      to judge importance
+  v
+[2023] FlexGen (Sheng et al.)
+  |
+  | Problem: Quantization solves "fitting"; but a 70B model in full precision
+  |          simply does not fit — what then?
+  | Solution: Partition weights across GPU / CPU / SSD three tiers,
+  |           scheduling data movement to maximize throughput
+  | Residue: Placement is treated as a pure data-flow problem;
+  |          all weights are treated equally — no signal for
+  |          "which ones are important and should stay on GPU"
+  v
+[2024] PowerInfer (Song et al.)
+  |
+  | Problem: FlexGen treats all weights equally, ignoring the
+  |          activation-sparsity prior — most neurons never fire
+  | Solution: Train a per-model MLP predictor; at inference time predict
+  |           which neurons will activate; keep "hot neurons" on GPU,
+  |           offload "cold neurons" to CPU
+  | Residue: The predictor must be retrained whenever the base model changes;
+  |          it only governs placement, not precision —
+  |          precision is still handled separately (GPTQ / AWQ)
+  v
+[2024] LLM-in-a-Flash (Alizadeh et al.)
+  |
+  | Problem: Mobile devices have no CPU RAM headroom; only flash storage
+  | Solution: Stream weights from flash, combined with sparse-activation
+  |           prefetching
+  | Residue: Still the predictor + heuristics paradigm;
+  |          no unified "importance signal"
+  v
+[2026] MCAP / NVE (this paper, Anurita Das)
+  |
+  | Problems identified:
+  |   - PowerInfer's predictor is a "per-model trained extra component" —
+  |     invalidated whenever base weights are updated;
+  |     requires retraining to port across devices
+  |   - AWQ / GPTQ / EXL2 precision decisions are locked in at offline
+  |     calibration; changing devices means redoing everything
+  |   - Precision and placement are treated as two separate problems
+  |     driven by two independent systems — never coupled
+  | Solution:
+  |   1. A 60-second, 12-prompt, pure-forward profiler computes a
+  |      per-layer importance score (a 338-byte JSON file)
+  |   2. That single score drives *both* decisions simultaneously:
+  |      - Precision: important layers use W4A16, others use W4A8
+  |      - Placement: important layers on GPU, less important on RAM,
+  |        least important on SSD
+  |   3. Calibration result is architecture-keyed, not weight-keyed —
+  |      the same JSON is SHA-256 identical across T4 and A10G,
+  |      across 6 parallel containers
+  | Key: The carrier of "importance" regresses from a "trained predictor"
+  |      back to a "deterministic forward-pass statistic"
+#+end_example
+
+Note: LLM.int8 / GPTQ / AWQ belong to the *precision* (PTQ) line; FlexGen / PowerInfer / LLM-in-Flash belong to the *placement* line. MCAP's genuine contribution is bridging the two — using one signal to drive both decisions. EXL2 (Turboderp, 2024) already performs per-layer bit allocation, but *offline*; MCAP moves that step to load-time.
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Numbers in an LLM Are Not Uniformly Important
+
+*** What problem did it see?
+
+Researchers tried quantizing OPT-175B wholesale to INT8 with the expectation of no quality loss — and the model collapsed. The puzzling discovery: 6.7B is a phase-transition point. Smaller models survive INT8 fine; larger ones are devastated.
+
+*** Its solution
+
+Post-diagnosis, they found that models above 6.7B develop extreme outlier values in certain feature dimensions (> 6σ), far beyond the average. These dimensions account for less than 0.1% of the total, yet carry the majority of the information. INT8's 256 bins simply cannot accommodate them.
+
+The fix was mixed precision: "normal" dimensions use INT8, while "outlier" dimensions are extracted and kept in FP16. Every matrix multiply splits into two: the large INT8 part and the small FP16 part, summed together.
+
+*** Why it worked, and what it left behind
+
+This was the first paper to state clearly: "*Not all dimensions in an LLM are equally important.*" It planted the seed for every subsequent importance-aware approach.
+
+But its outlier detection happened *at runtime, on feature dimensions* — every inference pass had to scan activations for outliers. It never asked the deeper question: could we know *offline* which channels are outliers? AWQ picked that question up.
+
+** 2022 | GPTQ: Making "Importance" a Computable Scalar
+
+*** What problem did it see?
+
+LLM.int8() only reaches 8-bit. Practical needs demand 4-bit — halving the model size again. At 4-bit, outlier isolation is nowhere near enough: 16 bins cannot cover that wide a distribution.
+
+*** Its solution
+
+Drawing on Optimal Brain Surgeon from the 1990s: the second-order sensitivity of each weight with respect to the loss can be expressed via the Hessian. GPTQ quantizes weights column by column; after each column is quantized, it uses the inverse Hessian to redistribute that column's residual error onto the remaining unquantized columns — so each subsequent column compensates for the previous column's rounding.
+
+*** Why it worked, and what it left behind
+
+This was the first paper to give "importance" a mathematical definition: *per-column second-order sensitivity*. But computing the Hessian is expensive, and GPTQ still operates under the assumption that every weight deserves careful treatment.
+
+The question it left open: if only 1% of weights are truly important and the other 99% should be treated carelessly, why bother computing the Hessian at all?
+
+** 2023 | AWQ: Importance Is Written Right There in the Activations
+
+*** What problem did it see?
+
+GPTQ's inverse Hessian takes hours to compute. But the reality of LLMs is that the vast majority of weights are irrelevant — it is the channels that receive high activations that determine output quality. Could you just look at the activations and skip the Hessian?
+
+*** Its solution
+
+Run a calibration forward pass and measure the activation magnitude of every channel. The high-magnitude channels (~1%) are the "salient channels." Before quantization, multiply them by a scale factor greater than 1, pushing them into favorable quantization bins; divide back after quantization.
+
+*** Why it worked, and what it left behind
+
+AWQ shifted the carrier of "importance" from weight information (Hessian) to activation information — a cheap signal computable from *a single forward pass*. This was a key paradigm shift.
+
+But AWQ is still offline. It still produces a new quantized weight file, still calibrates per target device. The concept of "importance" is now understood as *per-channel activation magnitude*, but it is still shipped out embedded in a fixed weight file.
+
+Looking forward from AWQ, there are really only two directions: either make importance finer-grained (one value per weight), or push it later in time (to runtime). The first direction leads to SqueezeLLM / SpQR; the second leads to PowerInfer and ultimately MCAP.
+
+** 2023 | FlexGen: But What If the Model Does Not Even Fit?
+
+*** What problem did it see?
+
+All the PTQ work assumes the model fits in GPU memory. But a 70B model in BF16 requires 140 GB; even 4-bit it needs 35 GB — most GPUs cannot hold it. This is a different problem entirely.
+
+*** Its solution
+
+Partition the model across three storage tiers — GPU VRAM, CPU RAM, SSD — and schedule data movement via linear scanning. The optimization objective is throughput: keep the GPU computing at all times, keep data transfers from ever blocking computation.
+
+*** Why it worked, and what it left behind
+
+It proved that *cross-tier storage* is a viable deployment paradigm. But it treats all weights identically — they simply flow through the GPU in temporal order.
+
+The question it left open: since some weights matter more than others (AWQ already told us this), why not keep the important ones on GPU and dump the unimportant ones to SSD? The *precision* line told us "what matters," but the *placement* line never used that information. The two lines had to be joined.
+
+** 2024 | PowerInfer: Connecting Importance and Placement — With Heavy Machinery
+
+*** What problem did it see?
+
+During LLM inference, most ReLU/SiLU neurons simply do not fire — activation sparsity exceeds 80%. Treating all weights equally, as FlexGen does, wastes that prior. If you can predict which neurons will activate and keep "hot neurons" on GPU while offloading "cold neurons" to CPU, overall throughput improves significantly.
+
+*** Its solution
+
+Train a small MLP predictor for each base model. Before processing each token, the predictor forecasts which neurons will activate. Predicted hot neurons are computed with a dense kernel on GPU; cold neurons with a sparse kernel on CPU.
+
+*** Why it worked, and what it left behind
+
+This was the first system to realize "importance-driven placement" — where importance *determines* where data lives. This is the paradigm MCAP directly inherits.
+
+But the cost is substantial:
+- *The predictor is trained per model* — updating the base model invalidates the predictor
+- *The predictor is an extra component* — it must stay in sync with the weights; one more artifact means one more failure point
+- *It only governs placement, not precision* — precision still requires a separate AWQ / GPTQ pass
+- *Neuron-level granularity requires per-token prediction overhead* — the predictor runs on every single token
+
+The question MCAP inherits: can we do without the predictor?
+
+** 2026 | MCAP / NVE (This Paper): A 60-Second Forward Pass That Decides Both Precision and Placement
+
+*** What problem did it see?
+
+The landscape in early 2026:
+- The PTQ line (GPTQ / AWQ / EXL2) locks precision decisions offline — one machine, one weight file
+- The placement line (FlexGen / PowerInfer / LLM-in-Flash) made placement dynamic — but either ignores importance or requires training a predictor
+- The "importance" signals of the two lines have never been shared
+
+Looking more closely at PowerInfer, the nearest neighbor: its MLP predictor is a *model-dependent extra learned component* — it must be retrained whenever base weights change, recalibrated to port across devices, and adds one more fragile link to the deployment chain.
+
+Yet to judge which layers are important, you do not need to train anything. Run one forward pass, observe each layer's activation magnitude, average over 12 prompts — that is enough.
+
+*** Its solution
+
+Four small decisions that together constitute a paradigm convergence:
+
+1. *Monte Carlo Activation Profiling*: 60 seconds, 12 calibration prompts, pure forward pass, no gradients. Compute the mean activation norm ‖a_i‖ for each layer. This is the per-layer importance score.
+2. *One signal, two decisions*:
+   - High-score layers use W4A16 (higher precision); low-score layers use W4A8 (lower precision, faster)
+   - High-score layers reside on GPU; mid-score layers on RAM; low-score layers on SSD
+3. *Architecture-keyed, not weight-keyed*: the profile is not bound to a specific set of weights, only to the architecture. The same 338-byte JSON is SHA-256 identical across T4 and A10G, across 6 parallel containers. Compute once, use everywhere.
+4. *Rust + 1,413 lines of hand-written CUDA*: W4A8 dp4a kernels + flash decode attention + three-tier pager — converting the signal into real throughput and usability.
+
+*** Why it works, and what it leaves behind
+
+It works because it makes three contractions correctly:
+- *Contracting "importance" from the training stage to load-time* — orders of magnitude lighter than PowerInfer's trained predictor
+- *Raising the granularity of "importance" from neuron-level to layer-level* — coarser, but no per-token prediction overhead
+- *Expanding the use of "importance" from one axis to two* — the same score governs both precision and placement, eliminating an entire independent quantization system
+
+Results: Llama-3.1-8B (BF16, 16 GB) running on a 4 GB GPU at 1.25 tok/s — a memory region that 4-bit quantization cannot even reach (a 4-bit 8B model still needs 5–6 GB). The W4A8 path is also 1.5–1.8× faster than llama.cpp Q4_0.
+
+What it leaves open:
+- Per-layer granularity is still coarse — PowerInfer demonstrated at neuron level that finer-grained sparsity is real; MCAP deliberately gives that up
+- Static thresholds — once calibrated, thresholds are fixed and cannot adapt to runtime load changes (dynamic schedulers such as ActiveFlow are attacking this gap)
+- Only validated on Turing / Ampere — Jetson, Apple Silicon, and consumer RTX remain future work
+- Aggressive configurations fail on 1B models — the importance prior has insufficient signal-to-noise ratio in small models
+
+* Frontier Extensions
+
+MCAP is an April 2026 paper, and there is no direct follow-up work criticizing it yet. However, several concurrent lines are worth watching:
+
+- *PowerInfer-2* (Xue et al., 2024): brings PowerInfer to mobile, still using a per-model predictor; MCAP's "no predictor" path on edge devices remains unexplored
+- *HeadInfer* (Luo et al., 2025): offloads KV cache per attention head, reducing KV memory by 92%. This is an orthogonal direction — MCAP manages weights, HeadInfer manages KV cache; the two can be stacked
+- *ActiveFlow* (Zhang et al., 2025) and *NEO* (Jiang et al., 2025): dynamic schedulers that move weights according to runtime load. MCAP's static importance score is a natural input to these systems — decoupling "what is important" from "when to move it"
+- *BitNet / 1.58-bit* (Ma et al., 2024): changes the representation at training time to compress from the ground up. This is a different route; MCAP's deployment-time path and BitNet's training-time path are not mutually exclusive — a BitNet model can still be profiled by MCAP and deployed with differentiated precision and placement
+
+Foreseeable next steps:
+- *MCAP-guided KV quantization* — extending the same per-layer signal to precision selection for the KV cache (mentioned in the paper's Conclusion)
+- *Live re-profiling* — replacing the 12 fixed calibration prompts with a sliding window of real traffic, letting the importance signal drift with the workload
+- *Edge silicon validation* — verifying the portability of architecture-keyed profiles on Jetson, Apple Silicon, and consumer RTX
+
+* One Diagram to Understand It All
+
+#+begin_example
+       "Precision" line (PTQ)                "Placement" line (Offload)
+       ----------------------                --------------------------
+[2022] LLM.int8()                             (not yet present)
+       outlier dimensions in FP16
+       "numbers are not uniformly important"
+              |
+              v
+[2022] GPTQ
+       Hessian per-column importance
+       (offline, expensive)
+              |
+              v
+[2023] AWQ                                [2023] FlexGen
+       activation magnitude per-channel    GPU/CPU/SSD three-tier scheduling
+       (offline, cheap)                    (no importance, pure data-flow)
+              |                                    |
+              |                                    v
+[2024] EXL2                               [2024] PowerInfer
+       per-layer bit allocation             per-neuron hot/cold
+       (offline)                            (trained MLP predictor, placement only)
+              |                                    |
+              |                             [2024] LLM-in-a-Flash
+              |                                    streaming from flash
+              |                                    |
+              +----------+------------------------+
+                         |
+                         v
+                  +------------------+
+                  | "Importance signal" |  <--- used by both lines independently,
+                  +------------------+         but never shared between them
+                         |
+                         v
+[2026] MCAP / NVE (this paper)
+       60s forward -> per-layer importance score (338-byte JSON)
+       one signal  -> drives *precision* (W4A8/W4A16) + *placement* (GPU/RAM/SSD)
+       no predictor, architecture-keyed, load-time, deterministic
+       result: Llama-8B on 4 GB GPU, W4A8 is 1.5–1.8× faster than llama.cpp
+
+  Time ---------------------------------------------------------->
+
+  True main thread: "What determines what is important in an LLM?"
+            weight Hessian -> activation magnitude -> trained predictor -> forward statistic
+            (GPTQ)            (AWQ)                  (PowerInfer)          (MCAP)
+  Carrier migration: offline file -> offline file -> trained model -> 60s forward pass
+  Decision point:    calibration  -> calibration  -> inference     -> load-time
+#+end_example
+
+* Insights
+
+Reading this line end to end, the deepest observation is: *the carrier of "what determines importance in an LLM" has been regressing continuously — from heavy machinery (Hessian, trained predictors) back to lightweight statistics (mean forward-pass activation norm)*.
+
+Every generation is doing the same thing: finding the next signal that is "cheap enough and good enough."
+
+- LLM.int8 used *runtime outlier detection* — computed on every inference
+- GPTQ used *Hessian per-column* — computed once offline, very expensive
+- AWQ used *activation magnitude per-channel* — computed once offline, cheap
+- PowerInfer used *a trained sparsity predictor* — trained once per model, requires gradients
+- MCAP uses *60-second mean forward activation per-layer* — computed at load-time, no gradients, no training
+
+Each step of regression is accompanied by two things: coarser granularity, but *greater decision-making power*. MCAP is the coarsest (layer-level), yet has the *greatest decision-making power* — it simultaneously governs precision and placement, something no prior generation attempted.
+
+This suggests a general principle: *how many decisions a simple signal can drive matters far more than how sophisticated the signal itself is*. AWQ's per-channel signal actually carries more information, but it only drives one decision (precision), so its leverage is limited. MCAP uses a coarser per-layer signal, but drives two decisions (precision + placement), and thus unlocks more engineering value.
+
+Going further: *the core disagreement between PowerInfer and MCAP is whether "importance needs to be learned" or "importance can simply be observed."* PowerInfer bet on the former — train a predictor. MCAP bet on the latter — run a forward pass and look at the activations. MCAP wins not on prediction accuracy (it is admittedly coarser), but on *deployment chain simplicity* — one fewer component, one fewer dependency, one fewer synchronization point. This is a victory of engineering aesthetics, not algorithmic elegance.
+
+The most likely next directions: extend this "load-time deterministic signal" paradigm to other decisions — KV cache precision, draft model selection for speculative decoding, prefill-phase batch scheduling. Once you accept that "60 seconds of forward pass is enough," the surface area of decisions you can attach to it opens up dramatically.
+
+* Takeaways
+
+For practitioners working on systems and deployment, three things:
+
+1. *Ask "can we eliminate a component?" before asking "can we optimize a component?"* PowerInfer's predictor is a complete, well-reasoned, technically mature component — MCAP simply removed it. Eliminating components has far more impact than optimizing them, because it simplifies the *deployment chain*, not just a single number.
+2. *Look for opportunities where one signal drives multiple decisions.* If your system has two seemingly unrelated decisions that both require "some notion of importance," first suspect they are actually the same signal — just being derived redundantly by two independent subsystems. Connecting them often eliminates an entire layer of infrastructure.
+3. *Replacing "training" with "observation" is the cheapest simplification available.* Any design that says "I'll train a small model to predict X" should first ask: "What if I just run a forward pass over the data and look at the actual distribution of X?" In many cases the answer is yes — and you avoid a training pipeline, version synchronization, and model drift, all in one move.
+
+This means: the next time you face a "per-something allocation" problem in LLM deployment — per-layer, per-head, per-expert, per-token — resist the urge to immediately design an algorithm. Run a forward pass first, plot the activation distribution of each "something" — chances are, looking at the chart will tell you exactly how to allocate, with no learning required. MCAP is 22,000 lines of Rust, but its core algorithm is "mean of activation norm over 12 prompts." That simple.

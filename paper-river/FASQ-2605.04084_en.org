@@ -1,0 +1,325 @@
+#+title:      FASQ: Flexible Accelerated Subspace Quantization for Calibration-Free LLM Compression
+#+date:       [2026-05-28 Thu 16:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T160000-en
+#+source:     https://arxiv.org/abs/2605.04084
+#+authors:    Ye Qiao, Yian Wang, Zhiheng Chen, Hyoukjun Kwon, Sitao Huang (UC Irvine)
+#+venue:      arXiv 2026.04
+
+* The River of Problems
+
+Fitting an 8B model into your RTX 3090 — not just fitting, but running it *faster* than FP16.
+
+The difficulty lies in a counterintuitive paradox: every existing LLM quantization method makes the model "smaller," but at the cost of making inference "slower."
+They compress weights into 4-bit integers for storage, then must "decompress" them back to FP16 before every multiplication —
+and this dequantization step consumes more time than the memory bandwidth it saves.
+The result: you compress the model to 1/4 its size, but throughput drops to 60% of FP16.
+
+One layer deeper: the GPTQ/AWQ school of "scalar quantization" is also locked into two further constraints —
+*only discrete bit-widths are available: 4-bit, 3-bit, 8-bit* (there is no "4.5-bit"),
+and *calibration data is mandatory* to estimate Hessians, activation distributions, and per-channel scaling factors.
+For a closed-source or proprietary-domain model, where does the calibration data come from?
+
+This river asks the same question throughout:
+*Can LLM quantization be made continuously tunable, calibration-free, and completely free of dequantization overhead at inference time?*
+
+Everyone on this river has been racing toward ever-finer scalar quantization. FASQ simply steps off that track —
+it reaches back to *Product Quantization* from the information-retrieval community twenty-five years ago,
+bypasses every structural deficiency of scalar quantization, and then uses a pair of hand-written CUDA kernels to run faster than FP16.
+
+* Source Map
+
+#+begin_example
+[1984] Gray - Vector Quantization (VQ)
+  |
+  | Problem: quantizing one number at a time (scalar quantization)
+  |          ignores correlations between neighboring values.
+  | Solution: quantize a whole vector at once — learn K representative
+  |           vectors (centroids) from data; replace each vector with
+  |           the index of its nearest centroid.
+  v
+[2011] Jegou, Douze, Schmid - Product Quantization (PQ)
+  |
+  | Problem: at high dimensionality (e.g. 4096-d), K centroids cannot
+  |          cover the space. Good coverage requires K=2^40-scale
+  |          codebooks — neither storable nor searchable.
+  | Solution: split each high-d vector into N subspaces; learn one
+  |           codebook per subspace independently. N books of K
+  |           centroids each combine to express K^N possibilities with
+  |           only linear storage.
+  v
+[2022-2023] Frantar et al. - GPTQ / Lin et al. - AWQ
+  |          (Parallel "scalar-quantize LLMs" main line,
+  |           diverges from the PQ track)
+  |
+  | Problem: LLM weights contain outliers; naive round-to-nearest
+  |          causes error explosion.
+  | Solution: GPTQ uses second-order Hessian information to guide the
+  |           rounding order; AWQ identifies "salient weights" and
+  |           scales them. Both compress to INT4 but require
+  |           calibration data.
+  v
+[2023-2024] LUT-NN / DPQ / PQA
+  |          (Attempts to bring PQ back to neural networks,
+  |           but inference speed remains unsolved)
+  |
+  | Problem: PQ looks elegant — but inference requires table lookups,
+  |          and naive implementations are glacially slow.
+  |          Without dedicated GPU kernels it is a death sentence.
+  | Solution: These works validate that PQ achieves acceptable accuracy
+  |           on NN weights, but all use generic dequant + GEMM paths;
+  |           speed is crushed by AWQ/GPTQ.
+  v
+[2026.04] FASQ (this paper)
+  |
+  | Problem: Scalar quantization (GPTQ/AWQ) is blocked by three walls —
+  |          fixed bit-widths, calibration requirement, dequant overhead.
+  |          The PQ track (DPQ/LUT-NN/PQA) removes the first two walls
+  |          but is killed by missing kernels.
+  | Solution: Apply PQ to LLM weights (removes fixed bit-width +
+  |           calibration dependency); write two CUDA kernels:
+  |           decode uses "LUT-free direct-compute GEMV";
+  |           prefill uses "output-stationary double-buffered LUT GEMM";
+  |           PQ inference beats FP16 for the first time.
+  v
+[2026.+] GPTVQ / VPTQ / QuIP# and concurrent VQ-for-LLM work
+  |
+  | Concurrent, different track: also applying vector quantization to
+  | LLMs, but focused on codebook learning (e.g. Hessian-weighted
+  | K-means), whereas FASQ focuses on calibration-free + kernel design.
+#+end_example
+
+Note: the scalar-quantization main line (GPTQ/AWQ) and the PQ main line (VQ → PQ → PQA) developed almost entirely in parallel before 2023 —
+one was the LLM community's effort, the other decades of accumulation from IR and retrieval. FASQ's real move is to *merge the two rivers*:
+use PQ's structure to solve LLMs' pain points, and use specialized kernels to close the performance gap.
+
+* Evolutionary Narrative
+
+** 1984 | Vector Quantization: Stop Quantizing One Number at a Time — Do the Whole Vector Together
+
+*** What Problem Did It See?
+
+In the 1980s image and speech compression world, scalar quantization (the PCM family) was mainstream — each sample was independently mapped to the nearest discrete level. Robert Gray noticed one thing: adjacent samples are correlated. In speech, for instance, the energy spectrum of neighboring frames is nearly identical. Quantizing them independently discards that correlation — throwing away a free lunch.
+
+*** Its Solution
+
+Pack a group of correlated values into a vector and quantize the whole vector at once. Learn K "representative vectors" (codewords / centroids) from training data; replace each vector with the index of its closest centroid.
+
+For example, storing an 8-dimensional vector under scalar quantization requires storing 8 numbers; VQ stores only one index (1 byte at K=256). Compression ratios of ten-to-one or more are possible, and distortion is statistically smaller — because the centroids have learned the true distribution of the data.
+
+*** Why It Works (and What New Pit It Digs)
+
+The key is the *rate-distortion bound*: Shannon had already proven VQ is asymptotically optimal in high dimensions — scalar quantization cannot reach this bound.
+
+New pit: as dimensionality rises, everything collapses. Covering a 100-dimensional vector space requires an astronomical K. Storing the centroid table alone exceeds the original data, and nearest-centroid search becomes unacceptably slow. So VQ remained confined to low-dimensional settings (speech LPC coefficients, small image patches) for decades. To use VQ in high dimensions, a different approach is needed.
+
+** 2011 | Product Quantization: Factor High Dimensions into a Product of Low-Dimensional Pieces
+
+*** What Problem Did It See?
+
+Jegou, Douze, and Schmid were working on image retrieval, facing SIFT descriptors — 128-dimensional vectors with hundreds of millions of entries in the database. Using VQ for indexing, even with K=2^20, would produce GB-scale codebooks and make search infeasible.
+
+But they also saw that falling back to scalar quantization (quantizing each dimension independently) discards all inter-dimensional correlation, causing retrieval accuracy to collapse.
+
+The tension: VQ has high precision but becomes infeasible at high dimensionality; scalar quantization is feasible but too inaccurate. Where is the middle ground?
+
+*** Its Solution
+
+An elegant single cut: split the 128-d vector into 8 subvectors of 16 dimensions each (subspaces), and *apply VQ independently in each subspace* — each codebook has K=256 centroids, and the entire vector is encoded with just 8 one-byte indices.
+
+The mathematical key: the combination is equivalent to *K^8 = 256^8 ≈ 1.8 × 10^19* implicit centroids, yet only 8 × 256 = 2048 centroids are actually stored. Exponential expressive power, linear storage. Hence the name Product Quantization — the *Cartesian product* of 8 subspaces.
+
+Even more elegant: the distance between two vectors decomposes into a sum of 8 sub-distances, each precomputable as a lookup table. Retrieval becomes 8 table lookups plus accumulation — tens of times faster than computing Euclidean distance directly.
+
+*** Why It Works (and What New Pit It Digs)
+
+It works because of the *decomposition + shared codebook* combination: splitting into low dimensions makes VQ feasible; recombining restores high-dimensional expressive power.
+
+New pit (for the future LLM scenario): PQ solves the "compressing data" problem, but when applied to neural network weights, *how to use it at inference time* becomes a new problem. Traditional retrieval only requires computing distances or performing lookups; neural networks require matrix multiplication. PQ's codebook structure and GEMM's memory access pattern are naturally mismatched. This pit would take fifteen years to fill.
+
+** 2022-2023 | GPTQ / AWQ: The Scalar Quantization Camp's Final Sprint
+
+*** What Problem Did It See?
+
+After ChatGPT ignited the LLM era, deployment cost became the central tension. A 7B model in FP16 takes 14 GB — it won't fit in a consumer GPU. The most direct fix is quantization — but LLM weights contain special "outliers" (a small number of dimensions with values far exceeding the rest), and naive INT4 round-to-nearest quantization causes perplexity to explode.
+
+One layer deeper: PQ had already been tried on neural networks several times by then (DPQ, Maddness, etc.) with underwhelming results — worse accuracy than INT4 and slower speed than INT4 kernels. The LLM quantization community's tacit consensus was: *scalar quantization is the only viable route.* The remaining work was how to quantize more accurately into INT4.
+
+*** Its Solution
+
+Two parallel threads emerged:
+
+*GPTQ* (Frantar et al. 2022) inherits the Optimal Brain Surgeon tradition — it uses second-order Hessian information to greedily quantize weights one by one in order of importance, adjusting the remaining weights after each step to compensate for the accumulated error. A small calibration batch is needed to estimate the Hessian.
+
+*AWQ* (Lin et al. 2023) observes that different weight channels vary enormously in importance — those multiplied by large activation values are "salient weights." AWQ scales those channels up before quantization (while scaling the corresponding activations down), so the INT4 grid covers them more faithfully. Calibration data is still required, but the approach is far simpler than GPTQ.
+
+Both compress models to 4 bits with small accuracy loss (Llama-3-8B averages ~67-68% on five zero-shot tasks).
+
+*** Why It Works (and What New Pit It Digs)
+
+It works because: for the specific bit-width of INT4, both methods achieve "nearly lossless" compression. Mature AWQ-W4 and GPTQ-W4 CUDA kernels made INT4 inference genuinely usable.
+
+Three new walls appear:
+
+1. *Discrete bit-widths*: You can choose INT8 (57% of model size) or INT4 (36%), with nothing in between. Want the 45% model size that "4.5-bit" would give? Impossible. Every new bit-width requires a rewritten kernel.
+
+2. *Calibration dependency*: Where do you get calibration data for closed-source models, proprietary-domain models, or multilingual models requiring broad language coverage? A skewed calibration set produces a skewed quantization.
+
+3. *Dequant overhead*: INT4 weights must be decompressed to FP16 before matrix multiplication. This overhead is hidden only when the kernel is highly optimized. Switch to a non-standard bit-width (e.g. INT3.5), and without a dedicated kernel the dequant overhead multiplies latency several times over.
+
+These three walls are not engineering deficiencies — they are *structural limitations of scalar quantization*. The very fact that each weight is an independent b-bit integer locks you in.
+
+** 2023-2024 | PQ-for-NN Attempts: Right Idea, Wrong Speed
+
+*** What Problem Did It See?
+
+After GPTQ/AWQ took off, a small group realized: the scalar quantization walls are structural, and PQ naturally has none of them —
+- Subspace size and codebook size are *continuous parameters* (free bit-width)
+- The codebook is just K-means clustering — *only the weights themselves are needed* (no calibration data)
+- PQ inference can be *table-lookup-and-accumulate* (no dequantization needed)
+
+This gave rise to DPQ, LUT-NN, PQA, Maddness, and similar work applying PQ to neural networks.
+
+*** Its Solution
+
+The specifics differ across papers, but the direction is consistent: slice the weight matrix into subspaces, learn K-means codebooks per subspace, pre-multiply activations with codebooks into a lookup table at inference time, and replace matrix multiplication with "table lookup + accumulation."
+
+Accuracy is competitive with INT4 quantization. On small networks (CNNs, retrieval networks) PQ even shows advantages.
+
+*** Why It Works (and What New Pit It Digs)
+
+It works because: PQ's accuracy-vs-compression curve is genuinely superior to scalar quantization, with solid theoretical backing.
+
+But it is stuck on a very concrete issue: *no GPU kernels optimized for PQ inference.* All these works either take the generic dequant + cuBLAS GEMM path (expanding PQ codebooks back to FP16, then running standard matrix multiplication), or use naive LUT lookup kernels (high shared-memory pressure, severe bank conflicts, low occupancy).
+
+Result: acceptable accuracy, but *inference speed 2–3× slower than AWQ.* This rendered PQ-for-LLM practically worthless in 2024 — you compress more aggressively but run slower, and nobody would use it.
+
+The community concluded that PQ was unsuitable for LLM inference. FASQ would overturn this verdict.
+
+** 2026.04 | FASQ (This Paper): Merging the Two Rivers
+
+*** What Problem Did It See?
+
+FASQ's authors looked at both tracks and recognized one thing:
+
+- The *scalar quantization camp* is blocked by structural problems (bit-width, calibration, dequant). Further algorithmic refinement can only squeeze performance at a single operating point.
+- The *PQ camp* has resolved all structural problems but is killed by kernel implementation, so nobody uses it.
+
+If "PQ's structure + GPU kernel engineering at the GPTQ level" could be combined, both sets of pain points would vanish simultaneously. And because PQ inference needs no dequantization, it is theoretically possible to make *compressed inference faster than FP16* — something the scalar quantization camp could never achieve.
+
+*** Its Solution
+
+Two steps.
+
+*Step one: Apply PQ to LLM weights* (straightforwardly following Jegou 2011, no tricks)
+
+Each weight matrix W is sliced into N_ss subspaces; each subspace runs K-means to learn K_s centroids. Storage becomes: one *centroid table* (FP16 centroid values) + one *index table* (uint8 codes). By tuning N_ss and K_s, model sizes from 27% to 49% of FP16 can be covered continuously — filling every gap between INT8 (57%) and INT4 (36%).
+
+K-means needs only the weights themselves — *zero calibration data*.
+
+*Step two: Write two CUDA kernels from scratch to make PQ inference fly* (the true engineering challenge)
+
+LLM inference has two phases:
+
+- *Decode* (generation phase): batch=1, matrix multiplication degenerates to a matrix-vector product (GEMV), memory-bandwidth-bound. FASQ designs a *LUT-free direct-compute GEMV* — instead of precomputing a lookup table, it computes "centroid · activation" inner products directly in registers and accumulates them. This eliminates the shared-memory footprint of a LUT, causing occupancy to soar. Split-K parallelism further distributes the accumulation work across multiple warps.
+
+- *Prefill* (prompt processing phase): large batch, true GEMM. FASQ uses an *output-stationary double-buffered LUT GEMM* — precomputes products of activations and centroids into a lookup table stored in shared memory for reuse; output-stationary layout keeps accumulators in registers, reducing write-backs; double buffering overlaps LUT computation with table-lookup reads.
+
+*** Why It Works (and What New Pit It Digs)
+
+The numbers speak: on an RTX 3090, Llama-3-8B under FASQ 4-bit-equivalent compression achieves 45.2 tok/s decode — *above FP16's 43.9 tok/s*. At 3-bit-equivalent compression: 51.8 tok/s. Throughput is 1.6–1.8× AWQ, 2.2–2.5× GPTQ, 4.3–5× RTN.
+
+The most counterintuitive result: *FASQ runs faster the harder it compresses* — because heavier compression means less data to move from VRAM to SMs, while the inner-product computation volume stays nearly constant. The scalar quantization camp shows the exact opposite curve: more aggressive compression (non-standard bit-widths) means worse dequant kernels and higher latency.
+
+On accuracy: Llama-3-8B at 37–42% model size (3–4-bit equivalent) achieves 67.1–67.7% average zero-shot accuracy across five tasks, on par with or slightly above 4-bit AWQ/GPTQ (67–68%). Results are consistent on Qwen3-8B and Qwen3.5-9B-Base.
+
+New pits (identified by the paper itself):
+
+1. Codebook training is currently plain K-means, with no Hessian weighting or salient-weight awareness as in GPTQ — this is what concurrent GPTVQ and VPTQ are doing. FASQ leaves room here.
+
+2. K-means on large matrices is not cheap; the one-time quantization cost is non-trivial (though paid only once).
+
+3. The uint8 index choice of K=256 is arbitrary; larger K (higher accuracy) would require uint16 or wider indices, necessitating kernel rewrites.
+
+** 2026.+ | GPTVQ / VPTQ / QuIP#: Concurrent, Parallel Tracks
+
+FASQ is an April 2026 paper; several concurrent "VQ for LLM" works run on parallel tracks:
+
+- *GPTVQ* brings GPTQ's Hessian-weighting idea into vector-quantization codebook learning, achieving higher quantization accuracy than plain K-means — but *still requires calibration data*.
+- *VPTQ* pursues more aggressive codebook designs (multi-level codebooks, learnable subspace partitioning), targeting extreme 1–2 bit compression.
+- *QuIP#* uses incoherence processing and lattice codebooks to approach 4-bit accuracy at 2 bits.
+
+These works and FASQ are *complementary*: they have gone further than FASQ on "how to learn more accurate codebooks," but none has FASQ's combination of "calibration-free + kernels that beat FP16." FASQ's natural next step is likely to absorb their codebook learning methods — pushing accuracy closer to the limit while retaining the kernel advantage.
+
+* One-Screen Summary
+
+#+begin_example
+          Two rivers of LLM quantization converge at FASQ
+
+  Scalar Quantization Camp (LLM community)      VQ Camp (IR/retrieval community)
+  ----------------------------------------      --------------------------------
+  1990 OBS/OBD                                  1984 Gray VQ
+     |                                             |
+     | (Hessian-weighted pruning)                  | (infeasible at high dim)
+     v                                             v
+  2022 GPTQ (Frantar)                           2011 PQ (Jegou)
+     | + Hessian calibration                       |
+     v                                             | (subspaces, exponential
+  2023 AWQ (Lin)                                   |  expressive power)
+     | + activation-aware scaling                  v
+     |                                         2023 DPQ / LUT-NN / PQA
+     | Three walls:                                | (applied to NN weights)
+     | - discrete bit-widths 4/8                   |
+     | - requires calibration data             One wall:
+     | - dequant overhead                     - no GPU kernels, 2-3x slower
+     v                                             v
+      \                                           /
+       \                                         /
+        \                                       /
+         v                                     v
+         ===========================================
+         |                                         |
+         |            [2026.04] FASQ               |
+         |                                         |
+         |  - PQ structure -> removes scalar       |
+         |    camp's three walls                   |
+         |  - Hand-written GEMV/GEMM kernels       |
+         |    -> removes PQ camp's one wall        |
+         |  - calibration-free                     |
+         |  - faster with more compression         |
+         |    (beats FP16)                         |
+         |                                         |
+         ===========================================
+                          |
+                          v
+              Concurrent: GPTVQ / VPTQ / QuIP#
+              (improve codebook learning with
+               Hessian weighting, but still
+               require calibration data)
+#+end_example
+
+* What This River Is Really About
+
+On the surface, this river is about "LLM quantization moving from INT4 to PQ."
+
+One layer deeper, it is a *scalar-to-vector paradigm shift* — people are finally admitting that "treating each weight independently" carries a structural cost, and taking inter-weight correlation seriously produces qualitative gains.
+
+One layer deeper still, it is a subtler *return flow of classical techniques*. PQ is a mature tool from the information-retrieval community twenty-five years ago; it was deemed "unsuitable for neural networks" at the time because NNs require multiplication, not nearest-neighbor search. What FASQ actually demonstrates is that *"unsuitable" was a judgment made in the absence of corresponding GPU kernels.* When LLM inference itself pushes hardware to its limits (even FP16 doesn't run fast enough), PQ's approach of "replacing computation with table lookups" becomes an advantage — it sidesteps dequantization, sidesteps FP16 tensor cores, and performs matrix multiplication in a way that, while less polished, fits modern GPU memory hierarchies more naturally.
+
+At the deepest level, it is a *reversal of hardware friendliness*: the 2010s consensus was "algorithms should accommodate hardware by targeting INT4." The post-2025 emerging consensus may be "algorithms should express themselves in a way that hardware does not natively support but can efficiently simulate" — PQ is the archetype of this: "GPU has no PQ instruction, but I can simulate it with general CUDA and run faster than dedicated INT4 instructions."
+
+* Where This River Is Heading
+
+Two most likely directions:
+
+1. *Codebook learning upgrades*: Absorb Hessian-weighted K-means and salient-weight-aware clustering from GPTVQ/VPTQ into FASQ's framework. While preserving the calibration-free option, offer an optional mode of "more accurate if calibration data is available."
+
+2. *Kernel engineering ported to more hardware*: Current FASQ kernels are RTX 3090-specific. H100/A100, consumer NPUs, and mobile GPUs each need their own version. Memory hierarchy, warp scheduling, and shared-memory capacity differ across platforms, requiring kernel rewrites for each. Tedious but high-barrier work. If a team standardizes FASQ-style kernels (analogous to what FlashAttention did), PQ-for-LLM could become truly widespread.
+
+Further out: the combination of *PQ + sparsification / activation quantization* has not been systematically explored by anyone. FASQ only compresses weights; activations remain FP16. If activations were also handled via some "dequantization-free" approach (e.g. low-rank + PQ residual), the remaining FP16 operations in the full inference pipeline could be further compressed.
+
+* Honest Annotations
+
+- *Confirmed citations*: FASQ → GPTQ, AWQ, SmoothQuant; FASQ → PQ (Jegou 2011), VQ (Gray), Maddness, PECAN, DPQ, LUT-NN, PQA, LUT-DLA. All are explicitly listed in FASQ Section 2.2.
+- *Inferred relationships*: The connection between GPTQ and OBS/OBD is community consensus but not cited explicitly in this paper. The "complementary" positioning of FASQ versus concurrent GPTVQ/VPTQ/QuIP# is inferred from publication timing and method comparison; FASQ itself does not discuss those works (they are too contemporaneous).
+- *Unverified details*: FASQ kernel implementation specifics (split-K partitioning strategy, double-buffering timing) come from paper Section 4 and have not been independently verified.

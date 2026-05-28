@@ -1,0 +1,458 @@
+#+title:      From Signal Degradation to Computation Collapse: Uncovering the Two Failure Modes of LLM Quantization
+#+date:       [2026-05-28 Thu 15:30]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T153000-en
+#+source:     https://arxiv.org/abs/2604.19884
+#+authors:    Chenxi Zhou, Pengfei Cao, Jiang Li, Bohan Yu, Jinyu Ye, Jun Zhao, Kang Liu (CAS / UCAS / IMU)
+#+venue:      Findings of ACL 2026
+
+* The River of Problems
+
+Compress an 8-billion-parameter language model to 2-bit, and you might expect something like
+"a rougher 4-bit" — instead the model dies outright, accuracy drops to zero, and all it can
+say is "the" "." ".". Squeeze to 4-bit and it still resembles itself; squeeze one notch
+further and it falls off a cliff.
+
+That cliff has been a black box for thirty years. Every method has been doing the same thing:
+*staring at numerical error and trying to make it smaller*. Round weights to the nearest grid
+point, minimize reconstruction error, smooth out activation distributions — every paper is
+racing to minimize MSE. Yet even when MSE is driven down to near-zero, the 2-bit model still
+dies.
+
+Every milestone along this river is, at its core, asking the same question: *which "part" of
+the weights cannot be compressed without breaking the model?* The answer has been upgrading
+over thirty years — from "look at second derivatives" to "look at the inverse Hessian" to
+"look at activation outliers," and finally to this paper: *stop looking at numbers; look at
+the computational mechanisms inside the model.*
+
+* Provenance Map
+
+#+begin_example
+[1989] LeCun et al. - OBD (Optimal Brain Damage)
+  |
+  | Problem: Pruning neural networks by weight magnitude kills important parameters
+  | Solution: Use the second derivative (diagonal Hessian) of the loss w.r.t. each weight
+  |           to estimate "how much would the loss rise if we removed it?"
+  |           Prune by that score instead.
+  v
+[1993] Hassibi & Stork - OBS (Optimal Brain Surgeon)
+  |
+  | Problem: OBD only looks at the diagonal Hessian, assuming weights are independent —
+  |           in reality weights are tightly coupled, so the diagonal approximation
+  |           frequently misfires.
+  | Solution: Use the full inverse Hessian H^{-1} to estimate importance;
+  |           when one weight is pruned, simultaneously update all other weights
+  |           as compensation.
+  v
+[2022] Frantar & Alistarh - OBQ (Optimal Brain Quantization)
+  |
+  | Problem: OBS was designed for pruning — "remove a weight" is a binary action,
+  |           but quantization is "round a weight to a grid point," a continuous action.
+  | Solution: Transplant the OBS framework: each time one weight is quantized,
+  |           use H^{-1} to update all remaining weights to compensate for the
+  |           rounding error.
+  v
+[2023] Frantar et al. - GPTQ
+  |
+  | Problem: OBQ costs O(d^4) per run — completely infeasible for billion-parameter models.
+  | Solution: Tiling + Cholesky decomposition + fixed column order —
+  |           reduces O(d^4) to O(d^3), letting OPT-175B finish in 4 hours.
+  |           OPT-175B compressed to 4-bit with near-zero loss; 3-bit still usable.
+  v
+[2023-2024] AWQ / SmoothQuant / QuIP# / SpinQuant  (parallel branch)
+  |
+  | Problem: After GPTQ, people found the real bottleneck was not weights but
+  |           activation outliers.
+  | Solution: AWQ applies per-channel scaling by activation magnitude to protect
+  |           important weight channels;
+  |           QuIP#/SpinQuant use random orthogonal rotation matrices to "flatten"
+  |           outliers into a more uniform distribution.
+  |           — But still a numerical viewpoint: align output distribution with FP16.
+  v
+[2025] Chang et al. - RMSNorm Reversal
+  |
+  | Problem: None of the above explains why 2-bit is a cliff-edge failure.
+  | Solution: Begin using mechanistic interpretability tools to inspect quantized models;
+  |           discover that RMSNorm reverses its direction on certain tokens —
+  |           a concrete failure phenomenon, but the perspective is still very local.
+  v
+[2026.04] Zhou et al. - Two Failure Modes Hypothesis (this paper)
+  |
+  | Problem: Mechanistic studies are too fragmented — each work sees one phenomenon;
+  |           how many fundamentally distinct failure modes actually exist?
+  | Solution: Systematically decompose using logit lens + causal tracing;
+  |           find that 4-bit and 2-bit failures are mechanistically distinct:
+  |           - 4-bit = Signal Degradation: components still function, just polluted by noise
+  |           - 2-bit = Computation Collapse: structural failure of components;
+  |             early layers destroy the signal before it can propagate
+  |           And prove: the former can be fixed training-free; the latter cannot —
+  |           it requires reconstruction.
+  v
+[2026+] Not yet clear: structural reconstruction
+        (QAT, QLoRA-style fine-tuning, mixed-precision protection of early layers)
+#+end_example
+
+Note: The main chain OBD → OBS → OBQ → GPTQ → Two Failure Modes has explicit citation
+links traceable in the papers themselves. AWQ/SpinQuant are parallel branches not directly
+inherited by this paper, but belong to the same camp of "methods being critiqued." Chang et
+al. (2025) is the only prior mechanistic work named in §1; it is tagged as "fragmentary."
+
+* Evolutionary Narrative
+
+** 1989 | OBD: Which Connections Should a Neural Network Cut?
+
+*** What Problem It Saw
+
+By the late 1980s, neural networks already knew they needed pruning — too many parameters
+led to overfitting, and deployment was slow. The standard approach at the time was
+straightforward: look for weights with the smallest absolute value and cut them. "A weak
+signal on this connection means it probably doesn't matter."
+
+But LeCun spotted the flaw immediately: *a small weight does not mean an unimportant one*.
+A weight can be numerically tiny yet have the loss function be exquisitely sensitive to it —
+nudge it and the whole network collapses. Conversely, a large weight might sit in a saturated
+region where any change barely affects the output. Pruning by magnitude is therefore
+indiscriminate killing.
+
+*** Its Solution
+
+Switch the criterion: *look at the second derivative of the loss L with respect to each
+weight w*.
+
+The intuition: if the second derivative is large, L has steep "curvature" near that weight —
+any small change causes L to spike — so this weight must not be touched. If the curvature is
+flat, the weight can be cut. Formalized, this is the "saliency":
+
+#+begin_example
+  s_i = (1/2) * h_ii * w_i^2
+#+end_example
+
+where h_ii is the diagonal element of the Hessian matrix. Prune the weights with the smallest
+s_i, and the loss rises least.
+
+*** What Pit It Left Behind
+
+It only looks at the *diagonal* of the Hessian — it assumes the second-order effects of each
+weight can be computed independently. This is a lazy approximation: in reality weights are
+tightly coupled, and pruning one often affects a whole neighborhood through the off-diagonal
+terms. That pit would wait four years for OBS to fill.
+
+** 1993 | OBS: Compensate While You Cut
+
+*** What Problem It Saw in the Previous Paper
+
+Hassibi and Stork attacked OBD's approximation directly. They ran experiments on small
+networks comparing "prune a weight + leave everything else unchanged" against "prune a weight
++ apply H^{-1}-based compensation updates"; the latter's accuracy loss was an order of
+magnitude smaller.
+
+More critically — after OBD pruning, you still had to retrain to recover accuracy. If there
+were a way to prune and *skip retraining* entirely, that would be truly useful.
+
+*** Its Solution
+
+Throw away the diagonal approximation and use the *full inverse Hessian* H^{-1}. Each time
+a weight w_q is pruned, all remaining weights are simultaneously updated according to:
+
+#+begin_example
+  delta_w = -(w_q / [H^{-1}]_qq) * H^{-1}_:,q
+#+end_example
+
+The meaning: the "task" previously carried by the pruned weight is redistributed to the
+other weights according to Hessian correlations. This step is called a *closed-form update*
+and requires no backpropagation whatsoever.
+
+*** What Pit It Left Behind
+
+The inverse Hessian is a d×d matrix, where d is the number of weights. Computing H^{-1}
+once costs O(d^3) memory and O(d^3) computation. Networks in the 1990s had only a few
+thousand parameters — manageable — but as networks grew, this became untenable. So OBS was
+essentially shelved after deep learning took off, until someone remembered it thirty years
+later.
+
+** 2022 | OBQ: Transplanting OBS to Quantization
+
+*** What Problem It Saw
+
+Fast-forward to 2022. Deep learning models had ballooned from thousands of parameters to
+hundreds of billions. Pruning still happened, but a bigger demand had arrived: *quantization*.
+Compress FP32 weights to INT8, INT4, INT2 — cutting memory and bandwidth by 4–16×.
+
+But quantization methods at the time were quite crude: either round-to-nearest (each weight
+independently rounded to the nearest grid point, coupling entirely ignored), or QAT
+(quantization-aware training, requiring a full model retrain, cost explosion).
+
+Frantar and Alistarh asked: could the *closed-form compensation* idea from pruning be
+ported over? "Round one weight, then update all others"?
+
+*** Its Solution
+
+Redefine "pruning = set weight to zero" as "quantization = round weight to a grid point."
+All of OBS's mathematics carries over:
+
+#+begin_example
+  OBS: after pruning w_q (→ 0), update other weights via H^{-1}
+  OBQ: after rounding w_q, update other weights via H^{-1}
+#+end_example
+
+Each quantized weight gets one optimal compensation solve. This is *Optimal Brain
+Quantization*.
+
+In practice, OBQ significantly outperforms round-to-nearest on small models (BERT, ResNet)
+without any retraining. Theoretically it is also very elegant — a direct port of a
+1990s-era tool into a new setting.
+
+*** What Pit It Left Behind
+
+Still the old OBS problem: *too slow to run*. A full OBQ pass is O(d^4). On BERT (~110M
+parameters) it was still feasible; on GPT-3 (175B) it was completely impossible. Frantar
+himself acknowledged this limitation at the time — which is precisely why GPTQ appeared a
+year later.
+
+** 2023 | GPTQ: Engineering to Run on Hundred-Billion-Parameter Models
+
+*** What Problem It Saw
+
+OBQ had the right idea, but was too slow. Specifically:
+1. It used a "greedy" ordering — each step selects the column with the smallest current
+   error. This requires re-scanning all remaining columns after every quantized column,
+   causing complexity to explode;
+2. It maintained a separate inverse Hessian for each row. GPT-3 has tens of thousands of
+   columns; updating every row each time is completely unrealistic.
+
+*** Its Solution
+
+The Frantar team made three engineering compromises to reduce O(d^4) to O(d^3):
+
+1. *Fixed order*: abandon greedy column selection; quantize in a fixed order (left to right).
+   Sacrifice a little theoretical optimality for an enormous speedup;
+2. *Lazy batch updates*: synchronize H^{-1} only once every 128 columns. GPU-friendly;
+3. *Cholesky decomposition*: reparameterize H^{-1} via Cholesky, ensuring numerical
+   stability and reuse of the upper-triangular structure.
+
+Result: *OPT-175B 4-bit quantization in just 4 GPU-hours*, with near-zero loss. 3-bit is
+also usable. GPTQ became overnight the de facto standard for LLM quantization; all subsequent
+work uses it as a baseline.
+
+*** What Pit It Left Behind
+
+GPTQ pushed weight-only PTQ to the edge of "compress any further and it collapses" — 4-bit
+is fine, 3-bit is marginal, 2-bit is completely broken. But GPTQ cannot tell you *why* 2-bit
+breaks. Its entire mathematical framework is "minimize reconstruction error"; it can guarantee
+"after rounding, the output distribution is as close to FP16 as possible," but it cannot see
+"which internal component has been knocked out."
+
+That blind spot would not be torn open until this paper, in 2026.
+
+** 2023-2024 | AWQ/SmoothQuant/QuIP#/SpinQuant: A Parallel Branch Driving the Nail Deeper
+
+*** What Problem They Saw
+
+After GPTQ, it became clear that the real challenge was not weights but *outliers in
+activations*. Certain channels in LLM activations can spike to 100× the normal value; at
+quantization time, these outliers are either clipped (losing information) or they blow up the
+entire scale (destroying the precision of all normal values).
+
+*** Their Solutions (One Line Each)
+
+- *SmoothQuant* (Xiao 2023): "migrate" some of the activation outlier magnitude onto the
+  weights, making both easier to quantize;
+- *AWQ* (Lin 2024): apply per-channel scaling by activation magnitude to protect the weight
+  channels that correspond to large activations;
+- *QuIP#* (Tseng 2024) / *SpinQuant* (Liu 2025): rotate weights and activations with a
+  *random orthogonal matrix*, spreading outliers into a uniform distribution in the new
+  coordinate system.
+
+These methods progressively pushed 4-bit to near-lossless and made 3-bit usable.
+
+*** What They Did Not Solve
+
+*They never answered "why does collapse happen."* Their entire objective is "make output as
+close to FP16 as possible." So they can reduce MSE and perplexity, but 2-bit still dies —
+because the problem is not numerical precision; it is that *the model's internal computational
+mechanisms have broken down*. That is what forced this paper into existence.
+
+** 2025 | RMSNorm Reversal: The First Person to Look Inside
+
+*** What Problem It Saw
+
+Chang et al. (2025) were the first to stop fixating on "reducing error" and instead ask:
+*what is actually happening inside a quantized model?* Using mechanistic interpretability
+tools to inspect a 2-bit model, they discovered a concrete failure phenomenon — on certain
+tokens, the direction after RMSNorm is reversed (sign reversal), causing all downstream
+computation to be completely misaligned.
+
+*** Its Solution
+
+Identify RMSNorm as the vulnerable point and protect it specifically (e.g., keep it at high
+precision).
+
+*** What Pit It Left Behind
+
+The perspective was *too local*: it only saw one phenomenon (RMSNorm reversal) and did not
+answer "is this the only cause of failure, or just the tip of the iceberg?" Contemporary
+mechanistic works of the same period — component sensitivity analyses, studies of collapsed
+refusal mechanisms, truthfulness drift analyses — all suffered from the same limitation:
+*each blind man feeling a different part of the elephant*. The entire motivation of this paper
+is: we need a *systematic diagnostic framework*, not a pile of isolated phenomena.
+
+** 2026 | Two Failure Modes: One Cut Revealing Two Distinct Deaths
+
+*** What Problem It Saw
+
+Looking back along the entire river, the authors realized something: *4-bit failure and 2-bit
+failure may not be the same thing at all*. Everyone had previously assumed they were
+continuous — "4-bit loses 1%, 3-bit loses 5%, 2-bit loses 99%" — differing only in degree.
+But the 99% number itself is screaming: "This is not a matter of degree; it is a phase
+transition."
+
+*** Its Solution (Three Core Steps)
+
+*Step 1: Layer-wise knowledge probing.* Use logit lens to project each layer's hidden state
+into vocabulary space and observe how the correct answer's probability evolves across layers.
+Results:
+- FP16 model: correct-answer probability rises gradually in the middle-to-late layers;
+- 4-bit model: the curve has almost the same shape, just a slightly lower endpoint —
+  *the signal is still there, merely attenuated*;
+- 2-bit model: starting from layers two or three, the correct answer is completely buried
+  under high-frequency tokens like "the / . / ." and never recovers —
+  *the signal is destroyed in the early layers*.
+
+*Step 2: Causal analysis.* Transplant a layer's activations from the good model into the
+corresponding position of the bad model:
+- Transplant a FP16 layer into the 4-bit model → performance recovers substantially
+  (conclusion: *components still work; they were just receiving polluted input*);
+- Transplant a FP16 layer into the 2-bit model → no effect
+  (conclusion: *the components themselves are broken; even clean input cannot fix them*).
+
+This gives rise to the *Two Failure Modes Hypothesis*:
+
+| Mode | Manifestation | Nature | Analogy |
+|------+---------------+--------+---------|
+| Signal Degradation | 4-bit type | Components functionally intact; input polluted by noise | An old photo fading |
+| Computation Collapse | 2-bit type | Structural failure of components themselves | Camera lens shattered |
+
+*Step 3: Mechanistic validation + targeted intervention.*
+
+For Signal Degradation: locate the "First Domino" (the earliest layer that begins amplifying
+error) and apply a lightweight *two-stage repair strategy* (training-free); performance can
+be recovered.
+
+For Computation Collapse: apply the same repair — failure. Apply low-rank compensation —
+failure. Conclusion: *compensation cannot save a collapsed model; structural reconstruction
+is required* (e.g., QAT or retraining).
+
+*** This Is a Watershed
+
+It shifts LLM quantization research from "minimize numerical error" toward "diagnose internal
+mechanisms." Once this framework is accepted, the question future PTQ papers must answer is
+no longer only "what is the PPL?" but also "are you fixing Degradation or Collapse?"
+
+* Compression Overview Diagram
+
+#+begin_example
+                 Criterion for cutting weights          Cost of quantization
+                 ----------------------------           --------------------
+  [Magnitude pruning]  Small weight = unimportant           --
+       |                (crude)
+       v
+  [OBD 1989]           Second derivative (diagonal Hessian)  --
+       |                "look at loss curvature"
+       v
+  [OBS 1993]           Full H^{-1} + closed-form update       --
+       |                "compensate while pruning"
+       +-----------------+
+                         |   (dormant for 30 years)
+                         v
+  [OBQ 2022]              ← Transplant OBS framework to quantization   Weight rounding error
+       |                   "round one weight, compensate the rest"
+       v
+  [GPTQ 2023]             Scaled to 175B models               Weight reconstruction error
+       |                   "compress OPT-175B in 4 hours"      (MSE perspective)
+       +-----+
+       |     |
+       v     v
+  [AWQ/SmoothQuant/         Activation outlier suppression   Activation + weight MSE
+   QuIP#/SpinQuant]         "flatten the outliers"            (still a numerical perspective)
+       |
+       v
+  [Chang 2025]             Observation of a specific          RMSNorm reversal
+       |                   failure phenomenon
+       |                   (fragmented; only one spot examined)
+       v
+  [Two Failure Modes      Mechanistic failure mode diagnosis  Not a matter of error magnitude
+   2026 this paper]       "Signal Degradation                 but whether *component function*
+       |                    vs.                               is still intact
+       |                    Computation Collapse"
+       v
+  [Future]                 Structural reconstruction          Targeting Collapse;
+                           (QAT / fine-tuning)                Degradation still amenable to
+                           Mixed-precision protection          PTQ; protect early layers
+                           of early layers                     with higher precision
+
+  Perspective evolution:
+    Weight magnitude → Second-order curvature → Coupled compensation → Scale engineering
+    → Activation outliers → Local mechanistic observation → *Systematic mechanistic diagnosis*
+                                                             (this paper)
+#+end_example
+
+* Core Insight
+
+Reading back over this entire river, what is truly changing is *the ontology with which
+researchers view "compression loss"*:
+
+| Era | What loss is treated as |
+|-----+-------------------------|
+| 1989–1993 | A *scalar* (increment of the loss function) |
+| 2022–2024 | A *distributional distance* (gap between output distribution and FP16) |
+| 2025–2026 | A *mechanical failure* (which component failed, and is it noise or structural damage?) |
+
+This is a paradigm shift from "numerical optimization problem" to "mechanism diagnosis
+problem." In the OBD/OBS era we asked "which connection can we most afford to cut?"; in the
+GPTQ era we asked "how do we minimize error?"; this paper's question has become "which
+capability of the model has been broken, and can it be repaired?"
+
+At a deeper level: *as models grow ever larger and ever more organism-like, quantization
+research is quietly shifting from signal processing to neurology*. We are no longer talking
+about "signal-to-noise ratio" but starting to talk about "which brain region is still
+functional and which has died" — logit lens and causal tracing were originally developed for
+analyzing "why does the model know this?"; now they are being turned around to analyze "why
+does it no longer know?"
+
+* Where to Go Next
+
+The paper openly acknowledges two limitations at the end: it only examined weight-only PTQ,
+and only used factual recall tasks. Three directions for follow-up work are foreseeable:
+
+1. *Extend the diagnostic dimensions*: Do activation quantization and KV-cache quantization
+   also exhibit two distinct failure modes? Where is the Computation Collapse boundary on
+   complex reasoning tasks (GSM8K, math, code)?
+2. *Structural methods targeting Collapse*: Since pure PTQ cannot repair Collapse, should
+   *mixed-precision* (keeping critical early layers at high precision) be treated as a
+   first-class design choice? Or can lightweight QLoRA-style fine-tuning perform local
+   reconstruction?
+3. *Predictability of the Collapse threshold*: Can we predict, *before* quantizing, whether
+   a given model + bit-width configuration will collapse? If so, the "catastrophe" could be
+   surfaced at model-selection time rather than deployment time.
+
+A more radical direction: take this mechanistic diagnostic framework and *reverse its
+direction* — use it not to diagnose quantization failure but to diagnose fine-tuning failure,
+prompt injection attacks, or catastrophic forgetting. If the concept of "Two Failure Modes"
+can generalize across settings, it would not merely be a quantization-analysis paper; it
+would provide the first vocabulary for "model failure diagnosis" across all of deep learning.
+
+* Integrity Check
+
+- *Problem as axis*: ✓ The main thread is how the question "what is the essence of
+  compression failure?" has been re-understood over thirty years.
+- *Difference as core*: ✓ Each paper's focal point is "what did it see that its predecessor
+  missed?"
+- *Causal chain unbroken*: ✓ OBD misses coupling → OBS fixes it → OBS is too slow → OBQ
+  ports it → OBQ is too slow → GPTQ engineers it → GPTQ cannot explain the 2-bit cliff →
+  this paper provides the mechanistic framework.
+- *Zero-jargon-first principle*: ✓ Analogies like "cutting connections," "a faded old photo
+  vs. a shattered lens" come first; PTQ/Hessian/logit lens follow.
+- *Honest labeling*: ✓ The main chain has explicit citation links in the papers; the
+  parallel branches (AWQ etc.) and fragmentary mechanistic work (Chang 2025) are categorized
+  as per §1–2 of this paper; forward-looking extensions are flagged as speculative with
+  "not yet clear."

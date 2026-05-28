@@ -1,0 +1,246 @@
+#+title:      Hybrid Policy Distillation for LLMs
+#+date:       [2026-05-28 Thu 14:45]
+#+filetags:   :paper:river:
+#+identifier: 20260528T144500
+#+source:     https://arxiv.org/abs/2604.20244
+#+authors:    Wenhong Zhu, Ruobing Xie, Rui Wang, Pengfei Liu (SJTU & Tencent)
+#+venue:      arXiv preprint, 2026-04-22
+
+* 问题之河
+
+把一个 70 亿参数的 "老师" 模型，压成一个 15 亿参数的 "学生" 模型，让小模型尽量学到大模型的本事——这就是知识蒸馏 (KD)。
+
+听起来简单：让学生模仿老师的输出分布即可。但十年下来，这条线一直在反复回答同一个问题：*学生该用什么"损失函数"去模仿老师？该看老师真实写出来的句子，还是看自己写出来的句子？两者怎么混？* 答错任何一个，学生要么变成"老师的劣化复印件"（什么都说一点，什么都不像），要么"自我陶醉"（只敢说一种话，模式坍缩）。
+
+每一代方案都解一个具体的毛病，又留下新的坑。HPD 是这条线 2026 年的最新一节，它说前面所有方案都可以装进同一个数学框架里——然后在这个框架里挑了一个谁都没挑过的组合。
+
+* 溯源地图
+
+#+begin_example
+[2015] Hinton et al. - Original KD
+   |
+   | 坑: 只在分类 logits 上算 KL；语言生成是序列，token 之间有依赖
+   v
+[2016] Kim & Rush - Sequence-Level KD (SeqKD)
+   |
+   | 解法: 让老师生成一批句子, 学生在这批句子上做 SFT
+   | 坑: 用的是"老师写的", 学生自己生成时还是会跑偏 (train-inference mismatch)
+   v
+[2023] Gu et al. - MiniLLM
+   |
+   | 看到: 用 Forward-KL 让学生覆盖老师所有模式 -> 小模型容量不够 -> 输出"平滑发糊"
+   | 解法: 换成 Reverse-KL, 让学生只锁定老师的高频模式
+   | 坑: Reverse-KL 在 学生<<老师 时方差极大, 训练不稳; 还得在线采样
+   v
+[2024] Agarwal et al. - GKD (Generalized KD)
+   |
+   | 看到: 训练时用老师的句子, 推理时用学生自己的句子 -> 永远 mismatch
+   | 解法: On-Policy, 学生自己采样自己学, 损失用 JSD (FKL + RKL 各一半)
+   | 坑: 每步都要采样 -> 计算贵; JSD 的固定 1:1 配比是拍脑袋
+   v
+[2024] Ko et al. - DistiLLM
+   |
+   | 看到: On-policy 采样开销爆炸, 而且 K3 估计器仍方差大
+   | 解法: 用 Schulman 2020 的 K1 估计器, 更省也更稳
+   | 坑: 仍然是单一 KL 方向, 只是估计器更聪明
+   v
+[2025] Wang et al. - alpha-beta Divergence
+   |
+   | 看到: 不该非黑即白选 Forward 还是 Reverse, 应该插值
+   | 解法: 用 alpha-beta 散度做"加权和", 一个超参滑动覆盖整条谱
+   | 坑: 加权和的系数是全局固定的, 不看每个 token 当下的情况
+   v
+[2026] HPD  <-- 本文
+   |
+   | 看到: 所有上面这些, 其实都是"对 log-likelihood 加权"的特例
+   | 解法: 把"加权"做成 per-token 动态的——学生猜低了用 Forward-KL,
+   |       学生猜高了用 Reverse-KL, 学生胡言乱语再额外采样压一压
+   | 同时: 大部分数据走便宜的离线 (off-policy), 只对学生采样的少量 token 做在线 (on-policy)
+#+end_example
+
+* 演化叙事
+
+** 2015 | Hinton et al.: 知识蒸馏的起点
+
+*** 它看到了什么问题
+
+那时候没人想压语言模型——大家想压的是图像分类器。一个深网络 (老师) 在 1000 类上输出 softmax 概率，比如 "猫: 0.85, 狗: 0.10, 老虎: 0.04, 其它: 0.01"。如果只告诉小模型 (学生) "标签是猫"，那 "狗比老虎更接近猫" 这条信息就被一刀切掉了。
+
+*** 它的解法
+
+让学生不仅学正确答案，还学老师对所有错误答案的概率分布——也就是把老师 softmax 当成"软标签"。两者之间用 KL 散度对齐。再加一个 "温度" 参数让分布更平滑，把暗藏的相似性信息放大出来。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+老师的整个分布里藏着"哪些类别相近"的暗知识 (dark knowledge)。这个暗知识用一个标签传不出来，用整个分布就能传。这是十年里所有 KD 方案的母题。
+
+但语言模型是 *自回归生成* 的——每一步要预测下一个 token，前面一个 token 错了后面全跑偏。简单的 "对每个 token 算 KL" 在序列层面不一定最优，而且序列搜索空间是指数级，KL 算不动。
+
+** 2016 | Kim & Rush: SeqKD — 在序列层面做蒸馏
+
+*** 它看到了什么问题
+
+Hinton 的方法是 token-level：每一步学生学老师在这一步的整个 softmax。问题是机器翻译、生成任务里，重要的是 *整个句子* 像不像老师，不是每个 token 的边缘概率像不像。而且词表很大 (几万)，每步算全词表 KL 太贵。
+
+*** 它的解法
+
+直接让老师写一批句子出来——比如 NMT 里老师 beam search 生成翻译——然后让学生在这批 "老师写的" 句子上做监督微调 (SFT)。这等价于在 sequence-level 上做 Forward-KL，但只用 one-hot 标签，便宜十倍。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+老师写的句子比真实数据更"干净"——少了语言中的噪声和长尾。学生学得快。
+
+但有一个隐藏的坑十年后才被人挑明：训练时学生看的是"老师写的句子"，推理时学生看的是"自己之前写的 token"。学生在自己的输出分布下从来没被训练过，一旦走偏就回不来。这就是 *exposure bias / train-inference mismatch*。这个坑要等八年才有人正面解决。
+
+** 2023 | Gu et al. MiniLLM: 从 Forward-KL 转向 Reverse-KL
+
+*** 它看到了什么问题
+
+LLM 时代来了，大家把 SeqKD 套到 GPT 系大模型上，发现学生输出"什么都说一点、什么都不像"——典型的 *mode-averaging*。原因：Forward-KL `KL(p_老师 || q_学生)` 重罚 "老师有概率而学生没有" 的地方。学生为了不被罚，只能把概率铺得很平，覆盖所有模式。小模型容量不够，铺平之后每个模式都模糊。
+
+*** 它的解法
+
+把 KL 方向反过来：`KL(q_学生 || p_老师)`，叫 Reverse-KL。这个方向重罚 "学生有概率而老师没有" 的地方——学生只敢往老师概率高的几个模式上集中。叫做 *mode-seeking*。结果是输出更锐利、更像老师的某一个模式。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+Reverse-KL 的期望是对 *学生* 的分布取的，所以必须在线采样——学生写一句话，再去问老师 "这句你给多大概率"。但学生和老师差距大时，学生写的句子在老师眼里概率接近零，log 一下方差爆炸，训练不稳。Gu et al. 用了 policy gradient 的技巧 (single-step decomposition、teacher-mixed sampling 等) 稳一稳，但开销和稳定性仍是后续工作的靶子。
+
+** 2024 | Agarwal et al. GKD: On-Policy + JSD 的统一框架
+
+*** 它看到了什么问题
+
+MiniLLM 解决了 mode-averaging，但仍有两个问题：(1) 究竟该用 Forward 还是 Reverse？两者一个偏粗一个偏锐，哪个都不够；(2) SeqKD 那个 train-inference mismatch 还没正面解决——你要么用 SeqKD 给的老师句子 (mismatch)，要么用 MiniLLM 的 on-policy (贵且不稳)。
+
+*** 它的解法
+
+GKD 摆出统一姿势：*让学生采样自己的输出* (on-policy)，损失用 *JSD*——也就是 `0.5 * FKL + 0.5 * RKL`，两个方向各一半，加权和取中庸。同时框架里允许混入老师采样，可调比例。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+On-policy 解决了 train-inference mismatch——训练时见的就是推理时见的。JSD 兼顾了 coverage 和 sharpness。
+
+但代价是每步都要让学生采样——对 LLM 来说就是每步都要做一次完整生成，比看老师写好的数据贵 10 倍以上。而且 "JSD 取 1:1 配比" 是一个全局固定的拍脑袋——不同 token 当下的"覆盖 vs. 锐利"诉求其实不一样。
+
+** 2024 | Ko et al. DistiLLM: 更便宜更稳的 KL 估计器
+
+*** 它看到了什么问题
+
+GKD 的 on-policy 太贵，而且 KL 散度的标准 Monte Carlo 估计 (Schulman 2020 里叫 K_3 / k_2 等) 在 LLM 这种长序列上方差大、梯度噪声大。
+
+*** 它的解法
+
+把 Schulman 2020 提出的 *K_1 估计器* 引进来。简单写就是 `K_1 = log(q/p)`——它是 KL 的 *无偏* 估计，且在大量场景下方差比 K_3 小。配合学生 / 老师混采的策略，让 on-policy 学习既稳又省。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+K_1 是 PPO 里证明过的"老朋友"——HPD 后来在论文里直接把 K_1 当成训练奖励 (per-token reward)，这条路就是从 DistiLLM 这里铺出来的。
+
+但 DistiLLM 仍然是 "选一个 KL 方向 (通常 Reverse) 然后用 K_1 估" 的格局。Forward 和 Reverse 谁更好，仍然没解决。
+
+** 2025 | Wang et al. alpha-beta 散度: 在 Forward 和 Reverse 之间滑
+
+*** 它看到了什么问题
+
+GKD 用 JSD 是 0.5:0.5 的死配比。MiniLLM 是 100% Reverse。SeqKD 是 100% Forward。但 Forward (覆盖广) 和 Reverse (锐利) 应该是一条 *连续谱*——不同任务、不同模型容量比，需要不同位置。
+
+*** 它的解法
+
+用 *α-β 散度* 这一个数学家族——通过 (α, β) 两个超参，这一个公式就能滑过 Forward-KL、Reverse-KL、JSD、Hellinger 等所有常见 f-divergence。研究者可以对自己的任务调出最适合的散度。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它把 "选哪个散度" 从离散选择变成连续旋钮，可以用验证集去搜。
+
+但旋钮是 *全局固定* 的——一旦选定 (α, β)，整个数据集上所有 token 都用同一个加权。然而一个 token 序列里，有的位置学生预测过低 (需要 Forward 推一推)，有的位置学生预测过高 (需要 Reverse 压一压)。一个静态加权不可能两边都对。这正是 HPD 的入口。
+
+** 2026 | HPD: 把"选哪个 KL"做成 per-token 的动态决策
+
+*** 它看到了什么问题
+
+回头看上面这一长串：SeqKD、MiniLLM、GKD、DistiLLM、α-β——HPD 论文先做了一件聪明的事：*把它们全部写成同一个数学式子*——"在某个数据源上，对 log q (a|s) 加权 w(a|s)"。不同方法只是 w 的具体形式不同 (SFT 是常数 1，FKLD 是 p(a|s)，RKLD 是 log(p/q) 等等)。
+
+在这个统一视角下，问题变得清晰：之前所有方法的 w 要么是全局固定的、要么是单一方向的。但对于一个具体的 (state, token) 对，应该问 "学生这一步是低估了还是高估了老师？"——低估就 Forward 拉上去，高估就 Reverse 压下去。
+
+*** 它的解法
+
+两件事：
+
+1) *Per-token 动态加权（Hybrid Forward-Reverse KL）*：对每个 token，算一个 reverse-K_1 估计 `k_1 = q(a*|s) * (log p(a*|s) - log q(a*|s))`。`k_1 > 0` 表示学生低估了真值 token，触发 Forward-KL 加权 `p(a*|s) + k_1`；`k_1 ≤ 0` 表示学生已经高估，*把 Forward 部分屏蔽掉* 只保留 `k_1` 做 Reverse 压抑。这就是 *masking* 替代固定加权和——避免两方向梯度互相打架。
+
+2) *Hybrid Off-Policy + Lightweight On-Policy*：大部分训练用老师 / 离线数据 (便宜)。同时让学生轻量地采一个非真值 token `a_t ≠ a*`，对这个学生采样的 token 算它的 `k_1`，如果 `k_1 < 0` (学生胡乱拔高了一个不该高的 token)，就额外压一下。同时对真值 token 给 *2 倍 Forward 权重* 做 reinforce。
+
+整套机制只用一个奖励信号 (K_1)，没新超参。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+实验里能看到三件事：
+- 训练熵不再坍缩 (SFT 会迅速过拟合到老师，HPD 维持探索)
+- KL 损失持续下降 (其它方法卡在某个 plateau)
+- 数学推理上 Qwen2.5-3B 比纯 SFT 涨 41%, LLaMA3-3B 涨 78%
+
+但仍然有未解：(1) K_1 估计在极端 student-teacher 差距下方差仍大；(2) 这套机制目前都在 "学生 < 老师" 的方向验证，反向的 weak-to-strong 还没碰；(3) 大部分实验是 7B → 1B/3B 的小压缩比，更激进的压缩 (70B → 1B) 还没人系统测过。
+
+* 前沿延伸
+
+HPD 是 2026 年 4 月的论文，几乎同期或之后的相关工作：
+
+- *DistiLLM-2 (Ko et al., 2025)*：和 HPD 同期出现的另一思路——对比式蒸馏 (contrastive)，同时增大老师生成响应的概率、降低学生生成响应的概率，也利用了 off-policy + on-policy 双数据源。和 HPD 的差别：DistiLLM-2 用 contrastive loss 框架，HPD 用 reweighted likelihood 框架。两条路殊途同归地承认 "纯 off / 纯 on 都不够"。
+
+- *DPO + HPD 串联*：HPD 论文自己在 §7 给出 DPO 阶段实验——HPD 训完做初始化，再用 DPO 做偏好对齐，能比 SFT+DPO 多涨 6 个点。说明 HPD 不是终点，是一个 *更好的起点*。
+
+截至本笔记 (2026-05)，沿 "per-token 动态加权" 这条思路的后续工作还没成型；猜测下一步会是把动态加权信号换成更强的 RL 风格估计器 (advantage、GRPO group baseline 之类)，或者拓展到多老师 (mixture-of-experts as teacher) 场景。
+
+* 一张图看懂
+
+#+begin_example
+                   |  数据来源              |  KL 方向          |  权重粒度
+   ----------------+-----------------------+------------------+-----------------
+   2015 Hinton KD  |  分类任务的标签       |  Forward (软标签) |  per-class
+   2016 SeqKD      |  老师写的句子 (off)   |  Forward, 序列级  |  全局 = 1
+   2023 MiniLLM    |  学生自己采样 (on)    |  Reverse          |  全局
+   2024 GKD/JSD    |  on-policy 为主       |  JSD = 0.5F+0.5R  |  全局, 固定 1:1
+   2024 DistiLLM   |  on-policy + 混采     |  Reverse + K_1    |  全局, K_1 估
+   2025 alpha-beta |  off-policy 为主      |  连续谱 (α, β)    |  全局, 可调旋钮
+   2026 HPD        |  off + 轻量 on        |  动态: F 或 R     |  per-token, 看 K_1 符号
+
+   核心剧情:
+       "选 Forward 还是 Reverse"  -->  "插值 Forward 和 Reverse"  -->
+       "per-token 动态在 Forward 和 Reverse 之间切换 (masking)"
+
+       "全 off-policy"  -->  "全 on-policy"  -->
+       "off-policy 为主 + 学生采样一两个 token 做轻量 on-policy"
+
+   两条主线在 HPD 这里第一次同时被 per-token 化。
+#+end_example
+
+* 洞见
+
+读完这条 11 年的演化线，浮出三层规律：
+
+*1. "选 A 还是 B" 是过渡问题，"动态在 A 和 B 之间切换" 才是终点*
+
+整条线就是这个模式的反复上演。Forward vs Reverse？先二选一 (MiniLLM)，再固定混合 (GKD)，再连续插值 (α-β)，最后 per-token 动态切换 (HPD)。Off-policy vs On-policy？先全 off (SeqKD)，再全 on (MiniLLM/GKD)，最后 off 主 + on 辅 (HPD)。
+
+每一步看似进步，其实都还停在"用一个超参选位置"的层面。真正的范式跃迁是让选择本身变成 *数据驱动、per-instance* 的。这是机器学习从"调参艺术"到"meta-learn 选择"的标志性轨迹。
+
+*2. 数学统一不是花架子, 是寻找新组合的搜索空间*
+
+HPD 最具方法论意义的一步，是把 SFT/SeqKD/MiniLLM/GKD/DistiLLM 全部写成"reweighted log-likelihood"的统一形式。一旦写出来，就能在 w(a|s) 的设计空间里搜——发现"动态符号判断 + 屏蔽"这种之前没人试过的组合。
+
+这条范式在很多领域反复出现：先有花式方法堆叠，然后有人写出统一框架，框架揭露的 *空白格子* 就是下一篇论文。
+
+*3. 训练 - 推理 一致性 (train-inference alignment) 是被低估的金矿*
+
+SeqKD 留下的 "学生训练时看老师写的、推理时看自己写的" 这个 mismatch，整整撑起了 2023-2026 三年的 OPD 浪潮。HPD 把它做到极致——不是要么全 off 要么全 on，而是 "off 给 dense 监督 + on 给 calibration"，两者承担不同角色。
+
+这条规律不止 KD 适用：RLHF、agent training、世界模型——所有 "在分布 A 上训练，在分布 B 上部署" 的任务里，都存在 SeqKD 式的隐藏 mismatch，且每次都要等几年才被人正面拆出来。
+
+* 启发
+
+这意味着你可以：
+
+- *做工程时*：如果你在做小模型蒸馏，先别再争"用哪个 KL"，直接用 HPD 的 per-token K_1 符号判断；它没多新超参、计算开销几乎不变、对各种模型族都涨点。
+- *做研究时*：拿到一个 "F vs R" 二选一的争论，先问"能不能写成统一形式"；如果能，再问"统一形式里有没有 per-instance 维度还没被用"。HPD 的范式可以平移到很多领域 (RLHF 里的 reward model 训练、preference learning、agent 模仿学习)。
+- *做综述时*：把每条研究线画成 "全局固定 → 可调超参 → 数据驱动动态" 的三段式，然后看你的领域目前停在哪一段——下一段往往就是你的论文。
+- *做团队时*：如果你看到组内不同小组在 "选 A 派 vs 选 B 派" 互掐，停下来问"能不能 per-instance 在 A 和 B 之间动态切换"。十有八九能。

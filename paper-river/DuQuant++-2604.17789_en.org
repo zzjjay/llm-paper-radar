@@ -1,0 +1,302 @@
+#+title:      DuQuant++: Fine-grained Rotation Enhances Microscaling FP4 Quantization
+#+date:       [2026-05-28 Thu 14:18]
+#+filetags:   :paper:river:quantization:llm:mxfp4:rotation:en:
+#+identifier: 20260528T141808-en
+#+source:     https://arxiv.org/abs/2604.17789
+#+authors:    Haokun Lin, Xinle Jia, Haobo Xu, Bingchen Yao, Xianglong Guo, Yichen Wu, Zhichao Lu, Ying Wei, Qingfu Zhang, Zhenan Sun (CASIA / NJU / THU / ZJU / Harvard / CityU)
+#+venue:      arXiv preprint, 2026-04-21
+
+* The River of the Problem
+
+Squeezing a 7-billion-parameter model into 4 bits—the biggest obstacle is not the weights, it's the activations. LLM activations always sprout a few absurdly large values (outliers), sometimes tens or hundreds of times larger than their neighbors. With only 16 quantization slots to spare, a single outlier drags the scale to the ceiling and crushes the remaining 15 slots toward zero.
+
+This research thread has been chasing outliers ever since. From the moment the phenomenon was identified in 2022, every successive paper has been asking a variant of the same question:
+
+- How do we stop outliers from "monopolizing" the scale?
+- Can we "move" an outlier from one place to another?
+- Can we mathematically "spread" an outlier so it is shared across many channels?
+- When the hardware itself changes the rules (MXFP4 with per-block scales), do the old solutions become over-engineered?
+
+DuQuant++ is the settling of accounts that happens when hardware absorbs half the problem and the method simplifies accordingly.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | Problem: LLM activations contain "emergent outliers"—a small number of
+  |          dimensions are 20-100× larger than the rest. INT8 immediately breaks.
+  | Solution: Extract outlier channels and compute them in FP16;
+  |           the remainder runs in INT8—mixed-precision as a workaround.
+  | Residual: 4-bit is completely out of reach; outliers are "bypassed",
+  |           not "resolved".
+  v
+[2023] SmoothQuant (Xiao et al.)
+  |
+  | Problem: Outliers live in fixed channels—can they be migrated from
+  |          activations into weights? Weight distributions are far smoother.
+  | Solution: Insert a diagonal matrix diag(s) before X*W:
+  |           (X/s) * (s*W). Mathematically equivalent, but a well-chosen
+  |           s tames X/s while s*W remains manageable (weights were easy anyway).
+  | Residual: Not enough for "massive outliers" (extreme spikes);
+  |           completely breaks down at W4A4.
+  v
+[2024] QuaRot (Ashkboos et al.)
+  |
+  | Problem: SmoothQuant can only "move" outliers, not eliminate them.
+  |          Some layers have outliers so extreme that even shifting them
+  |          to the weight side yields no relief.
+  | Solution: Use a Hadamard rotation matrix—an orthogonal matrix whose
+  |          entries are all ±1/sqrt(d)—multiplied onto the activations.
+  |          Rotation has an energy-spreading property: one spike gets
+  |          distributed evenly across all channels.
+  |          The rotation matrix can be absorbed offline into adjacent
+  |          weights, making it nearly free at inference time.
+  | Residual: Hadamard is *data-agnostic*—it ignores where outliers live
+  |          and spreads indiscriminately. If outliers are concentrated
+  |          in a few channels, it "wastes" spreading capacity on
+  |          channels that had no problem to begin with.
+  v
+[2024] DuQuant (Lin et al.)
+  |
+  | Problem: Hadamard scatters by probability alone, blind to the data.
+  |          But in practice we *know* which channels hold outliers
+  |          (one forward pass on a calibration set is enough).
+  |          Why not build a *targeted* rotation?
+  | Solution: Greedily search for a block-diagonal rotation R that
+  |          specifically disperses the largest outlier channels' energy
+  |          into other channels within each block. But block-diagonal
+  |          only governs intra-block structure—inter-block energy
+  |          variance remains unaddressed. Fix: insert a zigzag
+  |          permutation P to interleave high-energy and low-energy
+  |          blocks, then apply a second block-diagonal rotation:
+  |          R1 -> P -> R2.
+  | Residual: At inference, two block-diagonal matrix multiplications
+  |          plus one permutation must be computed. Non-trivial overhead.
+  |          The whole design fights "inter-block variance under
+  |          per-token or per-channel scaling"—a product of the INT4 era.
+  v
+[2026] DuQuant++ (this paper)
+  |
+  | Observations:
+  |   1. Hardware changed—MXFP4 (natively supported on NVIDIA Blackwell)
+  |      gives every 32 elements their own independent E8M0 scale.
+  |      "Inter-block variance" is simply not a problem in MXFP4—
+  |      each block manages its own scale.
+  |   2. MR-GPTQ / BRQ moved Hadamard rotation to MXFP4 blocks
+  |      (block_size=32) but reverted to data-agnostic—discarding
+  |      DuQuant's outlier-aware advantage.
+  | Solution: Adapt DuQuant's outlier-aware rotation to MXFP4 by
+  |          matching the rotation block size B to the MXFP4 group
+  |          size (B=32). Because each MXFP4 group has its own scale,
+  |          *inter-block variance is no longer a problem, so the
+  |          zigzag step and the second rotation are simply dropped*.
+  |          What remains: one outlier-aware rotation + smooth.
+  | Gain: Online rotation cost is halved; the rotation also acts
+  |       on the weights, naturally smoothing their distribution.
+#+end_example
+
+Note: After SmoothQuant the field branched into three streams—AWQ/GPTQ pursued "weight refinement," QuaRot/DuQuant pursued "rotation to handle outliers." This narrative follows only the rotation branch, since DuQuant++ is its direct continuation.
+
+* The Evolutionary Story
+
+** 2022 | LLM.int8(): Outliers Are LLMs' "Native Disease"
+
+*** What problem it identified
+
+Compressing a trained GPT-style model to INT8 should be straightforward—8 bits gives 256 levels, more than enough for a near-Gaussian distribution. But when Dettmers ran it, the models collapsed. Inspection revealed that in every transformer layer, a handful of activation dimensions were wildly large—50–100× the median of the same layer. These "emergent outliers" drove the INT8 scale to extremes, leaving all other values crammed near zero.
+
+*** Its solution
+
+Simply don't quantize the outliers. The paper built a mixed-precision implementation: scan once to identify outlier channels (roughly 0.1% of channels), send those through FP16, and send the other 99.9% through INT8. Concatenate the results afterward.
+
+*** Why it worked (and what new trap it laid)
+
+It was the first work to explicitly name and isolate outliers as a *phenomenon*. The cost was engineering complexity—matmul kernels now had to handle two precisions. More fatally: at 4-bit this trick simply doesn't work—FP4 has only 16 values, and removing 0.1% of channels to run in FP16 still leaves the remaining 99.9% with no room to breathe.
+
+The real question it bequeathed to the entire thread wasn't technical; it was philosophical: *Are outliers an objective fact to be accepted, or are they a surface artifact that can be eliminated through a mathematical transformation?*
+
+** 2023 | SmoothQuant: Move Outliers from Activations into Weights
+
+*** What problem it identified
+
+LLM.int8()'s mixed-precision approach completely fails at W4A4 (4-bit weights, 4-bit activations). But Xiao noticed an asymmetry: outliers are everywhere in activations, while weight distributions are comparatively smooth. If some of the difficulty in activations could be "transferred" to weights, both sides might survive.
+
+*** Its solution
+
+A mathematically equivalent reformulation: rewrite Y = X @ W as Y = (X * diag(s)^-1) @ (diag(s) * W), with the same result. You then choose s_j—for example s_j = max(|X_j|)^α / max(|W_j|)^(1-α)—to shrink column j of X (pressing the outlier down) while scaling up column j of W (which was well-behaved to begin with).
+
+*** Why it worked (and what new trap it laid)
+
+It elevated "outlier handling" from LLM.int8()'s "cut apart and use different precisions" to "mathematically equivalent migration." This was a paradigm shift—it told the community that outliers can be *operated on*, not merely accepted.
+
+But two hard limitations remained. First, it is insufficient for the extreme spikes the paper calls "massive outliers"—no matter how much you shift them, the weight side cannot absorb them. Second, diag(s) performs only *per-channel* scaling; it cannot change the relative relationships between channels. The outlier is "held down," not truly "dispersed."
+
+** 2024 | QuaRot: Let Outliers Mathematically "Spread Out"
+
+*** What problem it identified
+
+SmoothQuant's migration is linear—press a channel's outlier down and it obediently shrinks. But you cannot suppress super-extreme outliers. Ashkboos noticed a useful property: if you multiply an activation vector x by an orthogonal matrix R to get x' = R @ x, the variance across dimensions of x' becomes more uniform—energy spreading.
+
+If R is a Hadamard matrix (all entries ±1/sqrt(d)), then a spike concentrated in one dimension of x gets spread uniformly across all dimensions of x' = H @ x—variance shifts from extreme concentration to uniform distribution.
+
+*** Its solution
+
+Insert H and H^T around the weight matrix: Y = (X @ H) @ (H^T @ W). Since H^T @ H = I, the computation is mathematically equivalent. But X @ H is now well-behaved in every dimension and can be 4-bit quantized; H^T @ W can be precomputed offline and stored—H is invisible at inference time.
+
+The only online cost is computing X @ H. But the special structure of the Hadamard matrix allows this multiplication to be done in O(d log d) (analogous to FFT), making the overhead small.
+
+*** Why it worked (and what new trap it laid)
+
+It made W4A4 genuinely usable for the first time—LLaMA quantized to 4 bits approached FP16 accuracy. A qualitative leap.
+
+But H is *data-agnostic*—it spreads any 4096-dimensional vector in exactly the same way. The problem is that LLM outliers are not randomly distributed; they cluster in specific fixed channels (often the inputs to down projections). Spreading one spike across 4096 dimensions sounds great, but it also "uses up" some dynamic range in all 4096 dimensions. If outliers are concentrated in just 100 channels, you could confine the spreading operation to those 100 channels—why disturb the other 3,996?
+
+** 2024 | DuQuant: Don't Disturb Healthy Channels—Rotate Surgically
+
+*** What problem it identified
+
+QuaRot's Hadamard approach casts a wide net—it doesn't look at where the outliers are. But Lin observed: run a calibration set once and you can pinpoint exactly which channels contain outliers. Why not build a rotation *specifically targeting those channels*?
+
+*** Its solution
+
+Greedily search for a block-diagonal rotation matrix R—each block is a B×B orthogonal matrix (typically B = 128 or 256), designed to address the largest outliers within that block. The algorithm iterates: find the current largest outlier dimension, construct a rotation that disperses its energy into other dimensions within the block, find the next largest, disperse again, until convergence.
+
+But a serious problem arises: a block-diagonal rotation *governs only the intra-block structure*. The energy distribution across blocks remains uneven—some blocks carry many outliers, others are naturally well-behaved. You have done all the work inside each block, but the cross-block disparity is unaddressed.
+
+DuQuant's remedy: insert a zigzag permutation P between two block-diagonal rotations—interleave outlier-heavy blocks with outlier-light blocks, re-form the blocks, then apply a second block-diagonal rotation. The full pipeline becomes: =R1 -> P -> R2=, three steps.
+
+*** Why it worked (and what new trap it laid)
+
+Upgrading from "data-agnostic spreading" to "data-aware targeted spreading" is theoretically more efficient—no capacity wasted on channels that were already fine.
+
+But the cost is visible: at inference, two block-diagonal matrix multiplications plus one permutation must be executed. The smaller the block (e.g., 32), the larger the relative overhead; the larger the block (e.g., 256), the closer the block-diagonal is to a dense rotation, weakening the efficiency advantage.
+
+More critically: *why is the zigzag + second rotation needed at all?* The root cause—integer quantization uses per-token or per-channel scaling, so the entire tensor shares one or a few scale values, and a single extreme value "pollutes" the usable scale range for everyone. Inter-block variance must be flattened. This design was made in the INT4-era context, before per-block-scale hardware existed.
+
+** 2026 | DuQuant++ (This Paper): Hardware Changed—Cut Half the Steps
+
+*** What problem it identified
+
+By 2025–2026, the hardware landscape had shifted. NVIDIA Blackwell tensor cores natively support MXFP4—a format that divides tensors into blocks of 32 elements, each block carrying its own independent E8M0 scale. This means:
+
+- Each block manages its own scale—one block's outlier affects only the 31 other elements in that block, not the next block.
+- Inter-block variance is no longer a problem—each block already has independent scaling.
+
+The zigzag permutation and second rotation in DuQuant exist entirely to fight inter-block variance. In MXFP4, *that problem simply does not exist*—you are paying for a solution to a nonexistent problem.
+
+Meanwhile, on the other side: MR-GPTQ and BRQ (2025) moved Hadamard rotation to MXFP4 blocks (block=32), correctly matching the hardware granularity, but reverted to data-agnostic—discarding DuQuant's outlier-aware advantage.
+
+The landscape: DuQuant has the right outlier-aware idea but an over-engineered pipeline; MR-GPTQ uses the right block size but is again data-agnostic. Neither has captured all the benefits of the other.
+
+*** Its solution
+
+Align DuQuant's outlier-aware block-diagonal rotation block size directly to the MXFP4 group size: =B = 32=. Then:
+
+1. *Drop the zigzag permutation*—MXFP4 provides built-in cross-block isolation; inter-block spreading is unnecessary.
+2. *Drop the second rotation*—one block equals one MXFP4 group; one round of spreading suffices.
+3. Add a SmoothQuant-style diagonal smooth matrix Λ to first migrate normal outliers partially into the weights—then use the outlier-aware rotation to handle massive outliers.
+
+Final formula: =Y = (X * Λ^-1 * R) @ (R^T * Λ * W)=—one smooth step plus one rotation.
+
+R is constructed exactly as in the original DuQuant: greedily find the largest outlier channel, build a rotation to disperse its energy, iterate. But because B=32 is much smaller than the original B=128/256, the rotation matrix multiplication itself is cheaper per step.
+
+*** Why it works (and what gaps remain)
+
+The intuition is clean:
+- DuQuant's "targeted rotation" is the genuinely useful core.
+- DuQuant's "dual rotation + permutation" is a patch for INT4-era inter-block variance.
+- MXFP4's per-block scale renders that patch unnecessary.
+- Drop the patch, keep the core—half the cost, full benefit.
+
+Empirically: LLaMA-3-8B under MXFP4 W4A4 reaches 6.88 perplexity (FP16 baseline: 6.14), 67.1% average zero-shot accuracy, surpassing the strongest baseline MR-GPTQ by 1.0%; on LLaMA-3.2-3B it reduces QuaRot's perplexity from 17.95 to 8.87, a relative improvement of over 50%.
+
+Gaps that remain:
+- Rotation R is found by greedy search on a calibration set—could it be learned (learnable rotation)?
+- B=32 is fixed by MXFP4; if NVFP4 (B=16) or other granularities emerge, the design must be revisited.
+- Smooth and rotation are applied sequentially—could they be jointly optimized?
+
+* Frontier Extensions
+
+DuQuant++ is an April 2026 paper, being concurrently improved or compared against by several contemporaneous works:
+
+- *MR-GPTQ* (Egiazarian et al. 2025): Combines GPTQ error compensation with block-wise Hadamard rotation, optimized for MXFP4. Used in the DuQuant++ paper as the strongest baseline to beat.
+- *BRQ* (Shao et al. 2025): Surveys standard practices for adapting PTQ pipelines to MXFP4; recommends block-diagonal Hadamard—the same road as MR-GPTQ.
+- *MicroMix* (Liu et al. 2025): A different direction—identify sensitive channels and assign them higher-precision MXFP kernels. Complementary to the "rotation-to-scatter" idea; the two can be stacked.
+- *FlatQuant* (Sun et al. 2024b): Learns end-to-end rotation matrices—more aggressive than DuQuant's greedy search, but with high training cost. Adapting it to MXFP4 remains an open question.
+- *NVFP4* (Alvarez et al. 2025): Another microscaling format, block=16, scale represented as FP8 (E4M3). Finer-grained than MXFP4; outlier impact is theoretically smaller—but the DuQuant++ approach should transfer directly.
+
+Most likely next steps:
+1. *Learnable outlier-aware rotation*—replace greedy search with differentiable optimization, trained end-to-end on the calibration set.
+2. *Format-agnostic rotation design*—one method supporting MXFP4 / NVFP4 / MXFP6 / custom block sizes simultaneously.
+3. *Coupling with KV cache quantization*—KV cache under MXFP4 faces the same outlier problem; the rotation idea transfers directly.
+
+* One Diagram to Understand It All
+
+#+begin_example
+        Outlier perspective              Tooling perspective
+        ------------------               -------------------
+[2022] LLM.int8()     "Outliers are unsolvable"          Mixed precision (FP16+INT8)
+                               |                          Refuse to quantize outliers
+                               v
+[2023] SmoothQuant    "Outliers can be moved to weights"  Per-channel diagonal scaling
+                               |                          Mathematically equivalent migration
+                               v
+[2024] QuaRot         "Outliers can be spread everywhere" Hadamard rotation
+                               |                          Data-agnostic spreading
+                               v
+[2024] DuQuant        "Outliers can be spread surgically" Block-diagonal rotation R1 + P + R2
+                               |                          Data-aware, but three steps
+                               |                          (P + R2 exist to fix inter-block variance)
+                               v
+[2025] MR-GPTQ / BRQ  "Move Hadamard to MXFP4 blocks"    Block-Hadamard (B=32)
+                               |                          Reverts to data-agnostic
+                               v
+[2026] DuQuant++       "MXFP4 makes inter-block variance  Single outlier-aware rotation
+       (this paper)     disappear automatically"          (B=32) + smooth
+                        "DuQuant's P+R2 are over-design"  Data-aware + half the cost
+
+Time ----------------------------------------------------------------->
+
+Main evolutionary arc: outlier handling progresses from "bypass" -> "migrate"
+         -> "spread" -> "spread surgically"
+         Each generation advances one step—but DuQuant++ is a counter-move:
+         it recognizes that the previous generation's complexity was forced by
+         a now-obsolete hardware assumption, and when the hardware changed,
+         that complexity could be shed.
+#+end_example
+
+* Insight
+
+Reading this thread to the end, two parallel evolutions come into view: *algorithms growing smarter, and hardware growing more aligned*. The most interesting events happen at the crossings—*complex algorithm designs built to compensate for coarse hardware become over-engineered once the hardware grows finer*.
+
+DuQuant's zigzag permutation and dual rotation are fundamentally a self-rescue design built in the INT quantization era, where a single global scale created the problem in the first place. When MXFP4 cut that scale down to 32 elements per block, the premise of the rescue vanished. The entire pipeline had to be reconsidered—not mechanically "porting DuQuant onto MXFP4."
+
+This points to a more general phenomenon: *the complexity of an algorithm is often the shadow of the hardware assumptions of its time*. When you see a multi-step solution, ask first: what sub-problem does each step solve? Do those sub-problems still exist under new hardware or new formats? You will frequently find that half the steps are "taxes paid for problems that no longer exist."
+
+Specifically within the LLM quantization thread, the underlying cognitive shift is:
+
+- *2022*: Outliers are a disease—avoid them if you can.
+- *2023*: Outliers are migratable objects—move them somewhere easier.
+- *2024*: Outliers can be dissolved by mathematical operations (rotation = spreading).
+- *2026*: The destructive power of outliers depends on the granularity of the scale—when hardware provides fine-grained scales, the algorithm should simplify.
+
+The third level (QuaRot/DuQuant) is the genuine algorithmic breakthrough. The fourth level (DuQuant++) is the settling of accounts that happens when hardware makes the algorithm simpler.
+
+What is most likely to happen next:
+
+1. Hardware scale granularity continues to shrink (NVFP4 is already at B=16); algorithmic complexity will continue to be shed.
+2. With W4A4 largely solved, the next battleground is W3A3 or W4A4-KV4 (KV cache also quantized).
+3. "Learnable outlier-aware rotation" + "hardware-aligned block granularity" will merge into a new standard practice.
+
+* Takeaways
+
+Three lessons for doing research:
+
+1. *Audit the previous generation's complexity*. When a pipeline has multiple steps, ask what each step is compensating for. New hardware or new formats will likely make some compensations unnecessary. The entire contribution of DuQuant++ is essentially "recognizing that P and R2 are no longer needed"—and this was visible only because the external condition, MXFP4, had changed.
+
+2. *Treat hardware primitives as design variables*. MXFP4's B=32 is not a "constraint"; it is a "lever"—it makes per-block independent scaling a free feature. When designing algorithms, don't assume hardware is fixed. Ask: "What happens if my algorithm's block size is aligned with the hardware's block size?" You will often discover that things previously handled in software are already managed by the hardware.
+
+3. *Data-agnostic is a regression*. The true high-water mark in this thread is DuQuant's outlier-aware design; MR-GPTQ and BRQ adopt Hadamard as a "simpler method to adapt to new hardware"—but DuQuant++ shows you can simultaneously have outlier-aware accuracy and hardware-friendly simplicity. Whenever you see "drop the fine-grained signal from before in order to use the new tool," there is almost always room to add that signal back.
+
+The implication is actionable: the next time you face "redo an old problem on new hardware," don't mechanically port the old method, and don't start from scratch either. Decompose the old method into "core idea" and "patches for old hardware." Drop the patches. Mount the core idea on the new hardware primitives. That move, in itself, is a good paper.

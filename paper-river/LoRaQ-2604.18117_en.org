@@ -1,0 +1,305 @@
+#+title:      LoRaQ: Optimized Low Rank Approximation for 4-bit Quantization
+#+date:       [2026-05-28 Thu 14:24]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T142423-en
+#+source:     https://arxiv.org/abs/2604.18117
+#+authors:    Yann Bouquet, Alireza Khodamoradi, Sophie Yáng Shen, Kristof Denolf, Mathieu Salzmann (AMD / EPFL)
+#+venue:      arXiv 2026-04-20 (cs.LG)
+
+* The Problem River
+
+Compress every parameter of a billion-parameter transformer down to 4 bits and the model breaks. Why? Because a small number of channels in the weights and activations carry values tens or hundreds of times larger than the rest — those *outliers*. Quantize globally and the large values monopolize the dynamic range, collapsing everything else into the same integer bucket. Quantize per-channel and the GPU can no longer execute vectorized ops across that row.
+
+For four years, the entire LLM/DiT quantization field has been wrestling with outliers: first isolating them and protecting them in FP16; then using mathematical transforms to redistribute their "difficulty" onto other components; then using rotations to scatter energy evenly across all channels; and finally using low-rank branches to take over the parts that simply cannot be quantized. Every step forward is a new angle on the same outlier problem.
+
+LoRaQ stands at the current end of this line. Its proposition: the cleverest prior solution (SVDQuant) still contains two "taken-for-granted compromises" that have never been challenged — the low-rank branch must be FP16, and calibration must see data. Neither is actually necessary.
+
+* The Source Map
+
+#+begin_example
+[2022.08] Dettmers et al. -- LLM.int8()
+  |
+  | Problem observed: LLMs of 6.7B+ collapse immediately under INT8,
+  |                   accuracy dropping to near-random
+  | Discovery: systematic outliers concentrated in *a small fixed set of channels*
+  | Solution: keep those channels in FP16, run all others in INT8
+  |           (mixed-precision decomposition)
+  | Remaining gap: requires complex mixed-precision kernels;
+  |                full INT8 throughput not achieved
+  v
+[2022.11] Xiao et al. -- SmoothQuant
+  |
+  | Problem observed: leaving outliers in FP16 is too passive;
+  |                   they are in fact *channel-wise*
+  | Key insight: Y = X*W = (X*diag(s)^-1) * (diag(s)*W) -- mathematically equivalent
+  |              so the outlier "scale" of activations can be multiplied into weights
+  |              channel-by-channel
+  | Solution: use a per-channel scale to migrate activation difficulty to the weight
+  |           side; after smoothing, run the whole thing as W8A8
+  | Remaining gap: at W4A4, even after smoothing, 4 bits still cannot hold
+  |                residual outliers
+  v
+[2024.04] Ashkboos et al. / Liu et al. -- QuaRot / SpinQuant
+  |
+  | Problem observed: smoothing trades "a few huge activation channels" for
+  |                   "a few huge weight rows" -- the shape changed but the
+  |                   substance did not; 4-bit still cannot hold them
+  | Solution: insert a pair of orthogonal matrices between X and W:
+  |           X*Q * Q^T*W -- still equivalent,
+  |           but Q is a Hadamard / learned rotation that *evenly disperses*
+  |           any concentrated energy across all channels,
+  |           making the distribution isotropic from the root
+  | Remaining gap: on DiT (iterative denoising), errors accumulate across steps;
+  |                rotation alone is not clean enough
+  v
+[2025.11] Li et al. -- SVDQuant (Nunchaku)
+  |
+  | Problem observed: DiT still blurs at W4A4; residual outliers concentrate
+  |                   along a few dominant singular directions
+  | Solution: after smoothing, decompose W via SVD into
+  |             W ~ L*R  (FP16 low-rank branch -- holds dominant energy)
+  |             + (W - L*R) quantized to INT4 (residual branch)
+  |           two branches are summed; a fused kernel hides the FP16 memory cost
+  | Remaining gap: (1) FP16 branch leaves the GPU's FP8/FP4 tensor cores idle
+  |                (2) L, R initialization requires running calibration data --
+  |                    heavy and expensive
+  |                (3) requires custom kernels; not portable
+  v
+[2026.04] Bouquet et al. -- LoRaQ  <-- this paper
+  |
+  | Problem observed: SVDQuant's two compromises (FP16 branch +
+  |                   data-dependent calibration) are not actually necessary
+  | Solution: (1) the quantizer is idempotent: Q(Q(x)) = Q(x). So just find
+  |               a low-rank D = L*R such that Q(W+LR) = W+LR, meaning the
+  |               quantization error equals exactly LR
+  |               -- a purely algebraic relationship, *no data needed at all*
+  |           (2) insert a rotation Omega between L and R so that the elements
+  |               of L and R themselves become isotropic, allowing L*Omega and
+  |               Omega^T*R to also be quantized
+  |               -- the first *fully sub-16-bit* low-rank branch
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022.08 | LLM.int8(): Discovering Outliers and Putting Them on a Pedestal
+
+*** What problem did it see?
+
+Before 2022, quantization worked well on CV models but fell apart when applied to large language models. The Dettmers team ran a series of comparisons: BERT, OPT, GPT. Under 2.7B parameters, INT8 was fine; above 6.7B, accuracy plummeted from the 70s to near-random.
+
+They performed a careful dissection: in each layer's activations, *the same fixed set of channels* (under 0.1%) had values 10 to 100 times larger than the rest. These channels were persistent — stable across samples and tasks. When quantizing with a global scale, the vast majority of ordinary values got squeezed into just a few quantization bins, and all their information was lost.
+
+*** Its solution
+
+Simple and direct: dynamically identify outlier channels, extract them and compute them in FP16; run the remaining channels through INT8 matrix multiplication; then add the two results back together. This is "mixed-precision decomposition."
+
+The intuition: if you don't want to lose outlier precision, and you don't want them to contaminate everyone else's quant range, just let them travel their own path.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because outlier channels are rare (0.1%–1%), so the overhead of keeping them in FP16 is small.
+
+But it dug several pits. First, *mixed-precision kernels are hard to write* — two precisions within the same matrix multiply are not hardware-friendly. Second, *it doesn't "digest" the outliers* — it merely detours around them. If you want to push to W4A4, this road goes nowhere: the outliers are still there; you've just left them alone.
+
+The third and most fatal: it treats outliers as "special entities." The next paper would show that outliers are in fact *systematic and can be mathematically redistributed*.
+
+** 2022.11 | SmoothQuant: Moving the Difficulty from Activations to Weights
+
+*** What problem did it see?
+
+LLM.int8() "protected" the outliers; Xiao et al. were unsatisfied: you ran INT8 throughout, yet the hardest parts are still FP16, swallowing half the theoretical speedup. And the ceiling of this approach is W8A8 — it cannot be pushed to 4 bits.
+
+They re-examined the outlier distribution and found a key fact: *activation outliers are per-channel* (certain channels are globally large), while *weights are generally smooth* (per-channel ranges are similar). So activations are hard to quantize and weights are easy — one side difficult, the other relaxed, a wasted asymmetry.
+
+*** Its solution
+
+A mathematically equivalent transformation:
+#+begin_example
+Y = X * W
+  = (X * diag(s)^-1) * (diag(s) * W)
+  = X' * W'
+#+end_example
+For each channel, choose a scale s_i — large activation channels are multiplied by a large 1/s_i (shrinking them), while s_i is multiplied into the corresponding weight row (enlarging it). Result: activations become *smooth* enough for INT8, and weights, carrying a bit more load, can still handle INT8.
+
+A hyperparameter alpha controls "how much to migrate": larger alpha means weights absorb more.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because the essence of outliers is *uneven channel-wise distribution* — since the shape is channel-wise, a channel-wise scale can dismantle it. One algebraic transformation, and the entire W8A8 pipeline runs cleanly without any special kernels.
+
+But the pit is clear: you have only moved the outliers *from a few activation channels* to *a few weight rows*. The shape changed; *the total energy did not*. W8A8 can hold it because the 8-bit grid is fine enough; the moment you push to W4A4, those weight rows still overflow. It cannot reach 4 bits.
+
+The next paper would say: instead of moving, scatter.
+
+** 2024.04 | QuaRot / SpinQuant: Scattering Energy with Rotations
+
+*** What problem did it see?
+
+QuaRot (Ashkboos et al.) and SpinQuant (Liu et al.) appeared almost simultaneously. Looking at post-SmoothQuant weight distributions, they found: smoothing solved "a few large activation channels" at the cost of "a few large weight rows." The shape shifted from one side to the other; the substance was unchanged. Pushing to W4A4, even this residual could not hold.
+
+The deeper issue: the root cause of outliers is *a poorly chosen basis* — in the standard basis, the model's features happen to concentrate along a few dimensions. In a different basis, the energy might disperse.
+
+*** Its solution
+
+Another mathematically equivalent transformation:
+#+begin_example
+Y = X * W = (X * Q) * (Q^T * W)
+#+end_example
+where Q is an orthogonal matrix (Q^T * Q = I). This insertion does not change the output, but the distributions of X*Q and Q^T*W change entirely.
+
+The key choice: make Q a *Hadamard matrix* (or a learned rotation). Hadamard rotation has a special property — it *evenly scatters any concentrated energy across all channels*. Outliers are no longer "a few very large channels" but "every channel has a little," making the distribution approach an isotropic Gaussian.
+
+Under this uniform distribution, the 4-bit quantization grid can accommodate the vast majority of values, and W4A4 becomes genuinely feasible.
+
+*** Why it worked (and what new pit it dug)
+
+The key to rotation is not "compression" but *changing the coordinate system* so that the "shape" of the distribution improves. SmoothQuant applied per-channel weighting (a diagonal matrix); QuaRot upgrades to *arbitrary orthogonal matrices* — far more expressive.
+
+The remaining pit: sufficient for LLMs, but not for *diffusion transformers*. DiT runs 20–50 iterative denoising steps, and quantization error at each step gets amplified by the next. Scattering energy reduces the average error, but cannot eliminate the residual — images generated by DiT start to blur.
+
+What is needed is not just "a better distribution," but *active error compensation*.
+
+** 2025.11 | SVDQuant: Sending the Dominant Error into a High-Precision Low-Rank Branch
+
+*** What problem did it see?
+
+Li et al. (MIT/NVIDIA, Nunchaku project) applied SmoothQuant + rotation to DiT models like PixArt / FLUX; W4A4 images still had visible artifacts. Analysis revealed that even after smoothing+rotation, the singular values of the weights remained highly concentrated — the first few dominant directions held most of the energy, while the long tail was small but uneven. The uniform 4-bit grid could neither contain the large dominant directions nor avoid wasting resolution on the already-flat tail.
+
+*** Its solution
+
+Explicitly *split the weights into two branches*:
+#+begin_example
+W_smoothed = L * R  +  Residual
+             ^^^^^    ^^^^^^^^
+            FP16      INT4 quantized
+            low-rank (rank rho << d)
+#+end_example
+L and R are obtained by taking the top rho singular values via SVD — this part captures the "dominant directions," which are too important and too concentrated, so they are preserved in FP16. The remaining Residual has a flat distribution, fitting neatly into the INT4 grid.
+
+To prevent the FP16 memory reads/writes of the low-rank branch from slowing inference, they wrote a *fused kernel* that executes L*R*X and Residual_INT4 * X within the same kernel call.
+
+Result: on large DiTs like PixArt-Sigma and FLUX, W4A4 produced usable-quality images for the first time.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because *"concentrated" and "uniform" are handled with separate precisions* — the important minority takes FP16, the flat majority takes INT4, and the quantization grid is no longer pulled in two directions at once.
+
+But it dug three pits that form the entire attack surface of the next paper:
+1. *The low-rank branch must be FP16* — modern GPUs already support FP8/FP4 tensor cores; keeping this branch in FP16 is a massive waste of hardware.
+2. *L, R initialization requires data* — SVD is computed from a covariance matrix estimated via a calibration set. You must first run hundreds of samples through a forward pass before quantization can even begin. On edge devices with no data and no compute, this road is completely impassable.
+3. *Dependence on custom kernels* — the fusion of the two branches must be written by hand; it cannot run directly on arbitrary frameworks or hardware.
+
+The next paper directly challenges the first two: "Why must it be FP16? Why must it see data?"
+
+** 2026.04 | LoRaQ: Treating the Quantizer as an Idempotent Operator and Algebraically Eliminating the Error
+
+*** What problem did it see?
+
+Bouquet et al. (AMD / EPFL) stared at SVDQuant's "low-rank branch must be FP16" assumption: why must it be FP16? Because L*R captures the dominant singular-value directions whose element values span a wide range, so quantizing them would destroy them. But what if the distributions of L and R *themselves* could be flattened?
+
+Then they stared at "data-dependent calibration": why must it see data? SVDQuant's logic is "first estimate the second moment of W after passing through X, then decide how to split the dominant directions." But what you actually need is not "which directions matter" — it is "*making the quantization error W − Q(W) itself become low-rank*." This is a *purely weight-side* algebraic problem, independent of X.
+
+*** Its solution
+
+Two breakthroughs, both arising from re-examining the mathematical properties of the quantization operator.
+
+*Breakthrough one: turning "error compensation" into an algebraic equation.* The quantization operator Q is *idempotent* — that is, Q(Q(x)) = Q(x); every point already on the grid is a fixed point.
+
+So find a *low-rank perturbation* D = L*R such that:
+#+begin_example
+Q(W + L*R) = W + L*R
+#+end_example
+This means the *quantization error equals exactly the low-rank branch L*R* — adding it in cancels the error perfectly.
+
+The solution method: directly optimize L and R by gradient descent, with the objective ||Q(W+LR) − W − LR||_F^2. The straight-through estimator (STE) handles the zero gradient of Q. The entire process *requires no input data whatsoever* — only W itself.
+
+*Breakthrough two: making the low-rank branch itself quantizable.* The element ranges of L and R are too large for INT4. Apply the rotation trick once more:
+#+begin_example
+L * R = L * Omega * Omega^T * R = (L*Omega) * (Omega^T * R)
+                                   ^^^^^^^^   ^^^^^^^^^^^^
+                                   Q_2 quantized   Q_2 quantized
+#+end_example
+Choose Omega so that L*Omega and Omega^T*R have a more isotropic distribution, enabling both to be represented in low bit-width (W8A8 / W6A6 / W4A8). Omega is fused with L and R before inference, incurring zero runtime overhead.
+
+Final architecture: main branch W4, low-rank branch W4–W8 selectable, *the entire pipeline sub-16-bit* — a first in the field.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because it found *the algebraic structure of the quantizer itself*. Previous work all treated Q as a non-differentiable black box and worked around it (protecting outliers, migrating them, rotating them, decomposing via SVD). LoRaQ is the first to directly exploit the property Q(Q(x))=Q(x), turning "error compensation" into an optimization problem with analytic structure.
+
+Data-free + fully sub-16-bit + no custom kernels: three goals achieved simultaneously, because they are in fact the same thing — *no longer relying on external resources (data, preserved bit-width) to compensate for an incomplete understanding of the quantizer*.
+
+Remaining new pits (the starting points for the next wave of research):
+1. This algebraic derivation has not yet modeled *the diffusion dynamics of DiT* — the propagation of errors across multiple denoising steps is not accounted for.
+2. *The optimal choice of Omega* is currently heuristic (Hadamard-like); a more targeted structure may exist.
+3. *Cross-layer coupling* — LoRaQ processes each layer independently, but errors compound along the attention + MLP chain in DiT.
+
+* Frontier Extensions
+
+As of May 2026, LoRaQ is the most recent published work on the "low-rank branch + quantization" line. Several foreseeable extensions are already surfacing in neighboring papers:
+
+- *Application to video DiT*: Temporal-spatial DiTs like Wan and CogVideoX demand far more compute and are even more in need of W4A4. LoRaQ's data-free property is exactly the remedy for the impracticality of long-video calibration.
+- *Extreme quantization at W3 / W2*: When the main branch drops to 3 or 2 bits, residual error grows sharply, and the low-rank branch must shoulder more — possibly requiring higher rank or a multi-branch structure.
+- *Fusion with timestep-aware methods*: Timestep-conditioned schemes from He 2023 / Huang 2024 all previously assumed data calibration; LoRaQ's algebraic route may yield data-free versions of timestep-aware quantization.
+
+This line of research is far from exhausted — LoRaQ has simply removed the two shackles of "must have data" and "must have FP16."
+
+* One Figure to Understand It All
+
+#+begin_example
+                  How are outliers handled?                  Data dependent?   Bits
+                  ========================================   ===============   ====
+2022.08  LLM.int8 |  Protect them (keep a few channels     |  Statistical     | W8A8 partial
+                  |  in FP16)                              |  thresholds      | FP16
+                          |
+                          | "Protection is too passive -- can we digest them?"
+                          v
+2022.11 SmoothQuant |  Migrate to weight side (per-ch      |  Small calib     | W8A8
+                    |  scale)                              |  set
+                          |
+                          | "Moving them around doesn't change the shape -- can we scatter?"
+                          v
+2024.04 QuaRot      |  Rotation to scatter (Hadamard /     |  Small calib     | W4A4 (LLM)
+        SpinQuant   |  learned)                            |  set
+                          |
+                          | "DiT still blurs -- how do we compensate the residual?"
+                          v
+2025.11 SVDQuant    |  SVD dominant directions ->          |  *Heavy* data    | W4A4 + FP16 lr
+                    |  FP16 low-rank branch                |
+                          |
+                          | "Why FP16? Why data?"
+                          v
+2026.04 LoRaQ       |  Algebraically construct LR so       |  *Zero data*     | W4 + W4~W8 lr
+        (this paper)|  Q(W+LR)=W+LR                        |                  | *fully sub-16*
+                    |  + insert rotation to quantize L, R  |
+
+
+  Vertical pattern: Going down,          Going down,              Going down,
+                    outliers are          external data            bit-width
+                    increasingly seen     dependence is            ceiling
+                    as a "distribution    progressively            pushed ever
+                    problem," not a       eliminated               lower
+                    "special entity"
+#+end_example
+
+* Insights
+
+Reading the full line of work, what I see is not "five generations of outlier-handling techniques" but a deeper shift:
+
+*From "working around the quantizer" to "modeling the quantizer."*
+
+LLM.int8() treated Q as a black box, found it couldn't beat outliers, and detoured (FP16 to the rescue). SmoothQuant still detoured, just more cleverly (transform first, then quantize). QuaRot detoured more thoroughly (transform the entire basis). SVDQuant half-detoured and half-cut (dominant components detour, residual gets quantized).
+
+LoRaQ is the first to *directly exploit the algebraic properties of the quantizer* — the idempotent structure Q(Q(x))=Q(x) was always there; no one used it in four years. Once you view the quantizer as a structured operator rather than a loss function, "error" transforms from a nuisance to be compensated into an object that can be *constructed by design*.
+
+A second hidden thread: *the complete elimination of data dependence*. LLM.int8() needed data to find outlier channels; SmoothQuant needed data to estimate activation ranges; QuaRot needed data to learn rotations; SVDQuant needed data to perform SVD. Each generation needed "a little less," but still needed some. LoRaQ is *zero-data* — this is a qualitative change, not a quantitative one. It means quantization can be pushed down to edge devices and completed locally, transitioning from a "deploy-time" artifact into a true "runtime feature."
+
+The most likely next step: extend this *operator-algebraic perspective* to more neural-network components — the softmax in attention, the normalization in layernorm are themselves nonlinear operators, and both may harbor similar "fixed-point structures" to be mined. As a research area, quantization will accelerate its transition from "empirical tuning" toward "operator algebra."
+
+* Implications
+
+On how to find problems: *Don't just focus on what predecessors solved — focus on what compromises they accepted in order to solve it.* SVDQuant accepted two compromises: "the low-rank branch must be FP16" and "calibration must see data." The first looks like an engineering trade-off; the second looks like a necessary condition. Almost no one challenged either. LoRaQ directly challenged both assumptions and found neither was necessary — that is the entire value of the paper.
+
+On how to do research: *When the standard approach in a field grows increasingly complex (custom kernels + heavy calibration + mixed precision), it often means a simpler algebraic structure has gone unnoticed.* LoRaQ dismantled three layers of accumulated complexity with a single property: idempotence. This suggests a strategy — return to any sub-field where "everyone does it this way," and ask once: "Is there an algebraic property of some operator here that everyone has been working around?"
+
+On engineering deployment: data-free quantization opens the path to *local PTQ completed on the end device itself*. This means you can distribute model weights in FP16 form and quantize them on the user's device at runtime — according to local hardware capability (W8A8? W6A6? W4A8?) — rather than pre-generating a separate quantized version for every hardware target in the cloud.

@@ -1,0 +1,292 @@
+#+title:      SAW-INT4: System-Aware 4-Bit KV-Cache Quantization for Real-World LLM Serving
+#+date:       [2026-05-28 Thu 14:30]
+#+filetags:   :paper:river:quantization:kvcache:serving:en:
+#+identifier: 20260528T143000-en
+#+source:     https://arxiv.org/abs/2604.19157
+#+authors:    Jinda Jia, Jisen Li, Zhongzhu Zhou, Jung Hwan Heo, Jue Wang, Tri Dao, Shuaiwen Leon Song, Ben Athiwaratkun, Chenfeng Xu, Tianyi Zhang, Xiaoxia Wu (Together AI)
+#+venue:      arXiv preprint, 2026-04-21
+
+* The River of the Problem
+
+LLM inference serving has an increasingly painful bottleneck: the KV cache. Every time a token is generated, the model must cache the keys and values of all preceding tokens so the next step can compute attention. The longer the context, the larger this cache grows — the Llama 4 Scout model itself weighs only 218 GB, yet a single 10M-token request requires 1.8 TiB of KV cache, eight times the model's own size.
+
+The natural response: quantize the KV cache to 4-bit, save 4× memory, and serve more users concurrently. But this path is riddled with awkward problems:
+
+- Naive INT4 quantization (RTN) collapses immediately — certain models output nothing but zeros
+- Academia has proposed a pile of remedies that look great in offline benchmarks — but once inserted into real serving systems (vLLM, SGLang, TensorRT-LLM), they either clash with PagedAttention's paged memory model, or break FlashAttention's fused kernels, causing end-to-end throughput to actually drop
+- Increasingly elaborate methods (vector quantization, Hessian-aware, learned codebooks) keep pushing numbers on paper while drifting further from "can actually run in production"
+
+This whole line keeps circling the same question: how do you simultaneously satisfy *offline accuracy*, *compression ratio*, and *serving-system constraints*? SAW-INT4 is a "counter-escalation" paper on this line — it does not invent a new method; it asks: under serving constraints, which existing method actually works? The answer turns out to be surprisingly plain.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8() (Dettmers et al.)
+  |
+  | Problem: Directly quantizing LLMs to 8-bit collapses. The culprit
+  |          is not the weights but a handful of activation channels
+  |          whose magnitudes are hundreds of times larger than the rest
+  |          — "outliers."
+  | Solution: Pull those outlier channels out and compute them in FP16;
+  |           use INT8 for everything else.
+  | Residual: Mixed precision breaks GPU kernel regularity; only
+  |           solves down to 8-bit.
+  v
+[2023] SmoothQuant (Xiao et al.)
+  |
+  | Problem: LLM.int8()'s mixed precision is ugly — can we make ALL
+  |          activations behave well enough for INT8?
+  | Solution: Migrate the "difficulty" of activations to weights on a
+  |           per-channel basis — divide activations by a per-channel
+  |           scale and multiply it back into the weights. Activations
+  |           become tame; weights get slightly harder but can be
+  |           quantized offline.
+  | Residual: Still a weight + activation quantization mindset;
+  |           KV cache is not addressed specifically. Also only
+  |           reaches 8-bit.
+  v
+[2024] KIVI (Liu et al.)
+  |
+  | Problem: KV cache has its own character: key outliers are
+  |          distributed along "channels" (embedding dim); value
+  |          outliers are distributed along "tokens" (sequence dim).
+  |          A single quantization granularity cannot serve both well.
+  v Solution: Use per-channel quantization for keys and per-token
+  |           quantization for values; add a fixed-length FP16
+  |           residual buffer to hold the most recent tokens until a
+  |           full group accumulates, then quantize them to low
+  |           precision.
+  | Residual: residual buffer = FP16 + INT2/INT4 coexisting in the
+  |           same KV cache block, which conflicts with
+  |           PagedAttention's assumption of uniform precision per page.
+  v
+[2024] QuaRot (Ashkboos et al.) + SpinQuant (Liu et al.)
+  |
+  | Problem: Outliers are really a symptom of a bad distribution shape
+  |          — can we just switch coordinate systems and transform that
+  |          spiky distribution into a smooth one?
+  | Solution: Apply an orthogonal Hadamard rotation to activations,
+  |           weights, and KV tensors before quantization. After
+  |           rotation the distribution tends toward Gaussian and
+  |           outliers are "spread out." SpinQuant further learns an
+  |           optimal rotation on the Stiefel manifold.
+  | Residual: Uses a full Hadamard over the entire head_dim (typically
+  |           128). Acceptable at head_dim = 128, but:
+  |           (1) overhead of fusing into FlashAttention is ignored,
+  |           (2) PagedAttention's block layout is not considered.
+  v
+[2026] SAW-INT4 (this paper, Together AI)
+  |
+  | Observed problem: QuaRot's full Hadamard rotation, KIVI's
+  |                   mixed-precision residual, various vector
+  |                   quantization schemes — all look great in offline
+  |                   benchmarks, but inserting them into vLLM causes
+  |                   trouble: either throughput does not improve, or
+  |                   fused kernels break outright.
+  | Solution: (1) Use block-diagonal Hadamard — rotate only within
+  |           small blocks (16–64 dims), adding near-zero overhead.
+  |           (2) Fuse rotation + INT4 quantization into a single CUDA
+  |           kernel that operates directly on PagedAttention's paged
+  |           KV layout.
+  |           (3) Remove the residual buffer, codebook lookup, and
+  |           Hessian calibration — keep only rotation + simple
+  |           token-wise INT4.
+  | Position: Rather than inventing yet another method, prove that
+  |           "under serving constraints, the simplest viable approach
+  |           is the best."
+#+end_example
+
+Note: QuaRot and SpinQuant are two versions of the same idea (randomized vs. learned rotation); SAW-INT4 groups them together as the "rotation" family. KIVI and QuaRot are two parallel threads in KV quantization — one adds complexity (mixed-precision + per-channel/per-token granularity), the other applies geometric transformation (rotation). SAW-INT4's experiments conclude that the latter wins.
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): The key to quantization without collapse is recognizing "outliers"
+
+*** What problem it saw
+
+Before LLM.int8(), INT8 quantization was considered a solved problem — CNNs had been doing it for years. Then someone tried quantizing OPT-175B and it broke. The failure was not the expected "model too large and sensitive" — it was something specific: as model scale grows, a small number of activation channels spike to magnitudes hundreds of times larger than all others. INT8 maps the entire tensor into 256 buckets; those outlier channels consume all the dynamic range, and everything else collapses to zero.
+
+*** Its solution
+
+Maximally simple: extract those outlier channels and compute them in FP16; use INT8 for the rest; add the two results together.
+
+*** Why it works (and where it digs a new hole)
+
+For the first time it pinpointed the concrete object at the heart of LLM quantization difficulty — *activation outliers*. Every subsequent paper orbits this finding. But it left an awkward tail: mixed precision. GPUs love regular, uniform-precision tensor operations; having a few FP16 columns suddenly appear inside a matrix is very hard to fuse into a kernel. In practice, LLM.int8() often runs slower than FP16.
+
+** 2023 | SmoothQuant: Don't isolate outliers — migrate the "difficulty" away
+
+*** What problem it saw
+
+LLM.int8() handles outlier channels separately, which is clunky — can we make all activations well-behaved enough for INT8? Observation: outliers concentrate in activations; weights are flat. If the quantization difficulty of the two sides can be exchanged, shifting some of the activation difficulty onto weights will smooth activations out.
+
+*** Its solution
+
+Introduce a per-channel scale s. Divide activations by s; multiply weights by s — mathematically equivalent (the matrix product is unchanged), but activations become tame while weights become slightly harder to quantize (acceptable, since weights are quantized offline).
+
+*** Why it works (and where it digs a new hole)
+
+It transformed "outliers are a fixed property" into "outliers are relocatable." This insight matters — it opened the door to "use mathematical transformations to improve distributions," a thread that QuaRot would later take to its logical extreme. But SmoothQuant only reaches 8-bit and only addresses weight + activation; the specific challenges of the KV cache remain untouched.
+
+** 2024 | KIVI: KV cache is not activations — keys and values have their "difficulty" oriented in different directions
+
+*** What problem it saw
+
+KV cache quantization is not the same as weight/activation quantization. KIVI's core observation: key outliers concentrate in certain channels (embedding dimension), arrayed along the channel axis; value outliers concentrate in certain tokens, arrayed along the sequence axis. The geometric orientations of the two tensors' outliers are orthogonal.
+
+Apply the same quantization granularity to both (e.g., per-token for keys) and the per-channel outliers in keys will blow up that token's entire dynamic range. The same problem occurs in reverse with per-channel.
+
+*** Its solution
+
+Split granularity: *keys use per-channel quantization* (independent per channel); *values use per-token quantization* (independent per token). Add one more trick — keep the most recent few tokens unquantized, holding them in an FP16 *residual buffer* until a full group accumulates, then compress them into the low-precision pool. This enables 2-bit quantization.
+
+*** Why it works (and where it digs a new hole)
+
+Accuracy is genuinely impressive. But KIVI is a product of *offline thinking* — it does not account for how a serving system actually manages the KV cache. Systems like vLLM use PagedAttention: the KV cache is split into fixed-size pages; each page must hold a single precision; pages can be stitched together and reused across requests.
+
+KIVI violates this premise from the start: a single KV cache contains INT2 "main body" and FP16 "residual" coexisting — either both precisions share one page pool (fragmentation explodes) or each gets its own page table (management complexity explodes). The fused attention kernel also needs a rewrite, since it assumes a single-precision input.
+
+Conclusion: KIVI looks great in offline benchmarks but cannot be inserted into a production stack.
+
+** 2024 | QuaRot / SpinQuant: Since outliers are a distribution-shape problem, just change coordinate systems
+
+*** What problem it saw
+
+Looking back at LLM.int8(), SmoothQuant, and KIVI — they all *manage* outliers (isolate, migrate, split by dimension). But the root cause of outliers is a bad distribution shape: extreme magnitudes on a few dimensions, near-zero on most. Can we *eliminate* this shape directly?
+
+The mathematical answer is yes. If you multiply a tensor by an orthogonal matrix R (e.g., a Hadamard matrix), each component in the new basis is approximately a random linear combination of the original dimensions — by the central limit theorem, the result tends toward a Gaussian. Outliers are "spread" across all dimensions, and each dimension becomes tame.
+
+Moreover, because R is orthogonal, the attention dot product q·k is mathematically unchanged if both q and k are rotated by the same R.
+
+*** Its solution
+
+Before quantization, apply a Hadamard rotation R to Q, K, V (and some weights). Quantize to INT4 after rotation. During attention computation, since Q and K have both been rotated by the same R, q·k = q'·R^T·R·k' = q'·k', so results are exact.
+
+SpinQuant goes further: R need not be a fixed Hadamard; it can be learned as an optimal rotation on the Stiefel manifold.
+
+*** Why it works (and where it digs a new hole)
+
+This is a genuine conceptual upgrade: from "handle outliers" to "make outliers cease to exist." Under the hardest setting — 4-bit weight + activation + KV — QuaRot/SpinQuant pull accuracy back to near BF16.
+
+But two engineering gaps remain:
+1. *Full Hadamard overhead.* The entire head_dim (usually 128) participates in each rotation — during decoding every token requires a 128×128 matrix multiply. Attention is already memory-bound; this extra step raises latency.
+2. *PagedAttention's block layout is not considered.* The published implementation is a standalone rotation operator, not fused into a production kernel.
+
+** 2026 | SAW-INT4 (this paper): Shrink the rotation, fuse it into the system
+
+*** What problem it saw
+
+By early 2026, KV cache quantization methods had proliferated: KIVI-style (mixed-precision + multi-granularity), vector quantization (codebook lookup), Hessian-aware (second-order calibration), QuaRot-style (rotation) — offline benchmark tables kept getting fuller. But the authors ran real end-to-end measurements and found:
+
+- KIVI/Kitty's residual buffer clashes with PagedAttention
+- Vector quantization's codebook lookups introduce irregular memory access patterns that GPUs dislike, adding latency per decoding step
+- Hessian-aware methods require calibration data and offline EM; deployment complexity is high and final accuracy is only marginally better than rotation alone
+- QuaRot's full Hadamard is not prohibitive at head_dim=128, but failing to fuse it into FlashAttention is still a real performance loss
+
+The more striking comparison: *Table 1 shows that naive INT4 scores 0 (model completely collapses), while BDR (block-diagonal rotation) + INT4 already recovers 73.78, close to BF16's 75.64.* That means rotation alone solves 90% of the problem. Everything added on top — vector quantization, Hessian-aware calibration — yields only marginal accuracy gains while the deployment complexity is entirely real.
+
+*** Its solution
+
+Take QuaRot's idea, then split the head_dim Hadamard into small blocks (e.g., partition 128 dims into eight 16-dim blocks) and rotate each block independently — you get a *block-diagonal Hadamard*. The overall transform is still orthogonal; the smoothing effect is nearly unchanged (because outliers are mostly local anyway); but the matrix multiply drops from 128×128 to 16×16 eight times — negligible overhead.
+
+Then do three system-level things:
+1. Fuse *rotation + INT4 quantization* into a single CUDA kernel
+2. Make that kernel consume PagedAttention's paged KV layout directly
+3. Connect it into FlashAttention's decoding path
+
+End-to-end result: throughput matches plain INT4 (within measurement noise); accuracy recovers to near BF16. This is the first time KV cache quantization achieves "accuracy restored + throughput not degraded."
+
+*** Its position (and its most important contribution)
+
+SAW-INT4 does not invent a new method. Its central argument is: *the existing literature has overshot*. Under the real constraints of serving systems, the simplest viable solution is the best —
+
+- No mixed precision (breaks PagedAttention)
+- No codebook lookup (breaks memory access patterns)
+- No Hessian calibration (marginal benefit < deployment complexity)
+- Just block-diagonal Hadamard rotation + token-wise INT4 + one fused kernel
+
+This is a paper about *cutting every non-essential complexity*.
+
+*** What gaps it leaves
+
+- *How to choose block size?* The paper ablates 16, 32, and 64, but is the optimal block size stable across models and head_dim settings?
+- *Sparser rotations beyond block-diagonal?* Butterfly transforms, Walsh-Hadamard variants — can they spread outliers more effectively at the same cost?
+- *Special handling for MLA / GQA?* MLA shares a latent space between K and V; the optimal rotation shape would differ.
+- *What happens in the FP8 era?* Blackwell natively supports FP8; does rotation still matter?
+
+* Frontier Extensions
+
+SAW-INT4 appeared in April 2026 and no work explicitly critiquing or superseding it has yet emerged. But several concurrent developments are worth tracking:
+
+- *FP4 / NVFP4 native hardware support*: 4-bit floating-point tensor cores are already live on Blackwell; the trend toward FP4 KV caches is clear. SAW-INT4's block-diagonal rotation framework can be applied directly to FP4.
+- *Hadamard alternatives*: Butterfly transforms and structured sparse rotations are being studied — the goal is "lower overhead, better outlier spreading."
+- *Revival of attention sinks / KV eviction*: As context lengths exceed 10M tokens, pure quantization is no longer enough; combination with eviction and selective attention is needed. SAW-INT4's design retains every token — eviction is an orthogonal direction.
+- *MLA-specific KV quantization*: DeepSeek's popularization of MLA changes the physical shape of the KV cache — rotation over the latent dimension needs to be redesigned.
+
+Prediction: the most likely next step is *block-diagonal rotation + FP4 + selective KV* — combining all three at the system level to cut the cost of long-context inference by another order of magnitude.
+
+* One Diagram
+
+#+begin_example
+                "Manage outliers" camp          "Eliminate outliers" camp
+                ----------------------          -------------------------
+ [2022] LLM.int8()  Pull outlier channels out, compute in FP16
+                       |        (mixed-precision: GPU hates it)
+                       v
+ [2023] SmoothQuant  Migrate activation "difficulty" to weights per-channel
+                       |        (still 8-bit; KV untouched)
+                       v                              |
+ [2024] KIVI         KV-specific: key per-channel +  |
+                     value per-token + FP16 residual  |
+                     buffer                           |
+                       |   (residual clashes with     |
+                       |    PagedAttn)                |
+                       |                              |
+                       |                              v
+ [2024] QuaRot                            Full Hadamard rotation
+                       |                  distribution tends to Gaussian
+                       |                  (overhead not fused into kernel)
+                       |                              |
+                       +---------------+--------------+
+                                       |
+                                       v
+ [2026] SAW-INT4 (this paper)  Slice Hadamard into 16x16 blocks (block-diagonal)
+                               + fuse into a single CUDA kernel
+                               + consume PagedAttention's paged KV layout directly
+                               + remove all mixed-precision / codebook / Hessian
+
+                               Result: accuracy 0 -> 73.78 (BF16 = 75.64)
+                                       throughput matches naive INT4
+
+ Time --------------------------------------------------------->
+
+ The real throughline: the core tension in KV cache quantization is
+ "offline accuracy" vs. "serving-system constraints." Earlier generations
+ kept adding complexity to gain accuracy; SAW-INT4 cuts in the opposite
+ direction — proving that *rotation alone is enough*, and everything
+ else is marginal while clashing with the serving stack.
+#+end_example
+
+* Insights
+
+Reading this line end to end, the sharpest observation is: *the direction of progress in academic benchmarks and the direction of progress in engineering deployment have diverged*.
+
+KIVI, vector quantization, Hessian-aware — each generation gains one or two points on offline benchmarks. But all of these methods assume you can freely use mixed precision, do codebook lookups, keep a residual buffer, and run calibration data. These assumptions are free in a paper environment; in production stacks like vLLM, SGLang, or TensorRT-LLM they are all forbidden — because they break PagedAttention's per-page precision contract, or break FlashAttention's fused kernels, or both.
+
+The result is an uncomfortable reality: *methods with higher offline accuracy can have lower end-to-end throughput*. SAW-INT4's Table 1 makes this discomfort vivid: KMeans (vector quantization) looks great on accuracy, but achieves only 366 TPS/GPU — 30% of naive INT4; Hessian+BDR costs twice the calibration effort of BDR alone and still yields slightly lower end-to-end throughput.
+
+At a deeper level: *orthogonal rotation* is a beautiful example of "geometric transformation defeating local tricks." LLM.int8() is a local trick (isolate outliers); SmoothQuant is a local trick (relocate outliers); KIVI is a local trick (multi-granularity quantization) — all of them *treat* outliers. QuaRot introduces orthogonal rotation as the first genuine coordinate change — outliers simply cease to exist. SAW-INT4 goes further: the rotation can be sparse (block-diagonal) at near-zero cost.
+
+A general pattern: *whenever a field develops a split between "system constraints" and "academic metrics," there is usually a paper waiting that takes system constraints as first principles and overturns the conventional wisdom*. SAW-INT4 is a clean instance of this pattern — its argument is not "I achieve higher accuracy than baselines" but "under system constraints, the baselines are all unusable, and the simplest approach is actually the best."
+
+The most likely next direction: treat "system-aware" as a methodology rather than the label of a single paper, and carry it into weight quantization, speculative decoding, and agentic workflow scheduling — all fields where the same tension between academic benchmarks and production deployment already exists.
+
+* Takeaways
+
+Three practical takeaways for researchers and engineers:
+
+1. *System constraints are a design variable, not an afterthought.* SAW-INT4's methodology treats PagedAttention and FlashAttention as hard constraints from the very beginning — and this actually simplifies the method (because a large class of complex approaches is immediately ruled out). If you are doing ML systems work, put your production stack's constraints in the first paragraph of your method section, not in the limitations section.
+2. *Cutting methods is more valuable than adding them.* When a research line has spent years piling on complexity (KIVI's residual + multi-granularity + mixed bitwidth; vector quantization's codebook; Hessian-aware calibration), stop and ask: is there a simpler idea from a previous generation (e.g., rotation) that, properly engineered, is already sufficient? SAW-INT4 is exactly the product of that question.
+3. *Orthogonal rotation is an underrated tool.* In ML systems, "change coordinate systems to improve distributions" is far from exhausted — SAW-INT4 applies it to KV caches, QuaRot applies it to activations, but gradient compression, low-rank attention, and sparse computation all have room for it. Wherever you see "a badly shaped distribution," try a Hadamard rotation before asking what else to do.
+
+This means that when building your next quantization / compression / sparsification method, ask yourself: (a) Can I remove one thing? (b) Will this actually run in a production stack? (c) Is there an orthogonal transform that makes the problem simpler? Answer even one of these correctly and you are already ahead of most papers.

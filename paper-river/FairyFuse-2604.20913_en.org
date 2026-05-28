@@ -1,0 +1,289 @@
+#+title:      FairyFuse: Multiplication-Free LLM Inference on CPUs via Fused Ternary Kernels
+#+date:       [2026-05-28 Thu 14:42]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T144250-en
+#+source:     https://arxiv.org/abs/2604.20913
+#+authors:    Fei Zuo, Xiaoyan Xi, Quanyi Zeng, Feiyu Wang, Ho Fai Leung
+#+venue:      arXiv preprint, 2026-04-22
+
+* The River of the Problem
+
+Can a computer without a GPU run a 7-billion-parameter large language model?
+
+The question sounds unglamorous, but it has stopped a generation of practitioners cold. GPUs are expensive, power-hungry, and hard to obtain, yet large models were essentially born for them — their operators, libraries, and optimization folklore all live on that side of the fence. The moment you try to move a model to a CPU, you hit a wall: memory bandwidth. DRAM bandwidth on a CPU is on the order of 200 GB/s, and generating each token requires sweeping the entire model's weights out of memory. The larger the model, the slower the sweep, the more sluggish the token stream.
+
+So for a decade, a crowd of people has been drilling down the same shaft: can we compress the weights smaller? Half the size means twice the speed. From 16-bit float down to 8-bit, then 4-bit, then 2-bit, then 1-bit. Every compression step shaves off quality, so you then have to figure out how to claw the quality back. Compress, recover, compress again, recover again — that is how this line of research grew, one link at a time.
+
+But compression is not the final destination. The real target is harder: not just storing weights compactly, but making the computation itself simpler. If a weight can only be one of {-1, 0, +1}, then "multiplication" disappears — it either adds x, or subtracts x, or does nothing at all. The entire matrix multiply collapses from floating-point multipliers into a pile of conditional additions. That is a completely different hardware world.
+
+FairyFuse stands at the very end of this line. Its claim: the algorithmic side has already been solved by predecessors (Fairy2i proved that a 2-bit ternary model loses negligible quality); the systems side has never actually delivered "multiplication-free" execution — everyone talks ternary, but under the hood they are still doing multiplications. FairyFuse studies the AVX-512 instruction set on a real CPU and writes a kernel with truly zero multiplications, achieving 1.24× the throughput of llama.cpp Q4_K_M.
+
+* Source Map
+
+#+begin_example
+[2015] Courbariaux et al. - BinaryConnect
+  |
+  | Problem: storing neural-network weights as 32-bit floats is wasteful;
+  |          can we get away with just +1 / -1?
+  | Solution: dual-track training — forward pass uses binary weights,
+  |           backward pass updates floating-point "shadow weights"
+  v
+[2016] Rastegari et al. - XNOR-Net
+  |
+  | Problem: BinaryConnect only worked on toy data; it collapsed on ImageNet
+  | Solution: add a per-kernel scaling factor alpha to preserve magnitude;
+  |           convolution via XNOR + popcount
+  v
+[2016] Li et al. - Ternary Weight Networks (TWN)
+  |
+  | Problem: binary is too extreme; it discards the signal that a weight
+  |          is simply unimportant (= 0)
+  | Solution: allow a third value 0; weights in {-1, 0, +1};
+  |           quality recovers substantially
+  v
+[2024] Ma et al. - BitNet b1.58 ("Era of 1-bit LLMs")
+  |
+  | Problem: TWN worked on CNNs but had never been validated on LLMs,
+  |          and requires training from scratch
+  | Solution: train a ternary LLM from scratch; prove 1.58-bit model
+  |           quality matches FP16 at the same scale
+  v
+[2025] Feng et al. - Fairy2i (PhaseQuant)
+  |
+  | Problem: BitNet requires training from scratch, wasting existing FP16 checkpoints
+  | Solution: complex-domain {1, -1, i, -i} + a few epochs of QAT to
+  |           "post-train" an FP16 model into ternary
+  v
+[2026] Zuo et al. - FairyFuse  <-- target paper
+  |
+  | Problem: Fairy2i eliminated multiplications algorithmically, but the
+  |          runtime still executes floating-point multiplications in PyTorch
+  | Solution: fuse 8 sub-GEMVs into a single AVX-512 loop using pure
+  |           masked add/sub
+
+Parallel branch (systems-side competitors):
+  [2024] T-MAC / BitNet.cpp  - replace multiplications with VPSHUFB table lookup
+                               FairyFuse argues: LUTs occupy L1 cache,
+                               competing with activations for bandwidth
+#+end_example
+
+* Evolutionary Narrative
+
+** 2015 | BinaryConnect: Can Neural-Network Weights Get Away with Just +1 and -1?
+
+*** What problem it saw
+
+In 2015, deep learning had just taken off and everyone was racing to build bigger models on more powerful GPUs. Courbariaux asked the opposite question: why does a single weight need 32 bits? Is there really that much useful information inside? Multipliers are the most expensive circuits on a GPU — what if we replaced multiplication with addition and subtraction outright?
+
+*** Its solution
+
+Training kept two books: a floating-point set of "shadow weights," updated normally through backpropagation; and a binary set derived from them via sign(), used exclusively in the forward pass to compute the loss. At inference time only the binary weights are kept, and every "multiply by weight" becomes "add the activation" or "subtract the activation."
+
+*** Why it worked (and what new trap it set)
+
+The intuition is that neural networks are remarkably robust, and the *direction* of a weight matters more than its *magnitude*. Keeping only the direction turned out to be nearly sufficient on MNIST and CIFAR.
+
+The trap: the authors only validated on small datasets. Whether the idea would hold on a real-world benchmark like ImageNet was an open question. Worse, binary weights throw away all magnitude information — a weight that was originally large and one that was originally small are both forced to the same value. That would inevitably cause trouble at larger scales.
+
+** 2016 | XNOR-Net: Putting a "Magnitude Hat" on Binary Weights
+
+*** What problem it saw
+
+XNOR-Net picked up the BinaryConnect baton and dropped it onto ImageNet — and it immediately collapsed. The reason was clear: binary quantization flattens every convolutional filter into the same {+1, -1} matrix, yet different filters naturally produce outputs of very different magnitudes, and that information was now gone.
+
+*** Its solution
+
+Store one floating-point scaling factor α per convolutional filter. Compute the binary convolution first (using XNOR plus popcount, 58× faster than true multiplication), then multiply by α at the end to restore the magnitude. Activations are binarized as well.
+
+*** Why it worked (and what new trap it set)
+
+Adding α is a clever compromise: direction is handled by binary weights, magnitude by a scalar. This design principle propagated into virtually every subsequent low-bit quantization method — AWQ, GPTQ, SmoothQuant all fundamentally implement "per-group scale + low-bit weight."
+
+But binarization itself is still too aggressive. Many weights in a neural network *should* be zero — they simply do not matter and should not participate in computation. Forcing them to ±1 injects systematic noise into every layer. CNNs could barely absorb this; deeper networks could not.
+
+** 2016 | Ternary Weight Networks: Teaching Weights to Stay Silent
+
+*** What problem it saw
+
+Li et al. stared at XNOR-Net's failure mode and asked: where exactly does binarization go wrong? It assumes every weight *must* contribute. If a weight's optimal value is near zero, binarization can only send it to +1 or -1, creating a systematic bias.
+
+*** Its solution
+
+Add one more value: 0. The weight alphabet expands from {+1, -1} to {-1, 0, +1}. Storage grows from 1 bit to 2 bits (⌈log₂3⌉), but expressiveness multiplies many times over. During training, a threshold Δ is set: weights whose absolute value falls below Δ are zeroed out; the rest take the sign of their values as ±1.
+
+*** Why it worked (and what new trap it set)
+
+Ternary's elegance lies in capturing two things at once: sparsity and sign. Neural networks are naturally sparse — most weights are near zero — and TWN makes this explicit. A zero weight is simply skipped at runtime, saving even the addition; only a ±1 weight triggers an add or subtract. Multiplication vanishes entirely.
+
+But in 2016 nobody dared apply this to LLMs — the "large models" of that era were ResNet and VGG. Transformers had not yet been born. Whether ternary quantization would survive the scale of a deep, billion-parameter model was untested. The field would wait eight years to find out.
+
+** 2024 | BitNet b1.58: The Era of 1.58-Bit Large Language Models
+
+*** What problem it saw
+
+For eight years, mainstream LLM quantization had polished 4-bit and 8-bit methods: GPTQ, AWQ, SmoothQuant — all post-training quantization schemes that take an FP16 checkpoint and output a 4-bit model. Nobody touched sub-2-bit; the community assumed it would collapse. BitNet's team asked: how do we know it collapses? No one had actually tried.
+
+*** Its solution
+
+No post-training quantization. Train a ternary LLM — weights drawn entirely from {-1, 0, +1} — from scratch, scaling up to 3B parameters. Each weight occupies log₂3 ≈ 1.58 bits. Training uses the same straight-through estimator (STE) trick from BitNet b1: ternary values in the forward pass, treated as floats in the backward pass.
+
+*** Why it worked (and what new trap it set)
+
+The striking finding: a from-scratch ternary LLM genuinely matches a same-scale FP16 model in quality. This sent an unambiguous signal to the field — ternary is not a quality ceiling; the 2-bit era is actually reachable.
+
+But BitNet left one enormous trap: you must train from scratch. By 2024 the industry had accumulated a mountain of FP16 Llama, Qwen, and Mistral checkpoints, each costing millions of dollars to produce. BitNet's answer — "want ternary? retrain everything" — was a non-starter for almost everyone.
+
+** 2025 | Fairy2i: Post-Training an FP16 Model into Complex Ternary
+
+*** What problem it saw
+
+Fairy2i's authors fixed their attention on BitNet's pain point: can we avoid retraining and simply *compress* an existing FP16 model into ternary? Why does conventional post-training quantization fall apart at 2 bits? Because the information loss is so large that a few calibration steps cannot compensate.
+
+*** Its solution
+
+Two moves. First, shift to the complex domain: weights no longer take values in {-1, 0, +1} but in {1, -1, i, -i}. This looks like a mere notational trick — but the real and imaginary parts of each complex weight are each ternary {-1, 0, +1}, so storage is still 2 bits. The key insight is that during training the "phase" dimension provides additional optimization freedom, smoothing the loss landscape. Second, a quantization-aware fine-tuning procedure called PhaseQuant: only a few epochs of calibration training are needed for the FP16 weights to migrate toward the nearest {1, -1, i, -i} value.
+
+A complex linear layer is not a simple y = Wx; it is widely-linear: y = Ux + W·conj(x), with an extra conjugate term. When expanded into real arithmetic, each complex layer becomes 8 independent real-valued GEMVs.
+
+*** Why it worked (and what new trap it set)
+
+The complex neural network literature (Trabelsi 2018) and the signal-processing theory of widely-linear representations (Picinbono 1995) both establish that complex representations are strictly more expressive than real ones. Fairy2i borrows this classical result to "lend an extra hand" to low-bit quantization — the phase dimension compensates for information lost by ternarization.
+
+The trap, however, is that algorithm and system are different things. Fairy2i's reference implementation is a PyTorch research prototype: every ternary weight is first dequantized to FP16, then fed into standard cuBLAS or MKL for FMA (fused multiply-add). The promised "multiplication-free" execution never materializes at runtime. The 16× compression headline is not honored by the hardware at all.
+
+On the parallel branch: T-MAC and BitNet.cpp tried to bypass dequantization by using SIMD table lookups (VPSHUFB) to implement "weight × activation" as a LUT lookup. But the lookup tables themselves become an L1 cache bottleneck — the table entries compete with activation data for on-chip bandwidth, preventing wide SIMD units (512-bit) from reaching their throughput potential.
+
+** 2026 | FairyFuse: Actually Erasing Multiplication from the CPU
+
+*** What problem it saw
+
+FairyFuse diagnosed the gaps left by its predecessors with precision:
+
+1. Algorithm side: Fairy2i had already established that every weight is ±1 or ±i — meaning every multiplication is mathematically unnecessary.
+2. Systems side: every existing runtime (Fairy2i's PyTorch, llama.cpp's Q4_K_M, T-MAC's LUT) was pretending in different ways to exploit ternary structure, while the inner loop still contained either FP multiplies or cache-thrashing table lookups.
+
+*** Its solution
+
+Four components fused into one kernel:
+
+1. *Bit decode*: 16 ternary weights are packed into a 32-bit integer. The BMI2 instruction _pext_u32 extracts, in a single cycle, two masks: "which positions are +1" and "which are -1."
+2. *Masked add/sub*: armed with the masks, use the masked variants of AVX-512 vaddps / vsubps directly — lanes where the mask is 1 accumulate, lanes where it is 0 are skipped. No floating-point multiply anywhere.
+3. *8-GEMV fusion*: Fairy2i's widely-linear layer expands to 8 GEMVs. Running them one by one causes activations to be reloaded repeatedly and intermediate results to spill to DRAM, wasting all the bandwidth savings. FairyFuse packs all 8 GEMVs into the same loop: decode the masks once and share them across all 8 GEMVs (O1); load activations once and share them (O2); express conjugation through a pre-stored sign-flip (O3); keep all partial sums in registers throughout (O4).
+4. *Roofline argument*: FP32 GEMV has an arithmetic intensity (AI) of 0.25 — deeply memory-bound. Ternary packing pushes AI to 8, landing exactly at the CPU's ridge point where memory bandwidth and compute are simultaneously saturated. On a GPU, whose memory bandwidth ceiling is far higher, this same trick yields almost no benefit — which means ternary actually makes the CPU its *natural home*.
+
+*** Why it worked (and what new traps it sets)
+
+Assembly-level inspection confirms zero floating-point multiply instructions in the inner loop. On a single Intel Xeon 8558P, Llama-7B achieves 32.4 tok/s — 1.24× faster than llama.cpp Q4_K_M — while WikiText-2 perplexity is only 0.05 higher than FP16 (5.52 vs. 5.47), and average downstream accuracy is 66.0%.
+
+New traps: FairyFuse has only been tested at the 7B scale, and only on one CPU microarchitecture (Xeon 8558P). What about 70B? What about AMD Zen 5, ARM SVE, or Apple M-series? The widely-linear formulation is specific to Fairy2i-style complex ternary models; plain real-valued ternary models like BitNet b1.58 cannot reuse the 8-GEMV fusion and would need their own kernels. Moreover, the KV cache and attention computation remain in FP16 — the full pipeline is not yet multiplication-free.
+
+* Frontier Extensions
+
+As of April 2026, FairyFuse represents the latest advance on this line. Several directions are predictably next:
+
+1. *Hardware platform expansion*: port the same "masked add/sub + 8-GEMV fusion" pattern to ARM SVE2 and Apple Neural Engine. Apple M-series CPUs have narrower bandwidth but wide SIMD and may benefit even more.
+2. *Multiplication-free attention*: represent the KV cache in ternary and attempt to implement the Q·K dot product using masked add/sub as well. This is the BitNet team's stated next focus.
+3. *Mobile / edge deployment*: smartphone SoC CPUs have narrower bandwidth than server-class chips; by the Roofline argument, the relative gain from ternary will be even larger on phones than on Xeon.
+4. *Training-side fusion*: FairyFuse only optimizes inference. Could PhaseQuant calibration training also run on ternary kernels, making training and inference homogeneous?
+
+* One Diagram to See It All
+
+#+begin_example
+         "How small can weights be stored?" --> "How simple can computation be?"
+         -----------------------------------------------------------------------
+
+     Storage        Training regime     Quality validated on     True zero-multiply at runtime?
+     -------        ---------------     --------------------     ------------------------------
+2015 32-bit FP      from scratch         toy datasets             (irrelevant — still FP)
+                    + shadow weights
+       |
+       v
+2015 1-bit          from scratch         toy + MNIST              zero multiply in operator
+     BinaryConn     STE backprop                                  (not verified in hardware)
+       |
+       v
+2016 1-bit + α      from scratch         ImageNet (CNN)           XNOR + popcount
+     XNOR-Net                                                     (fixed-point, still has ×)
+       |
+       v
+2016 1.58-bit       from scratch         ImageNet (CNN)           theoretically possible
+     TWN             + threshold Δ                                 (no one wrote the kernel)
+       |
+       v   .............[8 years of silence]..............
+       v
+2024 1.58-bit       from scratch         3B LLM matches FP16      bitnet.cpp uses LUT
+     BitNet b1.58   STE backprop                                  (LUT overhead remains)
+       |
+       v
+2025 2-bit          post-training        7B LLM matches FP16      PyTorch FP16 path
+     Fairy2i        calibration          (complex widely-linear)   (still has multiplies)
+                    (PhaseQuant,
+                     few epochs)
+       |
+       v
+2026 2-bit          post-training        same as Fairy2i           true zero multiply
+     FairyFuse      (runtime             AVX-512 masked
+                     optimization)       add/sub, 1.24×
+
+
+      Key inflection points:                    Primary battleground shifts:
+      ----------------------                    ---------------------------
+      1. TWN added "0":                         2015–2024: CNNs
+         sparsity made explicit                 2024–now : LLMs
+
+      2. BitNet proved 1.58-bit                 Design objective shifts:
+         can sustain LLM scale                  -----------------------
+                                                early   : reduce storage
+      3. Fairy2i used complex domain:           middle  : reduce compute circuits
+         no retraining required                 late    : reduce runtime instructions
+                                                FairyFuse: full-stack alignment
+
+      4. FairyFuse achieved true zero multiply:
+         algorithmic promise = hardware reality
+#+end_example
+
+* Insights
+
+Having read through this entire line, the biggest discovery is not the cleverness of any single algorithm — it is a pattern that recurs throughout the whole arc.
+
+*There is always a gap between algorithm and system; whoever closes that gap claims the returns of an entire generation.*
+
+This story replays every few years:
+
+- BinaryConnect claimed "multiplication can become addition" — but nobody wrote the GPU kernel for it.
+- XNOR-Net claimed "our convolution is 58× faster than standard" — that was a theoretical number; real hardware accelerators came years later.
+- BitNet b1.58 claimed "1.58-bit LLM quality can match FP16" — but bitnet.cpp used LUTs and was far from the hardware theoretical limit.
+- Fairy2i claimed "complex ternary post-training delivers 2-bit quality" — but the PyTorch path was full of FP16 dequantization.
+- FairyFuse finally honored the promise on a real CPU — but the GPU, ARM, and mobile paths remain open.
+
+Every "algorithm paper" draws the map; every "systems paper" eats the territory. The algorithmic side always runs ahead, proving "theoretically feasible"; the systems side always lags, translating "theoretically feasible" into "engineering-ready." The time gap between the two — ranging from months to years — is your window.
+
+A second, deeper observation: *hardware bottlenecks determine which quantization scheme wins.*
+
+Why did ternary LLMs only catch fire in 2024, when the algorithm was already described in TWN in 2016? Not because the algorithm was invented late. Because LLM inference is memory-bound, and ternary is a direct weapon against memory pressure. In the Roofline model, ternary packing pushes arithmetic intensity from 0.25 to 8, landing exactly at the CPU's ridge point — while on a GPU, which has a much higher bandwidth ceiling, the benefit is negligible.
+
+This suggests a counterintuitive judgment: *in the GPU-dominated era, ternary was not mainstream; as CPU edge deployment rises, ternary finally shows its worth.* The current wave of pushing LLMs to the edge will thrust the BitNet/Fairy2i ternary line into a central position it has never held before.
+
+A third observation concerns the cyclic structure of research progress: *extreme → compromise → go extreme again at the point of the previous compromise.*
+
+1-bit (BinaryConnect) → 1-bit + scale (XNOR) → 1.58-bit (TWN) → 1.58-bit LLM (BitNet) → 2-bit complex (Fairy2i) → maximally optimized CPU kernel (FairyFuse).
+
+Each generation is not simply "more aggressive" — it is "aggressive again at exactly the place where the previous generation made its compromise." BinaryConnect was too aggressive; XNOR saved it by adding scale. XNOR was still too aggressive; TWN saved it by adding zero. TWN was never validated on LLMs; BitNet saved it by going to LLM scale. BitNet required retraining from scratch; Fairy2i saved it with complex-domain post-training. Fairy2i never realized its promise in hardware; FairyFuse saved it with a real kernel.
+
+This pattern implies who writes the next paper. It will almost certainly not be "an even more aggressive bit-width" (ternary is already near the theoretical floor), but rather "going aggressive again at the places FairyFuse compromised" — for instance, extending its CPU optimizations to ARM and mobile, or making the attention mechanism multiplication-free as well.
+
+* Takeaways
+
+This line of research offers three concrete lessons for how to do research:
+
+1. *The gap between algorithm and system is a rich vein.* Whenever you read an algorithm paper that claims "theoretically N× faster" — go look at the code. More often than not, the runtime never actually achieves that N×. Building the system that does is a solid systems paper. FairyFuse was written exactly this way: the Fairy2i paper had been sitting there for two years, and nobody had filled that gap.
+
+2. *Hardware characteristics drive algorithmic choices, and vice versa.* If you work on low-bit quantization, draw the Roofline diagram first. The Roofline tells you which compression scheme wins on which hardware, and by how much. FairyFuse's core argument is not that its algorithm is clever — it is that "the benefit curve of ternary compression crosses the CPU's ridge point at exactly the right place." That insight is worth the entire paper.
+
+3. *Periods of silence are periods of opportunity.* TWN was invented in 2016 but lay dormant in the LLM context for eight years. During those eight years, LLMs exploded, CPU edge deployment became important, and memory bandwidth emerged as the dominant bottleneck — every external condition was quietly accumulating. An old method revived in a new setting is often more efficient to pursue than a brand-new method, because the old method's correctness is already established; all that is missing is alignment with the new setting. FairyFuse tells the same story: BMI2 (_pext_u32) is a 2013 instruction, AVX-512 is from 2016, masked add/sub stabilized by 2018 — none of these are new. They simply had never been wired together with ternary LLMs, an idea that only matured in 2024.
+
+The actionable point is "make it work." Concretely, that means:
+
+- For any algorithm paper you read, check its GitHub repository first. If it contains only PyTorch baselines with no hardware-level kernels, that is your opening.
+- For any hardware platform you know well (mobile NPU, Apple M-chip, AMD Zen), draw a Roofline diagram and locate where ternary, INT4, and INT8 each fall. The position of the ridge point tells you which bit-width is most worth pursuing on that platform.
+- Stop chasing the newest algorithms. Chase the good ideas from 5–8 years ago that have been forgotten, and ask which of them have become newly valuable in today's landscape — that path has a much higher hit rate than racing after the latest papers.

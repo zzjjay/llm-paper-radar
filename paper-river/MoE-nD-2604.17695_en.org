@@ -1,0 +1,242 @@
+#+title:      MoE-nD: Per-Layer Mixture-of-Experts Routing for Multi-Axis KV Cache Compression
+#+date:       [2026-05-28 Thu 14:15]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T141502-en
+#+source:     https://arxiv.org/abs/2604.17695
+#+authors:    Libo Sun, Peixiong He, Po-Wei Harn, Xiao Qin
+#+venue:      arXiv 2604.17695 (cs.LG), Apr 2026
+
+* The River of the Problem
+
+Feed a long-context LLM a 16k-token document and your GPU memory is immediately consumed by a lump called the *KV cache* — the record the model keeps of "what tokens I've already seen" while computing attention. The longer the sequence, the fatter the cache, until you hit OOM. The question is: how do you compress this cache by 10× or 20× without making the model stupid?
+
+What makes this hard is that there are *four independent axes* along which you can cut:
+1. Along the *sequence* dimension — drop some tokens, called eviction
+2. Along the *precision* dimension — reduce each number from 16 bits to 4 bits, called quantization
+3. Along the *head* dimension — project heads into a lower rank
+4. Along the *layer* dimension — share KV across adjacent layers
+
+Each generation of research drills down one axis until it hits a ceiling, then the next generation pivots to a different axis. By 2026, someone finally asked: *Why apply the same compression recipe to every layer? Shouldn't different layers use different recipes?*
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | Problem seen: long-sequence inference OOM; once a sliding window
+  |               drops the first few tokens, the entire attention
+  |               mechanism collapses
+  | Solution: always retain the first 4 tokens (attention sinks)
+  |           + the most recent window
+  | Remaining gap: everything in the middle is discarded —
+  |                QA-style tasks become impossible
+  v
+[2023] H2O (Zhang et al., NeurIPS)
+  |
+  | Problem seen: position is a crude proxy; need to know which
+  |               tokens are truly "useful"
+  | Solution: accumulate historical attention scores per token;
+  |           keep the "heavy hitters"
+  | Remaining gap: scores are only known online — by the time you
+  |                know who matters, it may be too late to act
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Problem seen: H2O scores across all historical queries are noisy;
+  |               only the recent segment near the current query
+  |               can predict which KVs will be needed
+  | Solution: use a short "observation window" at the end of prefill
+  |           to score all past KVs — decide once, freeze forever
+  | Remaining gap: the same budget is used for every layer, but
+  |                deep and shallow layers have very different needs
+  v
+[2024-25] AdaKV / PyramidKV / KVTuner  (three parallel threads)
+  |        +-- AdaKV/PyramidKV: per-layer "how many tokens to keep"
+  |        |                    (on the eviction axis)
+  |        +-- KIVI/KVQuant:    quantize KV to INT4/INT8
+  |        |                    (uniform bit-width across all layers)
+  |        +-- KVTuner:         per-layer "how many bits to quantize"
+  |                             (on the quantization axis)
+  |
+  | Shared insight: layer sensitivity varies; a uniform recipe wastes
+  |                 capacity
+  | Individual gap: each method does per-layer routing on its own
+  |                 axis only — eviction and quantization are still
+  |                 managed independently
+  v
+[2026] MoE-nD (Sun et al.)  <-- this paper
+         Joint routing: each layer simultaneously decides
+         (how many tokens to keep, K bits, V bits),
+         solved by a single greedy solver under a global memory budget
+#+end_example
+
+Note: only the "direct ancestor" chain is shown. MoE-nD also cites Scissorhands, R-KV, TriAttention, MiniKV, ASVD, CLA, Shazeer's MoE, and others; those lateral branches are omitted.
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Keep the Ends, Discard the Middle
+
+*** What Problem It Saw
+
+The most naive approach to long-sequence inference is a *sliding window* — keep only the KV cache of the most recent N tokens. That sounds reasonable: by the time you reach token 10,000, you've probably "forgotten" token 1. But the StreamingLLM authors discovered that as soon as the window slides past the very first few tokens, the model's perplexity explodes.
+
+The reason is counterintuitive: during training, the first few tokens have no earlier context to attend to, so they are forced to become "attention sinks" — a garbage bin that every subsequent layer quietly dumps its excess attention into. Once those tokens disappear, every layer loses its pressure-relief valve and the attention distribution collapses.
+
+*** Its Solution
+
+Bluntly simple: always retain the first 4 tokens (=attention sinks=) plus the most recent N tokens; discard everything in between.
+
+*** Why It Works — and Where It Buries a New Gap
+
+It exploits a mechanism quirk of transformers: keep the garbage bin around and the model stays stable. The cost is obvious: *the middle is completely gone*. You can do streaming chat, but you cannot answer "what was discussed at token 3,000?" The next step had to be a way to identify *which* middle tokens are worth keeping.
+
+** 2023 | H2O: Let the Scores Speak
+
+*** What Problem It Saw
+
+StreamingLLM uses *position* to decide what to keep — a crude proxy. What should actually be retained is whatever is "useful for future generation," which has no necessary relationship with position.
+
+*** Its Solution
+
+H2O proposes continuously *accumulating the attention score each KV receives* throughout generation. High-scoring tokens are "heavy hitters." Whenever the cache exceeds budget, evict the lowest scorers.
+
+*** Why It Works — and Where It Buries a New Gap
+
+Attention scores are a direct signal for "how important the model considers this KV" — far more principled than position. But H2O operates *online*: it can only use scores accumulated up to step t − 1 to decide at step t. When a long prompt arrives all at once, you must make decisions immediately — before any generation history exists.
+
+** 2024 | SnapKV: Decide Once, Commit Forever
+
+*** What Problem It Saw
+
+H2O accumulates scores from all past queries, including "tokens that a distant earlier query found important." SnapKV's finding is that *only the short segment immediately preceding the current query* has predictive power over which KVs will be needed. Older accumulated scores are pure noise and actually hurt accuracy.
+
+*** Its Solution
+
+At the end of prefill, reserve an "observation window" of roughly 32 tokens, use that window to score all preceding KVs via attention, and *decide once which historical tokens to keep or discard*. That decision is then frozen; no further changes during generation.
+
+*** Why It Works — and Where It Buries a New Gap
+
+Turning "online accumulation" into "a single decision at prefill's end" is both fast and accurate. But SnapKV applies the same keep ratio to every layer — e.g., "retain 25% globally." Deep transformer layers process abstract global information while shallow layers handle token-level local patterns; there is no reason to give them the same budget.
+
+** 2024–25 | AdaKV / PyramidKV / KVTuner: Three Forces Simultaneously Pry Open "Per-Layer"
+
+These three papers appeared in parallel, attacking the same hidden assumption from different angles: *treating all layers identically is wrong*.
+
+*** AdaKV / PyramidKV: Per-Layer Routing on the Eviction Axis
+
+Both observe that attention entropy decreases in deeper transformer layers — deeper layers attend more sharply and need fewer tokens. They therefore *allocate the global budget per layer*: more tokens for shallow layers, fewer for deep ones, in a pyramid-shaped decay. This beats SnapKV's one-size-fits-all approach by several points.
+
+*** KIVI / KVQuant: Effort on a Different Axis
+
+Rather than touching eviction at all, these works *compress every KV value from 16 bits to 4 bits*. With careful channel-wise quantization tricks, memory shrinks 4× with almost no accuracy drop — but all layers use the same bit-width.
+
+*** KVTuner: Moving Per-Layer Thinking to Quantization
+
+If different layers have different sensitivity to eviction, do they also differ in sensitivity to quantization? KVTuner runs an offline sensitivity sweep per layer, then uses a *greedy solver* to assign K bits and V bits to each layer under a global memory budget.
+
+*** The Gap All Three Leave Behind
+
+Each approach does per-layer routing on its own axis but *no one routes jointly across axes*. AdaKV only adjusts eviction; KVTuner only adjusts quantization. If "50% eviction" and "INT4 quantization" occupy roughly the same memory for a given layer but have wildly different accuracy costs, you need joint decision-making — not two independent solvers. That is MoE-nD's starting point.
+
+** 2026 | MoE-nD: Route All Axes Through a Single Router
+
+*** What Problem It Saw
+
+The authors ran a key offline experiment on DeepSeek-R1-Distill-Qwen-7B (28 layers): apply *one compression operation at a time to a single layer* (e.g., "only apply 50% eviction to layer 6") and measure the resulting L2 error in that layer's attention output. The results were striking:
+
+- *Aggressive eviction (75%, 90%)*: the most sensitive layer vs. the least sensitive layer differs by ~548–689×
+- *K quantized to 4 bits*: cross-layer range spans 15×
+- *V quantization*: cross-layer range only 1.2–1.6× (V can practically be quantized uniformly)
+- *Most critically*: for the same 50% memory footprint, evict_50% and K_quant_4 flip their relative costs — on L00 "eviction is 2.2× cheaper than quantization," but on L06 "quantization is 10× cheaper than eviction." *The preference between the two axes completely reverses across layers.*
+
+This means single-axis per-layer routing (AdaKV / KVTuner) can exploit cross-layer variation *within* one axis but *cannot handle the judgment "this layer should use eviction; that layer should use quantization."*
+
+*** Its Solution
+
+Frame everything as a *mixture-of-experts*: each layer has three knobs — keep_ratio (eviction intensity), K_bits, V_bits — and each knob setting is an "expert."
+
+Offline phase: run a sensitivity table recording "at layer ℓ, using configuration c, how much attention error is incurred."
+
+Online phase: a *greedy solver* (KVTuner's greedy extended to three axes) starts from the cheapest configuration and repeatedly upgrades the layer with the best bang-per-byte — the one where a one-step upgrade buys the largest error reduction per unit of additional memory — until the global budget is exhausted.
+
+Inference phase: each layer compresses its KV cache with its assigned configuration; everything is funneled through a *unified attention patch* that handles variable cache lengths and corrects RoPE positions accordingly.
+
+*** Why It Works — and Where It Buries New Gaps
+
+The key is that it *acknowledges the coupling between the two axes at each layer*. On LongBench at 16k context, MoE-nD's hetero variant matches a 1.9 GB full-precision baseline while using only 136 MB (≈14× compression); other single- or dual-axis methods at similar budgets fall below 8/100. On AIME reasoning benchmarks it outperforms the strongest per-layer-quantization baseline by +6 to +27 points.
+
+The authors honestly flag two *null results*: MoE-nD does not win on MATH-500 or LongBench-TREC. The explanation is principled: both tasks have short inputs and loose budgets, so the greedy solver selects keep=1.0 for most layers — hetero degenerates into uniform, yielding no advantage. This null result cleanly delineates the method's applicability: *per-layer routing pays off only when the budget is tight*.
+
+Remaining new gaps: the solver is greedy, not globally optimal; the sensitivity table is calibrated on a single 27-token short prompt (though the authors verify post hoc a Pearson 0.945 correlation with calibration on 8 sequences of length 2,048); cross-model and cross-task robustness is not fully established; and low-rank (ASVD) and cross-layer sharing (CLA) axes have not yet been incorporated into the router.
+
+* Frontier Extensions
+
+As of May 2026, MoE-nD was posted in April (v1) and *no public follow-up work has yet directly critiqued or extended it*. Likely next directions (speculative, not cited):
+
+1. *Incorporate low-rank and cross-layer axes into the router* — the authors note "internal experiments found poor interaction with GQA," but that is an engineering problem, not a fundamental theoretical barrier.
+2. *Replace the greedy solver with a learned router* — the sensitivity table captures only local, single-layer, single-configuration sensitivity without modeling cross-layer interactions. A learned router could potentially optimize jointly across layers.
+3. *Dynamic routing* — current routing is determined offline and statically. Future work may adjust per-layer budgets dynamically based on the current query.
+
+* One Diagram
+
+#+begin_example
+                     Evolution of the KV Cache Compression River
+   Time -->
+   2023 ............ 2024 ............ 2025 ............ 2026
+
+   StreamingLLM     SnapKV          AdaKV/PyramidKV     MoE-nD
+   "keep by         "obs-window,    "per-layer          "per-layer,
+    position"        decide once"    budget"             multi-axis
+       |               |                |                joint"
+       v               v                v                  |
+   +-------+       +-------+        +-------+              v
+   |sink   |       |obs win|        | layer |         +---------+
+   |+window|       |  +    |        |aware  |         | layer + |
+   |       |       |snap   |        |evict  |         | axis    |
+   +-------+       +-------+        +-------+         |joint    |
+                                                      |routing  |
+                                                      +---------+
+                                          ^                ^
+   H2O ----------------------------------+                 |
+   "accumulate attention scores"                          |
+                                                           |
+   KIVI/KVQuant ---------> KVTuner ------------------------+
+   "uniform INT4/8 quant"   "per-layer K/V bit quant"
+
+
+   =================== Dimension Evolution ===================
+
+   Who to keep (sequence):  position -> score -> obs-win -> per-layer keep
+   How many bits (precision): 16 bit -----------------> per-layer K/V bits
+   Joint (cross-axis):               nobody did this  <- MoE-nD: one solver
+
+   =================== Core Bets ===================
+
+   Old bet: "compress one axis; apply the same recipe to all layers"
+   MoE-nD: "on all axes, each layer picks its own recipe,
+            constrained by a single global budget"
+#+end_example
+
+* Insights
+
+By the time this river reaches MoE-nD, the *surface appearance* is "yet another KV compression paper," but the *underlying shift* is a profound change in perspective:
+
+*From "find the best universal recipe" to "accept that there should be no universal recipe."*
+
+The entire 2023–2025 arc operated under a tacit assumption: *there exists an optimal KV compression recipe*, and our job is to find it. StreamingLLM found "sink + window," H2O found "heavy hitters," SnapKV found "observation window," KIVI found "channel-wise INT4." Each one was betting that its mechanism was universal.
+
+It was AdaKV and KVTuner that first shook this assumption: *maybe different layers simply need different treatment*. But they were still half-convinced — willing to vary only one axis.
+
+MoE-nD flips the assumption entirely: not merely "different layers need different treatment," but *"different layers differ not only in how much to keep, but in which kind of compression to apply."* The model is no longer a homogeneous stack of equivalent layers; it is *28 experts with distinct personalities*, each needing its own tailored diet.
+
+This shift mirrors exactly what *Mixture-of-Experts does at the model architecture level* — both are admissions that "one size fits all is an optimization shortcut." MoE-nD's name is not a branding gimmick; it is doing *inference-time MoE*: treating each layer's compression configuration as an expert, dispatched by a router under a global budget constraint.
+
+Where does this go next? Most likely, *the router itself becomes learnable*. The current greedy solver is grounded in "single-layer, single-operation" local sensitivity, with no model of "how compressing layer 6 changes layer 7's sensitivity." Once cross-layer interactions and cross-task adaptation are incorporated, you have a *learned dynamic KV compressor* — and that will probably become the next generation's baseline.
+
+* Takeaways
+
+*An actionable heuristic:* whenever you are optimizing any "globally uniform parameter," stop and ask once: "should this parameter really be global?" Across ML systems, *globally uniform parameters* are the biggest laziness — learning rate, weight decay, batch norm momentum, prune ratio, quantization bit-width… every one of them is the MoE-nD story playing out in a different domain.
+
+*A heuristic for finding problems:* this paper's *starting point was not a new method but an observation experiment* — "if I apply the same compression operation layer by layer, how much error does each layer incur?" Once that experiment was done, the new method almost surfaced on its own. *First run experiments to expose heterogeneity, then design a method to exploit it* — this is a more productive research mode than "read papers and look for gaps."
+
+*A heuristic about honesty:* this paper devotes a section to two null results and explains clearly why they occur. That is not self-sabotage — it is *delineating the method's domain of applicability*. A method whose boundaries are clearly marked is more credible and more citable than one that claims to win everywhere.

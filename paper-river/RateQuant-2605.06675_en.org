@@ -1,0 +1,403 @@
+#+title:      RateQuant: Optimal Mixed-Precision KV Cache Quantization via Rate-Distortion Theory
+#+date:       [2026-05-28 Thu 14:56]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T145616-en
+#+source:     https://arxiv.org/abs/2605.06675
+#+authors:    Fei Zuo, Zikang Zhou, Hao Cong, Xiaoyan Xi, Ho Fai Leung
+#+venue:      arXiv 2605.06675 (2026-04)
+
+* The River of the Problem
+
+Every time a large model generates a new token, it must "look back" at notes
+for all previous tokens — that stack of notes is the KV cache.
+The longer the conversation, the thicker the notes; a 32B model processing a
+4k-token context accumulates over 1 GB of cache alone, consuming more GPU
+memory than the model weights themselves.
+
+One remedy is to "compress" those notes into fewer bits. But every existing
+compression scheme assigns the same bit-width to every attention head —
+whether that head is a "protagonist" or an extra, everyone gets equal treatment.
+The waste is obvious.
+
+The natural fix is to allocate by importance — give more bits to important heads
+and fewer to unimportant ones.
+That sounds perfectly reasonable, but RateQuant punctures an embarrassing truth
+that everyone had been dancing around:
+*allocating bit-widths by importance, if you use the wrong distortion curve,
+can produce results worse than flat uniform allocation.*
+
+The core question of this river is: given a fixed total bit budget, how do you
+distribute bits to where they matter most?
+On the surface it looks like an engineering problem; at its core it is a puzzle
+that information theory solved 35 years ago — nobody thought to pull out that
+old key.
+
+* The Source Map
+
+#+begin_example
+[1991/2006] Cover and Thomas - "Elements of Information Theory"
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Reverse Waterfilling: given a fixed total bit budget and N parallel
+  Gaussian sources, how should bits be allocated to minimize total
+  distortion? A closed-form textbook solution.
+  |
+  | Problem: pure theory. Nobody thought it was relevant to modern
+  |          neural networks.
+  v
+[2019/2020] Dong et al. - HAWQ / HAWQ-V2
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Formalizes "which layer matters": uses the top Hessian eigenvalue
+  (or trace) as a sensitivity proxy and assigns different bit-widths
+  to different layers. First time RD thinking landed on deep models.
+  |
+  | Problem: only looks at model weights. But at inference time the
+  |          KV cache eats more memory than the weights, and HAWQ
+  |          never sees that variable.
+  v
+[2024] Liu et al. - KIVI  (contemporaries: QuaRot, KVQuant, TurboQuant)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Directly targets KV cache compression. Key insight: Key matrices
+  are quantized symmetrically per-channel; Value matrices are
+  quantized asymmetrically per-token. State-of-the-art, but
+  *every attention head gets the same bit-width*.
+  |
+  | Problem: Voita 2019 already showed that different heads differ
+  |          in importance by orders of magnitude. Uniform allocation
+  |          is clearly wasteful.
+  v
+[2025] Chen et al. KVmix / Li et al. KVTuner / Liao Wen ChanMix ...
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Various attempts at mixed precision: allocating by layer or by
+  channel, using gradient norms / Pareto search / K-means clustering
+  as *heuristic* allocation rules.
+  |
+  | Problem: every rule is tied to one specific base quantizer;
+  |          switching quantizers means starting over. No theoretical
+  |          guarantee — just "tried it, looks like it works."
+  v
+[2026] Zuo et al. - RateQuant  <--- target paper
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Uncovers a pitfall everyone missed: the distortion-curve slope (beta)
+  varies from 3.6 (TurboQuant) to 5.3 (QuaRot) across quantizers.
+  Using the wrong beta makes mixed precision *worse* than uniform.
+  Fix: spend 1.6 s calibrating the true curve for the current
+  quantizer, then plug it into the 1991 reverse-waterfilling formula.
+  Closed-form, quantizer-agnostic, zero inference overhead.
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1991/2006 | Cover and Thomas: Reverse Waterfilling in the Textbook
+
+*** What problem did it see?
+
+This layer has no predecessor to critique — it is itself one of the
+foundations of information theory.
+The problem it attacks is fully abstract: you have N parallel Gaussian
+channels, each with different noise. Given a fixed total bit budget,
+how many bits should you allocate to each channel to minimize total distortion?
+
+*** Its solution
+
+Reverse waterfilling: imagine each channel as a pool of different depths,
+and the bit budget as water to be poured in.
+Pour first into the noisiest pool — that is where distortion improves fastest;
+pools whose water level would fall below a common threshold receive zero bits.
+Closed-form solution, mathematically elegant, proof spans three pages.
+
+*** Why it works — and where a new pitfall hides
+
+It assumes that "the distortion-rate curve for each channel is known."
+In communications that is fine — Gaussian channels have analytic formulas.
+But in neural networks 35 years later, the curve depends on the specific
+network architecture and quantization scheme, and *nobody can derive it by hand.*
+So the theory slept in deep-learning circles for two to three decades,
+treated as "known but not usable."
+
+** 2019–2020 | HAWQ / HAWQ-V2: Hessian as a Sensitivity Proxy
+
+*** What problem did it see?
+
+Neural-network quantization is an obviously non-uniform problem:
+the first few layers of ResNet are exquisitely sensitive to quantization
+error — push them to 2-bit and the model collapses; later convolutional
+layers can be compressed to 4-bit without trouble.
+Yet mainstream quantization at the time treated every layer identically,
+squandering bits.
+
+*** Its solution
+
+Use the top Hessian eigenvalue (HAWQ) or Hessian trace (HAWQ-V2) as a
+proxy for "how sensitive is this layer," then use integer programming or
+greedy search to assign different bit-widths per layer.
+In spirit this maps "channel noise" from Cover-Thomas to "layer sensitivity,"
+*but the authors did not recognize this as a special case of reverse waterfilling.*
+
+*** Why it works — and where a new pitfall hides
+
+Hessian eigenvalues genuinely capture second-order information about how much
+a perturbation to a layer's weights shifts the loss.
+The results on weight quantization are impressive.
+
+But it only examines model *weights*. After 2023, the inference bottleneck
+quietly shifted from weights to the KV cache — as sequences grew longer,
+the cache outgrew the weights.
+HAWQ's toolkit is powerless here because KV cache is dynamic state,
+not static weights.
+
+** 2024 | KIVI / QuaRot / KVQuant / TurboQuant: Compressing the KV Cache
+
+*** What problem did it see?
+
+This cohort zeroed in on the KV cache as the new memory hog.
+A 32B model running a 4k-sequence accumulates over 1 GB of KV cache,
+filling the GPU. But KV tensors are not ordinary tensors:
+Key matrices have extreme per-channel outliers; Value matrices are
+more uniform. Naively applying weight-quantization schemes fails.
+
+*** Its solution
+
+Each paper employs different tricks:
+- KIVI: Keys are quantized symmetrically *per-channel* (outliers are
+        channel-concentrated); Values are quantized asymmetrically
+        *per-token*.
+- QuaRot: Hadamard rotation scatters outliers across all channels
+          before quantization.
+- KVQuant: Outlier channels receive dedicated non-uniform quantization.
+- TurboQuant: Combines rotation with vector quantization.
+
+Each is clever, compressing the KV cache from FP16 to 4-bit or even 2-bit.
+
+*** Why it works — and where a new pitfall hides
+
+These methods exploit the structural properties of KV tensors.
+But every one of them commits the same mistake:
+*every attention head receives the same bit-width.*
+Voita 2019 had already demonstrated that different heads differ in
+importance by orders of magnitude — some heads aggregate critical
+information and collapse the model when compressed; others pass almost
+nothing and can be discarded without consequence.
+Uniform allocation is equivalent to wasting precious bits on unimportant heads.
+
+** 2025 | KVmix / KVTuner / ChanMix and Kin: The First Wave of Mixed-Precision Attempts
+
+*** What problem did it see?
+
+Carrying forward the pain from the KIVI layer: if head importance varies
+so dramatically, stop treating them uniformly — give important heads more
+bits and unimportant ones fewer. Sounds self-evident.
+
+*** Its solution
+
+Each group goes its own way:
+- KVmix: per-layer allocation using gradient norm as importance.
+- KVTuner: per-layer allocation using Pareto search to find optimal combinations.
+- PM-KVQ: per-layer allocation using integer programming.
+- ChanMix: per-channel allocation, K-means clustering by dynamic range.
+- KITTY: per-channel allocation, raising bit-width on outlier key channels.
+- MixKVQ: per-channel allocation, scoring by query-activation magnitude.
+
+Common thread: granularity is coarser than individual heads (layer or channel);
+all rules are *heuristic*; and every rule is *coupled to one specific base quantizer.*
+Switch quantizers and you have to redo everything.
+
+*** Why it works — and where a new pitfall hides
+
+These methods all report experimental gains, confirming that
+"allocate by importance" is the right direction.
+But they lack theoretical unity: nobody can answer "why this allocation?"
+or "does it hold in a different setting?"
+More critically — as RateQuant would later reveal — these heuristics
+*implicitly assume a specific distortion model.* Switch the quantizer,
+break the model, and the allocation rule not only fails but
+*actively makes things worse than uniform allocation.*
+At this stage, nobody realized this.
+
+** 2026 | RateQuant: A 35-Year-Old Key Opens a New Lock
+
+*** What problem did it see?
+
+The RateQuant team uncovered the hidden trap in every mixed-precision method:
+in the distortion model D(b) = α · β^{-b}, the decay rate β varies across
+quantizers from 3.6 (TurboQuant) to 5.3 (QuaRot).
+*Plugging one quantizer's β into another's framework reverses the ordering
+of "who should get more bits."*
+
+Concrete numbers: KIVI at 2.5-bit target perplexity (PPL) is 49.3.
+A mixed-precision scheme with the wrong β pushes it to 87 —
+76% worse than uniform allocation.
+
+This is what the paper calls *distortion model mismatch.*
+Every prior mixed-precision method steps in this trap; they only appeared
+to work because they happened to use a β that was close enough.
+
+*** Its solution
+
+Two steps:
+1. *Calibrate the distortion curve*: spend 1.6 seconds on a calibration
+   set to fit the current quantizer's true D(b) = α · β^{-b} curve
+   (R² > 0.99; the fit is very stable).
+2. *Apply the reverse-waterfilling formula*: substitute the curve into
+   Cover-Thomas (1991) to obtain the closed-form solution
+   b_i* = b_avg + (ln w_i − mean ln w) / ln(β),
+   where w_i is head i's sensitivity (gradient norm outperforms
+   activation-based proxies by 1.07 PPL).
+
+One additional detail: Key and Value budgets must be allocated separately.
+Under KIVI at a 2.5-bit average, the optimum is K at 2.85-bit and V at
+2.15-bit — Keys are more sensitive than Values.
+
+*** Why it works — and where new pitfalls remain
+
+This is a matter of "unpacking" a 35-year-old information-theoretic result
+and re-fitting it to LLM inference.
+The crucial insight is recognizing that *β is not a constant — it must be
+calibrated on-the-fly for each quantizer.*
+Once you see that, the closed-form solution falls out directly:
+zero inference overhead, 1.6-second calibration.
+
+Results: on Qwen3-8B, reduces KIVI's PPL from 49.3 to 14.9 (70% improvement)
+and improves QuaRot by 6.6 PPL. Most importantly — *it works for any base
+quantizer* because calibration automatically adapts β.
+
+New pitfalls left behind:
+- Allocation is currently per-head, but heads are correlated
+  (e.g., GQA shares K/V across heads); treating them independently
+  may not be optimal.
+- The distortion model assumes exponential decay D(b) = α · β^{-b};
+  for non-uniform quantizers (like KVQuant) the fit may be less clean.
+- This is still post-hoc calibration — KV quantization awareness has not
+  been *trained* into the model.
+
+* Frontier Extensions
+
+RateQuant was posted in April 2026; as of 2026-05-28, fewer than six weeks
+have passed. No explicit follow-up work is visible yet.
+
+Likely directions, based on the river's momentum:
+1. *Push calibration into the training loop*: train the model knowing that
+   its KV will be allocated by RateQuant — analogous to QAT versus PTQ.
+2. *Break the exponential distortion assumption*: for non-uniform quantizers
+   and vector quantization, D(b) need not be a simple exponential.
+   More flexible curve families (piecewise, neural-network-fitted) may be needed.
+3. *Joint cross-head allocation*: currently each head is treated independently,
+   but GQA causes multiple heads to share the same K/V group; the bit budget
+   should be optimized jointly.
+4. *Dynamic allocation*: different prompts activate different heads, so static
+   allocation may not be optimal. Per-request fast reallocation is feasible
+   because the reverse-waterfilling formula is closed-form.
+
+* The Picture in One Diagram
+
+#+begin_example
+
+Timeline -->  1991        2019         2024              2025                2026
+              |           |            |                 |                   |
+IT foundation C&T Reverse
+              Waterfilling
+              |
+              |  (dormant 28 years: formula exists, but
+              |   nobody knows how to derive distortion
+              |   curves for neural networks)
+              v
+Weight quant              HAWQ
+                      Hessian-based
+                      per-layer
+                           |
+                           |  (KV cache replaces weights
+                           |   as the new bottleneck)
+                           v
+KV cache quant                       KIVI / QuaRot
+                                     KVQuant / TurboQuant
+                                     -------------------
+                                     Clever structure + uniform bit-width
+                                                  |
+                                                  |  (head importance differs
+                                                  |   by orders of magnitude)
+                                                  v
+KV cache mixed-prec                                    KVmix / KVTuner
+                                                      ChanMix / KITTY ...
+                                                      -------------------
+                                                      Heuristic + quantizer-locked
+                                                               |
+                                                               |  (wrong distortion
+                                                               |   curve → worse!)
+                                                               v
+                                                                    RateQuant
+                                                                    ---------
+                                                                    Calibrate β +
+                                                                    Reverse waterfilling
+                                                                    (1.6 s, closed-form)
+
+             |                                                            |
+             |<------- 35-year detour: a textbook key opens a new lock ---|
+
+#+end_example
+
+* Insights
+
+What this river is really doing is not "algorithm iteration" but a
+*shift in cognitive layer*:
+
+1. *The bottleneck keeps migrating.* "Model weights are too large" →
+   "KV cache is too large" → "KV cache is uneven across heads."
+   Each step reveals a non-uniformity that the previous layer missed,
+   then exploits finer granularity to reclaim performance.
+
+2. *Theory lags behind practice — until it suddenly catches up.*
+   Reverse waterfilling has been sitting there since 1991. HAWQ used its
+   spirit in 2019 but never formalized it as an RD problem.
+   KV quantization spread widely in 2024, and only in 2026 did someone say
+   "wait — this is a standard RD optimization problem with a closed-form
+   solution already on the books." Engineering exploration always precedes
+   theoretical consolidation, but once consolidation happens, the whole
+   river becomes instantly clear.
+
+3. *"Apparently reasonable things can actively backfire."*
+   This is RateQuant's most valuable strike — not another +0.5 PPL method,
+   but the demonstration that "prior methods all implicitly assumed the wrong
+   distortion curve; swap quantizers and the allocation direction inverts."
+   This kind of reversal discovery is worth more than incremental gains:
+   it not only offers a new method but repositions every prior piece of work
+   where it actually belongs.
+
+4. *Calibration is the invisible protagonist of modern PTQ.*
+   From SmoothQuant's activation calibration, to AWQ's scaler calibration,
+   to RateQuant's distortion-model calibration — everyone is saying "don't
+   assume, measure it." This line will continue: the next breakthrough may
+   come from calibrating the true "bit budget vs. downstream task accuracy"
+   curve rather than using perplexity as a proxy.
+
+Where the river most likely flows next: pushing the RD framework into training
+(RD-aware training), so that models are shaped from the start to perform well
+under any K/V bit budget.
+
+* Takeaways
+
+What this evolutionary line teaches about *how to do research*:
+
+1. *Classical theory usually lies waiting; what is scarce is the eye that
+   connects it to a modern problem.* What RateQuant does is not mathematically
+   complex (reverse waterfilling is an introductory RD result); the hard part
+   is seeing that "allocating bits across attention heads in KV cache is
+   exactly the N-parallel-Gaussian-source budget-allocation problem."
+   Training yourself to recognize "a new problem wearing an old problem's
+   clothing" is worth more than learning yet another new method.
+
+2. *First, distrust heuristics that "seem to work."* The KVmix cohort all
+   reported experimental improvements, yet RateQuant exposed the implicit
+   assumption underneath. When a field simultaneously produces five or six
+   heuristic methods that all claim to work, there is very likely one shared
+   hidden assumption that nobody has articulated — find it, because that is
+   far more valuable than inventing a seventh heuristic.
+
+3. *Calibration has transferable reuse value.* RateQuant's 1.6-second
+   calibration makes it compatible with any quantizer — "buy adaptability
+   with a tiny compute cost" is a design pattern worth copying into other
+   domains: debugging tools, monitoring thresholds, inference parameters
+   can all be made "1-second calibrate, lifetime compatible."
+
+The landing point: the next time you face a field full of competing
+engineering heuristics, *go browse the textbooks in information theory,
+control theory, or operations research* for a formalized version that was
+solved in the 1980s — you might be the person who pulls out the key.

@@ -1,0 +1,282 @@
+#+title:      Sub-Token Routing in LoRA for Adaptation and Query-Aware KV Compression
+#+date:       [2026-05-28 Thu 14:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T145000-en
+#+source:     https://arxiv.org/abs/2604.21335
+#+authors:    Wei Jiang, Wei Wang (Futurewei Technologies)
+#+venue:      arXiv preprint, 2026-04 (v2 2026-05)
+
+* The Problem River
+
+KV cache bloat is the life-or-death problem of large-model inference. A 70B model running on a 32K context can consume tens of gigabytes of memory for the KV cache alone — more than the model weights themselves. The question is: what, exactly, can we afford to throw away?
+
+Every generation working on this river asks the same thing: "What do we actually not need to store?" But each generation cuts at a finer granularity: first by *head*, then by *token*, then by *page*, and finally by going *inside* the token — a single token need not be kept or discarded as a whole; you can keep half of it, a quarter of it.
+
+Why is this river so hard to navigate? Three forces are always tangled together:
+
+- *Correctness*: throw away the wrong thing and the model immediately gets dumber
+- *Efficiency*: deciding "what to throw away" must itself be cheap, otherwise you lose more than you gain
+- *Generalization*: at the moment you decide what to discard, you often don't yet know what the user is going to ask
+
+Generation after generation shuttles between these three forces, grinding the compression granularity finer and finer, one step at a time.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |  Attention mechanism established. Every token must store K and V.
+  |  Problem: KV cache grows explosively with long contexts.
+  v
+[2019] Shazeer - Multi-Query Attention (MQA)
+  |  Compression axis: head. All heads share a single K/V.
+  |  Problem: too aggressive — quality drops noticeably.
+  v
+[2023] Ainslie et al. - Grouped-Query Attention (GQA)
+  |  Compression axis: head groups. A middle ground.
+  |  Problem: the head axis is fully squeezed. Time to shift to the token axis.
+  v
+[2024] Xiao et al. - StreamingLLM (Attention Sinks)
+  |  Compression axis: token, heuristic. Keep only the recent window + a few "sinks".
+  |  Problem: too coarse. Useful tokens in the middle are discarded indiscriminately.
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |  Compression axis: token, selected by cumulative attention score.
+  |  Problem: "importance" is judged from history, blind to what the user will ask next.
+  v
+[2024] Tang et al. - Quest
+  |  Compression axis: page, query-aware.
+  |  The current query decides which pages to load.
+  |  Problem: pages are coarse, and selection requires the query to have already arrived.
+  v
+[2025] Devoto et al. - Expected Attention
+  |  Compression axis: token, query-aware. Estimates the attention distribution of "future queries".
+  |  Problem: does a selected token really need ALL of its content?
+  v
+[2026] Jiang & Wang - Sub-Token Routing  <-- this paper
+       Compression axis: sub-token parts (value-groups).
+       A token can be split internally; complements token-level selection.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al. - Attention Is All You Need: Throw Out Recurrence, Trust Attention Entirely
+
+*** What problem it saw
+
+Before this paper, RNN/LSTM was the standard for sequence modeling. But RNNs had a fatal bottleneck: token 100 had to wait for all 99 preceding tokens to finish before it could begin. Hardware like GPUs — ten thousand cores ready to work in parallel — was almost entirely wasted.
+
+*** Its solution
+
+Simply eliminate the temporal dependency. Every token computes its "relevance score" against every other token directly, all at once. That is the attention mechanism.
+
+*** Why it worked (and what new trap it set)
+
+Parallelism improved dramatically, and so did quality. But it buried a landmine: every token must store its own Key and Value so that future tokens can query them. This is the *KV cache*. As context lengths grow to 32K or 128K, the cache dwarfs the model itself.
+
+All subsequent compression work is about defusing that landmine.
+
+** 2019 | MQA - Multi-Query Attention: Start Cutting at the Coarsest Level — the Head
+
+*** What problem it saw
+
+A Transformer layer has many heads (say, 32). Each head stores its own K and V. Shazeer asked: do these 32 sets of K/V really differ that much? Could they share, trading a little quality for a lot of inference speed?
+
+*** Its solution
+
+Blunt and direct: all 32 heads share one K and one V. Only the Query is computed per-head. KV cache shrinks by a factor of 32.
+
+*** Why it worked (and what new trap it set)
+
+KV read/write bandwidth is the true bottleneck of inference, especially during the decode phase. Sharing KV is equivalent to widening that bottleneck. The cost is a drop in model quality — the 32 heads used to each look at their own material; now they are forced to share a single copy.
+
+The trap it left: can we be less extreme?
+
+** 2023 | GQA - Grouped-Query Attention: Heads Don't All Have to Share — Just Group Them
+
+*** What problem it saw
+
+MQA was too blunt. Having all 32 heads share 1 K/V caused too much quality loss. But storing separate K/V for all 32 heads was wasteful. There was no middle option.
+
+*** Its solution
+
+Split the 32 heads into 4 groups; each group of 8 heads shares one K/V. Quality stays close to the original; KV cache shrinks by 8×.
+
+*** Why it worked (and what new trap it set)
+
+It added a dial to the sharing knob. Llama 2, Mistral, and other large models use GQA by default.
+
+But the head axis is now fully squeezed dry. To compress further you must change axes — not cutting by head, but by *token*: can we simply stop storing "useless" tokens?
+
+** 2024 | StreamingLLM - Attention Sinks: Most Tokens Can Actually Be Dropped
+
+*** What problem it saw
+
+It made a simple observation: in long contexts, the final-layer attention of a model concentrates almost entirely on the first few tokens plus the most recent few dozen tokens. The thousands of tokens in between receive virtually zero attention.
+
+So why store them?
+
+*** Its solution
+
+Keep only the tokens in a *recent window* plus a handful of *sink tokens* at the start (the opening tokens that get attended to repeatedly, serving as anchors). Everything in between is discarded.
+
+*** Why it worked (and what new trap it set)
+
+This was the first big win for the *query-independent* approach — no need to know what the user will ask; positional heuristics alone can eliminate 90%+ of the KV cache. Streaming inference became practical.
+
+But the method was naive — some middle tokens are genuinely important (a key name, a crucial fact). Once discarded indiscriminately, they are gone forever.
+
+** 2023 | H2O - Heavy-Hitter Oracle: Select Tokens by Contribution, Not Position
+
+*** What problem it saw
+
+StreamingLLM's window strategy works reasonably for narrative-style long documents, but fails on tasks that require recalling specific facts — the important token might not be in the window.
+
+*** Its solution
+
+Instead of position, score tokens by their cumulative historical attention. Tokens that have been repeatedly attended to are "heavy hitters" and are kept; those consistently ignored are dropped.
+
+*** Why it worked (and what new trap it set)
+
+This was a step toward precision — upgrading from a positional heuristic to a *data-driven* one. It holds up considerably better than StreamingLLM on QA tasks.
+
+But it is still *query-independent*: historical average scores decide who gets kept, ignoring "what the user is asking *this time*." The KV cache used to answer question A and the one used to answer question B are identical — but they clearly shouldn't be.
+
+** 2024 | Quest - Query-Aware Sparse Retrieval: Let the Query Decide What to Load
+
+*** What problem it saw
+
+The "heavy hitter" tokens H2O selects may be irrelevant to the current query. If I ask "what is the protagonist's name today," that intense battle scene — however "important" historically — is just noise.
+
+*** Its solution
+
+Partition the KV cache into *pages*; for each page, store a statistical summary of its K values (max/min). When a query arrives, use this summary to quickly estimate which pages likely contain relevant content, and load only those pages for attention computation.
+
+This is the beginning of the *query-aware* approach.
+
+*** Why it worked (and what new trap it set)
+
+The savings are not just memory — computation too: only relevant pages participate in attention. Long-context inference suddenly became feasible.
+
+But two traps remain:
+1. *Granularity is still coarse*: a page is typically 16 or 64 tokens; the page is kept or discarded as a whole.
+2. *Purely reactive*: selection can only happen after the query arrives; it cannot support scenarios where you want to compress KV first and serve many unknown future queries from it.
+
+** 2025 | Expected Attention: Don't Wait for the Query — Estimate How Future Queries Will Attend
+
+*** What problem it saw
+
+Quest selects pages only after a query arrives. But in many scenarios we want to *proactively* compress and store KV (e.g., KV cache sharing, cross-request reuse) — at that point we have no idea what future queries will look like.
+
+*** Its solution
+
+Rather than storing everything, estimate a *probability distribution over future queries* and use it to compute the *expected attention score* for each token. Tokens with high expected scores are kept; the rest are dropped.
+
+This transforms "query-aware" from a reactive to a proactive stance — you can make query-aware decisions without seeing a real query.
+
+*** Why it worked (and what new trap it set)
+
+This is the strongest token-level method on the river. This paper also uses it as the hardest baseline in its experiments.
+
+But it still carries a fixed assumption: *a token is either kept in full or dropped entirely*. A token judged "moderately important" will very likely be dropped under Expected Attention's logic — but what if only *some dimensions* inside it are genuinely critical?
+
+Where to go next? The token level is exhausted. The only move left is to change axes: go *inside* the token.
+
+** 2026 | Sub-Token Routing (This Paper): A Token Can Be Split Internally, Too
+
+*** What problem it saw
+
+It made a counterintuitive observation: under a fixed KV budget, the tokens that are retained are actually *highly non-uniform internally* — many tokens have only some of their value dimensions kept, many tokens are dropped entirely, and only a few are kept entirely (paper Figure 1).
+
+In other words, the binary choice of "keep an entire token vs. drop it entirely" never reflected reality. The model is already doing "partial retention" implicitly — it's just that no one had explicitly modeled this.
+
+*** Its solution
+
+Split each token's value vector into S groups (e.g., 4 groups, called value-groups). Introduce two routing paths:
+
+1. *Query-independent path*: train a router to decide which value-groups inside each token to keep, paired with a trained "reconstructor" that fills in the dropped portions.
+2. *Query-aware path*: use a predictor to distribute a global budget (e.g., the equivalent of 1.0 full token) across all (token, value-group) pairs in a query-aware manner — important tokens get many groups; unimportant ones get none.
+
+This approach does *not replace* token-level methods — it *complements* them: a token-level method like Expected Attention first decides which tokens are globally more worth attending to, and then sub-token routing decides how to compress the interior of each retained token.
+
+To apply the same philosophy to LoRA fine-tuning, the paper also slices LoRA's low-rank update by internal subspace, calling it *routed subspace LoRA* — distinct from MoE-LoRA and similar methods that route among multiple LoRA experts, this routes *among subspaces within a single LoRA*. The same "finer-grained routing" philosophy lands on both adaptation and compression simultaneously.
+
+*** Why it worked (and what new traps it set)
+
+The intuition: different dimensions of a value vector carry different semantics — some encode "is this word a verb or a noun," some encode "what specific entity it refers to," some encode "its emotional valence." For a given query, only one class may matter. Forcing a whole-block keep or drop is wasteful.
+
+Experiments show: sub-token routing alone matches the strongest token-level method, Expected Attention; but *combined*, the two achieve almost no accuracy drop at much more aggressive compression ratios (e.g., total budget cut to 25%) — something no single token-level method can do.
+
+New traps left behind:
+- *Training cost*: requires training a router and reconstructor (query-independent mode) or a predictor (query-aware mode).
+- *Hardware friendliness*: sub-token-level sparsity may not play well with current GPU kernels; dedicated kernels are needed to realize the theoretical speedup.
+- *Can the axis go finer still?*: value vectors are already split into 4 groups. Would splitting further (e.g., selecting individual dimensions) yield sufficient benefit to justify the added complexity?
+
+* Frontier Extensions
+
+As of this paper's writing (May 2026, v2), this is the finest-grained publicly known scheme on this river. Whether further work exists — e.g., applying the same idea to the *key* path, or to *sub-vectors within each head* — has not yet appeared in any clear public publication.
+
+A few plausible directions (speculative, *not confirmed*):
+
+- *Symmetric work on the key path*: this paper only touches the value side, leaving keys unchanged. But keys constitute half the KV cache. Could similar sub-token routing be applied to keys? It would be harder, since keys directly determine "whether a token gets retrieved at all."
+- *Hardware co-design*: sub-token sparsity is unfriendly to existing attention kernels (FlashAttention family), likely catalyzing dedicated "sub-token aware" kernels.
+- *Combination with quantization*: sub-token routing decides "which groups to keep"; quantization decides "how many bits to use for what is kept." The two compression axes are orthogonal, leaving a large combinatorial design space.
+
+* One Diagram to Understand It All
+
+#+begin_example
+Evolution of compression granularity from coarse to fine:
+
+Coarse |
+       |   MQA (2019)                                 [all heads share K/V]
+       |     v
+       |   GQA (2023)                                 [grouped heads]
+       |     v   '''''''''''''''''''''''''''''''''''''   query-independent
+       |   StreamingLLM (2024)                        [token, positional heuristic]
+       |     v
+       |   H2O (2023)                                 [token, historical attention]
+       |     v   '''''''''''''''''''''''''''''''''''''  query-aware
+       |   Quest (2024)                               [page, selected on query arrival]
+       |     v
+       |   Expected Attention (2025)                  [token, estimates future queries]
+       |     v   '''''''''''''''''''''''''''''''''''''  sub-token
+  Fine |   Sub-Token Routing (2026)                   [value-group inside token]
+       |     |
+       |     +-> Combined with Expected Attention = deeper compression, near-zero accuracy drop
+       v
+                  Decision dimension ------------------------------>
+                  head           token         page          sub-token
+                  kept as block  kept as block kept as block partial retention
+#+end_example
+
+* Insights
+
+The most fundamental shift happening across this river is quiet but profound: *the definition of "what counts as an indivisible unit of information" keeps shrinking*.
+
+- When attention was born in 2017, a token was a natural atom.
+- MQA/GQA demoted the "head" from atomic unit to something splittable.
+- StreamingLLM/H2O/Quest demoted the "token" from something that must be stored to something that can be kept or discarded.
+- Sub-Token Routing goes to the extreme — *the interior of a single token is no longer atomic either*.
+
+Each time an atomic boundary is broken, a new compression degree of freedom is unlocked. This is a deep conceptual shift:
+
+We used to assume that the internal structures of a Transformer (heads, tokens, value vectors) were "semantically indivisible." But accumulating evidence suggests these boundaries are *engineering conveniences*, not *information-theoretically meaningful*. Inside the model, there is no such thing as "one token" — only a constellation of active patterns scattered across many dimensions.
+
+If that reading is correct, the next step is inevitably *dynamic granularity based on actual information distribution* — no longer hand-setting how many pieces to cut, but letting the model learn "for this query and this context, what is the best way to slice."
+
+A second thing worth noticing: *query-aware does not have to wait for the query*. Expected Attention uses a probability distribution over future queries to transform query-awareness from reactive to proactive. That idea itself is a paradigm shift, and the query-aware predictor in sub-token routing walks the same road.
+
+A possible future direction: not just deciding "what information to keep," but letting the query distribution also determine "how that information should be *organized*."
+
+* Takeaways
+
+Lessons for researchers and engineers:
+
+- *The axis matters more than the algorithm*: MQA → GQA is a small step along the same axis; GQA → StreamingLLM is a change of axis. When a field is truly stuck, it usually means the current axis is exhausted; opening a new axis unlocks an entire new region of design space. Notice how pushing "compression granularity" one notch finer in this paper illuminates the entire trajectory.
+- *Things assumed to be atomic usually aren't*: every time someone asks "does this seemingly indivisible thing actually have to be indivisible?" they find something new. The next time you're stuck, list everything you've been implicitly treating as a unit, and ask each one: "Can this really not be split further?"
+- *Complementary > replacement*: the strongest experimental result in this paper is not sub-token routing beating everything else single-handedly — it is sub-token routing *combined* with Expected Attention. A new method doesn't have to defeat the old one; finding a position *orthogonal* to the old method is often far more valuable.
+- *Diagnose before prescribing*: Figure 1 in this paper uses one simple histogram (the internal-distribution histogram of retained tokens) to make the case for sub-token routing completely clear. Prove with data that the problem genuinely exists before presenting the solution — that is ten times more convincing than just proposing a new method.
+
+Practical bottom line: if you are working on LLM inference optimization, ask yourself three things right now —
+1. What is the "unit" I'm currently compressing? Can I go finer?
+2. Is my decision query-independent or query-aware? Can I move from "wait for the query" to "estimate the distribution of queries"?
+3. Is my method trying to replace something else, or can I find a complementary position alongside it?

@@ -1,0 +1,344 @@
+#+title:      LKV: End-to-End Learning of Head-wise Budgets and Token Selection for LLM KV Cache Eviction
+#+date:       [2026-05-28 Thu 14:05]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T140511-en
+#+source:     https://arxiv.org/abs/2605.06676
+#+authors:    Enshuai Zhou, Yifan Hao, Chao Wang, Rui Zhang, Di Huang, Jiaming Guo, Xing Hu, Zidong Du, Qi Guo, Yunji Chen
+#+venue:      arXiv 2605.06676 (cs.LG), 2026-04
+
+* The Problem River
+
+During LLM inference, every additional token in the context grows the KV cache by another slice. In long-context scenarios, GPU memory is blown apart by this accumulating cache long before compute becomes the bottleneck.
+
+So for the past three years, an entire line of research has been doing exactly one thing: *cut the KV cache by half or more while keeping the model's answers correct*.
+
+Cutting the cache splits into two sub-problems:
+
+1. *How much budget does each attention head get?* (budget allocation) — Split equally across all heads? More for shallow layers, less for deep ones? Or let the data decide?
+2. *Within a budget, which tokens do we keep?* (token selection) — Look at attention scores? Key vectors? Cumulative history?
+
+Both questions have been attacked for three years with every variety of *hand-crafted heuristic*. Each paper earns a small gain, but every one involves guesswork — why should shallow layers get more? Why are "the first few tokens are attention sinks and must be kept" a law of nature? Why use the most recent 32 tokens as the observation window?
+
+LKV's verdict is sharp: *all those heuristics are detours. Backpropagate the task loss directly and let it learn which head gets how much budget and which tokens to keep — zero hand-written rules.*
+
+That sounds obvious — isn't it just the standard deep-learning playbook? But nobody did it for three years, because "select top-K" is a *non-differentiable* operation — gradients cannot flow through it. LKV's key to untying this knot is a differentiable operator called *Soft-TopK*, paired with a scorer that rates tokens directly from KV vectors without ever computing the attention matrix.
+
+The whole story is: how the field moved step by step from "split equally" to "use a fixed rule" to "learn it end-to-end."
+
+* Source Map
+
+#+begin_example
+[2023.09] Xiao et al. - StreamingLLM
+  |
+  | Finding: the first token always receives anomalously high attention scores
+  |           ("attention sink") and must never be evicted
+  | Solution: keep the first few tokens + a sliding window.
+  |           Extremely simple, yet handles sequences of unlimited length.
+  v
+[2023.10] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | Problem: the sliding window is too blunt — genuinely valuable distant tokens
+  |           are also cut off
+  | Solution: accumulate each token's historical attention score total;
+  |           keep the top-B tokens ("heavy hitters")
+  |           Budget: uniform across all heads
+  v
+[2024.04] Li et al. - SnapKV
+  |
+  | Problem: H2O's cumulative scores react slowly to "just-happened" events,
+  |           missing critical signals near the end of the prompt
+  | Solution: use only the attention from the last observation window of the prompt;
+  |           score each historical token by how often that window attends to it
+  |           Budget: still uniform across all heads
+  v
+[2024.05] Cai et al. - PyramidKV
+  |
+  | Problem: different layers contribute differently; uniform allocation wastes budget
+  | Solution: more for shallow layers, less for deep — a fixed pyramid decay curve
+  |           Still a *hand-coded* layer-wise ratio
+  v
+[2024.10] Xiao et al. - DuoAttention
+  |       Feng et al. - Ada-KV (2025.02)
+  |
+  | Problem: PyramidKV's pyramid is too rigid; middle layers can also host "retrieval heads"
+  | DuoAttention: learn a binary gate per head — either a "retrieval head"
+  |               (keep full KV) or a "streaming head" (keep only sink + window)
+  |               First time learning is introduced, but only a two-class decision
+  | Ada-KV: at inference time, use each layer's attention distribution to
+  |         adaptively split the layer budget across heads — concentration-based
+  |         No fixed curve, but still requires computing the attention matrix O(t^2)
+  v
+[2026.04] Zhou et al. - LKV  [this paper]
+  |
+  | Problem: both Ada-KV and DuoAttention stop short of the finish line
+  |   - Ada-KV still uses attention scores as a proxy, requiring O(t^2) at inference —
+  |     falling back into the very trap KV eviction tries to escape
+  |   - DuoAttention's binary split is too coarse; heads have far richer roles
+  |     than "retrieval vs. streaming"
+  |   - Every method still needs hand-coded safety nets (minimum budget floors,
+  |     forced recent-window, forced sink retention) to stay stable
+  | Solution: end-to-end differentiable; "select K" expressed as a differentiable
+  |           operator via Soft-TopK
+  |           LKV-H: flatten all layers and all heads into one pool;
+  |                  let them compete globally for a shared total budget
+  |           LKV-T: score tokens directly from KV vectors — no attention matrix,
+  |                  O(t) instead of O(t^2)
+  |           Zero safety nets: no minimum budget, no forced window, no forced sink
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.09 | StreamingLLM: First Admission That "Something Must Always Stay"
+
+*** What Problem It Saw
+
+Right after GPT-3.5 appeared, a strange failure mode surfaced: running a sliding window over long contexts — keeping only the most recent 1 024 tokens — caused models to rapidly "lose their minds," producing incoherent output.
+
+Intuitively, as long as the most recent 1 024 tokens are present, the model should at least write coherently. Why did it break?
+
+*** Its Solution
+
+Xiao et al. pulled up attention heat maps and spotted an anomaly: *the very first token (BOS or similar) always received abnormally high attention scores*, regardless of semantic relevance.
+
+They called this an *attention sink* — like a drain. Softmax must distribute probability somewhere, and the first few tokens become that "garbage bin." Once they are discarded, the softmax distribution collapses and inference breaks entirely.
+
+The fix is minimal: *always keep the first 4 tokens plus a sliding window*. Works for million-token sequences with negligible quality loss.
+
+*** The New Problem It Left Behind
+
+This approach tames the memory explosion, but *drops every piece of critical information from the distant past*. If a fact was buried 100K tokens earlier, the model cannot retrieve it.
+
+The deeper assumption is that *distant information equals irrelevant information* — clearly wrong. In real long-context applications (codebase analysis, multi-document QA), crucial information can live anywhere.
+
+The ball passed to H2O.
+
+** 2023.10 | H2O: Replacing a Position Rule with a Score Rule
+
+*** What Problem It Saw
+
+H2O inherited one observation from StreamingLLM: attention is *sparse* — most tokens are ignored most of the time, while a small minority are attended to repeatedly.
+
+So why decide what to keep by position (keep the recent ones)? It should be decided by *whether a token has been repeatedly attended to*.
+
+*** Its Solution
+
+Keep a running tally for each token: *how much cumulative attention score has it received over its lifetime?* When eviction is needed, keep the top-B tokens ("Heavy Hitters") and discard the rest.
+
+Budget allocation is kept simple: all layers, all heads receive an equal share of the total budget.
+
+*** Why It Works, Where the Trap Is
+
+It works because it genuinely captures attention's sparse structure — deleting low-score tokens barely affects output.
+
+But two traps were dug, each exposed by subsequent papers:
+
+- *Trap 1: cumulative scores react slowly.* A critical instruction near the end of the prompt ("Answer in English") hasn't had time to accumulate a high score and gets discarded as unimportant. SnapKV fills this hole.
+- *Trap 2: equal budget across all heads is naive.* Attention heads have wildly different roles — some handle syntax, some handle long-range retrieval, some handle local patterns. Giving them equal budgets is like feeding a starving person and a full person identical portions. PyramidKV and Ada-KV fill this hole in relay.
+
+** 2024.04 | SnapKV: Look at the End Window, Not the Entire History
+
+*** What Problem It Saw
+
+SnapKV identified a finer phenomenon: *the moment the prompt finishes processing, the attention pattern of the model's last few tokens already "reveals" which earlier tokens will be needed.*
+
+H2O's full-history accumulation averages this crucial "end-window signal" together with ancient noise and washes it out.
+
+*** Its Solution
+
+Look only at the attention from the final fixed observation window of the prompt (e.g., the last 32 tokens), and score each historical token by how often that window attends to it. Keep the highest-scored ones.
+
+One sentence: *swap "has it ever been important?" for "is it important for the question about to be asked?"*
+
+Budget allocation remains uniform across all heads — SnapKV does not touch that dimension.
+
+*** The New Problem It Left Behind
+
+Gains are substantial, but a core tension surfaces: *the strategy for which tokens to keep within a budget grew smarter, but "how much budget each head gets" is still frozen at the H2O era.*
+
+For the next three years, the main battlefield shifts to budget allocation.
+
+** 2024.05 | PyramidKV: Shallow Layers Get More, Deep Layers Less — Write a Fixed Curve
+
+*** What Problem It Saw
+
+The PyramidKV team ran extensive attention visualizations and found a pattern: *shallow layers have more "spread-out" attention distributions (high entropy), deep layers are more "focused" (low entropy).*
+
+Physical interpretation: shallow layers aggregate information and need to see many tokens; deep layers perform specific reasoning and attend to just a few.
+
+So why give shallow and deep layers equal budget? *Give shallow layers more, deep layers less.*
+
+*** Its Solution
+
+Define a pyramid-shaped linear decay: the first layer gets the maximum budget, layer L gets the minimum, with equal-step decrements in between. The specific decay slope is a hand-tuned hyperparameter.
+
+*** Why It Works, Where the Trap Is
+
+It works because "inter-layer variation" is a real signal. Under equal total budget, it typically gains about one point over H2O/SnapKV.
+
+The trap is immediately pointed out by the next paper:
+
+- *The pyramid is too rigid.* In practice, some "retrieval heads" live in the middle or deep layers — on LongBench haystack tasks, the critical heads sit around layers 16–20. Forcing deep layers to have low budgets starves those heads.
+- *Intra-layer head differences are ignored.* Within a single layer, different heads do different things, yet they all share the same layer budget — which reverts to H2O-style uniform allocation, just across heads instead of across layers.
+
+The ball passed to Ada-KV and DuoAttention.
+
+** 2024.10 – 2025.02 | DuoAttention and Ada-KV: Learning Enters for the First Time
+
+*** What Problem They Saw
+
+PyramidKV's fixed decay curve is a *hard-coded prior*. No matter how much a task needs deep-layer budget, the curve will not yield it.
+
+Both papers simultaneously recognized: *learning should replace hard-coded rules.* But they took two different paths.
+
+*** DuoAttention's Solution (Xiao et al., 2024.10)
+
+Train a *gating score in [0, 1]* per head via distillation — heads near 1 are classified as *Retrieval Heads* (keep their full KV cache), heads near 0 are classified as *Streaming Heads* (keep only attention sink + recent window).
+
+Clean, interpretable, effective. But *it only learns a two-class decision.*
+
+*** Ada-KV's Solution (Feng et al., 2025.02)
+
+At inference time, compute each layer's attention distribution for the current prompt and use *attention concentration* to adaptively split the layer's budget across its heads — highly concentrated heads (very selective) receive more; diffuse heads (less selective) receive less.
+
+No training required; dynamically adaptive at inference time. But *it depends on computing the attention matrix.*
+
+*** Why They Work, Where New Traps Are Buried
+
+DuoAttention is the first to bring learning into this problem, demonstrating the potential of end-to-end training. Ada-KV is the first to achieve fine-grained per-head adaptive budgets. Both improve results.
+
+But new traps remain:
+
+- *DuoAttention's binary split is too coarse.* Heads have far richer roles than "retrieval vs. streaming" — induction heads, copy heads, local heads, ICL heads, positional bias heads — a single binary cannot carve them up correctly. Budget granularity is effectively limited to two tiers.
+- *Ada-KV traps itself back in O(t^2).* It must compute attention to distribute budgets — but one of the core reasons for doing KV eviction is to *avoid the O(t^2) attention computation.* This is a *circular dependency*: to save memory we need eviction; to evict we must compute attention; computing attention costs time.
+- *Both still need safety-net rules.* Ada-KV enforces a minimum budget floor (to prevent heads from being starved to zero); DuoAttention enforces sink + recent-window retention (for stability). These are all signs that *learning was done, but hand-coded fall-backs are still required* — the learning is incomplete.
+
+The ball passed to LKV.
+
+** 2026.04 | LKV: Remove Every Hand-Written Rule at Once
+
+*** What Problem It Saw
+
+After reading five years of prior work, the LKV team's diagnosis is direct: *this field has been doing "semi-supervised" optimization the entire time — learn a bit, patch a bit, learn a bit, patch a bit.*
+
+Why not simply *backpropagate the task loss end-to-end and let it decide how much budget each head receives and which tokens to keep?*
+
+The reason nobody did this before is that "select top-K" is a *discrete* operation — non-differentiable, so gradients cannot flow through it. Every learning component in prior work broke the chain exactly at top-K.
+
+LKV's core insight: *find a differentiable drop-in for top-K* and wire the entire pipeline into one differentiable chain.
+
+*** Its Solution
+
+Three pieces:
+
+*1. The Soft-TopK Operator (the core mathematical tool)*
+
+Replace hard top-K with a differentiable sigmoid-based selection controlled by a Lagrange multiplier lambda: each candidate token receives a "retention probability" between 0 and 1, with the total constrained to sum to K. Lambda is solved in closed form. During training, gradients flow through this operator; at inference, it collapses to hard top-K (because probabilities are nearly 0 or 1 by then).
+
+This tool converts the entire problem from "discrete combinatorial optimization" to "continuous differentiable optimization." Every subsequent design choice rests on it.
+
+*2. LKV-H: Globally Flattened Budget Competition*
+
+No more layer-wise allocation. Flatten all layers and all heads into *one long queue*, assign each head a learnable embedding to compute a score, then use Soft-TopK to select *globally* who gets how much budget.
+
+This deconstructs PyramidKV's pyramid, DuoAttention's binary classes, and Ada-KV's intra-layer adaptation *all at once* — how much each head needs is decided by the task loss, with no layer prior, no binary gate, no minimum threshold.
+
+*3. LKV-T: A Token Selector That Never Computes the Attention Matrix*
+
+This is the antidote to Ada-KV's O(t^2) circular dependency. A lightweight MLP is added per head: it takes the KV vectors themselves as input and outputs a token importance score. Soft-TopK then selects the tokens within the budget.
+
+*Critical: the attention scores are never computed.* Complexity drops from O(t^2) to O(t). It also avoids the chicken-and-egg problem of "to select tokens you need the future query."
+
+*** Why It Works, and What New Findings the Paper Offers
+
+Experimentally, LKV achieves state of the art on LongBench, RULER, and similar benchmarks; retaining 15% of the cache produces near-lossless results. That claim alone is nothing special — every KV-eviction paper declares itself SOTA.
+
+The genuinely interesting finding is in the *ablation*: the authors separate LKV-H (learned budget) from LKV-T (learned selection) and discover that *the performance gain comes predominantly from LKV-H*, not from LKV-T.
+
+Translation: *the field spent three years primarily improving "which tokens to select," but the real performance bottleneck was "how much budget each head receives."* The iteration on token selection — SnapKV, KeyDiff, CriticalKV and the like — was yielding diminishing returns; budget allocation, from uniform to PyramidKV to Ada-KV to LKV-H, is where the real performance leaps came from.
+
+That ablation finding is worth more than LKV's method itself.
+
+*** The New Traps It Leaves
+
+- *Soft-TopK training requires labeled data (self-distillation).* This demands an uncompressed teacher model, making training non-trivial.
+- *LKV-T's MLP is per-head,* so parameter count scales linearly with the number of heads. This may not scale well for very large models (e.g., MoE architectures).
+- *End-to-end differentiability comes at the cost of inference-time adaptability.* Ada-KV can still adjust dynamically per prompt; LKV is fixed after training. Different tasks may require different budget distributions, but LKV learns the dataset-average optimum.
+- *How tight is the Soft-TopK approximation?* Training uses a soft version; inference switches to hard. The paper provides theoretical analysis but does not rigorously quantify this gap across all settings.
+
+* Frontier Extensions
+
+LKV was published in April 2026 — too new for clear follow-up papers. But tracing the river forward, several directions are inevitable:
+
+- *Inference-time adaptive learned budgets.* LKV-H learns a "globally optimal budget allocation for the dataset," but different prompts require different budget distributions. The next step is "learn a hyper-network that dynamically outputs a budget allocation conditioned on the current prompt," combining Ada-KV's flexibility with LKV's end-to-end nature.
+- *Cross-task budget routing.* Since LKV-H is globally learned, the natural extension is: different task types (code / QA / summarization) follow different budget pathways. This is essentially a MoE-of-budgets.
+- *Joint optimization of LKV-T and quantization.* LKV only compresses cardinality (how many tokens to keep), not precision (how many bits per token). The same differentiable framework naturally accommodates the bit-width dimension — the KIVI/AQUA-KV family could be folded in.
+- *Soft-TopK generalized to other discrete selections.* The operator is a general-purpose tool. MoE expert routing, draft token selection in speculative decoding, and chunk selection in retrieval can all be made differentiable with the same approach.
+
+Zooming out further: LKV essentially proposes a *framework-level shift* — "anywhere in KV cache management that can be written as a top-K selection can be learned end-to-end." If this idea spreads, every "add-a-heuristic, add-a-prior" paper from the past three years becomes a transitional artifact.
+
+* One Diagram
+
+#+begin_example
+   Budget Allocation                         Token Selection
+   ------------------------------            ---------------------------
+   Uniform across all heads                  Position rule: keep recent + keep first few
+   |  H2O (2023) / SnapKV (2024)             |  StreamingLLM (2023): sink + window
+   |                                         |
+   v                                         v
+   Inter-layer pyramid (hard-coded curve)    Cumulative attention score
+   |  PyramidKV (2024)                       |  H2O (2023): cumulative attention
+   |                                         |
+   v                                         v
+   Inter-head adaptive (requires attention)  End-window attention
+   |  Ada-KV (2025): O(t^2) circular dep.   |  SnapKV (2024): observation window
+   |                                         |
+   v                                         v
+   Learn a binary classification             Other signals: key geometry, value norm
+   |  DuoAttention (2024): retrieval vs      |  KeyDiff / CriticalKV (2025)
+   |  streaming                              |
+   |                                         |
+   v                                         v
+   =========== Every method above still needs hand-coded safety nets ============
+   minimum budget floor / forced sink / forced recent window / fixed pyramid slope
+   =============================================================================
+                          |
+                          v
+   ========================== LKV (2026) ========================================
+   |                                                                            |
+   |  LKV-H: flatten everything; all layers and all heads compete globally     |
+   |          for a shared total budget                                         |
+   |  LKV-T: no attention matrix; learn token importance directly from         |
+   |          KV vectors                                                        |
+   |  Zero safety nets; end-to-end differentiable (core tool: Soft-TopK)      |
+   |                                                                            |
+   |  Key finding: performance comes primarily from LKV-H (learned budget),   |
+   |               not from LKV-T (learned selection)                          |
+   ==============================================================================
+
+   Timeline:
+   2023 ---------- 2024 ---------- 2025 ---------- 2026
+   StreamingLLM   SnapKV         DuoAttention    LKV
+   H2O            PyramidKV      Ada-KV
+#+end_example
+
+* Insights
+
+Reading this entire line, the surface narrative is "KV cache compression keeps getting more refined," but underneath lie three deeper shifts.
+
+*First layer: the belated awakening from "write rules" to "learn rules."* The central creed of deep learning since 2012 has been "learning beats hand-crafting." Yet KV eviction from 2023 to 2025 kept piling up heuristics, priors, and safety nets, with almost nobody attempting end-to-end learning. The block was technical (top-K is non-differentiable), but the deeper cause was *inertia* — researchers with a systems and engineering background are conditioned to write rules; the ML paradigm never migrated over. LKV did not invent anything new (Soft-TopK has predecessors in differentiable sorting from other fields); it simply applied *the standard deep-learning playbook* rigorously to this problem. Next time you enter a domain "dominated by systems engineers," ask yourself: *Is anyone here still writing heuristics? Has the end-to-end learning paradigm arrived yet?*
+
+*Second layer: the real performance bottleneck is usually not where everyone is competing.* Along this line, from 2024 to 2026, *the vast majority of papers were improving token selection* (KeyDiff, CriticalKV, CapKV, EntmaxKV, Conf-KV…). LKV's ablation says: the true bottleneck is budget allocation, not token selection. This kind of "field consensus with a misplaced priority" recurs throughout engineering — in quantization, everyone races to improve activation quantization precision, but the real blocker is outlier handling; in retrieval, everyone races to improve embedding models, but the real blocker is chunk segmentation. *Choosing the right battlefield matters more than choosing the right tactic.* When ten teams in a field are all doing the same thing, the real alpha is usually in the corner none of them are watching.
+
+*Third layer: differentiability as a "domain elevation" tool.* LKV's essence is *turning a discrete combinatorial optimization problem (select K from N tokens) into continuous differentiable optimization.* This pattern recurs throughout ML history: Gumbel-Softmax made discrete sampling differentiable (enabling VAE + categorical follow-ons); DiffSort made sorting differentiable (enabling differentiable retrieval); now Soft-TopK makes top-K differentiable (enabling end-to-end KV eviction). *Every "discrete → differentiable" conversion pushes a field from hand-written rules to end-to-end learning.* If you see a field littered with "argmax + heuristic," ask: can that argmax be replaced by a differentiable operator? That might be the next LKV.
+
+* Takeaways
+
+For researchers and engineers alike, this line of work offers a few concrete lessons:
+
+*One: habitual thinking is harder to break through than technical difficulty.* End-to-end learning of KV eviction was technically feasible — the seeds of Soft-TopK existed in differentiable sorting papers around 2018 — yet the KV eviction field did not do it until 2026. Eight years elapsed. Not because the technology was absent, but because *researchers in the systems domain had not picked it up.* If you work across domains (from ML into systems, or from systems into ML), your biggest alpha is not inventing something new — it is *taking a standard tool from one side and applying it rigorously to the other side's problems from first principles.* LKV is exactly that: the ML-standard tool of end-to-end learning transplanted into a systems optimization problem.
+
+*Two: the ablation section is the most valuable part of a paper, and it is usually the part readers skip.* In LKV's method section, LKV-H and LKV-T appear side by side and seem equally important; but the ablation reveals that LKV-H is what actually drives the performance. *For any paper with an ablation, read the ablation first and the method section second — you will find that the story the authors tell and the story the numbers tell frequently diverge.* This is the fastest way to judge whether the authors truly understand why their method works or simply assembled a pile of tricks and tried them all.
+
+*Three: wherever a field is full of hand-coded safety nets, that is the entry point for end-to-end learning.* Ada-KV needs a minimum budget floor; DuoAttention needs sink + recent-window retention; PyramidKV needs a pyramid slope. Every safety net is a signal meaning *"we genuinely don't know what to do here, so we guessed."* If you can count five or more such patches, you can almost certainly bet that an end-to-end learned version will win. *The fastest way to find the entry point is not to look for where SOTA hasn't been beaten — it is to look for where hyperparameters are still being guessed.*
+
+One final sentence: *the real value of reading a field backward is that it lets you see its "engineering inertia curve."* LKV looks like "yet another KV eviction method"; reading back to StreamingLLM, you see that this field took three years to travel a road that ML had already paved — the journey from writing rules to learning them. The next time you enter any new domain, ask first: *what is its engineering inertia? Which step has not been taken yet?* That step is where the next LKV lives.
