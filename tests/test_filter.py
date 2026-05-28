@@ -334,3 +334,109 @@ async def test_milestone_override_skips_without_heat_signal(tmp_path, monkeypatc
     # No heat → LLM verdict stands, paper stays hard_gated.
     assert out["relevance_breakdown"]["hard_gate"] is True
     assert out["relevance_score"] == 0
+
+
+def _mk_milestone(arxiv_id: str, rank: int) -> Paper:
+    """Milestone-trending paper with HF trending heat signal."""
+    return Paper(
+        id=arxiv_id,
+        title=f"Paper {arxiv_id}",
+        authors=[],
+        abstract="abs",
+        url="https://x",
+        pdf_url=None,
+        published_at=datetime(2023, 1, 1, tzinfo=UTC),
+        primary_category="cs.LG",
+        categories=["cs.LG"],
+        sources=[
+            SourceRecord(
+                name="hf_daily",
+                fetched_at=datetime.now(UTC),
+                extras={"trending_rank": rank},
+            ),
+        ],
+    )
+
+
+def _write_scored(path: Path, arxiv_id: str, *, surfaced_as_trending: bool) -> None:
+    """Minimal scored entry. Mirrors the shape filter_papers writes so the
+    cooldown helper can read it back."""
+    entry = {
+        "id": arxiv_id,
+        "relevance_breakdown": {
+            "hard_gate": not surfaced_as_trending,
+            "topic_bucket": "trending" if surfaced_as_trending else "unknown",
+        },
+    }
+    path.write_text(json.dumps([entry]))
+
+
+@pytest.mark.asyncio
+async def test_milestone_cooldown_suppresses_recent_resurface(tmp_path, monkeypatch):
+    """If a milestone paper surfaced as trending within the last 14 days,
+    a subsequent run on a hot day must NOT re-fire the override."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    # 2309.06180 surfaced 3 days before target_date.
+    target_date = datetime(2026, 5, 27, tzinfo=UTC).date()
+    scored_root = tmp_path
+    prev = target_date.replace(day=target_date.day - 3)
+    _write_scored(scored_root / f"{prev.isoformat()}.json", "2309.06180", surfaced_as_trending=True)
+
+    in_path = tmp_path / f"{target_date.isoformat()}-in.json"
+    in_path.write_text(json.dumps([_mk_milestone("2309.06180", rank=12).model_dump(mode="json")]))
+    out_path = scored_root / f"{target_date.isoformat()}.json"
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("p")
+
+    fake = AsyncMock()
+    fake.call_json.return_value = {
+        "hard_gate": True,
+        "topic_relevance": 0,
+        "practicality": 0,
+        "topic_bucket": "unknown",
+        "reason": "serving engine, not a compression algorithm",
+    }
+    from pipeline.filter import _milestone_trending_ids
+    _milestone_trending_ids.cache_clear()
+
+    await filter_papers(in_path, out_path, prompt_path, fake, concurrency=1)
+    out = json.loads(out_path.read_text())[0]
+    # Cooldown wins: LLM hard_gate verdict stands, paper does NOT re-surface.
+    assert out["relevance_breakdown"]["hard_gate"] is True
+    assert out["relevance_breakdown"]["topic_bucket"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_milestone_cooldown_allows_after_window(tmp_path, monkeypatch):
+    """If the last surface was strictly older than 14 days, override fires again."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    target_date = datetime(2026, 5, 27, tzinfo=UTC).date()
+    scored_root = tmp_path
+    # Last surface 20 days ago — well outside the 14-day cooldown.
+    from datetime import timedelta
+    prev = target_date - timedelta(days=20)
+    _write_scored(scored_root / f"{prev.isoformat()}.json", "2309.06180", surfaced_as_trending=True)
+
+    in_path = tmp_path / f"{target_date.isoformat()}-in.json"
+    in_path.write_text(json.dumps([_mk_milestone("2309.06180", rank=12).model_dump(mode="json")]))
+    out_path = scored_root / f"{target_date.isoformat()}.json"
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("p")
+
+    fake = AsyncMock()
+    fake.call_json.return_value = {
+        "hard_gate": True,
+        "topic_relevance": 0,
+        "practicality": 0,
+        "topic_bucket": "unknown",
+        "reason": "serving engine",
+    }
+    from pipeline.filter import _milestone_trending_ids
+    _milestone_trending_ids.cache_clear()
+
+    await filter_papers(in_path, out_path, prompt_path, fake, concurrency=1)
+    out = json.loads(out_path.read_text())[0]
+    # Outside cooldown → override fires normally.
+    assert out["relevance_breakdown"]["hard_gate"] is False
+    assert out["relevance_breakdown"]["topic_bucket"] == "trending"
+    assert "milestone-override" in out["relevance_reason"]

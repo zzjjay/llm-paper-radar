@@ -84,7 +84,7 @@ Eight LLM-pickable buckets — seven strict compression buckets plus `trending` 
 
 **Caps scope:** the README compact table lists every surviving paper (no cap). Caps only gate which papers get a full detail block on the per-day digest page.
 
-**Milestone override:** papers in [`seeds.yaml`](seeds.yaml) under `category: trending` (vLLM, FlashAttention v1/v2/v3, EAGLE / Medusa / Lookahead, SGLang) get force-routed to the `trending` bucket — bypassing any LLM `hard_gate` — when HF trending rank ≤ 20 OR `code_meta.stars` ≥ 5000. Lets landmark serving / attention / spec-decoding papers surface even though they're "no new compression algorithm." See [`pipeline/filter.py`](pipeline/filter.py).
+**Milestone override:** papers in [`seeds.yaml`](seeds.yaml) under `category: trending` (vLLM, FlashAttention v1/v2/v3, EAGLE / Medusa / Lookahead, SGLang) get force-routed to the `trending` bucket — bypassing any LLM `hard_gate` — when HF trending rank ≤ 20 OR `code_meta.stars` ≥ 5000. Lets landmark serving / attention / spec-decoding papers surface even though they're "no new compression algorithm." A 14-day cooldown (`MILESTONE_COOLDOWN_DAYS`) suppresses the same milestone paper from re-surfacing day after day while it's stuck near the top of HF trending. See [`pipeline/filter.py`](pipeline/filter.py).
 
 **Watched authors:** `sources.arxiv_authors.authors` in [`config.yaml`](config.yaml) (Dan Alistarh / IST Austria, Song Han / MIT HAN Lab, Qualcomm AI Research) gets a dedicated **👤 Watched authors** block on each detail page that bypasses caps and shows *all* of their papers. The compact table still applies `hard_gate`, so off-topic watched-author work stays detail-page-only.
 

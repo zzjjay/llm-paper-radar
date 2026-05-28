@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,6 +20,10 @@ from sources.base import Paper
 # bypasses any LLM hard_gate verdict when EITHER heat signal fires.
 MILESTONE_TRENDING_RANK_MAX = 20
 MILESTONE_STARS_MIN = 5000
+# Don't re-surface the same milestone paper if it already surfaced within
+# this many days. Without a cooldown a perennially hot paper (vLLM, FlashAttn)
+# would appear in the daily digest every day it's on HF trending.
+MILESTONE_COOLDOWN_DAYS = 14
 
 
 @lru_cache(maxsize=1)
@@ -45,13 +50,56 @@ def _milestone_trending_ids() -> frozenset[str]:
     return frozenset(out)
 
 
-def _milestone_override(paper: Paper) -> dict | None:
+def _recently_surfaced_milestones(
+    scored_root: Path,
+    target_date: date,
+    cooldown_days: int,
+) -> frozenset[str]:
+    """IDs of milestone-trending papers that already surfaced (passed hard_gate
+    in the trending bucket) within the prior `cooldown_days` days strictly
+    before `target_date`. Used to suppress repeat overrides so a perennially
+    hot paper doesn't appear day after day."""
+    if cooldown_days <= 0:
+        return frozenset()
+    milestone_ids = _milestone_trending_ids()
+    if not milestone_ids:
+        return frozenset()
+    seen: set[str] = set()
+    for delta in range(1, cooldown_days + 1):
+        prev = target_date - timedelta(days=delta)
+        p = scored_root / f"{prev.strftime('%Y-%m-%d')}.json"
+        if not p.exists():
+            continue
+        try:
+            entries = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            aid = (e.get("id") or "").split(":")[-1]
+            if aid not in milestone_ids:
+                continue
+            br = e.get("relevance_breakdown") or {}
+            if br.get("topic_bucket") == "trending" and br.get("hard_gate") is False:
+                seen.add(aid)
+    return frozenset(seen)
+
+
+def _milestone_override(
+    paper: Paper, cooldown_ids: frozenset[str] = frozenset()
+) -> dict | None:
     """If the paper is on the milestone-trending whitelist AND meets either
     heat threshold (HF trending rank ≤ 20, or code_meta.stars ≥ 5000),
     return a breakdown dict that bypasses the LLM verdict and routes the
-    paper to the `trending` bucket. Otherwise return None."""
+    paper to the `trending` bucket. Otherwise return None.
+
+    `cooldown_ids` are milestone IDs that surfaced recently and should be
+    suppressed regardless of current heat — see `_recently_surfaced_milestones`."""
     arxiv_id = paper.id.split(":")[-1]
     if arxiv_id not in _milestone_trending_ids():
+        return None
+    if arxiv_id in cooldown_ids:
         return None
     has_hot_trending = any(
         s.name == "hf_daily"
@@ -206,6 +254,7 @@ async def _score_one(
     client: LLMClient,
     sem: asyncio.Semaphore,
     prefilter_cfg: PrefilterConfig,
+    cooldown_ids: frozenset[str] = frozenset(),
 ) -> Paper:
     # Skip stub papers (e.g. hf_daily trending-only entries with no metadata).
     # Without a title or abstract there is nothing for the LLM to assess.
@@ -255,7 +304,7 @@ async def _score_one(
     # HF heat or GitHub stars get routed to `trending` regardless of what
     # the LLM said. The LLM doesn't see heat signals so it can't make this
     # decision; the override is deterministic and easy to audit.
-    override = _milestone_override(paper)
+    override = _milestone_override(paper, cooldown_ids)
     if override is not None:
         paper.relevance_score = _composite(override)
         paper.relevance_reason = override["reason"]
@@ -270,6 +319,7 @@ async def filter_papers(
     client: LLMClient,
     concurrency: int = 50,
     prefilter_cfg: PrefilterConfig | None = None,
+    cooldown_days: int = MILESTONE_COOLDOWN_DAYS,
 ) -> int:
     raw = await asyncio.to_thread(Path(deduped_path).read_text)
     papers = [Paper.model_validate(p) for p in json.loads(raw)]
@@ -277,8 +327,16 @@ async def filter_papers(
     sem = asyncio.Semaphore(concurrency)
     if prefilter_cfg is None:
         prefilter_cfg = PrefilterConfig(enabled=False)
+    # Derive target date from out filename so caller doesn't have to pass it.
+    try:
+        target_date = date.fromisoformat(Path(out_path).stem)
+        cooldown_ids = _recently_surfaced_milestones(
+            Path(out_path).parent, target_date, cooldown_days
+        )
+    except ValueError:
+        cooldown_ids = frozenset()
     scored = await asyncio.gather(
-        *[_score_one(p, prompt, client, sem, prefilter_cfg) for p in papers]
+        *[_score_one(p, prompt, client, sem, prefilter_cfg, cooldown_ids) for p in papers]
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = json.dumps([p.model_dump(mode="json") for p in scored], indent=2)
