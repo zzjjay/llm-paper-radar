@@ -85,7 +85,8 @@ llm-paper-radar/
 │   └── seen.json            # cross-day dedup set, committed
 ├── digests/YYYY-MM-DD.md           # permanent, committed
 ├── weekly/YYYYMMDD-YYYYMMDD.md     # permanent, committed (full table, every gated paper)
-├── snapshots/YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot, committed
+├── snapshots/YYYYMMDD.md                 # single-day per-run paper-list snapshot
+├── snapshots/YYYYMMDD-YYYYMMDD-Ndays.md  # multi-day rollup snapshot, committed
 ├── README.md                       # always = latest digest
 ├── INDEX.md
 ├── pyproject.toml           # uv-managed
@@ -611,7 +612,7 @@ seeds:
 |------|-----------|-----------|
 | `digests/YYYY-MM-DD.md` | permanent | yes |
 | `weekly/YYYYMMDD-YYYYMMDD.md` | permanent | yes |
-| `snapshots/YYYYMMDD-YYYYMMDD-Ndays.md` | permanent | yes |
+| `snapshots/YYYYMMDD.md` (single-day) / `snapshots/YYYYMMDD-YYYYMMDD-Ndays.md` (multi-day) | permanent | yes |
 | `README.md` | always overwritten with latest | yes |
 | `INDEX.md` | permanent (grows over time) | yes |
 | `data/seen.json` | permanent (~50KB/year) | yes |

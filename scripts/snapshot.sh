@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Save the current README paper list to snapshots/<start>-<end>-<N>days.md.
+# Save the current README paper list to snapshots/.
 # Called from daily.sh after render; can also be run manually any time
 # to capture the current state of the working tree.
 #
@@ -8,7 +8,8 @@
 #   LABEL=rescreen ./scripts/snapshot.sh   # appended before .md
 #
 # Output:
-#   snapshots/<YYYYMMDD>-<YYYYMMDD>-<N>days[-<label>].md
+#   snapshots/<YYYYMMDD>[-<label>].md                          # single-day window
+#   snapshots/<YYYYMMDD>-<YYYYMMDD>-<N>days[-<label>].md       # multi-day window
 #     - top: window line + scanned/surfaced line + git sha + snapshot ts
 #     - body: the LATEST_START..LATEST_END block of README
 
@@ -65,7 +66,11 @@ START_EPOCH="$(date -u -d "$START_DASH" +%s)"
 END_EPOCH="$(date -u -d "$END_DASH" +%s)"
 N=$(( (END_EPOCH - START_EPOCH) / 86400 + 1 ))
 
-NAME="${START}-${END}-${N}days"
+if [[ "$N" -eq 1 ]]; then
+    NAME="${START}"
+else
+    NAME="${START}-${END}-${N}days"
+fi
 [[ -n "${LABEL:-}" ]] && NAME="${NAME}-${LABEL}"
 
 mkdir -p snapshots

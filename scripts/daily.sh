@@ -187,7 +187,8 @@ run_step "translate_paper_river" uv run python scripts/translate_paper_river.py 
 
 run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || exit 7
 
-# Snapshot the rendered paper list into snapshots/<start>-<end>-<N>days.md
+# Snapshot the rendered paper list into snapshots/ (single-day: <YYYYMMDD>.md;
+# multi-day: <start>-<end>-<N>days.md)
 # so each run leaves a browsable record (git history is preserve-only;
 # this gives a side-by-side comparison surface without `git show` games).
 DAYS="${DAYS}" run_step "snapshot" ./scripts/snapshot.sh || echo "  (snapshot failed, continuing)"

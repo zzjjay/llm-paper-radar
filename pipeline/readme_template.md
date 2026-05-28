@@ -230,7 +230,8 @@ llm-paper-radar/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
 ├── snapshots/
-│   └── YYYYMMDD-YYYYMMDD-Ndays.md  # per-run paper-list snapshot for tracking history
+│   ├── YYYYMMDD.md                 # single-day per-run paper-list snapshot
+│   └── YYYYMMDD-YYYYMMDD-Ndays.md  # multi-day rollup snapshot
 ├── paper-river/                 # ljg-paper-river deep-lineage analyses (see Pipeline)
 │   ├── <acronym>-<arxiv-id>.org # zh; render auto-links if present
 │   └── <acronym>-<arxiv-id>_en.org  # en sibling; auto-translated by daily.sh
