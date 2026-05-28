@@ -87,7 +87,13 @@ GIT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     [[ -n "$WINDOW_LINE"  ]] && echo "$WINDOW_LINE"
     [[ -n "$SCANNED_LINE" ]] && echo "$SCANNED_LINE"
     echo
-    awk '/<!-- LATEST_START -->/{flag=1} flag; /<!-- LATEST_END -->/{flag=0}' README.md
+    # README links are written relative to repo root (digests/, INDEX.md,
+    # config.yaml). Snapshots live in snapshots/, so rewrite to ../ so they
+    # resolve correctly from the snapshot file.
+    awk '/<!-- LATEST_START -->/{flag=1} flag; /<!-- LATEST_END -->/{flag=0}' README.md \
+        | sed -e 's|](digests/|](../digests/|g' \
+              -e 's|](INDEX.md)|](../INDEX.md)|g' \
+              -e 's|](config.yaml)|](../config.yaml)|g'
 } > "$OUT"
 
 echo "snapshot → $OUT"
