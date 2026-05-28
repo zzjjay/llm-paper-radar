@@ -370,3 +370,5 @@
 - [05-25](digests/2026-05-25.md) — 348 scanned, 8 passed, top: JacQuant: STE-Free Quantization-Aware Training via
 
 - [05-26](digests/2026-05-26.md) — 339 scanned, 5 passed, top: ThriftAttention: Selective Mixed Precision for Lon
+
+- [05-27](digests/2026-05-27.md) — 394 scanned, 5 passed, top: Pruning and Distilling Mixture-of-Experts into Den

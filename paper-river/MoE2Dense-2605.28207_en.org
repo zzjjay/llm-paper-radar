@@ -1,0 +1,265 @@
+#+title:      Pruning and Distilling Mixture-of-Experts into Dense Language Models
+#+date:       [2026-05-28 Thu 00:30]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T003035-en
+#+source:     https://arxiv.org/abs/2605.28207
+#+authors:    Junhyuck Kim, Jihun Yun, Haechan Kim, Gyeongman Kim, Joonghyuk Bae, Jaewoong Cho (KRAFTON; KAIST)
+#+venue:      arXiv preprint, 2026-05-27
+
+* The Problem River
+
+A straightforward question: the most capable large models today almost all use the *Mixture-of-Experts* (MoE) architecture — hundreds of billions of parameters in total, yet only a small subset of experts is activated per token. That sounds efficient, until you try to deploy one on a single 24 GB GPU, a laptop, or a phone: *even though you activate only a few experts, all expert weights must first fit into memory at once*. Qwen3-30B-A3B computes only 3B parameters per token, but you still need 30B of memory before the first token can run.
+
+Everyone working on this problem over the past three years has been doing the same thing: *slimming down MoE experts*. Early on: can we drop unimportant experts? Later: can we merge similar experts into one? Later still: can we prune more precisely by scoring experts on "gate × activation"?
+
+But every one of these approaches shares the same hidden ailment: *the output is still a MoE after you finish*. Experts go from 128 to 32, fine — but you still have to load all 32 into memory. *The MoE memory bill never goes away.*
+
+This paper is the first to truly cut to the root: not reducing experts, but *reshaping the entire MoE into a standard dense FFN*. This river turns 90 degrees for the first time.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: Want model capacity to explode, but dense scaling = enormous cost
+  | Solution: Put thousands of experts per layer; each token routes to top-k
+  | New pitfall: Unstable training, load imbalance, hard-to-tune routing
+  v
+[2022] Fedus et al. - Switch Transformer
+  |
+  | Problem: top-k routing is too complex — hard to train and scale
+  | Solution: Go top-1; each token visits exactly one expert
+  | New pitfall: Models reach trillion-scale parameters;
+  |              *all experts must permanently reside in memory*
+  v
+[2024] Li et al. - MC-SMoE
+  |
+  | Problem: Trained MoEs contain many redundant experts; dropping them hurts quality
+  | Solution: Cluster experts by routing similarity; merge each cluster into one expert
+  | New pitfall: Output is still MoE; routing similarity may not be the best signal
+  v
+[2025] Lasby et al. - REAP
+  |
+  | Problem: Routing similarity only captures scheduling, not true output contribution
+  | Solution: Score experts by *gate value × activation magnitude*;
+  |           prune low-scorers directly without merging
+  | New pitfall: Output is still MoE; independent ranking allows duplicate selection
+  v
+[2026] Kim et al. - MoE2Dense  <-- this paper
+       Problem: Even 32 experts still need full memory; "small MoE" doesn't cure MoE
+       Solution: Select diverse experts via D-Optimal log-det,
+                 *concatenate them into one dense FFN*
+                 + knowledge distillation from MoE teacher to recover accuracy
+       Result: +6.3 pp over dense-to-dense baseline (Minitron); 1.6× faster training
+
+       (Side branch: [2024] Muralidharan et al. - Minitron
+        Dense large model → prune → distill into dense small model;
+        the most direct comparison baseline in this paper)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al. (Sparsely-Gated MoE): Decoupling Model Capacity from Compute Cost
+
+*** What Problem Did It See?
+
+The bottleneck of deep learning in 2017 was blunt: bigger models work better, but training costs scale quadratically or cubically. If you want a 100B-parameter model, you must spend 100B-parameter worth of compute to train and run it. Nobody wanted that bill.
+
+*** Its Solution
+
+Shazeer proposed a deeply counter-intuitive idea: *make the model very "wide," but use only a small slice of it per input*.
+
+Split one FFN layer into 1,000 parallel "expert" sub-FFNs and add a "router" — the router decides which 2 experts to call for each input. Result: total parameters scale 1000×, but actual compute per token scales only 2×. Capacity explodes; the bill barely rises.
+
+This is *Sparsely-Gated MoE*.
+
+*** Why It Worked (and What Pitfalls It Buried)
+
+It decoupled "how large the model is" from "how much compute one forward pass costs" — previously these were locked together; now they were free.
+
+But the pitfalls were many: the router preferred to be lazy and route all tokens to the same expert; load imbalance caused training to collapse; experts failed to specialize and ended up looking identical. The idea did not catch fire, because it was too hard to tame.
+
+** 2022 | Fedus et al. (Switch Transformer): Simplify to the Extreme Before It Can Run
+
+*** What Problem Did It See?
+
+Shazeer's MoE spent the years from 2017 to 2021 as a "theoretically beautiful, practically painful" toy. The pain concentrated in top-k routing: finding the top-k experts per token, forming soft combinations, balancing load — a pile of mechanisms that incurred enormous communication costs in distributed training.
+
+*** Its Solution
+
+The Fedus team (Google) made a bold move: *cut k down to 1*. Each token visits exactly one expert, with no combination at all.
+
+That sounds crude, but the engineering benefits were revolutionary: routing becomes a simple argmax; inter-expert communication reduces to a plain routing table; load balancing needs only a lightweight auxiliary loss. With this, they scaled MoE to 1.6 trillion parameters (T5-scale), at a training cost equivalent to a 220B dense model.
+
+*** Why It Worked (and What Pitfalls It Buried)
+
+It proved MoE was not just a theoretical toy but a genuine engineering vehicle capable of absorbing a trillion parameters. From that point on, DeepSeek, Qwen, Mixtral, and GPT open-source models all adopted MoE as their backbone.
+
+But the *new pitfall* was invisible and would take years to be noticed: once you train a MoE with 100B–300B total parameters but only 3B–5B activated per token, it *looks* like a 3B small model — but when you *deploy* it, you must load the full 100B into memory before any computation can start. In multi-GPU data center environments this is fine; but when people want to move models to a single GPU, a laptop, an in-car unit, or a phone, it becomes an unavoidable hard wall.
+
+** 2024 | Li et al. (MC-SMoE): The First Attempt to Put MoE on a Diet
+
+*** What Problem Did It See?
+
+By 2023–2024 a large number of MoE models had been open-sourced. Researchers examined them and found: *out of 128 experts, maybe only 30–40 are genuinely useful* — many experts have nearly identical activation distributions and are pure redundancy.
+
+The most naïve diet: just delete low-frequency experts. But that hard-removes whatever knowledge they carried, and downstream accuracy drops badly.
+
+*** Its Solution
+
+MC-SMoE's idea is *merge, don't delete*.
+
+Specifically: identify the most frequently activated experts as anchor "centers"; assign the remaining experts to the nearest center using *routing-logit similarity*; take a weighted average of all experts within each cluster to form a new merged expert. 128 experts collapse to 32 this way.
+
+*** Why It Worked (and What Pitfalls It Buried)
+
+The intuition is: merging is "gentler" than deleting — you are not discarding knowledge, you are compressing similar knowledge together, theoretically losing less information.
+
+But two new pitfalls appeared:
+1. *The output is still a MoE.* Going from 128 to 32 looks like a 75% reduction, but deployment still requires loading all 32 into memory — the fundamental tension of MoE is unresolved.
+2. *Using routing similarity to judge expert similarity may pick the wrong signal.* Routing similarity only tells you "these experts are likely to be dispatched together," not "these experts produce similar outputs." REAP would later target exactly this point.
+
+** 2025 | Lasby et al. (REAP): Scoring by True Output Contribution
+
+*** What Problem Did It See?
+
+The REAP team looked at MC-SMoE-style merging methods and asked a sharp question: *are you using the right signal for clustering?*
+
+Router logits reflect "scheduling strategy" — they tell you the probability that an expert is called. But what an expert *actually contributes to the output* after being called is its activation values × gate weights, which is a completely different thing from "the probability of being called." A low-frequency expert that fires with full force every time it appears may be ten times more important than a high-frequency expert that barely does anything.
+
+*** Its Solution
+
+REAP (Router-weighted Expert Activation Pruning) switches to a more direct score: *gate weight × activation norm*.
+
+That is: compute each expert's "actual output energy" on calibration data, rank by this score, and prune low-scorers directly. No merging — because merging itself introduces approximation error, and REAP argues that for experts with significant importance differences, pure pruning is superior to merging.
+
+*** Why It Worked (and What Pitfalls It Buried)
+
+It upgrades the scoring from "routing signal" to "actual contribution" — roughly like switching from "who got called on" to "who actually spoke." REAP outperformed merging methods on multiple MoE models at the time.
+
+But REAP left two pitfalls:
+1. *Scoring is independent.* Each expert gets its own score, then they are sorted and the top-K are selected. The problem: if the three highest-scoring experts are all doing the same thing, selecting them is equivalent to selecting one — sheer waste. This is the classic flaw of *"independent ranking fails to capture diversity."*
+2. *The output is still a MoE.* This is the issue nobody on this entire river articulated: after pruning, it is still a MoE, still requiring everything in memory. Everyone implicitly assumed "MoE must preserve its routing structure" — until MoE2Dense came along and said it didn't have to.
+
+** 2026 | Kim et al. (MoE2Dense): Flattening the Entire MoE into a Dense Model
+
+*** What Problem Did It See?
+
+The MoE2Dense authors laid every prior method on the table and asked two questions:
+
+First: *What problem are you actually solving?* If the goal is "runnable on memory-constrained devices," what good does reducing to 32 experts do? The total parameter count of those 32 experts is whatever it is; the deployment threshold has not moved. This entire line of work was collectively doing something that "looks like compression but fundamentally does not resolve the deployment pain point."
+
+Second: *Why do independently ranked experts turn out to be duplicates?* Because the most important experts often do similar things (e.g., they all handle high-frequency tokens, or they all handle code). Independent top-K just hands you K "champions" that may all belong to the same competition, highly overlapping with each other.
+
+*** Its Solution
+
+MoE2Dense cuts to the root and gives two entirely new answers:
+
+*1. Stop producing MoEs — produce a dense model directly.*
+
+*Concatenate* the K selected experts from a MoE layer along the intermediate dimension into a standard dense FFN — the gate/up/down matrices of the experts are joined end-to-end, instantly becoming one wide FFN with no router, no top-k, no sparsity whatsoever. The original MoE model then acts as teacher in a knowledge-distillation step to let the dense student recover accuracy.
+
+Why does this work? Because for a MoE layer, "K experts compute separately and their outputs are weighted-summed" and "one wide FFN computes once" are nearly mathematically equivalent — provided you select the right K experts and handle the projection scales properly.
+
+*2. Score for diversity, not just individual importance.*
+
+Use REAP's "activation × gate" as each expert's quality score, but when selecting top-K, abandon independent ranking — instead apply a classical method from *D-Optimal experimental design*: construct an importance-weighted Gram matrix of expert outputs, then greedily select the K experts that *maximize the log-determinant* of this matrix.
+
+Intuition: log-det simultaneously rewards "individually important" and "collectively non-overlapping." If candidate experts have similar output directions (collinear), the matrix approaches singularity, log-det tends toward negative infinity, and the selection is automatically penalized. This mechanism naturally prevents REAP's failure mode of "selecting K champions that all compete in the same event." The authors call this scoring scheme *DO-ACP* (D-Optimal + Activation-weighted Conditional Probability).
+
+*** Why It Worked (and What Pitfalls It Left)
+
+It completes two paradigm shifts for the entire river:
+
+- *Output shifts from MoE to Dense.* The final model can be run directly by any standard inference engine (vLLM, llama.cpp, ONNX) without MoE routing support and without loading all experts into memory. Qwen3-30B-A3B (30B total / 3B activated) becomes a genuine 3B dense model — memory footprint cut from 30B to 3B.
+- *Scoring shifts from "individually important" to "collectively diverse."* This is an upgrade from "greedy top-K" to "combinatorial optimization." Across 350 experiments, DO-ACP beats all baselines on all three models (Qwen3-30B-A3B / DeepSeek-V2-Lite / GPT-OSS-20B), outperforming the second-best method by 5.7 pp.
+
+The most striking comparison: taking Qwen3-32B (dense 32B) and applying dense-to-dense pruning (Minitron method) to obtain a 3B dense student, versus MoE2Dense flattening Qwen3-30B-A3B into a 3B dense student — under the same 4B-token distillation budget, *MoE2Dense wins by 6.3 pp and trains 1.6× faster*. This proves that a MoE teacher is a better source for producing a dense student than a dense teacher is — because the MoE teacher already "composes" a large number of sub-modules internally, so the selected subset starts from a much better initialization.
+
+*New pitfalls*: MoE2Dense only resolves "intra-layer" expert selection and does not touch "inter-layer" structure — all layers are treated equally. But in practice, redundancy in shallow versus deep layers may differ substantially. This is an obvious direction for future work. Also, the distillation budget (4B tokens), while not enormous, is not negligible either, and remains a barrier for truly resource-constrained downstream users.
+
+* Frontier Extensions
+
+This paper was posted on 2026-05-27 and has no formal follow-up citations yet. But we can already see several *contemporaneous* parallel attempts that form the current fan-out of this river:
+
+- *Dense2MoE* (Li et al., 2026-05-26): Goes in the opposite direction — upgrading dense large models into MoE for edge deployment. It appeared almost the same week as MoE2Dense, forming a symmetric pair of "bidirectional transformation." This signals that the river's question has shifted from "whether to use MoE" to "how to freely transform between MoE and Dense."
+- *SlimMoE* (Li et al., 2025b): Leaves the expert count unchanged, instead progressively pruning neurons *inside* each expert. Complementary to MoE2Dense and stackable.
+- *EMO* (Wang et al., 2026): Introduces modularization guidance into the training phase itself, making subsequent pruning/flattening easier. This is the "treat the root cause" route — all prior methods treat the symptom.
+
+Predictable next steps:
+1. *Layer-heterogeneous* MoE→Dense (different K values for shallow versus deep layers)
+2. *End-to-end joint* selection-distillation (eliminating the two-stage separation)
+3. *Task-aware* expert selection (different downstream tasks select different subsets)
+
+* One Figure to Understand It All
+
+#+begin_example
+                     The "Diet History" of MoE Models
+
+Timeline →  2017          2022           2024            2025            2026
+Approach
+            |             |              |               |               |
+Paradigm   Sparsely-     Switch         MC-SMoE         REAP            MoE2Dense
+           Gated MoE     Transformer    "Merge"         "Better pruning" "Flatten entirely"
+            ▲             ▲              ▲               ▲               ▲
+            |             |              |               |               |
+Core        1k experts    top-1 routing  Cluster-merge   gate×activation  D-Optimal
+mechanism   per layer,    simplified     by routing      independent      log-det
+            sparse top-k  (T-scale)      similarity      ranking prune   -> 1 dense FFN
+            routing                      -> 32 experts   -> 32 experts
+            |             |              |               |               |
+Output      MoE           MoE            MoE             MoE             Dense   <<
+form        (n experts)   (n experts)    (fewer experts) (fewer experts) (concat into FFN)
+            |             |              |               |               |
+What it     Decouple      Engineeringly  First MoE diet  More accurate   Break the implicit
+solved      capacity &    scalable       (merging)       scoring         assumption that MoE
+            compute                                      (true contrib.) must produce MoE
+            |             |              |               |               |
+Pitfalls    Unstable      All experts    Output still    Output still    Inter-layer not
+            training,     must reside    MoE; routing    MoE; indep.     optimized; distil-
+            load imbal.   in memory      signal noisy    ranking picks   lation still needs
+                                                         duplicates      4B tokens
+
+Side branch: [2024] Minitron  Dense -> prune -> distill -> Dense
+                               <- most direct comparison baseline in this paper
+                               MoE2Dense beats it by 6.3 pp, at 1.6x training speed
+
+         The pivotal turning point is 2026: people finally realized that
+         "fewer experts" and "deployable" are not the same thing.
+         => MoE must be fully reshaped into Dense to truly lower the deployment barrier.
+#+end_example
+
+* Insights
+
+After reading the full river, what stands out most is not any specific technique — it is *the moment an unspoken assumption finally gets challenged*:
+
+From 2017 to 2025, everyone implicitly assumed *"a MoE goes in, a MoE comes out"* — you compress, merge, or prune, and the result is still a MoE. This was an invisible constraint that nobody stated aloud but everyone obeyed.
+
+MoE2Dense's real contribution is not the algorithm (D-Optimal log-det dates to 1978) — it is *surfacing that hidden constraint and asking out loud: why must the output be a MoE?* Once you dare to ask that question, the answer is obvious: concatenate the K selected experts along the intermediate dimension, and you naturally get a standard dense FFN.
+
+This is the canonical shape of a paradigm shift: technically it is often not complicated; the hard part is *noticing the assumption that everyone shares but nobody names*.
+
+A deeper insight: *MoE is an advantage at training time and a burden at deployment time.*
+- Training: sparse activation = learn 30B-capacity knowledge at 3B compute cost → worthwhile
+- Deployment: all experts must reside in memory = 30B deployment threshold → not worthwhile
+
+The most natural solution is therefore: *train with MoE, deploy as Dense*. MoE2Dense makes this "two-phase, two-form" approach a reality. Once this way of thinking is open, a wave of "train-deploy form transformation" work is foreseeable — treating MoE as a "compressed knowledge carrier" and Dense as a "deployment execution container."
+
+Where next? Two bets:
+1. *"Decouple train-form from deploy-form" becomes the new paradigm*: all large models are trained as MoE, then compressed into Dense of varying sizes (cloud / edge / mobile) depending on deployment target. MoE is no longer a "deployment form" but a "training form."
+2. *Expert selection gets internalized into MoE training*: future MoE training losses will automatically include "diversity + flattenability" regularization, producing models that are "easily flattenable by nature" from birth, eliminating the need to run D-Optimal selection afterward.
+
+* Takeaways
+
+This river offers three unusually clear reminders about how to find good problems:
+
+1. *Fix your gaze on the user's true pain point — don't be fooled by intermediate metrics.* The entire river spent eight years optimizing "number of experts," but what users actually care about is "deployment memory" — and under the "reduce MoE experts" paradigm these two metrics are decoupled. MoE2Dense re-aligns them. Take-away: the next time you do "compression" work, first ask *"Does the quantity I am compressing actually correspond to what hurts the user?"*
+
+2. *Unspoken assumptions are the richest gold mine.* "The output must be a MoE" — the kind of assumption nobody articulates but everyone obeys — is often the entry point to the next strong paper. Take-away: when reading a field, keep a dedicated page listing *"everything everyone here takes for granted,"* then challenge them one by one.
+
+3. *Powerful solutions are usually assemblies, not inventions.* MoE2Dense invented nothing: D-Optimal comes from 1978, log-det from 1970s experimental design, knowledge distillation from 2015, expert concatenation from engineering common sense. Its innovation lies in *assembling known components toward a new objective*. Take-away: your next contribution is probably not "build a new wheel" but "mount someone else's existing wheel onto a vehicle nobody thought of."
+
+This means you can:
+- Find a research direction that "appears to be doing X but in fact never solves Y," and realign the objective
+- List the implicit assumptions shared by everyone in that direction, and challenge the most expensive one
+- Reassemble existing classical tools (no new invention needed) around this new objective — often one clean strike is enough

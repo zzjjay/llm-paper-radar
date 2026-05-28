@@ -1,0 +1,334 @@
+#+title:      PrunePath: Towards Highly Structured Sparse Language Models
+#+date:       [2026-05-28 Thu 00:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T003342-en
+#+source:     https://arxiv.org/abs/2605.28283
+#+authors:    Zhexuan Gu, Zixun Fu, Yancheng Yuan
+#+venue:      arXiv preprint, 2026-05-27 (cs.CL)
+
+* The Problem River
+
+In a language model, the heaviest component is not the attention layers — it is the two feed-forward (FFN) layers sandwiched in between. They consume two-thirds of the parameters and dominate the compute cost of nearly every inference call.
+The central question is: *Can we cut the FFN down to a fraction of its original size while keeping answer quality intact — and actually run faster and use less memory on real GPUs?*
+
+This is hard precisely because "cutting" and "speeding up" have never been the same thing.
+You can zero out 90% of the weights (making the model extremely sparse), but GPUs compute over dense, regular matrix blocks — sparsity does not mean skipping.
+Zeros scattered at random positions actually add detours on hardware.
+The thirty-year history of this field is a back-and-forth tug-of-war between "how thin can we cut" and "how fast can we actually run."
+
+* The Source Map
+
+#+begin_example
+[1989] LeCun et al. - Optimal Brain Damage (OBD)
+  |
+  | Problem: Neural networks are clearly over-parameterized, but which weights to delete?
+  | Solution: Score weights by second-order curvature (Hessian diagonal); delete the least influential
+  v
+[2015/16] Han et al. - Deep Compression / Magnitude Pruning
+  |
+  | Problem: OBD's Hessian is intractable at AlexNet/VGG scale
+  | Solution: Simply prune by |weight| magnitude, then retrain to recover accuracy
+  v
+[2021] Mishra et al. - N:M Structured Sparsity   [2023] Frantar/Alistarh - SparseGPT
+  |                                                |    [2024] Sun et al. - Wanda
+  | Problem: Irregular zeros give no GPU speedup  | Problem: Retraining a 175B model is infeasible
+  | Solution: Force exactly N nonzeros per M      | Solution: Per-layer least-squares reconstruction /
+  |           weights; hardware-friendly pattern  |           score by activation magnitude, one-shot
+  |                                                |
+  +--------------------+---------------------------+
+                       |
+                       | Problem: Either hardware-friendly but too rigid, or clever but ignored by the GPU
+                       v
+[2022] Zhang et al. - MoEfication
+  |
+  | Problem: Can "sparsity" be structural from the start, rather than forced into shape afterward?
+  | Solution: Observe that FFN neurons fire in clusters; k-means splits them into E "experts"
+  |           At inference, each token activates only a few experts
+  v
+[2024] Zheng et al. - LTE (Learn-to-be-Efficient)
+  |
+  | Problem: MoEfication's router is hand-crafted heuristics — not flexible enough
+  | Solution: Train a sigmoid-gated router; activate any expert whose score exceeds a threshold
+  |
+  | Remaining flaw: Each expert scored independently, no concept of a "total budget."
+  |                 Low threshold → everything activates; high threshold → key experts missed
+  v
+[2026] Gu, Fu, Yuan - PrunePath  <-- target paper
+  |
+  | Solution: Replace independent sigmoids with a softmax probability distribution;
+  |           apply nucleus-sampling-style cumulative-probability cutoff;
+  |           one checkpoint, τ knob controls sparsity at inference time;
+  |           Triton kernel ships with it so sparsity actually saves memory
+  v
+[?] Next: Combine this with attention-side sparsity (H2O / Deja Vu)?
+          Native sparse training instead of post-hoc pruning?
+#+end_example
+
+* The Evolutionary Narrative
+
+The thread below runs from 1989 to 2026. The focus is not "what methods exist" but *what disease each generation diagnosed in its predecessor, what cure it invented, and what side effects that cure introduced.*
+
+** 1989 | OBD: Networks Are Obviously Fat — Teach Them to Be Lean
+
+*** What problem it saw
+
+LeCun was training handwritten-digit recognition networks — not enormous by later standards, but already perceptibly over-parameterized: deleting many weights changed almost nothing.
+The question was: *which ones?* Blind deletion could destroy a critical weight and collapse accuracy. At the time people pruned by intuition, with no principled basis.
+
+*** Its solution
+
+Borrow the second-order term of the Taylor expansion: the "curvature" of the loss with respect to each weight (the diagonal of the Hessian) tells you how much the loss would rise if that weight were pushed to zero. Delete the weights whose removal costs the least.
+This is *Optimal Brain Damage* — a darkly humorous name meaning "damage the brain optimally."
+
+*** Why it worked (and what new trouble it planted)
+
+It gave "importance" a mathematical definition for the first time, replacing intuition. But computing the second-order derivative requires the Hessian, which was manageable for small networks. Once networks exceeded millions of parameters after 2010, the Hessian exploded beyond memory.
+*The next generation would be forced to retreat: abandon second-order information and find a cheap proxy.*
+
+** 2015–2016 | Han et al. — Deep Compression: If Second-Order Is Too Expensive, Just Look at the Magnitude
+
+*** What problem it saw
+
+OBD was elegant but impractical. The Hessian of AlexNet or VGG was simply uncomputable. Han et al. wanted to slim down real large models and needed an approximation that could actually run.
+
+*** Its solution
+
+The most natural heuristic: *weights with small absolute values are probably unimportant.* Three steps:
+1. Train a dense network to convergence.
+2. Zero out every weight where |w| < threshold.
+3. Retrain to let the surviving weights compensate for the loss.
+
+Later additions of quantization and Huffman coding compressed AlexNet by 35×; the paper won ICLR Best Paper.
+
+*** Why it worked (and what new trouble it planted)
+
+Simple and effective. But it left a *still-unresolved* pain point:
+zeros are scattered randomly across the weight matrix. You might expect 90% sparsity to yield a 10× speedup. The GPU laughs. GPUs multiply dense matrix blocks; scattered zeros just mean detours — storage shrinks, compute does not.
+*This is the central contradiction that has been fought over from 2016 to the present: sparsity ≠ speedup.*
+
+** 2021–2024 | Two Diverging Paths: Hardware-Friendly vs. Algorithmically Optimal
+
+In the LLM era, this contradiction split into two mutually contemptuous lines of work:
+
+*** Branch One: N:M Structured Sparsity (Mishra et al. 2021)
+
+NVIDIA added hardware support in the Ampere architecture: *exactly N nonzeros are allowed in every M consecutive weights* (typically 2:4).
+The sparsity pattern is regular, so the GPU can genuinely skip zeros and double throughput.
+Cost: the rigid "keep 2 of every 4" rule is inflexible, and accuracy trails freely structured sparsity.
+
+*** Branch Two: SparseGPT (2023) + Wanda (2024) — One-Shot, No-Retrain LLM Pruning
+
+Retraining a 175B model costs an astronomical amount. Frantar and Alistarh applied OBS (an upgrade of OBD) to do per-layer least-squares reconstruction — one shot to 50% sparsity with minimal accuracy loss.
+Sun et al.'s Wanda went further: *importance = |weight| × |norm of the corresponding input activation|*.
+No equations to solve, no retraining needed; a 70B model can be pruned in minutes.
+
+*** What shared flaw both branches left behind
+
+Both approaches still ask "how do we put zeros in the weight matrix?" But the old problem persists: unstructured sparsity gives no hardware benefit; N:M structure is too rigid.
+Is there a third path? — not "create zeros in weight matrices" but *split the FFN from the start into chunks that can be skipped wholesale.*
+
+** 2022 | MoEfication: Don't Create Zeros — Create Blocks
+
+*** What problem it saw
+
+Zhang et al. noticed something: neurons in the FFN's intermediate layer *fire in clusters*.
+For inputs of the same type, the same group of neurons lights up while the rest stay dark.
+Why not physically separate them into groups? Then entire groups can be skipped — a granularity the GPU can genuinely exploit.
+
+*** Its solution
+
+Take the d_ff-dimensional intermediate layer of one FFN, partition it into E "experts" via k-means, each of width d_ff/E.
+Crucially, this partition is *exactly equivalent* — summing all experts reproduces the original dense FFN output precisely.
+Then train (or heuristically design) a router so each token activates only a few experts.
+The result: a dense FFN is retroactively converted into a MoE (Mixture of Experts).
+
+*** Why it worked (and what new trouble it planted)
+
+Expert-level granularity is naturally GPU-friendly — what you skip is an entire weight block, not scattered zeros.
+And it adapts per token: simple tokens use fewer experts, complex ones more.
+Production MoE systems like Mixtral and DeepSeek-V3 are industrial-scale realizations of this idea.
+
+Remaining flaw: *how do you train the router?* The original MoEfication used hand-crafted features and a simple classifier — not sensitive enough. A smarter trained router could push the efficiency–quality curve further.
+
+** 2024 | LTE: Give Each Expert Its Own Little Gate
+
+*** What problem it saw
+
+MoEfication's router was too blunt. How many experts should a token use? Which ones, and when?
+Heuristics cannot answer that. Zheng et al. wanted to solve this with *learning.*
+
+*** Its solution
+
+Attach a sigmoid gate to each expert:
+
+#+begin_example
+G_e(x) = sigmoid(w_e · x)    # each expert scored independently
+A(x) = { e | G_e(x) > δ }    # activate any expert whose score exceeds threshold δ
+#+end_example
+
+Two-phase training: first soft (all experts weighted by sigmoid, all active), then hard (threshold-based selection).
+An efficiency penalty encourages the router to learn sparse activation.
+
+*** Why it worked (and what new trouble it planted)
+
+The learned router is far more sensitive than hand-crafted heuristics and is the current state of the art across multiple benchmarks.
+But it has a *deep structural flaw* — each expert's score is *independent*, with no mutual constraint.
+Consequences:
+1. Adjusting threshold δ causes the number of active experts to swing wildly, making it hard to control.
+2. When you want only the top-2 most important experts, all 5 may exceed δ, causing *conservative over-activation.*
+3. Conversely, if you prune aggressively, a critical expert just below the threshold gets silently dropped.
+
+PrunePath's Figure 2 provides direct evidence: when only the top-k experts are retained, LTE's reconstruction error is noticeably larger than it should be.
+*Root cause: sigmoid has no concept of a "total budget."*
+
+** 2026 | PrunePath: Replace "Independent Scoring" with "Budget Allocation"
+
+*** What problem it saw
+
+PrunePath cuts to the point in one sentence: when you let E experts each vote independently, none of them knows how many should be open in total.
+What you actually want is not "scores above a threshold" but *"the few experts whose cumulative importance reaches 80%."*
+The latter carries a proper token-level total-budget semantic.
+
+*** Its solution
+
+Replace LTE's sigmoid with softmax, turning E expert scores into a probability distribution (summing to 1).
+Then borrow the mature *nucleus sampling (top-p)* idea from text generation:
+
+#+begin_example
+1. Sort softmax probabilities from largest to smallest
+2. Starting from the largest, accumulate until cumulative mass >= τ, then stop
+3. Those experts form the active set
+4. Always keep at least the top-1 expert (floor guarantee)
+#+end_example
+
+Mathematically clean:
+
+#+begin_example
+A_τ(x) = {π_1} ∪ { π_i | sum_{r=1..i} p_{π_r} < τ }
+#+end_example
+
+For output aggregation they retain sigmoid weighting (following LTE's blending strategy),
+but *which experts to select* has shifted from independent decisions to "allocation under a probability budget."
+
+Training introduces *progressive sparsity-path training*:
+τ is gradually reduced during training so the model simultaneously adapts to multiple sparsity levels within the same weight set.
+Result: one checkpoint, τ is a knob at inference time —
+turn it down to save memory, turn it up for quality, *no need to train a separate model per sparsity level.*
+
+Finally, they do something most algorithmic papers skip: they write a Triton kernel.
+In the autoregressive KV-cache decode setting, structural sparsity is *actually* translated into measurable peak-memory reduction and decoding speedup.
+
+*** Why it works (and what new trouble it plants)
+
+Three wins:
+1. *Budget semantics* — softmax + cumulative cutoff makes sparsity an interpretable, continuously adjustable quantity.
+2. *One checkpoint, many sparsity levels* — deployment headaches disappear.
+3. *End-to-end delivery* — the kernel ships with the paper, no reliance on "theoretical sparsity."
+
+Remaining open questions (targets for the next generation):
+- *How to coordinate with attention-side sparsity?* PrunePath only touches FFN; H2O and Deja Vu on the KV-cache side are a separate track.
+- *Why train dense first, then MoEfy?* Could you train into this soft-structured MoE form from scratch?
+- *Expert count E is fixed.* Dynamic expert widths may be the next frontier.
+
+* Frontier Extensions
+
+PrunePath was posted to arXiv on 2026-05-27; *there are currently no published follow-up works directly building on it.* It is the latest known station on this line.
+
+Several concurrent directions are worth placing alongside it, as they all gnaw at different parts of the same bone:
+
+- *Deja Vu* (Liu et al. 2023): "contextual sparsity" — also dynamically selects which FFN/Attention neurons to activate, but uses a small online predictor rather than a routing distribution. It is a *sister line* to PrunePath: the former uses a predictor, the latter uses a softmax budget.
+- *H2O* (Zhang et al. 2023): applies sparsity to the KV-cache by evicting low-importance historical tokens.
+- *DeepSeek-V3 / Mixtral*: industry has already deployed native sparse MoE, but both are *trained as MoE from the start* rather than retroactively converting a dense FFN.
+
+The most likely paper to appear in the next year: applying PrunePath's nucleus-sampling router *together with* H2O's KV sparsity to produce a full-stack sparse inference framework.
+
+* One Diagram
+
+#+begin_example
+                                                  |    The "Sparsity = Speedup" chasm
+                                                  |
+  Time / Evolution of approaches                  |
+  ============================================== | =================================
+                                                  |
+  1989  OBD            Second-order scoring,      |  Accurate, but intractable at scale
+                        prune weights             |
+                              |                   |
+  2016  Magnitude      |w| threshold, retrain     |  Practical, but GPU doesn't care
+                              |                   |
+  +--- Fork -----------------+---------+          |
+  |                                    |          |
+  2021 N:M Structured  2023 SparseGPT  2024 Wanda |  Hardware-friendly vs. algorithmically
+  (hardware 2:4)       (one-shot       (|w|·||a||)|  optimal — a genuine dilemma
+                        reconstruction)|          |
+                              |                   |
+                              v                   |
+  2022  MoEfication    New idea: don't make zeros,|  Whole-block skipping; GPU can truly save
+                       make "blocks";             |
+                       k-means splits FFN -> E    |
+                       experts                    |
+                              |                   |
+                              v                   |
+  2024  LTE            Train sigmoid router        |  Sensitive, but no "total budget"
+                       each expert scored         |  -> over-activation / dropped key experts
+                       independently             |
+                              |                   |
+                              v                   |
+  2026  PrunePath      softmax + nucleus cutoff    |  *Bridges the chasm*
+                       one checkpoint, τ tunes    |  Triton kernel delivers real speedup
+                       sparsity                   |
+                       +--- Triton kernel --------+
+                              |
+                              v
+  20XX  ???            FFN sparsity × KV sparsity full-stack synergy?
+                       Native sparse training instead of post-hoc pruning?
+#+end_example
+
+* Insights
+
+Reading through this lineage reveals three deep shifts, far more interesting than a surface-level "pruning technique iteration":
+
+*1. Importance metrics have become both cheaper and smarter*
+
+OBD (1989) used second-order Hessians → Magnitude (2016) used first-order absolute values → Wanda (2024) used |weight|×|activation|.
+This looks like regression (coarser approximation), but it is actually *incorporating the model's own runtime signal into the importance measure.*
+PrunePath goes further still: importance is no longer assigned to individual weights but to *experts* as probability mass,
+*using the shape of the entire distribution to determine the decision boundary.* From "score each item independently" to "allocate across the whole" — this is a paradigm shift.
+
+*2. The carrier of sparsity has moved from weights to structure*
+
+In the Han era, sparsity lived in *zeros within the weight matrix.*
+After MoEfication, sparsity lives in *whole paths through the computation graph.*
+This is the core paradigm shift: the question changes from "which number is zero?" to "which path do we take?"
+Path-level granularity is something hardware can naturally skip. This is what finally makes sparsity genuinely equal speedup.
+
+*3. Flexibility has moved from training time to inference time*
+
+Historically, wanting 50% and 70% sparsity meant training two checkpoints.
+PrunePath's progressive training plus the τ knob lets *a single set of weights support an entire sparsity curve.*
+The practical deployment value of this exceeds any benchmark numbers reported in the paper —
+it means sparsity can be adjusted *dynamically* in response to current load, power budget, or SLA.
+*Sparsity used to be a property; now it is an API.*
+
+The most likely next direction: extend this "inference-time adjustable" design philosophy to attention, KV cache, and even depth (layer dropping), turning an entire LLM into an object that sits on a continuous efficiency–quality curve with multiple adjustable knobs.
+
+* Takeaways
+
+*Sparsity is not the goal — structure is.*
+Thirty years of chasing "zeros in weights" were repeatedly rebuffed by hardware.
+What has actually shipped is always something designed *from the start so the hardware can skip entire blocks.*
+When doing acceleration research, first ask "does the sparsity I create mean anything to the hardware?" before writing any code.
+
+*"Independent decisions" almost always lose to "global budget."*
+LTE's per-expert sigmoid looks flexible — but without a token-level total constraint it inevitably drifts toward over- or under-activation.
+What PrunePath fixes is precisely that hole with softmax + nucleus cutoff.
+Whenever you find yourself doing "N independent scores + threshold," stop and ask whether you can instead use "a normalized distribution + a budget cutline."
+
+*Mature tools from one field are often the key to another.*
+Nucleus sampling appeared in text *generation* in 2019; seven years later it fits *expert routing* perfectly.
+Cross-domain analogy is a severely underrated research instrument.
+When you are stuck, ask yourself: does another subfield already have a solution to something with the same mathematical structure?
+
+*Algorithm + kernel shipped together is worth ten times either alone.*
+PrunePath is not just another sparse routing algorithm — it ships a Triton kernel that turns "theoretical sparsity" into measured memory reduction and wall-clock speedup.
+In systems and efficiency research today, if you do not write the kernel, you will persuade virtually no engineering team.
+*The Pareto frontier is pushed by code, not by LaTeX.*
