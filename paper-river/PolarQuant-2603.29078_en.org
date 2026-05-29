@@ -1,0 +1,502 @@
+#+title:      PolarQuant: Optimal Gaussian Weight Quantization via Hadamard Rotation for LLM Compression
+#+date:       [2026-05-28 Thu 18:50]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260528T185029-en
+#+source:     https://arxiv.org/abs/2603.29078
+#+authors:    Caio Vicentino
+#+venue:      arXiv preprint (2026-03, v1; v2 withdrawn 2026-04)
+
+* The River of the Problem
+
+Fitting a 9-billion-parameter model onto an ordinary laptop — FP16 demands 18 GB, but
+quantizing to 4 bit brings it down to just 5–6 GB. This has been a seven-year
+bottleneck: parameter values are not uniformly distributed, so the naive approach of
+"dividing the range into 16 buckets" always wastes slots. How do you represent a set of
+weights with fewer bits while the model barely notices the difference?
+
+Every generation fights the same monster — *outliers*. A handful of unusually large
+weights stretch the dynamic range wide, while the dense mass of small weights gets
+crammed into one or two coarse buckets. As long as the monster lives, quantization can
+only pile on algorithmic patches (GPTQ applies Hessian corrections; AWQ guards
+per-channel scales). Until someone asked: what if we twisted the distribution itself so
+the monster disappears?
+
+PolarQuant is a 2026 milestone on this "twist the distribution" route. Its story begins
+with GPTQ, seven years earlier.
+
+* Source Map
+
+#+begin_example
+[2023] GPTQ (Frantar et al.)
+   |
+   | Problem: calibration data + Hessian compensation, heavy engineering, no guarantees
+   | "Can we derive a worst-case bound from theory?"
+   v
+[2023] QuIP (Chee, Cai, Kuleshov, De Sa)
+   |
+   | Solution: multiply weights by a random orthogonal matrix before quantization
+   |           ("incoherence processing")
+   | Problem: a dense random orthogonal matrix is large and expensive;
+   |          2-bit quality still leaves something to be desired
+   v
+[2024] QuIP# (same group)
+   |
+   | Solution: replace random orthogonal with structured Walsh-Hadamard (RHT)
+   |           + E8 lattice codebook
+   | Problem: rotating weights alone is not enough — inference-time activations
+   |          and KV cache still teem with outliers
+   v
+[2024] QuaRot (Ashkboos et al.)
+   |
+   | Solution: elevate Hadamard rotation from "inside the weights"
+   |           to "the entire compute graph" —
+   |           rotate activations, KV cache, and hidden states
+   |           so outliers vanish mathematically
+   | Problem: requires graph surgery to absorb rotations into adjacent linear layers;
+   |          the KV-cache side could still be further optimised
+   v
+[2025] TurboQuant (Ashkboos et al.)
+   |
+   | Solution: decompose each KV vector in polar form — extract its length,
+   |           apply Hadamard rotation to the unit vector;
+   |           post-rotation coordinates ≈ Gaussian, then quantize with a
+   |           Gaussian-optimal codebook
+   |           (Lloyd-Max gives the MSE-optimal quantizer for a known distribution)
+   | Problem: this polar-quant pipeline is only applied to the KV cache;
+   |          nobody has done the same for weights
+   v
+[2026] PolarQuant (Vicentino) <<< target paper >>>
+   |
+   | Solution: port TurboQuant's polar quant to weights:
+   |           block-wise L2 normalisation -> Hadamard rotation -> Lloyd-Max Gaussian codebook
+   | Counter-intuitive finding: ablation shows Hadamard rotation alone accounts
+   |                            for 98 % of the improvement;
+   |                            the carefully derived Gaussian codebook contributes only 2 %
+   v
+[2026-04] Paper voluntarily withdrawn by the author: "Found some errors, I need to fix"
+#+end_example
+
+Side branches (contemporaneous / parallel):
+
+#+begin_example
+[1960] Max / [1982] Lloyd
+   ^   Lloyd-Max algorithm: derives the MSE-optimal scalar quantizer for a given distribution
+   |   (the mathematical bedrock on which the entire polar-quant idea rests)
+   |
+[2023] NF4 / QLoRA (Dettmers)
+   ^   Assumes weights are Gaussian; designs a quantile-spaced codebook
+   |   (the "assume Gaussian" school closest in spirit to PolarQuant)
+   |
+[2024] AWQ (Lin et al.) / [2025] SpinQuant (Liu et al.)
+   ^   Per-channel scaling / learned rotation matrices
+   |   (PolarQuant claims orthogonality with these; they can be combined)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | GPTQ: Correcting Quantization Error with Second-Order Information
+
+*** What Problem It Saw
+
+Before GPTQ, the mainstream approach to quantizing large models was absmax — find the
+largest absolute value in a group of weights, then linearly map the range onto integers
+such as {-8, …, 7}. The problem is that real weight distributions are approximately
+Gaussian: the vast majority of values cluster near zero, while a few outliers stretch
+the dynamic range enormously. The result is that 13 of the 16 quantization slots fall
+in empty air, 3 cover the dense region, and quantization error piles up precisely
+where it hurts most. Quantize a model to 4-bit this way, and perplexity simply
+collapses.
+
+*** Its Solution
+
+Work layer by layer. For each weight matrix, quantize columns left to right; after each
+column is quantized, use that layer's empirical Hessian (X^T X) to "spread" the
+quantization error introduced by that column back onto the columns not yet quantized,
+so they can pre-compensate. This idea is borrowed from "optimal brain surgeon": the
+mistakes you have already made can still be partly repaired by what comes later.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+It genuinely made 4-bit quantization practical — for the first time, INT4 large-model
+inference became a real option in the field. But the cost is heavy: you must collect
+calibration data (feed a small text corpus through the model), compute the Hessian, and
+invert it. The larger the model, the slower this gets. And — the point that mattered
+most to subsequent researchers — *this method carries no theoretical guarantees*. It
+works on most models, but you cannot predict when it will work; you have no idea how
+far it strays from the optimum at more aggressive bit-widths like 2-bit or 3-bit.
+
+The next question grows right out of that gap: can we derive a worst-case bound from
+information theory?
+
+** 2023 | QuIP: Scramble the Weights Before Quantizing
+
+*** What Problem It Saw
+
+GPTQ's problem is that "the outliers are still there; you just spread their damage
+algorithmically." QuIP's authors asked the opposite question: what if you could make
+the outliers *disappear* before quantization even starts?
+
+More precisely, the theoretical analysis of quantization error involves a quantity
+called "coherence" — a measure of how strongly the weights align with the eigenvectors
+of their corresponding Hessian. The stronger the alignment, the harder quantization
+is (many important directions carry large weight values). GPTQ never addresses this
+explicitly; it only corrects after the fact.
+
+*** Its Solution
+
+Multiply by a random orthogonal matrix on each side before and after quantization:
+first compute U W V, quantize it, then recover with U^T (·) V^T. The orthogonal
+transform leaves the model's output mathematically identical, but it "decouples"
+the weights from the Hessian — in expectation over random directions, coherence drops
+dramatically. This is called *incoherence processing*. Quantizing the resulting,
+"flatter" weights (QuIP uses lattice quantization) then yields provable worst-case
+error bounds — the first time such guarantees had been brought into LLM-scale
+quantization.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+The intuition: a random orthogonal matrix scatters any "spiky" distribution into
+something closer to isotropic. Important directions no longer concentrate on a few
+coordinates, so "no individual coordinate is very large," and quantization stops
+hurting.
+
+The pitfall: a dense random orthogonal matrix is large and expensive. A single
+4096×4096 layer already requires storing 16 M fp16 numbers. And at extreme bit-widths
+like 2-bit, simple scalar quantization is still insufficient.
+
+The next question: can we replace the expensive dense U with something structured and
+nearly free?
+
+** 2024 | QuIP#: Walsh-Hadamard Replaces Random Orthogonal, Plus a Lattice Codebook
+
+*** What Problem It Saw
+
+QuIP's random orthogonal matrix is mathematically beautiful but engineeringly heavy.
+Moreover, the scalar codebook QuIP uses at 2-bit is wasteful — representing each weight
+with only 4 levels means you must look for tighter codes at the vector level.
+
+*** Its Solution
+
+Two moves:
+1. Replace the random orthogonal with a *randomized Hadamard transform (RHT)* — the
+   Walsh-Hadamard matrix H_d is a ±1 matrix computable with bitwise operations, requiring
+   virtually zero storage and zero overhead. Flanking it with random ±1 diagonal
+   matrices (sign randomization) makes it statistically equivalent to a random
+   orthogonal matrix.
+2. Upgrade scalar quantization to *E8 lattice quantization* — pack 8 weights together
+   and find the nearest lattice point in the densest 8-dimensional lattice (E8).
+   Each weight averages 2-bit, but because an 8-dimensional codebook is far denser than
+   eight independent 2-bit codes combined, error drops noticeably.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+Hadamard is "the poor person's random orthogonal": it is cheap enough to be almost
+free, yet its theoretical properties (worst-case coherence bound) are nearly identical
+to those of a truly random orthogonal matrix. This is the crucial turning point where
+*mathematical elegance and engineering economy meet*.
+
+But QuIP#'s vision is still confined to the weights themselves. During inference,
+activation values have their own outliers — some channels are a hundred times larger
+than others, and quantizing those activations to 4-bit breaks everything. If you want
+a complete pipeline with both weights and activations at 4-bit, QuIP# offers no help.
+
+The next paper's job: elevate Hadamard rotation from the weights to the entire
+inference path.
+
+** 2024 | QuaRot: Lifting Hadamard Rotation to the Compute Graph
+
+*** What Problem It Saw
+
+QuIP# makes weights incoherent, but at inference time the input activations still
+carry heavy channel-wise outliers. In LLaMA-family models, a few dimensions of the
+residual stream have variance hundreds of times larger than the rest. Quantize those
+channels to 4-bit and the entire layer's output is destroyed.
+
+If you could "rotate away" these outlier channels — distributing energy evenly across
+all channels — you could enjoy the benefits of incoherence during inference as well.
+
+*** Its Solution
+
+QuaRot's core observation: for two adjacent linear layers W1 and W2 in a Transformer,
+inserting an orthogonal matrix R and its inverse R^T between them leaves the model
+output *completely unchanged*: W1 (R^T R) W2 = W1 W2.
+
+So, insert them. Use the Hadamard matrix H as R at the appropriate positions throughout
+the network, so activations and hidden states are always in a "rotated" representation
+as they propagate. Then absorb H mathematically into the adjacent W matrices — at
+inference time the rotation is invisible, but *the distribution of activations has been
+permanently scrambled*, and outliers vanish for good.
+
+Now not only the weights but also the KV cache and activations can all be quantized
+to 4-bit.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+The beauty of rotation is that it "changes nothing" mathematically, yet "changes
+everything" numerically. This is a very deep trick — a free lunch, provided you are
+willing to perform "graph surgery."
+
+But graph surgery means QuaRot must intrude into the model architecture: you must know
+where each layer lives, where to insert the matrices, and which linear layer to absorb
+them into. For custom architectures or unusual normalization layers, integration
+requires case-by-case adaptation. Moreover, the rotation matrix is shared across a
+whole layer — for dynamically generated objects like the KV cache, information theory
+suggests there is still room to do better.
+
+The next paper's question: can we push rotation to a finer granularity and fully
+exploit the knowledge of what the distribution looks like after rotation?
+
+** 2025 | TurboQuant: Polar Decomposition + Gaussian Codebook for the KV Cache
+
+*** What Problem It Saw
+
+QuaRot's treatment of the KV cache was "rotation + scalar quantization," but the
+authors observed that the coordinates of a rotated KV vector are actually *very close
+to Gaussian*. Given that the distribution is now known, why not use *the quantizer that
+Lloyd-Max proved in 1960 to be MSE-optimal for exactly that distribution*?
+
+Going one step further: what a vector really wants to compress are two independent
+things — its *length* and its *direction*. Length is a single scalar; direction is a
+point on the unit sphere. Storing them separately lets each be encoded with its own
+optimal scheme.
+
+*** Its Solution
+
+For each KV vector b:
+1. Extract the L2 length r = ||b||; the remainder b/r is a point on the unit sphere.
+2. Apply a randomized Hadamard rotation H to b/r. *Theoretical fact*: for a point
+   drawn uniformly from the unit sphere, the marginal distribution of each coordinate
+   after an orthogonal rotation converges asymptotically to N(0, 1/d) — a central-limit
+   theorem for spherical projections.
+3. Multiply each coordinate by sqrt(d) to obtain N(0, 1).
+4. Quantize using the optimal L = 2^b centroids that Lloyd-Max computes for the
+   standard normal distribution.
+
+Storage: one fp16 length r per block, one int8 code per weight.
+Decoding: table lookup → divide by sqrt(d) → inverse Hadamard → multiply by r.
+
+This is "polar quantization" — "polar" comes from polar coordinates (length and
+direction separated). TurboQuant uses rate-distortion tools from information theory to
+prove that this scheme approaches the optimum for online KV quantization.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+The entire mathematical chain is tight:
+- Rotation turns any distribution into Gaussian → Gaussian has a known optimal quantizer
+  → you obtain a scheme that is *theoretically MSE-optimal* on the transformed distribution.
+Not empirical patching, not a worst-case bound — but *attaining the rate-distortion limit
+on the post-transform distribution*.
+
+However, TurboQuant only addresses the KV cache. Dynamically generated KV vectors and
+statically stored model weights are two different problems: weights can be processed
+offline at leisure; KV vectors must be handled online for every new token. On the weight
+side, the distribution-aware path had not yet been explored — everyone was computing
+Hessians, tuning channels, or learning rotations.
+
+The leap the next paper makes: port TurboQuant's three steps — sphere normalization +
+Hadamard + Gaussian codebook — into weight quantization.
+
+** 2026 | PolarQuant: Porting Polar Quant to Weights, and Uncovering a Counter-Intuitive Fact
+
+*** What Problem It Saw
+
+TurboQuant proved that polar quant is near-optimal for the KV cache. But on the weight
+quantization side, the field had been stuck with "patch-and-pray" or "assume-and-hope"
+approaches — either relying on calibration data for remediation (GPTQ/AWQ) or simply
+*assuming* weights are already Gaussian (NF4, though in practice they are not). Nobody
+had verified: if you *force* the weights to become Gaussian (via Hadamard rotation) and
+then apply a Lloyd-Max-optimal codebook, what happens?
+
+*** Its Solution
+
+Directly transplant TurboQuant's polar-coordinate pipeline, but applied to weight blocks:
+1. Partition the weight matrix into blocks of length d = 128.
+2. L2-normalize each block; store the scale r_i as fp16.
+3. Apply Walsh-Hadamard rotation H_128 to the unit vector —
+   *key empirical fact*: the K-S distance between the rotated coordinates and N(0, 1/d)
+   is < 0.01, meaning *actual LLM weights are close enough to uniform on the sphere that
+   the post-rotation Gaussian approximation is very good*.
+4. Multiply by sqrt(d) to obtain N(0, 1), then look up the Lloyd-Max quantization code.
+
+On Qwen3.5-9B: absmax Q5 perplexity 6.90; PolarQuant Q5 is 6.40; FP16 is 6.37 —
+*nearly lossless*, and *requiring zero calibration data*.
+
+Furthermore, PolarQuant is a *composable* preprocessing step:
+- PolarQuant Q5, dequantized and re-quantized with torchao INT4, beats direct absmax INT4
+  by 0.12 perplexity points.
+- It is orthogonal to AWQ (one operates per-channel, the other per-block); combined they
+  achieve 3.6× compression with a perplexity only 0.06 above FP16.
+
+*** Why It Works (and What New Pitfall It Leaves)
+
+The most interesting finding is the *ablation study*: the authors decompose the scheme
+into two contributions —
+
+A. Sphere normalization + Hadamard rotation (making the distribution Gaussian)
+B. Using the carefully derived Lloyd-Max Gaussian codebook (rather than equally spaced
+   absmax bins)
+
+A alone: error drops by 98 %.
+B on top of A: a further 2 %.
+
+In other words: *virtually all the credit goes to the Hadamard rotation*. The
+seemingly sophisticated "Gaussian-optimal centroids" are almost decorative. This implies
+that everything the field spent the past three years carefully engineering into
+distribution-aware codebooks — NF4 and its relatives — contributes far less to final
+quality than the almost-free operation of "rotate first."
+
+New pitfalls:
+- Paper v2 was voluntarily withdrawn on 2026-04-20, with the note "Found some errors,
+  I need to fix." Whether the issue is numerical or whether the ablation conclusion
+  holds up is currently unknown — meaning the "98 %/2 %" figure should be treated with
+  caution for now.
+- Validation is limited to a single model, Qwen3.5-9B. Whether the Gaussian
+  approximation at d = 128 is equally good across different architectures needs more
+  evidence.
+- Dequantization at inference time requires an extra inverse Hadamard transform. The
+  author reports roughly 8 seconds of extra model-loading time, but the maturity of
+  dequantization kernels across platforms (especially Apple Silicon) still needs time.
+
+* Frontier Extensions
+
+Because PolarQuant itself was withdrawn in April 2026, the line of "subsequent work
+directly citing and improving PolarQuant" is currently *empty* — withdrawn papers rarely
+attract serious citations.
+
+But on the broader problem line of "weight + distribution-aware + Hadamard," foreseeable
+directions include:
+
+1. A revised PolarQuant resubmission — the author explicitly said they intend to fix it.
+   Whether the revision preserves the "98 % from rotation" conclusion is the key thing
+   to watch.
+2. Replacing the fixed Hadamard with a *learned rotation* to create a weight-side
+   SpinQuant — SpinQuant has already shown learned > fixed Hadamard on the activation
+   side; the weight-side counterpart is a natural extension.
+3. *Applying the ablation insight retroactively to older methods*: if Hadamard is the key,
+   then adding a block-wise Hadamard before GPTQ or AWQ's fine-grained compensation
+   could be a one-line change that captures most of the gain for free.
+4. Pushing to 3-bit / 2-bit. Q5 is already near-lossless; the real frontier where
+   PolarQuant should be challenged is the 2-bit territory currently held by QuIP# and AQLM.
+
+*Honest disclaimer*: directions 1–4 above are *reasonable downstream inferences* about
+this river, not published facts. The statement "no citations after withdrawal" reflects
+a current arXiv search snapshot and may miss parallel work I have not found.
+
+* One Diagram
+
+#+begin_example
+                Evolution of "Twist the Distribution" in LLM Weight Quantization
+                ==================================================================
+
+Year    Strategy                    Attitude toward outliers       Theory        Engineering cost
+----  --------------------------  --------------------------     ----------    -----------------
+2023  absmax (baseline)           "Live with it"                 None          Zero
+       |
+       v
+2023  GPTQ                        Algorithmic post-hoc fix       None          Medium (calib + Hessian)
+       |
+       v
+2023  QuIP                        Random orthogonal "scatters"   Worst-case    High (dense matrix)
+                                  the distribution
+       |
+       v
+2024  QuIP#                       Hadamard + E8 lattice          Worst-case    Low (structured)
+       |
+       +---> Extended to activations and KV cache
+       v
+2024  QuaRot                      Rotation absorbed into         Empirical     Medium (graph surgery)
+                                  adjacent layers
+       |
+       v
+2025  TurboQuant (KV)             Polar decomp, goes Gaussian,   Near-optimal  Low (KV-only)
+                                  Lloyd-Max codebook             (rate-distortion)
+       |
+       +---> Ported to weights
+       v
+2026  PolarQuant (weight)         Same, but applied to weight    "Near-lossless" Very low (no calib)
+                                  blocks                         (Qwen3.5)      [pending verification]
+
+      Key counter-intuitive finding:
+          Ablation reveals -- Hadamard rotation contributes 98 % of the improvement;
+                             the Gaussian-optimal codebook contributes only 2 %.
+          Implication      -- The careful engineering poured into distribution-aware
+                             codebooks over the past three years may matter far less
+                             than "doing one free Hadamard rotation before quantizing."
+
+
+Side branch (mathematical foundations):
+   1960  Max         |  Optimality conditions for scalar quantizers
+   1982  Lloyd       |  Lloyd-Max algorithm
+                     v
+                  (The codebook-design bedrock of the entire polar-quant line,
+                   rediscovered for LLM quantization half a century later)
+#+end_example
+
+* Insights
+
+This river ran for three years, and what actually happened was not "the algorithms got
+cleverer" — it was that *the coordinate system changed three times*:
+
+1. *Algorithm layer*: GPTQ applies Hessian corrections — treating quantization as an
+   optimization problem and patching errors after the fact.
+2. *Geometry layer*: QuIP / QuIP# / QuaRot introduce orthogonal rotations — transforming
+   weights and activations into a new coordinate system where outliers diminish.
+3. *Distribution layer*: TurboQuant / PolarQuant upgrade the goal from "fewer outliers"
+   to "distribution becomes a known-optimal shape" — Gaussian, because Lloyd-Max's 1960
+   work gives it a *closed-form optimal quantizer*.
+
+Each upgrade of the coordinate system made the approach *simpler, cheaper, and
+theoretically tighter*. GPTQ requires calibration data plus a Hessian inversion;
+PolarQuant needs only a single matrix multiply — and is actually more accurate.
+
+This illustrates something familiar yet easy to forget: *before attacking a hard
+problem, first move it into the right coordinate system*. If you can recast the problem
+into a form that has already been solved (Lloyd-Max on N(0,1) is a closed case), you
+inherit the gift a mathematician left 60 years ago.
+
+PolarQuant's ablation — 98 % vs. 2 % — is the *empirical proof* of this insight:
+what actually does the work is the geometric act of "twisting the distribution into the
+right shape," not "quantizing more finely once the shape is right." The latter is merely
+the cherry on top.
+
+Where to go next? Three directions:
+- Push to 2-bit. Q5 is already lossless; the new battleground is more aggressive
+  bit-widths.
+- Push into training. Everything so far is post-training; making weights "naturally
+  easy to quantize" during training is a deeper level.
+- Push to non-linear transforms. Hadamard is just one of many possible transforms; if a
+  learned non-orthogonal transform could twist the distribution into something even more
+  quantization-friendly than Gaussian (sharper, more regular), the next Lloyd-Max-inspired
+  opportunity lies right there.
+
+* Takeaways
+
+For "how to do research / find problems," this river offers the most direct guidance:
+
+1. *Cross-domain borrowing beats deep local excavation*. PolarQuant invented nothing —
+   polar quantization came from TurboQuant, Hadamard from QuIP#, Lloyd-Max from 1960.
+   Its sole contribution was *porting a mature recipe from KV cache to weights*. A complete
+   paper whose core is "transfer + one ablation experiment." The lesson: whenever you see
+   a clean toolchain working in one sub-domain, always ask — which adjacent problem in the
+   same field has nobody yet applied this toolkit to?
+2. *Ablations are more likely to yield insight than designs*. PolarQuant's real value is
+   not "PolarQuant is an impressive method" but "it turns out 98 % of the contribution
+   comes from the simplest step." A well-designed ablation lets you *throw away nineteen
+   twentieths of the paper's complexity* and extract the one line of code that actually
+   does the work in practice.
+3. *Withdrawal is a real cost*. The retraction of v2 is a reminder that in LLM
+   research, where numerical results are passed along in a chain, reproducibility
+   matters more than elegance. Before reusing a stunning "near-lossless" result, check
+   the random seed, the benchmark selection, and whether the baseline is truly
+   comparable — then decide whether to build on it.
+
+Actionable takeaway:
+- The next time you do any LLM weight quantization, *add a block-wise Hadamard before
+  quantizing* — it is free, has no side effects, and may capture most of the available
+  gain.
+- When you receive a distribution-aware method, *force an ablation*: separate "the
+  distribution transform" from "the optimal codebook on that distribution" and measure
+  each contribution independently. That is worth more than piling on new tricks.
+- Watch for the revised resubmission of PolarQuant — if it fixes the errors, it will
+  be the simplest, cheapest, and closest-to-SoTA weight quantization scheme of the
+  past two years.

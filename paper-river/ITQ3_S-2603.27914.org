@@ -1,0 +1,353 @@
+#+title:      ITQ3_S: High-Fidelity 3-bit LLM Inference via Interleaved Ternary Quantization with Rotation-Domain Smoothing
+#+date:       [2026-05-28 Thu 19:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T190000
+#+source:     https://arxiv.org/abs/2603.27914
+#+authors:    Edward J. Yoon
+#+venue:      arXiv 2026-03-31 (cs.LG)
+
+* 问题之河
+
+一个 70B 参数的大模型在 FP16 下要 140 GiB 显存，连 RTX 5090 的 32 GiB VRAM 都装不下。要在消费级显卡上跑，就只能压。压到 4-bit 还撑得住，压到 3-bit——所有人都说这是 "logic 的崩溃点"——困惑度爆掉，多步推理直接废。
+
+为什么 3-bit 这么难？因为 LLM 的权重不是好好的钟形分布，它有 *outlier*：大部分权重很小，少数几个值大得离谱。3-bit 一共只有 8 个量化级别，要覆盖这么宽的动态范围，每一级之间的间距就大到 outlier 一来一压全错。
+
+整条 LLM 量化的研究史，本质上就是一个问题在变形：*怎么对付 outlier？* 早期是把它和正常权重分开存（混合精度），后来是用 Hessian 调舍入，再后来突然有人意识到——与其想办法 *容忍* outlier，不如先把它 *消灭*。把权重旋转一下，outlier 的能量摊到所有维度上，分布就被抹平了。
+
+ITQ3_S 是这条 "旋转派" 路线的最近一节：它把 Fast Walsh-Hadamard Transform (FWHT) 这个旋转操作，直接 *融到 CUDA 内核里*，让 3-bit ternary 量化第一次能在 RTX 5090 上跑出 FP16 级别的困惑度。
+
+* 溯源地图
+
+#+begin_example
+[2022.08] Dettmers et al. -- LLM.int8()
+  |
+  | 第一次系统地发现: LLM 权重/激活里有 outlier channel
+  | 解法: 把 outlier 拆出来用 FP16 算, 其他走 INT8 (mixed precision)
+  | 留下的坑: 拆-合需要 scatter-gather, 消费级 GPU 上慢
+  v
+[2022.10] Frantar et al. -- GPTQ
+  |
+  | 看到的问题: LLM.int8() 把 outlier 单独走 FP16, 实际只是绕开问题
+  | 解法: 用 Hessian (X^T X) 二阶信息指导舍入, 把 outlier 引起的误差
+  |       摊给周围未量化的权重去补偿
+  | 留下的坑: 4-bit 还行, 3-bit 急剧退化—Hessian 补偿挽救不了
+  |          outlier 在 3 个 bit 里造成的根本误差
+  v
+[2023.07] Chee et al. -- QuIP
+  |
+  | 看到的问题: 与其在原始权重空间上跟 outlier 死磕,
+  |             不如先把权重"洗"成均匀分布
+  | 解法: 在量化前对权重矩阵左右各乘一个随机正交矩阵 U, V,
+  |       让 W' = U W V^T 变得 "incoherent" (没有方向上的偏向),
+  |       outlier 的能量被打散到所有维度
+  | 留下的坑: 随机正交矩阵存储/计算昂贵, 矩阵 vector 乘 O(n^2)
+  v
+[2024.02] Tseng et al. -- QuIP#
+  |
+  | 看到的问题: QuIP 的随机正交旋转又大又慢, 部署不友好
+  | 解法: 用 Randomized Hadamard Transform 替代—Hadamard 矩阵
+  |       元素全是 +/-1, 矩阵乘退化成加减法; FWHT 把复杂度从
+  |       O(n^2) 降到 O(n log n); 配合 E8 lattice 码本进一步压困惑度
+  | 留下的坑: 旋转用了, 但还是作为"预处理"——量化和反量化是分开的两步,
+  |          没有融到 GPU 推理内核里
+  v
+[2025-2026] (TurboQuant 路线) -- 旋转域自适应量化
+  |
+  | 看到的问题: QuIP# 把旋转应用在权重和激活上, 但 KV cache 量化
+  |             和权重量化是分头做的; 在 transformer 多层堆叠下
+  |             "在哪个域算" 容易跨层错位
+  | 解法: 把 FWHT 旋转作为一个 *adaptive* 操作引入,
+  |       理论上给 outlier 抑制了一个严格的上界
+  | 留下的坑: 论文给了理论, 但 *没有 CUDA 内核*. naive 实现:
+  |          KV cache 在旋转域, 权重还在原始域, 跨层累积域不匹配
+  |          的误差, 最后比原始 3-bit 还差
+  v
+[2026.03] Yoon -- ITQ3_S  <-- 本篇
+  |
+  | 看到的问题: TurboQuant 的旋转思想是对的, 但工程上根本没法部署;
+  |             另外 llama.cpp 生态里有个广泛使用的 3-bit 格式叫 IQ3_S,
+  |             但它没用旋转, 困惑度受 outlier 拖累
+  | 解法: 把 FWHT 旋转 *焊进* IQ3_S 这个具体格式的 CUDA 反量化内核——
+  |       权重在离线阶段做 256-point FWHT 然后 ternary 量化;
+  |       在线推理时 256-point IFWHT 被 *融进* MMQ kernel 的
+  |       shared-memory loading 阶段, 不增加显存往返;
+  |       由于 H 是 isometry, 反变换不引入额外误差,
+  |       重建误差只由 ternary grid 决定
+  v
+[2026+] (未来) ...
+#+end_example
+
+* 演化叙事
+
+** 2022.08 | LLM.int8(): 第一次承认 "outlier 这事必须单独处理"
+
+*** 它看到了什么问题
+
+2022 年之前大家都在做 CNN/ViT 的量化, INT8 跑得稳稳的. 把同一套搬到 LLM 上, 6.7B 参数以上的模型 INT8 一上就崩, 困惑度爆炸. 没人理解为什么.
+
+Dettmers 等人去看了权重和激活的分布, 发现一个反直觉的现象: LLM 的某些 *channel* (大约 0.1% 的特征维度) 的激活值, *系统性地* 比其他 channel 大 20 倍以上. 整层 INT8 的 scale 被这些 outlier channel 拖到极大, 普通 channel 在 INT8 grid 上的精度被压成几乎零.
+
+这是第一次把 "outlier" 作为 LLM 量化的 *主要矛盾* 提出来.
+
+*** 它的解法
+
+简单粗暴: *混合精度*. 在每一层动态检测 outlier channel, 把这些 channel 单拎出来用 FP16 算; 其他 99.9% 的 channel 走 INT8. 最后把两部分结果加起来.
+
+效果: 175B 模型 INT8 跑通, 没有质量损失.
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它没有 *解决* outlier 问题, 而是 *绕开* 了——既然这些 channel 数值太大, 那就不要逼它们进 INT8 grid, 用 FP16 完整保留就好.
+
+留下的坑:
+
+1. *scatter-gather 慢*. 每层都要把 0.1% 的 channel 抽出来再插回去. 在数据中心 GPU 上有 NVLink 还能忍, 在消费级 GPU 上这一步开销巨大.
+2. *3-bit 走不通*. 同样的思路推到 3-bit: outlier 要 FP16, 其他要塞进 3-bit—— 其他 channel 在 3 个 bit 里的余地比 INT8 小 32 倍, 同样的 grid 间距问题立刻翻车.
+3. *根本上是"治标"*. 把 outlier 拆出来不算消灭它, 你只是不在 INT8 里碰它. 真正的 outlier 抑制还没人做.
+
+接下来的 GPTQ 走的是另一条路: 不去拆 outlier, 而是 *补偿* 它带来的误差.
+
+** 2022.10 | GPTQ: 用 Hessian 把 outlier 误差摊给邻居
+
+*** 它看到了什么问题
+
+LLM.int8() 解决了 "INT8 也能跑大模型" 这件事, 但 INT8 内存压缩比只有 2x. 实际部署需要 4-bit 甚至更低. 那 outlier 这件事在 4-bit 上要怎么办?
+
+Frantar 等人从 OBS/OBC 那条 Hessian-based 路径切进来. 他们的逻辑是: outlier 的存在意味着某些权重一定会被量化得很差, 但 *只要剩下的权重相应调整一下*, 这一层的输出还能跟原来对得上.
+
+*** 它的解法
+
+把每一层的量化看成一个 *重建问题*:
+
+  min |X W_hat - X W|^2,  s.t.  W_hat ∈ 3-bit grid
+
+其中 X 是校准数据. 这个二次目标的 Hessian 就是 X^T X, 跟权重无关, 固定的, 可缓存.
+
+GPTQ 按列处理权重: 量化一列 → 算这一列因为掉到 grid 上产生的误差 → 把误差通过 Hessian 摊给右边还没量化的列, 让它们 *向反方向偏一点点* 去补偿. 一列一列往右扫.
+
+效果: 175B 模型 4-bit 量化几小时跑完, 困惑度只掉一点点. 整个 LLM PTQ 领域从此有了默认 baseline.
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+GPTQ 是把 LLM.int8() 的 "outlier 单独跑 FP16" 换成了 "outlier 还是被量化, 但用 Hessian 帮你补偿". 在 4-bit 上效果很好——因为 4-bit 的 grid 还密, 单个权重的量化误差小, 补偿能稳定收敛.
+
+留下的坑:
+
+1. *3-bit 上补偿失效*. 3-bit 一共 8 个 level, grid 间距比 4-bit 大一倍以上. outlier 落到 grid 上的误差大到补偿都吸收不了——往后摊只会让后面的列也错得离谱.
+2. *根本问题没碰*: 权重分布的 *形状* 没变. outlier 还在那里, 你只是想办法在量化后补偿它的影响. 在 sub-4-bit 上, 形状本身就是不可承受之重.
+3. *按列贪心*: 列序敏感, 误差沿列累积 (这个坑 ADMM-Q 这条线后来去填).
+
+GPTQ 把 "在原始权重空间上跟 outlier 死磕" 这条路推到了极致, 也撞到了天花板. 下一篇就是反着想的: *能不能在量化之前, 先把权重分布的形状改了?*
+
+** 2023.07 | QuIP: 把权重旋转一下, outlier 就消失了
+
+*** 它看到了什么问题
+
+GPTQ 在 3-bit 上崩, 说明 *补偿* 这条路有上限. Chee 等人换了个角度: 假如权重矩阵 W 没有 outlier, 量化就不会这么难. 那能不能找一个 *无损* 的变换, 把有 outlier 的 W 变成没有 outlier 的 W'?
+
+线性代数里早就知道: 一个矩阵的 outlier 是 *坐标系依赖* 的. 同一个矩阵在不同的正交基下看, 元素的分布完全不同. 一个数值很大的元素, 只要把坐标系旋转一下, 就被打散到很多个中等大小的元素里.
+
+如果旋转矩阵 U 是 *正交* 的, 那 U^T U = I, 矩阵的乘法不变——也就是说 W X 这个计算可以等价地写成 (U^T)(U W)(X)= 把 U W 当作新权重存, 推理时只多乘一个 U^T 在前面.
+
+*** 它的解法
+
+QuIP 提出 *incoherence processing*: 在量化前, 对权重 W 左右各乘一个 *随机* 正交矩阵 U 和 V:
+
+  W' = U W V^T
+
+理论分析证明: 经过随机正交旋转, W' 的元素 *以高概率* 是 "incoherent" 的——任意方向上都没有特别大的分量, outlier 被均匀打散到所有维度. 此时再做均匀量化, 误差就小得多.
+
+推理时, 需要把输入也乘 V, 把输出乘 U^T 才能对齐——这部分计算在 attention 旋转里可以被吸收, 不增加 FLOPS.
+
+3-bit 上 QuIP 大幅超过 GPTQ, 第一次让 3-bit LLM 看起来 "不是不可能".
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+差异的本质 *一句话*: GPTQ 是在 outlier 出现 *之后* 补救, QuIP 是 *先把 outlier 抹掉* 再量化. 这是从 "治标" 到 "治本" 的转向.
+
+留下的坑:
+
+1. *随机正交矩阵太重*. 一个 4096x4096 的随机正交矩阵, 存它就 64 MB, 乘它是 O(n^2). 每一层都要做, 推理时这部分开销大到压过量化带来的速度收益.
+2. *理论保证是 "高概率"*, 实际上每次跑结果会抖, 不利于稳定部署.
+3. *和现有内核不兼容*. 没办法把 "U^T (W' x)" 这一坨整合进现有的 GEMM kernel, 必须额外起 launch.
+
+旋转的想法对了, 但 "随机正交矩阵" 这个工具太钝. 下一篇就是来换工具的.
+
+** 2024.02 | QuIP#: 把随机旋转换成 Hadamard, 复杂度立刻降下来
+
+*** 它看到了什么问题
+
+QuIP 证明了旋转的有效性, 但用 *随机* 正交矩阵这个选择是工程上的灾难. 有没有一种 *结构化* 的正交矩阵, 既能起到打散 outlier 的作用, 又便宜?
+
+数字信号处理里早就有现成答案: *Hadamard 矩阵*. 它的元素全是 +1 或 -1, 矩阵 vector 乘只有加减法没有乘法; 而且有 *Fast Walsh-Hadamard Transform (FWHT)* 这个 O(n log n) 算法, 比 O(n^2) 快得多.
+
+*** 它的解法
+
+QuIP# 把 QuIP 的随机正交矩阵替换成 *Randomized Hadamard Transform*: 在 Hadamard 矩阵前后乘随机符号对角矩阵, 既有 Hadamard 的结构化加速, 又保留了随机性带来的 incoherence 保证.
+
+工程上, FWHT 用 butterfly 实现, 在 GPU 上跑得飞快. 同时配一个更好的码本 (E8 lattice 量化器代替均匀量化), 进一步把 sub-4-bit 困惑度压下去.
+
+效果: 比 QuIP 快好几倍, 4-bit 上几乎追平 FP16, 3-bit 上又向前一大步.
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+把 *任意正交矩阵* 替换成 *Hadamard 矩阵*, 在数学上是相同效力 (都是 isometry, 都让 incoherence 成立), 在工程上是 *从无法部署到可以部署* 的跨越.
+
+留下的坑:
+
+1. *旋转和量化是分开的两步*. QuIP# 的推理流程: 输入 → 乘 Hadamard → MMQ kernel → 乘 Hadamard^T → 输出. 两次 FWHT 是独立的 CUDA launch, 每次都有开销, 而且数据要在 global memory 里走一圈.
+2. *只对权重旋转, 没处理 KV cache 的 outlier*. transformer 推理时 KV cache 也有自己的 outlier 问题, QuIP# 不管这部分.
+3. *码本是软件库形态*, 没有针对 3-bit ternary 这种 GPU 友好的具体格式做工程化.
+
+旋转工具变好用了, 但 "把它焊进推理内核" 这件事还没人做. 下一篇 (TurboQuant 路线) 开始往这个方向走, 但只走到了 "理论上可行" 这一步.
+
+** 2025 | TurboQuant: 给旋转域量化一个严格理论, 但没有 CUDA 内核
+
+*** 它看到了什么问题
+
+QuIP# 证明了 FWHT 旋转好用, 但它在 transformer 推理流程里只覆盖 *权重*. 实际部署里, KV cache 的量化是另一个独立战场——而且 KV cache 的 outlier 比权重更严重 (注意力 head 之间方差差几个数量级).
+
+如果把 FWHT 旋转 *同时* 用到权重和 KV cache 上, 理论上 outlier 都能被压下去. 但 naive 这么做会出问题: 权重在 *旋转域* 算, KV cache 也在 *旋转域* 算, 中间还有 RoPE、LayerNorm 这些非线性操作——一旦哪一层域没对齐, 误差就开始累积.
+
+TurboQuant 这条线试图把 "在哪个域算" 这件事用一个 *统一框架* 描述: 把 FWHT 当作可以 *自适应* 选择 block size 的旋转算子, 给出每一层 outlier 抑制的严格上界, 让旋转域和原始域之间的切换有明确的代数语言.
+
+*** 它的解法
+
+理论上推导: 对任何 W in R^n, 经过 FWHT 后 ||H W||_inf 的期望以 O(sigma * sqrt(log n)) 收敛 (这就是 ITQ3_S 论文 Theorem 1 的内容). 这给了 "旋转能把 outlier 压到多小" 一个具体上界. 同时给出了不同 block size (64/128/256/512) 下质量-速度的 tradeoff.
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+把 QuIP# 的 "Hadamard 旋转有效" 升级成 "Hadamard 旋转 *能压多少*, 在什么 block size 上最优". 数学语言更精确了.
+
+留下的致命坑:
+
+1. *没有 CUDA 内核*. 整篇文章是数学和 PyTorch 实验, 不能直接在 vLLM/llama.cpp 这种推理引擎里跑.
+2. *域不匹配陷阱*. 如果你试图把 TurboQuant 的旋转 "塞进" 一个现成的量化方案 (比如 GPTQ 或 IQ3_S), 通常的做法是只对 KV cache 做旋转, 权重保持原样. 论文 ITQ3_S 明确指出: 这样跨层叠加, 误差大到 *比标准 3-bit baseline 还差*.
+3. *碰不到 IQ3_S 这种生产格式*. llama.cpp 用户实际部署的 3-bit 模型用的是 IQ3_S 这样的格式, TurboQuant 跟它没接口.
+
+到这里, 旋转思想已经成熟, 但 "把它焊进一个真实可部署的 3-bit 格式" 还差最后一步. 这一步就是 ITQ3_S.
+
+** 2026.03 | ITQ3_S: 把 FWHT 反变换融进 CUDA shared-memory loading
+
+*** 它看到了什么问题
+
+把前面的坑列一下:
+- QuIP/QuIP#: 旋转和量化是分开的两个 kernel, 多一次 global memory 来回.
+- TurboQuant: 给了理论上界, 但 *naive 拼装* (KV cache 旋转 + 权重原始域) 会因为跨层域不匹配把质量打到比标准 3-bit 还差.
+- llama.cpp 的 IQ3_S 格式: 已经在生产里被广泛用, 但没用旋转, 受 outlier 拖累.
+
+Yoon 看到的核心问题是: 这三条线必须 *合体*. 不合体就意味着旋转的好处兑现不到部署里.
+
+*** 它的解法
+
+ITQ3_S 把整件事变成一个 *单一融合内核*. 三件事必须一起设计:
+
+1. *离线量化阶段*: 把权重按 256 元素一块切, 每块先做 FWHT, 然后用 ternary { -1, 0, +1 } 量化, 配一个 per-block scale d_k 和 zero-point z_k. 关键是 ternary 量化必须在 *旋转域* 上做, 因为只有在旋转域 W' = H W 才接近高斯分布, ternary grid 才合身.
+
+2. *Interleaved 3-bit packing*: 把两块 ternary 子块的位串 *交错* 打包到 32-bit word 里, 让 GPU 的 DP4A (4-way INT8 dot product) 指令能一次性吃下 4 个权重, 同时让 Tensor Core 调度器看到一个对齐良好的内存布局. 这一步是为 RTX 5090 (Blackwell) 的硬件特化做的.
+
+3. *Online 反量化内核*: 这是真正的精华. 推理时一个矩阵向量乘 MMVQ (matrix-vector quantized) kernel 的流程被改写成: 从 global memory 把 3-bit 数据搬到 shared memory → *在 shared memory 里就地做 256-point 逆 FWHT (IFWHT)* → 跟激活做点积. IFWHT 完全在片上跑, 没有额外的显存往返.
+
+关键的代数性质保证这一切是无损的: H 是 isometry (||H v|| = ||v||), 所以 H^{-1} (q - H w) 的 norm 等于 q - H w 的 norm. 反变换 *不引入* 额外误差, 重建误差严格只由 ternary grid 决定 (Theorem 2). 离线和在线两步的代数一致性是 *证出来* 的, 不是 *测出来* 的.
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+差异的本质 *一句话*: 之前所有人都把旋转当 "预处理 + 后处理" 两步外挂, ITQ3_S 把旋转 *消解* 进了 CUDA 内核的 shared-memory loading 阶段, 让旋转成为 "免费" 的反量化步骤的一部分.
+
+效果: 在 RTX 5090 上, 3-bit 困惑度逼近 FP16, 吞吐比 4-bit 快 1.5x 以上 (因为内存带宽是 LLM 推理的瓶颈, 3-bit 比 4-bit 少 25% 数据搬运).
+
+留下的新坑:
+
+1. *256 是 magic number*. 当前 block size 选 256 是因为对应 RTX 5090 的 shared memory 容量、DP4A 字长、L1 cache line. 换 H100/MI300 要重新调.
+2. *只搞了权重*, 没搞 KV cache 和激活. TurboQuant 那条线想做的 "整个 transformer 全在旋转域" 还没在 ITQ3_S 里实现.
+3. *FWHT block 局限在 256*. 想压更大的 outlier 跨度需要更大的 block, 但这跟 shared memory 容量直接冲突.
+4. *训练时是否能引入 FWHT?* 现在 ITQ3_S 是纯 PTQ. 如果 QAT 阶段就让权重训练到 "旋转域友好" 的分布, 可能更进一步.
+
+* 前沿延伸
+
+ITQ3_S 是 2026-03-31 上 arXiv 的 v2, 距今 2 个月. 这条线明显能往哪走:
+
+- *KV cache + 权重 + 激活的统一旋转域 transformer*. 整个推理流水线全程在 FWHT 域里跑, RoPE 和 LayerNorm 都重新推导. 谁先把这个做出来, 就能把 sub-3-bit (W2 甚至 W1.58) 推到可用.
+- *2-bit ternary 的 ITQ2 系列*. 用同样的 FWHT 融合策略, 把 grid 进一步压到 2-bit. 难点是 grid 间距更大, ternary 的 3 个 level 已经不够, 需要重新设计 codebook.
+- *Tensor Core 时代的 micro-format 普及*. NVIDIA Blackwell 的 MXFP4/NVFP4 这些硬件原生 4-bit 格式正在普及; ITQ3_S 的设计哲学 (旋转融合到加载阶段) 可以反过来指导这些硬件格式的 software path 怎么用最大化 outlier 抑制.
+- *AMD ROCm / TPU 上的对偶实现*. 当前完全针对 RTX 5090 调; AMD MI300X 的 shared memory 模型不一样, 需要重新设计 packing 和 fusion 策略.
+
+* 一张图看懂
+
+#+begin_example
+                              LLM 量化 outlier 抑制思路 5 年演化
+
+  方法层级 ^
+              |
+   融合内核   |                                              [ITQ3_S 2026.03]
+   (旋转焊    |                                                  *
+    进 kernel)|                                                  | FWHT 反变换
+              |                                                  | 融进 CUDA shared
+              |                                                  | memory loading
+              |                                                  |
+   理论框架   |                                  [TurboQuant 2025]
+   (没内核)   |                                       *
+              |                                       | adaptive FWHT
+              |                                       | 严格 outlier 上界
+              |                                       | 但无 CUDA kernel
+              |
+   软件原型   |                       [QuIP# 2024.02]
+   (旋转 +    |                            *
+    量化两    |                            | Hadamard 替代随机正交
+    步)       |                            | FWHT: O(n log n)
+              |                            |
+              |          [QuIP 2023.07]
+              |               *
+              |               | 随机正交矩阵旋转
+              |               | 第一次"消灭"outlier
+              |               |
+   补偿派     |   [GPTQ 2022.10]
+              |       *
+              |       | Hessian 补偿
+              |       | outlier 误差摊给邻居
+              |       | 4-bit 行, 3-bit 崩
+   混合精度   |
+              | [LLM.int8() 2022.08]
+              |    *
+              |    | outlier channel 走 FP16
+              |    | 其他 INT8
+              +-----------------------------------------------------> 时间
+
+  ---------------------- 核心认知转变 ----------------------
+
+  2022           2023-2024              2025-2026
+  容忍 outlier    消灭 outlier          消灭 outlier + 焊进 kernel
+  (拆开或补偿)    (旋转打散)            (旋转融合到反量化里)
+
+  问题: "怎么减少      问题: "能不能      问题: "旋转的好处
+  outlier 的影响?"    让 outlier 消失?"  怎么不被kernel 切换
+                                          的开销抵消?"
+#+end_example
+
+* 洞见
+
+*真正发生的认知转变, 是 "outlier" 从 "需要被特殊处理的麻烦" 变成 "坐标系选错了的假象".*
+
+LLM.int8() 时代, outlier 被当作权重本身的属性——一个客观存在的、必须处理的麻烦. GPTQ 沿着这个假设走得更远: 既然 outlier 必然存在, 那就用 Hessian 帮它收拾烂摊子.
+
+QuIP 是认知拐点: outlier 不是权重的固有属性, 是 *观察角度* 的属性. 同一个矩阵, 换一个正交基去看, outlier 就被打散到所有维度上. 所谓 "outlier 抑制" 本质上是 "找到一个让权重分布最像高斯的坐标系".
+
+QuIP → QuIP# → TurboQuant → ITQ3_S 这条线, 每一步都在回答同一个问题——*哪个旋转最好用*——但都默认 "旋转是有用的". 这是和 LLM.int8()/GPTQ 那一代根本上不同的世界观.
+
+*另一个深层变化: 从 "算法-硬件解耦" 到 "算法-硬件协同设计".*
+
+GPTQ 时代, 量化算法是数学问题, kernel 实现是工程问题, 两件事可以分头优化. QuIP# 已经开始模糊这条界线 (Hadamard 选 256 是因为 GPU friendly). 到 ITQ3_S, 算法本身的 *正确性证明* (Theorem 2) 必须 *依赖* 内核实现细节 (IFWHT 必须在 shared memory 内做才能保证 isometry 的浮点精度).
+
+这意味着接下来 sub-3-bit 量化的 SOTA, 不会再来自纯算法论文, 而会来自 *算法-硬件-格式* 三位一体的工作.
+
+*下一个该被打破的常识*: "每一层独立量化". 现在所有方法 (包括 ITQ3_S) 都假设层和层是解耦的——每层有自己的 scale, 自己的 zero-point, 自己的 codebook. 但 FWHT 旋转一旦贯穿整个 transformer, 跨层 *域一致性* 就成了核心约束, 自然把整个模型从"一堆独立的层"变成"一个全局旋转域里的统一计算图". 这一步谁迈出来, 谁就开局下一代量化范式.
+
+* 启发
+
+1. *看到 "outlier 必须特殊处理" 这种叙述, 先问: 是数据本身的属性, 还是观察角度的伪影?* 三年里 LLM 量化界从前者转到后者, 整个领域的进展加速了一个数量级. 同样的问题搬到 attention sink、long-context degradation 这些 "看起来是数据问题" 的现象上, 多半也有 "换个坐标系它就消失了" 的解.
+
+2. *融合内核是低 bit 量化下唯一能兑现速度优势的路径.* 3-bit 比 4-bit 少 25% 数据搬运, 但只有当 dequant + matmul 融合时才能体现; 一旦中间还要走 global memory (像 QuIP# 那种独立 FWHT launch), 速度优势直接抵消. 这就是为什么 ITQ3_S 的 "FWHT 融进 shared-memory loading" 这一步是核心.
+
+3. *现成的开源格式 (IQ3_S) 是切入点而不是包袱.* Yoon 没有发明一个新的 3-bit 格式, 而是把 FWHT 嫁接到 llama.cpp 生态里已被广泛部署的 IQ3_S 上——这意味着工作可以 *立刻* 流到下游用户那里. 在已成熟的格式上做最小侵入式改进, 比另起炉灶的 "更好" 格式更有传播力.
+
+4. *这意味着你可以*——如果你在做任何 "理论上更好但没人用" 的算法, 第一件事是找一个已有大量部署的格式 / 接口, 把你的改进焊进去. 哪怕只是一个 isometry 性质的几何观察, 也能变成生产里的性能跳变.

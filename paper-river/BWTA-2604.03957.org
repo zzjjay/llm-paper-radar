@@ -1,0 +1,306 @@
+#+title:      BWTA: Accurate and Efficient Binarized Transformer by Algorithm-Hardware Co-design
+#+date:       [2026-05-28 Thu 19:08]
+#+filetags:   :paper:river:
+#+identifier: 20260528T190859
+#+source:     https://arxiv.org/abs/2604.03957
+#+authors:    Yifu Ding, Xianglong Liu, Shenghao Jin, Jinyang Guo, Jiwen Lu
+#+venue:      arXiv preprint, Apr 2026 (under review)
+
+* 问题之河
+
+把一个大模型塞进手机、塞进单卡、塞进推理服务器——能不能让每个数字只占 1 个 bit？
+
+这事说起来很简单："反正神经网络对精度不敏感，把 FP16 (16 bit) 砍到 1 bit，体积小 16 倍，矩阵乘法变成异或+加和，应该飞快。" 但十多年过去了，整个领域反复在同一道坎前栽跟头：
+
+- *精度坎*：模型越大、越接近 1 bit，掉点越严重，掉到不能用
+- *训练坎*：1 bit 的函数不可导，梯度怎么传？训练很难收敛
+- *硬件坎*：就算训出来了，GPU 没有 1 bit 矩阵乘的指令，理论上的省时省力变不成真省时
+- *激活坎*：权重可以砍到 1 bit，但激活（中间结果）一旦砍到 1 bit 就崩。所以大部分工作只敢动权重，激活留在 FP16/INT8，但这样真正的计算瓶颈没解掉
+
+这条河的主线就是：*"权重能砍到 1 bit 了，那激活什么时候轮到？"*——一代一代人在精度、训练、硬件这三个坎之间来回腾挪，每次往前挪一点。BWTA 是第一个把"激活砍到 ternary（{-1, 0, 1}）并真正在 GPU 上跑出加速"的工作。
+
+* 溯源地图
+
+#+begin_example
+[2016] BinaryConnect / XNOR-Net          (Courbariaux, Rastegari)
+       CNN 全二值化：权重和激活都 +/-1
+  |
+  | 问题: 只在小 CNN 上验证过，搬到 Transformer 上精度崩
+  v
+[2020-2022] BinaryBERT / BiBERT          (Bai, Qin et al.)
+       把二值化思路搬到 BERT 上
+  |
+  | 问题: 只能在 BERT 这种 100M 量级的模型，且依赖 FPGA/ASIC
+  |       GPU 上没有对应的低位 kernel
+  v
+[2023] BitNet                            (Wang et al., MSR)
+       1-bit 权重 + INT8 激活，原生从头训 LLM
+  |
+  | 问题: 权重砍到 1 bit 表达力不够，掉点
+  |       激活还是 INT8，没进一步压缩
+  v
+[2024] BitNet b1.58                      (Ma et al., MSR)
+       权重改成 ternary {-1, 0, 1}：多了一个"零"
+  |
+  | 问题: 激活还是 INT8/FP16，真正的计算量没省下来
+  |       没有现成 GPU kernel，速度优势只是理论上的
+  v
+[2023-2024] DB-LLM / PB-LLM / BiLLM      (Chen, Yuan, Huang et al.)
+       后训练把已有 LLM 压到 ~1 bit：双矩阵、显著权重保护、结构化校准
+  |
+  | 问题: 仍然是 weight-only（W-only），激活原封不动
+  |       并且都用通用 GEMM kernel，没真正利用 1-bit 结构
+  v
+[2026] BWTA  <-- 目标论文                (Ding, Liu et al., BUAA)
+       Binary Weight + Ternary Activation
+       + 自定义 CUDA bitpack kernel，激活也压下去了
+#+end_example
+
+* 演化叙事
+
+** 2016 | BinaryConnect / XNOR-Net: 把神经网络砍到只剩 +1 和 -1
+
+*** 它看到了什么问题
+
+那时候做计算机视觉的人发现一个很奇怪的现象：一个跑得飞起的 CNN，权重矩阵里几百万个浮点数，但很多 ".7234" 和 ".6981" 其实对最终预测没区别。FP32 是不是太浪费了？能不能干脆只留正负号？
+
+更进一步：如果权重只有 +/-1，激活也只有 +/-1，那一个标准的矩阵乘法 (a*w) 就变成了"异或 + 数 1 的个数"——CPU 的位运算一条指令就能干，理论上能比 FP32 快 32 倍。
+
+*** 它的解法
+
+*BinaryConnect* 干脆把权重二值化：训练时维护一份 FP32 的"影子权重"，前向传播时把它取符号变成 +/-1，反向传播时梯度直接打在 FP32 影子上（这招后来叫 *Straight-Through Estimator, STE*——把不可导的 sign 函数当作恒等函数来回传梯度）。
+
+*XNOR-Net* 更激进，连激活也二值化，并引入一个 *scaling factor*（每个 channel 一个浮点缩放系数）来补偿一下二值化带来的幅度损失。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+CNN 的卷积层有大量重复滤波，对单个权重的精度本来就不敏感。但是这一招留下了三个炸弹：
+
+1. *小模型 OK，大模型崩*：在 ImageNet 上 ResNet-18 大约掉 10-12 个点，能接受；但越大的模型越掉得多
+2. *只在 CNN 上验证*：Transformer 的注意力分布跟 CNN 卷积完全不一样，注意力的输出分布是"幂律分布"——大量靠近零的值、少量大值。强行二值化会把零附近那一大堆值粗暴劈成两半，错得离谱
+3. *没有 GPU 支持*：理论 32x 加速只在自定义 FPGA 上验证过，GPU 的硬件没有原生的 1-bit MMA 指令
+
+下一代人接手时，前两个炸弹爆了——把这套搬到 Transformer 上根本不 work。
+
+** 2020-2022 | BinaryBERT / BiBERT: 第一次摸索把二值化搬到 Transformer 上
+
+*** 它看到了什么问题
+
+BERT 在 2018 年发布以后，所有 NLP 任务都跑去用它。但 BERT-base 也有 110M 参数，部署到手机端要 400MB。如果能把它二值化，能压到 13MB 左右，端侧推理就成立了。
+
+可是直接把 XNOR-Net 那一套套上 BERT，精度直接崩。为什么？Transformer 里有一个 CNN 里没有的东西：*注意力分数*。Softmax 之后的注意力概率是 [0, 1] 之间的、大部分靠近 0 的稀疏分布。这种分布对二值化极度敏感——你强行劈成 {0, 1} 就把"几乎全是零、零星几个大值"变成"一半 0 一半 1"，整个注意力机制就废了。
+
+*** 它的解法
+
+*BinaryBERT* (Bai et al., ACL 2021) 想了个折中：先训一个 ternary BERT（权重 {-1, 0, 1}），再把每个 ternary 权重"劈成两半"得到 binary 权重。等于是用 ternary 当中间跳板。
+
+*BiBERT* (Qin et al., ICLR 2022) 引入"信息保留"目标：在二值化时显式最大化保留的互信息，并改造注意力的 softmax，先做 bool 化（{0, 1}）再加权。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这两篇证明了 Transformer 可以二值化、可以训得收敛、可以部署到端侧。但又留下两个新坑：
+
+1. *只在 BERT 这种小模型上跑通*：100M 量级。等 LLM 起来（7B、70B），这套方法的训练成本和精度退化都撑不住
+2. *仍然只有 FPGA/ASIC 验证过加速*：GPU 跑不动二值化的 MatMul
+
+下一代要解决的就是：*怎么在 LLM 规模上做二值化？以及怎么在 GPU 上跑出真加速？*
+
+** 2023 | BitNet: 第一次把"1-bit"摆到 LLM 的桌面上
+
+*** 它看到了什么问题
+
+GPT-3、LLaMA 起来以后，模型动辄 7B-70B 参数。一个 70B 模型 FP16 是 140GB，单张 H100 都塞不下。这时候量化的 ROI 比小模型时代高 100 倍。但 BinaryBERT 那套是后训练或量化感知微调，套到 70B 上巨贵且掉点严重。
+
+*BitNet* (Wang et al., 2023) 的关键观察：与其后训练再压缩，*不如从头就用 1-bit 训 LLM*。让模型一开始就适应二值化的世界。
+
+*** 它的解法
+
+把 Transformer 里所有的 nn.Linear 替换成 *BitLinear*——前向时把权重做 sign 取 +/-1，反向时用 STE。激活保留 INT8（8 bit）。在训练时引入 LayerNorm 让梯度稳定。
+
+整套架构叫 BitNet。模型大小直接砍到 FP16 的 1/16，理论计算能力翻 16 倍。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+证明了 LLM 可以从头用 1-bit 训练，精度比"后训练量化到 1 bit"好很多。但坑也清楚：
+
+1. *权重砍到 ±1 表达力还是不够*：跟 FP16 baseline 比还是差不少。能不能多留个 0？
+2. *激活还是 INT8*：真正的计算瓶颈在 MatMul，激活不压下去，省的只是显存不是算力
+3. *没有 GPU kernel*：1-bit weight x INT8 activation 这种 dtype 组合，cuBLAS/cuDNN 根本不支持。实际加速只是理论值
+
+下一代很快就来补第一个坑。
+
+** 2024 | BitNet b1.58: 多给一个"零"，精度回血
+
+*** 它看到了什么问题
+
+BitNet 把权重砍到 ±1，但 Transformer 里很多权重本来就该是"几乎为零"——把它们强行抬到 ±1 是注入了噪声。能不能让权重多一个值，就是 0？
+
+这件事看起来微不足道：三个值（-1, 0, 1）vs 两个值（-1, 1），不就多一个 token？但带来的代价是：每个权重要 log2(3) ≈ 1.58 bit 而不是 1 bit。所以叫 *b1.58*。
+
+*** 它的解法
+
+把 BitNet 的 sign 函数改成 *RoundClip*：先用 absmean 归一化，再 round 到最近的 {-1, 0, 1}。其它都跟 BitNet 一样。
+
+实验里这一改让 3B 模型直接追平 FP16 LLaMA。论文一发出来轰动业内："1.58-bit LLM 已经能和 FP16 打平手了"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+多一个 0 让模型可以"自然稀疏"，跟 Transformer 权重的真实分布对齐。但留下的坑变得更刺眼：
+
+1. *激活仍然是 INT8 甚至 FP16*：所有 W1.58 工作的真实推理成本，瓶颈都在激活
+2. *没有真实可用的 GPU kernel*：BitNet b1.58 的论文里报告的 speedup 都是理论值或 FPGA 上的数字。在 NVIDIA GPU 上跑实际推理，速度跟 FP16 几乎一样
+3. *为什么不顺手把激活也砍下去？* 因为激活是动态的、运行时才产生的，bitpack 一个激活张量是非常重的开销，得不偿失
+
+下一代要么解决"激活也压下去"，要么解决"GPU 真加速"。事实上 BWTA 是同时解决了这两个。
+
+** 2023-2024 | DB-LLM / PB-LLM / BiLLM: 走另一条路，后训练压到 1 bit 附近
+
+*** 它看到了什么问题
+
+BitNet 系列是"从头训练"，要烧几百卡时。可是世界上已经有几百个开源 LLM 训好了，能不能直接对一个已经训好的 LLaMA-7B 做后训练量化、压到接近 1 bit？
+
+挑战是：直接对训好的权重做 sign 函数，掉点掉到不能用。
+
+*** 它的解法
+
+三条不同的招：
+
+1. *DB-LLM* (Chen et al., 2024)：用 *两个 1-bit 矩阵的乘积*近似一个 FP 权重。$W \approx \alpha (B_1 \cdot B_2)$，两个 binary 矩阵叠加起来比单个 binary 表达力强很多。代价是计算量翻倍
+2. *PB-LLM* (Yuan et al., 2024)："Partially Binarized"——把权重分两组，最重要的 ~5% 保留高精度（FP16/INT8），剩下 95% 做纯 binary。基于"少量显著权重承担大部分信息"的观察
+3. *BiLLM* (Huang et al., ICML 2024)：把权重的"显著部分"用二阶残差近似（也是 binary），不显著部分做结构化分组二值化。平均 bit 数压到约 1.1
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+证明了不用从头训练，也能把已有 LLM 压到 1 bit 附近。但和前面的炸弹是同一颗：
+
+1. *仍然 weight-only*：激活全部 BF16/INT8，运行时计算瓶颈没动
+2. *推理用的还是通用 GEMM kernel*：把 1-bit 权重 dequantize 成 FP16 再走 cuBLAS——省了显存，但浪费了 1-bit 结构本可以带来的计算加速
+3. *kernel 这条路被回避了*：FPGA/ASIC 上 W1A1 早就能跑出 30x 加速，但在 GPU 上没人做得动
+
+至此，整条河走到 2026 年初的状态：*权重侧的招用尽了，激活和 kernel 这两个坑没人填*。BWTA 正好填这两个坑。
+
+** 2026 | BWTA: 第一次把"激活也砍下去 + GPU 真加速"同时做到
+
+*** 它看到了什么问题
+
+把前面所有工作摊在桌子上，BWTA 团队看到的事实是：
+
+- 权重: 1 bit 或 ternary，已经做得很彻底
+- 激活: 还是 INT8/FP16，"另一半"完全没动
+- GPU kernel: 没有，所有 speedup 数字都不真实
+
+最关键的洞察：*为什么没人压激活？* 是因为激活的分布特别难——尤其是注意力输出，是大量小值聚集在零附近的幂律分布。粗暴二值化 ({-1, +1}) 会把零附近的小值劈成两半，引入巨大的 *zeropoint distortion*（零点失真）。
+
+如果给激活多留一个 0，让它变成 ternary {-1, 0, 1}——就像 BitNet b1.58 对权重做的——是不是就能压下去了？
+
+*** 它的解法
+
+三块拼图：
+
+1. *BWTA scheme*：权重 binary {-1, +1}，激活 ternary {-1, 0, +1}。激活中的小值（|x| < 0.5）压到 0，保住零点附近分布
+2. *Smooth Multi-Stage Quantization*：训练时不一次砍到 ternary，而是从 bitwidth k=9 开始（512 个 level），按 *levelwise* 线性递降到 k=3 (8 level), 2 (ternary)。每次过渡用一个 *Magnitude-Alignment Projection Factor* 把幅度对齐，防止 loss 突然爆掉
+3. *BWTA MatMul CUDA Kernel*：自己写 CUDA。两个关键组件：
+   - *Instruction-level Parallel Bitpack*：用 mov/and/shr 等位指令在 GPU register 里实时把 FP16 激活打包成 binary/ternary bitstream
+   - *Comprehensive MatMul Implementations*：linear 是 W{-1,1} x A{-1,0,1}，attention 还有两种变体（Att x V, Q x K），三种 case 各有不同的位运算组合 (mma.xor / mma.and)
+   - 用 NVIDIA Tensor Core 的 bitwise mma 指令真正执行 1-bit 矩阵乘
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把过去十年没填上的两个坑一起填了：
+
+- BERT 上 GLUE 平均掉 3.5%（5 个 task 掉 <2%），LLM 上 perplexity 持平
+- kernel 级 16-24x speedup vs FP16，端到端 prefill 216-330 tokens/s
+- 跟 SOTA W1A8 比也明显快，因为激活那一半的位宽真的砍下去了
+
+留下的新坑：
+
+1. *Ternary 还是离 1 bit 有距离*：激活是 ~1.58 bit，不是真 1 bit
+2. *训练流程很重*：multi-stage 还要蒸馏，比简单 PTQ 贵很多
+3. *只在 BERT + 2B 量级 LLM 验证*：70B+ 的效果还没数据
+4. *Decode 阶段加速 (12-15 tok/s) 不如 prefill*：因为 decode 是 memory-bound，kernel 加速主要在 compute-bound 的 prefill
+
+* 前沿延伸
+
+截至 2026-05，BWTA 仍然是这条线上把"binary weight + sub-int8 activation + GPU 真加速"三件事一起做成的最新工作。可以看到的下一步压力：
+
+- *把激活进一步压到 binary*：W1A1 在 GPU 上有没有可能？理论 32x 加速，但精度坎可能不可逾越
+- *更大的 LLM 验证*：70B、Mixtral 这类 MoE 上能不能复现？
+- *Decode 加速*：BWTA 的 prefill 飞起来了，但生成阶段还是被 memory bandwidth 卡住。需要更激进的 KV cache 量化方案
+- *和稀疏化的合流*：weight 已经 binary 了，再加上 N:M 稀疏会怎样？两条压缩路径会不会撞车
+- *训练时直接 BWTA*：现在还需要 multi-stage + distillation，能不能像 BitNet 那样从头一步训出 BWTA？
+
+这些都是 2026-2027 这条线最可能的去处。
+
+* 一张图看懂
+
+#+begin_example
+                   权重位宽 (W)       激活位宽 (A)       GPU加速      验证规模
+                   ----------------   ---------------    ---------    ---------
+[2016] BinaryConnect   1 bit            FP32              FPGA only    small CNN
+[2016] XNOR-Net        1 bit            1 bit             FPGA only    ResNet-18
+                       |
+                       | "搬到 Transformer 试试"
+                       v
+[2021] BinaryBERT      1 bit            1 bit             FPGA only    BERT-base
+[2022] BiBERT          1 bit            1 bit             FPGA only    BERT-base
+                       |
+                       | "LLM 规模呢？从头训"
+                       v
+[2023] BitNet          1 bit            INT8              not real     up to 3B
+                       |
+                       | "权重多留个 0"
+                       v
+[2024] BitNet b1.58    1.58 bit (3值)   INT8/BF16         not real     up to 3B
+                       |
+                       | "对已训好的模型做 PTQ"
+                       v
+[2024] DB-LLM          2 x 1 bit        BF16              dequant-GEMM 7B-70B
+[2024] PB-LLM          ~95% 1bit + 5% hi  BF16            dequant-GEMM 7B-70B
+[2024] BiLLM           ~1.1 bit         BF16              dequant-GEMM 7B-70B
+                       |
+                       | "激活那一半呢？kernel 呢？"
+                       v
+[2026] BWTA            1 bit            1.58 bit (3值)    YES (16-24x) BERT + 2B LLM
+                                                                       ^
+                                                                       |
+                                          第一次三件事同时做到 ---------+
+
+  压缩路径从「权重」单侧推进，转向「权重 + 激活 + kernel」三件套
+  bitwidth 演化的真正阻力不是数学，而是 GPU 没指令、激活分布不友好
+#+end_example
+
+* 洞见
+
+读完这条十年的演化线，能看到几件比"算法越来越好"更底层的事情：
+
+1. *瓶颈轮换*——每一代解决的问题，恰好是上一代刚显露出的瓶颈。CNN 时代解决"小模型能不能 1-bit"，BERT 时代解决"Transformer 能不能 1-bit"，BitNet 解决"LLM 能不能从头 1-bit"，BWTA 解决"激活和 kernel 能不能跟上"。每一代都不是把上一代推翻，而是把它没敢碰的那一块捡起来
+
+2. *硬件指令是隐藏的引力*——这条河的真正阻力不是算法（早在 2016 就有 W1A1），而是 NVIDIA GPU 长期没有原生 1-bit MMA 指令。直到 Tensor Core 加入 bitwise mma，BWTA 才有可能把"理论 16x"变成"实测 16x"。所以算法的去向，本质上被硬件的能力天花板拽着走
+
+3. *"多留一个零"是反复出现的母题*——权重从 binary {-1, 1} 进化到 ternary {-1, 0, 1} (BitNet b1.58)；激活从 binary {-1, 1} 进化到 ternary {-1, 0, 1} (BWTA)。中间那个 0 看起来微不足道，但因为它对应 Transformer 中真实的"小值聚集在零附近"的分布，反复救场。下一个可能的母题：*为不同分布定制不同 level 数*
+
+4. *Weight-only 是一个虚假的舒适区*——2023-2024 大批 weight-only 工作（GPTQ, AWQ, BiLLM 等）拿到了漂亮的 perplexity 数字，但激活那一半没动，实际推理瓶颈没缓解。BWTA 的出现意味着这个舒适区到头了——下一代必须把激活也压下去
+
+下一步往哪走？最可能的方向：
+
+- *W1A1 真上车*：激活 binary，全栈 1-bit，理论 32x。可能要付出训练范式的彻底改变
+- *KV cache 也 ternary*：现在 KV cache 是推理时 memory 大户，砍下来直接放大 decode 加速
+- *MoE + 二值化*：稀疏路由 + 二值化矩阵，可能是 trillion-scale 模型的唯一出路
+
+* 启发
+
+这条河给"怎么找研究问题"的启发：
+
+1. *看清楚一条线的"剩下的坎"*——不是去发明全新的方向，而是把这条河里上一代回避的那个具体问题（"激活为什么没人压"、"GPU kernel 为什么没人写"）捡起来。BWTA 不是一个炫技的新方法，而是把别人不愿意啃的硬骨头啃了
+
+2. *算法-硬件 co-design 不再是可选项*——只做算法，speedup 是空中楼阁；只做 kernel，找不到合适的 dtype。BWTA 必须同时做两件事才能成立。这意味着：今后做模型压缩，必须从一开始就同时考虑"这个 dtype 在 GPU 上能不能跑得动"
+
+3. *不要被 SOTA 数字麻痹*——BitLLM 系列报的 speedup 大多是"理论值"或"FPGA 上的值"。BWTA 第一次诚实地报"真实 GPU 上的 wall-clock speedup"。这种诚实在卷王领域反而是最稀缺的资产
+
+落点在"能用"：这意味着你可以——
+
+- 把 BWTA kernel 直接套到你训好的 LLM 上做推理加速（github.com/yifu-ding/BGEMM-CUDA）
+- 在自己的领域里找类似"被回避的另一半"——比如 KV cache 没压、optimizer state 没压、gradient 没压
+- 做算法时主动问自己："这个 dtype 在主流硬件上有 mma 指令吗？没有的话，我的 speedup 数字是不是假的？"
+
+注：本文中关于早期 BinaryBERT / BiBERT、以及 DB-LLM / PB-LLM / BiLLM 三篇 PTQ 工作的具体年份和细节，基于 BWTA 论文 Related Work 章节的引用关系整理；如需精确实验数字请回查原始论文。

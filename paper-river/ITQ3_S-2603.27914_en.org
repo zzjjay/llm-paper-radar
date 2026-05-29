@@ -1,0 +1,372 @@
+#+title:      ITQ3_S: High-Fidelity 3-bit LLM Inference via Interleaved Ternary Quantization with Rotation-Domain Smoothing
+#+date:       [2026-05-28 Thu 19:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T190000-en
+#+source:     https://arxiv.org/abs/2603.27914
+#+authors:    Edward J. Yoon
+#+venue:      arXiv 2026-03-31 (cs.LG)
+
+* The Problem River
+
+A 70B-parameter LLM requires 140 GiB of memory in FP16 — more than the 32 GiB VRAM of an RTX 5090. Running it on a consumer GPU means compression is mandatory. Compressing to 4-bit is still manageable, but compressing to 3-bit — which everyone calls the "logic collapse point" — causes perplexity to explode and multi-step reasoning to break down entirely.
+
+Why is 3-bit so hard? Because LLM weights are not well-behaved bell curves; they have *outliers*: most weights are small, but a handful take on wildly large values. 3-bit offers only 8 quantization levels to cover this wide dynamic range, so the spacing between levels becomes so large that any outlier gets mapped catastrophically wrong.
+
+The entire history of LLM quantization research is, at its core, a single problem in different disguises: *how do you deal with outliers?* Early approaches stored them separately from normal weights (mixed precision); later methods used Hessians to guide rounding; then suddenly someone realized — instead of trying to *tolerate* outliers, why not *eliminate* them first? Rotate the weights so that outlier energy is spread across all dimensions, and the distribution flattens out.
+
+ITQ3_S is the latest installment in this "rotation school" lineage: it *fuses* the Fast Walsh-Hadamard Transform (FWHT) directly *into a CUDA kernel*, allowing 3-bit ternary quantization to achieve FP16-level perplexity on an RTX 5090 for the first time.
+
+* Source Map
+
+#+begin_example
+[2022.08] Dettmers et al. -- LLM.int8()
+  |
+  | First systematic discovery: LLM weights/activations contain outlier channels
+  | Solution: split outliers out to run in FP16; everything else uses INT8
+  |           (mixed precision)
+  | Remaining pit: split-and-merge requires scatter-gather; slow on consumer GPUs
+  v
+[2022.10] Frantar et al. -- GPTQ
+  |
+  | Identified problem: LLM.int8() keeps outliers in FP16 — it sidesteps,
+  |                     not solves, the issue
+  | Solution: use Hessian (X^T X) second-order info to guide rounding; spread
+  |           outlier-induced error onto surrounding unquantized weights as
+  |           compensation
+  | Remaining pit: 4-bit fine, but 3-bit degrades sharply — Hessian compensation
+  |               cannot rescue the fundamental error that outliers cause within
+  |               3 bits
+  v
+[2023.07] Chee et al. -- QuIP
+  |
+  | Identified problem: instead of fighting outliers in the original weight
+  |                     space, why not first "wash" the weights into a uniform
+  |                     distribution?
+  | Solution: before quantization, multiply the weight matrix on both sides
+  |           by random orthogonal matrices U and V so that
+  |           W' = U W V^T becomes "incoherent" (no directional bias);
+  |           outlier energy is scattered across all dimensions
+  | Remaining pit: random orthogonal matrices are expensive to store and compute;
+  |               matrix-vector multiply is O(n^2)
+  v
+[2024.02] Tseng et al. -- QuIP#
+  |
+  | Identified problem: QuIP's random orthogonal rotation is large and slow;
+  |                     not deployment-friendly
+  | Solution: replace with Randomized Hadamard Transform — Hadamard matrix
+  |           entries are all +/-1, so matrix multiply reduces to additions;
+  |           FWHT drops complexity from O(n^2) to O(n log n);
+  |           pair with E8 lattice codebook to further reduce perplexity
+  | Remaining pit: rotation is used but still as a "preprocessing" step —
+  |               quantization and dequantization are separate; not fused
+  |               into the GPU inference kernel
+  v
+[2025-2026] (TurboQuant line) -- rotation-domain adaptive quantization
+  |
+  | Identified problem: QuIP# applies rotation to weights and activations, but
+  |                     KV cache quantization and weight quantization are handled
+  |                     separately; in a stacked transformer, "which domain to
+  |                     compute in" can misalign across layers
+  | Solution: introduce FWHT rotation as an *adaptive* operator; give outlier
+  |           suppression a strict theoretical upper bound
+  | Remaining pit: paper provides theory but *no CUDA kernel*. Naive impl:
+  |               KV cache in rotation domain, weights in original domain;
+  |               cross-layer domain mismatch accumulates error that ends up
+  |               worse than a plain 3-bit baseline
+  v
+[2026.03] Yoon -- ITQ3_S  <-- this paper
+  |
+  | Identified problem: TurboQuant's rotation idea is correct, but
+  |                     undeployable in practice; also, llama.cpp's widely-used
+  |                     3-bit format IQ3_S has no rotation and its perplexity
+  |                     is dragged down by outliers
+  | Solution: *weld* FWHT rotation into the CUDA dequantization kernel of the
+  |           concrete IQ3_S format — weights are offline FWHT'd in 256-point
+  |           blocks then ternary-quantized; at inference time the 256-point
+  |           IFWHT is *fused* into the MMQ kernel's shared-memory loading
+  |           stage, adding no extra global-memory round trips; because H is an
+  |           isometry, the inverse transform introduces no additional error;
+  |           reconstruction error is determined solely by the ternary grid
+  v
+[2026+] (future) ...
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022.08 | LLM.int8(): The First Admission That "Outliers Must Be Handled Separately"
+
+*** What Problem It Saw
+
+Before 2022, everyone was doing quantization on CNNs and ViTs, where INT8 ran stably. When the same recipe was applied to LLMs, models above 6.7B parameters crashed immediately on INT8 with exploding perplexity. Nobody understood why.
+
+Dettmers et al. examined the distributions of weights and activations, and found a counterintuitive phenomenon: certain *channels* in LLMs (roughly 0.1% of feature dimensions) had activations that were *systematically* more than 20× larger than other channels. The INT8 scale for the entire layer was dragged up by these outlier channels, compressing ordinary channels to nearly zero precision on the INT8 grid.
+
+This was the first time "outliers" were named as the *central conflict* in LLM quantization.
+
+*** Its Solution
+
+Simple and blunt: *mixed precision*. Dynamically detect outlier channels in each layer, pull them out and run them in FP16; run the other 99.9% of channels in INT8. Sum both parts at the end.
+
+Result: a 175B model runs in INT8 with no quality loss.
+
+*** Why This Worked (and What New Pit It Dug)
+
+It didn't *solve* the outlier problem — it *sidestepped* it. If these channels have values too large for INT8, simply don't force them into the INT8 grid; keep them in FP16.
+
+Remaining pits:
+
+1. *Scatter-gather is slow.* Every layer must extract 0.1% of channels and re-insert them. Tolerable on datacenter GPUs with NVLink; the overhead is enormous on consumer GPUs.
+2. *Doesn't extend to 3-bit.* Applying the same idea at 3-bit means outliers stay in FP16 while the rest squeeze into 3 bits — but at 3 bits those other channels have 32× less grid room than INT8, and the same grid-spacing problem immediately breaks things.
+3. *Fundamentally symptomatic.* Splitting out outliers doesn't eliminate them; you're just avoiding touching them in INT8. True outlier suppression had not yet been attempted.
+
+The next paper, GPTQ, took a different path: don't split the outliers — instead, *compensate* for the error they cause.
+
+** 2022.10 | GPTQ: Use the Hessian to Spread Outlier Error to Neighbors
+
+*** What Problem It Saw
+
+LLM.int8() solved "INT8 can run large models," but INT8 gives only 2× memory compression. Real deployment needs 4-bit or lower. So how do you handle outliers at 4-bit?
+
+Frantar et al. approached the problem from the OBS/OBC Hessian-based lineage. Their logic: outliers mean certain weights will inevitably be quantized poorly, but *as long as the remaining weights adjust accordingly*, the layer's output can still match the original.
+
+*** Its Solution
+
+Frame quantization of each layer as a *reconstruction problem*:
+
+  min |X W_hat - X W|^2,  s.t.  W_hat ∈ 3-bit grid
+
+where X is calibration data. The Hessian of this quadratic objective is X^T X — independent of the weights, fixed, cacheable.
+
+GPTQ processes weights column by column: quantize one column → compute the error from snapping to the grid → spread that error via the Hessian to columns not yet quantized, nudging them *slightly in the opposite direction* to compensate. Scan left to right, column by column.
+
+Result: 175B model quantized to 4-bit in a few hours, with barely any perplexity drop. The entire LLM PTQ field gained a default baseline.
+
+*** Why This Worked (and What New Pit It Dug)
+
+GPTQ swapped LLM.int8()'s "run outliers in FP16" for "outliers get quantized too, but the Hessian helps compensate." Works well at 4-bit — because the grid is still dense, per-weight quantization error is small, and compensation converges stably.
+
+Remaining pits:
+
+1. *Compensation fails at 3-bit.* 3-bit has only 8 levels; the grid spacing is more than twice that of 4-bit. Outlier-to-grid error is large enough that propagating it forward only makes subsequent columns catastrophically wrong too.
+2. *Root cause untouched:* the *shape* of the weight distribution hasn't changed. Outliers are still there; you're just trying to compensate for their impact after quantization. At sub-4-bit, the shape itself is the unbearable burden.
+3. *Column-greedy:* column-order-sensitive, with error accumulating along columns (a pit that later ADMM-Q work addressed).
+
+GPTQ pushed "fighting outliers in the original weight space" to its limit — and hit the ceiling. The next paper thought in reverse: *can we change the shape of the weight distribution before quantizing?*
+
+** 2023.07 | QuIP: Rotate the Weights and the Outliers Disappear
+
+*** What Problem It Saw
+
+GPTQ's collapse at 3-bit showed that *compensation* has an upper bound. Chee et al. changed perspective: suppose weight matrix W had no outliers — quantization would be much easier. Is there a *lossless* transform that turns an outlier-heavy W into an outlier-free W'?
+
+Linear algebra has always known: outliers in a matrix are *coordinate-system-dependent*. The same matrix, viewed in a different orthogonal basis, has an entirely different distribution of element magnitudes. A single very large element, once you rotate the coordinate system, gets spread across many moderate-sized elements.
+
+If the rotation matrix U is *orthogonal*, then U^T U = I and the multiply is invariant — meaning W X can equivalently be written as (U^T)(U W)(X): store U W as the new weights, and at inference time simply prepend a multiplication by U^T.
+
+*** Its Solution
+
+QuIP proposes *incoherence processing*: before quantization, multiply the weight W on both sides by *random* orthogonal matrices U and V:
+
+  W' = U W V^T
+
+Theoretical analysis proves that after random orthogonal rotation, W' elements are *with high probability* "incoherent" — no direction carries an unusually large component; outlier energy is spread uniformly across all dimensions. Uniform quantization applied at this point yields much smaller error.
+
+At inference time, the input must be multiplied by V and the output by U^T to realign — in attention rotation this can be absorbed without extra FLOPs.
+
+QuIP at 3-bit substantially outperforms GPTQ, making 3-bit LLMs look "not impossible" for the first time.
+
+*** Why This Worked (and What New Pit It Dug)
+
+The essential difference *in one sentence*: GPTQ tries to recover after outliers appear; QuIP *erases outliers first*, then quantizes. This is the pivot from symptomatic treatment to addressing the root cause.
+
+Remaining pits:
+
+1. *Random orthogonal matrices are heavy.* A random orthogonal matrix of size 4096×4096 alone takes 64 MB to store, and multiplying by it is O(n^2). Done at every layer, this overhead exceeds the speed gains from quantization.
+2. *The guarantee is "with high probability."* In practice, results jitter across runs — not ideal for stable deployment.
+3. *Incompatible with existing kernels.* There is no way to integrate the "U^T (W' x)" chain into an existing GEMM kernel; it requires a separate launch.
+
+The rotation idea was right, but "random orthogonal matrix" was too blunt a tool. The next paper came to replace it.
+
+** 2024.02 | QuIP#: Replace Random Rotation with Hadamard; Complexity Drops Immediately
+
+*** What Problem It Saw
+
+QuIP proved rotation works, but choosing a *random* orthogonal matrix was an engineering disaster. Is there a *structured* orthogonal matrix that scatters outliers just as well, yet is cheap?
+
+Digital signal processing has had the answer for decades: the *Hadamard matrix*. Its entries are all +1 or -1, so matrix-vector multiply uses only additions and no multiplications; and the *Fast Walsh-Hadamard Transform (FWHT)* runs in O(n log n), vastly faster than O(n^2).
+
+*** Its Solution
+
+QuIP# replaces QuIP's random orthogonal matrix with a *Randomized Hadamard Transform*: multiply random sign diagonal matrices on both sides of the Hadamard matrix, preserving the structural speed advantage while retaining the randomness needed for incoherence guarantees.
+
+Engineered as a butterfly FWHT, this runs extremely fast on GPU. Combined with a better codebook (E8 lattice quantizer replacing uniform quantization), sub-4-bit perplexity is further reduced.
+
+Result: several times faster than QuIP, nearly matching FP16 at 4-bit, and a large further step forward at 3-bit.
+
+*** Why This Worked (and What New Pit It Dug)
+
+Replacing an *arbitrary orthogonal matrix* with a *Hadamard matrix* is mathematically equivalent (both are isometries; both establish incoherence), but engineeringly it is the leap *from undeployable to deployable*.
+
+Remaining pits:
+
+1. *Rotation and quantization are still two separate steps.* QuIP#'s inference flow: input → multiply Hadamard → MMQ kernel → multiply Hadamard^T → output. Two independent CUDA launches for FWHT, each with overhead, and data has to make a global-memory round trip in between.
+2. *Only weight rotation; KV cache outliers are untouched.* Transformer inference also has KV cache outlier issues; QuIP# ignores them.
+3. *Codebook lives in a software library*, not engineered toward a GPU-friendly concrete format like 3-bit ternary.
+
+The rotation tool was now much better, but "welding it into the inference kernel" had still not been done. The TurboQuant line began moving in that direction, but only got as far as "theoretically feasible."
+
+** 2025 | TurboQuant: A Rigorous Theory for Rotation-Domain Quantization, but No CUDA Kernel
+
+*** What Problem It Saw
+
+QuIP# proved FWHT rotation is useful, but in the transformer inference pipeline it only covered *weights*. In real deployment, KV cache quantization is a separate battlefield — and KV cache outliers are even more severe than weight outliers (attention head variance spans several orders of magnitude across heads).
+
+Applying FWHT rotation *simultaneously* to weights and KV cache should suppress outliers in both. But doing it naively causes problems: if weights are computed in the *rotation domain* and KV cache is also in the *rotation domain*, but nonlinearities like RoPE and LayerNorm sit in between — the moment any layer's domain becomes misaligned, errors start accumulating.
+
+The TurboQuant line attempted to describe "which domain to compute in" with a *unified framework*: treat FWHT as a rotation operator whose block size can be chosen *adaptively*, derive strict per-layer upper bounds on outlier suppression, and give the domain-switching between rotation and original space a precise algebraic language.
+
+*** Its Solution
+
+Theoretically derived: for any W ∈ R^n, after FWHT the expected value of ||H W||_inf converges as O(σ · sqrt(log n)) (this is the content of ITQ3_S's Theorem 1). This gives a concrete upper bound on "how small rotation can make the outliers." It also characterizes quality-speed tradeoffs for different block sizes (64/128/256/512).
+
+*** Why This Worked (and What New Pit It Dug)
+
+Upgraded QuIP#'s "Hadamard rotation is effective" to "how much the Hadamard rotation suppresses outliers and at what block size it is optimal." The mathematical language became more precise.
+
+Fatal remaining pits:
+
+1. *No CUDA kernel.* The entire paper is mathematics and PyTorch experiments; it cannot be run directly in inference engines like vLLM or llama.cpp.
+2. *The domain-mismatch trap.* If you try to jam TurboQuant's rotation into an existing quantization scheme (e.g., GPTQ or IQ3_S), the typical shortcut is to rotate only the KV cache and leave weights in their original domain. The ITQ3_S paper explicitly shows that stacking layers this way accumulates error to the point of being *worse than a plain 3-bit baseline*.
+3. *No interface to production formats.* llama.cpp users deploy 3-bit models in formats like IQ3_S; TurboQuant has no connection to them.
+
+At this point the rotation idea was mature, but "welding it into a real, deployable 3-bit format" was still one step away. That step is ITQ3_S.
+
+** 2026.03 | ITQ3_S: Fuse the FWHT Inverse Transform into CUDA Shared-Memory Loading
+
+*** What Problem It Saw
+
+Listing the accumulated pits:
+- QuIP/QuIP#: rotation and quantization are two separate kernels, requiring an extra global-memory round trip.
+- TurboQuant: provides a theoretical upper bound, but *naive assembly* (KV cache rotated + weights in original domain) causes cross-layer domain mismatch that makes quality worse than a plain 3-bit baseline.
+- llama.cpp's IQ3_S format: already widely deployed in production, but has no rotation and suffers from outlier drag.
+
+The core problem Yoon identified: these three lines must *merge*. Without merging, the benefits of rotation never reach deployment.
+
+*** Its Solution
+
+ITQ3_S makes everything a *single fused kernel*. Three things must be co-designed:
+
+1. *Offline quantization stage:* slice weights into 256-element blocks; apply FWHT to each block; quantize with ternary {-1, 0, +1}, assigning a per-block scale d_k and zero-point z_k. Critically, ternary quantization must be applied *in the rotation domain*, because only there does W' = H W approach a Gaussian distribution, making the ternary grid a good fit.
+
+2. *Interleaved 3-bit packing:* interleave the bit strings of two ternary sub-blocks into 32-bit words, allowing the GPU's DP4A (4-way INT8 dot product) instruction to consume 4 weights at once, while presenting the Tensor Core scheduler with a well-aligned memory layout. This step is specifically tailored to the RTX 5090 (Blackwell) hardware.
+
+3. *Online dequantization kernel:* this is the true contribution. The matrix-vector-quantized (MMVQ) kernel for inference is rewritten so that: 3-bit data is moved from global memory to shared memory → *256-point inverse FWHT (IFWHT) is performed in-place in shared memory* → dot product with activations. The IFWHT runs entirely on-chip, with no additional global-memory round trip.
+
+A key algebraic property guarantees this is lossless: H is an isometry (||H v|| = ||v||), so the norm of H^{-1}(q − H w) equals the norm of q − H w. The inverse transform introduces *no additional error*; reconstruction error is strictly determined by the ternary grid (Theorem 2). The algebraic consistency between the offline and online stages is *proved*, not just measured.
+
+*** Why This Worked (and What New Pit It Dug)
+
+The essential difference *in one sentence*: every prior approach treated rotation as a two-piece "preprocessing + postprocessing" add-on; ITQ3_S *dissolves* the rotation into the shared-memory loading stage of the CUDA kernel, making it a "free" part of the dequantization step.
+
+Result: on the RTX 5090, 3-bit perplexity approaches FP16; throughput exceeds 4-bit by more than 1.5× (because memory bandwidth is the bottleneck for LLM inference, and 3-bit moves 25% less data than 4-bit).
+
+Remaining new pits:
+
+1. *256 is a magic number.* The current block size of 256 was chosen to match the RTX 5090's shared memory capacity, DP4A word width, and L1 cache line. Different hardware (H100, MI300) would require retuning.
+2. *Only weights are handled* — not KV cache or activations. The TurboQuant vision of "the entire transformer always in the rotation domain" has not yet been realized in ITQ3_S.
+3. *FWHT block size is locked at 256.* Suppressing larger outlier spans would require bigger blocks, but this directly conflicts with shared memory capacity.
+4. *Can FWHT be incorporated during training?* ITQ3_S is currently pure PTQ. If QAT were used to train weights toward a "rotation-domain-friendly" distribution, further gains might be possible.
+
+* Frontier Extensions
+
+ITQ3_S appeared on arXiv as v2 on 2026-03-31, two months ago. The directions this line can clearly go:
+
+- *A unified rotation-domain transformer for KV cache + weights + activations.* The entire inference pipeline operates in FWHT domain throughout; RoPE and LayerNorm are rederived. Whoever achieves this first can push sub-3-bit (W2 or even W1.58) to practical usability.
+- *ITQ2 series for 2-bit ternary.* Apply the same FWHT fusion strategy to compress the grid further to 2-bit. The challenge: larger grid spacing makes 3 ternary levels insufficient; a new codebook design is needed.
+- *Micro-format ubiquity in the Tensor Core era.* NVIDIA Blackwell's hardware-native 4-bit formats MXFP4/NVFP4 are spreading; ITQ3_S's design philosophy (fusing rotation into the loading stage) can in turn guide how the software path for these hardware formats should maximize outlier suppression.
+- *Dual implementations on AMD ROCm / TPU.* The current work is entirely tuned for the RTX 5090; AMD MI300X has a different shared memory model, requiring a redesigned packing and fusion strategy.
+
+* One Diagram
+
+#+begin_example
+                   5-Year Evolution of Outlier Suppression in LLM Quantization
+
+  Method level ^
+               |
+  Fused kernel |                                              [ITQ3_S 2026.03]
+  (rotation    |                                                  *
+   welded into |                                                  | FWHT inverse
+   kernel)     |                                                  | fused into CUDA
+               |                                                  | shared-memory
+               |                                                  | loading
+               |
+  Theoretical  |                                  [TurboQuant 2025]
+  framework    |                                       *
+  (no kernel)  |                                       | adaptive FWHT
+               |                                       | strict outlier upper bound
+               |                                       | but no CUDA kernel
+               |
+  Software     |                       [QuIP# 2024.02]
+  prototype    |                            *
+  (rotation +  |                            | Hadamard replaces random orthogonal
+   quant as    |                            | FWHT: O(n log n)
+   two steps)  |                            |
+               |          [QuIP 2023.07]
+               |               *
+               |               | random orthogonal matrix rotation
+               |               | first to "eliminate" outliers
+               |               |
+  Compensation |   [GPTQ 2022.10]
+               |       *
+               |       | Hessian compensation
+               |       | spread outlier error to neighbors
+               |       | 4-bit fine, 3-bit collapses
+  Mixed        |
+  precision    | [LLM.int8() 2022.08]
+               |    *
+               |    | outlier channels run in FP16
+               |    | everything else INT8
+               +-----------------------------------------------------> time
+
+  ---------------------- Core Cognitive Shift ----------------------
+
+  2022                2023-2024              2025-2026
+  Tolerate outliers   Eliminate outliers     Eliminate outliers
+  (split or           (scatter via           + weld into kernel
+   compensate)         rotation)             (rotation fused into
+                                              dequantization)
+
+  Question: "How do we    Question: "Can we     Question: "How do we
+  reduce the impact of    make outliers         capture rotation's
+  outliers?"              disappear?"           gains without losing
+                                                them to kernel-switch
+                                                overhead?"
+#+end_example
+
+* Insights
+
+*The real cognitive shift was "outlier" moving from "a nuisance that needs special treatment" to "an illusion caused by choosing the wrong coordinate system."*
+
+In the LLM.int8() era, outliers were treated as an intrinsic property of the weights — an objective, unavoidable nuisance. GPTQ pushed that assumption further: since outliers inevitably exist, use the Hessian to clean up the mess afterward.
+
+QuIP was the cognitive turning point: outliers are not an intrinsic property of the weights; they are a property of the *observer's vantage point*. The same matrix, viewed in a different orthogonal basis, has its outliers scattered across all dimensions. "Outlier suppression" is fundamentally "finding the coordinate system that makes the weight distribution most Gaussian."
+
+The line QuIP → QuIP# → TurboQuant → ITQ3_S answers the same question at each step — *which rotation is most useful* — but they all take "rotation is useful" as given. This is a fundamentally different worldview from the LLM.int8()/GPTQ generation.
+
+*A second deep change: from "algorithm-hardware decoupling" to "algorithm-hardware co-design."*
+
+In the GPTQ era, quantization algorithms were a math problem and kernel implementation was an engineering problem — the two could be optimized separately. QuIP# already began blurring this line (choosing a Hadamard block size of 256 because it is GPU-friendly). By ITQ3_S, the *correctness proof* of the algorithm (Theorem 2) *depends on* implementation details of the kernel (IFWHT must happen inside shared memory to preserve isometry in floating-point arithmetic).
+
+This means that future sub-3-bit quantization SOTA will not come from purely algorithmic papers, but from work that co-designs *algorithm, hardware, and format* as a trinity.
+
+*The next received wisdom waiting to be broken*: "quantize each layer independently." Every current method (including ITQ3_S) assumes layers are decoupled — each layer has its own scale, zero-point, and codebook. But once FWHT rotation spans the entire transformer, cross-layer *domain consistency* becomes the central constraint, naturally turning the whole model from "a pile of independent layers" into "a unified computation graph in a global rotation domain." Whoever takes that step will be opening the next generation of quantization paradigms.
+
+* Takeaways
+
+1. *When you hear "outliers must be handled specially," first ask: is this an intrinsic property of the data, or an artifact of the observation angle?* Over three years, the LLM quantization field made exactly this shift, and the pace of progress accelerated by an order of magnitude. Applying the same question to attention sinks, long-context degradation, and other phenomena that "look like data problems" will likely also reveal solutions where "change the coordinate system and the problem vanishes."
+
+2. *A fused kernel is the only path to realizing speed gains at low bit-widths.* 3-bit moves 25% less data than 4-bit, but that advantage only materializes when dequant + matmul are fused; the moment an intermediate global-memory trip is required (like QuIP#'s separate FWHT launch), the speed advantage is wiped out. This is precisely why ITQ3_S's "FWHT inside shared-memory loading" is the central contribution.
+
+3. *An established open-source format (IQ3_S) is an entry point, not a constraint.* Yoon did not invent a new 3-bit format; instead, he grafted FWHT onto IQ3_S — already widely deployed in the llama.cpp ecosystem — meaning the work can *immediately* flow to downstream users. Making a minimally invasive improvement to a mature, widely-deployed format has more reach than a "better" format built from scratch.
+
+4. *What this implies for you* — if you have an algorithm that is "theoretically superior but unused in practice," the first thing to do is find a format or interface that already has widespread deployment, and weld your improvement into it. Even a simple geometric observation (that some transform is an isometry) can translate into a production performance leap.

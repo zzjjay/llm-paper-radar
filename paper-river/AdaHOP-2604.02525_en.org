@@ -1,0 +1,244 @@
+#+title:      AdaHOP: Fast and Accurate Low-Precision Training via Outlier-Pattern-Aware Rotation
+#+date:       [2026-05-28 Thu 18:58]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T185803-en
+#+source:     https://arxiv.org/abs/2604.02525
+#+authors:    Seonggon Kim, Alireza Khodamoradi, Pranathi Vasireddy, Kristof Denolf, Eunhyeok Park
+#+venue:      arXiv preprint, Apr 2026 (v2: May 2026)
+
+* The Problem River
+
+Can a large language model still train reliably if every number is compressed from 16 bits down to 4?
+
+The proposition is enticing — four times less memory, more than twice the throughput, a matching drop in power bills. But seven or eight years of attempts have never quite cracked it. The root cause is a seemingly unrelated phenomenon: a handful of numbers inside the model are wildly large (called *outliers*). Pack them into the same quantization range as ordinary values and the ordinary values get crushed to near-zero noise — the model collapses immediately.
+
+The entire research river is one generation after another wrestling with these "immovable squatters": first identify them, then isolate them, then try to use mathematical rotations to flatten them out. Each move is a little smarter than the last, and each one leaves a new gap. AdaHOP is where the river has reached today.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers - LLM.int8()
+  |
+  | Finding: once an LLM exceeds 6.7B parameters, a small set of
+  |          feature channels starts to explode in magnitude.
+  |          Quantizing those extreme values together with ordinary
+  |          values in INT8 destroys the model.
+  | Fix:     detect outlier channels, route them through FP16,
+  |          route the rest through INT8.
+  v
+[2022] Xiao - SmoothQuant
+  |
+  | Problem: splitting out a FP16 path is ugly; hardware hates it
+  |          (two separate execution paths required).
+  | Fix:     multiply each activation column by a scale factor s,
+  |          transferring the "difficulty" to the weight side.
+  |          Both sides become smooth; a single INT8 kernel suffices.
+  v
+[2024] Ashkboos - QuaRot (inference quantization)
+  |
+  | Problem: scale migration tames some channels but still fails at
+  |          4-bit; it is per-channel and treats symptoms, not causes.
+  | Fix:     insert Hadamard rotation matrices around each matmul.
+  |          Mathematically equivalent (rotation is invertible), but
+  |          energy from each channel is spread across all channels.
+  |          Outliers are "diluted" — 4-bit inference finally holds.
+  v
+[2025] Ashkboos - HALO  /  Castro - Quartet
+  |
+  | Problem: QuaRot only addresses inference. Training adds gradients
+  |          as a third tensor type, and both forward and backward
+  |          passes must stay stable.
+  | Fix:     move Hadamard into training.
+  |          HALO places rotations per the heuristic
+  |          "activations → column-wise, gradients → row-wise".
+  |          Quartet uses fixed Hadamard in the forward pass and
+  |          random Hadamard in the backward pass.
+  v
+[2026] Kim et al. - AdaHOP   <-- this paper
+  |
+  | Problem: HALO/Quartet assume the same rotation direction for all
+  |          instances of the same tensor type.
+  |          But the same tensor participates in different matmuls
+  |          with different partner tensors; the optimal rotation
+  |          direction changes with the partner.
+  |          A one-size-fits-all scheme always misfires on some ops.
+  | Fix:     move the decision granularity from "tensor type" down to
+  |          "operator-pair level".
+  |          A calibration phase detects each pair's outlier pattern
+  |          (Row / Col / None), then picks one of three strategies:
+  |          Inner Hadamard Transform (IHT) / Outer Hadamard (OHT) /
+  |          Outlier Extraction (OE).
+  v
+[2026~] Future: the river is still flowing
+  As of May 2026, AdaHOP is the latest publication on this line.
+  Likely extensions point in two directions:
+  (1) make the per-pair strategy selection differentiable and
+      learned end-to-end during training;
+  (2) compress the extra high-precision OE path back down to
+      low precision.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): First Sighting of the "Squatters"
+
+*** What problem did it see?
+
+Before LLM.int8(), the conventional wisdom was that finding a good per-tensor scale was all you needed for INT8 quantization — and on small models that held up. But Dettmers et al. scaled models all the way to 6.7B parameters and discovered something strange: a small number of hidden dimensions had activations that suddenly exploded, two to three orders of magnitude above normal values. Those "squatters" shared the same INT8 dynamic range as ordinary activations; the ordinary values were crushed to nearly zero, and inference collapsed.
+
+*** Its fix
+
+If INT8 cannot hold them, stop forcing them in. LLM.int8() detects which columns are "outlier channels" at runtime during the forward pass, extracts those columns and runs them through a FP16 matrix multiply, runs the remaining columns through INT8, then merges the two results.
+
+*** Why it worked (and what new gap it left)
+
+It worked because it acknowledged a fact: outliers are not noise — they are the "dedicated channels" the model uses to encode certain critical semantics, and they must not be compressed. Route them through high precision and the problem disappears.
+
+The gap is obvious: every matmul now requires two GPU kernels, a merge, and a sync. Memory is saved but speed is partially eaten by that overhead. Worse, the approach was only viable for inference — during training, gradients change at every step, which means "which columns are outliers" also shifts, making the runtime detection cost even harder to justify.
+
+** 2022 | SmoothQuant: Moving the Difficulty from Activations to Weights
+
+*** What problem did it see?
+
+Xiao et al. found the dual-path design of LLM.int8() inelegant — hardware loves a single execution path. They noticed something useful: the outlier columns are in the activations, but the corresponding weight columns are perfectly well-behaved. All the difficulty sits on the activation side.
+
+*** Its fix
+
+Multiply each column by a scale factor s: divide activations by s, multiply weights by s. The product X·W is unchanged mathematically, but the activation outliers are flattened, and the difficulty is migrated to the weight side — which has enough redundancy to absorb it. Result: both activations and weights fit comfortably in INT8, a single kernel handles everything.
+
+*** Why it worked (and what new gap it left)
+
+SmoothQuant correctly identified that "outliers are an activation problem." The scale operation is almost impossibly simple — zero runtime overhead, all computed offline during calibration. INT8 inference became clean.
+
+But a scale is just a per-channel stretch. When you try to push from INT8 to INT4, the gap between outlier and normal values is still tens of times; stretching is no longer sufficient. The next step would need a different mathematical tool.
+
+** 2024 | QuaRot: Spreading Energy via Rotation
+
+*** What problem did it see?
+
+In the INT4/FP4 era, scales no longer worked. Even halving the activation outliers, the 4-bit dynamic range still could not contain them. QuaRot's insight was: instead of trying to suppress outliers, *scatter* them — force the energy that was concentrated in a few channels to spread evenly across all channels.
+
+*** Its fix
+
+Insert a Hadamard matrix H (an orthogonal matrix of all +1/−1 entries) on each side of a matmul. Mathematically (X·H)·(Hᵀ·W) = X·W — multiplying by H and its transpose is a no-op. But Hadamard transforms each channel into a weighted average of all channels, forcibly equalising energy across every dimension. Outliers vanish — not suppressed, but diluted into the whole tensor.
+
+*** Why it worked (and what new gap it left)
+
+The key is Hadamard's "structured chaos": it equalises energy while losing no information because it is orthogonal. Once this idea appeared, QuaRot / SpinQuant / QuIP / QuIP# / FlatQuant all flooded out, and 4-bit inference was essentially solved.
+
+But QuaRot only addressed inference. Training introduces a gradient tensor, and the data-flow paths of the forward and backward passes differ; "where to insert H, and which H" suddenly becomes a combinatorial explosion.
+
+** 2025 | HALO & Quartet: Hadamard Enters Training
+
+*** What problem did it see?
+
+Everyone wanted to take the inference Hadamard and drop it into training, but it immediately caused trouble. Training involves three tensor types — activations, weights, gradients — each of which passes through matmuls in both the forward and backward passes; six or seven matrix multiplies, each with its own outlier distribution. A single fixed Hadamard arrangement pushes down one problem only to pop up another.
+
+*** Their fixes
+
+HALO (the Ashkboos team, the same group behind QuaRot) made an empirical observation: *activation outliers tend to be column-wise; gradient outliers tend to be row-wise.* They therefore applied a left Hadamard to activations and a right Hadamard to gradients, following this heuristic.
+
+Quartet (Castro et al.) took a different path: *fixed Hadamard in the forward pass, random Hadamard in the backward pass.* The randomness provides a mathematical guarantee that gradient estimates are unbiased, avoiding training divergence.
+
+Together, these two approaches first demonstrated that MXFP4 training at the 1–3B scale could approach BF16 quality.
+
+*** Why they worked (and what new gap they left)
+
+They worked because they acknowledged that "outliers in training are more complex than in inference" and attempted to treat different tensor types differently.
+
+But the AdaHOP authors found a counterexample: *the same tensor type (say, the weight of a given layer) participates in different matmuls with different partner tensors, and the optimal Hadamard direction differs accordingly.* HALO makes its decision based on "what type is this tensor"; Quartet decides based on "is this forward or backward" — both miss the question "what are the outlier patterns of the two operands in this specific matmul?" A one-size-fits-all decision amplifies error in certain layers rather than reducing it.
+
+** 2026 | AdaHOP: Decision Granularity Down to the Operator Pair
+
+*** What problem did it see?
+
+The AdaHOP team decomposed every matmul in every layer of a Llama3.2-1B training run and produced a chart that will make readers frown: a single self_attn_o block can simultaneously exhibit weights with a None pattern, activations with a Column-wise pattern, and gradients with a Row-wise pattern — three completely distinct outlier structures. If you ask, for each matmul operator pair, "what pattern does each operand have?" you get 9 possible combinations, each requiring a different treatment. HALO and Quartet classify by "what is this tensor type," ignoring "who is it currently being multiplied with," so some fraction of matmuls inevitably get the wrong Hadamard direction.
+
+*** Its fix
+
+A two-stage approach.
+
+**Stage 1:** Use a *Coefficient of Variation* metric (standard deviation / mean), computed over the first 100 calibration steps, to classify each tensor as Row-wise / Column-wise / None. The authors show that this pattern is stable throughout training.
+
+**Stage 2:** For each of the 9 pattern-combination possibilities that a matmul operator pair can exhibit, look up a table and select a strategy:
+
+- When the partner's outlier direction aligns with "apply Hadamard along the shared inner dimension" → use *Inner Hadamard Transform (IHT)*. This is the cheapest option: the Hadamard is inserted along the k-dimension of the matrix multiply with no extra data movement.
+- When IHT does not align (e.g., both operands are Column-wise) → fall back to *Outlier Extraction (OE)*. Extract the largest rows/columns, route them through BF16, route the remainder through MXFP4, then merge. This is the old LLM.int8() trick, but it is now reserved for the minority of operators that cannot be solved otherwise.
+
+**Stage 3:** Fused Triton kernels run the BF16 outlier path and the MXFP4 residual path in parallel; on an AMD MI350 the end-to-end training is 1.46× faster than BF16.
+
+*** Why it worked (and what new gap it left)
+
+It works because it turns "which Hadamard to use" from a single global decision into a **per-operator-pair** local decision. Every matmul can be matched to the strategy best suited to it. At the same time, OE is not treated as a universal fix — OE is more expensive than IHT (it requires a BF16 path), so it is enabled only on the operators where IHT fails, preserving the overall efficiency gain of MXFP4.
+
+Gaps that remain:
+1. The current strategy selection relies on an offline calibration table, assuming patterns do not drift during training. If patterns shift (e.g., in MoE or reinforcement learning post-training), the table becomes stale.
+2. Some of the 9 combinations fall back to OE, and the more high-precision OE paths there are, the closer the system drifts back toward the two-path overhead of the LLM.int8() era. Future work will either make the table differentiably learnable or find a way to compress OE itself back to 4-bit precision.
+
+* Frontier Extensions
+
+As of May 2026 (one month after AdaHOP v2), no public paper has directly critiqued or improved upon AdaHOP. But the same cohort of researchers (the Ashkboos, Alistarh, and Hoefler groups) is advancing hardware-co-design for MXFP4 training along a parallel track (see Egiazarian 2025 et al.). The next paper in this line will likely either make strategy selection learnable end-to-end or amortise calibration cost by running it online during training.
+
+* One-Chart Overview
+
+#+begin_example
+             The River: "Outliers Ruin Low-Bit Training"
+             =============================================
+
+  Year         Problem seen               Tool used                Decision granularity
+  ----         ------------               ---------                --------------------
+  2022         Outlier activation         FP16 isolation           Channel-level (coarse)
+  LLM.int8()   channels wreck INT8            |
+                                               |
+  2022         FP16 path is ugly,             Scale migration       Channel-level
+  SmoothQuant  difficulty all on              to weights
+               activation side                |
+                                               |
+  2024         4-bit cannot hold              Hadamard rotation     Tensor-level
+  QuaRot       scales                         (inference only)
+                                               |
+                                               |
+  2025         Training has gradients;        Left/right Hadamard   Tensor-level
+  HALO         forward & backward             (heuristic rules)     (first time in training)
+  Quartet      both must be stable            Fixed/random Hadamard
+                                               |
+                                               |
+  2026         Tensor-level decisions         Pattern-aware         Operator-pair level (fine)
+  AdaHOP       miss operator-pair             IHT + OE
+               differences                    |
+                                               v
+                                          (river reaches here)
+
+   Vertical axis (tool):        scale → rotation → rotation + selective isolation
+   Vertical axis (granularity): channel → tensor → path → operator pair
+   Horizontal axis:             2022 ===================================== 2026
+
+   One dominant theme: *Accept that outliers cannot be eliminated — only relocated.*
+                       From "isolate them" to "spread them" to "choose per pair,"
+                       each generation learns to relocate them more precisely.
+#+end_example
+
+* Insights
+
+Read from end to end, this line looks like a sequence of technical upgrades (FP16 → scale → Hadamard → pattern-aware), but what is actually changing underneath is *the degree to which engineers are willing to acknowledge outliers*:
+
+- LLM.int8() treats outliers as exceptions (single them out and isolate them);
+- SmoothQuant treats outliers as movable (shift them to the other side);
+- QuaRot treats outliers as redistributable energy (rotation spreads them);
+- HALO/Quartet treat outliers as structure (distinguish by direction);
+- AdaHOP treats outliers as **dual structure** (not just a property of a tensor, but a property of that tensor *in relation to its partner*).
+
+Every generation's advance came not from inventing a new tool, but from seeing a finer geometric structure in the outliers. Outliers in LLMs were never "just a few large numbers" — they are the model using an extremely small number of dimensions to carry critical semantics. The clearer you see them, the better you know where to cut.
+
+Where will this river flow next? Two directions:
+(1) *Learn instead of hand-crafting*: replace AdaHOP's offline calibration table with a differentiable policy network and let the model learn the optimal combination;
+(2) *Training knowledge feeds back into inference*: can the pattern-aware knowledge acquired during training be turned around to give inference quantization per-operator-pair treatment as well?
+
+* Takeaways
+
+This line reads most like a story of *continuously increasing resolution* — the same problem is examined repeatedly, each generation of researchers returning with a higher-magnification microscope, each time seeing finer structure in the outliers, and each time arriving at a more precise solution.
+
+Lessons for how to find problems:
+- *Look deeper into an old problem.* "Outliers ruin quantization" has been repeated from 2022 through 2026, yet every paper that mattered brought a new *dimension of visibility* — from values to channels, to tensors, to directions, to operator pairs.
+- *Mismatches reveal the right decision granularity.* When a coarse-grained decision ("activations get column-wise Hadamard") breaks down, the tool is usually not wrong — the granularity is just not fine enough. Find the failure case → push the decision one level finer → new paper.
+- *Accept compromises; keep a fallback.* AdaHOP does not force a unified Hadamard scheme on all 9 pattern combinations. It accepts that where IHT cannot solve the problem, OE is the fallback. That is only possible because LLM.int8() exists as a proven backstop — old methods do not die, they get deployed precisely where they are needed most.

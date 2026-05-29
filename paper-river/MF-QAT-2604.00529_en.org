@@ -1,0 +1,250 @@
+#+title:      MF-QAT: Multi-Format Quantization-Aware Training for Elastic Inference
+#+date:       [2026-05-28 Thu 18:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T185440-en
+#+source:     https://arxiv.org/abs/2604.00529
+#+authors:    Zifei Xu, Sayeh Sharify, Hesham Mostafa (d-Matrix)
+#+venue:      arXiv 2604.00529, 2026-04
+
+* The Problem River
+
+In one sentence: you have trained a large model — but at deployment time, should it run in INT8, INT4, or FP4? Hardware, workload, and power costs shift every day. Can you train once, store one copy, and have it perform well at any precision?
+
+This is hard because "training-time precision" and "deployment-time precision" have long been locked together. A model trained for INT8 drops significantly when run at INT4; supporting multiple formats means training multiple models and storing multiple copies. Yet GPU/NPU precision options have been multiplying — INT4, INT8, FP4, FP6, FP8, MXINT, MXFP… A model that cannot flex across these either forces hardware vendors to bake in per-format adaptations or forces ops teams to maintain ten separate model replicas.
+
+The entire research thread is a repeated attempt to answer the same question — "train once, deploy many ways" — with progressively more elegant solutions.
+
+* Source Map
+
+#+begin_example
+[2017] Jacob et al. - Integer QAT
+  |
+  | Pain: floating-point inference is too slow and power-hungry on mobile SoCs
+  | Fix:  simulate INT8 quantization during training so the model adapts to noise
+  | Debt: one training run locks one format; 2-3 bit causes collapse
+  v
+[2020] Esser et al. - LSQ (Learned Step Size)
+  |
+  | Pain: below 4 bit, hand-picked quantization step sizes break down
+  | Fix:  treat each layer's step size as a learnable parameter, train via backprop
+  | Debt: still one training run per format; learned step only helps within that format
+  v
+[2023] Rouhani et al. - Microscaling (MX) format
+  |
+  | Pain: per-tensor shared scale is too coarse; per-element FP32 scale is too costly
+  | Fix:  one scale per small block, elements encoded in narrow integer/float
+  | Debt: good building blocks, but training pipelines are still tied to a single MX format
+  v
+[2024] Park et al. - Any-Precision LLM
+  |
+  | Pain: supported precisions keep changing; don't want to store a separate copy per format
+  | Fix:  "stack" 3/4/.../n-bit models into a shared bitplane memory with custom CUDA kernels
+  | Debt: requires special storage layout and custom kernels; uses k-means quantization, not MX
+  v
+[2026] Xu et al. - MF-QAT (this paper)
+  |
+  | Pain: Any-Precision is heavyweight (changed architecture / LoRA / custom kernels)
+  | Fix:  multi-format QAT + Slice-and-Scale conversion; one MXINT8/MXFP8 anchor checkpoint;
+  |       at inference time, slice+scale down to lower precision on demand — no retraining,
+  |       no architecture changes
+  v
+[2026] MX-SAFE / LATMiX (parallel frontiers)
+  ...
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Jacob et al.: Moving Integer Inference from Paper to Phone
+
+*** What Problem It Saw
+
+Before 2017, model deployment was essentially FP32 all the way. But mobile SoCs and embedded NPUs are unfriendly to floating-point — for the same compute budget, integer multiply-accumulate is several times faster and several times more power-efficient. Just cast a trained FP32 model to INT8 for inference? Accuracy drops badly, especially for already-tight architectures like MobileNet, which collapse after quantization.
+
+The problem was not "quantization" per se — it was that "the model never knew during training that it would eventually be quantized." It had learned a set of finicky weights in the continuous FP32 space; dropping them onto an INT8 discrete grid undid that learning.
+
+*** Its Solution
+
+Make the training process "pretend" it is already quantized. During the forward pass, insert quantize–dequantize nodes ("fake quant") that first compress weights and activations to INT8 and then restore them to FP32, so the loss function perceives the quantization error. The backward pass proceeds normally with FP32 gradients. After training, the entire graph maps 1-to-1 onto a pure integer inference graph — INT8 multiply-accumulate feeding an INT32 accumulator, INT32 biases, ReLU in the INT8 domain.
+
+This is the ancestor of every QAT variant that followed: simulate at training time, commit at inference time.
+
+*** Why It Works (and What New Debt It Created)
+
+It works because the model adapts during training to the fact that "I will eventually have to live on a grid." But the debt is clear:
+
+First, *format lock-in*. A model trained for INT8 must be retrained for INT4; the same weights cannot elastically serve multiple hardware targets.
+
+Second, *collapse at very low bit-widths*. INT8 is fine, INT4 is manageable, but at INT3/INT2 the quantization noise is so large that training simply cannot converge — the quantization function's gradient is zero almost everywhere, and Straight-Through Estimator cannot compensate.
+
+The next paper tackles the second problem.
+
+** 2020 | LSQ: Let the Quantization Step Size Learn Itself
+
+*** What Problem It Saw
+
+Jacob's QAT had a naïve element: each layer's quantization step size (scale) was fixed — computed from the weight maximum or a percentile and held constant throughout training. At INT8 this is fine, but at 2-3 bits, a step size set too large clips the high-magnitude weights entirely; set too small, it squashes nearly all weights into the bottom few bins.
+
+*Hand-picking step sizes* cannot scale to low bit-widths.
+
+*** Its Solution
+
+Treat each layer's step size $s$ as an ordinary learnable parameter and update it alongside the weights via SGD. The difficulty is that the quantization function has no true gradient with respect to $s$ (it is a staircase). LSQ gives a clean approximation: at each quantization-grid boundary, a tiny change in $s$ causes weights near that boundary to jump one bin — so the gradient magnitude is proportional to "how close are the weights to a boundary." A learning-rate scaling factor balances the update magnitude of $s$ relative to the weights, and training becomes stable.
+
+The result: ResNet at 3-bit can match the FP32 baseline.
+
+*** Why It Works (and What New Debt It Created)
+
+Intuitively: a fixed step size is a *guess*; a learned step size is *adjusted by the loss*. The loss directly tells the model where each layer is losing the most accuracy, and $s$ moves accordingly. This transforms "quantization" from a fixed pre-processing step into a part of the model itself.
+
+But LSQ is still single-format — the $s$ learned for INT3 is wrong for INT4. Change the deployment precision and everything must be retrained. The entire QAT school had not yet realized that "the format itself" could be a variable.
+
+Moreover, LSQ operates with *per-tensor* or *per-channel* scale. In the LLM era, weight tensors are enormous and increasingly long-tailed. Per-channel scale is still too coarse — a single channel can contain both outliers and tiny values that one shared scale cannot serve well. A finer-grained scaling unit is needed.
+
+** 2023 | MX (Microscaling): One Scale per Small Block
+
+*** What Problem It Saw
+
+In the LLM era, weight tensors routinely contain hundreds of millions to billions of elements. LSQ-style per-channel scale, applied to a 4096-dimensional channel, is still far too coarse — a handful of outliers inflate the channel's scale and waste 99% of the precision bins for the remaining values.
+
+At the other extreme, per-element FP32 scales give the best accuracy but explode in storage and bandwidth — effectively negating any compression gain.
+
+The gap in between: *per-block* scale. But without a standard, each vendor did its own thing and hardware could not align.
+
+*** Its Solution
+
+The OCP consortium (Microsoft, AMD, Intel, Meta, NVIDIA, Qualcomm) finalized the MX specification in 2022; Rouhani et al. provided the empirical study in 2023. The rule is simple:
+
+- Slice the tensor into blocks of length $k = 32$
+- Each block shares one 8-bit exponent (E8M0) as its scale
+- Each element within a block is encoded in a narrow integer (MXINT, 2/4/6/8 bit) or narrow float (MXFP, E2M1/E3M2/E4M3)
+
+The real value of a block element is `X * P_i`: $X$ is the shared scale, $P_i$ is the narrow element.
+
+Outliers no longer pollute an entire channel — they only affect the scale of their own 32-element block. Meanwhile, hardware can efficiently implement block-level multiply-accumulate because the arithmetic within each block is fixed-point.
+
+*** Why It Works (and What New Debt It Created)
+
+MX provides *new building blocks*. MXFP6 can be fine-tuned to match FP32; MXINT8 can be a drop-in replacement for FP32 inference. For the first time, narrow-precision training has an open standard.
+
+But this paper itself still solves a single-format problem — "can a model trained in MXFP6 serve MXFP6 inference?" It does not answer: in real deployments, the same model runs MXFP8 today, MXINT4 tomorrow, and MXFP4 the day after on a different machine. Either train $N$ models and store $N$ copies, or…
+
+The next paper attempts to answer this by "stacking" precisions.
+
+** 2024 | Any-Precision LLM: Stacking Multiple Precisions into One Memory Footprint
+
+*** What Problem It Saw
+
+Rouhani gave good building blocks, but the uncertainty of real deployment is what that paper left unanswered. Park et al. sharpen the question: in a cloud inference service, today's heavy load demands aggressive quantization (INT3) to save memory and maximize throughput; tomorrow's lighter load calls for INT5 to maximize quality. Store six separate copies of a 7B LLM — INT3, INT4, INT5, INT6, INT7, INT8? Memory explodes.
+
+*** Its Solution
+
+Park proposes "any-precision LLM." The core is a clever storage trick: *stack* quantized weights at multiple bit-widths into a single representation — an $n$-bit weight is just an $(n-1)$-bit weight with one additional least-significant bit appended. Store one $n$-bit copy; at runtime, slice out the bitplane to obtain a 3/4/…/$n$-bit sub-model, each of which is a valid quantized model. Custom CUDA kernels handle bitplane-level memory access.
+
+On the training side, the method uses k-means (cluster-based) quantization with a lightweight post-training procedure called "incremental upscaling" to keep low-bit sub-models from degrading too much.
+
+*** Why It Works (and What New Debt It Created)
+
+The elegance is "zero extra storage" — one memory footprint decodes an entire family of precisions.
+
+But the debt is visible:
+
+First, it is *tied to a special storage layout* (bitplane / nested) and *custom kernels*. It cannot be fed directly to modern NPUs that natively support MXINT/MXFP, which expect standard MX layouts.
+
+Second, it is *tied to cluster/INT quantization* and does not directly serve the MX format family (MXFP, MXINT) — which is what mainstream 2025/2026 hardware natively accelerates.
+
+Third, *architecture-level modifications accumulate*. Follow-up work (Yi 2025, Chen 2025b, etc.) introduces additional LayerNorm, LoRA adapters, and token/layer-level precision switching to keep any-precision LLMs accurate on modern architectures. The model is no longer "just that model," and the deployment stack grows heavier accordingly.
+
+In short: Any-Precision turns "elastic precision" into a *systems engineering problem*. MF-QAT wants to pull it back into a *training problem*.
+
+** 2026 | MF-QAT: One Training Run for Multiple Formats + Format Conversion Without Retraining
+
+*** What Problem It Saw
+
+The Any-Precision line (including its 2025 derivatives) pursues "one memory footprint, many precisions," but at the cost of changed architectures, custom kernels, and special storage layouts — and it does not directly consume MX formats.
+
+MF-QAT's three authors are from d-Matrix, a company that builds MX-format inference accelerators. Their practical pain points are concrete:
+
+- Our hardware natively supports MXINT (2/4/6/8 bit) and MXFP (E2M1/E3M2/E4M3)
+- Customers want the same model weights to switch precision across different SKUs and workloads
+- But they do not want the Any-Precision ecosystem of custom kernels and bitplane storage
+- Nor do they want to train $N$ models and maintain $N$ checkpoints
+
+The question becomes: can a single QAT run produce a model that also performs well on *MX formats it never saw during training*? And can a mathematically cheap format conversion slice MXINT8 down to MXINT4/2 on the fly, without retraining?
+
+*** Its Solution
+
+Two things:
+
+*Multi-format QAT.* Rather than optimizing for one format, training cycles through MXINT {2,4,6,8} and MXFP {E2M1, E3M2, E4M3} in *ascending bit-width order* (one epoch each). The reason for ascending order is that low-bit training requires large weight updates to jump quantization bins, which would destroy the fine adjustments already learned for high-bit formats if done in reverse. The result: a *single* model that, across all trained formats, is close to the precision of a separately trained single-format QAT model — and that also holds up on *formats never seen during training* (e.g., MXINT3, MXINT5, MXFP E3M3).
+
+*Slice-and-Scale (SS) format conversion.* MX formats have an understated algebraic property: the shared scale for high-precision MXINT_h and low-precision MXINT_l differs only by the `e_max(b)` term of the element format. Therefore, converting from MXINT8 to MXINT4 does not require revisiting the original FP32 tensor to recompute scales — simply multiply the high-precision block scale by `2^(b_h - b_l)`, truncate the element to fewer bits with rounding, and the result is equivalent to having quantized from FP32 directly to MXINT4. The same applies to MXFP.
+
+*Combined:* run multi-format QAT at training time; store only one MXINT8/MXFP8 anchor checkpoint; at inference time, slice down to MXINT4 or MXFP4 according to hardware needs, with "negligible or zero" additional accuracy loss.
+
+*** Why It Works (and What New Debt It Created)
+
+Why does multi-format QAT not simply degrade into a jack of all trades? The authors' explanation is that the MX format family is mathematically highly homogeneous — all members share the same block-wise scaling abstraction and differ only in element encoding (INT vs. FP) and element bit-width. The robustness a model acquires through QAT is fundamentally "robustness to quantization noise," not "specialized adaptation to one particular bin grid." Having trained on {2,4,6,8} bits, the model generalizes well to 3, 5, and 7 bits.
+
+Why is Slice-and-Scale essentially "free": in MX formats *the scale changes linearly with element bit-width*, so going from high to low precision requires no re-examination of the original data. Other quantization families (k-means, Any-Precision bitplanes) cannot claim this, because their scales are fit to the original distribution — change the bit-width and the scale changes in a completely different way.
+
+Honest remaining debts:
+
+- Experiments focus on LLM text tasks plus Qwen3-VL on ChartQA; broader multimodal/agent scenarios await validation
+- QAT uses only 128 WikiText samples; stability with larger calibration data remains to be studied
+- "The anchor format must be MXINT8/MXFP8" is a hard constraint — you cannot slice to formats lower than the anchor
+
+* Frontier Extensions
+
+This thread is still actively growing. Two parallel nearby papers:
+
+*MX-SAFE (2026-05, Park et al.)* — Rather than tackling "multiple formats," it addresses "training stability within MX formats themselves." It shows that MXFP8 E4M3 suffers severe gradient underflow during training and proposes MXSF, a format that adaptively switches between "wide mantissa (E2M5)" and "subnormal FP (E3M2)," patching a weak spot in MX training. It complements MF-QAT — MF-QAT assumes the anchor training is stable; MX-SAFE makes it more so.
+
+*LATMiX (2026-02, Arm)* — Rather than touching training, it modifies the *transform*. It applies a learnable affine transformation to activations before quantization to reduce outlier impact, generalizing traditional outlier-reduction techniques (rotation/Hadamard) to the MX format family. It also complements MF-QAT — MF-QAT solves "one set of weights, many deployments"; LATMiX squeezes out extra accuracy within any single MX deployment.
+
+The near-term direction of this thread is clear: combine *multi-format robust training*, *zero-overhead format conversion*, *MX training stability*, and *activation transforms* as independent orthogonal dimensions and probe how high the ceiling can go.
+
+* One Diagram
+
+#+begin_example
+                                       Train once → Deploy many ways
+   Time →                              ⇧ This is the target the whole thread converges on
+
+   2017       2020       2023            2024              2026
+   Jacob      LSQ        MX format       Any-Precision     MF-QAT
+   --------   --------   -----------     -------------     ----------
+Format: single single    single          multiple(overlay) multiple (multi-fmt QAT)
+        INT8  INT low-b  MXINT/MXFP      INT 3..n bit      MXINT/MXFP full spectrum
+Scale:  fixed learned    per-block       cluster centers   per-block, arbitrary width
+Store:  1 copy 1 copy    1 copy          1 copy (bitplane) 1 copy (MX8 anchor)
+Switch: retrain retrain  retrain         kernel unpack     Slice-and-Scale
+Cost:   --     --        --              arch changes +    QAT only, no arch changes
+                                         custom kernels
+
+Quant-aware → Quant-aware+learned step → Block-scale primitive → Elastic(system) → Elastic(training)
+#+end_example
+
+* Insights
+
+Reading through this thread, what surfaces is not the technical details but the evolution of a judgment: *at which layer of abstraction should a given responsibility live?*
+
+- Jacob placed "quantization" inside the training loop, but the format was still hand-chosen by the engineer.
+- LSQ placed "scale" among the learnable parameters, but the format remained fixed.
+- MX standardized "the granularity of scale" as per-block, but the training pipeline was still bound to a single format.
+- Any-Precision moved "format" entirely into the *storage layer* — physically stacking multiple copies inside one bitplane. The cost was binding to special storage and custom kernels.
+- MF-QAT pulled "format" back into the *training layer*, but with a shifted perspective: not "train a separate copy for each format," but "train one model that is robustly tolerant of quantization noise and can be cheaply downgraded to any MX sub-format."
+
+Every step asks "who should be responsible for this?" — hardware? compiler? kernel? storage format? training loop? The trend over the past five years is clear: *let the training loop shoulder more*. Only the training loop can be directly accountable for final accuracy; every other layer is only indirect.
+
+The most likely next step: pulling *runtime precision selection* into the training loop as well. MF-QAT assumes "which precision to cut to" is decided by hardware/workload; the next generation of work may let the model itself learn "what precision should this token / this layer / this head use" — making precision another internal decision of the model. Any-Precision follow-up work (ICLR 2025) is already doing token/phase-level switching; combined with MF-QAT's training-side robustness, that is the next wave.
+
+* Takeaways
+
+What this thread suggests about doing research and finding problems:
+
+First, *watch for rot at the interface*. The misalignment between "training-time format" and "deployment-time format" is not a bug — it is a research goldmine. Anywhere "what training produces" and "what is actually used" have a gap, there are papers to be written. Jacob exploited this gap, LSQ exploited it, MF-QAT still exploits it — the gap just keeps narrowing.
+
+Second, *don't reach for architecture changes first*. The Any-Precision line quickly slid toward LoRA, special BatchNorm, and custom kernels — all of which solve the problem but at huge ecosystem cost. MF-QAT's elegance lies in recognizing that "nothing actually needs to change — just change the training objective." Before adding another layer of abstraction, always ask: "Can this be solved by just changing the loss, without touching the architecture?"
+
+Third, *the algebraic properties of format families are worth mining specifically*. The Slice-and-Scale trick follows almost directly from the definition of MX formats — yet for several years nobody wrote a paper dedicated to it. When new hardware standards (MX/FP8/FP4/…) land, *the conversion properties between them* are often a plot of land nobody has cultivated. If you work on low-level inference or compilers, this is a direction that can keep yielding.
+
+The practical upshot: next time you spot a "train-time X, deploy-time Y" misalignment, ask three questions first — can the training loop optimize for both X and Y simultaneously? Is there a cheap algebraic conversion between X and Y? And does anything really need to change in the architecture, or is changing the loss sufficient?

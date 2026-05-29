@@ -1,0 +1,286 @@
+#+title:      IsoQuant: Hardware-Aligned SO(4) Isoclinic Rotations for LLM KV Cache Compression
+#+date:       [2026-05-28 Thu 18:43]
+#+filetags:   :paper:river:quantization:kv_cache:rotation:llm:
+#+identifier: 20260528T184323
+#+source:     https://arxiv.org/abs/2603.28430
+#+authors:    Zhongping Ji
+#+venue:      arXiv preprint, 2026-03-30
+
+* 问题之河
+
+长上下文推理时，KV cache 把显存吃干净——一个 70B 模型跑 128k context，单 batch 的 KV cache 就要几十 GB。把它压到 4 bit 甚至 2 bit 是必经之路。
+
+但 KV 张量直接量化会崩——每个 head 维度的分布形状千奇百怪，有几根方向方差极大（outlier channel），其他方向却扁成一线。16 个或 4 个格子撒上去，要么把 outlier 切糊，要么牺牲掉密集区。
+
+这条线的核心洞察是 *先把坐标旋转一下再量化*：用一个正交变换把方差摊平到各个维度上，量化的目标就从"被扭曲的坐标系"换成"均匀友好的坐标系"。问题就剩下一个——*这个旋转矩阵怎么搞才便宜？*
+
+- 太密：一个 d × d 的随机正交矩阵，存 d² 个数，算 d² 次乘加。对 d=128 就是 16384 个 FMA，还得在 autoregressive decode 的每一步上重算
+- 太稀：随便挑几个方向旋转，混合能力不够，量化精度回落
+- 太碎：分块旋转能省成本，但块大小不对齐硬件 SIMD/向量寄存器，再快的数学也被 layout 拖死
+
+IsoQuant 就站在这条"如何让旋转既便宜、又混得动、还和硬件对齐"的演化线最末端。
+
+* 溯源地图
+
+#+begin_example
+[~2024] 直接量化 KV (KIVI / KVQuant)
+  |
+  | 问题: outlier channel 撑大 dynamic range, 整体精度崩
+  | 解法: 校准 + per-channel scale + 非对称量化
+  |       (在原始坐标系里硬挤)
+  | 残留: 没动坐标系本身, 4-bit 以下还是吃力
+  v
+[~2025] TurboQuant
+  |
+  | 问题: 与其在歪的坐标系里调 scale, 不如先把坐标拧正
+  | 解法: dense random 正交矩阵 R 旋转 -> per-coord 标量量化
+  |       -> R^T 反旋转 + QJL 残差修正
+  |       理论上 Lloyd-Max 在旋转后的均匀分布上接近最优
+  | 残留: dense R 是 O(d^2) 存储和算力
+  |       autoregressive decode 每步一刀, latency 撑不住
+  v
+[~2026] RotorQuant
+  |
+  | 问题: dense 没必要——把它换成稀疏块状旋转, 用几何代数里的
+  |       Clifford rotor (3D 旋转的代数表达, 每块 3 个角)
+  | 解法: 把 d 维分成 d/3 个 3D 块, 每块用一个 Cl(3,0) rotor
+  |       做局部旋转。从 O(d^2) 降到 O(d)
+  | 残留: 1) 3 不整除 64/128/256 这种 power-of-two head dim,
+  |          末尾要留一个 2D 尾巴, layout 不规则
+  |       2) 3D 块只有 3 自由度, 局部混合能力有限
+  |       3) GPU SIMD 喜欢 4 的倍数, 3D 块导致 warp 利用率掉
+  v
+[2026.03] IsoQuant (本文, Zhongping Ji)
+  |
+  | 看到的问题: RotorQuant 的几何选择 (Cl(3,0)) 是数学优雅,
+  |             但跟硬件层是"互相为敌"——3 不是 2 的幂,
+  |             寄存器、tensor core、L1 cache 全围着 4/8/16 设计
+  | 解法: 把块大小升到 4D, 用四元数 (quaternion) 描述
+  |       4D 旋转。Lie 代数恰好告诉我们:
+  |             so(4) ≅ su(2) ⊕ su(2)
+  |       —— 任何 4D 旋转都能分解成左右两个独立的四元数作用
+  |             T(v) = q_L * v * q̄_R
+  |       于是给两个变种:
+  |       * IsoQuant-Full:  两个四元数都用, 全 6 自由度
+  |       * IsoQuant-Fast:  只用一边 q_L, 退化到 SO(3) 等价的
+  |                         3 自由度, 但仍在 4D layout 里
+  |       附带一个 2D 平面旋转的退化版本做对照
+  v
+[未来] 端到端 KV cache 评测 / 更高维块 / 与 W4A4 联用
+       (作者明确把这些留到 future work)
+#+end_example
+
+注：TurboQuant 和 RotorQuant 的具体引用是来自 IsoQuant 自己的 related work 段落（[1] 和 [2]），arxiv 编号未独立确认。这条"先旋转再量化"的支线从 IsoQuant 的引用结构看是清晰的，但更早的 anchor（QuIP、QuaRot 这条对称的 *权重* 量化线）和 KV cache 这条 *激活* 量化线在哪里合流，论文并没有交代清楚。
+
+* 演化叙事
+
+** ~2024 | KIVI / KVQuant: 在歪坐标系里硬扛
+
+*** 它们看到了什么问题
+
+LLM 的 KV 张量在每个 head 维度上的分布并不均匀——总有几个 channel 方差大得离谱（outliers）。4-bit 量化直接套上去，dynamic range 全被这几个 channel 撑开，其余 channel 的量化误差就被放大。
+
+*** 它们的解法
+
+不动坐标系，只在原坐标系里加补丁——per-channel 不同 scale、非对称量化、按 key/value 分别校准、把 outlier channel 单独存 FP16。本质是"识别哪些维度难对付，特殊对待"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+8-bit、6-bit 范围内够用。到了 4-bit 以下就吃力——outlier 的特殊处理越来越复杂，最后变成"一个工程清单"而不是"一个干净算法"。同时它没回答一个更根本的问题：*为什么非要在这个坐标系里量化？* 这个坐标系是模型训出来的、跟硬件没关系、跟量化也没关系。换一个坐标系，问题会不会本来就消失？
+
+** ~2025 | TurboQuant: 与其改 scale, 不如换坐标系
+
+*** 它看到了什么问题
+
+outlier 之所以让量化崩，本质是因为信息在坐标系里分布不均。如果有一个 *随机正交变换* R 作用在向量上，由 Johnson-Lindenstrauss 这类结论可以期待——旋转后的坐标变成接近独立同分布的高斯，每个 channel 都"长得差不多"。这时候 Lloyd-Max 标量量化器才是 near-optimal 的。
+
+*** 它的解法
+
+三步流水线：
+
+1. 用 dense random 正交矩阵 R 旋转向量 x → Rx
+2. 对 Rx 做 per-coordinate 标量量化
+3. 用 R^T 反旋转，配合 QJL 残差修正 [3] 收尾
+
+它把"挑哪些 channel 特殊处理"换成了"先打散，再均匀对待"。哲学上的转折点。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度立刻上去——尤其在 3-bit、2-bit 这种极低位宽下，旋转带来的好处比任何 per-channel 调 scale 都管用。
+
+但 R 是个 d × d 的稠密矩阵——head dim 128 的话就是 16384 个数，每次 decode 都要算一遍 16384 个 FMA。在 autoregressive decode 那种 latency-sensitive 场景里，这个开销直接劝退。
+
+留下的问题非常具体：*能不能用一个稀疏的、能拆成局部块的正交变换，逼近 dense R 的去相关效果？*
+
+** ~2026 | RotorQuant: 用 Clifford rotor 把旋转切成块
+
+*** 它看到了什么问题
+
+dense R 浪费的是它的"全局性"——其实你不需要把第 1 维和第 128 维真的混在一起。量化只要 *局部* 把几个相邻坐标的能量摊平，效果就够好。那为什么不把 R 拆成一堆小块，每块只管自己那几个维度？
+
+*** 它的解法
+
+借用几何代数（Geometric Algebra）的语言：3D 空间的旋转可以用 *Clifford rotor*（Cl(3,0) 几何代数里的一个偶数级元素）紧凑描述——本质上是 cos(θ/2) + sin(θ/2)·B，B 是一个 bivector。每块 3 个连续坐标用一个 rotor 旋转，等价于一个 3D 正交矩阵但参数化更紧。
+
+把 d 维向量分成 d/3 个 3D 块（必要时尾部留一个 2D 块），每块独立做 rotor 旋转。复杂度从 O(d²) 降到 O(d)——linear，可以接受。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学很优雅——几何代数天然适合表达旋转。精度也站得住——局部混合就够把每块内部的能量摊平。
+
+但 *3 不整除任何主流 head dim*——64、128、256 都是 2 的幂。d=128 切 3D 块会留下 42 个完整 3D 块 + 1 个 2D 尾巴——尾部需要单独 kernel 处理，layout 不规整，warp divergence，fused kernel 写起来恶心。
+
+更根本的问题：3D 块只有 3 个自由度，能描述的局部混合很有限。如果想增强混合能力，要么加更多 rotor 层（depth），要么换更大的块。
+
+这两个问题——*硬件未对齐* 和 *局部混合不足*——就是 IsoQuant 攻击的靶子。
+
+** 2026.03 | IsoQuant: 升到 4D, 让数学和硬件同时高兴
+
+*** 它看到了什么问题
+
+RotorQuant 的痛点不在数学上，而在 *几何选择* 上。3D 是物理空间里"自然"的维度，但 GPU 不是物理空间——它的寄存器、tensor core、cache line 全是 2 的幂为单位组织的。3D 块在硬件上是个"格格不入"的尺寸。
+
+可如果换成 4D 块：
+- 4 整除 64、128、256，零尾巴
+- 4D 向量天然对齐 SIMD 寄存器（float4、half4）
+- 一个 4D 旋转 (SO(4)) 有 6 个自由度，比 SO(3) 的 3 个多一倍，局部混合能力更强
+
+那 4D 旋转怎么便宜地参数化？dense 4×4 矩阵是 16 个数；要找一个紧凑的、closed-form 的、又能保正交性的表达。
+
+*** 它的解法
+
+用 *四元数代数 + SO(4) 的 isoclinic 分解*。Lie 代数有一个经典结果：
+
+#+begin_example
+                  so(4) ≅ su(2) ⊕ su(2)
+#+end_example
+
+翻译成大白话：每一个 4D 旋转都可以写成 *两个独立的四元数* 的左乘和右乘组合：
+
+#+begin_example
+                  T(v) = q_L * v * q̄_R
+#+end_example
+
+其中 v 是把 4D 向量 (x_0, x_1, x_2, x_3) 当作四元数 x_0 + x_1·i + x_2·j + x_3·k；q_L、q_R 都是单位四元数（4 个数，模长 1）。这个映射保正交，全 6 自由度，没有矩阵——只是一串四元数乘法（每次 16 个 FMA）。
+
+由此自然分出两个变种：
+
+- *IsoQuant-Full*：保留 q_L 和 q_R 两个四元数。完整 SO(4)，全 6 自由度，局部混合最强。每个块前向 16+16=32 个 FMA 量级（实际优化后更少）
+- *IsoQuant-Fast*：只保留一边 q_L，丢掉 q_R——退化到一个 SO(3) 等价的 3 自由度子群（论文里叫 isoclinic factor），但仍然嵌在 4D layout 里。算得更便宜（16 个 FMA 量级一块）
+
+外加一个 *2D 平面旋转* 的"极简版"做下界对照——证明再退一步精度会掉多少。
+
+参数化用一个朴素技巧：在欧式空间里存自由参数 u ∈ R⁴，每次用前归一化 q = u/‖u‖，把单位四元数约束放进 computation graph，省掉黎曼优化的麻烦。要随机旋转就从 Haar 分布抽样（高斯归一化即可）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+三件事同时拿到：
+
+1. *数学干净*：closed-form，不需要构造 skew-symmetric 矩阵再做矩阵指数，直接四元数乘法
+2. *硬件友好*：4D 块对齐 power-of-two head dim，零 padding，零尾巴，fused CUDA kernel 写起来直
+3. *自由度合适*：6 DOF (Full) 比 3D 的 3 DOF 多一倍混合能力，3 DOF (Fast) 持平但 layout 更好
+
+实测数据（论文 stage-1 quantize-dequantize, 合成正态向量）：
+- d=128：RotorQuant ~2408 FMA → IsoQuant-Full 1024 FMA → IsoQuant-Fast 512 FMA
+- 18 个 fused CUDA 配置（d ∈ {128,256,512}, bit ∈ {2,3,4}, FP16/FP32）：kernel-level 平均 *4.5x-4.7x* 加速，peak >6x；reconstruction MSE 持平
+
+留下的坑作者自己点了：
+
+- *只验证了 stage-1*——合成正态向量的 quantize-dequantize 路径。真实 KV cache（模型激活、有分布偏移、有 outlier）端到端没测
+- *没和最新的 KV cache 方法对比* end-to-end —— 只对比了 RotorQuant 这一个 baseline
+- *4D 是终点吗？* —— 既然 4D 比 3D 好，那 8D（用 octonion？非结合的代数）会不会更好？或者保持 4D 但叠多层？
+
+* 前沿延伸
+
+IsoQuant 在 2026 年 3 月，是这条"先旋转再量化"线上目前能看到的最新一块拼图。论文写明 end-to-end KV cache 评测留作 future work，所以"批 IsoQuant"的后续公开论文还没出现。
+
+但同时期可观察到的几个动向：
+
+- *RiemannFormer* [7]（论文自己引用的）：把 SO(4) isoclinic 分解用在 curved-space attention 上。和 IsoQuant 是同一个数学工具的不同应用方向——一个用在 attention 几何里，一个用在 KV cache 量化里。提示这个 SO(4) 工具箱在 LLM 设计里会越来越常见
+- *和 W4A4 联动*：当前主流是 weight 量化（QuaRot、SpinQuant 用 Hadamard 旋转）和 KV cache 量化分开做。IsoQuant 的便宜 4D 旋转有潜力做成统一的"旋转层"，同时服务两边
+- *端到端 latency*：论文报的是 kernel-level 加速，没有 end-to-end TTFT/TPOT 数据。要真正进 production，下一步是把 IsoQuant kernel 接到 vLLM/SGLang 的 paged KV cache 上看实际收益
+
+截至目前（2026-05），这是"硬件对齐的低开销正交去相关"这条线的最新进展。
+
+* 一张图看懂
+
+#+begin_example
+                  正交变换的成本        硬件对齐      局部混合 DOF       精度
+                  ----------------     ----------    --------------     ----
+
+[~2024]  KIVI/         无 (原坐标系)      天然          0                  4-bit 起
+         KVQuant       per-channel scale                                  吃力
+                       outlier 单独存
+                            |
+                            | 觉醒: 也许换个坐标系问题就消失了
+                            v
+
+[~2025]  TurboQuant    O(d^2) dense R     yes           整个 d 维全混      2-bit 也行
+                       16384 FMA @d=128                                    但 latency
+                                                                          扛不住
+                            |
+                            | 觉醒: 不需要全局混合, 局部就够
+                            v
+
+[~2026]  RotorQuant    O(d) blockwise     no            3 / 块             比 dense
+                       3D Clifford rotor  (3 != 2^k)                       稍降, 但 OK
+                       ~2408 FMA @d=128                                    kernel 难写
+                            |
+                            | 觉醒: 块大小是几何选择, 硬件不接受 3
+                            v
+
+[2026.03] IsoQuant-Full    O(d) blockwise     yes            6 / 块             ~= RotorQuant
+          (本文)             4D quaternion       (4 = 2^2)
+                            T(v)=q_L v q̄_R
+                            1024 FMA @d=128
+          IsoQuant-Fast    O(d) blockwise     yes            3 / 块             略降但仍 OK
+                            4D 单 quaternion                                4.5x-4.7x 平均
+                            T(v)=q_L v        (硬件 friendly)               6x peak vs Rotor
+
+ 时间 ------------------------------------------------------------------------>
+
+ 演化的真正主线: 从"在坐标系里挣扎"到"换个坐标系", 再到"换的成本要降"
+                每一步的支点不是数学优雅, 而是 *硬件能不能吃下这个数学*
+                IsoQuant 的关键洞察 = 几何选择 (3D vs 4D) 比代数选择
+                                       (Clifford vs Quaternion) 更决定成本
+#+end_example
+
+* 洞见
+
+这条线读下来，最深的一个观察是：*工程领域里, 数学的"自然"和硬件的"自然"经常不重合, 谁让步谁就赢*。
+
+- 3D Clifford rotor 是数学上最优雅的旋转表达——几何代数的旗帜性应用
+- 但 GPU 是 power-of-two 的世界，3 在这个世界里是异类
+- IsoQuant 做的事情，本质上是 *为了对齐硬件, 主动放弃了"最简的几何 (3D)"*，选了一个数学上略微复杂（要引入四元数代数）但硬件上完美对齐的 4D
+
+更宽的视角：从 TurboQuant 到 RotorQuant 到 IsoQuant，每一代的关键创新 *都不是引入新的优化目标, 而是改变了实现同一目标的代数工具*——
+
+| 阶段       | 同一目标          | 工具                | 让步换来                |
+|------------+-------------------+---------------------+-------------------------|
+| TurboQuant | 让旋转后近高斯   | dense 正交矩阵      | 精度上限                |
+| RotorQuant | 同上             | Clifford rotor      | 计算成本 O(d^2) -> O(d) |
+| IsoQuant   | 同上             | quaternion / SO(4)  | 硬件对齐 + 自由度可调   |
+
+*目标稳定, 工具迭代* ——这是一个成熟领域的典型节奏。
+
+还有一个值得记下的 meta 观察：*Lie 代数同构（so(4) ≅ su(2) ⊕ su(2)）这种纯数学结果, 在 systems 论文里变成了 4.5x 加速* 。这种"古典数学 → 工程红利"的转化路径，在 LLM 系统这两年还会反复出现——SpinQuant 用的 Hadamard 矩阵、QuaRot 用的 orthogonal procrustes、IsoQuant 用的四元数，背后是同一类思路：把一个看起来跟 ML 无关的代数结构，放到对的位置上去，硬件直接吐出免费的算力。
+
+下一步最可能的方向：
+
+1. *端到端落地*：先把 IsoQuant kernel 接进真实推理框架，验证 stage-1 的 4.5x 加速能否折算到 TTFT/TPOT
+2. *更高维的块*：8D 用 octonion（非结合代数，处理起来比四元数复杂但有人在尝试）；或者 4D 多层（depth）补足混合能力
+3. *统一旋转层*：把 IsoQuant 当作一个通用的"低成本正交去相关"模块，同时服务 weight 量化（替代 QuaRot 的 Hadamard）和 KV cache 量化
+
+* 启发
+
+落点在"能用"：
+
+1. *做 quantization 研究时, 别把"数学优雅"当目标——把"硬件对齐 + 数学闭式"当目标* 。一个 3D rotor 论文和一个 4D quaternion 论文，前者数学更优雅，但后者拿到了 production，因为它和硬件谈成了
+
+2. *压缩问题的支点经常不在算法本身, 在"换坐标系"* 。如果你在原坐标系里挣扎 outlier、动态范围、scaling，可以反问一句：有没有一个便宜的变换能让问题在新坐标系里自动消失？这是从 KIVI 到 TurboQuant 的范式跃迁，对很多看似"调 scale"的问题都适用
+
+3. *Lie 代数 / 几何代数 / 四元数这些"古典数学"工具, 在 LLM systems 里有红利可挖* 。它们提供了"closed-form 的低参数量正交变换"，这正是 quantization、normalization、orthogonal regularization 这些场景缺的——值得专门维护一个"数学工具 → 可能的工程应用"的对照表
+
+4. *Kernel-level 加速 != end-to-end 加速* 。论文跑出 4.5x 是真的，但能不能折算到 production，还要看 memory bound vs compute bound、能不能 fuse 进 paged attention、tensor core 利用率怎么样。读这类论文时记得问一句"这个加速在哪一层"
+
+5. *看一篇 systems 论文时, 先看它在"前一代"基础上动了哪一刀* 。IsoQuant 的关键差异不是用了四元数（很多人都知道四元数能做 4D 旋转），而是把它放进 SO(4) 的 isoclinic 分解里得到 closed-form 的 sandwich product。这种"半行的变形"才是论文真正的杠杆——也是评估一篇 follow-up 工作含金量的关键

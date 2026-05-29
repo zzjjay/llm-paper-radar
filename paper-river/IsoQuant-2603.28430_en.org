@@ -1,0 +1,298 @@
+#+title:      IsoQuant: Hardware-Aligned SO(4) Isoclinic Rotations for LLM KV Cache Compression
+#+date:       [2026-05-28 Thu 18:43]
+#+filetags:   :paper:river:quantization:kv_cache:rotation:llm:en:
+#+identifier: 20260528T184323-en
+#+source:     https://arxiv.org/abs/2603.28430
+#+authors:    Zhongping Ji
+#+venue:      arXiv preprint, 2026-03-30
+
+* The Problem River
+
+During long-context inference, KV cache devours GPU memory — a 70B model running a 128k context needs tens of gigabytes of KV cache for a single batch. Compressing it to 4-bit or even 2-bit is an unavoidable path.
+
+But directly quantizing KV tensors breaks down — the distribution shape across head dimensions is wildly uneven: a few directions carry enormous variance (outlier channels) while the rest collapse into a thin sliver. Scattering 16 or 4 grid points across this space either smears the outliers or sacrifices the dense region.
+
+The core insight running through this line of work is *rotate the coordinates first, then quantize*: apply an orthogonal transform to spread variance evenly across dimensions, shifting the quantization target from a "twisted coordinate system" to a "uniformly friendly" one. That leaves a single remaining question — *how do you make this rotation matrix cheap?*
+
+- Too dense: a random d × d orthogonal matrix stores d² numbers and computes d² multiply-adds. At d=128 that is 16,384 FMAs that must be recomputed at every autoregressive decode step.
+- Too sparse: rotating along only a few directions provides insufficient mixing, and quantization quality falls back.
+- Too fragmented: block-wise rotation cuts cost, but if the block size is not aligned to hardware SIMD/vector registers, even fast mathematics gets killed by layout overhead.
+
+IsoQuant stands at the very end of this evolutionary line of "making the rotation simultaneously cheap, expressive enough, and hardware-aligned."
+
+* Provenance Map
+
+#+begin_example
+[~2024] Direct KV quantization (KIVI / KVQuant)
+  |
+  | Problem: outlier channels inflate dynamic range, overall quality collapses
+  | Solution: calibration + per-channel scale + asymmetric quantization
+  |           (forcing a fit inside the original coordinate system)
+  | Residual: the coordinate system itself is untouched;
+  |           sub-4-bit is still painful
+  v
+[~2025] TurboQuant
+  |
+  | Problem: instead of tuning scales in a skewed coordinate system,
+  |          straighten the coordinates first
+  | Solution: dense random orthogonal matrix R rotates x -> per-coord
+  |           scalar quantization -> R^T inverse rotation + QJL residual correction
+  |           Lloyd-Max on the post-rotation near-uniform distribution is near-optimal
+  | Residual: dense R is O(d^2) storage and compute;
+  |           one pass per autoregressive decode step is too slow
+  v
+[~2026] RotorQuant
+  |
+  | Problem: dense is unnecessary — replace it with sparse block-wise rotations,
+  |          using Clifford rotors from geometric algebra
+  |          (each 3D block parameterized by 3 angles)
+  | Solution: split d dims into d/3 blocks of 3D, each block rotated by a
+  |           Cl(3,0) rotor. Complexity drops from O(d^2) to O(d).
+  | Residual: 1) 3 does not divide any power-of-two head dim (64/128/256);
+  |              a 2D tail block is needed — irregular layout
+  |           2) 3D blocks have only 3 DOF; local mixing capacity is limited
+  |           3) GPU SIMD prefers multiples of 4; 3D blocks hurt warp utilization
+  v
+[2026.03] IsoQuant (this paper, Zhongping Ji)
+  |
+  | Observed problem: RotorQuant's geometric choice (Cl(3,0)) is mathematically
+  |                   elegant but adversarial to hardware — 3 is not a power of two,
+  |                   and registers, tensor cores, and L1 cache are all designed
+  |                   around 4/8/16
+  | Solution: raise block size to 4D, describe 4D rotations with quaternions.
+  |           Lie algebra tells us exactly:
+  |                 so(4) ≅ su(2) ⊕ su(2)
+  |           — every 4D rotation decomposes into independent left/right
+  |             quaternion actions:
+  |                 T(v) = q_L * v * q̄_R
+  |           Two variants follow naturally:
+  |           * IsoQuant-Full:  both quaternions, full 6 DOF
+  |           * IsoQuant-Fast:  only q_L, degenerates to SO(3)-equivalent
+  |                             3 DOF, but lives entirely in 4D layout
+  |           A 2D plane-rotation degenerate version is included as a baseline
+  v
+[Future] End-to-end KV cache evaluation / larger blocks / joint use with W4A4
+         (explicitly deferred to future work by the authors)
+#+end_example
+
+Note: The specific citations for TurboQuant and RotorQuant come from IsoQuant's own related-work section ([1] and [2]); their arXiv numbers have not been independently verified. The "rotate-then-quantize" branch is clearly visible from IsoQuant's citation structure, but the paper does not explain where the earlier anchor — QuIP, QuaRot, and the symmetric *weight*-quantization line — merges with this *activation*-quantization line.
+
+* Evolutionary Narrative
+
+** ~2024 | KIVI / KVQuant: Holding the Line in a Skewed Coordinate System
+
+*** What Problem They Saw
+
+LLM KV tensors are not uniformly distributed across head dimensions — a handful of channels carry disproportionately large variance (outliers). Applying 4-bit quantization directly lets those channels dominate the dynamic range, amplifying quantization error everywhere else.
+
+*** Their Solution
+
+Leave the coordinate system alone; patch the original coordinates instead — per-channel scales, asymmetric quantization, separate calibration for keys and values, and storing outlier channels in FP16. The essence is "identify the difficult dimensions and handle them specially."
+
+*** Why It Worked (and What New Problem It Created)
+
+Good enough for 8-bit and 6-bit. Below 4-bit it struggles — the special-casing of outliers grows ever more complex until the result looks like an engineering checklist rather than a clean algorithm. And it never answers a more fundamental question: *why quantize in this coordinate system at all?* That coordinate system emerged from training; it has nothing to do with hardware and nothing to do with quantization. Could switching systems make the problem disappear?
+
+** ~2025 | TurboQuant: Instead of Tuning Scales, Change the Coordinate System
+
+*** What Problem It Saw
+
+Outliers break quantization because information is unevenly distributed in the coordinate system. If a *random orthogonal transform* R acts on a vector, results in the spirit of Johnson-Lindenstrauss suggest the rotated coordinates will resemble independent near-Gaussian samples — every channel will "look alike." Only then is Lloyd-Max scalar quantization near-optimal.
+
+*** Its Solution
+
+A three-stage pipeline:
+
+1. Rotate vector x with a dense random orthogonal matrix R → Rx
+2. Apply per-coordinate scalar quantization to Rx
+3. Inverse-rotate with R^T, cleaned up with a QJL residual correction [3]
+
+It replaces "choose which channels to treat specially" with "scatter first, then treat uniformly." A philosophical turning point.
+
+*** Why It Worked (and What New Problem It Created)
+
+Quality improves immediately — especially at 3-bit and 2-bit extreme widths, where the benefit of rotation outweighs any per-channel scale tuning.
+
+But R is a dense d × d matrix — at head dim 128 that is 16,384 numbers, with 16,384 FMAs recomputed every decode step. In the latency-sensitive autoregressive decode setting this overhead is simply prohibitive.
+
+The residual problem is very concrete: *can a sparse, block-decomposable orthogonal transform approximate the decorrelation effect of a dense R?*
+
+** ~2026 | RotorQuant: Slice the Rotation into Blocks with Clifford Rotors
+
+*** What Problem It Saw
+
+Dense R wastes compute on its "global reach" — you do not actually need dimension 1 mixed with dimension 128. Quantization only needs local variance flattening across a few adjacent coordinates per block. Why not decompose R into small blocks, each responsible only for its own slice?
+
+*** Its Solution
+
+Borrow the language of Geometric Algebra: 3D rotation is compactly described by a *Clifford rotor* (an even-grade element of the Cl(3,0) algebra) — essentially cos(θ/2) + sin(θ/2)·B, where B is a bivector. Every group of 3 consecutive coordinates is rotated by one rotor, equivalent to a 3D orthogonal matrix but with a tighter parameterization.
+
+Split the d-dimensional vector into d/3 blocks of 3D (with a 2D tail if necessary), each rotated independently. Complexity drops from O(d²) to O(d) — linear, and acceptable.
+
+*** Why It Worked (and What New Problem It Created)
+
+Mathematically elegant — geometric algebra is naturally suited to expressing rotations. Accuracy holds up — local mixing is sufficient to flatten energy within each block.
+
+But *3 does not divide any mainstream head dimension* — 64, 128, 256 are all powers of two. At d=128, splitting into 3D blocks yields 42 full blocks plus one 2D tail — the tail requires a separate kernel, produces irregular layout, causes warp divergence, and makes fused-kernel implementation painful.
+
+More fundamentally: a 3D block has only 3 degrees of freedom, limiting local mixing. Stronger mixing requires either more rotor layers (depth) or larger blocks.
+
+These two problems — *hardware misalignment* and *insufficient local mixing* — are exactly what IsoQuant targets.
+
+** 2026.03 | IsoQuant: Lift to 4D and Make Math and Hardware Happy Simultaneously
+
+*** What Problem It Saw
+
+RotorQuant's pain is not mathematical; it is a *geometric choice*. 3D is the "natural" dimension of physical space, but GPUs are not physical space — their registers, tensor cores, and cache lines are all organized in powers of two. A 3D block is an "alien size" on hardware.
+
+Switch to 4D blocks and everything clicks:
+- 4 divides 64, 128, 256 — zero tail fragments
+- 4D vectors naturally align to SIMD registers (float4, half4)
+- A 4D rotation (SO(4)) has 6 degrees of freedom, double the 3 of SO(3), for stronger local mixing
+
+How do you parameterize a 4D rotation cheaply? A dense 4×4 matrix is 16 numbers; what is needed is a compact, closed-form expression that preserves orthogonality.
+
+*** Its Solution
+
+*Quaternion algebra + the isoclinic decomposition of SO(4)*. A classical result from Lie theory:
+
+#+begin_example
+                  so(4) ≅ su(2) ⊕ su(2)
+#+end_example
+
+In plain language: every 4D rotation can be written as a combination of *two independent quaternion* left-multiplication and right-multiplication actions:
+
+#+begin_example
+                  T(v) = q_L * v * q̄_R
+#+end_example
+
+where v treats the 4D vector (x_0, x_1, x_2, x_3) as the quaternion x_0 + x_1·i + x_2·j + x_3·k, and q_L, q_R are unit quaternions (4 numbers each, unit norm). This map preserves orthogonality, has full 6 DOF, and requires no matrix — just a sequence of quaternion multiplications (16 FMAs per block).
+
+Two variants follow naturally:
+
+- *IsoQuant-Full*: retain both quaternions q_L and q_R. Full SO(4), 6 DOF, strongest local mixing. On the order of 16+16=32 FMAs per block (fewer after optimization).
+- *IsoQuant-Fast*: retain only q_L, drop q_R — degenerates to an SO(3)-equivalent 3-DOF subgroup (called the isoclinic factor in the paper), but still lives within the 4D layout. Cheaper to compute (roughly 16 FMAs per block).
+
+A *2D plane rotation* "minimal" variant is included as a lower-bound baseline, showing how much quality is lost by retreating one step further.
+
+Parameterization uses a straightforward trick: store free parameters u ∈ ℝ⁴ in Euclidean space, normalize to q = u/‖u‖ at each forward pass, folding the unit-quaternion constraint into the computation graph and avoiding Riemannian optimization. Random rotations are sampled from the Haar distribution (normalize a Gaussian sample).
+
+*** Why It Worked (and What Pits Remain)
+
+Three things are achieved simultaneously:
+
+1. *Mathematically clean*: closed-form, no need to construct a skew-symmetric matrix and exponentiate it — just quaternion multiplication.
+2. *Hardware-friendly*: 4D blocks align to power-of-two head dims, zero padding, zero tail, fused CUDA kernels are straightforward to write.
+3. *Right number of degrees of freedom*: 6 DOF (Full) doubles the mixing capacity of 3D's 3 DOF; 3 DOF (Fast) matches it but with better layout.
+
+Measured results (paper stage-1 quantize-dequantize, synthetic Gaussian vectors):
+- d=128: RotorQuant ~2408 FMA → IsoQuant-Full 1024 FMA → IsoQuant-Fast 512 FMA
+- 18 fused CUDA configurations (d ∈ {128,256,512}, bit ∈ {2,3,4}, FP16/FP32): kernel-level average *4.5x–4.7x* speedup, peak >6x; reconstruction MSE is on par.
+
+The authors openly acknowledge the remaining gaps:
+
+- *Only stage-1 is validated* — the quantize-dequantize path on synthetic Gaussian vectors. Real KV cache (model activations, distribution shift, outliers) is not tested end-to-end.
+- *No end-to-end comparison against recent KV cache methods* — only RotorQuant is used as the baseline.
+- *Is 4D the endpoint?* — If 4D beats 3D, could 8D (using octonions, a non-associative algebra) be better? Or multiple layers of 4D blocks for deeper mixing?
+
+* Frontier Extensions
+
+IsoQuant, dated March 2026, is the most recent piece visible in this "rotate-then-quantize" line. The paper explicitly defers end-to-end KV cache evaluation to future work, so no subsequent public paper critiquing or superseding IsoQuant has appeared yet.
+
+Several concurrent trends worth watching:
+
+- *RiemannFormer* [7] (cited by the paper): applies the SO(4) isoclinic decomposition to curved-space attention. Same mathematical toolkit, different application — one for attention geometry, one for KV cache quantization. Signals that this SO(4) toolbox will become increasingly common in LLM design.
+- *Joint use with W4A4*: the current mainstream separates weight quantization (QuaRot, SpinQuant use Hadamard rotations) from KV cache quantization. IsoQuant's cheap 4D rotations have the potential to serve as a unified "rotation layer" serving both sides.
+- *End-to-end latency*: the paper reports kernel-level speedup, not end-to-end TTFT/TPOT numbers. Getting to production requires plugging the IsoQuant kernel into vLLM/SGLang's paged KV cache and measuring real gains.
+
+As of now (2026-05), this is the most recent progress on the "hardware-aligned, low-overhead orthogonal decorrelation" line.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  Rotation Cost          HW Aligned    Local DOF / Block    Accuracy
+                  ----------------       ----------    -----------------    --------
+
+[~2024]  KIVI/        None (original         Natural        0                  Struggles
+         KVQuant      coordinate system)                                        below 4-bit
+                      per-channel scale
+                      outlier stored FP16
+                            |
+                            | Awakening: maybe switching coordinate systems
+                            |            makes the problem disappear
+                            v
+
+[~2025]  TurboQuant   O(d^2) dense R         Yes            Full d-dim mix     Works at 2-bit
+                      16384 FMA @ d=128                                         but latency
+                                                                                is prohibitive
+                            |
+                            | Awakening: global mixing is unnecessary,
+                            |            local is enough
+                            v
+
+[~2026]  RotorQuant   O(d) blockwise         No             3 / block          Slightly below
+                      3D Clifford rotor      (3 != 2^k)                         dense, but OK;
+                      ~2408 FMA @ d=128                                         kernel is messy
+                            |
+                            | Awakening: block size is a geometric choice;
+                            |            hardware rejects 3
+                            v
+
+[2026.03] IsoQuant-Full    O(d) blockwise      Yes            6 / block          ~= RotorQuant
+          (this paper)      4D quaternion        (4 = 2^2)
+                            T(v)=q_L v q̄_R
+                            1024 FMA @ d=128
+          IsoQuant-Fast    O(d) blockwise      Yes            3 / block          Slightly lower,
+                            4D single quat                                        still OK;
+                            T(v)=q_L v          (HW friendly)                    4.5x–4.7x avg
+                                                                                  6x peak vs Rotor
+
+ Time ------------------------------------------------------------------------->
+
+ True main thread of evolution: from "struggling within a coordinate system"
+   to "switching coordinate systems", then to "making the switch cheap"
+   The pivot at each step is not mathematical elegance but
+   *whether the hardware can digest the mathematics*
+   IsoQuant's key insight = the geometric choice (3D vs 4D) determines cost
+                             more than the algebraic choice (Clifford vs Quaternion)
+#+end_example
+
+* Insights
+
+Reading through this line, the deepest observation is: *in engineering, mathematical "naturalness" and hardware "naturalness" frequently do not coincide — whichever side yields tends to win*.
+
+- The 3D Clifford rotor is the most mathematically elegant expression of rotation — a flagship application of geometric algebra.
+- But GPUs inhabit a power-of-two world, and 3 is an alien there.
+- What IsoQuant does is, in essence, *deliberately abandon the "simplest geometry (3D)" in order to align with hardware*, choosing a 4D that is slightly more complex mathematically (requiring quaternion algebra) but perfectly aligned on hardware.
+
+A broader view: from TurboQuant to RotorQuant to IsoQuant, the key innovation at each generation is *not a new optimization objective but a change in the algebraic tool used to achieve the same objective* —
+
+| Stage      | Same Objective             | Tool                | Concession Gains                   |
+|------------+----------------------------+---------------------+------------------------------------|
+| TurboQuant | Near-Gaussian after rotation | Dense orthogonal   | Accuracy ceiling                   |
+| RotorQuant | Same                       | Clifford rotor      | Compute cost O(d^2) → O(d)         |
+| IsoQuant   | Same                       | Quaternion / SO(4)  | Hardware alignment + tunable DOF   |
+
+*Stable objective, iterating tools* — the characteristic rhythm of a maturing field.
+
+One more meta-observation worth recording: *the Lie algebra isomorphism so(4) ≅ su(2) ⊕ su(2), a piece of pure mathematics, becomes a 4.5x speedup in a systems paper*. This pathway from "classical mathematics → engineering dividend" will recur repeatedly in LLM systems over the next few years — SpinQuant's Hadamard matrices, QuaRot's orthogonal Procrustes, IsoQuant's quaternions all share the same underlying logic: take an algebraic structure that appears unrelated to ML, place it in exactly the right position, and the hardware hands you free compute.
+
+The most likely next directions:
+
+1. *End-to-end deployment*: plug the IsoQuant kernel into a real inference framework and verify that the stage-1 4.5x speedup translates into TTFT/TPOT gains.
+2. *Larger blocks*: 8D using octonions (non-associative algebra, more complex than quaternions but being explored); or multiple layers of 4D blocks (depth) to compensate for mixing capacity.
+3. *Unified rotation layer*: treat IsoQuant as a general-purpose "low-cost orthogonal decorrelation" module serving both weight quantization (replacing QuaRot's Hadamard) and KV cache quantization simultaneously.
+
+* Takeaways
+
+Grounded in practicality:
+
+1. *When doing quantization research, don't treat "mathematical elegance" as the goal — treat "hardware alignment + closed-form mathematics" as the goal*. A 3D rotor paper and a 4D quaternion paper: the former is more elegant, but the latter reaches production, because it negotiated successfully with the hardware.
+
+2. *The lever in compression problems often isn't the algorithm itself — it's "changing the coordinate system"*. If you're wrestling with outliers, dynamic range, and scaling in the original space, ask: is there a cheap transform that makes the problem vanish in the new coordinates? This is the paradigm shift from KIVI to TurboQuant, and it applies broadly to problems that look like "tuning scales."
+
+3. *Lie algebra / geometric algebra / quaternions — these "classical mathematics" tools carry untapped dividends in LLM systems*. They provide closed-form, low-parameter-count orthogonal transforms, which is precisely what quantization, normalization, and orthogonal regularization settings lack. It's worth maintaining a personal "math tool → possible engineering application" reference table.
+
+4. *Kernel-level speedup ≠ end-to-end speedup*. The paper's 4.5x is real, but whether it translates to production depends on memory-bound vs compute-bound behavior, whether it fuses into paged attention, and tensor core utilization. When reading this class of paper, always ask: "at which layer does this speedup live?"
+
+5. *When reading a systems paper, first look at exactly which one cut it makes relative to the prior generation*. IsoQuant's key difference is not "uses quaternions" (many people know quaternions can represent 4D rotations) — it is placing them inside SO(4)'s isoclinic decomposition to obtain a closed-form sandwich product. That half-line of transformation is where the paper's real leverage lives, and it is the right lens for evaluating the substantive contribution of any follow-up work.

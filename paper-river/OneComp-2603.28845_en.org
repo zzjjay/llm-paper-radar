@@ -1,0 +1,316 @@
+#+title:      OneComp: One-Line Revolution for Generative AI Model Compression
+#+date:       [2026-05-28 Thu 18:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T184654-en
+#+source:     https://arxiv.org/abs/2603.28845
+#+authors:    Yuma Ichikawa, Keiji Kimura, Akihiro Yoshida, Yudai Fujimoto, Hiroki Tokura, Yamato Arai, Yoshiyuki Ishii, Yusei Kawakami, Genki Shikada, Achille Jacquemond, Yoshihiko Fujisawa, Katsuki Fujisawa, Takumi Honda, Akira Sakai
+#+venue:      arXiv 2603.28845 / 2026-03
+
+* The Problem River
+
+You have a 70-billion-parameter model in front of you. How do you squeeze it onto a consumer GPU and keep it from turning stupid?
+
+What makes this hard? Not a shortage of methods — quite the opposite. Dozens of algorithms, three granularities (layer / block / global), plus choices of bit-width, calibration data, and which instruction sets the hardware actually supports. Every new academic trick fixes one specific flaw in the previous one, but nobody tells you the right order, the right combination, or the right knobs to turn. The result: the SOTA numbers in papers and the models engineers can actually ship are separated by about two years.
+
+This river has seen wave after wave of people solving different facets of the same problem: *how to crush a model's precision from 16 bits down to 4 bits and still have it think like its original self*. Each generation finds a new bottleneck; the next generation dismantles it. OneComp arrives at this point and says: we have enough individual tricks — what's missing is someone to chain them into a pipeline.
+
+* The Source Map
+
+#+begin_example
+[1993] Hassibi & Stork - Optimal Brain Surgeon (OBS)
+  |
+  | Problem: neural networks are too big and we want to prune them,
+  |          but which weight can be removed without hurting the model?
+  | Solution: compute the second-order derivative (Hessian) of the loss
+  |           w.r.t. each weight; the one with the smallest second derivative
+  |           is the safest to prune
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: applying OBS to GPT requires a 175B×175B Hessian — impossible
+  | Solution: column-wise greedy quantization + Hessian-inverse error
+  |           compensation; transplants the OBS idea from pruning to quantization
+  v
+[2022] Xiao et al. - SmoothQuant
+  |
+  | Problem: GPTQ only handles weights, but LLM activations contain
+  |          "monster channels" (outliers) that collapse under quantization
+  | Solution: use a diagonal matrix to migrate some outlier magnitude
+  |           from activations to weights — mathematically equivalent
+  v
+[2024] Lin et al. - AWQ
+  |
+  | Problem: SmoothQuant's scaling factor is determined by the activation
+  |          maximum, but a weight's "importance" is not how large it is —
+  |          it's how large the corresponding activation is
+  | Solution: activation-aware: rank the critical 1% of weights by
+  |           activation magnitude and protect them specifically
+  v
+[2023] Shao et al. - OmniQuant
+  |
+  | Problem: SmoothQuant's and AWQ's scaling parameters are computed
+  |          analytically, not optimally
+  | Solution: make all scaling, shifting, and clipping parameters learnable;
+  |           train with block-wise reconstruction error
+  v
+[2026] Ichikawa et al. - OneComp  <-- target paper
+  |
+  | Problem: all the above tricks each cover one piece; users have no idea
+  |          what order to combine them in, or which bit-widths to assign
+  |          to which layers. There is a two-year gap between academic SOTA
+  |          and production deployment
+  | Solution: invent no new algorithm — instead, orchestrate all existing
+  |           tricks into one pipeline: AutoBit assigns per-layer bit-widths
+  |           automatically; layer→block→global three-stage progressive
+  |           refinement; the first stage's output is already deployable,
+  |           and each subsequent stage only makes it better
+  v
+[????] The next step has not appeared yet, but the direction is almost
+       certain: joint cross-stage optimization, encoding hardware constraints
+       into the bit-width planning objective, feeding training-time knowledge
+       directly back into the compression pipeline
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1993 | OBS: Want to know which weight you can safely prune? Compute its second derivative
+
+*** What problem it saw
+
+In the 1990s neural networks were small but slow, and memory was expensive. Researchers wanted to prune weights to shrink models. The most naïve approach was to rank by absolute value and cut the small ones — but that is wrong. A weight's "importance" is not how large it is; it is how much the overall loss rises when you set it to zero.
+
+LeCun's Optimal Brain Damage estimated this "rise" using only the diagonal elements of the Hessian. But diagonal elements are an approximation — weights interact with each other, so pruning one should trigger compensatory adjustments in the rest.
+
+*** Its solution
+
+Hassibi & Stork computed the full Hessian inverse $H^{-1}$. When you zero out weight $w_q$, the optimal compensation is to adjust all other weights according to the corresponding row of $H^{-1}$. After each prune, every remaining weight gets a tiny nudge, keeping the loss increase minimal.
+
+The formula is elegant, and it seeded the *compress-then-compensate* philosophy that would dominate compression research for thirty years: remove/modify a parameter → use second-order information to compute the optimal collective correction.
+
+*** Why it worked (and what new trap it set)
+
+Second-order information captures the coupling between weights. But the Hessian is $N \times N$ — $N$ being the number of parameters. Tractable for the small networks of 1993; for GPT-3's 175 billion parameters in 2022, just storing the matrix would require $175\text{B}^2 \times 4$ bytes — more memory than exists on Earth. OBS's intuition is right, but it cannot be applied directly at scale.
+
+That is exactly where GPTQ enters: how do you make the OBS second-order trick usable on an actual LLM?
+
+** 2022 | GPTQ: Bringing OBS's second-order compensation to LLMs
+
+*** What problem it saw
+
+Applying OBS directly is infeasible. But LLM quantization desperately needs that compensation idea — 4-bit integers can represent only 16 distinct values, every weight rounding introduces error, and those errors accumulate and amplify through matrix multiplications. Without compensation, a 4-bit LLM degrades to something that sounds like it has studied for only a few days.
+
+More concretely: each layer's weight matrix $W$ is $N \times M$ (e.g., 4096 × 4096); each column independently processes 4096 weights. The Hessian to compute is $H = X^\top X$ (where $X$ is the activation), still $N \times N$. Applying OBS naïvely requires $O(N^3)$ operations — quantizing one layer takes hours.
+
+*** Its solution
+
+GPTQ uses two engineering tricks to make OBS actually run:
+
+1. *Column-wise greedy quantization*: instead of quantizing all weights at once, process columns from first to last. When quantizing column $j$, propagate its rounding error to all subsequent unquantized columns using the $H^{-1}$ formula as compensation.
+2. *Lazy batch updates*: batch the Hessian-inverse updates across several columns and execute them as matrix multiplications on the GPU, giving a speedup of tens of times compared to weight-by-weight updates.
+
+A 175B model that would take weeks to quantize is handled by GPTQ in a few hours, with accuracy close to full precision.
+
+*** Why it worked (and what new trap it set)
+
+Replacing "weight by weight" with "column by column in batches," combined with column-structured error compensation via the Hessian, industrialises the OBS idea. GPTQ remains the de-facto standard for 4-bit weight quantization today — roughly half of quantized models on HuggingFace are produced with it.
+
+But it only looks at weights, not activations. The problem is that LLM activations hide *monsters*: a handful of channels carry values more than 100× larger than their neighbours. GPTQ has no awareness of these channels, so when the corresponding weights are rounded, those few channels collapse.
+
+The next paper is dedicated to hunting these monsters.
+
+** 2022 | SmoothQuant: Activations have monsters — let the weights carry half the burden
+
+*** What problem it saw
+
+Dettmers, in LLM.int8(), was the first to document outlier channels in LLM activations — roughly 0.1% of channels in OPT-175B carry values two orders of magnitude larger than their neighbours. Once these outliers are squeezed into the 8-bit integer range, they monopolise the effective precision and blow up the entire activation distribution.
+
+LLM.int8()'s fix is blunt: compute that 0.1% in fp16, the rest in int8. Mixed precision — but hardware-unfriendly, since most GPUs cannot efficiently co-execute fp16 and int8 kernels.
+
+*** Its solution
+
+Xiao devised a mathematically equivalent trick. The matrix multiplication $Y = XW$ can be rewritten as:
+
+$$Y = X W = (X \cdot \text{diag}(s)) \cdot (\text{diag}(s)^{-1} W) = \tilde{X} \tilde{W}$$
+
+That is: divide each activation channel by a scalar $s_j$ and multiply the corresponding weight row by $s_j$; the product is unchanged. SmoothQuant sets $s_j = \max(|X_j|)^\alpha / \max(|W_j|)^{1-\alpha}$ — essentially migrating some of the "monster energy" from the activation side to the weight side. After smoothing, both sides become easy to quantize.
+
+Both activations and weights can use int8; hardware-friendly and fast.
+
+*** Why it worked (and what new trap it set)
+
+SmoothQuant reframes "outliers are activations' problem" as "outliers are a shared burden between activations and weights." A simple diagonal-matrix rewrite makes fully int8 quantization feasible on LLMs for the first time.
+
+But the scaling factor $s_j$ is computed from the current layer's statistics, requiring per-layer, per-$\alpha$ hand-tuning. The optimal $\alpha$ differs across models, with no automatic selection method. And it rests on an assumption — "larger weight means more important weight" — that turns out to be wrong.
+
+AWQ comes to correct that error.
+
+** 2024 | AWQ: A weight's importance is determined by the magnitude of its corresponding activation
+
+*** What problem it saw
+
+SmoothQuant assumes that large weights are important weights. Lin's finding overturns this:
+
+In a matrix multiplication $Y = XW$, the contribution of weight $W_{ij}$ is $X_i \cdot W_{ij}$. If $X_i$ (the corresponding activation channel) is tiny, it doesn't matter how large $W_{ij}$ is — its contribution is suppressed by the activation side. Conversely, weights in high-activation-magnitude channels are critical even if they are individually small.
+
+Empirically: keeping just 1% of weights in fp16, selected by activation magnitude rather than weight magnitude, yields dramatically better accuracy.
+
+*** Its solution
+
+AWQ does not use mixed precision (hardware-unfriendly). It inherits SmoothQuant's equivalent-scaling idea but redefines the scaling factor as "protect the weights whose corresponding activations are large":
+
+$$s_j = \max(|X_j|)^\alpha$$
+
+Only the activation side — the weight denominator is dropped. The most significant 1% of weight channels are "amplified," so during quantization they land in the middle of the integer grid where rounding error is smallest.
+
+*** Why it worked (and what new trap it set)
+
+AWQ redefines "weight importance": the weight doesn't get to speak for itself — the activation speaks for it. This perspective remains mainstream in 4-bit quantization today.
+
+But both SmoothQuant's and AWQ's scaling factors are computed from *closed-form formulas* — a single hyperparameter $\alpha$ drives everything. Yet quantization error is a non-convex optimisation problem, and a closed-form solution is only near-optimal under special conditions. Can we make the scaling factors themselves learnable parameters, and find the optimum via gradients?
+
+OmniQuant does exactly that.
+
+** 2023 | OmniQuant: Turn all equivalent transforms into learnable parameters and train block-wise
+
+*** What problem it saw
+
+SmoothQuant's $\alpha$, AWQ's protection strategy, GPTQ's column ordering — every one of these is a hand-crafted heuristic. Each paper claims to be optimal, but switch to a different model or a different bit-width and you need to re-tune everything. The fundamental issue is that *differentiable optimisation* — deep learning's most powerful tool — has not been applied.
+
+A second problem: GPTQ operates layer by layer, treating each layer independently. But the several linear layers inside one Transformer block (QKV, O, Up, Gate, Down) are coupled — quantizing Q in ignorance of K's quantization means the two layers' errors interact and compound.
+
+*** Its solution
+
+Shao parameterises every "equivalent transform" from SmoothQuant and AWQ — scaling factors, clipping thresholds, shift biases — as learnable tensors. The objective is block-wise reconstruction:
+
+$$\min_{\theta} \| f_{\text{block}}(X; W) - f_{\text{block}}(X; \hat{W}(\theta)) \|^2$$
+
+Each Transformer block receives a few hundred gradient-descent steps, pushing the quantised block's output to match the full-precision block's output as closely as possible. This replaces "heuristic tuning" with "end-to-end learning," and upgrades "layer-wise independence" to "block-wise joint optimisation."
+
+*** Why it worked (and what new trap it set)
+
+OmniQuant moves PTQ from "compute a formula" to "learn parameters." At extremely low bit-widths — 4 bits, 3 bits — it significantly outperforms a pure GPTQ + SmoothQuant combination.
+
+But it creates a new problem: there are now simply too many choices. Use GPTQ? Add SmoothQuant or AWQ? Apply OmniQuant on top? Stack a rotation transform (QuaRot / SpinQuant)? How many bits per layer? How to split mixed precision?
+
+Every new academic paper adds another knob. Engineers face a *combinatorial explosion*, and every combination performs differently across models. The latest SOTA paper takes an average of two years to reach production deployment.
+
+OneComp's eye is on that time gap.
+
+** 2026 | OneComp: Stop inventing algorithms — compile the existing ones into a pipeline
+
+*** What problem it saw
+
+By early 2026, the LLM quantization toolbox is overflowing: GPTQ, AWQ, SmoothQuant, OmniQuant, QuIP, QuaRot, SpinQuant, BRECQ, CBQ, OneBit, MDBF… Each solves a specific sub-problem. But in practice *they have no shared protocol* — you cannot simply "run SmoothQuant, then GPTQ, then OmniQuant," because each tool assumes different input formats, calibration data, and hyperparameters.
+
+Deeper problems:
+
+1. *No automatic bit allocation.* Layers differ in sensitivity; uniform bit-width wastes precision, but hand-assigning per-layer widths is not reproducible.
+2. *No bridge between one-shot and iterative algorithms.* GPTQ is one-shot; OmniQuant is iterative — switching between them produces incompatible checkpoints.
+3. *Hardware constraints are not in the planning loop.* The kernels supported by CUDA vs. MXFP4 vs. INT4 are completely different; researchers ignore this; engineers discover the mismatch at deployment time.
+
+OneComp is not trying to publish yet another algorithm paper. It says: what is missing is a pipeline.
+
+*** Its solution
+
+OneComp is an open-source framework. Give it a model identifier and a hardware description, and it does four things:
+
+1. *AutoBit*: uses sensitivity analysis to automatically assign per-layer bit-widths (mixed precision). The objective is "minimise global error under a memory budget."
+2. *JointQ*: replaces standard GPTQ. Simultaneously optimises integer weights and scaling factors (standard GPTQ only optimises integer weights; scaling factors are fixed in advance). Clearly outperforms GPTQ at 3–4 bits, while remaining GPTQ-compatible in output format.
+3. *Pivot checkpoint*: immediately after layer-wise PTQ, produces a *deployable* checkpoint. This is the core architectural choice — every previous research framework produced layer-wise and block-wise outputs in incompatible formats; OneComp enforces compatibility.
+4. *Progressive three-stage refinement*: layer-wise → block-wise → global. Each stage *refines the same model* on top of the previous stage; quality improves monotonically with compute budget. Stop at stage one if budget is tight; run all three if it isn't.
+
+*** Why it worked (and what new traps it sets)
+
+OneComp's core insight is not technical but conceptual: *PTQ is not "pick an algorithm" — it is "compose a set of algorithms."* It treats each algorithm as one stage of a pipeline and enforces an inter-stage protocol (a shared checkpoint format), so that improvements across stages accumulate.
+
+New traps:
+
+1. AutoBit's sensitivity analysis itself requires calibration — a bad calibration set biases the bit-width assignments.
+2. The three-stage pipeline is sequential; there is no joint cross-stage optimisation. In principle, the layer-wise output is not necessarily the optimal starting point for block-wise refinement.
+3. Hardware awareness is still coarse — it checks which kernels are supported, but does not measure actual end-to-end latency or energy consumption.
+
+* Frontier Extensions
+
+OneComp was published in March 2026. As of this writing (May 2026), no direct critical follow-up has appeared in the public literature. But several obvious directions are already in motion:
+
+1. *Cross-stage joint optimisation*: the three stages are currently sequential. Can AutoBit, JointQ, and block-wise refinement be written into a single shared objective? This would be equivalent to lifting OmniQuant's "learnable" philosophy from within one block to the entire pipeline.
+2. *Hardware measurement in the loop*: use real hardware latency and energy as signals fed back into bit-width planning. A handful of studies (e.g., hardware-in-the-loop NAS) have explored this path.
+3. *Training-time knowledge reflow*: the cost of QAT is declining. Perhaps the next step is to blur the boundary between PTQ and QAT — OneComp's pipeline extended with a lightweight fine-tuning stage.
+
+As of today, OneComp is the most mature node on the "engineering-grade PTQ" branch of this river. What this branch needs next is not yet another clever quantization algorithm, but a more thorough automation of the "algorithm selection" decision itself.
+
+* One Diagram
+
+#+begin_example
+                LLM quantization problem: compress a 16-bit model to 4 bits without making it dumber
+                              |
+   Time    Solution            Problem seen                    Core approach
+   ----    --------            ------------                    -------------
+   1993    OBS                 Pruning by weight magnitude     Use Hessian to compute
+                               is unreliable                   "how much does the loss
+                                                               rise if I remove this weight"
+                              |
+                              | Completely intractable for 175B-parameter models
+                              v
+   2022    GPTQ                OBS formula cannot run on GPT   Column-wise greedy +
+                                                               lazy batch; industrialises OBS
+                              |
+                              | Only handles weights; outlier channels in activations
+                              | collapse under quantization
+                              v
+   2022    SmoothQuant         Activations have monster        Diagonal matrix migrates
+                               channels                        half the monster energy
+                                                               onto the weights
+                              |
+                              | "Large weight = important weight" assumption is wrong;
+                              | look at activations instead
+                              v
+                              |
+   2024    AWQ                 Weight importance is            Rank the critical 1% of
+                               determined by activations       weights by activation magnitude;
+                                                               amplify and protect them
+                              |
+                              | Scaling factor is computed analytically, not learned;
+                              | not guaranteed optimal
+                              v
+   2023    OmniQuant           Manual tuning vs.              All equivalent transforms
+                               end-to-end learning            become learnable parameters;
+                                                              trained with block-wise
+                                                              reconstruction
+                              |
+                              | Too many algorithms; engineers don't know how to combine them
+                              v
+   2026    OneComp             Algorithms are sufficient;     AutoBit selects bit-widths +
+                               pipeline is missing            layer/block/global three-stage
+                                                              progressive refinement +
+                                                              compatible checkpoints
+                              |
+                              | Stages are still sequential; no joint cross-stage optimisation
+                              v
+   ?       Next generation                                    Pipeline end-to-end learnable;
+                                                              real hardware in the loop
+#+end_example
+
+* Core Insight
+
+Walking this river to its end, one recurring rhythm becomes visible:
+
+*Beat one: identify a concrete pain point.* OBS saw that "rank weights by magnitude" is unreliable. SmoothQuant saw that activations have outliers. AWQ saw that weight importance is actually determined by activations. Each generation finds a problem that is *more hidden and more structural* than the previous one — something the prior generation thought was solved, but wasn't.
+
+*Beat two: dismantle it with a smarter mathematical tool.* Hessians, diagonal equivalent transforms, activation-awareness, parameterised learning — the tools for dismantling problems move step by step from static to dynamic, from formulas to learning.
+
+*Beat three: leave behind a new, higher-dimensional problem.* The new solution itself generates new complexity. SmoothQuant leaves behind the choice of $\alpha$. AWQ leaves behind the protection strategy. OmniQuant leaves behind "algorithm composition." Every solution creates its own successor problem.
+
+But OneComp is an *inflection point*. It is not the next "smarter algorithm" in this rhythm — it steps outside the rhythm to solve the *meta-problem* of "too many algorithms." This move has appeared in every mature field: compilers (hand-written assembly → GCC → LLVM optimisation pipeline), machine learning (manual hyperparameter tuning → AutoML → MLOps), deep learning training (hand-written CUDA → cuDNN → PyTorch). When a field's "rate of algorithm invention" outpaces its "rate of algorithm adoption," an *orchestrator* becomes necessary.
+
+Where things go next already has a signpost: when an orchestrator appears and stabilises, the next wave typically makes *the orchestrator itself learnable*. OneComp's three-stage pipeline is today defined by rules; it will eventually become learnable — a meta-model that learns to decide "given this model on this hardware, what pipeline should I use?"
+
+* Takeaways
+
+This river offers three concrete hints about how to find research problems:
+
+1. *Don't add knobs to algorithms — pave roads at the system level.* OneComp invented no new algorithm; it only orchestrated existing ones into a pipeline — yet it addresses the genuine pain of real engineers. When a field is already stacked with tools, a "meta-method for composition" is more valuable than "yet another tool." This means you can look for analogous meta-opportunities in any "algorithm-saturated" domain — not just quantization: index selection in vector databases, batching strategies in LLM serving, retriever composition in RAG systems — all are at the same stage.
+
+2. *When watching a field evolve, don't ask "who solved what" — ask "who defined a new problem."* OBS is not a "pruning algorithm" — it is the *perspective* of "measuring importance with the Hessian." GPTQ is not a "quantization algorithm" — it is the *action* of "industrialising OBS." AWQ is not a "compression method" — it is the *redefinition* of "weight importance is defined by activations." Research breakthroughs live not in the solution but in the reframing. Train yourself, when reading papers, to first find *at what level they redefine the problem*, then examine the solution.
+
+3. *When you build tools, put the inter-stage protocol first.* OneComp's truly core architectural choice is not AutoBit, not JointQ — it is "the layer-wise output is a deployable pivot checkpoint," meaning it defines *a checkpoint format that all stages are compatible with*. The influence of this interface design exceeds that of any single algorithm. When building a framework or tool, the first question should be "what is the output format of each stage, and how does the next stage consume it?" — not "which algorithm should each stage use?"

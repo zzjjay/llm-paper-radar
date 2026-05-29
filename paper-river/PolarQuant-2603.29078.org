@@ -1,0 +1,402 @@
+#+title:      PolarQuant: Optimal Gaussian Weight Quantization via Hadamard Rotation for LLM Compression
+#+date:       [2026-05-28 Thu 18:50]
+#+filetags:   :paper:river:quantization:llm:
+#+identifier: 20260528T185029
+#+source:     https://arxiv.org/abs/2603.29078
+#+authors:    Caio Vicentino
+#+venue:      arXiv preprint (2026-03, v1; v2 withdrawn 2026-04)
+
+* 问题之河
+
+把一个 90 亿参数的大模型塞进一台普通笔记本——FP16 要 18 GB，量化到 4 bit 只要 5~6 GB。
+这件事卡了七年：参数的取值不是均匀分布，简单的 "把范围切成 16 份" 永远在浪费档位。
+怎么用更少的 bit 表示一组权重，而让模型几乎察觉不到？
+
+每一代人都在和同一个怪兽搏斗——*异常值*。少数几个特别大的权重把整个动态范围拉宽，
+真正密集的、小的权重全被挤进一两个粗糙档位。怪兽不死，量化就只能往算法上叠补丁（GPTQ 拿
+Hessian 修正、AWQ 按通道护盘）。直到有人想到：能不能把这个分布本身扭一扭，让怪兽消失？
+
+PolarQuant 是这条 "扭分布" 路线 2026 年的一站。它的故事，要从七年前的 GPTQ 讲起。
+
+* 溯源地图
+
+#+begin_example
+[2023] GPTQ (Frantar et al.)
+   |
+   | 问题: 校准数据 + Hessian 补偿，工程重，没保证
+   | "我们能不能从理论上拿出一个 worst-case bound？"
+   v
+[2023] QuIP (Chee, Cai, Kuleshov, De Sa)
+   |
+   | 解法: 量化前先用随机正交矩阵把权重 "打散" (incoherence processing)
+   | 问题: 一个稠密随机正交矩阵又大又贵，2-bit 还差点意思
+   v
+[2024] QuIP# (同组人)
+   |
+   | 解法: 把随机正交换成结构化的 Walsh-Hadamard (RHT) + E8 lattice codebook
+   | 问题: 只动权重还不够——推理时激活值/KV cache 里依然全是异常值
+   v
+[2024] QuaRot (Ashkboos et al.)
+   |
+   | 解法: 把 Hadamard 旋转从 "权重内部" 提升到 "整个计算图"
+   |       —— 旋转激活、KV cache、隐状态，让异常值在数学上消失
+   | 问题: 需要改模型图，把旋转吸收到相邻线性层；KV cache 端还想更优
+   v
+[2025] TurboQuant (Ashkboos et al.)
+   |
+   | 解法: KV 向量先做 "极坐标分解"——抽出长度，单位向量做 Hadamard 旋转，
+   |       旋转后坐标≈高斯分布，用 Gaussian-optimal 码本量化
+   |       (Lloyd-Max 在已知分布下给出 MSE 最优量化器)
+   | 问题: 这套 polar quant 只用在了 KV cache 上，weight 的世界还没人这么做
+   v
+[2026] PolarQuant (Vicentino) <<< 目标论文 >>>
+   |
+   | 解法: 把 TurboQuant 的 polar quant 搬到 weight 上
+   |       block 内 L2 归一化 -> Hadamard 旋转 -> Lloyd-Max 高斯码本
+   | 反直觉发现: 消融发现 Hadamard 旋转一项就贡献了 98% 的提升；
+   |             精心调出来的 Gaussian 码本只贡献 2%
+   v
+[2026-04] 论文被作者主动撤稿: "Found some errors, I need to fix"
+#+end_example
+
+侧支（同期 / 平行）：
+
+#+begin_example
+[1960] Max / [1982] Lloyd
+   ^   Lloyd-Max 算法: 给定分布求 MSE 最优标量量化器
+   |   (整条 polar quant 之所以能成立的数学基石)
+   |
+[2023] NF4 / QLoRA (Dettmers)
+   ^   认定权重就是高斯, 设计 quantile-spaced 码本
+   |   (距 PolarQuant 思路最近的 "假设高斯" 学派)
+   |
+[2024] AWQ (Lin et al.) / [2025] SpinQuant (Liu et al.)
+   ^   按 channel 缩放 / 学习旋转矩阵
+   |   (PolarQuant 论文说和它们正交, 可以组合)
+#+end_example
+
+* 演化叙事
+
+** 2023 | GPTQ: 拿二阶信息修正量化误差
+
+*** 它看到了什么问题
+
+在 GPTQ 之前，量化大模型的主流就是 absmax——找到这一组权重里最大的绝对值，按比例线性映到
+{-8, ..., 7} 这样的整数。问题是：权重的真实分布近似高斯，绝大多数挤在 0 附近，极少数几个
+异常值把动态范围撑得很大。结果，16 个量化档位里有 13 个落在了空气中，3 个负责密集区域，量化
+误差全堆在最重要的地方。把模型扔进去 4-bit，perplexity 直接崩。
+
+*** 它的解法
+
+层一层来。对每一层的权重矩阵，按列从左到右量化；每量化一列，就用这层输入的 Hessian
+(经验上的 X^T X) 把这次量化引入的误差，反向"摊"到还没量化的列里去——让后面的列预先补偿。
+这是从 "optimal brain surgeon" 借来的思路：你已经犯的错，让后面有机会替你弥补。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它确实把 4-bit 量化做到了能用的程度，业界第一次有了 "INT4 也能跑大模型" 的现实选项。
+但代价很重：你得收集校准数据（一小段文本喂模型），算 Hessian，还要算逆。模型越大越慢，
+计算成本不容忽视。而且——这是后人最在意的——*这套方法没有理论保证*。它在大多数模型上
+work，但你不知道它什么时候会 work；你不知道在更激进的 2-bit、3-bit 上，离最优解到底有多远。
+
+下一个问题就长在这里：能不能从信息论上给出一个 worst-case bound？
+
+** 2023 | QuIP: 量化之前先把权重 "打乱"
+
+*** 它看到了什么问题
+
+GPTQ 的问题是 "异常值依旧在那里，只是你用算法把伤害摊薄了"。
+QuIP 的作者反问：能不能干脆让异常值在量化前就*消失*？
+
+更具体地说，量化误差的理论分析有一个量叫 "coherence"——衡量权重和它对应的 Hessian
+特征向量对齐得有多狠。对齐得越狠，越难量化（很多重要的方向上权重都很大）。GPTQ 没有显式
+处理这件事，它只是事后修正。
+
+*** 它的解法
+
+量化前后各乘一个随机正交矩阵 U, V：先做 U W V，量化它，再用 U^T (·) V^T 还原。
+正交变换不改变模型输出（数学上等价），但它把权重和 Hessian "解耦"——
+随机方向上，coherence 期望意义下大幅下降。这叫 *incoherence processing*。
+
+然后在变换后的、更 "平" 的权重上做量化（QuIP 用了 lattice quantization），就能给出
+worst-case 误差界。这是第一次有人把量化误差的理论保证带进 LLM 这个尺度。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉：随机正交矩阵把任何 "尖" 的分布都打散成更接近各向同性的东西。重要的方向不再
+集中在少数几个坐标上，于是 "每个坐标都不太大"，量化就不痛。
+
+坑：随机的稠密正交矩阵又大又贵。一个 4096x4096 的层就要存 16M 个 fp16 数；
+而且 2-bit 这种极端档位上，简单的 scalar quantization 还是不够。
+
+下一篇要解决的：把那个稠密的 U 换成结构化的、几乎免费的东西。
+
+** 2024 | QuIP#: 用 Walsh-Hadamard 替代随机正交，再加 lattice 码本
+
+*** 它看到了什么问题
+
+QuIP 的随机正交矩阵是个数学上很美但工程上很重的选择。
+而且 QuIP 用的标量码本 (scalar codebook) 在 2-bit 下浪费严重——你只用了 4 个档位
+表达每个权重，肯定要从向量层面找更紧的码。
+
+*** 它的解法
+
+两个动作：
+1. 把随机正交换成 *randomized Hadamard transform (RHT)*——Walsh-Hadamard 矩阵
+   H_d 是一个 ±1 矩阵，按位运算就能算，几乎零存储零开销；前后再各乘一个随机
+   ±1 对角矩阵（带 sign randomization），统计上还是 "随机正交"。
+2. 把标量量化升级为 *E8 lattice quantization*——8 个权重打包到一起，用 8 维空间
+   里最密的 lattice (E8) 找最近的格点。每个权重平均 2-bit，但因为 8 维码本比 8 个
+   独立 2-bit 码加起来密得多，误差小一截。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+Hadamard 是 "穷人的随机正交"：它便宜到几乎没成本，但理论性质（at-most-coherence
+bound）和真随机正交几乎一样。这是 *把数学美 + 工程便宜性凑到了一起*的关键转折。
+
+但 QuIP# 的视野还只在权重内部。推理的时候，激活值 (activation) 也有自己的异常值——
+有几个 channel 的激活会比其他大百倍，导致激活量化崩溃。如果你想做 "权重 + 激活都 4-bit"
+的完整推理流水线，QuIP# 帮不上忙。
+
+下一篇要解决：把 Hadamard 旋转从权重升级到整条推理路径。
+
+** 2024 | QuaRot: 把 Hadamard 旋转抬到 "计算图" 这一层
+
+*** 它看到了什么问题
+
+QuIP# 让权重变 "incoherent"，但当你真正推理时，输入激活值依然带着大量的 channel-wise
+异常值。在 LLaMA 这类模型里，残差流的少数几个维度方差比其他大上百倍，
+那几个 channel 一旦被 4-bit 量化，整层的输出就毁了。
+
+如果你能把这些异常 channel "旋转走"——让能量在所有 channel 之间均匀分布——
+就能在推理时也享受到 incoherence 的好处。
+
+*** 它的解法
+
+QuaRot 的核心观察：Transformer 里相邻的两个线性层 W1, W2，
+如果在中间插入一个正交矩阵 R 和它的逆 R^T，模型输出*完全不变*：
+W1 (R^T R) W2 = W1 W2。
+
+那就插！把 Hadamard 矩阵 H 当作 R 插到每一层的合适位置，让激活和隐状态在传播过程中
+始终是 "旋转后" 的版本。再把 H 数学上吸收进相邻的 W 里——推理时根本看不到旋转，
+但 *激活值的分布已经被永久打散*，异常值从此消失。
+
+这下不光权重能 4-bit，KV cache、激活值也都能 4-bit 了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+旋转的妙处在于它在数学上"什么也没改"，但在数值分布上"全改了"。这是一个非常深的
+trick——免费的午餐，前提是你愿意做"图手术 (graph surgery)"。
+
+但图手术意味着 QuaRot 要侵入模型架构：你得知道每一层在哪、把矩阵插哪、和哪个线性层合并。
+对于自定义架构、奇怪的归一化层，集成是一件需要逐个适配的事。
+而且，旋转矩阵是 *layer 之间* 的，整层共享一个 H——对 KV cache 这种动态生成的东西，
+信息论上还能更优。
+
+下一篇要解决：能不能把旋转推到更细的粒度，再把 "旋转之后的分布是什么" 这件事彻底吃透？
+
+** 2025 | TurboQuant: 极坐标分解 + 高斯码本，给 KV cache 用
+
+*** 它看到了什么问题
+
+QuaRot 在 KV cache 上的做法是 "旋转 + scalar 量化"，但作者发现：
+旋转之后的 KV 向量坐标，实际上*非常接近高斯分布*。
+既然分布已知，为什么不用 *Lloyd-Max 1960 年就给出的、那个分布上 MSE 最优的量化器*？
+
+更近一步：一个向量真正想压缩的是 *方向 + 长度* 这两个独立的东西。长度是单一标量，
+方向是单位球面上的一个点。如果分开存，就能各用各的最优编码。
+
+*** 它的解法
+
+对每个 KV 向量 b：
+1. 抽出 L2 长度 r = ||b||，剩下 b/r 是单位球面上的点。
+2. 用一个随机 Hadamard 旋转 H 作用到 b/r 上。
+   *理论事实*：单位球面上均匀分布的点经过正交旋转后，每一坐标的边缘分布渐近于
+   N(0, 1/d)——这是球面投影的中心极限定理。
+3. 把每个坐标乘 sqrt(d)，得到 N(0,1)。
+4. 用 *Lloyd-Max 算法* 给标准正态分布求出的最优 L=2^b 个 centroid 来量化。
+
+存储：每 block 一个 fp16 长度 r，每个权重一个 int8 码。
+解码：查表 -> 除 sqrt(d) -> 反 Hadamard -> 乘 r。
+
+这就是 "polar quantization"——polar 取自极坐标（长度+方向分离）。
+TurboQuant 用信息论的 rate-distortion 工具证明：这套方案在线 KV 量化任务上接近最优。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学链条整条都收紧了：
+- 旋转把任意分布变高斯 → 高斯分布有已知最优量化器 → 你拿到了一个 *理论上 MSE 最优* 的方案。
+不是经验地修补，不是 worst-case bound，是 *在变换后的分布上达到了率失真极限*。
+
+但 TurboQuant 只解决了 KV cache 的事。推理时动态生成的 KV 向量和静态存储的模型 weight
+是两种问题：weight 你可以离线慢慢算，KV 必须每个 token 在线做。
+weight 端，distribution-aware 这条路还没人走过——大家都在算 Hessian、调通道、学旋转。
+
+下一篇要做的就是这个跳跃：把 TurboQuant 的"球面归一化 + Hadamard + 高斯码本"三步走，
+搬到 weight quantization 上。
+
+** 2026 | PolarQuant: 把 polar quant 搬到 weight，再发现一个反直觉事实
+
+*** 它看到了什么问题
+
+TurboQuant 证明了在 KV cache 上 polar quant 是逼近最优的。
+但 weight quantization 这边一直在用 GPTQ/AWQ/NF4 这些"修补型"或"假设型"方案——
+要么靠校准数据补救（GPTQ/AWQ），要么*假设*权重已经是高斯（NF4，但实际不是）。
+没人验证：如果你*强制把权重变成高斯*（用 Hadamard 旋转），再上 Lloyd-Max 最优码本，
+会怎么样？
+
+*** 它的解法
+
+直接照搬 TurboQuant 的极坐标流程，但作用对象换成 weight block：
+1. 把权重矩阵切成长度为 d=128 的 block。
+2. 每个 block 做 L2 归一化，长度 r_i 存为 fp16。
+3. Walsh-Hadamard 旋转 H_128 作用到单位向量上——
+   *关键经验事实*：rotated 之后的坐标和 N(0, 1/d) 的 K-S 距离 < 0.01，
+   就是说，*实际 LLM 权重在球面上跟均匀分布足够接近，旋转后的高斯近似非常好*。
+4. 乘 sqrt(d) 化为 N(0,1)，查 Lloyd-Max 表得到量化码。
+
+对 Qwen3.5-9B：absmax Q5 perplexity 6.90，PolarQuant Q5 是 6.40，
+FP16 是 6.37——*几乎无损*，且*完全不需要校准数据*。
+
+更进一步，PolarQuant 是 *可组合* 的预处理：
+- PolarQuant Q5 解码后再用 torchao INT4 重新量化，比直接 absmax INT4 好 0.12 perplexity。
+- 和 AWQ 正交（一个按 channel 一个按 block），组合后 3.6× 压缩，perplexity 只比 FP16 高 0.06。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+最有意思的是 *消融实验*：作者把方案拆成两件事——
+A. 球面归一化 + Hadamard 旋转（让分布变高斯）
+B. 用精心算出来的 Lloyd-Max 高斯码本（而不是 absmax 那种等距档位）
+
+A 单独做：误差降低 98%。
+B 在 A 基础上再做：再降 2%。
+
+也就是说：*所有的功劳几乎全在 Hadamard 旋转上*。
+那个看起来很高大上的 "Gaussian-optimal centroids" 几乎是装饰。
+这意味着 NF4、各种 distribution-aware 码本在过去三年里所做的精雕细琢，
+对最终质量的贡献远不如 "先旋转一下" 这件几乎免费的操作。
+
+新坑：
+- 论文 v2 在 2026-04-20 被作者主动撤稿，留言 "Found some errors, I need to fix"。
+  具体是数值出了问题还是消融的结论站不住，目前未知——但这意味着 "98%/2% 这个数字"
+  现阶段应当持保留态度。
+- 只在 Qwen3.5-9B 一个模型上验证；不同架构上 d=128 的高斯近似是否同样好，还需要更多证据。
+- 推理时 dequantization 多了一次 Hadamard 反旋转，作者说约 8s 模型加载耗时，
+  但跨平台（尤其 Apple Silicon）的 dequant 内核成熟度还需要时间。
+
+* 前沿延伸
+
+PolarQuant 自身在 2026 年 4 月被撤稿，所以 "后续工作直接引用并改进 PolarQuant"
+这条线目前是 *空的*——撤稿论文一般不会被严肃工作大量引用。
+
+但 "weight + distribution-aware + Hadamard" 这条问题线上，可以预期的方向：
+1. 修订后的 PolarQuant 重新提交——作者明确说要修。修订版会不会保留 "98% 来自旋转"
+   这个结论是关键看点。
+2. 用 *学习的旋转* 替代固定 Hadamard，做 weight 端的 SpinQuant ——SpinQuant 已经在
+   激活层证明了 learned > fixed Hadamard，weight 端的对应物是自然延伸。
+3. *把消融启示反向用到老方案*：如果 Hadamard 才是关键，那 GPTQ、AWQ 在做精细补偿前
+   先加一个 block-wise Hadamard，可能是一行代码就能拿到的免费午餐。
+4. 3-bit / 2-bit 的极限。Q5 已经"几乎无损"了，PolarQuant 真正应该挑战的是
+   QuIP# / AQLM 占据的 2-bit 阵地。
+
+*诚实标注*：以上 1-4 是这条河 *合理的下游* 推断，并非已发表事实；
+"PolarQuant 被撤稿后无人引用" 是基于 arXiv 检索的当前状态判断，仍可能有
+我没找到的并行工作。
+
+* 一张图看懂
+
+#+begin_example
+                LLM 权重量化的 "扭分布" 演化
+                =================================
+
+时间    解法策略             对待异常值的态度        理论保证      工程代价
+----  ----------------     -----------------     ---------    --------
+2023  absmax (baseline)    "凑合用"               无           零
+       |
+       v
+2023  GPTQ                 算法事后修正           无           中(校准+Hessian)
+       |
+       v
+2023  QuIP                 随机正交把分布"打散"   worst-case   高(稠密矩阵)
+       |
+       v
+2024  QuIP#                Hadamard + E8 lattice  worst-case   低(结构化)
+       |
+       +---> 扩展到激活和 KV cache 端
+       v
+2024  QuaRot               旋转吸收进相邻层      经验           中(图手术)
+       |
+       v
+2025  TurboQuant (KV)      polar 分解, 转高斯,    近最优        低(KV-only)
+                            Lloyd-Max 码本        (率失真)
+       |
+       +---> 平移到权重端
+       v
+2026  PolarQuant (weight)  同上, 但作用在权重    "几乎无损"    极低(无校准)
+                            block 上              (Qwen3.5)     [待复核]
+
+      关键反直觉:
+          消融揭示 -- Hadamard 旋转贡献 98% 的提升,
+                     Gaussian-optimal 码本仅贡献 2%.
+          意义 -- 过去三年 distribution-aware 码本上花的功夫,
+                  可能远不如 "在量化前先做一次免费的 Hadamard 旋转".
+
+
+旁支(数学根基):
+   1960  Max         |  scalar quantizer 最优条件
+   1982  Lloyd       |  Lloyd-Max 算法
+                     v
+                  (整条 polar quant 的码本设计基石,
+                   半个世纪后才在 LLM 量化里被取出)
+#+end_example
+
+* 洞见
+
+这条河走了三年，背后真正发生的事不是"算法越来越聪明"，而是 *坐标系换了三次*：
+
+1. *算法层*: GPTQ 拿 Hessian 修正——把量化当成一个优化问题，事后补救。
+2. *几何层*: QuIP/QuIP#/QuaRot 引入正交旋转——把权重和激活变换到一个 "异常值变少" 的
+   新坐标系下做量化。
+3. *分布层*: TurboQuant/PolarQuant 把目标从 "异常值变少" 升级到 "分布变成已知最优形"——
+   高斯分布因为 Lloyd-Max 1960 年的工作，是少数有 *闭式最优量化器* 的分布。
+
+每一次坐标系的提升，都让方案 *更简单，更便宜，理论更紧*。
+GPTQ 要校准数据 + Hessian，PolarQuant 一次矩阵乘就够了——后者反而更准。
+
+这告诉我们一件常见但容易忘的事：*在做一个难问题之前，先把这个问题搬到一个对的坐标系*。
+如果你能把问题搬到一个"已经被解决"的形式 (Lloyd-Max 对 N(0,1) 是已解的)，
+你就接住了 60 年前数学家的礼物。
+
+PolarQuant 的消融——98% vs 2%——是这条洞见的 *实证版*：
+真正起作用的是 "把分布扭到对的形状" 这件几何动作，而不是 "在对的形状上做更精细的量化"。
+后者只是锦上添花。
+
+下一步往哪走？三个方向：
+- 推到 2-bit。Q5 已经无损了，新的战场是更激进的 bit-width。
+- 推到训练。目前都是 post-training；在训练时就让权重 "天生易量化" 是更深的层次。
+- 推到非线性变换。Hadamard 只是众多变换中的一种；如果学习的非正交变换能再扭出
+  比高斯更易量化的分布（更尖、更有规律），下一个 Lloyd-Max 启发的机会就在那里。
+
+* 启发
+
+对 "怎么做研究/找问题"，这条河给的最直接启发：
+
+1. *跨域借用比域内深耕更省力*。PolarQuant 没有发明任何东西——polar quantization 是
+   TurboQuant 的、Hadamard 是 QuIP# 的、Lloyd-Max 是 1960 年的——
+   它做的只是 *把 KV cache 上的成熟配方，原样搬到 weight 上*。一个完整的 paper，
+   核心贡献是 "迁移 + 一个消融实验"。这意味着：当你在一个子领域看到一个干净的工具链时，
+   永远要问一句——同领域里有哪个相邻问题，还没人用这套工具？
+2. *消融比设计更可能产出洞见*。PolarQuant 真正有价值的不是 "PolarQuant 这个方案
+   多牛"，而是 "原来 98% 的贡献都来自最简单那一步"。一个好的消融能让你
+   *扔掉九成的论文复杂度*，提取出 "现实中真正起作用的那一行代码"。
+3. *撤稿是真实的代价*。论文 v2 撤稿提醒：在 LLM 这种数值结果一手接力的领域，
+   reproducibility 比 elegance 更重要。读到一个 "几乎无损" 的惊人结论，
+   先检查 seed、benchmark 选择、对照组是不是真的可比——再决定要不要复用。
+
+落点："能用" 的部分：
+- 你下次做任何 LLM 权重量化，*先在量化前加一个 block-wise Hadamard*——
+  它免费，没有副作用，可能就拿走了大部分增益。
+- 当你拿到一个 distribution-aware 方法，*强制做消融*: 把 "分布变换" 和
+  "分布上的最优码本" 拆开，分别贡献多少。这比追加新 trick 更值钱。
+- 关注 polar quant 的修订版重投——如果它真的修好了，那将是过去两年里 weight quant
+  最简单、最便宜、最接近 SoTA 的一份方案。

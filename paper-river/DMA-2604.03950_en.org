@@ -1,0 +1,201 @@
+#+title:      Diagonal-Tiled Mixed-Precision Attention for Efficient Low-Bit MXFP Inference
+#+date:       [2026-05-28 Thu 19:06]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T190635-en
+#+source:     https://arxiv.org/abs/2604.03950
+#+authors:    Yifu Ding, Xinhao Zhang, Jinyang Guo (Beihang U / Beijing Jiaotong U)
+#+venue:      CVPR Workshop EDGE 2026, arXiv 2604.03950
+
+* The River of the Problem
+
+A problem that seemed already solved: how do we make attention's O(n²) even cheaper?
+
+Nine years. Since 2017, when Transformer hoisted the banner "Attention Is All You Need," every generation of researchers has been running the same arithmetic — a sequence of length n requires each token to compute similarity against every other token, so both computation and memory scale as n². 8K context is tolerable; 32K starts to hurt; 128K is an engineering disaster, yet users and applications keep pushing higher.
+
+The way each generation has passed the baton is fascinating: no one overturns the previous generation — instead, they find a new layer of cost buried inside the "secondary overhead" left behind. First came saving memory (avoid materializing the n×n intermediate matrix), then saving compute (swapping FP16 for FP8 / INT8), then harvesting hardware dividends (Blackwell GPUs natively support 4-bit floating point). Each layer peeled away exposes the next, which promptly becomes the new bottleneck.
+
+By 2026, the cost-shaving has reached an awkward impasse: hardware offers MXFP4 / NVFP4 4-bit float instructions with 4× the theoretical throughput of FP16, but who dares use them? Applying 4-bit precision directly to QK^T drops the attention-score cosine similarity from 0.988 to 0.714, and the model collapses. This is exactly the embarrassment DMA sets out to fix — "the hardware gives you 4× speed but you're afraid to use it." Can we identify the positions that cannot afford a precision drop, keep those at 8-bit, and compress everything else to 4-bit, capturing the hardware dividend without sacrificing accuracy?
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Debt left behind: n×n attention matrix, O(n^2) compute + memory for long sequences
+  v
+[2018] Milakov & Gimelshein - Online Softmax (NVIDIA Tech Report)
+  |
+  | Solved: softmax can be computed in a single streaming pass — no need to see the full row first
+  | Debt left behind: purely a mathematical trick; nobody integrated it with attention in a kernel
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | Combined online softmax + tiling into a single fused GPU kernel
+  | Memory: O(n^2) → O(n); speed 2-4×
+  | Debt left behind: arithmetic still in FP16; no low-bit hardware dividend claimed
+  v
+[2024] Shah/Jin/Zhang et al. - SageAttention / INT-FlashAttention
+  |
+  | Quantized QK^T to INT8/FP8; another 2-3× speedup
+  | Debt left behind: direct quantization to 4-bit collapses quality; "smoothing" needed as a fix
+  v
+[2024-2025] SageAttention v2/v3 series - smoothing-based low-bit attention
+  |
+  | Extra floating-point GEMV "flattens" outliers before quantization
+  | Debt left behind: that extra GEMV eats back a significant portion of the kernel throughput gain
+  v
+[2026] Ding et al. - DMA  <-- this paper
+  |
+  | No smoothing; instead, acknowledge that "tokens near the diagonal matter more"
+  | Diagonal window stays at MXFP8; everything else at MXFP4; hardware-native instructions throughout
+  | Quantization / micro-scaling / 4-bit packing / attention compute all fused into one Triton kernel
+  v
+[Future] Finer-grained token-importance routing + NVFP4 / FP6 mixed formats
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Replace Recurrence with Attention
+
+*** What Problem It Saw
+
+Before 2017, the workhorse for sequence modeling was RNN/LSTM. RNNs have a fundamental constraint — tokens must be processed one at a time, each step waiting for the previous hidden state. This is inherently sequential; GPU compute sits largely idle. Attention mechanisms already existed as auxiliary components (e.g., Bahdanau attention), but always as a side dish to the RNN main course.
+
+*** Its Solution
+
+Elevate attention to the main course: every token directly attends to every other token, resolved in a single matrix multiplication. The formula is Softmax(QK^T / sqrt(d)) V. All pairwise scores are computed in one shot — exactly what GPUs love.
+
+*** Why It Worked (and What Debt It Left)
+
+Parallelism took off, training throughput took off, quality took off — this became the root of every subsequent LLM. But it planted a time bomb: QK^T is an n×n square matrix; every element must be computed, and storing it requires n×n memory. When sequences are short nobody cares, but once length exceeds 4K, that n² factor is an inescapable disaster.
+
+** 2018 | Online Softmax: Compute Softmax While You Stream
+
+*** What Problem It Saw
+
+Classical softmax requires two passes: first scan the entire row to find the maximum (to prevent exp overflow), then scan again to compute numerator and denominator. This blocks tiling of attention — you must see the full row before you can begin. Any attempt to process attention in chunks hits this wall.
+
+*** Its Solution
+
+Milakov & Gimelshein buried a mathematical trick in an obscure NVIDIA technical report: maintain a running maximum m and a running normalization sum l, updating them incrementally with each new batch of data, such that the final result is numerically identical to the two-pass approach. This is online softmax.
+
+*** Why It Worked (and What Debt It Left)
+
+It compresses softmax from "two passes" to "one streaming pass." The trick attracted little attention at the time because standalone softmax wasn't a bottleneck. Its real power had to wait four years, until someone used it as a LEGO brick — it is the mathematical prerequisite that lets FlashAttention fuse the entire attention operation into a single kernel.
+
+** 2022 | FlashAttention: Stream Attention Through SRAM
+
+*** What Problem It Saw
+
+By 2022, n² memory had become the hard bottleneck for training long-context LLMs. The prevailing approach to "cheaper attention" was algorithmic surgery — sparse attention, linear attention, low-rank approximations — but all of these alter the mathematical definition of attention and introduce quality loss. Dao's insight was: the algorithm doesn't need to change; the bottleneck is the HBM ↔ SRAM data movement, not arithmetic.
+
+*** Its Solution
+
+Tile Q, K, and V into small blocks; load only one block at a time into the GPU's SRAM (fast on-chip memory); use online softmax to incrementally accumulate the attention output. The full n×n intermediate matrix is never materialized. Everything is fused into a single CUDA kernel, reducing HBM accesses from O(n²) to O(n).
+
+*** Why It Worked (and What Debt It Left)
+
+Mathematically exact — no quality loss unlike sparse or approximate methods — while winning on both memory and speed. This is arguably the most impactful engineering paper for LLMs in the past decade. But it revealed a new problem: once HBM is no longer the bottleneck, where does the bottleneck go? The answer: arithmetic itself. FP16 Tensor Cores computing QK^T can only go so fast. To squeeze further, you have to touch precision.
+
+** 2024 | SageAttention / INT-FlashAttention: Compress QK to INT8/FP8
+
+*** What Problem It Saw
+
+FlashAttention claimed the memory dividend, but arithmetic was still FP16. Meanwhile, LLM inference had broadly embraced low-bit quantization (weight INT4, KV cache INT8), yet the two matrix multiplications inside attention — QK^T and PV — were still running in FP16/BF16. This was a conspicuous unclaimed dividend.
+
+*** Its Solution
+
+Quantize Q and K online to INT8 (SageAttention) or FP8 (INT-FlashAttention), compute QK^T using low-bit Tensor Cores, then dequantize back to floating point for softmax. Speed improves another 2-3× over FlashAttention, with precision loss negligible on most tasks.
+
+*** Why It Worked (and What Debt It Left)
+
+INT8/FP8 has enough dynamic range to faithfully represent attention scores, so this is essentially plug-and-play with minimal quality loss. But when people grew greedier and tried pushing to 4-bit, things broke — 4-bit representation is far too sensitive to the tail outliers in attention scores, and naive quantization catastrophically distorts the softmax probability distribution. This set the stage for the next generation: smoothing.
+
+** 2024–2025 | SageAttention v2/v3: Patching 4-Bit with Smoothing
+
+*** What Problem It Saw
+
+Directly quantizing QK to 4-bit (MXFP4/INT4) drops cosine similarity from 0.988 to 0.714 (Table 2 in this DMA paper), collapsing model quality. Yet NVIDIA Blackwell GPUs natively support MXFP4 / NVFP4 instructions with twice the throughput of FP8 — too tempting a target to ignore.
+
+*** Its Solution
+
+Borrow SmoothQuant's idea: apply a smoothing transform before quantization, transferring outliers from Q to K (or V) so that both tensors have a distribution more amenable to quantization. With outliers tamed, 4-bit precision loss falls back into an acceptable range.
+
+*** Why It Worked (and What Debt It Left)
+
+Smoothing directly attacks the outlier problem that makes 4-bit quantization painful, so precision is recovered. But it carries an engineering cost: the smoothing step is an additional floating-point GEMV that must run either before or inside the attention kernel. When the DMA authors profile this (Table 7), they find that extra GEMV eats back a large fraction of the speedup that 4-bit otherwise provides. The natural next question: can we use 4-bit without smoothing at all?
+
+** 2026 | DMA: No Smoothing — Partition Instead. Important Tiles Stay at 8-Bit; the Rest Drops to 4-Bit
+
+*** What Problem It Saw
+
+DMA directly challenges the previous approach: smoothing exists to make *all* tokens work at 4-bit. But is every token in attention truly equally important? Sparse-attention research (SparseAttention, StreamingLLM, etc.) has repeatedly demonstrated that attention scores are heavily concentrated near the diagonal — in a local window — and in a handful of "sink tokens." In other words, most positions don't need to be rescued by 4-bit — only a small subset of critical positions needs higher precision; 4-bit is fine everywhere else.
+
+*** Its Solution
+
+DMA partitions the entire n×n attention matrix by tile. Tiles near the diagonal (interactions between nearby, important tokens) are computed in MXFP8 (8-bit); tiles far from the diagonal are computed in MXFP4 (4-bit). The full map requires neither smoothing nor sacrifices the speed of 4-bit Tensor Cores.
+
+At the same time, DMA does something that follow-up FlashAttention work often neglects: it fuses quantization, micro-scale transformation, 4-bit encoding and packing, and the attention computation itself into a single Triton kernel. The smoothing GEMV in the SageAttention series made this kind of end-to-end fusion difficult; removing smoothing makes fusion straightforward.
+
+*** Why It Worked (and What Debt It Left)
+
+The core insight: rather than using smoothing to force *all positions* into 4-bit territory, accept that *some positions genuinely need 8-bit* and partition by importance. The idea sounds simple once stated, but it rests on two prerequisites:
+1. Hardware must natively support mixed-precision Tensor Core instructions (only available on Blackwell and later).
+2. The spatial distribution of "important" attention scores must follow a predictable pattern (the diagonal window).
+
+Debt left behind: the diagonal window is hand-crafted, assuming "important token = local token." For long-context retrieval tasks, important tokens may appear at the sequence beginning (sink tokens) or at arbitrary positions in the middle. The next generation will likely require *dynamic token-importance routing* — deciding at runtime which tiles take 8-bit and which take 4-bit.
+
+* Frontier Extensions
+
+This paper appeared on arXiv only in April 2026, and no follow-up work explicitly citing and improving on it has emerged yet. Two directions are foreseeable:
+
+1. *Dynamic mixed-precision routing*: replace the static diagonal window for "which tiles use 8-bit" with an importance score computed dynamically from the query/key at runtime — analogous to a Mixture-of-Experts router, but operating at attention-tile granularity.
+
+2. *Even lower bit-width mixing*: beyond MXFP4, incorporate FP6, MXINT4, binarization, and other formats to build a multi-level 8/6/4/2 precision pyramid. The next GPU generation after Blackwell already has additional low-bit instructions on its roadmap.
+
+As of 2026-05, DMA is the first publicly published work to run hardware-native MXFP mixed-precision in an end-to-end attention kernel.
+
+* One Diagram to Understand It All
+
+#+begin_example
+   Time ----->
+   2017          2018          2022          2024          2025          2026
+
+  +-------+    +-------+    +-------+    +-------+    +-------+    +-------+
+  |Trans- |    |Online |    |Flash- |    |Sage / |    |Sage   |    |  DMA  |
+  |former |    |Softmax|    |Attn   |    |INT-FA |    |v2/v3  |    |       |
+  +-------+    +-------+    +-------+    +-------+    +-------+    +-------+
+  Parallel,    softmax      No longer    QK->INT8      4-bit +      Partition
+  but O(n^2)   streamable   stores n×n   /FP8 compute  smooth fix   + full fusion
+
+   Where the savings came from:
+   Algorithm        -> Math trick -> Memory -----> Bit-width -> Extreme bits -> Hardware dividend
+                                  (HBM I/O)       (FP16->8)    (8->4 + patch)   (4-bit practical)
+
+   Each generation's "savings target" only appears after the previous generation's target becomes the new bottleneck.
+#+end_example
+
+* Insight
+
+Reading the full arc, what is truly changing is not the attention algorithm itself, but *the understanding of where the bottleneck lies*.
+
+- In 2017, the perceived bottleneck was "the algorithm isn't parallel enough."
+- In 2022, it was "not enough memory."
+- In 2024, it was "bit-width is too wide."
+- In 2026, DMA says: the bottleneck is "we applied uniform precision to positions of unequal importance."
+
+This is a thoroughly classical engineering move: discover *heterogeneity* inside a problem that was previously treated as homogeneous, then allocate resources according to that heterogeneity. MoE does exactly this (each token routes to a different expert), as does speculative decoding (easy tokens take the small model) and mixed-precision training (different layers use different precision). DMA pushes the same pattern down to the granularity of individual attention tiles.
+
+Prediction for the next step: this river will enter a phase of *adaptive, runtime decision-making*. Every static, hand-crafted choice — diagonal window, fixed number of sink tokens, fixed sparsity pattern — will be replaced by some lightweight runtime router. The future of attention may look less like a fixed kernel and more like a dynamic circuit.
+
+* Takeaways
+
+Lessons for finding problems:
+
+1. *Read the profiler, not the paper title.* The reason DMA identified smoothing as the bottleneck is that the authors did the kernel breakdown profiling in Table 7 and saw how much time the GEMV was consuming. Many "performance problems" are hand-waved into existence; only actually measuring reveals where the money leaks.
+
+2. *The hardware roadmap is the research roadmap.* The moment MXFP instructions appeared on Blackwell GPUs, a paper like DMA was already inevitable somewhere in this river. The research window is often opened by hardware releases — arrive two years early and nobody can use your work; arrive two years late and someone else has planted the flag.
+
+3. *Accepting heterogeneity is cheaper than enforcing uniformity.* When a problem is handled uniformly, there is often a low-hanging fruit of "partition by importance" waiting to be picked — MoE, speculative decoding, mixed-precision training are all variations on the same underlying theme. Whenever you see uniform processing, it is worth asking: is this actually uniformly important?
+
+The actionable takeaway: the next time you encounter a design with uniform precision, uniform bandwidth, or uniform time allocation, run a lightweight importance profiling pass, identify the top-k% critical positions, give them more resources, and cut everything else. That is often the embryo of a publishable paper.

@@ -1,0 +1,256 @@
+#+title:      RUQuant: Towards Refining Uniform Quantization for Large Language Models
+#+date:       [2026-05-28 Thu 19:11]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T191155-en
+#+source:     https://arxiv.org/abs/2604.04013
+#+authors:    Han Liu, Haotian Gao, Changya Li, Feng Zhang, Xiaotong Zhang, Wei Wang, Hong Yu
+#+venue:      KDD 2026
+
+* The River of Problems
+
+Squeezing a model with tens of billions of parameters onto a consumer GPU is most directly achieved by chopping its floating-point numbers down to 4-bit integers. Quantizing weights is relatively manageable — weights are fixed after training. The hard part is *activations*: every new input sentence produces different intermediate values in every layer, and a handful of channels routinely carry values hundreds of times larger than their neighbors.
+
+Feed a distribution this stretched and skewed to a uniform quantizer that simply "divides the number line into 16 equal bins," and the result is predictable: 99% of values are crammed into a tiny cluster of bins and brutally rounded to the same integer; the 1% outliers monopolize the wide bins on the edges. The model promptly falls apart.
+
+Generation after generation of researchers along this line have been doing the same thing — *finding ways to flatten that stretched, skewed distribution so that a uniform quantizer can survive*. From the earliest approach of pulling outlier channels aside and handling them at high precision, to using mathematical "skin stretching" (rotation matrices) as the central tool, to revisiting "what distribution is most quantizer-friendly" through a 1960s signal-processing theorem — this is a trajectory from *avoiding the problem* to *transforming the problem* to *theoretically redefining the problem*.
+
+* Provenance Map
+
+#+begin_example
+[2022] Dettmers - LLM.int8()
+  |
+  | Observed problem: Once LLMs cross the ~6.7B scale threshold,
+  |                   "super-large channels" emerge in activations
+  |                   and whole-layer INT8 collapses.
+  | Solution: Give outlier channels a side door — they run in FP16;
+  |            everything else runs in INT8.
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Observed problem: The side door hurts hardware efficiency;
+  |                   outliers still exist, just detoured.
+  | Solution: Multiply a per-channel scaling factor into activations
+  |            to shift the "difficulty" onto weights,
+  |            letting both sides run in INT8.
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Observed problem: Per-channel scaling only adjusts along axes;
+  |                   outliers remain sparse in a few channels.
+  | Solution: Use a Hadamard orthogonal rotation to "scatter"
+  |            activations into an approximately Gaussian shape,
+  |            spreading outliers across all dimensions.
+  v
+[2025] Liu et al. - SpinQuant
+  |
+  | Observed problem: Random Hadamard is a blind guess;
+  |                   results have high variance across runs.
+  | Solution: Make the rotation matrix learnable
+  |            (Cayley-SGD optimizing on the orthogonal manifold).
+  v
+[2024] Xiang & Zhang - DFRot
+  |
+  | Observed problem: "Massive activations" in a few tokens
+  |                   dominate the error; generic rotation is too coarse.
+  | Solution: Optimize rotation directions specifically
+  |            for those problematic tokens.
+  v
+[2026] Liu et al. - RUQuant  <-- Target paper
+        Observed problem: All predecessors reshaped distributions
+                          by intuition; nobody answered "what
+                          distribution is theoretically optimal
+                          for a uniform quantizer?"
+        Solution: Invoke the 1960s Lloyd-Max optimal quantization
+                  theorem: prove that mapping activations to a
+                  uniform distribution makes a uniform quantizer
+                  achieve its theoretical optimum. Then use a
+                  composite orthogonal transform — Householder
+                  reflections + Givens rotations — to map
+                  activations block-wise to a uniform distribution
+                  in closed form.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering "Ghost Channels" in LLM Activations
+
+*** What problem it saw
+
+Everyone had assumed INT8 quantization was a solved problem — it worked fine on ResNet and BERT. But when Dettmers applied the same recipe to GPT-3-scale LLMs, the model immediately went incoherent. After careful investigation, they pinpointed a phenomenon nobody had noticed before: once model scale crossed the 6.7B threshold, activations developed a handful of channels whose *absolute values were hundreds of times larger than neighboring channels* (emergent outlier features), and these channels were locked to fixed dimensions.
+
+Feed such activations into INT8 — to accommodate those monster values, the quantization step size is forced to expand by tens of times, and the remaining 99.99% of normal values all collapse into nearly indistinguishable integers. The model inevitably breaks.
+
+*** Its solution
+
+Simply stop mixing them together. During each layer's matrix multiplication, split activations by channel into two groups: *outlier channels run in FP16; normal channels run in INT8*; then sum the two results at the end.
+
+*** Why it worked (and where the new pitfall lay)
+
+It worked because it acknowledged that "some channels simply cannot be quantized" — an honest admission of limits. But the new pitfall was obvious: mixed precision means the GPU kernel must perform two separate multiplications along two data paths, hurting hardware efficiency; and the outliers still exist — they were merely routed around. The next researcher would ask: can every channel run in INT8?
+
+** 2023 | SmoothQuant: Migrate the Difficulty from Activations to Weights
+
+*** What problem it saw
+
+LLM.int8's "side-door" strategy forced inference engines to maintain two separate data paths, making deployment cumbersome. More fundamentally, it never solved the outliers — it only *avoided* them. Xiao et al. wanted to eliminate outliers head-on.
+
+*** Its solution
+
+Observe a simple identity: =Y = X @ W = (X / s) @ (s * W)=. Here =s= is a per-channel scaling factor. If a particular channel has an activation of 100 and a weight of 0.01, set =s=10=: the activation becomes 10, the weight becomes 0.1. The outlier in the activation is suppressed, and the weight grows slightly (but weights already have a relatively flat distribution), transferring the quantization difficulty from activations to weights.
+
+Tune =s= (via a harmonic-mean heuristic), and both sides can run in INT8.
+
+*** Why it worked (and where the new pitfall lay)
+
+Activation outliers are concentrated *per channel* — that structured non-uniformity is exactly absorbed by a "one scaling factor per channel" structured correction. But SmoothQuant's =s= is a hand-tuned heuristic with no optimality guarantee. More importantly, this transform is nothing more than *axis-aligned scaling*: the fundamental issue — a handful of channels with disproportionately large variance — never truly disappears, it is merely split roughly in half between the two sides. Once bit-width drops to 4, that "split in half" is no longer enough.
+
+** 2024 | QuaRot: Don't Dodge — Scatter the Outliers Across All Dimensions
+
+*** What problem it saw
+
+SmoothQuant was adequate at W8A8; it collapsed at W4A4. At only 16 quantization levels (4-bit), any remaining significant outlier in any dimension destroys the whole layer. Per-channel scaling treats the symptom but not the cause — *outliers are harmful precisely because they are concentrated*. If the outlier energy could be "spread" across all dimensions so each dimension carries only a tiny share, the problem disappears.
+
+*** Its solution
+
+Borrow an old trick: *orthogonal rotation*. Multiply activations =X= by a rotation matrix =Q= (=Q^T Q = I=) and simultaneously multiply weights by =Q^T= — the result is unchanged. But after rotation, energy that was concentrated in a few dimensions is spread uniformly across all of them. By high-dimensional probability theory, multiplying by a random orthogonal matrix (specifically a Hadamard matrix, chosen for its regular structure and cheap computation) pushes any distribution toward a Gaussian.
+
+A Gaussian has no sharp outliers; every dimension looks roughly the same. Uniform quantization applied afterward incurs dramatically less error.
+
+*** Why it worked (and where the new pitfall lay)
+
+It worked because it reframed "outliers" — which seemed like an inescapable physical reality — as "a poorly chosen coordinate system." Change the coordinate system (rotate), and the problem vanishes. That is a significant conceptual leap.
+
+New pitfall: the Hadamard matrix is a *fixed, random* choice. It assumes "scatter to Gaussian = optimal" — but why? Moreover, the best rotation almost certainly differs across models and layers. Hadamard is merely convenient engineering.
+
+** 2025 | SpinQuant: The Rotation Should Be Learned, Not Guessed
+
+*** What problem it saw
+
+QuaRot's random Hadamard produced high variance across runs, indicating the rotation was far from optimal. Since the rotation matrix's purpose is to minimize quantization loss, why not *learn the rotation directly using quantization loss as the objective*?
+
+The difficulty: rotation matrices must remain orthogonal (=Q^T Q = I=) at all times; a single standard SGD step destroys this property.
+
+*** Its solution
+
+Move the optimization onto the *orthogonal manifold*. Cayley-SGD is a Riemannian optimization method that steps along the tangent space of the orthogonal manifold and projects results back onto it. The learned rotation matrix stays orthogonal throughout while moving in the direction that reduces quantization loss.
+
+*** Why it worked (and where the new pitfall lay)
+
+Turning "rotation design" from hand-crafted or random into *a differentiable learning objective* is a more modern approach. But it still treats the full rotation matrix as a black-box optimization target — it does not reveal what the learned rotation actually means, and offers no theoretical characterization of what the rotation should look like at convergence. It is simply better in practice.
+
+** 2024 | DFRot: The Real Trouble Lies in a Few Tokens
+
+*** What problem it saw
+
+All prior methods computed loss averaged over all tokens with "one rotation per layer." Xiang and Zhang examined the error distribution carefully and found quantization error was not spread evenly across tokens — *a tiny number of tokens ("massive activations") contributed the overwhelming majority of error*. Adjusting the rotation specifically for those tokens was far more cost-effective than adjusting it for all tokens equally.
+
+*** Its solution
+
+Identify these "hot-spot" tokens and optimize a dedicated set of rotation parameters for them, minimizing quantization error specifically on those tokens.
+
+*** Why it worked (and where the new pitfall lay)
+
+Shifting the perspective from "global average error" to "the long tail of the error distribution" is a simple but effective engineering optimization. But the approach remains *empirically driven*: fix what hurts. Throughout the entire rotation-plus-quantization lineage — from SmoothQuant all the way to DFRot — nobody had answered a fundamental question:
+
+*What activation distribution actually minimizes the error of a uniform quantizer?*
+
+** 2026 | RUQuant: Stop Guessing — Let Lloyd-Max from the 1960s Give You the Answer
+
+*** What problem it saw
+
+Every predecessor was doing the same thing: reshape the activation distribution and hope it becomes more quantizer-friendly. But what does "friendly" actually mean? Gaussian? Bimodal? Something else? Nobody said. The result was that each method groped for parameters under its own empirical conditions, crafted a distribution that "looked better," and compared perplexity (PPL).
+
+RUQuant retrieved the *Lloyd-Max optimal quantization conditions* from signal processing (a foundational theorem of speech coding established in the 1960s):
+
+1. *Decision-boundary condition*: the boundary between adjacent quantization points should be their midpoint.
+2. *Centroid condition*: each quantization point should be the centroid of the probability density within that interval.
+
+A uniform quantizer naturally satisfies condition 1 (fixed step size means midpoints are boundaries). Condition 2 is satisfied only when the *distribution within each interval is uniform* — only then does the centroid coincide exactly with the midpoint.
+
+In other words: *mapping the distribution to a uniform distribution makes a uniform quantizer theoretically optimal*. Not Gaussian — uniform. Three years of empirical groping in the dark, and the correct answer had been sitting in a textbook from sixty years ago.
+
+*** Its solution
+
+With the goal clearly stated, the remaining challenge is engineering: how to *in closed form* map an arbitrary activation distribution to a uniform distribution?
+
+The answer is to combine two families of elementary orthogonal transforms:
+- *Householder reflection*: given any two vectors =x= and =u= of equal norm, there exists a Householder matrix =H= such that =H x = u=. Sample a target vector =u= from a uniform distribution, construct =H=, and map =x= to =u= in a single step — no training required.
+- *Givens rotation*: rotate in a two-dimensional plane. Pair up dimensions of the high-dimensional vector, rotate each pair, shuffle the pairings with a random permutation, and iterate a few rounds to further uniformize.
+
+Slice activations into blocks (to control matrix overhead); apply a composite orthogonal matrix =Q_c= — a combination of Householder and Givens transforms — that maps each block to a uniform distribution in closed form. Add a globally learnable Householder reflection for final fine-tuning, using the discrepancy between the Transformer's input and output as the loss function.
+
+On a 13B model, W4A4, *calibration finishes in one minute*, retaining 97% of full-precision accuracy.
+
+*** Why it worked (and where the new pitfall lay)
+
+It worked because it *crossed from empiricism into theory*: the transform's goal is no longer "look better" but "satisfy the second Lloyd-Max condition." Once the goal is explicit, the task becomes constructing a family of transforms that achieves it in closed form — Householder + Givens turns out to do exactly that.
+
+New pitfall: Lloyd-Max assumes *scalar quantization*, encoding each scalar independently. But real hardware — tensor cores, multiply-accumulate units — operates on *vectors*; whether "map activations to a uniform distribution" remains the optimal target in a vector quantization setting still needs deeper investigation. Additionally, "exactly uniform distribution" can be achieved within a finite block, but across blocks and across the full layer it remains an approximation — there is still a gap between theoretical optimum and practical optimum.
+
+* Frontier Extensions
+
+As of May 2026, RUQuant represents the current frontier of the "theory-driven rotation quantization" line. It was published at KDD 2026 (posted to arXiv in April 2026).
+
+Two directions are predictably emerging:
+
+1. *Theoretical extension*: Lloyd-Max is the optimality condition for scalar quantization. The optimality conditions for *vector quantization* (e.g., the generalized Lloyd / LBG algorithm) will be brought to bear — once inter-channel covariance is taken into account, the "uniform distribution" may no longer be the optimal target, and something like "spherical Gaussian + equidistant" may take its place.
+2. *Hardware co-design*: "Structured orthogonal matrices" of the Householder + Givens variety are naturally hardware-friendly (multiply-accumulate units can unroll them in parallel). The next step is to *fuse these transforms into Transformer inference kernels* rather than storing a separate rotation matrix — quantization and the operator merged into one.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                Time ->
+                2022      2023        2024         2025        2026
+  ----------+---------+------------+-------------+----------+-----------
+            |         |            |             |          |
+  Attitude  | Isolate | Migrate    | Scatter via | Learn a  | Don't
+  toward    | them    | them to    | rotation    | better   | "scatter" --
+  outliers  | (side   | weights    | to all dims | rotation | "eliminate"
+            | door)   |            |             |          | (uniformize)
+            |         |            |             |          |
+  Method    | LLM.int8| SmoothQuant| QuaRot      | SpinQuant| RUQuant
+            |         |            | DuQuant     | DFRot    |
+            |         |            |             |          |
+  Guiding   | Engi-   | Engineering| Empirical + | Empirical| Theory
+  principle | neering | heuristic  | high-dim    | + optim. | (Lloyd-Max)
+            | patch   |            | intuition   |          |
+            |         |            |             |          |
+  Core      | Split   | Scale      | Rotate      | Rotate   | Orthogonal
+  action    | channels| channels   | (random)    | (learned)| transform
+            |         |            |             |          | (closed-form)
+            |         |            |             |          |
+  Bit-width | W8A8    | W8A8       | W4A4        | W4A4     | W4A4
+  target    | (mixed) |            | workable    | better   | near
+            |         |            |             |          | full-prec.
+  ----------+---------+------------+-------------+----------+-----------
+       |        |          |          |          |         |
+  "Outliers" "Relocate  "Scatter    "Learn to   "Fully
+  discovered  outliers"  outliers"   scatter"    eliminate"
+              (still     (blindly)   (no         (because we
+              exist)                 theory)     know the
+                                                 target:
+                                                 uniform)
+#+end_example
+
+* Insight
+
+This river looks like an engineering evolution of "pushing quantization precision from 8-bit to 4-bit," but what is actually changing underneath is *researchers' conceptual attitude toward the phenomenon of activation outliers*:
+
+1. *Treat them as physical reality* (LLM.int8 era): outlier channels objectively exist; route around them.
+2. *Treat them as a redistributable burden* (SmoothQuant era): outliers are "unequal allocation between activations and weights"; rebalancing dissolves them.
+3. *Treat them as a coordinate-system problem* (QuaRot/SpinQuant era): outliers arise from a poorly chosen coordinate system; change the system and they vanish.
+4. *Treat them as a distribution-shape problem* (RUQuant era): outliers reflect the wrong distribution shape; reshape the distribution into the form "most friendly to the quantizer" — and what that form is, theory settled long ago.
+
+Each step *abstracts the problem one level further*. Each abstraction unlocks design degrees of freedom that were invisible before.
+
+A more important takeaway: *the right theoretical framework is often more valuable than a new algorithm*. RUQuant did not invent Householder, and it did not invent Lloyd-Max. It merely combined two tools from sixty years ago, and in one sentence clarified a problem that empiricism had occupied for three years. This kind of "theoretical archaeology" is severely undervalued in AI research.
+
+The most likely next advance: jump from Lloyd-Max for scalar quantization to the *LBG framework for vector quantization*, and revisit "what is the optimal activation distribution." Once that leap is made, the entire W4A4 paradigm will be rewritten again.
+
+* Lessons
+
+If you work in applied AI research or engineering, this river offers at least three transferable perspectives:
+
+1. *When a field has been governed by empiricism for three or more years, go treasure-hunting in old textbooks on signal processing, statistics, and optimization.* RUQuant's Lloyd-Max dates to the 1960s; the Householder reflection it uses dates to 1958; Givens rotations to 1955. Deep learning's "new" problems are often problems for which classical disciplines already worked out the optimal solution.
+2. *Whenever you see the words "heuristic," "empirical," or "requires tuning" in a paper, treat it as an opportunity signal.* It means nobody has written down the objective function clearly. The first person who can formalize the objective usually earns the ticket to the next step.
+3. *First acknowledge the problem (side door), then route around it (migrate), then eliminate it (reshape), then define precisely what "eliminate" means (theoretical convergence)* — this four-step pattern governs almost every technological evolution. Identifying which step you are on lets you predict what the next step should look like.

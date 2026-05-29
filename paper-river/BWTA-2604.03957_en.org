@@ -1,0 +1,309 @@
+#+title:      BWTA: Accurate and Efficient Binarized Transformer by Algorithm-Hardware Co-design
+#+date:       [2026-05-28 Thu 19:08]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T190859-en
+#+source:     https://arxiv.org/abs/2604.03957
+#+authors:    Yifu Ding, Xianglong Liu, Shenghao Jin, Jinyang Guo, Jiwen Lu
+#+venue:      arXiv preprint, Apr 2026 (under review)
+
+* The River of Problems
+
+Squeezing a large model into a phone, into a single GPU, into an inference server — can every number be made to occupy just 1 bit?
+
+The idea sounds simple: "Neural networks aren't that sensitive to precision anyway. Slash FP16 (16 bit) down to 1 bit, shrink the footprint by 16×, turn matrix multiplication into XOR + popcount, and it should fly." Yet after more than a decade, the entire field has stumbled repeatedly at the same set of hurdles:
+
+- *Accuracy hurdle*: The larger the model and the closer to 1 bit, the steeper the quality drop — often to the point of unusability.
+- *Training hurdle*: 1-bit functions are non-differentiable. How do gradients flow? Training is very hard to converge.
+- *Hardware hurdle*: Even after training successfully, GPUs have no native 1-bit matrix-multiply instruction, so the theoretical savings never translate into real savings.
+- *Activation hurdle*: Weights can be cut to 1 bit, but activations (intermediate values) collapse as soon as they are cut to 1 bit. So most work only dares to touch weights, leaving activations at FP16/INT8 — but that means the true computational bottleneck is never resolved.
+
+The main thread of this river is: *"Weights can already reach 1 bit — when do activations get their turn?"* — successive generations maneuvering between the three hurdles of accuracy, training, and hardware, advancing a little each time. BWTA is the first work to simultaneously cut activations to ternary ({-1, 0, 1}) and achieve real measured speedup on GPUs.
+
+* Source Map
+
+#+begin_example
+[2016] BinaryConnect / XNOR-Net          (Courbariaux, Rastegari)
+       Full binarization for CNNs: weights and activations both ±1
+  |
+  | Problem: only validated on small CNNs; accuracy collapses on Transformers
+  v
+[2020-2022] BinaryBERT / BiBERT          (Bai, Qin et al.)
+       Moving the binarization idea to BERT
+  |
+  | Problem: only works at the ~100M scale of BERT; relies on FPGA/ASIC
+  |          no corresponding low-bit kernel on GPU
+  v
+[2023] BitNet                            (Wang et al., MSR)
+       1-bit weights + INT8 activations; train LLMs natively from scratch
+  |
+  | Problem: 1-bit weights lack expressiveness; accuracy drops
+  |          activations still INT8, no further compression
+  v
+[2024] BitNet b1.58                      (Ma et al., MSR)
+       Weights become ternary {-1, 0, 1}: one extra "zero"
+  |
+  | Problem: activations still INT8/FP16; real compute cost unchanged
+  |          no working GPU kernel; speed advantage is purely theoretical
+  v
+[2023-2024] DB-LLM / PB-LLM / BiLLM      (Chen, Yuan, Huang et al.)
+       Post-training compression of existing LLMs to ~1 bit:
+       dual matrices, salient-weight protection, structured calibration
+  |
+  | Problem: still weight-only (W-only); activations untouched
+  |          all use generic GEMM kernels; 1-bit structure never exploited
+  v
+[2026] BWTA  <-- target paper            (Ding, Liu et al., BUAA)
+       Binary Weight + Ternary Activation
+       + custom CUDA bitpack kernel; activations finally compressed too
+#+end_example
+
+* Evolutionary Narrative
+
+** 2016 | BinaryConnect / XNOR-Net: Cutting a Neural Network Down to Just +1 and −1
+
+*** What Problem Did It See
+
+Computer-vision researchers of that era noticed a peculiar phenomenon: a blazing-fast CNN might have millions of floating-point weights, yet many ".7234" and ".6981" values make no difference to the final prediction. Wasn't FP32 just wasteful? Could we keep only the sign?
+
+Taking it further: if weights are only ±1 and activations are only ±1, a standard matrix multiply (a*w) becomes "XOR + popcount" — a single bitwise CPU instruction, theoretically 32× faster than FP32.
+
+*** Its Solution
+
+*BinaryConnect* simply binarizes weights: during training a full-precision FP32 "shadow weight" is maintained; in the forward pass it is sign-quantized to ±1; in the backward pass gradients flow directly to the FP32 shadow (this trick is later called *Straight-Through Estimator, STE* — treating the non-differentiable sign function as an identity during backpropagation).
+
+*XNOR-Net* goes further and binarizes activations as well, introducing a *scaling factor* (one floating-point scalar per channel) to partially compensate for the magnitude loss induced by binarization.
+
+*** Why It Worked (and What New Traps It Set)
+
+CNN convolution layers have enormous amounts of repeated filtering and are naturally insensitive to the precision of individual weights. But this approach planted three time bombs:
+
+1. *Fine for small models, catastrophic for large ones*: On ImageNet, ResNet-18 drops roughly 10–12 points — tolerable; but larger models drop proportionally more.
+2. *Only validated on CNNs*: The attention distribution in Transformers is utterly unlike CNN convolutions. Attention outputs follow a power-law distribution — a large mass of near-zero values and a handful of large ones. Forcing binarization crudely splits that near-zero mass in two, causing severe errors.
+3. *No GPU support*: The theoretical 32× speedup was only validated on custom FPGAs; NVIDIA GPUs have no native 1-bit MMA instruction.
+
+When the next generation tried to move this to Transformers, bombs two and three detonated — the approach simply did not work.
+
+** 2020–2022 | BinaryBERT / BiBERT: First Attempts to Bring Binarization to Transformers
+
+*** What Problem Did It See
+
+After BERT's release in 2018, every NLP task migrated to it. But even BERT-base has 110M parameters and weighs 400 MB for mobile deployment. Binarizing it would shrink it to roughly 13 MB, making on-device inference viable.
+
+Yet naively applying the XNOR-Net recipe to BERT caused precision to collapse immediately. Why? Transformers contain something CNNs do not: *attention scores*. Post-softmax attention probabilities are sparse distributions in [0, 1], with most values near zero. This distribution is extremely sensitive to binarization — forcing it into {0, 1} turns "almost all zeros with a few large spikes" into "half zeros and half ones," crippling the attention mechanism entirely.
+
+*** Its Solution
+
+*BinaryBERT* (Bai et al., ACL 2021) found a compromise: first train a ternary BERT (weights {-1, 0, 1}), then "split" each ternary weight into two binary weights. Ternary serves as a stepping stone to binary.
+
+*BiBERT* (Qin et al., ICLR 2022) introduces an information-retention objective: explicitly maximizing preserved mutual information during binarization, and replacing the softmax in attention with booleanization ({0, 1}) followed by weighted aggregation.
+
+*** Why It Worked (and What New Traps It Set)
+
+These two papers proved that Transformers can be binarized, trained to convergence, and deployed on edge devices. But new traps emerged:
+
+1. *Only validated on small models like BERT*: At the ~100M scale. When LLMs arrived (7B, 70B), the training cost and accuracy degradation of this approach became untenable.
+2. *Speedup still only validated on FPGA/ASIC*: GPU-side binary MatMul remained out of reach.
+
+The next generation had to answer: *How do you binarize at LLM scale? And how do you achieve real speedup on GPUs?*
+
+** 2023 | BitNet: The First to Put "1-bit" on the LLM Table
+
+*** What Problem Did It See
+
+After GPT-3 and LLaMA, models routinely reached 7B–70B parameters. A 70B model in FP16 is 140 GB — too large for a single H100. The ROI on quantization was now 100× higher than in the small-model era. But BinaryBERT-style training on 70B models was prohibitively expensive and suffered severe accuracy drops.
+
+*BitNet* (Wang et al., 2023) made a key observation: rather than compressing after training, *train LLMs from scratch in 1-bit from the very beginning*. Let the model adapt to the binarized world from the start.
+
+*** Its Solution
+
+Replace every nn.Linear in the Transformer with *BitLinear* — sign-quantize weights to ±1 in the forward pass, use STE in the backward pass. Activations stay at INT8 (8 bit). A LayerNorm is added at training time to stabilize gradients.
+
+The full architecture is called BitNet. Model size drops to 1/16 of FP16; theoretical compute throughput increases 16×.
+
+*** Why It Worked (and What New Traps It Set)
+
+It proved that LLMs can be trained from scratch with 1-bit weights, and that this works far better than post-training quantization to 1 bit. But the traps are obvious:
+
+1. *±1 weights still lack expressiveness*: A noticeable gap versus FP16 baseline remains. Could a third value, zero, be added?
+2. *Activations still INT8*: The true computational bottleneck is MatMul; without compressing activations, only memory is saved, not compute.
+3. *No GPU kernel exists*: The dtype combination of 1-bit weight × INT8 activation is not supported by cuBLAS/cuDNN. Measured speedup remains theoretical only.
+
+The next generation quickly patched the first trap.
+
+** 2024 | BitNet b1.58: One Extra Zero Buys Back Accuracy
+
+*** What Problem Did It See
+
+BitNet cuts weights to ±1, but many Transformer weights are naturally "near zero" — forcing them up to ±1 injects noise. Could weights be allowed one more value, simply 0?
+
+This seems trivial: three values (-1, 0, 1) versus two (-1, 1) — just one extra token's worth. But the cost is that each weight now requires log₂(3) ≈ 1.58 bits rather than 1 bit. Hence the name *b1.58*.
+
+*** Its Solution
+
+Replace BitNet's sign function with *RoundClip*: first normalize by absmean, then round to the nearest value in {-1, 0, 1}. Everything else remains the same as BitNet.
+
+In experiments, this single change allowed a 3B model to match FP16 LLaMA outright. When the paper dropped, it sent shockwaves through the field: "A 1.58-bit LLM already matches FP16."
+
+*** Why It Worked (and What New Traps It Set)
+
+The extra zero lets the model "naturally sparsify," aligning with the true weight distribution of Transformers. But the remaining traps became even more glaring:
+
+1. *Activations still INT8 or even FP16*: The real inference cost of all W1.58 work is bottlenecked by activations.
+2. *Still no usable GPU kernel*: Speedup numbers in the BitNet b1.58 paper are theoretical or measured on FPGAs. Running actual inference on NVIDIA GPUs yields almost no speedup over FP16.
+3. *Why not compress activations at the same time?* Because activations are dynamic — generated at runtime — and bitpacking an activation tensor on the fly carries heavy overhead that outweighs the savings.
+
+The next generation needed to either solve "compress activations too" or solve "real GPU speedup." BWTA ended up solving both simultaneously.
+
+** 2023–2024 | DB-LLM / PB-LLM / BiLLM: A Different Path — Post-Training Quantization to Near 1 Bit
+
+*** What Problem Did It See
+
+The BitNet line requires training from scratch, burning hundreds of GPU-days. But hundreds of open-source LLMs already exist. Could you directly take a trained LLaMA-7B and post-training-quantize it to near 1 bit?
+
+The challenge: directly applying the sign function to trained weights causes catastrophic accuracy loss.
+
+*** Its Solution
+
+Three distinct approaches:
+
+1. *DB-LLM* (Chen et al., 2024): Approximate one FP weight using the *product of two 1-bit matrices*: $W \approx \alpha (B_1 \cdot B_2)$. Two stacked binary matrices are far more expressive than a single binary one — at the cost of doubling compute.
+2. *PB-LLM* (Yuan et al., 2024): "Partially Binarized" — split weights into two groups: the most important ~5% are kept at high precision (FP16/INT8); the remaining 95% are purely binary. Based on the observation that a small number of salient weights carry the bulk of the information.
+3. *BiLLM* (Huang et al., ICML 2024): Approximate the "salient" part of weights using second-order residuals (also binary); apply structured group binarization to the non-salient part. Average bit-width is compressed to approximately 1.1.
+
+*** Why It Worked (and What New Traps It Set)
+
+These papers proved that existing LLMs can be compressed to near 1 bit without training from scratch. But the same time bombs as before are still ticking:
+
+1. *Still weight-only*: All activations remain at BF16/INT8; the runtime compute bottleneck is untouched.
+2. *Inference still uses generic GEMM kernels*: 1-bit weights are dequantized back to FP16 before passing through cuBLAS — memory is saved, but the compute speedup that 1-bit structure could have provided is wasted.
+3. *The kernel problem is sidestepped*: W1A1 achieves 30× speedup on FPGA/ASIC, but nobody has managed to implement this on a GPU.
+
+At this point — early 2026 — the river's state is: *every trick on the weight side has been tried; the activation and kernel gaps remain unfilled.* BWTA fills exactly those two gaps.
+
+** 2026 | BWTA: The First to Simultaneously Compress Activations and Achieve Real GPU Speedup
+
+*** What Problem Did It See
+
+Laying all prior work on the table, the BWTA team saw the following facts:
+
+- Weights: 1 bit or ternary — thoroughly addressed.
+- Activations: still INT8/FP16 — the "other half" completely untouched.
+- GPU kernels: nonexistent — all speedup numbers are fictional.
+
+The key insight: *Why has nobody compressed activations?* Because activation distributions are particularly hostile — especially attention outputs, which follow a power-law distribution with a large mass of small values clustered near zero. Crude binarization ({-1, +1}) splits that near-zero cluster in two, introducing a massive *zeropoint distortion*.
+
+What if activations were allowed one extra zero, becoming ternary {-1, 0, 1} — just as BitNet b1.58 did for weights? Could they then be compressed?
+
+*** Its Solution
+
+Three puzzle pieces:
+
+1. *BWTA scheme*: Weights binary {-1, +1}; activations ternary {-1, 0, +1}. Small activation values (|x| < 0.5) are mapped to 0, preserving the near-zero distribution.
+2. *Smooth Multi-Stage Quantization*: Rather than cutting straight to ternary in one shot, training starts with bitwidth k=9 (512 levels) and decreases *levelwise* linearly down to k=3 (8 levels) and then k=2 (ternary). Each transition uses a *Magnitude-Alignment Projection Factor* to realign the magnitude and prevent sudden loss spikes.
+3. *BWTA MatMul CUDA Kernel*: Custom CUDA implementation. Two key components:
+   - *Instruction-level Parallel Bitpack*: Uses mov/and/shr bitwise instructions to pack FP16 activations in-flight into a binary/ternary bitstream directly in GPU registers.
+   - *Comprehensive MatMul Implementations*: The linear layer is W{-1,1} × A{-1,0,1}; attention has two additional variants (Att × V, Q × K). Each of the three cases uses a different bitwise operation combination (mma.xor / mma.and).
+   - NVIDIA Tensor Core bitwise mma instructions are used to execute genuine 1-bit matrix multiplication.
+
+*** Why It Worked (and What New Traps It Set)
+
+It filled two gaps that had gone unfilled for a decade:
+
+- On BERT, GLUE average drops by only 3.5% (fewer than 2% on 5 of the tasks); LLM perplexity is on par.
+- Kernel-level 16–24× speedup versus FP16; end-to-end prefill at 216–330 tokens/s.
+- Clearly faster than SOTA W1A8 because the activation half of the bit-width is genuinely reduced.
+
+Remaining new traps:
+
+1. *Ternary is still not quite 1 bit*: Activations are ~1.58 bit, not true 1 bit.
+2. *Training pipeline is heavy*: Multi-stage scheduling plus distillation is far more expensive than simple PTQ.
+3. *Only validated on BERT and ~2B-scale LLMs*: No data yet for 70B+.
+4. *Decode speedup (12–15 tok/s) lags behind prefill*: Decode is memory-bound; kernel speedup primarily helps the compute-bound prefill phase.
+
+* Frontier Extensions
+
+As of May 2026, BWTA remains the latest work on this line to simultaneously achieve binary weights + sub-INT8 activations + real GPU speedup. The next pressure points are foreseeable:
+
+- *Compressing activations further to binary*: Is W1A1 on GPUs possible? It promises a theoretical 32× speedup, but the accuracy barrier may be insurmountable.
+- *Validation on larger LLMs*: Can results be reproduced on 70B models or MoE architectures like Mixtral?
+- *Decode speedup*: BWTA's prefill flies, but the generation phase is still bottlenecked by memory bandwidth. More aggressive KV cache quantization is needed.
+- *Convergence with sparsity*: Weights are already binary — what happens if N:M sparsity is added on top? Do these two compression paths conflict?
+- *Training BWTA from scratch*: Currently multi-stage + distillation is required. Could BWTA be trained from scratch in one shot, BitNet-style?
+
+These are the most likely directions for this line in 2026–2027.
+
+* One Diagram
+
+#+begin_example
+                   Weight bitwidth (W)     Activation bitwidth (A)  GPU speedup    Validation scale
+                   ------------------      -----------------------   -----------    ----------------
+[2016] BinaryConnect   1 bit                FP32                     FPGA only      small CNN
+[2016] XNOR-Net        1 bit                1 bit                    FPGA only      ResNet-18
+                       |
+                       | "Let's try this on Transformers"
+                       v
+[2021] BinaryBERT      1 bit                1 bit                    FPGA only      BERT-base
+[2022] BiBERT          1 bit                1 bit                    FPGA only      BERT-base
+                       |
+                       | "What about LLM scale? Train from scratch"
+                       v
+[2023] BitNet          1 bit                INT8                     not real       up to 3B
+                       |
+                       | "Let weights keep a zero"
+                       v
+[2024] BitNet b1.58    1.58 bit (3 values)  INT8/BF16                not real       up to 3B
+                       |
+                       | "Apply PTQ to already-trained models"
+                       v
+[2024] DB-LLM          2 x 1 bit            BF16                     dequant-GEMM   7B-70B
+[2024] PB-LLM          ~95% 1bit + 5% hi    BF16                     dequant-GEMM   7B-70B
+[2024] BiLLM           ~1.1 bit             BF16                     dequant-GEMM   7B-70B
+                       |
+                       | "What about the activation half? What about the kernel?"
+                       v
+[2026] BWTA            1 bit                1.58 bit (3 values)      YES (16-24x)   BERT + 2B LLM
+                                                                                     ^
+                                                                                     |
+                                             First work to achieve all three --------+
+
+  Compression has advanced from the "weight" side alone
+  to the full "weight + activation + kernel" triple.
+  The true resistance to shrinking bitwidth was never the math —
+  it was absent GPU instructions and hostile activation distributions.
+#+end_example
+
+* Insights
+
+Reading through this decade-long evolutionary arc, one can see something deeper than "algorithms keep improving":
+
+1. *Bottlenecks rotate* — each generation's contribution is precisely to address the bottleneck that the previous generation had just exposed. The CNN era solved "can small models go 1-bit?"; the BERT era solved "can Transformers go 1-bit?"; BitNet solved "can LLMs be trained from scratch at 1-bit?"; BWTA solved "can activations and kernels keep up?" Each generation does not overturn its predecessor — it picks up the specific piece that the predecessor was unwilling to touch.
+
+2. *Hardware instructions are the hidden gravity* — the real resistance throughout this river was never the algorithm (W1A1 existed in 2016) but the long absence of a native 1-bit MMA instruction on NVIDIA GPUs. It was only after Tensor Core gained bitwise mma that BWTA could turn "theoretical 16×" into "measured 16×." The trajectory of algorithms is, at its core, pulled along by the ceiling of hardware capability.
+
+3. *"Keep one zero" is a recurring motif* — weights evolved from binary {-1, 1} to ternary {-1, 0, 1} (BitNet b1.58); activations evolved from binary {-1, 1} to ternary {-1, 0, 1} (BWTA). That middle zero looks insignificant, but because it corresponds to the genuine "mass clustered near zero" distribution inside Transformers, it has saved the day repeatedly. The next possible motif: *customize the number of levels to match different distributions*.
+
+4. *Weight-only is a false comfort zone* — the flood of weight-only work in 2023–2024 (GPTQ, AWQ, BiLLM, etc.) produced impressive perplexity numbers, but leaving the activation half untouched means the true inference bottleneck was never addressed. BWTA's arrival signals that this comfort zone has run out — the next generation must compress activations too.
+
+Where to go next? The most likely directions:
+
+- *W1A1 for real*: Binary activations, full-stack 1-bit, theoretical 32×. May require a complete rethinking of the training paradigm.
+- *KV cache also ternary*: KV cache is the dominant memory consumer during inference; compressing it would directly amplify decode speedup.
+- *MoE + binarization*: Sparse routing combined with binary weight matrices may be the only viable path for trillion-scale models.
+
+* Takeaways
+
+What this river teaches about *how to find research problems*:
+
+1. *Identify the remaining hurdles in a line* — rather than inventing a wholly new direction, pick up the specific problem that the previous generation in this river deliberately avoided ("why has nobody compressed activations?", "why has nobody written a GPU kernel?"). BWTA is not a flashy new method; it is someone willing to chew through the hard bone that everyone else left on the plate.
+
+2. *Algorithm–hardware co-design is no longer optional* — doing only the algorithm leaves speedup as a castle in the air; doing only the kernel offers no suitable dtype. BWTA only works because it does both at once. This means: from now on, compression research must consider "can this dtype actually run on a GPU?" from the very beginning.
+
+3. *Don't be numbed by SOTA numbers* — most speedups reported in the BitNet line are "theoretical values" or "numbers measured on FPGAs." BWTA is the first to honestly report wall-clock speedup on real GPUs. In a field full of one-upsmanship, that honesty is actually the scarcest asset.
+
+The landing point is *usability*. Concretely, this means you can —
+
+- Drop the BWTA kernel directly onto your trained LLM for inference acceleration (github.com/yifu-ding/BGEMM-CUDA).
+- Look for a similar "neglected other half" in your own domain — KV cache not compressed, optimizer states not compressed, gradients not compressed.
+- Ask yourself when designing algorithms: "Does this dtype have an mma instruction on mainstream hardware? If not, are my speedup numbers fabricated?"
+
+Note: Details about BinaryBERT / BiBERT and the three PTQ works DB-LLM / PB-LLM / BiLLM — including specific years and experimental details — are organized from the citation relationships in BWTA's Related Work section. For precise experimental numbers, please consult the original papers.

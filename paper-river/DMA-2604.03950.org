@@ -1,0 +1,201 @@
+#+title:      Diagonal-Tiled Mixed-Precision Attention for Efficient Low-Bit MXFP Inference
+#+date:       [2026-05-28 Thu 19:06]
+#+filetags:   :paper:river:
+#+identifier: 20260528T190635
+#+source:     https://arxiv.org/abs/2604.03950
+#+authors:    Yifu Ding, Xinhao Zhang, Jinyang Guo (Beihang U / Beijing Jiaotong U)
+#+venue:      CVPR Workshop EDGE 2026, arXiv 2604.03950
+
+* 问题之河
+
+一个看似已经被解决的问题：注意力的 O(n²) 怎么再便宜一点？
+
+九年了。从 2017 年 Transformer 把"注意力即一切"这句口号打出来开始，每一代研究都在算同一笔账——一个长度为 n 的序列，每个 token 要和其他所有 token 算一遍相似度，计算量和显存都按 n² 涨。8K 上下文还能忍，32K 开始痛，128K 已经是工程灾难，但用户和应用还要继续往上推。
+
+这条河前后接力的方式很有意思：每一代人不是在颠覆前一代，而是在前一代留下的"次要成本"里继续抠钱。先是省显存（不要把 n×n 的中间矩阵存下来），然后是省算力（把 FP16 换成 FP8 / INT8），再然后是借硬件红利（Blackwell GPU 原生支持 4 位浮点）。每抠掉一层成本，下一层成本就暴露出来，开始变成新的瓶颈。
+
+到了 2026 年，钱被抠到了一个尴尬的地方：硬件提供了 MXFP4 / NVFP4 这样的 4 位浮点指令，理论吞吐是 FP16 的 4 倍，但谁敢真用？4 位精度直接套到 QK^T 上，注意力分数的相似度从 0.988 掉到 0.714，模型就废了。本篇 DMA 要解决的就是这个"硬件给了你 4 倍速度但你不敢用"的尴尬——能不能挑出那些不能掉精度的地方留在 8 位，剩下的全压到 4 位，既不丢精度也吃得到硬件红利？
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 留下的坑: 注意力矩阵 n x n，长序列下 O(n^2) 算力 + 显存
+  v
+[2018] Milakov & Gimelshein - Online Softmax (NVIDIA Tech Report)
+  |
+  | 解决了: softmax 可以单遍流式算，不必先看完一整行
+  | 留下的坑: 仅是数学技巧，没人把它跟 attention 整合进 kernel
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | 把 online softmax + tiling 拼起来，融成一个 GPU kernel
+  | 显存从 O(n^2) 砍到 O(n)，速度 2-4x
+  | 留下的坑: 算力还是 FP16，没吃到低位宽硬件红利
+  v
+[2024] Shah/Jin/Zhang et al. - SageAttention / INT-FlashAttention
+  |
+  | QK^T 量化到 INT8/FP8，速度再 2-3x
+  | 留下的坑: 直接量化到 4 位会崩，需要"平滑"(smoothing)修补
+  v
+[2024-2025] SageAttention v2/v3 系列 - smoothing-based low-bit attention
+  |
+  | 用额外的浮点 GEMV 把 outlier "拍平"再量化
+  | 留下的坑: 额外 GEMV 啃掉了一部分 kernel 吞吐
+  v
+[2026] Ding et al. - DMA  <-- 本篇
+  |
+  | 不做 smoothing，而是承认"对角附近的 token 更重要"
+  | 对角窗口留 MXFP8 高精度，其余 MXFP4，硬件原生指令直接吃
+  | 同时把量化/编码/打包全部 fuse 进一个 Triton kernel
+  v
+[未来] 更细粒度的 token-importance 路由 + NVFP4 / FP6 混合
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 用注意力替掉循环网络
+
+*** 它看到了什么问题
+
+在 2017 之前，序列建模的主力是 RNN/LSTM。RNN 有个根本限制——必须一个 token 接一个 token 地算，前一步的隐状态出来了才能算下一步。这天然不并行，GPU 算力大量闲置。当时已有人用 attention 做辅助（如 Bahdanau attention），但都是当 RNN 的"配菜"。
+
+*** 它的解法
+
+把 attention 提到主菜：每个 token 直接看见所有其他 token，一次矩阵乘搞定。公式就是 Softmax(QK^T / sqrt(d)) V。所有 token 的相互打分一次性算完，GPU 喜欢。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行起飞，训练速度起飞，质量也起飞——这是后面所有 LLM 的根。但留下了一颗定时炸弹：QK^T 是一个 n×n 的方阵，每个元素都要算，存下来更要 n×n 显存。序列短的时候没人在乎，序列一长（>4K），这个 n² 就是无法回避的灾难。
+
+** 2018 | Online Softmax: softmax 可以一边看一边算
+
+*** 它看到了什么问题
+
+经典 softmax 要分两步：先扫一遍找出整行的最大值（防止 exp 溢出），再扫一遍算分子分母。这意味着如果你想 tile 化注意力，softmax 这一步就把你卡死了——你必须先看完整行才能开始算。
+
+*** 它的解法
+
+Milakov & Gimelshein 在 NVIDIA 一份不起眼的技术报告里写了一个数学技巧：维护一个"当前最大值 m"和"当前归一化和 l"，每来一批新数据就增量更新，保证最终结果和"先扫完再算"完全等价。这就是 online softmax。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它本质是把 softmax 从"两遍扫"压成"一遍流式"。这个技巧当时没引起注意，因为单独的 softmax 速度问题不大。它的真正威力要等四年后被人拿来拼乐高——它就是后来 FlashAttention 能把整个 attention 融进一个 kernel 的数学前提。
+
+** 2022 | FlashAttention: 注意力可以装进 SRAM 流过去
+
+*** 它看到了什么问题
+
+到 2022 年，n² 显存已经成了训练长上下文 LLM 的硬瓶颈。当时主流"省 attention"的思路是改算法——稀疏注意力、线性注意力、低秩近似——但这些都改变了 attention 的数学定义，质量都有损。Dao 的洞察是：算法不用改，瓶颈在 HBM ↔ SRAM 的内存搬运，不在算力。
+
+*** 它的解法
+
+把 Q、K、V 都切成小块（tiling），每次只把一小块搬进 GPU 的 SRAM（fast on-chip memory），用 online softmax 增量地累加注意力输出。整张 n×n 的中间矩阵根本就不会被写出来。整个流程融在一个 CUDA kernel 里，HBM 访问从 O(n²) 降到 O(n)。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学上完全等价于标准 attention（不像稀疏/近似方法有质量损失），同时显存和速度都赢。这是过去十年 LLM 工程上影响最大的一篇之一。但它留下了一个新问题：HBM 已经不是瓶颈了，那瓶颈跑到哪去了？答案是——算力本身。FP16 的 Tensor Core 算 QK^T，再快也就那样。要想再省，就得动精度。
+
+** 2024 | SageAttention / INT-FlashAttention: 把 QK 压到 INT8/FP8
+
+*** 它看到了什么问题
+
+FlashAttention 拿到了内存红利，但算力还是 FP16。同期 LLM 推理领域已经全面拥抱低位量化（weight INT4, KV cache INT8），唯独 attention 的 QK^T 和 PV 这两个矩阵乘还在用 FP16/BF16 跑。这是一块明显的"还没被吃"的红利。
+
+*** 它的解法
+
+把 Q、K 在线量化成 INT8（SageAttention）或 FP8（INT-FlashAttention），用低位 Tensor Core 算 QK^T，再反量化回 FP 做 softmax。速度比 FlashAttention 再快 2-3 倍，精度损失在多数任务上可忽略。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+INT8/FP8 的精度足够覆盖 attention 分数的动态范围，所以"plug-and-play"基本无损。但当人们更贪心，想继续推到 4 位时，事情就崩了——4 位的表达力对 attention 分数的尾部 outlier 太敏感，直接量化会让 softmax 的概率分布严重失真。这就引出了下一代——smoothing。
+
+** 2024-2025 | SageAttention v2/v3 系列: 用 smoothing 修补 4 位
+
+*** 它看到了什么问题
+
+直接把 QK 量化到 4 位（MXFP4/INT4），cosine similarity 从 0.988 掉到 0.714（本篇 DMA 论文的 Table 2），模型质量崩盘。但 NVIDIA Blackwell GPU 已经原生支持 MXFP4 / NVFP4 指令，理论吞吐比 FP8 再翻倍——这块肉太想吃了。
+
+*** 它的解法
+
+借鉴 SmoothQuant 的思路——量化前先做一次"平滑变换"，把 Q 中的 outlier "转移"到 K（或 V）上，让两边的数值分布都变得更易量化。然后再量化。这样 4 位的精度损失就能压回可接受范围。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+smoothing 直接攻击的是 4 位量化最痛的"outlier"问题，所以精度恢复了。但它有个工程代价：smoothing 本身是一个额外的浮点 GEMV，必须在 attention kernel 之外（或内）多跑一次。当本篇 DMA 论文做 profiling 时发现，这个额外 GEMV 把 4 位带来的速度收益啃回去了一大部分。所以下一个问题是——能不能不做 smoothing，也能用 4 位？
+
+** 2026 | DMA: 不平滑，分区——重要的留在 8 位，其余压到 4 位
+
+*** 它看到了什么问题
+
+DMA 直接质问前面那条路：smoothing 是为了让"所有 token"都能用 4 位。但 attention 真的所有 token 都同等重要吗？已有的稀疏注意力研究（SparseAttention、StreamingLLM 等）早就反复指出：注意力分数高度集中在对角线附近的"局部窗口"和少数几个"sink token"上。换句话说，不是每个分数都需要 4 位的精度都救不回来——而是只有少数关键位置需要更高精度，其他位置 4 位足够。
+
+*** 它的解法
+
+DMA 把整个 n×n 的注意力矩阵按 tile 划分。对角线附近的 tile（重要 token 之间的交互）用 MXFP8（8 位）算，远离对角线的 tile 用 MXFP4（4 位）算。整张图既不需要 smoothing，也吃到了 4 位 Tensor Core 的速度。
+
+同时它做了一件 FlashAttention 后续工作经常漏掉的事：把"量化 / 微缩放变换 / 4 位编码打包 / 注意力计算"全部 fuse 进一个 Triton kernel。前面 SageAttention 系列因为做了 smoothing GEMV，这种 end-to-end fusion 很难；DMA 砍掉 smoothing 后，融合就顺理成章了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+核心洞察：与其用 smoothing 强行把"所有位置都搞到能用 4 位"，不如承认"有些位置就是需要 8 位"，按重要性分区。这个想法说出来很朴素，但它能成立有两个前提：
+1. 硬件原生支持 mixed-precision Tensor Core 指令（Blackwell 才有）
+2. attention 分数的"重要性"在空间上有规律可循（对角窗口）
+
+留下的新坑：对角窗口是 hand-crafted 的，假设了"重要 token = 局部 token"。但对长上下文检索任务，重要 token 可能在序列开头（sink token）或者中间任意位置。下一代很可能要做"动态 token importance 路由"——运行时决定哪些 tile 走 8 位、哪些走 4 位。
+
+* 前沿延伸
+
+本篇 2026 年 4 月才上线，arxiv 上还没有明确引用并改进它的后续工作。但可以预见两个方向：
+
+1. *动态混合精度路由*：把"哪些 tile 用 8 位"从静态对角窗口改成基于 query/key 实时计算的 importance score，类似 Mixture-of-Experts 的 router，但作用在 attention tile 粒度上。
+
+2. *更低位宽混合*：MXFP4 之外再加入 FP6、MXINT4、二值化等格式，形成 8/6/4/2 多级金字塔。Blackwell 之后的下一代 GPU 已经在路线图上提供更多低位指令。
+
+截至 2026-05，DMA 是公开发表中第一篇真正把 hardware-native MXFP mixed-precision 跑到端到端 attention kernel 里的工作。
+
+* 一张图看懂
+
+#+begin_example
+   时间 ----->
+   2017          2018          2022          2024          2025          2026
+
+  +-------+    +-------+    +-------+    +-------+    +-------+    +-------+
+  |Trans- |    |Online |    |Flash- |    |Sage / |    |Sage   |    |  DMA  |
+  |former |    |Softmax|    |Attn   |    |INT-FA |    |v2/v3  |    |       |
+  +-------+    +-------+    +-------+    +-------+    +-------+    +-------+
+   并行了       softmax     不再存       QK->INT8      4 位 + smooth  分区精度
+   但 O(n^2)    可流式      n x n       /FP8 算       压精度        + 全融合
+
+   抠的钱:
+   算法              -> 数学技巧 -> 显存 ------> 算力位宽 --> 极限位宽 -> 硬件红利
+                                 (HBM I/O)      (FP16->8)    (8->4 加补救)  (4 位实用化)
+
+   每一代的"省钱位置"都在前一代变成新瓶颈之后才出现。
+#+end_example
+
+* 洞见
+
+读完整条线，真正在发生变化的不是 attention 算法，而是 *"什么是瓶颈"的认知*。
+
+- 2017 大家以为瓶颈是"算法不够并行"；
+- 2022 大家以为瓶颈是"显存不够大"；
+- 2024 大家以为瓶颈是"位宽太宽"；
+- 2026 DMA 在说：瓶颈是"我们用统一精度对待了重要性不同的位置"。
+
+这是一个非常古典的工程套路：在一个原本均匀分布的问题里发现 *异质性* ，然后按异质性分配资源。MoE 是这样（每个 token 走不同的 expert），speculative decoding 是这样（容易的 token 走小模型），混合精度训练是这样（不同层用不同精度）。DMA 把这个套路下沉到了 attention tile 的粒度。
+
+预测下一步：这条河会进入"自适应、运行时决策"的阶段。所有静态的 hand-crafted 选择（对角窗口、固定 sink token 数量、固定稀疏模式）都会被某种轻量级 runtime router 替代。Attention 的未来可能更像一个动态电路而不是一个固定 kernel。
+
+* 启发
+
+对"怎么找问题"的启发：
+
+1. *看 profiler，不看 paper title* 。DMA 之所以发现 smoothing 是瓶颈，是因为他们做了 Table 7 的 kernel breakdown profiling，看见 GEMV 啃了多少时间。很多"性能问题"其实是 hand-waving 出来的，真去测一下才知道钱漏在哪。
+
+2. *硬件路线图就是研究路线图* 。Blackwell GPU 上 MXFP 指令出现的那一刻，这条河里就注定要有一篇 DMA。研究的时间窗口往往由硬件释放决定，提前 2 年做没人用，晚 2 年做被别人占。
+
+3. *承认异质性比追求均匀更便宜* 。当一个问题被均匀地处理时，往往存在"按重要性分区"的低垂果实——MoE、speculative、mixed-precision 都是同一个母题的变奏。看到任何 uniform processing 都值得问一句：这里真的均匀重要吗？
+
+落点："能用"——这意味着，当你下次遇到一个"统一精度/统一带宽/统一时间"的设计时，做一次轻量级的 importance profiling，找出 top-k% 的关键位置，给它们更多资源，剩下的全砍掉。这往往就是一篇可发表论文的胚胎。

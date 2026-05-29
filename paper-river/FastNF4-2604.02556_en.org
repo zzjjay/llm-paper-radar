@@ -1,0 +1,262 @@
+#+title:      Fast NF4 Dequantization Kernels for Large Language Model Inference
+#+date:       [2026-05-28 Thu 19:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T190047-en
+#+source:     https://arxiv.org/abs/2604.02556
+#+authors:    Xiangbo Qi, Chaoyi Jiang, Murali Annavaram (USC)
+#+venue:      arXiv 2604.02556, Apr 2026
+
+* The River of the Problem
+
+A simple question: you compress a model to 4-bit integers to save VRAM — but does the GPU actually run faster?
+
+The answer is surprisingly hard. GPU compute lives in Tensor Cores designed for 16-bit floating point; they do not speak 4-bit. So every matrix multiplication requires "decompressing" 4-bit weights back to 16-bit first. The hidden thread running through a decade of quantization research is this endless cat-and-mouse game — compression saves VRAM on one side, decompression gives the time back on the other. Every generation of researchers asks the same question: where exactly does the money we saved leak out?
+
+By 2026, large models no longer fit on a single GPU, and 4-bit quantization has become the de-facto deployment default. NF4 (NormalFloat-4) paired with the BitsAndBytes library is the de-facto standard in the HuggingFace ecosystem. Yet when Qwen3-32B runs inference on an A100, the dequantization step alone consumes 30–40% of end-to-end latency. What this paper sets out to do is almost embarrassingly simple — don't touch the algorithm, don't touch the precision, just move that 16-entry lookup table into shared memory, and the problem is cut in half.
+
+What makes this river interesting is that each generation's solution is proven by the next generation to have "an even cheaper fix." This paper is, so far, the cheapest move yet.
+
+* Source Map
+
+#+begin_example
+[2018] Jacob et al. - Integer-Arithmetic-Only Inference
+  |
+  | Observed: models trained in FP32 can run INT8 inference with
+  |           negligible accuracy loss
+  | Left behind: only covers CNNs, coarse quantization granularity,
+  |              depends on QAT
+  v
+[2022-Aug] Dettmers et al. - LLM.int8()
+  |
+  | Observed: naively quantizing LLMs to 8-bit causes collapse
+  |           due to "outlier activations"
+  | Solution: mixed precision -- 99% of the matrix via INT8,
+  |           1% outlier columns via FP16
+  | Left behind: 8-bit is still too large; outlier separation logic is costly
+  v
+[2022-Oct] Frantar et al. - GPTQ
+  |
+  | Observed: outlier weights can also be quantized, with Hessian-guided
+  |           per-column calibration as the key
+  | Solution: second-order approximation + OBQ-style per-layer
+  |           post-training quantization, pushing down to 4-bit
+  | Left behind: calibration is slow; inference still requires dequant
+  v
+[2023-May] Dettmers et al. - QLoRA / NF4
+  |
+  | Observed: INT4 wastes grid points on weight distributions --
+  |           LLM weights are close to Gaussian
+  | Solution: NormalFloat-4, choosing 16 quantization levels at
+  |           equal-probability quantiles of the normal distribution
+  | Engineering: BitsAndBytes library -- weights stored as 4-bit,
+  |              dequantized to FP16 at runtime
+  | Left behind: dequant uses a 4-level conditional tree + global-memory LUT,
+  |              290 cycles per memory access
+  v
+[2026-Apr] Qi et al. - FastNF4 Dequant Kernel  <-- this paper
+  |
+  | Observed: BitsAndBytes dequant kernel is memory-bound on Ampere
+  | Solution: the 16-entry LUT is only 64 bytes -- move it into shared memory,
+  |           shared across all threads; replace the 4-level tree with
+  |           2 bitwise instructions, eliminating warp divergence
+  v
+[Frontier] Marlin / Flute / Triton quantized GEMM
+  |
+  | Claim: dequant should not exist as a standalone step; fuse it with matmul
+  | But: requires changing the operator interface,
+  |      breaking HuggingFace plug-and-play compatibility
+#+end_example
+
+* Evolutionary Narrative
+
+** 2018 | Jacob et al.: Making INT8 Inference Actually Work
+
+*** What problem did it see?
+
+Before 2018, neural networks were trained and inferred entirely in FP32. Mobile and embedded devices simply could not keep up. People had already tried compressing weights to 8-bit integers, but the results were poor — a large accuracy drop, or effectiveness only on toy models. The root issue: models trained in the continuous floating-point world were never prepared for the distortion of being mapped into discrete integer buckets at inference time.
+
+*** Its solution
+
+Two things done together. First, define a clean "affine mapping" — float = (integer − zero_point) × scale — and rewrite the entire inference graph as pure INT8 arithmetic. Second, introduce *quantization-aware training (QAT)*: simulate this distortion during training so that the model actively learns to function well under INT8.
+
+Think of it this way: before, you were throwing a non-swimmer into the deep end; their approach was to teach the swimmer in a bathtub first, then let them jump in.
+
+*** Why it worked (and what new pit it buried)
+
+This framework made INT8 inference of MobileNet-class CNNs genuinely viable on phones with less than 1% accuracy loss. It defined the minimum viable shape of "quantization" in industry — integer-only inference + QAT.
+
+But its world ended at CNNs. Three pits remained: (1) it assumed you could retrain the model — unrealistic for LLMs that cost thousands of GPU-days; (2) quantization granularity was per-tensor or per-channel, handling badly distributed weights poorly; (3) it never encountered the Transformer pattern where a handful of dimensions explode in magnitude while everything else stays small.
+
+The next generation would first have to deal with that third pit — the LLMs were coming.
+
+** 2022-Aug | LLM.int8(): Outlier Activations Force Mixed Precision
+
+*** What problem did it see?
+
+In 2022, hundred-billion-parameter LLMs like OPT-175B had arrived. Dettmers and colleagues applied Jacob's INT8 recipe directly and watched model accuracy collapse. Strangely, the larger the model, the worse the collapse — the exact opposite of what the CNN era had taught everyone.
+
+After weeks of microscope-level analysis, they found something counterintuitive: once model size crosses roughly 6.7B parameters, a tiny cluster of "outlier features" suddenly appears in Transformer activations — certain hidden dimensions carry values 20–100× larger than the rest. These outlier dimensions account for only 0.1%–1% of all dimensions but carry the bulk of the model's effective computation. Cramming them alongside normal dimensions into INT8's tiny buckets erases all that detail.
+
+*** Its solution
+
+Pragmatic: since only 1% of columns are problematic, use *mixed precision* — 99% of columns go through INT8 matrix multiplication as usual, the remaining 1% of outlier columns are pulled out and computed in FP16, then the two parts are summed.
+
+Analogy: supermarket checkout. 99% of customers use the self-service fast lane (INT8, cheap and fast); the few VIP customers buying expensive goods go to the staffed counter (FP16, slow but accurate).
+
+*** Why it worked (and what new pit it buried)
+
+It was the first approach to run hundred-billion-parameter LLMs on consumer hardware with almost no accuracy loss. HuggingFace integrated it directly into `transformers`, and the name BitsAndBytes entered the mainstream.
+
+But it had two obvious pits. First, *8-bit is still too large* — OPT-175B quantized to INT8 still requires 175 GB of VRAM, which doesn't fit on a single card. Second, *the outlier separation logic itself is expensive*: every forward pass must scan activations to find outlier columns, perform two separate matrix multiplications, then merge. Its design goal was "make it run," not "make it fast."
+
+To save more memory, you must push to 4-bit. But 4-bit has only 16 buckets — the outlier-separation trick is no longer sufficient.
+
+** 2022-Oct | GPTQ: Second-Order Information Makes 4-Bit Viable
+
+*** What problem did it see?
+
+LLM.int8() taught everyone: naive quantization fails because of *tail values* in the distribution. Dettmers's fix was to route around them (compute in FP16). But Frantar's group at IST Austria thought harder — can you *quantize the tails too*, just by choosing quantization points more intelligently?
+
+Rounding directly to 4-bit's 16 buckets will inevitably flatten outlier weights and destroy accuracy. But if you know "which weights have the greatest impact on the final output," you can bias calibration to protect them. That information lives in the second derivative (the Hessian) — it tells you how much a small perturbation in each weight shifts the loss.
+
+*** Its solution
+
+Resurrect Optimal Brain Quantization from the 1990s — Hessian-based per-weight quantization — and re-engineer it for speed. The core loop: for each layer, process column by column; after quantizing each column, use the inverse Hessian to redistribute the "quantization error" onto the remaining unquantized columns so they can compensate.
+
+Analogy: cutting a cake. If you must cut the cake into 16 unequal pieces, the naive approach is mechanical equal spacing. GPTQ's approach: cut one slice, observe how the person eating it reacts; if they're unhappy, adjust how you cut the remaining cake to favor their preference. Cut your way through, and overall satisfaction is maximized.
+
+Engineered to finish calibrating OPT-175B in 4 hours, with 4-bit accuracy nearly matching FP16.
+
+*** Why it worked (and what new pit it buried)
+
+GPTQ was the first to prove that *4-bit LLMs can be lossless*, with none of LLM.int8()'s "must keep 1% in FP16" mixed-precision overhead. The entire weight matrix is INT4, storage savings are maximal.
+
+But it buried two pits: (1) calibration depends on a small calibration dataset, and generalization across datasets occasionally fails; (2) it only solved "how to compute 4-bit values" and said nothing about "how to compute with them." Inference still requires dequanting back to FP16, because Tensor Cores do not speak INT4. How to do that dequant efficiently was left for the next generation to fill.
+
+** 2023-May | QLoRA / NF4: Making 4-Bit Feel "Natural"
+
+*** What problem did it see?
+
+GPTQ uses a uniform INT4 grid — 16 equally spaced buckets. But Dettmers noticed something: well-trained LLM weights are not uniformly distributed; they are *close to a standard normal distribution*. If you quantize a Gaussian with equally spaced buckets, the dense mass in the center shares very few buckets while the sparse tails each get one. That is wasteful.
+
+GPTQ's calibration procedure compounds the problem — it needs a calibration dataset, takes 4 hours to run, and requires understanding Hessians. The barrier is far too high for a graduate student who just wants to fine-tune their own model.
+
+*** Its solution
+
+Two legs. First, *NormalFloat-4 (NF4)*: instead of equal spacing, choose 16 quantization levels at the equal-probability quantiles of the standard normal distribution — buckets are dense in the center, sparse at the tails. Each bucket receives approximately the same number of weights, information entropy is nearly maximized. No calibration needed; information-theoretically optimal for normally distributed data.
+
+Second, package everything into the *BitsAndBytes* library and the *QLoRA* training framework: the base model is stored at NF4 4-bit, LoRA adapters are trained at 16-bit. A 65B model shrinks from 780 GB of VRAM to 48 GB, fine-tunable on a single consumer GPU.
+
+Analogy: before, you drew tick marks at equal spacing (INT4); now you draw tick marks based on where people actually stand — dense where the crowd is thick, sparse where it's thin (NF4). Subway platform signs placed where the crowds are: naturally more efficient.
+
+*** Why it worked (and what new pit it buried)
+
+NF4 fully democratized 4-bit quantization. No calibration, no second-order math, just one line in HuggingFace: `load_in_4bit=True`. It became the de-facto standard from 2023 through 2026.
+
+But it left one specific, headache-inducing pit — the dequant kernel was badly written.
+
+Exactly how bad? (1) Recovering 4-bit values to FP16 requires looking up the 16-entry NF4 table. BitsAndBytes stores this table in *global memory*, so every dequant operation by every thread re-reads from global memory. On Ampere, a global memory access costs 290 cycles. (2) The indexing logic uses a *4-level conditional tree* (check the high bit, then the next bit, …), requiring 7 branching instructions per weight. On a GPU, 32 threads in a warp taking different branches causes *warp divergence* — what could be 32-way parallel execution is serialized.
+
+The NF4 algorithm itself is fine. The problem is that its dequant kernel was left in a "good enough to run" state. That is exactly what this paper addresses.
+
+** 2026-Apr | FastNF4: 64 Bytes of Shared Memory Rewrites Everything
+
+*** What problem did it see?
+
+QLoRA/BitsAndBytes had been popular for three years, and nearly every user running 4-bit LLMs through HuggingFace was using the same dequant kernel. Qi's group at USC ran the profiler: on Qwen3-32B inference, dequant consumes 30–40% of total time. 72.4% of matmul time is spent on dequant; the actual multiplication is a small fraction. The kernel is *completely memory-bound* — GPU compute sits idle waiting for memory.
+
+What makes this even more striking: the NF4 lookup table has only 16 values, which in FP32 is a grand total of 64 bytes. An Ampere SM has on the order of 100 KB of shared memory. Yet this 64-byte table was being stored in 290-cycle global memory, re-read by every thread, repeated hundreds of millions of times.
+
+*** Its solution
+
+So obvious it almost feels like a joke: move those 64 bytes into shared memory.
+
+The concrete steps are just a few: (1) at thread block launch, let thread 0 copy the 16-entry table into shared memory — 64 bytes of sequential copy, essentially instantaneous. (2) A single `__syncthreads()` barrier so all threads see the complete table. (3) From that point on, every dequant operation in the entire block queries shared memory — shared memory access costs 19–23 cycles versus 290 cycles for global memory, a 12–15× speedup.
+
+The second cut is equally simple: replace the 4-level conditional tree with 2 bitwise instructions. The original required 7 branching instructions — "compare high bit, then next bit…"; the replacement directly uses `>> 4` to extract the high nibble and `& 0x0F` for the low nibble: 2 instructions, zero branches. All 32 threads in a warp execute identical code paths; divergence disappears.
+
+Analogy: previously every library patron had to walk to the warehouse to retrieve a book (global memory); the new approach has the librarian place these 16 popular books on the front desk at opening time (shared memory), and every patron grabs them there. With millions of lookups per day, the difference is 12–15×.
+
+*** Why it worked (and what new pit it buried)
+
+Results: 2.0–2.2× kernel-level speedup, 1.07–1.54× end-to-end speedup, with larger models benefiting more (Llama3.3-70B at batch size 2 achieves 1.54×). Cost: 64 bytes of shared memory, zero algorithmic changes, zero accuracy loss, output that is bit-exact with the original implementation.
+
+Even better is the *zero-invasiveness* — it is a direct drop-in replacement for the single function `kDequantizeBlockwise` inside BitsAndBytes; not one line of HuggingFace Transformers needs to change.
+
+But it still leaves pits: (1) this only optimizes the *standalone dequant step*. The ideal solution is to *fuse dequant + matmul*, feeding 4-bit values directly into the Tensor Core equivalent computation and never materializing an FP16 intermediate. (2) It targets Ampere specifically; Hopper/Blackwell already support native FP4/INT4 Tensor Cores, making the entire dequant step potentially unnecessary. This approach has a lifetime of perhaps one to two GPU generations.
+
+* Frontier Extensions
+
+** Marlin / Flute / QuTLASS: Fuse Dequant Into Matmul Entirely
+
+FastNF4's philosophy is "optimize dequant as a standalone step." Running in parallel is a different camp — exemplified by Marlin (Frantar 2024) — arguing that dequant should not exist as a standalone step at all.
+
+Their approach: write a *fused INT4×FP16 GEMM kernel* where dequant happens at the register level inside the Tensor Core, overlapping with multiply-accumulate, never producing a separate FP16 intermediate matrix. Marlin achieves arithmetic intensity close to FP16 at small batch sizes, with 2–3× end-to-end speedup.
+
+The difference: the Marlin camp has a higher performance ceiling, but at the cost of *requiring changes to the operator interface* — no longer "dequant first, then call cuBLAS GEMM," but an entirely new fused op. Integrating it into HuggingFace requires a new quantized linear API.
+
+FastNF4 chose the other road: accept slightly lower peak performance in exchange for preserving BitsAndBytes plug-and-play compatibility. This is an engineering trade-off, not a technical defeat. Both paths remain alive, serving different users.
+
+** Hopper / Blackwell Native FP4 Support
+
+Starting with H100, Tensor Cores added native FP8 support; B100 goes further with native FP4. In principle, the dequant step will eventually disappear — 4-bit data feeding directly into Tensor Cores for computation.
+
+But the A100 will remain the workhorse of data centers and university clusters for at least another five years. The window for "squeezing the last drop out of older hardware" optimizations like FastNF4 is still long.
+
+* One Diagram to Understand It All
+
+#+begin_example
+          Eight Years of Quantization Research: Where Does the Savings Leak?
+
+  [2018] Jacob      INT8 + QAT          ----> CNNs can run
+                                               (but LLMs hadn't arrived yet)
+
+  [2022.8] LLM.int8()   INT8 + outlier cols in FP16  ----> LLMs at 8-bit, lossless
+                         (leak: 8-bit is still too large)
+
+  [2022.10] GPTQ         INT4 + Hessian calibration  ----> LLMs at 4-bit, lossless
+                         (leak: needs calibration data)
+
+  [2023.5] QLoRA/NF4     NF4 quant + bnb library     ----> 4-bit democratized
+                         (leak: dequant kernel is bad)
+
+  [2026.4] FastNF4       64B shared-mem LUT           ----> 2.0-2.2x dequant speedup
+                         + 2 bitwise instructions      (leak: standalone dequant still exists)
+
+  [parallel] Marlin/Flute   fused INT4 GEMM           ----> eliminate dequant entirely
+                         (cost: API change required)
+
+  [future] FP4 Tensor Core  hardware-native 4-bit     ----> dequant disappears
+                         (but Ampere will be in service for 5 more years)
+
+  =============================================================
+
+  Read vertically: each generation closes the gap between "what we save"
+                   and "what we spend"
+  Read horizontally: algorithm (NF4) / systems (FastNF4) / hardware (B100)
+                     pass the baton across three layers
+#+end_example
+
+* Insights
+
+Reading through this river, a few things become clearer with each generation:
+
+*First, the true main thread of quantization research is not "compression ratio" but "compression ratio ÷ decompression cost."* From 2018 to 2026, each paper's surface story is about pushing to lower bit-widths — 8-bit, 4-bit, 3-bit, 2-bit — but the hidden story is "VRAM saved vs. compute given back." LLM.int8() gave some of it back through 99/1 mixed-precision overhead; GPTQ gave some back in calibration time; QLoRA gave some back in dequant time; FastNF4 finally starts *reclaiming* that lost time.
+
+*Second, "apparently simple engineering optimizations" are often left untouched for years precisely because they are so fundamental.* The NF4 lookup table is 64 bytes; moving it to shared memory is a Chapter 1 topic in any CUDA optimization textbook. Yet BitsAndBytes — used by millions of people — shipped with this inefficiency for three years. Why? Because the people writing the library were algorithm researchers focused on "correct, runnable, readable"; the last mile of performance optimization requires systems engineers to step in. The interesting pattern in this river is that *the more mature a field, the more likely it is to harbor "obvious but untouched" opportunities*.
+
+*Third, "zero invasiveness" is an underrated engineering virtue.* FastNF4 changes no algorithm, no API, no user code — it is a single function-level swap. This means every HuggingFace user of BitsAndBytes can `pip install --upgrade` tomorrow and get a 1.5× speedup. Marlin achieves higher peak performance but requires rewriting the operator interface — its propagation will be an order of magnitude slower. In an ecosystem that has already formed a de-facto standard, "small change, big leverage" is worth more than "entirely new solution."
+
+*Fourth, hardware generation transitions can sever an entire line of research at the waist.* B100 natively supports FP4, which means the entire target of FastNF4's optimization — "eliminating dequant overhead" — simply does not exist on new hardware. But this does not negate the paper's value; it actually confirms the nature of systems research: you are not optimizing an eternal problem, but the bottleneck of the current hardware generation. Every new GPU generation reshuffles "where the bottleneck is." The researcher's job is to *quickly identify the current bottleneck, eliminate it with minimal cost, then be ready to be made obsolete by the next hardware generation*.
+
+*Where does the river flow next?* In the short term (the next 2–3 years of A100/H100 dominance), the fused dequant + matmul route (the Marlin family) will steadily erode BitsAndBytes' market share — unless BitsAndBytes itself adopts fusion. In the medium term, as B100/MI400 proliferate, "software dequant optimization" as a research direction will gradually disappear, shifting to higher-level problems like *training-time quantization awareness* and *cross-device consistency*. FastNF4 is one of the last-mile contributions to this particular river.
+
+* Takeaways
+
+*For doing research*: go find those "stale implementations locked in by ecosystem gravity" — critical functions in mature codebases that have been running unchanged for years are often gold mines of 1.5×–3× speedup. Nobody has touched them not because they are hard, but because algorithm researchers have no incentive and systems researchers don't know they exist. This kind of work may not land at top venues, but it is extremely useful and typically reaches millions of users very quickly.
+
+*For engineering trade-offs*: in ecosystems that have already formed a de-facto standard (HuggingFace, PyTorch, BitsAndBytes), the leverage of "small change, big effect" vastly exceeds "build from scratch." The same 1.5× speedup with zero API changes propagates an order of magnitude faster than one requiring a new API.
+
+*For hardware generations*: the bottleneck you are optimizing is created by the current hardware, not an eternal truth. Before starting, ask: does this optimization still matter on the next GPU generation? If the answer is "obsolete in two years," either compress your development cycle to ship it while the window is open, or reframe the paper's real contribution as *theoretical insight* rather than *performance numbers*.
+
+*For 4-bit LLM deployment*: if you are running 4-bit inference with BitsAndBytes, watch for this PR landing in the main branch (or cherry-pick it into BnB 0.47.0+) — you can get a free 1.07–1.54× end-to-end speedup. The larger the model, the smaller the batch size, and the more A100s you have, the more pronounced the benefit. If you are already using Marlin or AWQ kernels, this work does not apply to you.
