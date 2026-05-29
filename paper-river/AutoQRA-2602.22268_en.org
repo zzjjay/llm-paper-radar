@@ -1,0 +1,269 @@
+#+title:      AutoQRA: Joint Optimization of Mixed-Precision Quantization and Low-rank Adapters for Efficient LLM Fine-Tuning
+#+date:       [2026-05-29 Fri 01:53]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T015320-en
+#+source:     https://arxiv.org/abs/2602.22268
+#+authors:    Changhai Zhou, Shiyang Zhang, Yuhua Zhou, Qian Qiao, Jun Gao, Cheng Jin, Kaizhou Qin, Weizhong Zhang
+#+venue:      arXiv 2026 (preprint, ICML 2026 submission)
+
+* The River of the Problem
+
+Fitting a ten-billion-parameter model onto a consumer GPU and then teaching it a new task — is there a method that minimizes memory while losing as little accuracy as possible?
+
+It sounds like a tidy engineering question. But over the past decade, this river has been dug ever deeper.
+
+Where is the difficulty? Fine-tuning a large model has two knobs: the first is *how narrow to compress the weights* (how many bits to quantize to), and the second is *how much room to leave for learning* (how large the rank of the LoRA adapter is). Every time you turn one knob, the optimal setting of the other shifts. Prior work has always turned the two knobs separately — first fix the quantization scheme, then fix the adapter — so each side is locally "optimal," but the combination is often far from good. The paper runs a direct falsification experiment: under the same memory budget, different (bit-width, rank) combinations can differ by 25 points on downstream tasks. This shows that the two are not independent — they are coupled — yet every existing method pretends they are independent.
+
+This river has attracted wave after wave of researchers precisely because *no one has ever truly confronted the joint search space of two discrete knobs*. Every additional layer of heterogeneity multiplies the search cost exponentially, so everyone retreats to the safe strategy of "fix one half, then tune the other." AutoQRA puts this long-avoided coupling problem squarely on the table.
+
+* Source Map
+
+#+begin_example
+[2019] Wang et al. - HAQ
+  |
+  | Problem: Different layers have different quantization sensitivity;
+  |          uniform bit-width is wasteful
+  | Solution: Use reinforcement learning to pick the bit-width per layer
+  |           (per-layer mixed-precision)
+  v
+[2021] Hu et al. - LoRA
+  |
+  | Problem: Full fine-tuning of a large model is too expensive
+  | Solution: Freeze the backbone; attach a pair of low-rank matrices (A·B)
+  |           on the side; train only that small set
+  v
+[2023] Dettmers et al. - QLoRA
+  |
+  | First handshake between the two lines above:
+  | Problem: Even the frozen backbone doesn't fit in memory during fine-tuning
+  | Solution: Backbone quantized to NF4 + LoRA adapters
+  |           (uniform 4-bit for all layers, uniform rank for all layers)
+  v
+            +----------------------+----------------------+
+            v                      v                      v
+[2023] LoftQ / LQ-LoRA   [2023] AdaLoRA           [2025] SlimLLM
+            |                      |                      |
+            | Problem: Quantization | Problem: Same rank   | Problem: Same bit-width
+            |   error corrupts LoRA |   for all layers is  |   for all layers is
+            |   initialization      |   unreasonable       |   unreasonable
+            | Solution: Alternate   | Solution: Dynamically | Solution: Assign bits
+            |   between quantization|   allocate rank per  |   per layer by Hessian
+            |   and low-rank        |   layer by singular  |   sensitivity
+            |   decomposition       |   values             |
+            |   (reconstruction     |                      |
+            |   loss as proxy)      |                      |
+            +----------------------+----------------------+
+                                   |
+                                   | All three lines have reached their own dead-ends:
+                                   |   heterogeneous bits vs. heterogeneous ranks vs.
+                                   |   quantization-LoRA alignment
+                                   |   All still "first this, then that"
+                                   v
+[2026] Zhou et al. - AutoQRA  <-- Braids all three lines together
+  |
+  | Problem: Bits and rank are coupled; doing either first is wrong;
+  |          static proxies (reconstruction error / perplexity) correlate
+  |          with true post-fine-tuning accuracy at only ρ = 0.46
+  | Solution: Model the joint allocation of both knobs as a
+  |           budget-constrained black-box optimization:
+  |           Phase I  multi-fidelity evolutionary search maps the Pareto front;
+  |           Phase II trust-region Bayesian optimization refines the
+  |                    most promising regions
+  v
+[Ongoing]  Joint search + larger-scale models + training-dynamic adaptation
+           (speculated directions)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2019 | HAQ: Bit-Width Customized Per Layer for the First Time
+
+*** What problem it saw
+
+The mainstream quantization of that era was "uniform 8-bit across the whole network" or "uniform 4-bit across the whole network." But experiments showed: the first embedding layer, the final classification head, and a few critical attention layers — compress their bit-width and performance collapses. Other layers can be pushed far more aggressively. Uniform bit-width means *spending all your budget evenly: the most sensitive layers are under-resourced, while the most tolerant layers are over-resourced*.
+
+*** Its solution
+
+HAQ (Hardware-Aware Automated Quantization) uses reinforcement learning as the "decision-maker": feed it each layer, have it output that layer's bit-width, and use hardware-measured latency and accuracy as rewards to train the decision-maker in return.
+
+*** Why it worked (and what new pit it dug)
+
+It was the first to acknowledge that "layers are heterogeneous." But RL-based search is enormously expensive — every candidate configuration requires a full evaluation pass. This ghost of "search cost" would haunt every successor: as long as you want per-layer configuration, you face combinatorial explosion.
+
+** 2021 | LoRA: Stop Touching the Backbone
+
+*** What problem it saw
+
+Full-parameter fine-tuning of an LLM blows GPU memory. Prior remedies — training only the last few layers, or adding adapter modules — still required those adapters to participate in the forward pass, carrying overhead at inference time.
+
+*** Its solution
+
+The key observation: "parameter updates are themselves low-rank" — the weight change ΔW induced by fine-tuning can be approximated as the product of two thin matrices A·B (rank r much smaller than the original dimension). So freeze the original weight W, attach a pair A, B on the side, and train only those two small matrices. At inference time, W + AB is merged back, with no latency overhead.
+
+*** Why it worked (and what new pit it dug)
+
+The low-rank assumption holds empirically for most tasks, and the training footprint drops dramatically — from "all of W" to "two small matrices" — slashing both memory and compute.
+
+But LoRA left one problem unsolved: *the backbone W itself still occupies memory*. Even if you only train the small matrix pair, the FP16 W must reside on the card for the forward pass. Once the model is large enough, even fitting the backbone becomes impossible.
+
+** 2023 | QLoRA: Quantization and LoRA Shake Hands for the First Time
+
+*** What problem it saw
+
+LoRA solved the memory cost of *training*, not the memory cost of *loading*. The HAQ line solved accuracy loss from quantization, but only for inference — once you try to fine-tune on top of a quantized backbone, quantization error clashes with backpropagation and results are poor.
+
+*** Its solution
+
+QLoRA quantizes the backbone to 4-bit (NF4 format), then attaches LoRA adapters on top of the quantized backbone. During the forward pass, the backbone is dequantized and added to the LoRA output; during the backward pass, only LoRA is updated. This is both loadable and trainable.
+
+*** Why it worked (and what new pit it dug)
+
+It democratized LLM fine-tuning — 65B models became tunable on a single 48 GB GPU. But it made two *lazy assumptions*: all layers use 4-bit, all layers use the same rank r. A uniform cut across the board.
+
+This left exactly the positions that HAQ (heterogeneous bits) and later AdaLoRA (heterogeneous ranks) would come to fill.
+
+** 2023 | LoftQ and LQ-LoRA: Quantization and Low-Rank Begin to "Talk"
+
+*** What problem it saw
+
+QLoRA's pipeline is: *first quantize the backbone (introducing error), then randomly initialize LoRA, then train*. LoRA starts at zero, so it must spend precious training steps "patching up" the wounds from quantization before it can learn the new task. It's like making a firefighter extinguish a blaze before they can do any real work — inefficient.
+
+*** Its solution
+
+LoftQ proposes: at initialization, let quantization error and LoRA cooperate. Concretely: decompose the original W simultaneously into *a quantized component Q plus a low-rank pair A·B*, so that Q + AB ≈ W is optimal in the reconstruction sense. Alternating optimization for several rounds produces A, B that are used as the LoRA initial weights. LQ-LoRA did something similar and more refined in parallel.
+
+*** Why it worked (and what new pit it dug)
+
+LoRA no longer starts from zero — it has already "pre-compensated" for quantization noise, yielding better downstream accuracy.
+
+But its optimization objective is *local reconstruction error* — making the forward output approximate the original W, not making the final downstream task stronger. AutoQRA demonstrates empirically that this proxy (reconstruction/perplexity) correlates with true post-fine-tuning accuracy at only ρ = 0.46. In other words, *a configuration that looks good under the proxy may perform terribly after real training; a configuration that looks bad under the proxy may actually perform well*. LoftQ is climbing the wrong hill.
+
+** 2023–2025 | AdaLoRA, RankAdaptor: Rank Also Varies Per Layer
+
+*** What problem it saw
+
+In QLoRA, all layers' LoRA adapters share the same rank r = 8 or r = 16. But some layers (e.g., certain attention projections) contribute enormously to downstream tasks and deserve more capacity; some intermediate FFN layers contribute little and need less. A one-size-fits-all rank wastes the adaptation budget.
+
+*** Its solution
+
+AdaLoRA reformulates A·B as A·diag(λ)·B in SVD form, and during training dynamically prunes/allocates rank per layer based on the magnitude of λ — important layers retain many singular directions, unimportant layers retain only one or two. RankAdaptor (2025) takes a similar approach, treating rank allocation as a learnable distribution.
+
+*** Why it worked (and what new pit it dug)
+
+Adaptation capacity is allocated precisely, yielding higher accuracy at the same parameter count.
+
+But these methods make a symmetric lazy assumption: *quantization is uniform*. AdaLoRA assumes the backbone uses a single fixed precision. The HAQ line (heterogeneous bits) and the AdaLoRA line (heterogeneous ranks) never truly crossed.
+
+** 2025 | SlimLLM: Heterogeneous Bits, but Ignoring Adaptation
+
+*** What problem it saw
+
+QLoRA's compression of all layers to 4-bit is wasteful — the same problem HAQ identified years earlier. SlimLLM computes per-layer sensitivity via Hessian/salience scores: sensitive layers get 6-bit, tolerant layers get 3-bit; the weighted average still fits within a 4-bit memory budget, but accuracy surpasses uniform 4-bit.
+
+*** Its solution
+
+Assign bit-widths by layer importance, calibrated with PTQ methods such as GPTQ/AWQ.
+
+*** Why it worked (and what new pit it dug)
+
+It brought HAQ's insight into the LLM era. But it has a *mirror-image blind spot*: it only moves the bits knob, not the LoRA rank knob, and largely ignores fine-tuning.
+
+At this point, all three lines — heterogeneous bits / heterogeneous ranks / quantization-LoRA alignment — had each reached their own frontier, but no one had braided them together. That is AutoQRA's entry point.
+
+** 2026 | AutoQRA: Joint Search, Black-Box Optimization, a New Solution After Proxy Failure
+
+*** What problem it saw
+
+Lay out all the lazy assumptions from before:
+
+- QLoRA: uniform bits + uniform rank (double laziness)
+- LoftQ / LQ-LoRA: quantization-LoRA aligned, but rank still uniform, and optimized against the wrong proxy
+- AdaLoRA / RankAdaptor: rank heterogeneous, but bits uniform
+- SlimLLM: bits heterogeneous, but adaptation ignored
+
+Nobody has simultaneously let both bits and rank be customized per layer. Two reasons: (1) the search space is enormous — L layers × bit candidates × rank candidates, combinatorial explosion; (2) there is no fast way to evaluate whether a configuration is good — reconstruction-error proxies are weakly correlated with true fine-tuning accuracy, and the only reliable evaluation is "actually train it," which is too expensive.
+
+AutoQRA also presents a direct falsification figure (Figure 1 in the paper): under the same memory budget, 30 randomly sampled (bit, rank) configurations produce downstream accuracy gaps of up to 25 points, while proxy perplexity correlates with actual accuracy at only ρ = 0.46, with frequent reversals where "good proxy → bad result" and "bad proxy → good result."
+
+*** Its solution
+
+The problem is modeled directly as *discrete black-box optimization under a memory budget constraint*. Two phases:
+
+- *Phase I — Global Multi-Fidelity Evolutionary Search*: Start from an initial population warm-started by a layer-importance prior; use short-run fine-tuning (low fidelity) to filter out most configurations; promote the promising few to high-fidelity retraining. The Pareto front is built from *measured* scores only — no surrogate proxies. NSGA-II handles the multi-objective trade-off (accuracy vs. memory).
+
+- *Phase II — Local Trust-Region Bayesian Optimization*: Around the strongest candidates from Phase I, define several "trust regions"; use a Gaussian process as the surrogate and Expected Improvement (EI) to select the next evaluation point within each small region. This phase is purely fine-grained refinement — no more wide jumps.
+
+Key engineering details: "atomic edits" (changing only one layer's bits or rank by one step at a time) keep the neighborhood meaningful; *memory-compensated coupled mutation* — any edit that increases memory must be paired with one that decreases memory — keeps the search on the budget boundary, preventing wasted evaluations.
+
+*** Why it worked (and what new pit it dug)
+
+It solves the coupled search that prior work avoided: both knobs jointly assigned, per-layer, under a global budget constraint. Experiments show that at an average 4-bit memory budget, downstream accuracy approaches full-precision fine-tuning.
+
+Remaining new pits (speculative):
+- The search cost itself is still non-trivial; though amortizable over multiple deployments, the marginal cost for a single task remains high;
+- The "layer importance prior" warm-start still relies on PTQ-era proxy metrics — not entirely clean;
+- Beyond bits and rank, there are other knobs — LoRA injection position, scaling, dropout — and the frontier of heterogeneity can keep being pushed.
+
+* Frontier Extensions
+
+AutoQRA is a February 2026 preprint, released just a few months ago. The thread of "joint automated allocation" is just opening up, and no clear direct successor has appeared yet. Likely extensions (speculative, based on the paper's Discussion and field trends):
+
+- *Training-dynamic adaptation*: Rather than fixing the configuration before training begins, adjust bits and rank on the fly during training based on gradient/activation signals;
+- *Learnable search surrogate*: Replace the "layer importance" prior — currently a PTQ-era Hessian metric — with a lightweight learned model, so the warm-start gets progressively closer to optimal;
+- *Joint search + inference optimization*: The current work optimizes only the training-time memory budget; future work may jointly optimize inference latency, KV cache, and batched serving.
+
+As of May 2026, AutoQRA is the latest advance on this line.
+
+* The Whole Picture at a Glance
+
+#+begin_example
+         Evolution of "fitting a large model into a small GPU to learn a new task"
+
+Time ->   2019         2021        2023            2023-2025         2026
+
+Bit       HAQ ----------------------------> SlimLLM -------+
+hetero-   (RL per-layer)                    (Hessian       |
+geneity                                      per-layer)    |
+                                                           v
+Adapter   Hu et al. LoRA ----> QLoRA ----+            AutoQRA
+capacity  (low-rank adapter)   (NF4 + LoRA            (Phase I evolutionary search
+                                uniform bits+rank) <--+  Phase II TR-BO
+                                                   |  per-layer bits + rank
+Quant-                        LoftQ / LQ-LoRA -----+  joint optimization,
+LoRA                          (quantization and         measurement-driven)
+alignment                      low-rank co-init,
+                               but wrong proxy)          ^
+                                                 ^       |
+Rank                          AdaLoRA / ---------+       |
+hetero-                       RankAdaptor                |
+geneity                       (dynamic rank alloc,       |
+                               but uniform bits) --------+
+
+Main threads of change:
+  (1) Frontier of heterogeneity keeps advancing:
+        uniform -> bit-heterogeneous -> rank-heterogeneous -> bits+rank jointly heterogeneous
+  (2) Evaluation method evolves:
+        proxy (reconstruction error / PPL) -> measured downstream accuracy
+  (3) Search paradigm evolves:
+        heuristic / RL -> multi-fidelity evolution + trust-region Bayesian optimization
+#+end_example
+
+* Insights
+
+Reading this line of work reveals something more than "algorithms got better" — it reveals that *researchers have been willing to acknowledge more and more coupling over time*.
+
+Each generation saw that "layers are heterogeneous" or that "the two knobs are coupled" — but each chose a shortcut: move only one knob, use a cheap proxy, pretend the other side doesn't exist. The reason wasn't blindness; it was fear. Fear of combinatorial explosion in the search space, fear of evaluation costs, fear of producing results nobody can reproduce.
+
+AutoQRA's true contribution is not "proposing multi-fidelity evolution + Bayesian optimization" — both are off-the-shelf tools. Its contribution is *the willingness to put the avoided coupling on the table* and to accept the cost of "must evaluate with real downstream accuracy, must burn a search budget." It turns the "dirty work of joint search" into an amortizable offline cost — a shift in engineering posture, not merely an algorithmic upgrade.
+
+At a deeper level: the proxy failure (ρ = 0.46) is more important than any individual method. It says that *all the metrics accumulated in the PTQ era may not carry over to the PEFT era*. Fine-tuning shifts the goal from "reconstruct the forward pass" to "search for good parameters within a constrained subspace" — the objective changes, so the proxy naturally collapses. Any work still using PTQ proxies to guide PEFT decisions may be building on sand.
+
+Where to go next? The two most likely directions: (1) Merge "search" and "training" — adjust per-layer configurations online within the training loop rather than searching offline first; (2) Upgrade the allocation granularity from "layer" to something finer — head-level, neuron-level, or even token-level heterogeneous quantization and adaptation.
+
+* Takeaways
+
+For researchers: When you see an entire line of work doing "first A then B" or "first B then A," don't rush to build a better A or a better B — ask first whether "A and B are coupled." If they are, the first person to demonstrate "doing them jointly" often doesn't need to outperform everyone on A or on B individually; they only need to show that "doing them separately is wrong." AutoQRA invented no new quantization algorithm and no new LoRA variant — it simply acknowledged the coupling. That step had not been taken before it.
+
+For engineers: Every "calibrate first, then train" pipeline deserves a look back at *the correlation between the calibration metric and the final metric*. If it's only 0.46 weak correlation, all your "calibration optimization" may be self-reassurance. The proxy-objective mismatch figure from AutoQRA (ρ = 0.46) is a general diagnostic pattern: plot your proxy metric against the true target and see whether it's a cloud of noise — this means you can run this simple experiment to *check whether every proxy-based decision your team makes is actually standing on solid ground*.
+
+For those choosing a tech stack: When 4-bit + LoRA is still "uniform across the board," remember that this is the *state of 2023*. If you are still using a uniform bit + uniform rank QLoRA configuration for serious tasks, you are fighting today's battles with three-year-old defaults — under the same memory budget you may be giving away 20+ points on tasks like ARC-Challenge for no good reason. Put another way: the cost of running joint search once may well be lower than the cost of retraining your model one extra time.

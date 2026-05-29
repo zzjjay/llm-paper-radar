@@ -1,0 +1,368 @@
+#+title:      pQuant: Towards Effective Low-Bit Language Models via Decoupled Linear Quantization-Aware Training
+#+date:       [2026-05-29 Fri 01:57]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260529T015702-en
+#+source:     https://arxiv.org/abs/2602.22592
+#+authors:    Wenzheng Zhang, Bingzheng Liu, Yang Hu, Xiaoying Bai, Wentao Zhang, Bin Cui
+#+venue:      arXiv preprint, Feb 2026
+
+* One-liner
+
+Compress an LLM's weights to an average of 1.35 bits and still beat FP16 —
+not by inventing cleverer quantization tricks, but by reframing an old
+problem: extreme-low-bit training causes "which parameters matter" to vanish
+entirely, so the separation of "important parameters take the high-precision
+lane, ordinary parameters take the 1-bit highway" must be *welded in at the
+architecture level*.
+
+* Provenance Map
+
+#+begin_src
+                          [2016]                    [2016]
+                          BNN  ----------------->  XNOR-Net
+                          {-1,+1}                  + scale alpha
+                          trainable, small tasks   ImageNet-capable
+                              |
+                              v
+                       (fast-forward to the LLM era)
+                              |
+                              v
+                          [Autumn 2023]
+                          PB-LLM            <-- key pivot:
+                          "not all weights are equal"  no longer chasing pure binary,
+                          salient weights kept at high precision  protect sensitive weights
+                              |
+                       +------+------+
+                       v             v
+                  [Early 2024]   [Early 2024]
+                  BiLLM          OneBit
+                  two-stage      SVID decomposition
+                  Hessian salient + scale
+                       \\           /
+                        \\         /
+                  (PTQ route approaches saturation: trained FP16 can't compress to 1-bit)
+                              |
+                              v
+                          [Late 2023]
+                          BitNet      <-- major turning point:
+                          "don't compress, train from scratch"  abandon PTQ,
+                          1-bit Linear trained directly   QAT-from-scratch
+                              |
+                              v
+                          [Early 2024]
+                          BitNet b1.58 / "Era of 1-bit LLMs"
+                          add 0, become ternary {-1,0,+1}
+                          ~1.58 bit, near-lossless
+                              |
+                              v
+                       (new bottleneck: trained 1-bit models, all parameters become "equally important")
+                              |
+                              v
+                          [Spring 2026, this paper]
+                          pQuant
+                          diagnosis: parameter democratization
+                          prescription: 1-bit backbone + 8-bit small branch + MoE-ified small branch
+#+end_src
+
+Note: This provenance chain is the *core sequence explicitly cited and
+critiqued/inherited by this paper*. Contemporary sibling works also exist —
+FBI-LLM (distillation), iFairy (complex-valued representation), PTQ1.61
+(1-D structural mask), etc. — with related problems but different approaches;
+they are not on the main axis and are not expanded here.
+
+* Evolutionary Narrative (from the beginning)
+
+** Starting point: replacing neural-network multiplication with XOR (BNN, 2016)
+
+The story begins not with LLMs but in the era of image recognition.
+
+The question then was blunt: does a neural network really need 32-bit
+floating point? A multiply-accumulate is slow and power-hungry; if weights
+can only take +1 or −1, matrix multiplication degrades to addition and
+subtraction — or even directly to XNOR + popcount (counting ones), a
+hardware instruction tens of times faster than floating-point, with
+dramatically lower power.
+
+BNN (Binarized Neural Networks, Hubara 2016) was the first to make this work
+end-to-end: during the forward pass, both weights and activations are
+binarized to ±1; during back-propagation, a full-precision "shadow weight" is
+secretly retained for updates. On small tasks like MNIST and CIFAR-10, the
+accuracy drop was not catastrophic.
+
+What BNN saw: *precision is not free, but the lower bound is much lower than
+people imagined.*
+
+What BNN left unsolved: the moment you move to ImageNet, everything collapses.
+Multiplying raw ±1 values produces wildly wrong magnitudes across channels,
+and the model's representational capacity is effectively locked.
+
+** Step two: adding a knob to binary multiplication (XNOR-Net, 2016)
+
+XNOR-Net's insight was simple: you cannot demand that every individual weight
+in a convolution kernel be exact, but you can allow *the entire kernel to
+share a single floating-point scale factor* α. The forward pass computes
+sign(W) × X × α — cheap, yet magnitude is restored.
+
+What XNOR-Net saw: BNN discards all degrees of freedom, including the
+"magnitude" degree that is actually cheap to keep.
+
+What XNOR-Net left unsolved: this mechanism works for CNNs because their
+kernels are small and inter-channel structure is strong. Scale it to an LLM
+where a single matrix is thousands × thousands, and one shared α is nowhere
+near enough.
+
+(This line of work then went quiet for years, because the Transformer arrived
+and 16-bit gave everyone more than enough to do.)
+
+** Step three: LLMs push the contradiction to the extreme — a counter-intuitive discovery (PB-LLM, 2023)
+
+Fast-forward to 2023. Once LLaMA appeared, extreme-low-bit compression
+suddenly mattered again: a 70B model that goes from 16-bit to 4-bit already
+saves half the memory; below 2-bit it fits on a consumer GPU.
+
+Among the first serious attempts at binarization on LLMs was PB-LLM
+(Partially-Binarized LLM, Shang 2023). When they tried to compress weights to
+1-bit, they encountered a phenomenon that *violated the intuition of
+"compress everything"*:
+
+- If you compress the entire matrix to 1-bit, accuracy collapses irreparably.
+- But if you keep *the most salient 10% of weights* at 4-bit or 8-bit and
+  compress the remaining 90% to 1-bit, accuracy almost fully recovers.
+
+This gave rise to the concept of "salient weights" — a small cluster of
+weights that carries the overwhelming majority of the model's representational
+capacity and must be protected.
+
+The key difference from XNOR-Net: XNOR-Net treats all weights as equivalent
+and concedes only on *scale*; PB-LLM admits that weights play *unequal roles*
+and concedes on *precision*. This is the cognitive foundation for everything
+that follows.
+
+What PB-LLM left unsolved: how do you automatically identify that 10%?
+Without an ad-hoc threshold? And this is a PTQ scheme — the model is already
+trained, you are only post-hoc compressing it, so the expressivity ceiling is
+baked in.
+
+** Step four: refining salient selection (BiLLM / OneBit, 2024)
+
+Two improvement lines appeared in parallel after PB-LLM:
+
+- *BiLLM (Huang 2024)*: instead of naively picking top-10%, use Hessian
+  information to compute which weights are most sensitive and set them aside;
+  then apply a "bell-shaped residual approximation" to the remaining
+  non-salient weights for extra precision recovery. Two stages.
+
+- *OneBit (Xu 2024)*: a mathematical decomposition route. Each weight matrix
+  W is written as W ≈ sign(W) × (a × b^T) — a 1-bit sign matrix plus two
+  high-precision column/row scale vectors. This is essentially extending
+  XNOR-Net's "single α" to "two vectors α".
+
+What they saw: PB-LLM's salient selection is crude; and every PTQ scheme's
+ceiling is still the original FP16-trained weight.
+
+What they left unsolved: no matter how accurately you select salient weights,
+you are still compressing after the fact. The fine-grained correlations that
+exist in a FP16 model cannot be recovered once quantized. To break through the
+ceiling, the model must *adapt to the 1-bit world during training*.
+
+** Step five: just train 1-bit from scratch (BitNet, 2023)
+
+BitNet (Wang 2023, appearing almost simultaneously with PB-LLM but taking the
+exact opposite path) proposed: stop training in FP16 and then compressing;
+start from random initialization and train a natively 1-bit LLM directly.
+
+Technically simple — replace every Linear with a BitLinear (weights ±1,
+full-precision shadow weights retained during training), add standard
+LayerNorm and initialization adjustments, then pretrain normally.
+
+What BitNet saw: PTQ routes (PB-LLM, BiLLM, OneBit) are all fighting against
+the "geometric structure of an already-formed FP16 model"; but the model is
+fully capable of *learning a geometry suited to 1-bit representation* — it
+just needs to learn it from scratch.
+
+Result: at matched size, it significantly outperforms all PTQ binarization
+schemes, making "end-to-end 1-bit LLM" seem viable for the first time.
+
+What BitNet left unsolved: there is still a non-trivial accuracy gap versus
+FP16, and *the gap shrinks only slowly with scale* — a 3B model still lags
+clearly behind a FP16 3B.
+
+** Step six: one extra state, nearly matching FP16 (BitNet b1.58, 2024)
+
+The immediately following BitNet b1.58 ("The Era of 1-bit LLMs", Ma 2024) did
+exactly one thing: expand {−1, +1} to {−1, 0, +1}. The extra "0" brings the
+average bit-count to log₂(3) ≈ 1.58.
+
+Why does this matter? Because "0" lets the model learn "no connection",
+effectively embedding sparsity into the weight representation — equivalent to
+automatic pruning. At 3B scale, b1.58 nearly matches FP16 LLaMA. The paper
+title boldly declares "Era of 1-bit LLMs."
+
+What b1.58 saw: BitNet's ±1 forces every weight to *always connect*, which is
+unnecessary waste.
+
+What b1.58 left unsolved — and this is pQuant's entry point: b1.58 looks
+beautiful at 3B, but *scaling further yields diminishing returns*. The
+1-bit/1.58-bit scaling curve is noticeably flatter than FP16. Why? Nobody had
+an answer.
+
+** Step seven: pQuant's diagnosis — "parameter democratization" (this paper, 2026)
+
+The pQuant team did something nobody else had done: rather than inventing a
+new quantization operator, they *opened up a BitNet-trained model and looked
+at what had happened inside*.
+
+The procedure was simple — score each weight with a standard "sensitivity"
+metric (approximately the squared perturbation error under the Optimal Brain
+Surgeon framework), then plot heat maps.
+
+Findings:
+
+- *16-bit LLaMA-3*: sensitivity is extremely uneven; a small cluster of
+  weights (a few percent) has sensitivity orders of magnitude higher than the
+  rest. Fully consistent with the "salient weights" found by PB-LLM and BiLLM.
+- *1-bit BitNet at the same size*: sensitivity is flattened to near-uniform.
+  *All weights appear equally important — which is to say, equally
+  unimportant.*
+
+They named this phenomenon: *parameter democratization*.
+
+This is a pointed diagnosis. The "sensitive-weight structure" that PTQ-era
+researchers painstakingly discovered is *erased by the training process itself*
+in the QAT-from-scratch world. To fit the hard 1-bit constraint, the model
+learns a solution in which every weight contributes uniformly — a "mediocre
+optimum." It works, but it cannot scale further, because there is no
+"priority" left to strengthen.
+
+The key difference from BitNet b1.58: b1.58 tries to expand expressivity by
+adding a "0" state; pQuant argues the real problem is not the number of
+states but that *training erases structural differentiation capacity along the
+way*.
+
+** Step eight: pQuant's prescription — weld the differentiated structure into the architecture
+
+With the diagnosis in hand, the logic of the fix becomes clear: if training
+will flatten "which parameters matter," then *don't give it the opportunity*
+— separate "important parameters" from "ordinary parameters" into distinct
+physical channels at the architecture level, before training begins.
+
+The concrete mechanism (decoupled linear layer):
+
+#+begin_src
+  Input x
+    |
+    +---------+----------+
+    |                    |
+    v                    v
+  1-bit main branch   High-precision (8-bit) small branch
+  (high rank, all 1-bit)  (very low rank, only a few columns/rows)
+    |                    |
+    +---------+----------+
+              v
+            Output
+#+end_src
+
+Every Linear layer in every FFN is replaced by this dual-path structure: a
+wide 1-bit backbone plus a narrow 8-bit bypass. Two important details:
+
+1. *Feature scaling guidance*: a learnable scale vector is inserted before
+   each branch. During training, features with large scale naturally flow more
+   through the 8-bit branch; features with small scale flow through 1-bit.
+   This gives the model an explicit "how important is this feature" switch,
+   letting it *learn* to push sensitive content toward the high-precision path.
+2. *MoE-ifying the 8-bit branch*: this is the real capacity multiplier.
+   Replace the single 8-bit bypass with *a group of sparsely activated small
+   experts*, each token activating only 1 via a lightweight router. This
+   effectively multiplies the high-precision capacity without increasing
+   inference cost.
+
+The key difference from everyone before: PB-LLM/BiLLM distinguish sensitive
+weights *at compression time* (post-hoc); BitNet makes no distinction at all
+(one-size-fits-all); pQuant *enforces* the distinction *in the architecture*,
+so training cannot circumvent it.
+
+Results: on a 1.3B model, at an average of 1.35-bit weights, WikiText2
+perplexity is 17.2 — surpassing OmniQuant 2-bit (42.4), PTQ1.61 1.61-bit
+(39.6), and pure BitNet 1-bit (21.8). At scale, inference throughput exceeds
+FP16 by more than 2×, while accuracy is on par with FP16.
+
+* Problem–Solution Overview
+
+#+begin_src
+Era          Problem seen                              Card played
+---------    ----------------------------------------  ---------------------------
+2016 BNN     "32-bit is too costly — must it be?"      Compress weights & activations to +-1
+2016 XNOR    "+-1 magnitudes are wrong, model breaks"  Add one float scale alpha per kernel
+2023 PB-LLM  "Full 1-bit on LLMs doesn't work"         Keep 10% salient weights at high precision
+2024 BiLLM/OneBit "Salient selection is too coarse"   Hessian sensitivity / SVID decomposition
+2023 BitNet  "PTQ ceiling is too low"                  Train from scratch, no post-hoc compression
+2024 b1.58   "Pure +-1 is too rigid"                   Add 0, go ternary (~1.58 bit)
+2026 pQuant  "Sensitivity is flat after training (democratization)"
+                                                        Architecturally enforce 1-bit backbone +
+                                                        MoE-ified high-precision small branch
+#+end_src
+
+* Insights
+
+** What is actually changing along this line
+
+On the surface it looks like "bit-count marching from 32 down to 1.35." But
+the deeper shift is: *where "parameter importance" gets expressed*.
+
+- In the BNN/XNOR-Net era: importance is not expressed at all; all weights are
+  equal.
+- In the PB-LLM/BiLLM/OneBit era: importance is *read out after the fact* —
+  train in FP16, then identify which weights matter.
+- In the BitNet/b1.58 era: importance *disappears* — to fit the 1-bit
+  constraint, training automatically grinds it away (only later discovered and
+  named by pQuant).
+- In the pQuant era: importance is *predefined in the architecture* — you
+  carve out "important parameters live here" rooms in the network upfront, and
+  training naturally moves the important ones in.
+
+The whole line is really a *battle between explicit and implicit*. The
+conventional deep-learning wisdom is "let the model learn for itself"; pQuant's
+counter-thesis is "under extreme constraints, the model cannot learn the
+structure you want on its own — you must *weld the structure in*, then let it
+learn." This is the reverse direction of the "reduce inductive bias" trend that
+drove early CNN → Transformer progress.
+
+** Where things are most likely to go next
+
+Three directions:
+
+1. *Carry the decoupling idea into attention*: pQuant uses the decoupled
+   linear layer only in FFN blocks; MHA remains pure 1-bit. Does the attention
+   matrix's sensitivity structure also get democratized? Almost certainly. This
+   is the most direct extension.
+2. *Adaptive rank allocation*: pQuant's high-precision branch rank is set
+   manually. Different layers and different heads surely have different appetites
+   for high-precision capacity. Letting the model *learn* how much high-precision
+   capacity each layer needs is the natural next step.
+3. *Hardware co-design*: the mixed dataflow of 1-bit backbone + 8-bit bypass +
+   sparse MoE is not necessarily optimal on a general-purpose GPU. Dedicated
+   ASICs will follow, just as a wave of binary accelerators appeared in the wake
+   of XNOR-Net.
+
+A more interesting meta-level question: if "democratization" is a general
+pathology of QAT-from-scratch, does it also exist to varying degrees in
+*2-bit* and *4-bit* QAT? Researchers may have been unknowingly living with
+suboptimal solutions all along.
+
+* Honest Disclaimers
+
+- In the provenance chain BNN → XNOR-Net → PB-LLM → BiLLM/OneBit → BitNet →
+  b1.58 → pQuant, *all citation relationships are explicitly mentioned and
+  compared in the pQuant paper itself* — none are inferred.
+- *BitNet and PB-LLM appeared almost simultaneously*; strictly speaking BitNet
+  did not "improve upon" PB-LLM — they chose opposite strategies for the same
+  problem. The narrative here is ordered as "PTQ route saturates first, then
+  someone pivots to QAT" for the sake of narrative flow, but in reality both
+  paths were explored in parallel.
+- *Follow-on work is not discussed in the paper*: pQuant is a February 2026
+  paper, and as of the writing of this analysis (May 2026) there is no clearly
+  identified successor work that critiques it. The citation tree has *upstream
+  only, no downstream*.
+- *FBI-LLM (distillation), iFairy (complex-valued representation), PTQ1.61
+  (structural mask)* and similar contemporaneous works are sibling branches,
+  not on this main axis, and are not expanded here.

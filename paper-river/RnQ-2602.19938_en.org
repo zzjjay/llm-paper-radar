@@ -1,0 +1,268 @@
+#+title:      A Replicate-and-Quantize Strategy for Plug-and-Play Load Balancing of Sparse Mixture-of-Experts LLMs
+#+date:       [2026-05-29 Fri 01:43]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T014319-en
+#+source:     https://arxiv.org/abs/2602.19938
+#+authors:    Zijie Liu, Jie Peng, Jinhao Duan, Zirui Liu, Kaixiong Zhou, Mingfu Liang, Luke Simon, Xi Liu, Zhaozhuo Xu, Tianlong Chen
+#+venue:      arXiv preprint, 2026
+
+* The Problem River
+
+One core question: when you split a massive model into "a pool of experts + a dispatcher" (Mixture-of-Experts, MoE), the dispatcher inevitably plays favorites — routing the vast majority of work to a handful of star experts while the rest sit idle. One GPU is overloaded while another spins empty; compute is there in abundance, yet throughput refuses to climb.
+
+Why is this so hard?
+
+- *Training time and inference time are two different worlds*: During training you can bolt on a loss term to force balanced routing. But once the model is deployed, the router is frozen — and its favoritism shows its true face under real traffic. Worse, the larger the batch, the more pronounced the skew.
+- *"Gets routed to often" ≠ "important"*: Earlier fixes assumed that selection frequency equals importance. In practice some rarely-chosen experts carry critical computations, while some heavily-chosen experts contribute almost nothing.
+- *Modifying the router or retraining is prohibitively expensive*: Every new MoE release (Mixtral, DeepSeek-MoE, LLaMA-MoE, …) would demand a full retraining cycle — nobody can afford that.
+- *Memory is a hard wall*: Replicating popular experts distributes the load, but the memory budget does not allow unlimited copies.
+
+The entire research thread is generation after generation of people trying to make routing both balanced and cheap without sacrificing accuracy.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: want hundred-billion-scale params but compute won't allow it
+  | Fix: activate only a few experts per token; noisy top-k + simple LB loss
+  v
+[2020] Lepikhin et al. - GShard
+  |
+  | Problem: noisy top-k load balancing still collapses at large distributed scale
+  | Fix: hard per-expert capacity cap + explicit balancing auxiliary loss
+  v
+[2021] Fedus et al. - Switch Transformer
+  |
+  | Problem: GShard's top-2 is heavy; auxiliary loss is finicky to tune
+  | Fix: simplify to top-1 + standardized load-balancing auxiliary loss
+  v
+[2022] Zhou et al. - Expert Choice Routing
+  |
+  | Problem: tokens choosing experts leads to expert overload;
+  |          auxiliary loss is always a post-hoc patch
+  | Fix: flip it — let experts pick tokens, guaranteeing balance by design
+  v
+[2024] Wang et al. - Loss-Free Balancing (DeepSeek)
+  |
+  | Problem: auxiliary loss interferes with the main task, hurting accuracy
+  | Fix: add a dynamic per-expert bias to routing scores; no extra loss needed
+  v
+[2026] Liu et al. - R&Q  (this paper)
+  |
+  | Problem: all of the above are train-time solutions; once deployed,
+  |          inference-phase imbalance is *nobody's problem*,
+  |          and it worsens with larger batch sizes
+  | Fix: leave training untouched; at inference prep time,
+  |      replicate hot experts and quantize cold ones + replicas —
+  |      same memory budget, load spread evenly
+  v
+[2025-26] Capacity-Aware Inference / HarMoEny / Lina / SwapMoE
+  |
+  | Problem: even so, cross-GPU scheduling and expert swapping remain bottlenecks
+  | Fix: rewrite the runtime at the system level (complementary to R&Q, not conflicting)
+  v
+[?] Next: the router itself should be aware of "which machine am I running on"
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Sparsely-Gated MoE: The First Neural Network That Calls Experts On Demand
+
+*** What Problem It Saw
+
+At the time, everyone wanted to push parameter counts into the hundreds of billions, but GPUs couldn't handle the compute. The question was: does a forward pass really need to touch every parameter? Intuitively, no — most words in a sentence don't need a "math expert," and a "poetry expert" is useless on a block of code.
+
+*** Its Solution
+
+Split one large FFN into N smaller FFNs (called "experts"), with a dispatcher in front (called the "gate/router"). Each token arrives, the dispatcher glances at it, picks the top-k experts to do the work, and lets the rest take the round off.
+
+To stop the dispatcher from always picking the same crowd, they added two tricks:
+- *Noisy top-k*: inject noise into the routing scores before selection, forcing the dispatcher to occasionally try someone new.
+- *Load balancing loss*: incorporate "how often each expert gets selected" into the loss, penalizing the model for uneven assignment.
+
+*** Why It Worked (and What Pit It Dug)
+
+Parameters scaled up while compute did not — that is MoE's fundamental value proposition, and it held.
+
+But the pit is deep: that load balancing loss is really just a gentle nudge. It tells the model "try to be even," but imposes no hard constraint and does not distinguish "selected often" from "actually important." At large distributed scale, a gentle nudge does nothing.
+
+** 2020 | GShard: Adding a Hard Capacity Gate
+
+*** What Problem It Saw
+
+Running Shazeer's setup at 600B parameters across a thousand-plus TPUs immediately exposed the failure: certain experts got hammered and their token queues overflowed; others received almost no tokens and sat idle. Noisy top-k is far too soft a constraint at this scale.
+
+*** Its Solution
+
+A hard gate: *expert capacity*. Each expert processes at most C tokens per round; the overflow is dropped (or spills to the next layer). The load-balancing objective was rewritten as a more explicit auxiliary loss, directly penalizing the product of routing probabilities and actual assignment fractions.
+
+*** Why It Worked (and What Pit It Dug)
+
+Hard capacity caps guaranteed distributed efficiency — no single expert could stall the pipeline.
+
+The cost: dropped tokens lose their information; top-2 routing is itself compute-heavy with large communication overhead; and the auxiliary loss coefficient requires careful hand-tuning, where a bad value fights the main loss.
+
+** 2021 | Switch Transformer: Cut to Top-1, Standardize the Pipeline
+
+*** What Problem It Saw
+
+GShard's top-2 was slow and complicated. Fedus et al. asked: can we just route each token to one expert? Top-1 should be harder to balance, but with the right loss, could it be stable?
+
+*** Its Solution
+
+Each token goes to exactly one expert. They contributed a clean, closed-form load-balancing auxiliary loss (which has since become the MoE "standard part"). They also addressed precision instabilities in training (softmax blowing up at low precision).
+
+*** Why It Worked (and What Pit It Dug)
+
+Top-1 made MoE genuinely lightweight, scaling to 1.6 trillion parameters. Nearly every subsequent open-source MoE (Mixtral, DeepSeek-MoE, LLaMA-MoE) inherited this framework.
+
+But a deeper pit appeared: no matter how the loss is tuned, *selection frequency* and *expert importance* are still implicitly treated as equivalent — and that is simply wrong.
+
+** 2022 | Expert Choice: Flip Who Picks Whom
+
+*** What Problem It Saw
+
+Whether top-1 or top-2, the essential structure is "tokens pick experts" — tokens carry scores and compete for popular experts, which inevitably get overwhelmed. More auxiliary loss is always a post-hoc patch.
+
+*** Its Solution
+
+Mechanistically flip it: let *experts pick tokens*. Each expert selects the fixed-k highest-scoring tokens. Every expert's workload is identical by construction — balance is a mechanical guarantee, not something optimized into existence by a loss function.
+
+*** Why It Worked (and What Pit It Dug)
+
+Elegant. Eliminates the auxiliary-loss headache at the root.
+
+But it requires seeing a full batch at routing time (experts must choose from a pool of tokens). That assumption breaks under autoregressive inference — when decoding token-by-token there is no "pool" to choose from. Inference falls back to token-choice routing, and the old problem returns unchanged.
+
+** 2024 | Loss-Free Balancing (DeepSeek): Replace the Loss with a Dynamic Bias
+
+*** What Problem It Saw
+
+The auxiliary loss fights the main task loss — to force expert balance, the model is compelled to compromise, and accuracy suffers. The DeepSeek team found this deeply troubling during V2 development.
+
+*** Its Solution
+
+Drop the loss entirely. Add a *bias* to each expert (added directly to its routing score). If an expert has been selected too often recently, shrink its bias so it gets chosen less next round; otherwise grow it. This is a dynamic equilibrium mechanism that never enters the main loss.
+
+*** Why It Worked (and What Pit It Dug)
+
+Accuracy is preserved and balance is maintained. DeepSeek-V3 uses exactly this.
+
+But all of these approaches — Switch, Expert Choice, Loss-Free — are *train-time* stories. Once a model is trained and released, the router is frozen, the biases are frozen. At inference time, what the real traffic looks like, how large the batch is, what users actually ask — none of that is guaranteed to keep the balance intact.
+
+That is R&Q's starting point.
+
+** 2026 | R&Q: Leave Training Alone — Replicate and Quantize at Inference Time
+
+*** What Problem It Saw
+
+The authors took five open-source MoEs (Switch, LLaMA-MoE, DeepSeek-MoE, DeepSeek-V2 Lite, Mixtral) and ran them under actual inference conditions, discovering three surprising facts:
+
+1. *The larger the batch, the worse the favoritism*. Small batches look reasonably balanced; once batch size hits 64 or 128, popular experts absorb 5–10× the workload of their peers.
+2. *Frequency does not equal importance*. Measuring expert importance with Wanda (an importance metric from the pruning literature) revealed that some frequently-chosen experts can be pruned with almost no accuracy impact, while some rarely-chosen experts are critical.
+3. *A very small calibration set* (a few hundred samples) is sufficient to obtain stable estimates of both "workload" and "importance" for every expert.
+
+Yet all seven years of prior work fought its battles at training time and had no answer for real post-deployment traffic. The alternatives — retrain or modify the router — cost too much.
+
+*** Its Solution
+
+Two actions, both happening in a "preparation phase" before inference begins, with zero change to training:
+
+- *Replicate*: Copy high-workload popular experts once or several times. When the router selects such an expert, the request can be dispatched to any replica — load is naturally distributed.
+- *Quantize*: Replication inflates memory. So compress the unimportant experts (as measured by Wanda) and the replicas using low-bit quantization (LLM.int8), keeping the overall memory budget unchanged.
+
+The key insight is *importance ≠ frequency*: nobody had made this separation before. Common sense would say "quantize the hottest experts to save memory" — but hot does not mean important, and quantizing the wrong experts hurts accuracy. R&Q uses Wanda to correctly determine "who can be compressed."
+
+*** Why It Worked (and What Pit It Dug)
+
+Results: load imbalance (measured by their proposed LIS metric) is reduced by up to 1.4×, with accuracy change of only ±0.6%. The biggest selling point is *plug-and-play* — drop it onto any existing model, no retraining, no router changes, no runtime modifications.
+
+Remaining pits:
+- Scheduling replicas across multiple GPUs remains an open systems problem.
+- The coupling between quantization and importance is deepening, but only one metric (Wanda) has been explored so far.
+- Real online traffic distributions drift; the calibration set may become stale over long deployment periods.
+
+* Frontier Extensions
+
+Around the same time, several other forces are pushing on "how to handle MoE load imbalance at inference time":
+
+- *Capacity-Aware Inference* (He et al.): identify "straggler experts" and reschedule them at the system layer.
+- *HarMoEny* / *MoEShard* / *Lina* / *SwapMoE*: attack the same problem from different angles — distributed scheduling, expert swapping, edge deployment.
+
+All of these require rewriting the runtime or the scheduler. R&Q's positioning is clear: a model-level plug-and-play that is orthogonal to all of them and can be stacked on top.
+
+Looking one step further, the most natural direction is: make the *router itself deployment-aware* — have it know how many GPUs it is running on, what the current batch size is, and how many replicas exist for each expert — so it can adjust routing strategies dynamically. In other words, solve training-time "soft balancing" and deployment-time "hard reality" in a single unified framework.
+
+* A Single Diagram
+
+#+begin_example
+                   Train-time                              |    Inference-time
+                                                           |
+2017 Shazeer  | noisy top-k + LB loss                     |   (nobody's concern)
+              |   soft constraint                          |
+              v                                            |
+2020 GShard   | + expert capacity hard cap                 |   (nobody's concern)
+              |   hard cutoff, top-2                       |
+              v                                            |
+2021 Switch   | top-1 + standardized LB aux loss           |   (nobody's concern)
+              |   pipeline crystallized                    |
+              v                                            |
+2022 ExpChoice| flip: expert picks token                   |   degrades to token-choice at inference
+              |   balance by design                        |   (old problem returns unchanged)
+              v                                            |
+2024 LossFree | dynamic bias replaces loss                 |   bias frozen, breaks after deployment
+   (DeepSeek) |   no accuracy drop                         |
+              |                                            v
+              |                                       -------------
+              |                                       2026 R&Q
+              |                                       Training untouched; before inference:
+              |                                       * use calibration set to measure
+              |                                         workload + importance per expert
+              |                                       * Replicate hot experts
+              |                                       * Quantize cold experts + replicas
+              |                                       * memory budget unchanged
+              |                                       -------------
+              |                                            |
+              |                                            v
+              |                               System-level complements:
+              |                               HarMoEny / Lina / SwapMoE
+              |
+              v
+        Shared trajectory: deployment-aware router; unified train–deploy modeling
+
+    Conceptual shift:   "balance by mechanism" -> "balance by loss" ->
+                        "balance by bias" -> "don't touch training, fix it at deploy time"
+    Metric shift:       selection frequency == importance  ===>
+                        selection frequency != importance  (Wanda)
+    Cost shift:         retrain router -> fine-tune router -> tune bias ->
+                        no training, no tuning, drop in and go
+#+end_example
+
+* Insights
+
+Reading through the entire thread, what emerges is not "yet another MoE improvement" but several deeper shifts in understanding:
+
+1. *From "settle it once at training time" to "keep correcting it at deployment time."* For seven years, the field assumed "once the model is trained, its behavior is fixed." R&Q tears that assumption open — batch size, traffic distribution, and hardware configuration at inference time are all "truths invisible during training." This means there is a vast, still-untapped optimization space in MoE inference.
+
+2. *The collapse of the hidden assumption "frequency = importance."* Every train-time load balancing loss implicitly assumed that "experts that get selected are useful." R&Q uses Wanda — borrowed from the pruning literature — to puncture that assumption: importance must be measured independently and cannot be inferred from routing behavior. This separation is what gives "whom to compress, whom to replicate" a correct foundation for the first time.
+
+3. *Cross-domain tool reuse.* Wanda was originally designed for pruning (deciding which weights can be deleted). R&Q transplants it to decide which experts can be quantized and which replicas can be removed. This kind of cross-domain tool migration is a recurring breakthrough pattern — pruning, distillation, quantization, and expert management are all ultimately answering the same question: "Which parameters actually matter?"
+
+Where does this river flow next? *Deployment-aware routing* — giving the router the ability to sense at inference time "how many replicas do I have available," "which GPU is currently free," and "has an important expert been compressed" — enabling real-time adjustment. R&Q opens this space but stops at the "static preparation" phase. The genuine next step is dynamic, online adaptation.
+
+* Takeaways
+
+On the craft of doing research:
+
+1. *Breaking hidden assumptions is the cheapest form of innovation.* The assumption "frequency = importance" lived in the field for seven years without being systematically challenged. R&Q invented no new algorithm — it simply split that equals sign apart and immediately gained a new dimension. Finding the silently-accepted equalities in a field is often where the opportunity lives.
+
+2. *Looking at real deployments can surface gold that training-time studies miss entirely.* The single smartest move in this whole thread is "let's actually run inference and observe" — minimal experimental effort, maximally concrete conclusions. Academia has long favored training-time papers; the phenomenology of deployment is still almost entirely open territory.
+
+3. *Plug-and-play is an underrated form of product strength.* The community already has five major MoE models; every new balancing method that demands retraining simply won't get used. R&Q chose a design point of "works on any already-released model," and that constraint forced out the cleanest possible solution. Adding the constraint "cannot touch X" to a design often forces out the more essential answer.
+
+Practical landing points:
+
+- If you have an existing MoE model running inference with throughput that won't scale, you can try the R&Q approach directly — prepare a calibration set → measure expert importance with Wanda → replicate hot experts + quantize cold ones + replicas. No training required.
+- If you are doing MoE deployment optimization, you can stack R&Q (model layer) with HarMoEny/Lina (system layer) — they are orthogonal.
+- If you are designing a new MoE router, *treat deployment context as an input to the router from the start* — that is the most likely direction this river flows next.

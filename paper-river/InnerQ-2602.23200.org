@@ -1,0 +1,216 @@
+#+title:      InnerQ: Hardware-Aware Tuning-Free Quantization of KV Cache for Large Language Models
+#+date:       [2026-05-29 Fri 02:00]
+#+filetags:   :paper:river:
+#+identifier: 20260529T020031
+#+source:     https://arxiv.org/abs/2602.23200
+#+authors:    Sayed Mohammadreza Tayaranian Hosseini, Amir Ardakani, Warren J. Gross
+#+venue:      arXiv preprint, 2026
+
+* 问题之河
+
+LLM 一边生成一边在背一个东西：KV cache——前面所有 token 的 key/value 都得留着，给后面每一步算 attention 用。生成越长，这个东西越大，最后把显存撑爆，把带宽吃满，速度卡死。
+
+问题听起来很简单：把 KV cache 压一压不就行了？但 cache 里塞着两类完全不同的数字——大部分是温和的小数，少数 channel 是离群点（outlier），数值大得离谱。一刀切的量化会被这些离群点拉爆精度；细致地分组又会让 GPU 算起来变慢。
+
+于是这条线一代代人都在打同一个回旋镖：*压得更狠* 还是 *算得更快*？每次压更狠，就引来新的精度坑；每次想算更快，就发现压缩格式跟硬件不对付。InnerQ 之所以有意思，是因为它第一次站出来说："你们之前看错地方了——问题不是怎么分组，而是沿哪个方向分组。"
+
+* 溯源地图
+
+#+begin_example
+[2023] Xiao et al. - StreamingLLM / Attention Sink
+  |
+  | 发现: 序列开头几个 token 拿走了不成比例的 attention
+  |       砍掉它们模型就崩。它们是 "sink"。
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | 问题: KV cache 太大；离群点让朴素量化烂掉
+  | 解法: 用校准数据学非均匀的量化点位 + 处理 outlier channel
+  | 新坑: 要外部校准数据；非均匀点位查表慢
+  v
+[2024] Liu et al. - KIVI
+  |
+  | 问题: 不想要校准数据，要 tuning-free
+  | 解法: K 沿 channel 维度（outer dim）分组量化隔离 outlier
+  |       V 沿 token 维度分组；最近 N 个 token 留 FP16
+  | 新坑: outer dim 分组在 GPU 上 scale factor 不能复用
+  |       sink token 没被特殊对待，outlier 还是会污染
+  v
+[2025] Wang et al. - SQuat
+  |
+  | 问题: KIVI 的 K 量化误差会被 query "看见"
+  | 解法: 让 K 的量化误差和 query 正交（解小优化问题）
+  | 新坑: 周期性优化拖慢 throughput
+  v
+[2026] Zandieh et al. - TurboQuant
+  |
+  | 问题: 想 data-oblivious，不依赖任何输入分布
+  | 解法: 随机旋转把分布拍平 + 预算好的非均匀 codebook
+  | 新坑: codebook 查表多次访问 shared memory，kernel 慢
+  v
+[2026] Tayaranian et al. - InnerQ  <-- 目标论文
+        重新审视: 大家都在卷"怎么分组",
+        但分组的"方向"才是硬件瓶颈的根
+#+end_example
+
+* 演化叙事
+
+** 2023 | StreamingLLM (Attention Sink): 序列开头的几个 token 是隐藏的"垃圾桶"
+
+*** 它看到了什么问题
+
+人们试图给 LLM 做长上下文推理时，最朴素的想法是：cache 满了就把最老的 token 扔掉，保留最近的窗口。结果模型直接崩——胡言乱语、循环输出。
+
+为什么？因为 attention softmax 必须把概率分配出去，总要找个地方"倒"。Xiao 他们发现：序列最开头的几个 token，无论内容是什么，都被后续所有 token 给予了不成比例高的 attention。它们成了一个 *attention sink*——一个吸收冗余概率质量的水槽。砍掉 sink，softmax 没地方倒水，整个分布就乱了。
+
+*** 它的解法
+
+简单粗暴：永远保留最开头的几个 token，再保留最近的滑动窗口，中间的可以丢。这样既能跑长上下文，又不崩。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为它顺应了模型自己的结构——sink 是 transformer 训练时自发长出来的逃生阀。但它只是发现了现象，没有去问：*在量化这件事里，sink token 该怎么办？* 这个问题留给了后人。所有后续的 KV 量化方法都得回答：sink token 是数值上的 outlier，要不要被压？怎么压？
+
+** 2024 | KVQuant: 第一代正经的 KV 量化，但要你交学费
+
+*** 它看到了什么问题
+
+StreamingLLM 解决的是"丢什么"，KVQuant 想解决"留下的怎么压更小"。问题是：KV cache 里的 key 矩阵有非常显著的 channel 维度 outlier——某些 channel 整列数值偏大，另一些偏小。一刀切的 INT4 量化会被这些 outlier 拉爆整组的精度。
+
+*** 它的解法
+
+两个动作：第一，用校准数据集跑一遍，学出非均匀的量化点位（signposts），让点位密度匹配实际分布。第二，对 outlier channel 做特殊处理（高精度保留或单独编码）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+学出来的非均匀点位精度高，但代价是两个：(1) 你得有一份和推理任务分布相似的校准数据，否则跑偏。(2) 推理时每次反量化都要查表（codebook lookup），多一次访存，GPU kernel 就慢一拍。
+
+留下的问题很直接：*能不能不用校准数据？*
+
+** 2024 | KIVI: 不要校准了，但分组方向走错了一步
+
+*** 它看到了什么问题
+
+KIVI 接住 KVQuant 留下的问题：tuning-free——不要校准数据，靠观察数据的结构本身。它注意到，key cache 的 outlier 集中在 channel 维度，value cache 的 outlier 更分散。
+
+*** 它的解法
+
+K 沿 channel 维度（也就是矩阵的 *outer dimension*）分组做非对称量化——把每个 channel 自己的范围算清楚，outlier 大的 channel 自成一组，不污染其他组。V 沿 token 维度分组。最近 N 个 token（recent window）保留 FP16，因为它们对当下 step 的 attention 影响最大。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把 outlier 隔离在自己的组里，确实是个聪明的招——精度保住了，又不用校准。但这一步埋了两个深坑，恰恰是 InnerQ 后来挖出来的：
+
+1. *Sink 没被特殊对待*。最近 token 留了 FP16，开头 sink token 没留。sink 是天然的数值 outlier，混在量化组里继续污染。
+
+2. *分组方向跟 GPU 反着*。Attention 解码阶段的计算是向量乘矩阵（一个 query 向量乘整个 K 矩阵）。GPU 把矩阵切片给不同 compute unit 算，每个 unit 拿到的是一段连续的行。如果 scale factor 是沿 channel（outer）维度分配的，同一行里的元素属于不同组，每个元素都要查自己的 scale，scale factor 在 unit 之间不能复用，访存量倍增。
+
+这第二个坑很微妙——它不影响精度，只影响速度。但是当所有后续工作都在这个分组方向上继续卷精度时，它成了房间里的大象，没人去碰。
+
+** 2025 | SQuat: 在 KIVI 之上做精修，速度反而更慢
+
+*** 它看到了什么问题
+
+SQuat 接住 KIVI 留下的 *精度* 问题：K 的量化误差并不是"消失了"，而是会被 query 向量"看见"——内积运算会把误差放大到 attention 分数里。
+
+*** 它的解法
+
+让 K 的量化误差和 query 向量正交——这样内积时误差被吸收掉。做法是周期性地解一个小优化问题，调整量化参数。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学上漂亮，精度确实再往上一截。但它走的是 KIVI 同一条路：在 outer-dim 分组的框架内更精细。代价是周期性优化拖慢了 throughput。
+
+这是这条线的典型困境——*每一次精度的微小提升都要付出运行时开销，没人去问框架本身是不是错的*。
+
+** 2026 | TurboQuant: 换条路走，但 codebook 还是慢
+
+*** 它看到了什么问题
+
+如果连 KIVI 那种"看一眼数据再分组"都嫌依赖输入分布，能不能做 *data-oblivious* 的——完全不看数据，给个保证？
+
+*** 它的解法
+
+先给 K 和 V 乘一个随机旋转矩阵（Johnson-Lindenstrauss 那一类）。旋转后，向量的坐标分布趋近 Beta 分布——分布变规则了。然后用一个针对 Beta 分布预先算好的非均匀 codebook 做量化。Outlier channel 用更宽的 bit-width 单独处理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+理论保证漂亮，精度也不错。但又回到了 KVQuant 当年那个坑：*codebook 查表*。GPU kernel 里反量化每次都要访问 shared memory 里的 codebook，多次访存把延迟堆起来。
+
+到这里这条线已经走得很拧巴：精度方法越来越精致，但每一次精度的优化都对应一次硬件友好性的退步。
+
+** 2026 | InnerQ: 把分组方向转 90 度
+
+*** 它看到了什么问题
+
+InnerQ 没有继续在精度上卷。它退回去问了一个更本的问题：*为什么前面所有方法都把分组放在 outer dimension？*
+
+答案是历史惯性：outlier 集中在 channel 维度，所以"按 channel 分组"看起来天经地义。但作者看出来了——这个选择和 GPU 的计算模式冲突。Attention decode 是向量乘矩阵，GPU 把矩阵按行切给 compute unit。outer-dim 分组让同一行里的元素属于不同组，scale factor 不能复用，访存爆炸。
+
+同时 KIVI 把高精度窗口全给了最近 token，sink 没人管——sink 的 outlier 继续污染量化组。
+
+*** 它的解法
+
+三件事，全都顺应硬件：
+
+1. *Inner-dimension 分组*。K 沿 token 维度（inner dim）分组，V 沿 channel 维度（inner dim）分组——都对齐到向量乘矩阵的内积方向。这样同一行的元素属于同一组，共享 scale factor，GPU compute unit 可以复用。dequant + GEMV 融合成一个 kernel。
+
+2. *双窗口*：保留 32 个 sink token + 96 个 recent token 为 FP16，加起来还是 128 个，预算和 KIVI 一样，但把 sink 给救出来了。Outlier 不再污染量化组。
+
+3. *Key cache per-channel 归一化，但在 prefill 阶段算一次然后折进 W_Q 和 W_K*——运行时零开销。这一步在 outer-dim 框架下做不到（会破坏分组），但在 per-token (inner-dim) 框架下天然自洽。
+
+外加一个小花招（Hybrid 变体）：每个 group 自由选择对称还是非对称量化，用 scale factor 的符号位编码这个选择，不占额外空间。实测 99% 的 group 选对称，但那 1% 选非对称的 group 在低 bit 时把精度救回来不少。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是一次很纯的*重新定位*——精度部分（sink 处理、normalization、hybrid）大多沿用前人思路，真正的发明是把分组方向转 90 度。结果：1.3× 比前人 KV 量化快，2.7× 比不量化快，精度还更高。
+
+新坑？目前看：
+- inner-dim 分组对 outlier 没有 outer-dim 那么天然的"隔离"作用，要靠 sink window + normalization 这套组合拳兜底。在更激进的 bit-width（比如 1.5 bit）下这套组合是否还撑得住，没验证。
+- 当前结果在 Llama / Mistral 上漂亮，更大的 MoE 模型上 inner-dim outlier 的结构可能完全不同，整套方法可能要重新评估。
+
+* 前沿延伸
+
+InnerQ 是 2026 年 2 月才放出来的，截至 2026-05-29 还没有正面 follow-up 的论文出现。但可以预期的几个方向：
+
+- *Inner-dim + 学习型 codebook*：把 TurboQuant 的非均匀点位和 InnerQ 的 inner-dim 框架合起来，做"硬件友好的非均匀量化"。
+- *动态 sink 窗口*：现在 sink 窗口固定 32，但不同模型 sink 数量不同，让它自适应。
+- *训练时就让模型适应 inner-dim 量化*：现在所有方法都是 post-training，未来可能在预训练阶段就 bake in inner-dim 友好的 KV 结构。
+
+* 一张图看懂
+
+#+begin_example
+                                     |-------------------- 精度方向 ------------------|
+                                     v                                                  v
+  时间         论文          校准数据? 分组方向    sink 处理?   特殊技巧            硬件友好?
+  -------     ------------   -------- ----------  -----------  ------------------  --------
+  2023        StreamingLLM   -        -           保留         (只解决"丢什么")    -
+  2024        KVQuant        要       outer       无           非均匀点位          差（查表）
+  2024        KIVI           不要     outer       无           per-channel asym    差（不复用）
+  2025        SQuat          不要     outer       无           正交化误差          更差（要优化）
+  2026        TurboQuant     不要     outer       无           随机旋转+codebook   差（查表）
+  2026        InnerQ         不要     INNER       保留         normalization+hybrid 好（融合 kernel）
+                                       ^^^^^
+                                  这一步把整条线推向新方向
+                                  ——不是再卷精度，是修正框架
+#+end_example
+
+* 洞见
+
+这条线最有意思的不是"InnerQ 比 KIVI 快 1.3×"，而是它揭示了一个集体盲点：*从 KVQuant 到 SQuat 到 TurboQuant，所有人都默认 outer-dim 分组是天然的，因为 outlier 在 channel 维度*。这个假设没人挑战过两年。
+
+但 outlier 在哪一维 和 应该沿哪一维分组 是两个问题，被混为一谈了。前者由数据决定，后者由计算决定。InnerQ 把这两个解耦了：分组方向跟着硬件走，outlier 用 sink window + normalization 这套独立机制处理。
+
+更深层的认知转变：*KV 量化这件事，三年前是"算法问题"——怎么压精度损失最小；现在变成了"系统问题"——压缩格式必须和计算模式同呼吸*。下一代方法大概率不再是孤立的量化方案，而是 quant + kernel + memory layout 的联合设计。
+
+下一步最可能的方向：把 KV 量化、attention kernel（FlashAttention 那一系）、page-based KV management（vLLM 那一系）整合成一个 co-designed 栈，而不是三个独立的优化。
+
+* 启发
+
+1. *当一个领域所有论文都在同一个方向上卷指标，回头去查它们共享的那个隐含假设——很可能那个假设就是问题的根*。InnerQ 没有比 KIVI/SQuat 更聪明的精度技巧，它只是把分组方向转了 90 度。
+
+2. *"看哪里出问题"和"怎么修这个问题"是两件不同的事，混在一起会做出 SQuat 这种 "把对的事情做得更精细，但代价更高" 的方案*。先看清问题的*结构*，再看*解法*。
+
+3. *硬件友好性不是优化阶段才考虑的事——它应该是算法设计阶段的一等约束*。前五年的 KV 量化论文几乎都是先想算法、后想 kernel，结果就是每篇论文的"理论速度"和"实测速度"差很多。InnerQ 反过来：从 GPU 计算模式倒推算法该长什么样。
+
+4. 对你自己的工作：*如果你在某个领域读了很多论文都觉得"思路差不多，就是改了改细节"——别再读这种细节论文了，去找下一个换框架的工作*。框架级的论文密度低但单位价值高十倍。

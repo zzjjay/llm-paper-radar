@@ -1,0 +1,224 @@
+#+title:      InnerQ: Hardware-Aware Tuning-Free Quantization of KV Cache for Large Language Models
+#+date:       [2026-05-29 Fri 02:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T020031-en
+#+source:     https://arxiv.org/abs/2602.23200
+#+authors:    Sayed Mohammadreza Tayaranian Hosseini, Amir Ardakani, Warren J. Gross
+#+venue:      arXiv preprint, 2026
+
+* The River of the Problem
+
+As an LLM generates tokens, it carries a growing burden: the KV cache — the keys and values of every preceding token, kept in memory so that each decoding step can compute attention over the full history. The longer the generation, the larger this cache grows, until it blows out GPU memory, saturates memory bandwidth, and chokes throughput.
+
+The fix sounds obvious: just compress the KV cache. But low-precision compression has a peculiar split — the cache holds two fundamentally different kinds of numbers. Most values are well-behaved small floats; a handful of channels are outliers with magnitudes orders of magnitude larger. A uniform quantization scheme gets pulled apart by those outliers; careful grouping to isolate them makes the GPU run slower.
+
+So this line of work has been throwing the same boomerang for generations: *compress harder* or *run faster*? Every push toward harder compression opens a new precision hole; every attempt to run faster reveals that the compression format clashes with the hardware. InnerQ is interesting precisely because it is the first to say: "You've all been looking at the wrong thing — the problem isn't how to group, it's *which direction* to group along."
+
+* The Source Map
+
+#+begin_example
+[2023] Xiao et al. - StreamingLLM / Attention Sink
+  |
+  | Finding: the first few tokens in a sequence capture
+  |          a disproportionate share of attention;
+  |          drop them and the model collapses. They are "sinks."
+  v
+[2024] Hooper et al. - KVQuant
+  |
+  | Problem: KV cache is too large; outliers ruin naive quantization
+  | Fix: learn non-uniform quantization points from calibration data
+  |      + handle outlier channels specially
+  | New hole: requires external calibration data;
+  |           non-uniform lookup tables slow down the kernel
+  v
+[2024] Liu et al. - KIVI
+  |
+  | Problem: no calibration data wanted — must be tuning-free
+  | Fix: quantize K along the channel dimension (outer dim)
+  |      to isolate outliers; quantize V along the token dimension;
+  |      keep the most recent N tokens in FP16
+  | New hole: outer-dim grouping means scale factors cannot be reused
+  |           on the GPU; sink tokens get no special treatment,
+  |           outliers still contaminate groups
+  v
+[2025] Wang et al. - SQuat
+  |
+  | Problem: K quantization error is "seen" by the query
+  | Fix: make K's quantization error orthogonal to the query
+  |      (solve a small optimization problem)
+  | New hole: periodic optimization reduces throughput
+  v
+[2026] Zandieh et al. - TurboQuant
+  |
+  | Problem: want data-oblivious — no dependence on input distribution
+  | Fix: random rotation flattens the distribution +
+  |      budget-matched non-uniform codebook
+  | New hole: codebook lookups require multiple shared-memory accesses;
+  |           kernel is slow
+  v
+[2026] Tayaranian et al. - InnerQ  <-- target paper
+        Re-examination: everyone has been competing on "how to group,"
+        but the *direction* of grouping is the root hardware bottleneck
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2023 | StreamingLLM (Attention Sink): The First Tokens Are a Hidden "Trash Can"
+
+*** What Problem It Saw
+
+When people tried to run LLM inference over long contexts, the most natural idea was: once the cache is full, evict the oldest tokens and keep a recent window. The result was immediate collapse — incoherent output, repetition loops.
+
+Why? Because attention softmax must distribute probability mass somewhere; it always needs somewhere to "pour." Xiao et al. discovered that the very first tokens in a sequence, regardless of their content, receive a disproportionately large share of attention from every subsequent token. They function as an *attention sink* — a basin that absorbs surplus probability mass. Remove the sinks and softmax has nowhere to pour; the entire distribution destabilizes.
+
+*** Its Fix
+
+Blunt but effective: always keep the first few tokens, keep a sliding recent window, and discard everything in between. This enables long-context inference without collapse.
+
+*** Why It Worked (and What It Left Buried)
+
+It worked because it respected a structure the model grew on its own — sinks are escape valves that transformers develop spontaneously during training. But the paper only documented the phenomenon; it never asked: *In the context of quantization, what do we do with sink tokens?* That question was left to successors. Every subsequent KV quantization method must answer it: sinks are numerical outliers — should they be quantized? How?
+
+** 2024 | KVQuant: The First Serious KV Quantization, but It Charges Tuition
+
+*** What Problem It Saw
+
+StreamingLLM answered "what to discard." KVQuant wanted to answer "how to compress what remains." The obstacle: the key matrix in the KV cache has pronounced channel-dimension outliers — certain channels have uniformly large magnitudes, others uniformly small. A single INT4 quantization range gets distorted by those outliers, destroying precision across the whole group.
+
+*** Its Fix
+
+Two moves: first, run a calibration dataset to learn non-uniform quantization points (signposts), so point density matches the actual distribution. Second, treat outlier channels specially — retain them at higher precision or encode them separately.
+
+*** Why It Worked (and What It Left Buried)
+
+The learned non-uniform points yield high precision, but at two costs: (1) you need a calibration corpus whose distribution resembles the inference task, otherwise the points drift. (2) During inference, every dequantization step requires a codebook lookup, adding a memory access that slows the GPU kernel by one beat.
+
+The question it left behind is plain: *Can we do this without calibration data?*
+
+** 2024 | KIVI: No Calibration — but the Grouping Direction Takes a Wrong Turn
+
+*** What Problem It Saw
+
+KIVI picked up the question KVQuant left: tuning-free — no calibration data, relying instead on the structure of the data itself. It observed that outliers in the key cache cluster along the channel dimension, while outliers in the value cache are more diffuse.
+
+*** Its Fix
+
+Quantize K along the channel dimension (the matrix's *outer dimension*) using asymmetric quantization per group — each channel's own range is computed cleanly, so a channel with a large outlier forms its own group and cannot contaminate others. Quantize V along the token dimension. Keep the most recent N tokens (the recent window) in FP16, since they have the greatest influence on the current attention step.
+
+*** Why It Worked (and What It Left Buried)
+
+Isolating outliers within their own groups is genuinely clever — it preserves precision without calibration. But this step buried two deep problems that InnerQ would later excavate:
+
+1. *Sink tokens receive no special treatment.* The recent window stays in FP16; the leading sink tokens do not. Sinks are natural numerical outliers and continue to contaminate their quantization groups.
+
+2. *The grouping direction is opposite to what the GPU wants.* The attention decoding step is a vector-times-matrix operation: a single query vector multiplied against the entire K matrix. The GPU partitions the matrix into row slices and dispatches them to different compute units. If scale factors are assigned along the channel (outer) dimension, elements within the same row belong to different groups; each element must look up its own scale, scale factors cannot be reused across units, and memory traffic multiplies.
+
+The second problem is subtle — it does not affect precision, only speed. But as all subsequent work continued to refine precision within this grouping framework, the issue became the elephant in the room that nobody touched.
+
+** 2025 | SQuat: A Precision Refinement on Top of KIVI, at the Cost of More Latency
+
+*** What Problem It Saw
+
+SQuat picked up the *precision* problem KIVI left: quantization error in K does not simply vanish — it is "seen" by the query vector, because the dot product amplifies the error all the way into the attention scores.
+
+*** Its Fix
+
+Make K's quantization error orthogonal to the query vector — so the dot product absorbs the error rather than propagating it. The mechanism is to periodically solve a small optimization problem that adjusts quantization parameters.
+
+*** Why It Worked (and What It Left Buried)
+
+Mathematically elegant, and precision does improve another notch. But it travels the same road as KIVI: increasingly fine-grained refinement within the outer-dim grouping framework. The cost is that periodic optimization reduces throughput.
+
+This is the signature trap of this line of work — *every marginal precision gain demands runtime overhead, and nobody stops to ask whether the underlying framework is itself incorrect.*
+
+** 2026 | TurboQuant: A Different Path, but the Codebook Is Still Slow
+
+*** What Problem It Saw
+
+If even KIVI's lightweight "glance at the data before grouping" is considered too dependent on the input distribution, can one build something *data-oblivious* — something that makes guarantees without looking at the data at all?
+
+*** Its Fix
+
+Multiply K and V by a random rotation matrix (in the Johnson-Lindenstrauss family). After rotation, vector coordinates tend toward a Beta distribution — the distribution becomes regular. Then apply a non-uniform codebook pre-computed for the Beta distribution. Outlier channels are handled separately with a wider bit-width.
+
+*** Why It Worked (and What It Left Buried)
+
+Theoretically clean, and precision is solid. But it falls back into the same hole KVQuant dug years earlier: *codebook lookups*. Dequantization in the GPU kernel requires multiple accesses to the codebook in shared memory, and accumulated latency kills throughput.
+
+At this point the line has tied itself in knots: precision methods grow ever more sophisticated, but each precision improvement corresponds to a step backward in hardware friendliness.
+
+** 2026 | InnerQ: Rotate the Grouping Direction by 90 Degrees
+
+*** What Problem It Saw
+
+InnerQ did not continue competing on precision. It stepped back and asked a more fundamental question: *Why have all previous methods placed their grouping along the outer dimension?*
+
+The answer is historical inertia: outliers cluster along the channel dimension, so "group by channel" feels self-evident. But the authors saw the conflict — this choice fights the GPU's computation pattern. Attention decode is vector-times-matrix; the GPU slices the matrix by rows and assigns slices to compute units. Outer-dim grouping means elements within the same row belong to different groups, scale factors cannot be reused, and memory traffic explodes.
+
+Meanwhile KIVI's high-precision window was given entirely to the recent tokens; sinks went unmanaged and their outliers kept contaminating quantization groups.
+
+*** Its Fix
+
+Three changes, all aligned with hardware:
+
+1. *Inner-dimension grouping.* Quantize K along the token dimension (inner dim); quantize V along the channel dimension (inner dim) — both aligned with the inner-product direction of vector-times-matrix. Elements in the same row now belong to the same group and share a scale factor; GPU compute units can reuse it. Dequantization and GEMV fuse into a single kernel.
+
+2. *Dual window:* keep 32 sink tokens + 96 recent tokens in FP16, totaling 128 — the same budget as KIVI, but now the sink tokens are rescued. Outliers no longer contaminate quantization groups.
+
+3. *Per-channel normalization of the key cache, computed once during prefill and folded into W_Q and W_K* — zero runtime overhead. This step is impossible under the outer-dim framework (it would break the grouping) but fits naturally inside the per-token (inner-dim) framework.
+
+Plus one small flourish (the Hybrid variant): each group freely chooses symmetric or asymmetric quantization, with the choice encoded in the sign bit of the scale factor — no extra storage. In practice 99% of groups choose symmetric, but that 1% that chooses asymmetric recovers a meaningful amount of precision at low bit-widths.
+
+*** Why It Worked (and What It Left Buried)
+
+This is a clean *reframing* — the precision ingredients (sink handling, normalization, hybrid selection) mostly echo prior ideas; the genuine invention is rotating the grouping direction by 90 degrees. The result: 1.3× faster than prior KV quantization methods, 2.7× faster than no quantization, with higher precision.
+
+New holes? For now:
+- Inner-dim grouping does not naturally isolate outliers the way outer-dim grouping does; the combination of sink window + normalization must compensate. Whether this holds at more aggressive bit-widths (e.g., 1.5 bpp) is unverified.
+- Current results are strong on Llama / Mistral; in larger MoE models the inner-dim outlier structure may be entirely different, and the whole approach may need re-evaluation.
+
+* Frontier Extensions
+
+InnerQ was posted in February 2026; as of 2026-05-29 no direct follow-up papers have appeared. Predictable directions:
+
+- *Inner-dim + learned codebooks:* combine TurboQuant's non-uniform quantization points with InnerQ's inner-dim framework, creating "hardware-friendly non-uniform quantization."
+- *Dynamic sink windows:* the current sink window is fixed at 32, but the number of sinks varies across models; making it adaptive is a natural next step.
+- *Training the model to be inner-dim quantization friendly:* all current methods are post-training; future work may bake inner-dim-friendly KV structure into pretraining.
+
+* The Picture in One Glance
+
+#+begin_example
+                                     |----------- Precision direction ------------|
+                                     v                                             v
+  Year         Paper          Calib? Group dir    Sink handled?  Special trick         HW friendly?
+  -------     ------------   ------ ----------   -------------  -------------------   -----------
+  2023        StreamingLLM   -      -            keep           (only answers "what to drop")  -
+  2024        KVQuant        yes    outer        no             non-uniform points    poor (lookup)
+  2024        KIVI           no     outer        no             per-channel asym      poor (no reuse)
+  2025        SQuat          no     outer        no             orthogonal error      worse (optimize)
+  2026        TurboQuant     no     outer        no             random rotation+codebook  poor (lookup)
+  2026        InnerQ         no     INNER        yes            normalization+hybrid  good (fused kernel)
+                                      ^^^^^
+                                  This step pushes the entire line in a new direction
+                                  — not more precision tuning, but correcting the framework
+#+end_example
+
+* The Core Insight
+
+The most interesting thing about this line of work is not "InnerQ is 1.3× faster than KIVI." It is the collective blind spot it exposes: *from KVQuant through SQuat to TurboQuant, everyone assumed outer-dim grouping was natural, because outliers live in the channel dimension.* That assumption went unchallenged for two years.
+
+But *where outliers live* and *which dimension to group along* are two separate questions that were conflated. The former is determined by the data; the latter is determined by the computation. InnerQ decoupled them: grouping direction follows the hardware; outliers are handled by an independent mechanism — the sink window and normalization.
+
+The deeper conceptual shift: *KV quantization has transformed over three years from an "algorithmic problem" — how to compress with minimum precision loss — into a "systems problem" — the compression format must breathe in sync with the computation pattern.* The next generation of methods will almost certainly not be standalone quantization schemes but co-designs of quant + kernel + memory layout.
+
+The most likely near-term direction: integrating KV quantization, the attention kernel (FlashAttention family), and page-based KV management (vLLM family) into a single co-designed stack, rather than three independent optimizations.
+
+* Takeaways
+
+1. *When every paper in a field is competing along the same axis, go back and examine the implicit assumption they all share — that assumption is likely the root of the problem.* InnerQ has no cleverer precision technique than KIVI or SQuat; it simply rotated the grouping direction 90 degrees.
+
+2. *"Seeing where the problem is" and "deciding how to fix it" are two different acts; conflating them produces SQuat — doing the right thing more elaborately, at higher cost.* First understand the *structure* of the problem; then look at the fix.
+
+3. *Hardware friendliness is not something to consider at the optimization stage — it should be a first-class constraint during algorithm design.* Almost every KV quantization paper of the past five years designed the algorithm first and thought about the kernel later; the gap between "theoretical speed" and "measured speed" in each paper reflects exactly this. InnerQ inverts the order: it reasons backward from the GPU's computation pattern to what the algorithm should look like.
+
+4. For your own work: *if you have read many papers in a field and they all feel like "same idea, tweaked details" — stop reading those detail papers and go find the next work that changes the framework.* Framework-level papers are rare but carry ten times the value per unit.
