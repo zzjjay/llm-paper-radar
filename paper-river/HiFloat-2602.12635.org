@@ -1,0 +1,313 @@
+#+title:      Unleashing Low-Bit Inference on Ascend NPUs: A Comprehensive Evaluation of HiFloat Formats
+#+date:       [2026-05-29 Fri 10:00]
+#+filetags:   :paper:river:quantization:fp4:ascend:
+#+identifier: 20260529T100000
+#+source:     https://arxiv.org/abs/2602.12635
+#+authors:    Pengxiang Zhao, Hui-Ling Zhen, Xing Li, et al. (Huawei)
+#+venue:      arXiv 2026
+
+* 一句话
+
+这篇论文不是发明新算法，而是把华为自家造的两种"低位数字格式" HiF8 / HiF4 拉到主流 LLM 量化的擂台上，跟 INT8、MXFP4、NVFP4 一个个比，告诉你在 Ascend NPU 上 4-bit 推理到底能不能扛得住。
+
+* 主角
+
+被评估的格式叫 HiFloat，分 8-bit 的 HiF8 和 4-bit 的 HiF4，是华为给 Ascend NPU 系列设计的"自家数字格式"。这条故事线的真正主角不是 HiFloat 本身——是一个 LLM 工程界纠缠了三四年的老问题：
+
+*4-bit 量化为什么总是崩？* 模型越大越要压，压到 4-bit 就开始掉点，掉到不能用——背后的元凶都指向同一个东西：activation 里的离群值（outlier）。
+
+整条演化线讲的就是：人们怎么一步步从"INT8 够用"走到"FP8 兜底"，再走到"FP4 块共享缩放"，最后走到"分层缩放挤干每一位"。
+
+* 溯源地图
+
+#+begin_example
+
+  [1960s]
+  Block Floating Point (BFP)
+  共享一个 exponent 省位                              <-- 古老的根
+       |
+       v
+  [Sep 2022]
+  FP8 Formats for Deep Learning (NVIDIA/Arm/Intel)
+  arXiv 2209.05433                                    <-- 树根: FP8 标准化
+  E4M3 给权重激活, E5M2 给梯度
+  Hopper H100 原生支持
+       |
+       +------ 平行线: INT 路线 ------+
+       |                              |
+       v                              v
+  [Oct 2022] GPTQ                  [Aug 2022] SmoothQuant
+       |                              |
+       v                              v
+  [Jun 2023] AWQ <---- INT4 weight-only, outlier 挡不住 ----+
+       |                                                    |
+       v                                                    |
+  [Sep 2023] OCP Microscaling (MX) Formats <----------------+
+  arXiv 2310.10537                                    <-- 转折: 共享缩放
+  MXFP4: 32 个元素一组, 共享 E8M0 缩放
+       |
+       v
+  [2024] NVFP4 (NVIDIA Blackwell)                     <-- 精细化
+  16 个元素一组, 共享 E4M3 缩放
+       |
+       v
+  [Sep 2024] HiFloat8 (Ascend HiF8)
+  arXiv 2409.16626
+       |
+       v
+  [Feb 2026] HiFloat4 Spec
+  arXiv 2602.11287                                    <-- 分层化
+  三级缩放: E6M2 + E1 + E1 + E1M2
+       |
+       v
+  [Feb 2026] *** HiFloat Comprehensive Evaluation *** <-- 本文
+  arXiv 2602.12635
+       |
+       +-- 前沿延伸 --+
+       |              |
+       v              v
+  HiF4 Pretraining   AMXFP4 / MX+
+  arXiv 2604.08826   arXiv 2411.09909
+                     更激进的对 outlier 的补丁
+
+#+end_example
+
+* 演化叙事
+
+** 第零幕: 为什么会有 "低位数字格式" 这件事
+
+LLM 越长越大。一个 70B 模型用 FP16 存权重要 140 GB——一张 H100 装不下，要两张甚至四张。推理的时候光是把这些数从显存搬到计算单元，带宽就被吃光了，GPU 算力闲得发慌。
+
+省钱省电的路只有一条：*把每个数字用更少的 bit 表示*。FP16 砍到 FP8，再砍到 FP4，权重大小直接 4x 缩小，搬运速度 4x 加快。
+
+但问题来了：你不能随便砍。神经网络里有些数特别大，有些特别小，差距能跨 10 个数量级。砍 bit 等于把"能表示的范围"和"精度"同时压缩。压得太狠，模型就开始胡言乱语。
+
+整条研究线就是在回答：*怎么砍才不崩？*
+
+** 第一幕 (2022): FP8 把"标准"立起来
+
+故事的真正起点是 NVIDIA + Arm + Intel 三家在 2022 年 9 月联手发的一篇 paper —— *"FP8 Formats for Deep Learning"* (arXiv:2209.05433)。
+
+之前每家都在偷偷搞自己的低位格式，互不兼容。这三家坐下来定了一个跨厂商的标准：FP8 有两种变体，叫 E4M3 和 E5M2。
+
+- *E4M3*: 4 位指数，3 位尾数。范围窄但精度高，给权重和激活用。
+- *E5M2*: 5 位指数，2 位尾数。范围宽但精度低，给梯度用（梯度容易出大值）。
+
+这个 paper 看到的问题非常具体：*INT8 在 LLM 训练里不够用了*。Transformer 里的 activation 经常出现远超普通分布的大数（后来叫 outlier），INT8 那种"线性均匀切分"硬塞进去会丢掉大量信息。FP8 因为带指数位，能"自适应地"匹配数据的动态范围。
+
+H100 (Hopper) 出厂就硬件原生支持这两种 FP8。从此 "8-bit 推理" 从概念变成生产力。
+
+*它留下了什么问题?* FP8 解决了 8-bit 这一档，但行业很快就盯上了下一档 —— 4-bit。FP8 里那点指数位到了 4-bit 就根本不够分了：你只剩 4 个 bit，怎么分指数和尾数都是"两边都不够"。
+
+** 第二幕 (2022-2023): 平行的 INT 路线撞墙
+
+跟 FP8 几乎同时，另一条路在搞 INT4 weight-only 量化。代表作三连击：
+
+1. *SmoothQuant* (Aug 2022): 发现 activation 的 outlier 比 weight 严重得多，于是把"难量化"从激活推到权重——给激活除一个 smoothing factor，给权重乘上同样的因子，保持等价，但让两边都好量化。结果做到 W8A8。
+
+2. *GPTQ* (Oct 2022): 用 Hessian 二阶信息一层层量化权重，把量化误差"传播"到后续权重去补偿。把 175B 的 OPT 压到 INT3-4 几小时跑完，几乎不掉点。
+
+3. *AWQ* (Jun 2023): 观察到只有 ~1% 的 weight channel 真正重要（"salient channel"）——就是那些对应大 activation 的通道。给这些通道在量化前乘个 scale 保护起来，再量化。比 GPTQ 简单、快、效果差不多甚至更好。
+
+这条 INT 路线 *看到的核心问题*：直接 round-to-nearest（RTN）量化在 LLM 上必崩——*outlier 通道会把整个量化范围吃光，普通值全部挤到 0 附近，精度归零*。
+
+但 INT4 也撞墙了：在 4-bit 这一档，无论 GPTQ 还是 AWQ，都需要校准（calibration），都要小心翼翼避开 activation outlier。而且 INT4 用在 *推理* 时还有个尴尬：硬件算的时候得先反量化回 FP16，多一道 overhead。
+
+*所以人们开始想:* 能不能让 4-bit *本身* 就有动态范围，不用每次反量化？
+
+** 第三幕 (2023): MXFP4 —— "块共享缩放"成为新范式
+
+2023 年 9 月，OCP（Open Compute Project，由微软、AMD、Arm、Intel、Meta、NVIDIA、Qualcomm 联合）发布了 *Microscaling (MX) Formats* 标准（arXiv:2310.10537）。
+
+它的关键转折在于借用了一个非常老的想法 —— *Block Floating Point (BFP)*：与其给每个数字都配一个完整的指数位，*让一整组数字共享一个 exponent*。
+
+MXFP4 的具体方案：
+- 把 32 个数字打成一组（block）
+- 每组共享一个 8-bit 的缩放因子（E8M0，纯指数没尾数）
+- 组内每个数字只用 4 bit 存（E2M1: 1 位符号 + 2 位指数 + 1 位尾数）
+
+这就解决了 INT4 的根本问题: *outlier 不会污染整个张量*。它只会污染自己那 32 个元素的小组——小组的共享指数会被这个 outlier 拉大，组内其他元素精度略降，但全局崩塌没了。
+
+平均存储成本 = 4 + 8/32 = 4.25 bit / 数字，几乎跟 INT4 一样省。
+
+*MXFP4 看到的 INT4 问题*: outlier 影响范围太大。
+*它的解法*: 把影响范围限制在一个 32-元素的小组内。
+
+*但它留下了什么问题?* 三个：
+1. *缩放因子精度太粗*: E8M0 只有指数没有尾数，只能表达 2 的整数次幂。组内数据要是分布很集中，这个粗糙的 scale 会浪费很多 bit。
+2. *组太大 (32)*: 一个 outlier 还是会拖累 31 个邻居。
+3. *组内 element 只有 4 bit*: E2M1 只能表示 8 个不同的正数（约 -6 到 6），表达力极差。
+
+** 第四幕 (2024): NVFP4 —— "把组切小，把 scale 做细"
+
+NVIDIA 在 Blackwell 架构（2024 发布）上引入了自家的 4-bit 格式 *NVFP4*，针对 MXFP4 的三个痛点做了三件事：
+
+1. *组从 32 缩到 16*: 局部适应性更强，outlier 拖累的邻居少一半。
+2. *共享缩放因子从 E8M0 (8-bit 纯指数) 升级到 E4M3 (8-bit FP8)*: 多了 3 位尾数，scale 能表达的值密度大幅提升。
+3. *再叠一层 per-tensor 的 FP32 全局缩放*: 兜底超大动态范围。
+
+平均 bit = 4 + 8/16 = 4.5 bit / 数字，比 MXFP4 略多一点点，但 Blackwell 硬件原生加速。
+
+*NVFP4 看到的 MXFP4 问题*: 缩放粒度太粗、scale 表达力太弱。
+*它的解法*: 缩小组、升级 scale 类型、加一层全局兜底。
+
+效果: DeepSeek-R1 从 FP8 量化到 NVFP4，关键任务掉点 ≤ 1%。
+
+*但它留下了什么问题?*
+- *缩放只有两层*（block 级 + per-tensor 级），中间没有更细的颗粒。如果一个 16-元素的组里只有 *一个* outlier，它还是会拖累那 15 个邻居。
+- 它是 NVIDIA 自家的格式，跑在 Blackwell tensor core 上，*非 NVIDIA 厂商怎么办?*
+
+** 第五幕 (2024-2026): HiFloat —— 华为的"分层缩放"答案
+
+华为 HiSilicon 2021 就启动了 HiFloat 项目，做自家的低位格式。两步走：
+
+*** HiF8 (2024, arXiv:2409.16626)
+
+8-bit 这档跟 FP8 (E4M3/E5M2) 抢生意。差异化卖点是 *"tapered precision"*——根据数值大小动态分配尾数位：小数值多给尾数提高精度，大数值少给尾数换更大的动态范围。一种格式同时覆盖训练和推理，不用像 FP8 那样切分 E4M3/E5M2 两套。
+
+*** HiF4 (2026 Feb, arXiv:2602.11287) —— 真正的差异化在这
+
+HiF4 把 NVFP4 的"两层缩放"推到 *三层*。结构是这样的:
+
+#+begin_example
+
+  +----------------------------------------------------+
+  | Level 1: 8-bit E6M2 缩放因子 (共享 64 个元素)     |
+  | (6 位指数 + 2 位尾数, 提供全局动态范围)            |
+  +----------------------------------------------------+
+       |          |          |          |
+       v          v          v          v
+   +-----+    +-----+    +-----+    +-----+
+   | E1  |    | E1  |    | E1  |    | E1  |  Level 2: 1-bit
+   |x 8  |    |x 8  |    |x 8  |    |x 8  |  micro-exp
+   +--+--+    +--+--+    +--+--+    +--+--+  (8-元素子块)
+      |          |          |          |
+      v          v          v          v
+   +--+--+    +--+--+    +--+--+    +--+--+
+   | E1  |    | E1  |    | E1  |    | E1  |  Level 3: 1-bit
+   |x 16 |    |x 16 |    |x 16 |    |x 16 |  micro-exp
+   +--+--+    +--+--+    +--+--+    +--+--+  (4-元素微块)
+      |          |          |          |
+      v          v          v          v
+  [4 个 S1P2 FP4 元素] x 16 = 64 个元素
+
+  总计: 64 元素 + 32 bit 缩放元数据
+  平均 = 4 + 32/64 = 4.5 bit / 数字
+
+#+end_example
+
+三层是干什么的？
+
+1. *L1 (E6M2, 全局)*: 给 64 个元素的整块定一个粗略的指数基线。比 MXFP4 的 E8M0 多了 2 位尾数。
+2. *L2 (1-bit micro-exponent, 8-元素子块)*: 每 8 个元素再叠一个 *只有 0 或 1* 的微指数。等于在 L1 基础上"局部加一档"或"不加"。
+3. *L3 (1-bit micro-exponent, 4-元素微块)*: 每 4 个元素再叠一层 0/1 微指数。
+
+为什么这样设计？*让 outlier 的影响范围进一步收窄到 4 个元素以内*。如果组里只有一个 outlier，L2 和 L3 的微指数可以"局部抬高"那 4 个邻居的 scale，让外部 60 个元素完全不受影响。
+
+代价: 多花 0.5 bit / 数字（跟 NVFP4 持平）。
+收益: 三级缩放对 outlier 的鲁棒性大幅提升，论文声称比 NVFP4 准度更高。
+
+*HiF4 看到的 NVFP4 问题*: 两层缩放对 outlier 隔离不够细。
+*它的解法*: 加两层 1-bit micro-exponent，把 outlier 的污染半径从 16 缩到 4。
+
+** 第六幕 (本文, 2026 Feb): 把擂台搭起来比一比
+
+到这一步，4-bit 量化格式已经百花齐放了: INT4、MXFP4、NVFP4、HiF4...... 而每家的 paper 都声称自己最好。
+
+*"Unleashing Low-Bit Inference on Ascend NPUs"* (arXiv:2602.12635) 这篇 paper 做的事就是一件: *把 HiF8 和 HiF4 放进 Ascend NPU，用统一的 PTQ 框架（GPTQ / AWQ / SmoothQuant 等），系统地跑一遍主流 LLM benchmark*。
+
+三个核心结论:
+
+1. *INT8 vs FP8 (8-bit 这档)*: INT8 适合分布窄的数据（比如 normalize 过的权重），FP8 / HiF8 适合分布宽的数据（比如带 outlier 的 activation）。没有"哪个永远好"，要看 tensor 性质。
+
+2. *4-bit 这档, INT 类格式直接崩，FP 类格式扛得住*: 这一条最重要——它实证了"INT4 在 LLM 上不可用"已经是事实，而 *HiF4 的分层缩放* 是阻止崩盘的关键。
+
+3. *HiFloat 跟现有 PTQ 框架（GPTQ/AWQ/SmoothQuant）完全兼容*: 不需要为它重写算法栈。这一条是实用主义胜利，Ascend 用户可以直接复用 NVIDIA 生态的量化工具链。
+
+*这篇 paper 的真正贡献* 不是"发明了什么"，而是 *为 Ascend 客户提供了官方背书的 PTQ 配方*: 你买华为 NPU，照着这套配方做 4-bit 推理，精度有保障。
+
+** 第七幕 (2026, 进行时): 还在往哪走
+
+- *HiFloat4 用于预训练* (arXiv:2604.08826): 不只推理，连训练都用 HiF4。比 MXFP4 训练只需要 RHT (Random Hadamard Transform)，不需要 SR 和 Truncation-free scaling，简化了训练流水线。
+- *AMXFP4* (arXiv:2411.09909): 非对称 microscaling，专攻 activation outlier 不对称分布的痛点。
+- *MX+* (MICRO 2025): 不改 MX 格式本身，但允许 outlier "借用"自己的 exponent 位当尾数用，免费提升 outlier 元素的精度。
+
+* 压缩总览图
+
+#+begin_example
+
+  问题演化: 4-bit LLM 量化为什么这么难?
+  =====================================
+
+  [核心矛盾] activation outlier vs 低位精度
+
+  时间 | 看到的问题            | 解法核心思路           | 留下的新问题
+  -----|-----------------------|------------------------|---------------------------
+  2022 | INT8 在 outlier 前崩  | 用 FP8 (带指数位)      | 4-bit 时指数尾数都不够分
+       | FP8 -- E4M3/E5M2      |                        |
+  -----|-----------------------|------------------------|---------------------------
+  2022 | 整张量 INT4 直接崩    | 校准 + 保护 salient    | 推理时还要反量化, 慢
+       | -- GPTQ/AWQ           | weight                 |
+  -----|-----------------------|------------------------|---------------------------
+  2023 | INT4 缩放范围太大     | 32 元素一组共享指数    | scale 粒度粗, 组太大
+       | -- MXFP4 (OCP)        | (block floating point) |
+  -----|-----------------------|------------------------|---------------------------
+  2024 | MXFP4 scale 太粗      | 组缩到 16, scale 改 FP8| 一个 outlier 还污染 15 邻居
+       | -- NVFP4 (NVIDIA)     | 再叠 per-tensor FP32   |
+  -----|-----------------------|------------------------|---------------------------
+  2026 | NVFP4 两层不够细      | 三级缩放: 大组 E6M2    | 0.5 bit 开销, 硬件复杂
+       | -- HiF4 (Huawei)      | + 子块 1-bit micro-exp | 度上升
+       |                       | + 微块 1-bit micro-exp |
+  -----|-----------------------|------------------------|---------------------------
+  2026 | 各种 FP4 格式没人系统 | 在 Ascend 上跑 PTQ 全  | 跨硬件横向对比缺失
+       | 比较                  | 套主流方法 + benchmark |
+       | -- 本文               |                        |
+  -----|-----------------------|------------------------|---------------------------
+
+  趋势: 缩放从"全局一个" -> "块共享" -> "多层嵌套"
+       outlier 污染半径从 整张量 -> 32 -> 16 -> 4
+
+#+end_example
+
+* 洞见
+
+读完整条线，你会发现表面是"FP4 格式之争"，底下其实是 *一场关于"缩放粒度"的军备竞赛*。
+
+每一代的进步都是同一个公式: *把共享缩放因子做得更细、更密、更分层*，从而把"一个 outlier 能污染多少邻居"这个数往下压。
+
+- 全张量一个 scale (INT4) → 污染半径 = 整张量 → 崩
+- 32 元素一组 (MXFP4) → 污染半径 = 32 → 勉强
+- 16 元素一组 (NVFP4) → 污染半径 = 16 → 接近 BF16
+- 4 元素 (HiF4 第三层) → 污染半径 = 4 → 论文宣称最优
+
+这条线的本质是 *用元数据空间换计算精度*: 大家都在 4.25-4.5 bit/数字这个预算内，用"缩放元数据"的 0.25-0.5 bit 去换"组内精度"的提升。
+
+*下一步会去哪?*
+
+1. *继续往下切*: 2-bit (S1P0)? Per-element micro-exponent? 但每多一层缩放，硬件设计就复杂一档，电路面积和功耗都要算账。物理上有上限。
+2. *非对称化*: AMXFP4 已经在做。activation 分布天然不对称（往正向偏），对称的格式浪费一半位。
+3. *跨硬件标准化*: 现在 MXFP4 (OCP) 是标准, NVFP4 是 NVIDIA, HiF4 是 Huawei, 模型在不同硬件上量化结果会有差异。下一步要么是 NVFP4/HiF4 路线合并成新标准, 要么是 *推理时动态转换* 的中间件。
+4. *训练原生 FP4*: 不再用"BF16 训练 → PTQ 到 FP4"两步，直接用 FP4 训练（GPT-OSS 已经验证了 MXFP4 训练可行）。HiF4 pretraining paper 已经在沿这条路走。
+
+* 诚实标注
+
+- 本文 (arXiv:2602.12635) 与 HiF4 spec (arXiv:2602.11287) 是同一团队同期工作，引用关系明确。
+- HiF4 -> NVFP4 / MXFP4 是直接对标关系（HiF4 paper 明确把 NVFP4 列为 SOTA baseline），可信。
+- MXFP4 (OCP) -> 早期 INT4 (GPTQ/AWQ) 不是严格的"批判"关系，更是"另一条路线": MX 格式回应了 INT4 处理 outlier 的根本困难，但两条线在 2023-2024 还是并行存在的。
+- FP8 paper (2209.05433) -> 早期 INT8 量化 (LLM.int8(), SmoothQuant 等) 是大背景，不是 1-对-1 批判。
+- HiF8 (2409.16626) 相对 FP8 (2209.05433) 的差异化主要是 "tapered precision" 设计哲学，而非具体技术问题的修补——这两篇关系更像是"思路不同"而非"前后改进"。
+- 后续延伸 (HiF4-pretrain、AMXFP4、MX+) 是真实存在的同时代工作，但能否说"它们改进了本文"还需要看具体引用——本文 2026 Feb 发表，AMXFP4 2024 Nov 已存在，时间上 AMXFP4 在前，不算"后续"。
+
+* 参考
+
+- 本文: https://arxiv.org/abs/2602.12635
+- HiF4 spec: https://arxiv.org/abs/2602.11287
+- HiF8 spec: https://arxiv.org/abs/2409.16626
+- HiF4 pretraining: https://arxiv.org/abs/2604.08826
+- OCP Microscaling: https://arxiv.org/abs/2310.10537
+- FP8 Formats: https://arxiv.org/abs/2209.05433
+- GPTQ: https://arxiv.org/abs/2210.17323
+- AWQ: https://arxiv.org/abs/2306.00978
+- SmoothQuant: https://arxiv.org/abs/2211.10438
+- AMXFP4: https://arxiv.org/abs/2411.09909
+- NVFP4 (NVIDIA blog): https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/

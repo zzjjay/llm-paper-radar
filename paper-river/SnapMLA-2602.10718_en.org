@@ -1,0 +1,214 @@
+#+title:      SnapMLA: Efficient Long-Context MLA Decoding via Hardware-Aware FP8 Quantized Pipelining
+#+date:       [2026-05-29 Fri 04:03]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T040341-en
+#+source:     https://arxiv.org/abs/2602.10718
+#+authors:    Yifan Zhang, Zunhai Su, Shuhao Hu, Rui Yang, Wei Wu, Yulei Qian, Yuchen Xie, Xunliang Cai (Meituan)
+#+venue:      arXiv 2026
+
+* One-liner
+
+Why DeepSeek's "compressed KV cache" attention mechanism grinds to a halt the moment you try FP8 — SnapMLA excavates the FP8 acceleration chain one joint at a time and finds a small tail that everyone overlooked: RoPE.
+
+* Lineage Map
+
+#+begin_src text
+
+  2017                     2022             2023            2024                 2025                 2026
+   |                        |                |               |                    |                    |
+   v                        v                v               v                    v                    v
+
+  Attention            FlashAttention    FlashAttn-2     MQA/GQA            MLA (DSv2/v3)         FlashMLA           SnapMLA
+  Is All You Need  -->  (tile + recom)  --> (split-K) --> (share K,V)  -->  (low-rank KV)  -->   (FA for MLA)  -->   (FP8 MLA)
+  "standard attention"  "I/O is the      "low GPU       "KV eats        "compress another      "FA adapted          "halve the
+                         bottleneck"      occupancy"     VRAM"           order of magnitude"    to MLA"              bandwidth"
+        |                       |              |              |                    |                    |                  ^
+        |                       |              |              |                    |                    |                  |
+        +-----------------------+--------------+--------------+--------------------+--------------------+------------------+
+                                              FlashAttn-3 (FP8) ----------------------------------+
+                                              "standard attention in FP8 on H100"                |
+                                                                                                  v
+                                                                                       adapted by SnapMLA
+
+  Each arrow annotates: "what problem did the successor see in the predecessor"
+
+  Attention      --[too slow, VRAM explosion]------> FlashAttention
+  FlashAttention --[GPU underutilized]-------------> FlashAttention-2
+  Standard MHA   --[KV cache too large]------------> MQA/GQA
+  MQA/GQA        --[shared heads hurt accuracy]----> MLA
+  Pre-Hopper     --[H100 left idle]----------------> FlashAttention-3
+  MLA + FA3      --[FA3 doesn't fit MLA]-----------> FlashMLA
+  FlashMLA       --[BF16 still too slow]-----------> SnapMLA (FP8)
+  SnapMLA -------+
+                 |
+                 +--> discovers: the small RoPE sub-vector behaves nothing like the rest
+
+#+end_src
+
+* The Story: a chain forced open one link at a time
+
+** Beat 0 — Standard Attention (2017): the starting point
+
+The most naïve formulation. Every token produces three vectors: Q, K, V. Q is dotted against all Ks, passed through softmax, then used to weight the Vs.
+
+The math is simple; so is the problem: as sequence length grows to 8K, 32K, or 128K, the Q×K similarity matrix is N×N. At 32K that is one billion numbers. Computation is slow, but what kills you is memory — an A100 80 GB cannot even hold it.
+
+The first nail is driven here: the attention bottleneck is not compute, it is memory traffic. Nobody realized that in 2017.
+
+** Beat 1 — FlashAttention (2022): "I/O is the bottleneck"
+
+Tri Dao looked at GPU traces and said: you are spending all your time moving data, not computing. Attention is slow not because of the operation count but because that N×N intermediate matrix shuttles endlessly between HBM (VRAM) and SRAM (on-chip fast memory).
+
+His fix was almost obvious in hindsight: tile the attention into small blocks, compute each block entirely in on-chip SRAM, decompose softmax so it also works block-wise. The intermediate matrix never lands in HBM.
+
+Result: memory footprint drops from O(N²) to O(N), and speed improves rather than suffering.
+
+Remaining gap: the tiling scheme still left GPU occupancy on the table — many threads sat idle.
+
+** Beat 2 — FlashAttention-2 (2023): "the GPU still isn't saturated"
+
+FA1 partitioned along batch and head dimensions; the remaining parallelism was insufficient to saturate an A100.
+
+FA2 flipped the decomposition — it also tiles along the sequence-length dimension (split-K), redesigns the loop order, and keeps more warps busy simultaneously.
+
+At this point the "standard attention" track was mature for Ampere (A100).
+
+Meanwhile a second track was thickening: *KV cache*.
+
+** Beat 3 — MQA / GQA (2019/2023): "KV eats all the memory"
+
+During inference, every newly generated token must retain the K and V of every preceding token. 32 layers × 32 heads × 4096 dimensions × 32K tokens — the KV cache routinely dwarfs the model weights.
+
+MQA (Multi-Query Attention): all heads share a single K and V; only Q is multi-headed.
+GQA (Grouped-Query Attention): a middle ground where groups of heads share one K/V pair.
+
+Memory drops immediately. The cost: reduced expressiveness and accuracy degradation on long contexts.
+
+** Beat 4 — MLA (DeepSeek-V2/V3, 2024): "compress by another order of magnitude"
+
+DeepSeek found GQA insufficiently aggressive. Their question: since most of the information in K and V is redundant, can we compress the entire KV representation into a *low-dimensional latent space* and project back on demand?
+
+That is *Multi-head Latent Attention*. Each token caches only one small latent vector; K and V are reconstructed on the fly through two projection matrices. The KV cache shrinks from tens of gigabytes to a few gigabytes.
+
+But RoPE (Rotary Position Embedding) does not survive this compression: RoPE is coupled to absolute position and cannot be folded into a "compressed latent." DeepSeek's compromise was *decoupled RoPE* — split K into two halves: the large part is the compressed "content component," the small tail is the uncompressed "position component (RoPE)," and the two are concatenated.
+
+That small tail is the detonator for everything that follows.
+
+** Beat 5 — FlashAttention-3 (2024): "put FP8 to work"
+
+Hopper (H100) arrived with native FP8 tensor cores whose theoretical throughput is twice that of BF16. FA2 could not use them.
+
+FA3 rewrote the entire kernel: asynchronous data movement, inter-warp pipelining, FP8 for the key multiplications. One particularly clever trick: *on-the-fly transposition*. The WGMMA instruction is extremely picky about operand memory layout; FA3 transposes in-register at runtime so every GEMM can be fed directly.
+
+But FA3's design rests on a silent assumption: *the entire attention data stream is uniform*. All K and V are quantized the same way under one set of scales, end to end.
+
+MLA's K is heterogeneous — half compressed content, half RoPE tail. FA3's "uniform FP8 datapath" collides with this asymmetric structure; dropping it in directly breaks things.
+
+** Beat 6 — FlashMLA (2025): "adapt FA to MLA"
+
+DeepSeek moved first on their own stack: they ported FA's tiling and async mechanisms onto MLA's latent KV, producing FlashMLA. This step mainly closes the gap between "the KV layout FA assumes" and "the low-rank KV layout MLA uses."
+
+But FlashMLA is still BF16. During the decode phase — emitting tokens one at a time — memory bandwidth is still the binding constraint. The obvious next step is FP8.
+
+And the moment you attempt FP8, every loose end set earlier detonates simultaneously.
+
+** Beat 7 — SnapMLA (2026): defusing three mines at once
+
+When SnapMLA put "FP8 + MLA + decode" together, it found that the FA3 approach broke at three distinct points.
+
+*Mine 1: the RoPE tail lives in a completely different numerical range*
+
+They plotted histograms: the content sub-vector values cluster tightly around zero in a well-behaved distribution. The RoPE sub-vector swings to ±1000 and sports a long outlier tail.
+
+If you force a single FP8 scale over the entire K vector, either the RoPE values overflow or the content values collapse to zero. Eight bits cannot simultaneously accommodate two sub-vectors whose magnitudes differ by three orders of magnitude.
+
+*The fix is straightforward*: do not quantize the RoPE portion at all — keep it in BF16. Apply FP8 only to the content portion. The paper calls this *RoPE-Aware Per-Token Quantization*.
+
+Why per-token rather than the cheaper per-tensor or per-block? Because decode produces one token at a time; per-token quantization is the natural granularity. Per-block always leaves partially filled blocks at the boundary, requiring elaborate buffer management, and experiments show it also hurts accuracy.
+
+*Mine 2: the PV GEMM scales don't line up*
+
+To save memory, MLA's K and V share the same underlying latent representation in cache. FA3's k-major layout requires V's quantization scales to be distributed along the "K token dimension" — but that dimension is precisely the *reduction dimension* in the PV GEMM (attention probabilities P multiplied by V), i.e., the dimension being summed over.
+
+Standard FP8 GEMM handles scales by multiplying after the fact (per-tensor) or by a column of scales (per-row). Scales along the reduction dimension cannot be applied after the GEMM — they have already been folded into the accumulation and their individual contributions are gone.
+
+Their solution redesigns the PV computation pipeline so that scales participate in the arithmetic in the correct manner before the reduction swallows them. The paper calls this *Quantized PV Computation Pipeline Reconstruction*.
+
+*Mine 3: no one had written this kernel before*
+
+Mainstream inference frameworks such as vLLM and SGLang have no ready-made "MLA + FP8 + decode" code path. SnapMLA wrote the entire stack from scratch — an end-to-end kernel that chains asynchronous copy, quantization, GEMM, and dequantization into a single unbroken pipeline, referred to as *End-to-End Dataflow Optimization*.
+
+*Result*: throughput improves by up to 1.91× on long-generation workloads, with accuracy essentially identical to the BF16 baseline.
+
+* Problem–Solution Overview
+
+#+begin_src text
+
+  +-----------------------------------------------------------------------+
+  |              The evolution of KV cache: wringing out redundancy       |
+  +-----------------------------------------------------------------------+
+
+  [Problem]                         [Solution]                   [New Problem]
+
+  N x N matrix won't fit in VRAM --> FlashAttention tiling     --> GPU underutilized
+                                     (less memory, I/O opt.)
+
+  GPU underutilized              --> FA2 loop reorder + split-K --> KV cache too large
+                                     (saturate Ampere)
+
+  KV cache too large             --> MQA/GQA share K/V          --> accuracy drops on long ctx
+                                     (brute-force head reduction)
+
+  GQA still drops accuracy       --> MLA low-rank latent KV     --> RoPE can't be compressed;
+  and still uses space               (DeepSeek-V2/V3)               split off as a tail
+
+  H100 FP8 unused                --> FA3 uniform FP8 + WGMMA   --> assumes homogeneous KV,
+                                     (Hopper speedup)               incompatible with MLA
+
+  FA3 incompatible with MLA      --> FlashMLA: FA ported to     --> still BF16, decode BW tight
+                                     latent KV (DeepSeek)
+
+  MLA decode wants FP8           --> SnapMLA triple fix:        --> ?
+                                      1. RoPE stays BF16, rest FP8
+                                      2. PV pipeline rebuilt for scales
+                                      3. end-to-end kernel written in-house
+                                     ==> 1.91x throughput, accuracy intact
+
+  +-----------------------------------------------------------------------+
+
+  Core observation: the hidden protagonist throughout is "heterogeneity"
+  ----------
+  - MHA is homogeneous: all heads equal; FA family works cleanly
+  - GQA introduces the first heterogeneity: grouped heads
+  - MLA introduces the second: K's sub-vectors split into content + RoPE
+  - SnapMLA finally confronts this heterogeneity directly: instead of
+    "one datapath rules all," it applies the right precision to each sub-structure
+
+#+end_src
+
+* Insights
+
+*1. The real throughline is not "acceleration" — it is "heterogenization"*
+
+On the surface every generation looks like "faster, leaner." But what quietly happened underneath is that the attention mechanism evolved from a *homogeneous structure* (all K vectors equal) into an increasingly *heterogeneous one* (compressed content + position encoding + different precision requirements).
+
+Every kernel optimization (FA, FA2, FA3) was built on the homogeneity assumption. MLA was the first design to genuinely shatter it, yet for two years everyone handled the mismatch with patches (FlashMLA). SnapMLA is the first work to openly acknowledge: this structure demands heterogeneous treatment, and the quantization strategy must follow suit.
+
+*2. RoPE is a repeatedly underestimated player in this story*
+
+RoPE started as just a positional encoding scheme. Who would have guessed that inside MLA it would become the first sub-vector that could not be compressed, and inside FP8 quantization the first sub-vector that could not be quantized? Every new mechanism in this chain stumbles at RoPE.
+
+If someone redesigns a *FP8-friendly positional encoding* — one whose numerical range is compatible with the content sub-vector's scale — it may prove more valuable than any further kernel optimization.
+
+*3. Where does the line go next?*
+
+- *FP4 / NVFP4 MLA adaptation on Blackwell* — SnapMLA has cleared the FP8 path. The next precision tier is even more aggressive; the heterogeneity problem will be more severe and may force truly radical "per-sub-vector quantization" schemes.
+- *FP8 MLA during training* — SnapMLA only addresses inference decode. Backpropagation is numerically far more sensitive; the same RoPE heterogeneity problem will be harder to manage in gradients.
+- *Co-designing MLA's latent space with the quantization strategy* — today the order is "design MLA, then figure out how to quantize it." Treating "quantization friendliness" as a first-order constraint during MLA architecture design might yield a fundamentally different structure.
+
+* Honest Annotations
+
+- *Confirmed citation relationships*: SnapMLA explicitly critiques and improves upon FA3 and FlashMLA. It explicitly builds on DeepSeek-V2/V3's MLA design.
+- *Inferred relationships*: SnapMLA's relationship to KIVI, KVQuant, and RotateKV — the paper only lists them briefly in the introduction as "background work in KV quantization" without direct comparison. I placed them on the map solely to help readers understand the parallel "KV compression" track; they are not direct predecessors in SnapMLA's own citation chain.
+- *The foundational layer is filled in*: Attention Is All You Need (2017) is the natural starting point, but SnapMLA does not recursively critique it — the source node was added to complete the evolutionary narrative, not because it appears in the paper's own reference chain.
+- *Future work*: Published in May 2026, there is as yet no widely cited work that clearly critiques SnapMLA, so the "frontier extensions" section is written as "where the line might go next" rather than as established follow-up literature.

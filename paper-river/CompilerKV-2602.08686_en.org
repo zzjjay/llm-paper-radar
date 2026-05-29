@@ -1,0 +1,262 @@
+#+title:      CompilerKV: Risk-Adaptive KV Compression via Offline Experience Compilation
+#+date:       [2026-05-29 Fri 03:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T035452-en
+#+source:     https://arxiv.org/abs/2602.08686
+#+authors:    Ning Yang, Chengzhi Wang, Yibo Liu, Baoliang Tian, Haijun Zhang
+#+venue:      arXiv 2026 (preprint, cs.LG / cs.AI)
+
+* The River of the Problem
+
+When a large model reads a long document, it records the "state" of every token in memory — that pile of states is called the KV cache. The longer the document, the larger this memory footprint. A 32k-token input at batch=16 simply does not fit on an ordinary GPU.
+
+And so a deceptively simple question arises: *Can we keep only a small fraction of the KV entries and discard the rest?* Say, keep 512 and throw away 31,488.
+
+The hard part is not the discarding itself — it is whether the model can still answer correctly after the discard. What you throw away might be exactly the critical information needed later. The Needle-in-a-Haystack (NIAH) benchmark is specifically designed to test this.
+
+This problem has lingered for three years. Each generation of solutions answers a different facet of the same question: *which tokens actually matter?* But each generation also discovers a new pit dug by its predecessor. CompilerKV's stance is peculiar: it argues that everyone before was looking at the problem through the wrong statistical unit.
+
+* The Lineage Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Birth: Transformer appears; the KV cache becomes a thing
+  v
+[2023] Xiao et al. - StreamingLLM (Attention Sink)
+  |
+  | Discovery: the first token is always attended to heavily — like a "sink"
+  | Fix: keep the opening tokens + a recent sliding window → infinite-length streaming
+  v
+[2023] Zhang et al. - H2O (Heavy Hitter Oracle)
+  |
+  | Problem: the sliding window is too blunt; important tokens can appear in the middle
+  | Fix: rank tokens by cumulative attention score; keep the "heavy hitters"
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Problem: H2O evicts tokens on the fly during decode — too late for long prefills
+  | Fix: select tokens once during prefill using the prompt's tail window as a probe
+  v
+[2024] Cai - PyramidKV / Feng - AdaKV / Fu - HeadKV
+  |
+  | Problem: SnapKV gives every head the same budget, but heads differ enormously
+  | Fix: allocate budgets adaptively per layer / per head (still based on current prompt)
+  v
+[2024] Xiao et al. - DuoAttention
+  |
+  | Problem: recomputing head importance for every prompt is unstable
+  | Fix: offline, classify heads once into "retrieval heads" vs. "streaming heads"
+  v
+[2026] CompilerKV  <-- target paper
+  |
+  | Problem: DuoAttention only does binary classification; ignores per-prompt risk
+  | Fix: offline-compile a "continuous head reliability table" + a "risk gate table";
+  |       at inference time a single O(1) table lookup suffices
+  v
+[?] No follow-up work yet (paper too recent)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: Where Does the KV Cache Even Come From?
+
+*** What Problem It Saw
+
+RNNs process tokens sequentially, one at a time — painfully slow.
+
+*** Its Solution
+
+Remove the sequential dependency along the time axis so every position can directly attend to every other position — via the Q/K/V matrix multiplications.
+
+*** Why It Worked (and What Pit It Dug)
+
+Training became parallelizable, but at a cost: during inference, to avoid recomputing the K and V of every preceding token at each step, they must be cached. The longer the sequence, the more this cache grows linearly. *KV cache memory explosion* — this is the origin of every story that follows.
+
+** 2023 | StreamingLLM: Turns Out Attention Has a "Sink"
+
+*** What Problem It Saw
+
+Models running on long contexts would collapse after a certain length — perplexity would spike and outputs would become incoherent.
+
+*** Its Solution
+
+Keep the first token (and a few that follow) forever, plus a recent sliding window; discard everything in between.
+
+*** Why It Worked (and What Pit It Dug)
+
+They discovered a strange phenomenon: models pour a disproportionate share of attention onto the very first few tokens, even when those tokens are entirely irrelevant to the current question. This is the *attention sink* — the opening tokens act as a pressure-relief valve for the attention distribution; remove them and the whole distribution collapses.
+
+Keeping "beginning + recent" stabilized generation indefinitely. But the pit is obvious: *the tokens discarded in the middle might contain the answer*. Ask "what did paragraph 5 of the document mention?" — sorry, paragraph 5 has already scrolled out of the window.
+
+** 2023 | H2O: Can't Discard Blindly — Pick the "Heavy Hitters"
+
+*** What Problem It Saw
+
+The sliding-window approach assumes "more recent = more important," but in reality some early tokens are referenced heavily and persistently (e.g., key proper nouns).
+
+*** Its Solution
+
+Accumulate the attention score received by each token throughout decoding; keep the top scorers (Heavy Hitters).
+
+*** Why It Worked (and What Pit It Dug)
+
+Using the model's own attention as an importance vote is far more principled than a purely positional heuristic.
+
+But H2O performs eviction *dynamically during decode* — you have to compute attention before you know who should leave. For long prompts, memory has already exploded during the *prefill* phase. *We need to decide who stays in a single prefill pass.*
+
+** 2024 | SnapKV: Decide Everything at Prefill Time
+
+*** What Problem It Saw
+
+H2O's "evict-on-the-fly" approach is useless for prefill-only scenarios — the GPU runs out of memory the moment a long document is fed in.
+
+*** Its Solution
+
+A clever trick: use a small *observation window* at the tail of the prompt and measure which earlier tokens it attends to strongly; those become the tokens to keep.
+
+*** Why It Worked (and What Pit It Dug)
+
+The prompt tail is often the question itself. Using the question to "point at" the answer region and circle it in one shot is far more efficient than H2O, and requires no per-step recomputation. SnapKV quickly became the baseline king for the prefill-only camp.
+
+New pit: *it gives every attention head the same budget.* In practice, some heads are "generalists" and others are "specialists"; the number of tokens each needs varies enormously.
+
+** 2024 | PyramidKV / AdaKV / HeadKV: Every Head Deserves Different Treatment
+
+*** What Problem It Saw
+
+SnapKV treats all heads equally. But look at the attention distributions: some heads are highly focused (a small number of tokens suffices); others are diffuse (many tokens must be kept or information is lost entirely).
+
+*** Its Solution
+
+Allocate budgets adaptively per layer (PyramidKV), per head (AdaKV), or per head combined with task type (HeadKV).
+
+*** Why It Worked (and What Pit It Dug)
+
+Fine-grained allocation genuinely recovers substantial accuracy.
+
+But CompilerKV identifies a deeper flaw: *all of these methods estimate head importance from the attention of the single current prompt.* The trouble is that a single prompt's attention follows a heavy-tailed, noisy distribution — what looks like "this head is important" might be an artifact of that particular prompt.
+
+In other words: *they are making estimates at the wrong statistical unit.* A head's characteristics are a property of the model (stable across prompts), not a property of a prompt.
+
+** 2024 | DuoAttention: Then Compute It Offline, Once and For All
+
+*** What Problem It Saw
+
+Recomputing head importance for every incoming prompt is both slow and unstable.
+
+*** Its Solution
+
+Use a calibration corpus to classify all heads offline into two categories:
+- *Retrieval heads*: must retain the full KV
+- *Streaming heads*: a sliding window suffices
+
+At inference time, apply this fixed classification directly — no more per-prompt estimation.
+
+*** Why It Worked (and What Pit It Dug)
+
+This is the pivotal cognitive shift: *a head's role is an intrinsic property of the model and should not be rediscovered from scratch each time.* Fu et al. independently verified that "retrieval-head identity is stable across prompts."
+
+But DuoAttention is too coarse — it is binary. In reality heads are not black-or-white; they lie on a continuous spectrum. Moreover: *different prompts carry different "risk"* — a simple summarization task tolerates aggressive compression fine, while a needle-in-a-haystack task requires a much looser budget. DuoAttention ignores this entirely.
+
+** 2026 | CompilerKV: Compile Everything That Can Be Pre-Computed Into Tables
+
+*** What Problem It Saw
+
+CompilerKV summarizes the entire prefill-only battlefield in one sentence: *everyone is using the instantaneous attention of a single prompt to estimate quantities that are inherently stable at the model level or across-prompt level.* It calls this a **statistical unit mismatch**.
+
+Three specific charges (E1/E2/E3):
+- E1: Single-prompt attention is heavy-tailed and noisy
+- E2: Cross-head variance is enormous; a single prompt cannot reliably estimate head reliability
+- E3: Nobody performs prompt-level "risk calibration" — how aggressive compression can be should depend on how error-prone this particular prompt is
+
+*** Its Solution
+
+Just as a compiler pre-compiles frequently executed code into a binary, CompilerKV moves everything that requires cross-prompt statistics into an offline phase and stores the results as tables.
+
+Two tables specifically:
+1. *Head reliability table*: a continuous reliability weight per head (not DuoAttention's binary label), calibrated via downstream reward signals on a calibration corpus
+2. *Risk gate table*: given observable features of a prompt, look up how aggressive a compression that prompt can tolerate
+
+At inference time: run a standard SnapKV-style observation-window scan → two O(1) table lookups → apply head weights + budget clamping → done.
+
+*** Why It Worked (and What Pit It Dug)
+
+The empirical results are compelling:
+- At a 512-token budget, CompilerKV achieves SOTA on four different models (Llama / Qwen / Mistral)
+- *The tables transfer across models* with only 0.4–0.8 LongBench points of loss (Spearman ≈ 0.90)
+- Remains stable under extreme compression (retaining only 1.56% of prefill KV)
+- 128k RULER: SnapKV scores 38; CompilerKV scores 73
+
+Foreseeable new pits:
+- Offline calibration depends on the representativeness of the calibration corpus — what happens with fully out-of-distribution tasks?
+- What if adversarial prompts fool the observable features used by the risk gate?
+- Stability when coupled with other system components such as RAG or speculative decoding
+
+* Frontier Extensions
+
+CompilerKV is a February 2026 preprint; as of now there is no publicly available follow-up work directly critiquing or extending it.
+
+Adjacent threads worth watching:
+- *KVzip* (Kim et al., 2025) uses context reconstruction for query-agnostic scoring — also motivated by "move expensive work offline" — but it still requires an additional LLM forward pass per context. CompilerKV's table-lookup approach amortizes this cost to zero
+- *ShadowKV* / *MagicPIG* pursue retrieval-accelerated decoding; they run in parallel with the prefill-only line as a separate river
+
+Likely next steps for this river (see the Insights section):
+- Extend "offline compilation" to a joint three-dimensional table: head × layer × task
+- Add a lightweight online "safety check" — if a prompt falls outside the calibration distribution, fall back to SnapKV
+
+* One Diagram
+
+#+begin_example
+                       Evolution of Prefill-Only KV Compression
+  Time ->  2023        2023        2024         2024              2024            2026
+           Stream      H2O         SnapKV       Pyramid/Ada/Head  DuoAttention    CompilerKV
+           LLM                                                                    (this paper)
+
+  Stat.   positional   evict       prompt-tail  per-prompt        offline head    offline head
+  unit    heuristic    during      observation  per-head          binary          continuous weights
+          (none)       decode      window       estimate          classify        + offline risk gate
+
+  Alloc.  all heads    all heads   all heads    per-head          per-head        per-head continuous
+  granu-  same         same        same         (per-prompt)      (offline        (offline
+  larity  window       heavy-hit   budget                         binary)         continuous)
+
+  Risk    not          not         not          not               not             per-prompt
+  calib.  considered   considered  considered   considered        considered      gate
+
+  Online  O(L)         O(L)        O(L) once    O(L) once         O(L) once       O(L) once
+  cost                                                                             + two O(1)
+
+                                              _______________Cognitive Turning Point______________
+                                             |                                                   |
+                                             v                                                   v
+                                  head importance is a prompt property         head importance is a model property
+                                  (recompute every time)                       (compile once, use forever)
+#+end_example
+
+* Insights
+
+Reading this lineage, the most important takeaway is not "yet another KV compression algorithm" — it is the *awakening to the statistical unit*.
+
+The entire prefill-only camp, from H2O to HeadKV, was making the same mistake: using one sample (a single prompt) to estimate a quantity that requires a full distribution (across many prompts) to estimate reliably. It is like looking at a single day's stock price and declaring you know the long-term beta — the unit is wrong, and no matter how sophisticated the algorithm, you are just sculpting noise.
+
+DuoAttention was the first to say "head importance is a model property" — that is the true watershed of this river. But it only went as far as binary classification. CompilerKV pushes the insight to its logical extreme: *anything that is stable across prompts should be compiled offline; anything that must be decided per prompt (risk) should be handled through a hybrid of offline tables and online observation.*
+
+At a deeper level, this is a victory of the *compiler mindset* over the *interpreter mindset*. SnapKV is an interpreter — it re-evaluates from scratch every time. CompilerKV is a compiler — it resolves all invariants ahead of time and does only the irreducible minimum at runtime. Large-scale inference systems are undergoing exactly this migration (speculative decoding, KV reuse, prefix caching all follow the same logic).
+
+Where is this river most likely to flow next?
+1. *Composable offline tables*: Can tables for different tasks be mixed online — composed like LoRA adapters?
+2. *Stronger signals for the risk gate*: Currently using shallow prompt features; future versions might employ a small classifier model for risk assessment
+3. *Compile at training time*: CompilerKV is post-hoc offline calibration; the ultimate version might train the model to learn its own "self-compressibility"
+
+* Takeaways
+
+This lineage offers three lessons for how to do research:
+
+1. *Ask "is my statistical unit correct?" before asking "is my algorithm precise?"* If the statistical unit is wrong, a more precise algorithm only overfits noise more faithfully. CompilerKV does not invent a new algorithm — it moves the same head-importance concept onto the correct statistical unit. Work that *reframes the problem* is usually more valuable than work that takes small steps forward on the original problem.
+
+2. *When every SOTA method in a field is doing the same thing, that thing is almost certainly the field's blind spot.* Every prefill-only method was doing per-prompt estimation — that was the opening. When looking for research directions, hunt for the shared implicit assumptions of an entire community — then challenge them.
+
+3. *The compiler mindset can be applied to any system that repeatedly evaluates the same thing.* What in your workflow is recomputed every time but could be pre-compiled? Your code, your decisions, even your interpersonal relationships.
+
+The actionable bottom line: the next time you encounter any "online decision-making" problem, start by asking — *"which quantities here are actually stable across contexts and can be moved offline?"* That one question can often turn a P95 latency of 100 ms into a P95 latency of 1 ms.

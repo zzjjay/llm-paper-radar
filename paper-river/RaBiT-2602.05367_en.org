@@ -1,0 +1,239 @@
+#+title:      RaBiT: Residual-Aware Binarization Training for Accurate and Efficient LLMs
+#+date:       [2026-05-29 Fri 03:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T033344-en
+#+source:     https://arxiv.org/abs/2602.05367
+#+authors:    Youngcheon You, Banseok Lee, Minseop Choi, Seonyoung Kim, Hyochan Chong, Changdong Kim, Youngmin Kim, Dongkyu Kim
+#+venue:      arXiv 2026
+
+* The River of the Problem
+
+Can you squeeze a model with tens of billions of parameters onto a single GPU—and still have it run blazing fast—by representing every weight with just one bit (+1 or −1)?
+
+It sounds absurd: a number that used to take 16 bits now takes 1, losing 16× the information. But the upside is equally absurd: all multiplications disappear, leaving only additions and subtractions. That is the form hardware loves most—no multiplier units needed, throughput multiplied several times over.
+
+This river has flowed unbroken for a decade, because every generation stumbles at the same threshold: *the harder you compress, the dumber the model gets*. 1 bit runs, but accuracy collapses; 2 bits barely works, but the gap from the original model is enormous; close that gap and you must introduce complex lookup tables and rotation matrices, erasing the hardware gains.
+
+RaBiT stands at the latest bend this river has carved by 2026: it wants *the hardware friendliness of binary weights* while refusing to give up *the accuracy of higher-bit formats*. Its answer—stack multiple binary layers and let each successive layer correct the errors left by the previous one. That sounds straightforward, yet the moment engineers tried to build it, every generation hit the same ghost: *the stacked binary layers copy each other's homework*.
+
+* Source Map
+
+#+begin_example
+[2013] Bengio et al. - Straight-Through Estimator
+  |
+  | Problem: sign() is non-differentiable; binary weights can't be
+  |          trained with SGD
+  | Solution: Pretend it's differentiable—pass gradients straight through
+  v
+[2012] Hinton et al. - "Co-adaptation"
+  |
+  | Problem: Neurons cluster to learn the same feature, wasting capacity
+  | Solution: Coined the concept (Dropout is the response)—borrowed
+  |           conceptually in RaBiT
+  v
+[2022-2024] GPTQ / AWQ / BiLLM / ARB-LLM (PTQ camp)
+  |
+  | Problem: Post-training quantization (no retraining) holds at 3-4 bit
+  |          but collapses at 2 bit
+  | Solution: Fine-tune weights with calibration data, model stays frozen
+  | Residual problem: Cliff-edge accuracy drop below 2 bit; retraining required
+  v
+[2023-2024] BitNet / OneBit / Mixture-of-Scales (binary QAT camp)
+  |
+  | Problem: How to let the model adapt to binary weights during training
+  | Solution: Maintain a full-precision shadow weight; binarize in the
+  |           forward pass; use STE in the backward pass
+  | Residual problem: A single binary layer lacks expressiveness;
+  |                   2-bit tasks are still hard
+  v
+[2024] BitStack / QBB / MBOK (residual binarization camp)
+  |
+  | Problem: One binary layer isn't enough—so stack several
+  | Solution: W ≈ B1 + B2; let B2 repair B1's errors
+  | Residual problem: During training B1 and B2 copy each other;
+  |                   no true residual hierarchy forms
+  v
+[2024] DB-LLM (heuristic-patch camp)
+  |
+  | Problem: B1 and B2 are too similar
+  | Solution: Forcibly split W in two so the two paths are negatively
+  |           correlated
+  | Residual problem: The negative correlation is manufactured mechanically,
+  |                   not truly correcting residual errors
+  v
+[2026] RaBiT (this paper)
+  |
+  | Problem: How to structurally guarantee that B2 genuinely fixes B1's
+  |          mistakes instead of competing with B1 for the same signal
+  | Solution: Store only one full-precision weight; compute B1 on the fly,
+  |           then compute B2 on the fly from W − B1
+  v
+[2026+] ??? (deeper residuals? joint VQ?)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2013 | STE: How to Train a Non-Differentiable Function
+
+*** What Problem It Saw
+
+Compressing a continuous real-valued weight to +1/−1 uses the sign() function. That function is a step at zero—its derivative is zero everywhere (ignoring the undefined point). The entire gradient-descent machinery stalls immediately: no gradient, no learning.
+
+*** Its Solution
+
+Bengio et al. proposed the Straight-Through Estimator: pretend the function is the identity map. During back-propagation, gradients pass straight through the binarization step and land on the full-precision weight upstream. Think of it as a one-way mirror—the forward pass sees discrete ±1; the backward pass sees continuous reals.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It worked because we don't need the *correct* gradient—we just need a *directional* gradient. But the pit it dug is deep: all subsequent binarization training methods are built on STE, and STE supplies a "global" gradient that is unaware of how many parallel binarization paths exist in the network. That ignorance, left to grow for over a decade, became the inter-path adaptation problem RaBiT had to solve.
+
+** 2022–2024 | The PTQ Camp (GPTQ / AWQ / BiLLM): Compress Without Retraining
+
+*** What Problem It Saw
+
+Training a large model once costs millions of dollars. Asking users to retrain it for compression? Nobody would. So Post-Training Quantization rose: leave the trained model untouched, re-bin the weights with a small calibration dataset.
+
+*** Its Solution
+
+GPTQ uses second-order information (a Hessian approximation) to quantize column by column, compensating each column's error forward to the remaining columns. AWQ finds that "salient weights" must not be perturbed too aggressively and applies per-channel magnitude scaling to protect them. BiLLM and ARB-LLM push even harder, targeting 1–2 bits directly.
+
+*** Why It Worked (and What New Pit It Dug)
+
+In the 3–4 bit regime, PTQ almost matches full precision. But at 2 bits, every PTQ method collapses collectively—discretization destroys too much information for local compensation to recover. That wall told everyone: *to live below 2 bits, the model must adapt during training*. In other words, you must return to QAT (Quantization-Aware Training).
+
+** 2023–2024 | The Binary QAT Camp (BitNet / OneBit / MoS): Train the Model to Expect Binary Weights
+
+*** What Problem It Saw
+
+Since PTQ cannot rescue 2-bit accuracy, let the model know from the start that it will only have ±1 at inference. The challenge: how to coexist with non-differentiable sign() during training.
+
+*** Its Solution
+
+The classic three-step recipe: maintain a full-precision shadow weight W_FP; binarize it in the forward pass to get B = sign(W_FP), scaled by a full-precision factor so B can approximate W; use STE in the backward pass to let gradients flow through sign() and update W_FP. OneBit further introduced SVID (magnitude-based rank-1 SVD decomposition) for a smart initialization—rather than starting from random guesses, first decompose W_FP into the optimal approximation B ⊙ g ⊙ h.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Accuracy improved substantially, but a single binary layer's expressiveness is ultimately too weak. Reaching near-full-precision either means tolerating significant degradation or—stacking layers.
+
+** 2024 | The Residual Binarization Camp (BitStack / QBB / MBOK): Two Layers When One Isn't Enough
+
+*** What Problem It Saw
+
+A single binary layer can represent only two directions: ±1. For finer granularity, the natural idea is superposition: W ≈ B1 + B2. If B1 captures the bulk, B2 can fill the details B1 missed. In theory this is 2 bits, yet each B is still ±1, so multiplication still vanishes—the hardware gains are preserved.
+
+*** Its Solution
+
+Store two full-precision weights W1, W2; binarize each in the forward pass to get B1, B2; the effective weight is their sum. This is "residual binarization"—the name implies B2 should fill B1's residual.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Beautiful in theory. But on inspection, B1 and B2 learn *nearly identical* features. Tracing back the cause: during back-propagation, the full loss gradient hits W1 and W2 simultaneously. Both paths see the same gradient and naturally move in the same direction. This is what RaBiT names *inter-path adaptation*—the two paths copy each other's homework, and the intended "primary + correction" hierarchy collapses.
+
+QBB and MBOK tried "path freezing" as a patch—train B1 while freezing B2, then swap—but this is too mechanical; it hard-cuts the solution space and limits what can be learned.
+
+** 2024 | DB-LLM: Forcing the Two Paths to Run in Opposite Directions
+
+*** What Problem It Saw
+
+DB-LLM attacked the symptom directly: B1 and B2 are too alike, so *force* them to be unlike.
+
+*** Its Solution
+
+Split weight W into two halves (by a heuristic rule) and binarize each separately. The correlation between the two paths can thereby be pushed to −0.49—statistically, they are "moving oppositely."
+
+*** Why It Worked (and What New Pit It Dug)
+
+Accuracy did improve. But RaBiT delivers a decisive diagnostic metric: *residual alignment*. It asks not "do B1 and B2 look different?" but "is B2 actually correcting B1's mistakes?" DB-LLM scores only 0.26 on residual alignment—proof that it flipped the two paths against each other, but in a direction unrelated to the true residual. The two paths are "opposing for opposition's sake," not "cooperating to correct."
+
+This is the key insight: correlation can be manufactured mechanically; *residual alignment* cannot—it requires B2 to genuinely target the portion that B1 missed.
+
+** 2026 | RaBiT: Guaranteeing the Residual Relationship Structurally
+
+*** What Problem It Saw
+
+Every predecessor—whether QBB's freezing or DB-LLM's forced split—was patching a fundamental structural flaw after the fact: the two paths exist in parallel, parallelism implies symmetry, and symmetry implies copying. The root cause is: *why make them parallel in the first place?*
+
+*** Its Solution
+
+Store only one full-precision weight W_FP and derive the paths *sequentially* in every forward pass:
+
+1. B1 = sign(W_FP) → first-path approximation Ŵ1
+2. Compute residual R1 = W_FP − Ŵ1
+3. B2 = sign(R1) → the second path binarizes the *actual residual* directly
+
+B1 and B2 are no longer stored independently; they are two children derived from W_FP. The second child is designated from birth to "fill the holes left by the first child"—not a soft constraint but a definition.
+
+During back-propagation, all gradients converge onto the single W_FP. The optimizer sees the equivalent gradient of the entire binarization stack; there is no way to send different update directions to two separate paths, and inter-path adaptation simply ceases to exist.
+
+A bonus: previously two full-precision weights had to be stored (each needing Adam's momentum and variance buffers); now only one is stored, halving optimizer memory.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Empirically, RaBiT reaches a WikiText-2 perplexity of 5.78 at 2 bits on Llama2-7B—substantially ahead of DB-LLM (7.23) and MBOK (6.99), and even surpassing VQ-based QTIP (5.86). It simultaneously delivers a 4.49× end-to-end inference speedup on an RTX 4090. This is the first time a binary method at 2 bits has *simultaneously* matched VQ-level accuracy and delivered VQ-beating speed.
+
+The remaining pit: after stacking 2 layers, can you stack 3 or 4? In theory deeper residuals approximate W_FP more precisely, but each additional layer adds a sequential computation step and increases training memory. The current method is validated only at k=2; deeper residual stacks remain unexplored.
+
+* Frontier Extensions
+
+RaBiT only appeared on arXiv in February 2026 and is itself the current frontier of this line. As of now, no direct critiques or improvements have appeared. Two foreseeable directions:
+
+1. *Deeper residuals*: k=2 gives 2 bits. If k=3, that is a 3-bit binary stack—can it approach 4-bit accuracy while maintaining binary hardware friendliness?
+2. *Convergence with VQ*: RaBiT has already matched QTIP in accuracy. The next step may be a hybrid architecture—residual binarization for the bulk of the model (fast), VQ for the small set of most-sensitive layers (accurate).
+
+* One Diagram to See It All
+
+#+begin_example
+
+Timeline --> 2013       2022-24        2023-24         2024             2024           2026
+             STE        PTQ camp       BitNet/OneBit   BitStack/QBB     DB-LLM         RaBiT
+             (basis)    (GPTQ/AWQ)     (QAT single)    (QAT res-stack)  (heuristic     (structural
+                                                                         split)         guarantee)
+
+What We Want
+------------
+Speed         -          fast           medium          very fast        very fast      very fast
+(no mult?)   --         partial         no              yes              yes            yes
+Accuracy      -          3-4bit good    1-2bit marginal 1-2bit unstable  2bit marginal  2bit matches VQ
+              -          2bit collapses
+Retraining?   no         no             yes             yes              yes            yes
+
+Core Tension
+------------
+SGD vs sign()      ->  STE resolves it
+PTQ 2bit collapse  ->  shift to QAT
+Single layer weak  ->  stack 2 layers (residual)
+Two layers copy    ->  DB-LLM: force split / RaBiT: sequential derivation
+
+RaBiT's decisive move:
+   Not "make the two paths different" (that's the symptom)
+   But "make the second path target only what the first path missed"
+   Method: compute B1, compute R1 = W - B1, compute B2 = sign(R1)
+   This turns "residual" from a training objective into a structural constraint
+
+#+end_example
+
+* Insights
+
+On the surface this lineage is a "history of model compression"; at a deeper level it is a cognitive turn that recurs again and again: *hardening soft constraints into structure*.
+
+- PTQ treated "low-bit can still work" as a soft constraint (calibration fine-tuning) → collapsed at 2 bit
+- Binary QAT hardened "the model must adapt to binary" into structure (binarize in the forward pass) → 2 bit survived
+- Residual stacking softened "use more bits" into "add more layers" → the layers copied each other
+- DB-LLM tried to fix that with a new soft constraint (anti-correlation) → treated the symptom, not the cause
+- RaBiT hardened "the second path *is* the residual" from a soft constraint (train it to be so) into structure (it *is so by definition*) → the problem disappears
+
+Every advance was turning something "we hope happens" into something "that must happen." Research progress is often not the invention of a new method but the conversion of a relationship previously left to training chance into a fact guaranteed by architecture.
+
+A second insight: *metrics can lie*. DB-LLM looked good on "path correlation" (−0.49) but scored only 0.26 on "residual alignment." A large part of RaBiT's victory came from identifying a diagnostic metric that cannot be satisfied mechanically, exposing the false success of prior methods. When a field hits a plateau, it is often not because better methods are absent—it is because everyone is scoring each other with the wrong ruler.
+
+* Implications
+
+For researchers:
+
+- *Look beyond benchmark numbers*—examine whether a paper's diagnostic metric actually measures what it claims to solve. DB-LLM scored on "correlation"; RaBiT scored on "residual alignment." The moment the latter metric appeared, the entire leaderboard reshuffled.
+- *Converting a training objective into an architectural constraint* is often the critical step from "works" to "robust." That conversion is valuable precisely because it transforms a statistical problem into an engineering problem.
+
+For engineers:
+
+- If you work on LLM inference optimization, RaBiT delivers the first genuinely usable combination of 2-bit weights and eliminated matrix multiplication. That means *you can run near-full-precision large models on consumer GPUs using only 50% of the memory*.
+- Its training paradigm—"share one W_FP, derive B sequentially"—can be applied directly to any other scenario involving stacked approximations: compression, sparsity, low-rank decomposition. Wherever the original method shows multiple parallel approximations copying each other, this pattern is worth trying.

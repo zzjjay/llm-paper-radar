@@ -1,0 +1,260 @@
+#+title:      CompilerKV: Risk-Adaptive KV Compression via Offline Experience Compilation
+#+date:       [2026-05-29 Fri 03:54]
+#+filetags:   :paper:river:
+#+identifier: 20260529T035452
+#+source:     https://arxiv.org/abs/2602.08686
+#+authors:    Ning Yang, Chengzhi Wang, Yibo Liu, Baoliang Tian, Haijun Zhang
+#+venue:      arXiv 2026 (preprint, cs.LG / cs.AI)
+
+* 问题之河
+
+大模型读一篇长文档的时候，会在内存里记下每个词的"状态"——这堆状态叫 KV cache。文档越长，这块内存越大。32k token 的输入、batch=16，普通显卡直接装不下。
+
+于是有了一个看似简单的问题：*能不能只留一小部分 token 的 KV，扔掉剩下的？* 比如只留 512 个，扔掉 31488 个。
+
+难点不在"扔"，而在"扔了之后还能不能答对题"。你扔掉的可能正是后面要用的关键信息——大海捞针题（NIAH）就是专门考这个。
+
+这个问题缠了三年。每一代解法都在回答同一个问题的不同部分：*哪些 token 真的重要？* 但每一代也都在前一代的尸体上发现新的坑。CompilerKV 这篇的姿势很怪：它说前面所有人都在用错误的统计单位看问题。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 出生: Transformer 出现, KV cache 这个东西才存在
+  v
+[2023] Xiao et al. - StreamingLLM (Attention Sink)
+  |
+  | 发现: 第一个 token 永远被高度关注, 像个"水槽"
+  | 解法: 留住开头几个 + 最近滑窗, 就能跑无限长
+  v
+[2023] Zhang et al. - H2O (Heavy Hitter Oracle)
+  |
+  | 问题: 滑窗太粗暴, 中间也有重要 token
+  | 解法: 按累积 attention 分数挑"重锤" token 留下
+  v
+[2024] Li et al. - SnapKV
+  |
+  | 问题: H2O 是 decode 时边跑边挑, 太晚了
+  | 解法: prefill 一次性挑完, 用 prompt 尾部窗口预测哪些重要
+  v
+[2024] Cai - PyramidKV / Feng - AdaKV / Fu - HeadKV
+  |
+  | 问题: SnapKV 给所有 head 同样的预算, 但 head 之间差别巨大
+  | 解法: 按层/按 head 自适应分配预算 (还是看当前 prompt)
+  v
+[2024] Xiao et al. - DuoAttention
+  |
+  | 问题: 每来一个 prompt 都重新算 head 重要性, 不稳定
+  | 解法: 离线把 head 分成两类——"检索头" vs "流式头"
+  v
+[2026] CompilerKV  <-- 目标论文
+  |
+  | 问题: DuoAttention 只做二分类, 没考虑不同 prompt 风险不同
+  | 解法: 离线编译"连续的 head 可靠度表" + "风险闸门表"
+  |       在线 O(1) 查表即可
+  v
+[?] 后续暂未出现 (paper 太新)
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: KV cache 这东西是怎么来的
+
+*** 它看到了什么问题
+
+RNN 一个词一个词串着算，慢得要死。
+
+*** 它的解法
+
+扔掉时间方向的串行依赖，让每个位置都能直接看到所有其他位置——靠 Q/K/V 三个矩阵的乘法。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行起来了，但代价是：推理时为了不重复算前面所有 token 的 K 和 V，必须把它们缓存下来。序列越长，这块缓存线性增长。*KV cache 内存爆炸*——这就是后面所有故事的源头。
+
+** 2023 | StreamingLLM: 原来注意力有个"水槽"
+
+*** 它看到了什么问题
+
+模型跑长上下文跑到一定长度就崩了——困惑度飙升，胡言乱语。
+
+*** 它的解法
+
+把第一个 token (和前几个) 永远留住, 加一个最近的滑动窗口，中间的全扔。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+他们发现一个怪现象：模型会把大量注意力分给开头的几个 token，哪怕这些 token 跟当前问题毫无关系。这叫 *attention sink*——开头 token 是注意力的"泄洪口"，扔了它整个分布就崩。
+
+留住"开头+最近"就能稳定跑下去。但坑也很明显：*中间被扔掉的 token 里可能藏着答案*。问"文档第 5 段提到了什么"，对不起，第 5 段已经被滑出窗外了。
+
+** 2023 | H2O: 不能瞎扔, 得挑"重锤"
+
+*** 它看到了什么问题
+
+滑窗法假设"越近越重要", 但事实是有些早期 token 的确一直被频繁使用 (比如关键的专有名词)。
+
+*** 它的解法
+
+边解码边累积每个 token 收到的 attention 分数, 留下分数最高的那批 (Heavy Hitters)。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+用模型自己的注意力作为重要性投票, 比"位置启发式"细多了。
+
+但 H2O 是 *decode 阶段* 动态淘汰——你必须先算 attention 才知道谁该走。在长 prompt 的 prefill 阶段, 内存已经爆了。*我们需要在 prefill 一次性决定留谁。*
+
+** 2024 | SnapKV: 在 prefill 时就一次挑完
+
+*** 它看到了什么问题
+
+H2O 的"边走边淘汰"对 prefill-only 场景没用——长文档输进来那一刻显存就崩了。
+
+*** 它的解法
+
+天才的小技巧：用 prompt 尾部的一小段作为"观察窗口" (observation window), 看它们对前面哪些 token 注意力强, 那些就是要留的。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+prompt 尾部往往是问题本身, 用问题去"指向"答案区域, 一次性圈出来——比 H2O 高效得多, 而且不用每步重算。SnapKV 一度成为 prefill-only 阵营的 baseline 王。
+
+新坑: *它给所有 attention head 同样的预算*。但实际上, 有的 head 是"通才", 有的是"专才", 各自需要的 token 数量天差地别。
+
+** 2024 | PyramidKV / AdaKV / HeadKV: 每个 head 待遇要区别对待
+
+*** 它看到了什么问题
+
+SnapKV 一视同仁。但你看 attention 分布: 有些 head 注意力很集中 (留少量就够), 有些散成一片 (必须留更多, 不然信息全丢)。
+
+*** 它的解法
+
+按层 (PyramidKV)、按 head (AdaKV)、按 head + 任务类型 (HeadKV) 自适应分配预算。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精细化分配确实救了不少分数。
+
+但 CompilerKV 指出一个深层问题: *这些方法都是从"当前这个 prompt"的注意力里估计 head 重要性的*。可是单个 prompt 的 attention 是重尾分布、噪声很大——你看到的"这个 head 重要"可能只是这个 prompt 的偶然。
+
+换句话说: *他们在错的统计单位上做估计*。head 的特性应该是模型属性 (跨 prompt 稳定), 不是 prompt 属性。
+
+** 2024 | DuoAttention: 那就离线一次算清楚
+
+*** 它看到了什么问题
+
+每来一个 prompt 都重算 head 重要性, 又慢又抖。
+
+*** 它的解法
+
+用一个校准语料库, 离线把所有 head 分成两类:
+- *检索头* (retrieval heads): 必须保留完整 KV
+- *流式头* (streaming heads): 只留滑窗就够
+
+推理时直接按这个分类执行, 不再 per-prompt 估计。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是关键的认知转折: *head 的角色是模型自身的属性, 不应该每次重新发现*。Fu 等人也独立验证了"检索头身份跨 prompt 稳定"。
+
+但 DuoAttention 太粗糙——二分类。现实里 head 不是非黑即白, 是一个连续光谱。而且: *不同 prompt 的"风险"也不一样*——简单的总结题随便压缩没事, 大海捞针题就得宽松点。DuoAttention 没考虑这个。
+
+** 2026 | CompilerKV: 把所有可预先算的东西都编译成表
+
+*** 它看到了什么问题
+
+CompilerKV 一句话总结整个 prefill-only 战场: *大家都在用单个 prompt 的瞬时注意力, 去估计本该是模型级或跨 prompt 级的稳定量。* 这叫 statistical unit mismatch。
+
+具体三宗罪 (E1/E2/E3):
+- E1: 单 prompt 注意力是重尾, 噪声大
+- E2: 跨 head 方差巨大, 单 prompt 估不准 head 可靠度
+- E3: 没人做 prompt 级别的"风险校准"——压缩到什么程度算激进, 应该看这个 prompt 多容易出错
+
+*** 它的解法
+
+像编译器把高频计算预编译进二进制一样: 把所有需要"跨 prompt 统计"才能稳定的东西, 在离线阶段算成表。
+
+具体两张表:
+1. *Head 可靠度表*: 每个 head 一个连续的可靠度权重 (不是 DuoAttention 的二分类), 来自校准语料上的下游 reward 反向标定
+2. *风险闸门表*: 给定 prompt 的某些可观测特征, 查表得到"这个 prompt 能承受多激进的压缩"
+
+推理时: 标准 SnapKV 式观察窗扫一遍 → 两次 O(1) 查表 → 应用 head 权重 + 预算 clamp → 完事。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+实证非常硬:
+- 512-token 预算下, 四个不同模型 (Llama/Qwen/Mistral) 全是 SOTA
+- *表可以跨模型转移*, 损失只 0.4-0.8 LongBench 点 (Spearman ≈ 0.90)
+- 在极端压缩 (留 1.56% prefill KV) 下不崩
+- 128k RULER: SnapKV 38 分, CompilerKV 73 分
+
+新坑 (可预见的):
+- 离线校准依赖校准语料的代表性——遇到完全 OOD 的任务怎么办?
+- 风险闸门用的可观测特征如果被对抗性 prompt 欺骗呢?
+- 与 RAG、speculative decoding 等其他系统耦合时的稳定性
+
+* 前沿延伸
+
+CompilerKV 是 2026 年 2 月的 preprint, 截至目前还没有公开的后续工作直接批判或扩展它。
+
+但同时期值得关注的相邻线索:
+- *KVzip* (Kim et al., 2025) 用上下文重构做 query-agnostic 评分, 思路也是"把昂贵的事情挪到离线"——但代价是每个上下文还要一次额外 LLM forward。CompilerKV 用表查询完全摊平了这个开销
+- *ShadowKV* / *MagicPIG* 走的是 decode 时检索加速, 跟 prefill-only 是平行的另一条河
+
+这条河的下一步可能性 (洞见在下面写):
+- 把"离线编译"扩展到 head + 层 + 任务三维联合表
+- 在线时增加少量"安全检测"——发现 prompt 不在校准分布内就 fallback 到 SnapKV
+
+* 一张图看懂
+
+#+begin_example
+                       prefill-only KV 压缩演化河
+  时间 ->  2023        2023        2024         2024              2024            2026
+           Stream      H2O         SnapKV       Pyramid/Ada/Head  DuoAttention    CompilerKV
+           LLM                                                                    (本文)
+
+  统计    位置启发     decode时    prompt尾部   per-prompt        离线 head       离线 head 连续权重
+  单元    (无统计)     边算边挑    观察窗口     per-head          二分类          + 离线风险闸门
+
+  分配    全 head      全 head     全 head      per-head          per-head        per-head 连续
+  粒度    同滑窗       同重锤      同预算       (per-prompt)      (offline 二元)  (offline 连续)
+
+  风险    不考虑       不考虑      不考虑       不考虑            不考虑          per-prompt 闸门
+  校准
+
+  在线    O(L)         O(L)        O(L) 一次   O(L) 一次         O(L) 一次       O(L) 一次
+  代价                                                                            + 两次 O(1)
+
+                                              ___________________认知转折________________
+                                             |                                          |
+                                             v                                          v
+                                  head 重要性是 prompt 属性               head 重要性是模型属性
+                                  (每次重算)                              (一次编译, 永久使用)
+#+end_example
+
+* 洞见
+
+读完这条线, 最重要的不是"又一个 KV 压缩算法", 而是 *统计单位的觉醒*。
+
+整个 prefill-only 阵营从 H2O 到 HeadKV 都在做同一件错事: 用一个样本 (单 prompt) 去估计本该用整个分布 (跨 prompt) 才能估准的量。这就像你看一天的股价就敢说某只股票的长期 beta 是多少——单位错了, 再精细的算法都是在噪声上雕花。
+
+DuoAttention 第一次说"head 重要性是模型属性", 是这条河的真正分水岭。但它只走到二分类。CompilerKV 把这个洞见推到极致: *凡是跨 prompt 稳定的量, 都该离线编译; 凡是必须 per-prompt 决定的量 (风险), 也该用离线表+在线观察的杂交方式做*。
+
+更深一层: 这是一种"*编译器思维*"对"解释器思维"的胜利。SnapKV 是解释器——每次重新求值; CompilerKV 是编译器——把不变量提前算清楚, 运行时只做必要的最少工作。深度学习的 inference 系统正在大规模发生这种迁移 (speculative decoding、KV reuse、prefix caching 都是同类思路)。
+
+下一步最可能往哪走?
+1. *离线表的可组合性*: 不同任务的表能不能在线混合? 像 LoRA 那样组合
+2. *风险闸门的更强信号*: 现在只用 prompt 浅特征, 未来可能用一个小的"分类器模型"做风险评估
+3. *训练阶段就编译*: CompilerKV 是 post-hoc 离线校准, 终极版本可能是训练时就让模型学出"自我可压缩性"
+
+* 启发
+
+这条线对怎么做研究有三个启发:
+
+1. *先问"我用的统计单位对吗"再问"我的算法精吗"*。如果统计单位错了, 算法越精细越是过拟合噪声。CompilerKV 不是发明新算法, 是把同样的 head 重要性概念挪到正确的统计单位上。这种"重新定义问题"的工作往往比"在原问题上小步快跑"更有价值。
+
+2. *看到一个领域里所有 SOTA 方法都在做同一件事, 那件事大概率就是这个领域的盲区*。所有 prefill-only 方法都在 per-prompt 估计, 那就是机会。寻找研究方向时, 找"大家共同的隐式假设"——挑战它。
+
+3. *编译器思维可以套到任何"反复求值同样东西"的系统上*。你的工作流里有什么是每次都在重算、其实可以预编译的? 你的代码、你的决策、甚至你的人际关系。
+
+落点在能用: 这意味着你可以下次接到任何"在线决策"问题时, 先问一句——*"这里面哪些量其实跨场景稳定, 可以挪到离线?"* 这一问, 往往能把一个 P95 慢 100ms 的服务变成 P95 慢 1ms。

@@ -1,0 +1,317 @@
+#+title:      Unleashing Low-Bit Inference on Ascend NPUs: A Comprehensive Evaluation of HiFloat Formats
+#+date:       [2026-05-29 Fri 10:00]
+#+filetags:   :paper:river:quantization:fp4:ascend:en:
+#+identifier: 20260529T100000-en
+#+source:     https://arxiv.org/abs/2602.12635
+#+authors:    Pengxiang Zhao, Hui-Ling Zhen, Xing Li, et al. (Huawei)
+#+venue:      arXiv 2026
+
+* In One Sentence
+
+This paper is not about inventing a new algorithm. It takes Huawei's two home-grown low-bit numeric formats — HiF8 and HiF4 — into the arena of mainstream LLM quantization and benchmarks them head-to-head against INT8, MXFP4, and NVFP4, asking squarely: can 4-bit inference on Ascend NPUs hold up?
+
+* The Protagonists
+
+The formats under evaluation are called HiFloat: HiF8 (8-bit) and HiF4 (4-bit), both designed by Huawei for the Ascend NPU family. But the true protagonist of the story is not HiFloat itself — it is a stubborn engineering question that has haunted the LLM community for three or four years:
+
+*Why does 4-bit quantization keep breaking?* Models keep growing and demand compression; push to 4-bit and accuracy collapses below usability. Every post-mortem points to the same culprit: activation outliers.
+
+The whole arc is the story of how the field moved, step by step, from "INT8 is enough" to "FP8 as a safety net," then to "FP4 with block-shared scaling," and finally to "hierarchical scaling that squeezes every last bit."
+
+* Lineage Map
+
+#+begin_example
+
+  [1960s]
+  Block Floating Point (BFP)
+  Share one exponent to save bits                     <-- ancient root
+       |
+       v
+  [Sep 2022]
+  FP8 Formats for Deep Learning (NVIDIA/Arm/Intel)
+  arXiv 2209.05433                                    <-- root: FP8 standardization
+  E4M3 for weights/activations, E5M2 for gradients
+  Hopper H100 native hardware support
+       |
+       +------ parallel track: INT path ------+
+       |                                      |
+       v                                      v
+  [Oct 2022] GPTQ                  [Aug 2022] SmoothQuant
+       |                                      |
+       v                                      v
+  [Jun 2023] AWQ <----- INT4 weight-only, outliers still a problem -----+
+       |                                                                 |
+       v                                                                 |
+  [Sep 2023] OCP Microscaling (MX) Formats <---------------------------+
+  arXiv 2310.10537                                    <-- turning point: shared scaling
+  MXFP4: 32-element blocks, shared E8M0 scale
+       |
+       v
+  [2024] NVFP4 (NVIDIA Blackwell)                     <-- refinement
+  16-element blocks, shared E4M3 scale
+       |
+       v
+  [Sep 2024] HiFloat8 (Ascend HiF8)
+  arXiv 2409.16626
+       |
+       v
+  [Feb 2026] HiFloat4 Spec
+  arXiv 2602.11287                                    <-- hierarchical scaling
+  Three-level scaling: E6M2 + E1 + E1 + E1M2
+       |
+       v
+  [Feb 2026] *** HiFloat Comprehensive Evaluation *** <-- this paper
+  arXiv 2602.12635
+       |
+       +-- forward extensions --+
+       |                        |
+       v                        v
+  HiF4 Pretraining         AMXFP4 / MX+
+  arXiv 2604.08826         arXiv 2411.09909
+                           More aggressive patches for outliers
+
+#+end_example
+
+* The Evolutionary Narrative
+
+** Act Zero: Why Do "Low-Bit Numeric Formats" Exist at All?
+
+LLMs keep getting bigger. A 70B model stored in FP16 needs 140 GB — one H100 is not enough; you need two or four. During inference, just moving those numbers from memory to the compute units saturates memory bandwidth, leaving GPU compute sitting idle.
+
+There is only one way to save money and power: *represent each number with fewer bits*. FP16 → FP8 → FP4: weight size shrinks 4×, transfer speed rises 4×.
+
+But you cannot just chop carelessly. Neural networks contain numbers that differ by ten orders of magnitude. Fewer bits means compressing both the representable range and the precision simultaneously. Compress too hard and the model starts hallucinating.
+
+The entire research arc is an answer to one question: *how do you cut bits without breaking things?*
+
+** Act I (2022): FP8 Sets the Standard
+
+The true starting point is a September 2022 paper jointly authored by NVIDIA, Arm, and Intel: *"FP8 Formats for Deep Learning"* (arXiv:2209.05433).
+
+Before this, every vendor was quietly cooking up its own low-bit format, incompatible with everyone else's. The three companies sat down and defined a cross-vendor standard: two FP8 variants, E4M3 and E5M2.
+
+- *E4M3*: 4 exponent bits, 3 mantissa bits. Narrow range but high precision — for weights and activations.
+- *E5M2*: 5 exponent bits, 2 mantissa bits. Wide range but lower precision — for gradients (which tend to spike).
+
+The paper's diagnosis was precise: *INT8 was no longer adequate for LLM training*. Transformer activations routinely produce values far beyond a typical distribution — later called outliers — and INT8's uniform linear quantization discards enormous amounts of information trying to accommodate them. FP8, with its exponent bits, can adapt its dynamic range to match the data automatically.
+
+H100 (Hopper) shipped with native hardware support for both FP8 variants. From that point "8-bit inference" went from concept to production practice.
+
+*What problem did it leave behind?* FP8 solved the 8-bit tier, but the industry immediately set its sights on the next tier — 4-bit. The exponent bits that made FP8 work simply cannot be fit inside 4-bit: with only 4 bits total, no matter how you divide them between exponent and mantissa, both sides are starved.
+
+** Act II (2022–2023): The Parallel INT Track Hits a Wall
+
+Almost simultaneously with FP8, another track was pushing INT4 weight-only quantization. Three landmark papers:
+
+1. *SmoothQuant* (Aug 2022): Discovered that activation outliers are far worse than weight outliers, so it migrates the "hard-to-quantize" burden from activations to weights — divide activations by a smoothing factor, multiply weights by the same factor, preserving mathematical equivalence but making both sides easier to quantize. Result: W8A8.
+
+2. *GPTQ* (Oct 2022): Uses second-order Hessian information to quantize one layer at a time, propagating quantization error forward to subsequent weights as compensation. Compresses 175B OPT to INT3–4 in a few hours with minimal accuracy loss.
+
+3. *AWQ* (Jun 2023): Observes that only ~1% of weight channels truly matter — "salient channels," specifically those corresponding to large activations. Protects these channels by scaling them before quantization. Simpler and faster than GPTQ, with comparable or better accuracy.
+
+The *core problem* this INT track identified: round-to-nearest (RTN) quantization simply fails on LLMs — *outlier channels consume the entire quantization range, leaving ordinary values crushed to zero, killing precision*.
+
+But INT4 also hit its wall: at 4-bit, both GPTQ and AWQ require careful calibration and delicate handling of activation outliers. And INT4 for *inference* has another awkward cost: hardware must dequantize back to FP16 before computing, adding overhead.
+
+*So people began to ask:* can 4-bit itself carry enough dynamic range that dequantization is unnecessary?
+
+** Act III (2023): MXFP4 — Block-Shared Scaling Becomes the New Paradigm
+
+In September 2023, the OCP (Open Compute Project, backed by Microsoft, AMD, Arm, Intel, Meta, NVIDIA, and Qualcomm) published the *Microscaling (MX) Formats* specification (arXiv:2310.10537).
+
+Its key insight revived a very old idea — *Block Floating Point (BFP)*: instead of giving every number its own full exponent, *let an entire group of numbers share one exponent*.
+
+MXFP4's concrete scheme:
+- Pack 32 numbers into one block.
+- Each block shares one 8-bit scale (E8M0 — pure exponent, no mantissa).
+- Each number within the block is stored in only 4 bits (E2M1: 1 sign + 2 exponent + 1 mantissa).
+
+This addresses the fundamental INT4 problem: *outliers no longer corrupt the entire tensor*. An outlier can only corrupt its own 32-element block — the shared exponent expands to accommodate it, slightly degrading precision for block neighbors, but global collapse is gone.
+
+Average storage cost = 4 + 8/32 = 4.25 bits/number — nearly as cheap as INT4.
+
+*The MXFP4 diagnosis of INT4*: outlier impact range is too large.
+*Its fix*: confine the damage to a 32-element block.
+
+*What problems did it leave behind?* Three:
+1. *Scale precision is too coarse*: E8M0 has no mantissa, so it can only represent powers of two. If values within a block cluster tightly, this coarse scale wastes representable range.
+2. *Block size is still large (32)*: one outlier still drags down 31 neighbors.
+3. *Only 4 bits per element*: E2M1 can represent only 8 distinct positive values (roughly −6 to 6), which is extremely limited.
+
+** Act IV (2024): NVFP4 — Smaller Blocks, Finer Scales
+
+With the Blackwell architecture (released 2024), NVIDIA introduced its own 4-bit format, *NVFP4*, addressing MXFP4's three pain points:
+
+1. *Block size shrinks from 32 to 16*: better local adaptability; an outlier affects only half as many neighbors.
+2. *Shared scale upgraded from E8M0 (8-bit pure exponent) to E4M3 (8-bit FP8)*: three mantissa bits are added, dramatically increasing the density of representable scale values.
+3. *An additional per-tensor FP32 global scale*: backstop for extreme dynamic ranges.
+
+Average bits = 4 + 8/16 = 4.5 bits/number — slightly more than MXFP4, but Blackwell hardware accelerates it natively.
+
+*NVFP4's diagnosis of MXFP4*: scale granularity too coarse, scale expressiveness too weak.
+*Its fix*: smaller blocks, upgraded scale type, plus a global fallback layer.
+
+Result: DeepSeek-R1 quantized from FP8 to NVFP4 drops ≤ 1% on critical tasks.
+
+*What problems did it leave behind?*
+- *Only two levels of scaling* (block-level + per-tensor level), with nothing finer in between. If a single outlier appears in one 16-element block, it still drags down those 15 neighbors.
+- It is NVIDIA's proprietary format running on Blackwell Tensor Cores. *What do non-NVIDIA vendors do?*
+
+** Act V (2024–2026): HiFloat — Huawei's Hierarchical Scaling Answer
+
+Huawei HiSilicon launched the HiFloat project in 2021 to build its own low-bit formats for Ascend. The roadmap has two steps.
+
+*** HiF8 (2024, arXiv:2409.16626)
+
+Competing in the 8-bit tier against FP8 (E4M3/E5M2). The differentiating feature is *tapered precision* — mantissa bits are dynamically allocated based on magnitude: small values receive more mantissa bits for higher precision; large values receive fewer mantissa bits in exchange for greater dynamic range. A single format covers both training and inference, eliminating the need to choose between E4M3 and E5M2.
+
+*** HiF4 (Feb 2026, arXiv:2602.11287) — The True Differentiator
+
+HiF4 extends NVFP4's two-level scaling to *three levels*. The structure:
+
+#+begin_example
+
+  +----------------------------------------------------+
+  | Level 1: 8-bit E6M2 scale (shared over 64 elements)|
+  | (6 exponent bits + 2 mantissa bits,                |
+  |  provides global dynamic range)                    |
+  +----------------------------------------------------+
+       |          |          |          |
+       v          v          v          v
+   +-----+    +-----+    +-----+    +-----+
+   | E1  |    | E1  |    | E1  |    | E1  |  Level 2: 1-bit
+   |x 8  |    |x 8  |    |x 8  |    |x 8  |  micro-exponent
+   +--+--+    +--+--+    +--+--+    +--+--+  (8-element sub-block)
+      |          |          |          |
+      v          v          v          v
+   +--+--+    +--+--+    +--+--+    +--+--+
+   | E1  |    | E1  |    | E1  |    | E1  |  Level 3: 1-bit
+   |x 16 |    |x 16 |    |x 16 |    |x 16 |  micro-exponent
+   +--+--+    +--+--+    +--+--+    +--+--+  (4-element micro-block)
+      |          |          |          |
+      v          v          v          v
+  [4 S1P2 FP4 elements] x 16 = 64 elements total
+
+  Total: 64 elements + 32 bits of scaling metadata
+  Average = 4 + 32/64 = 4.5 bits/number
+
+#+end_example
+
+What does each level do?
+
+1. *L1 (E6M2, global)*: Establishes a coarse exponent baseline for the entire 64-element block. Two mantissa bits make it more expressive than MXFP4's E8M0.
+2. *L2 (1-bit micro-exponent, 8-element sub-block)*: Stacks a single bit (0 or 1) on top of L1 per 8 elements. Effectively a local "shift up by one" or "do nothing" on the L1 base.
+3. *L3 (1-bit micro-exponent, 4-element micro-block)*: Stacks yet another 0/1 micro-exponent per 4 elements.
+
+Why this design? *It further shrinks the contamination radius of a single outlier to just 4 elements.* If only one outlier sits in the block, L2 and L3 micro-exponents can "locally boost" the scale for that 4-element neighborhood, leaving the other 60 elements completely unaffected.
+
+Cost: +0.5 bits/number overhead (on par with NVFP4).
+Benefit: three-level scaling greatly improves robustness to outliers; the paper claims higher accuracy than NVFP4.
+
+*HiF4's diagnosis of NVFP4*: two scaling levels provide insufficient outlier isolation.
+*Its fix*: two additional 1-bit micro-exponent layers, shrinking the outlier contamination radius from 16 elements down to 4.
+
+** Act VI (This Paper, Feb 2026): Setting Up the Ring
+
+By this point, 4-bit quantization formats had proliferated: INT4, MXFP4, NVFP4, HiF4 … and every vendor's paper claimed to be best.
+
+*"Unleashing Low-Bit Inference on Ascend NPUs"* (arXiv:2602.12635) does exactly one thing: *it puts HiF8 and HiF4 on Ascend NPUs, runs them through a unified PTQ framework (GPTQ / AWQ / SmoothQuant, etc.), and systematically benchmarks them across mainstream LLM evaluation suites.*
+
+Three core conclusions:
+
+1. *INT8 vs. FP8 (the 8-bit tier)*: INT8 suits data with narrow distributions (e.g., normalized weights); FP8 / HiF8 suits data with wide distributions (e.g., outlier-laden activations). Neither is universally superior — it depends on the tensor's statistical character.
+
+2. *At 4-bit, INT-family formats simply collapse; FP-family formats hold up*: This is the most important finding — it empirically confirms that INT4 is no longer viable for LLMs, and that *HiF4's hierarchical scaling* is what prevents the collapse.
+
+3. *HiFloat is fully compatible with existing PTQ frameworks (GPTQ / AWQ / SmoothQuant)*: No algorithmic stack rewrite is required. This is a pragmatic victory: Ascend users can directly reuse quantization tooling from the NVIDIA ecosystem.
+
+*The real contribution* of this paper is not "inventing something new" — it is *providing an officially sanctioned PTQ recipe for Ascend customers*: buy a Huawei NPU, follow this recipe for 4-bit inference, and accuracy is guaranteed.
+
+** Act VII (2026, Ongoing): Where Is It Heading?
+
+- *HiFloat4 for pretraining* (arXiv:2604.08826): Not just inference — train directly in HiF4. Compared to MXFP4-based training, only a Random Hadamard Transform (RHT) is needed; stochastic rounding and Truncation-free scaling are unnecessary, simplifying the training pipeline.
+- *AMXFP4* (arXiv:2411.09909): Asymmetric microscaling, targeting the asymmetric distribution of activation outliers specifically.
+- *MX+* (MICRO 2025): Keeps the MX format unchanged but allows outlier elements to "borrow" their exponent bits for mantissa use, freely upgrading outlier precision at no format cost.
+
+* Summary Diagram
+
+#+begin_example
+
+  Problem Evolution: Why Is 4-bit LLM Quantization So Hard?
+  ==========================================================
+
+  [Core tension] activation outliers vs. low-bit precision
+
+  Era  | Problem Identified        | Core Solution Idea          | Problem Left Behind
+  -----|---------------------------|-----------------------------|------------------------------
+  2022 | INT8 breaks on outliers   | Use FP8 (with exponent      | At 4-bit, exponent and
+       | FP8 -- E4M3/E5M2          | bits)                       | mantissa both starved
+  -----|---------------------------|-----------------------------|------------------------------
+  2022 | Full-tensor INT4 collapses| Calibration + protect       | Inference requires
+       | -- GPTQ/AWQ               | salient weights             | dequantization; slow
+  -----|---------------------------|-----------------------------|------------------------------
+  2023 | INT4 scale range too wide | 32-element blocks share     | Coarse scale, block too large
+       | -- MXFP4 (OCP)            | one exponent (BFP)          |
+  -----|---------------------------|-----------------------------|------------------------------
+  2024 | MXFP4 scale too coarse    | Shrink block to 16, upgrade | One outlier still contaminates
+       | -- NVFP4 (NVIDIA)         | scale to FP8, add per-      | 15 neighbors
+       |                           | tensor FP32 backstop        |
+  -----|---------------------------|-----------------------------|------------------------------
+  2026 | NVFP4's two levels not    | Three-level scaling:        | +0.5-bit overhead, increased
+       | fine enough               | large-block E6M2 +          | hardware complexity
+       | -- HiF4 (Huawei)          | sub-block 1-bit micro-exp   |
+       |                           | + micro-block 1-bit micro-  |
+       |                           | exp                         |
+  -----|---------------------------|-----------------------------|------------------------------
+  2026 | No systematic comparison  | Run full PTQ suite on       | Cross-hardware comparison
+       | across FP4 formats        | Ascend + standard benchmarks| still missing
+       | -- this paper             |                             |
+  -----|---------------------------|-----------------------------|------------------------------
+
+  Trend: scaling granularity moves from "one global" -> "block-shared" -> "multi-level nested"
+         outlier contamination radius: entire tensor -> 32 -> 16 -> 4
+
+#+end_example
+
+* Insight
+
+Reading the full arc, you realize that what looks on the surface like a "FP4 format war" is underneath *an arms race over scaling granularity*.
+
+Every generation's advance follows the same formula: *make the shared scale finer, denser, more hierarchical* — and thereby push down the number of neighbors a single outlier can contaminate.
+
+- One scale for the whole tensor (INT4) → contamination radius = entire tensor → collapse
+- 32-element blocks (MXFP4) → contamination radius = 32 → barely workable
+- 16-element blocks (NVFP4) → contamination radius = 16 → approaching BF16 quality
+- 4-element micro-blocks (HiF4 third level) → contamination radius = 4 → claimed best
+
+The underlying trade is *spending metadata budget to buy computational precision*: everyone is working within a 4.25–4.5 bits/number envelope, spending 0.25–0.5 bits on scaling metadata to buy back precision inside each block.
+
+*Where does it go next?*
+
+1. *Keep cutting granularity*: 2-bit (S1P0)? Per-element micro-exponent? But each additional scaling layer raises hardware design complexity, circuit area, and power consumption. There is a physical ceiling.
+2. *Asymmetry*: AMXFP4 is already working on this. Activation distributions are naturally asymmetric (skewed positive), and symmetric formats waste half the representable space.
+3. *Cross-hardware standardization*: Today MXFP4 (OCP) is the standard, NVFP4 is NVIDIA's, HiF4 is Huawei's — the same model quantized on different hardware will yield different results. The next step is either merging the NVFP4/HiF4 approaches into a new standard, or middleware that performs *dynamic format conversion at inference time*.
+4. *Native FP4 training*: Eliminate the two-step "train in BF16 → PTQ to FP4" pipeline and train directly in FP4. GPT-OSS has already validated MXFP4 training; the HiF4 pretraining paper is following this same path.
+
+* Honest Caveats
+
+- This paper (arXiv:2602.12635) and the HiF4 spec (arXiv:2602.11287) are concurrent works from the same team; the citation relationship is explicit and clear.
+- HiF4 vs. NVFP4 / MXFP4 is a direct competitive comparison — the HiF4 paper explicitly lists NVFP4 as its SOTA baseline. This framing is credible.
+- MXFP4 (OCP) vs. early INT4 (GPTQ/AWQ) is not a strict "critique" relationship; it is more accurately a different path. The MX formats address the fundamental difficulty INT4 has with outliers, but the two tracks coexisted in 2023–2024.
+- The FP8 paper (2209.05433) vs. early INT8 quantization (LLM.int8(), SmoothQuant, etc.) is a broad contextual relationship, not a one-to-one rebuttal.
+- HiF8 (2409.16626) relative to FP8 (2209.05433): the differentiation is primarily a design philosophy ("tapered precision") rather than a surgical fix to a specific technical flaw. These two papers are more "different approaches" than "successive improvements."
+- The forward extensions (HiF4-pretrain, AMXFP4, MX+) are real, contemporaneous works, but whether they "improve upon this paper" requires checking citations carefully. This paper was published Feb 2026; AMXFP4 was already on arXiv Nov 2024 — AMXFP4 came first, so it is not a sequel.
+
+* References
+
+- This paper: https://arxiv.org/abs/2602.12635
+- HiF4 spec: https://arxiv.org/abs/2602.11287
+- HiF8 spec: https://arxiv.org/abs/2409.16626
+- HiF4 pretraining: https://arxiv.org/abs/2604.08826
+- OCP Microscaling: https://arxiv.org/abs/2310.10537
+- FP8 Formats: https://arxiv.org/abs/2209.05433
+- GPTQ: https://arxiv.org/abs/2210.17323
+- AWQ: https://arxiv.org/abs/2306.00978
+- SmoothQuant: https://arxiv.org/abs/2211.10438
+- AMXFP4: https://arxiv.org/abs/2411.09909
+- NVFP4 (NVIDIA blog): https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/

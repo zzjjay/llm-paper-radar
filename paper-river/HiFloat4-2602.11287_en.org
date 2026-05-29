@@ -1,0 +1,183 @@
+#+title:      HiFloat4 Format for Language Model Inference
+#+date:       [2026-05-29 Fri 04:06]
+#+filetags:   :paper:river:quantization:lowprecision:en:
+#+identifier: 20260529T040620-en
+#+source:     https://arxiv.org/abs/2602.11287
+#+authors:    Yuanyong Luo, Jing Huang, Yu Cheng, et al. (Huawei / Ascend, 22 authors)
+#+venue:      arXiv preprint, 2026
+
+* One-Line Summary
+
+This thread is not about "yet another 4-bit format." It addresses a more fundamental question: *when you have only 4 bits to describe a number, how do you carve out space to record "roughly how large this number is"?* Over five years, the industry's answer has grown increasingly like a set of Russian nesting dolls — one coarse scale nested inside a finer one, nested inside a finer one still.
+
+* Provenance Map
+
+#+begin_src text
+
+   [older]                                                              [newer]
+
+  vanilla BFP        MX4              MXFP4           NVFP4           HiF4
+  (~1990s)         (MS/Meta          (OCP             (Nvidia         (Huawei
+                    2023)             2023)           Blackwell       Ascend
+                                                       2024)           2026)
+     |               |                  |                |              |
+     |  "one group   |  "give each      |  "just let     |  "use FP8    | "three-layer
+     |   gets one    |   small octet    |   each element |   for scale  |  micro-exp
+     |   power-of-2  |   an extra 1-bit |   carry its    |   instead of |  nesting"
+     |   scale"      |   micro-exp"     |   own 2-bit    |   power-of-2"|
+     |               |                  |   micro-exp"   |               |
+     v               v                  v                v              v
+   range too       group too small    activation      scale hardware  4.5 bpp but
+   narrow          (5 bit/value to    quality poor    expensive +     maximum
+   (single layer)  fit in, precision  (weight-only)   needs extra     local dynamic
+                   actually worse)                    PTS             range
+
+      ----- one-level scale --->  two-level scale  -->  still one  -->  still one  -->  three-level
+
+#+end_src
+
+Note: the arrows do not represent 100% direct citation relationships, but each paper's introduction explicitly positions the previous entry as its comparison baseline, so this lineage is one the papers themselves lay out.
+
+* Forward Narrative: How a Number's "Ruler" Came to Be Nested Layer by Layer
+
+** The Starting Point: Why 4-Bit Is So Hard
+
+Let's lay out the problem clearly. You need *4 bits* to represent a weight or activation in a neural network. Four bits give you exactly 16 possible states. The trouble is that numbers inside neural networks span several orders of magnitude — some sit around 0.001, others around 100. Cramming that range into 16 states makes the error per value too large to be useful.
+
+The classic solution is *block floating point (BFP)*: pack a group of numbers (say, 32) together, *share a single exponent* (a common "order of magnitude" or "scale"), and let each number store only a 4-bit mantissa. Think of it this way — instead of writing "3.7 m, 4.2 m, 3.9 m," you write "in units of 1 m: 3.7, 4.2, 3.9." The word "metres" is factored out.
+
+This is the starting point of the whole story: *extract "roughly how large this number is" and share it.* Every subsequent evolution changes exactly this — how coarsely it is shared, how many layers of sharing there are, and what the shared ruler itself looks like.
+
+** First Generation MX4: One Scale Is Not Enough, So Add a "Fine-Grained Tier"
+
+Vanilla BFP has a well-known failure mode: if a single outlier sits in a group, it pulls the group scale up, squashing all the smaller values into a handful of indistinguishable states.
+
+Microsoft/Meta's 2023 MX4 had a straightforward response: *one scale is too coarse, so add a second, finer scale underneath it.* Concretely: every 16 values share one 8-bit coarse exponent (power-of-2, cheap hardware), and then every *2 values* share a 1-bit "micro-exponent," effectively subdividing each coarse bin into eight finer slots.
+
+This is a *two-tier structure*: the coarse exponent handles the group's overall magnitude; the 1-bit micro-exponent rescues the few small neighbours crushed by an outlier.
+
+But the scheme backfired. Count the bits: 4 bits per value, plus 1-bit micro-exp amortised per pair, plus an 8-bit coarse exponent amortised across 16 values (0.5 bit/value), totalling *5.5 bit/value*. To squeeze inside a 5 bit/value hardware budget the authors cut each element from 4-bit to 3-bit. The result: accuracy ended up *worse* than plain BFP4. AMD's Versal AI Edge skipped MX4 entirely, choosing MX6/MX9 instead.
+
+Lesson: *adding a layer makes conceptual sense, but how many bits you allocate to each layer is a critical budgeting problem.*
+
+** Second Generation MXFP4: Instead of Another Layer, Let Each Number Carry a Little Exponent of Its Own
+
+OCP (Open Compute Project, with Nvidia, AMD, and Huawei all involved) took a different road with 2023's MXFP4. It abandoned the idea of an extra micro-scale layer and instead changed the per-element format from *3-bit mantissa + 1-bit sign* to *E2M1* — 2-bit exponent + 1-bit mantissa + 1-bit sign. In other words: *rather than a centralised shared micro-exponent, every value carries its own private 2-bit exponent.*
+
+This is a subtle trade-off: each number has its own exponent, giving it better resilience against outliers; the cost is that the effective significand shrinks to just 1 bit. Group size is 32, amortising to 4.25 bit/value — cheap, and hardware-friendly because a power-of-2 scale can be handled with pure integer arithmetic. Nvidia, AMD, and Huawei all adopted it.
+
+But it has a fatal weakness: *activation values cannot tolerate it.* Weights are relatively static and quantisation loss is bearable, but activations have large dynamic ranges and sharply peaked distributions that the 1-bit mantissa of E2M1 simply cannot express. Consequently, in models like the GPT-OSS family, MXFP4 can only be applied weight-only — weights at 4-bit, activations still at BF16, which means the 4-bit compute units sit largely idle.
+
+Lesson: *"each value carries a little private exponent" eliminates one structural layer, but the precision ceiling is pinned down by the single mantissa bit.*
+
+** Third Generation NVFP4: Upgrade the Scale Itself from Integer to Floating-Point
+
+Nvidia's Blackwell introduced NVFP4 in 2024, targeting a more specific problem: MXFP4's group scale is *power-of-2* — it can only take values like …, 1/4, 1/2, 1, 2, 4, … NVFP4's answer: *represent the scale in FP8 (E4M3), making it a continuous floating-point value* that can more accurately align with each group's true maximum. Group size shrinks to 16; each element remains E2M1; average cost is 4.5 bit/value.
+
+It sounds appealing, but two new problems emerge.
+
+First, *E4M3's range is actually insufficient.* FP8-E4M3 can represent a maximum of roughly 448, with a minimum normal number around 2^{-6} — a span of only about 14 power-of-2 steps. For true large outliers or tiny tails, the scale must be divided by yet another per-tensor scale (PTS) to fit — meaning *NVFP4 is implicitly two-tier*: one per-tensor scale plus one per-group FP8 scale. Each additional software intervention costs throughput.
+
+Second, *an FP8 scale at group size 16 suddenly drives up hardware cost.* The original virtue of MXFP4 was that integer scales let matrix multiplication decompose into "do the integer multiply-accumulate first, then shift by a power of two at the end" — almost pure fixed-point. NVFP4's FP8 scale requires one floating-point multiply every 16 elements; the compute tiles fill with floating-point circuitry, and area and power both spike.
+
+Lesson: *increasing the expressiveness of the scale raises hardware cost proportionally, and the new range gap remains unfilled.*
+
+** Fourth Generation HiF4: Honestly Build Proper Three-Level Nesting
+
+By this point you can feel the tension: MX4 used a two-tier structure but allocated the bits too stingily; MXFP4 abandoned multi-tier in favour of E2M1 per-element exponents, leaving activations unusable; NVFP4 improved scale precision but missed the range problem and made hardware expensive.
+
+HiF4's answer is to redo MX4's *layered approach correctly*, and extend it to three tiers:
+
+1. *First tier: E6M2 coarse scale* (unsigned 8-bit float, 6-bit exponent + 2-bit mantissa). This tier governs the *global magnitude of the entire group.* Its 6-bit exponent covers ~69 binary orders of magnitude (binades) — more than three times the ~22 binades of NVFP4's FP8 scale. The range is large enough that no PTS is needed.
+2. *Second tier E1_8*: the 64 elements are divided into 8 sub-groups, each sharing one 1-bit micro-exponent.
+3. *Third tier E1_16*: subdivided further into 16 sub-groups, each with another 1-bit micro-exponent.
+
+Each element itself is encoded as *S1P2* (1-bit sign + 2-bit pure fraction, equivalent to E1M2, giving *3 significant bits* — one mantissa bit more than NVFP4/MXFP4's E2M1). Group size is 64, and the 32-bit metadata amortises to exactly 4.5 bit/value, identical to NVFP4.
+
+Placed side-by-side with MX4, the difference is clear: MX4 is "coarse exponent + one micro layer"; HiF4 is "coarse exponent + two nested micro layers" — picture it as *first reading the global water level across 64 elements, then the medium-scale fluctuation across each 8, then the local jitter across each 4.* The resulting local dynamic range is 4.81 binades, versus 3.58 for MXFP4/NVFP4, giving it meaningfully more headroom for outliers.
+
+The key insight is that the first-tier *E6M2 is not true floating-point*; it is specifically designed so that each group's maximum value maps precisely onto the representation's upper bound, keeping the core of the matrix multiplication in *fixed-point*. The hardware cost that plagued FP8-scale designs is sidestepped. The paper reports: the extra silicon area NVFP4 adds over an INT8 array is X; HiF4 adds only ~X/3, with ~10% lower power.
+
+** One-Line Summary of the Lineage
+
+#+begin_src text
+
+  Era          | Who      | Problem seen                      | Solution                          | What it left behind
+  -------------+----------+-----------------------------------+-----------------------------------+-----------------------------
+  vanilla BFP  | —        | shared scale not fine enough      | one power-of-2 scale per group    | one outlier ruins the whole group
+  MX4          | MS/Meta  | outlier disaster                  | add one 1-bit micro-exp layer     | bit budget too tight, worse than naive
+  MXFP4        | OCP      | extra layer is expensive          | each element carries 2-bit exp    | activations can't cope, weight-only
+  NVFP4        | Nvidia   | scale too coarse                  | upgrade scale to FP8              | range still short + hardware expensive
+  HiF4         | Huawei   | range + hardware + precision all unsolved | large E6M2 + two nested micro layers + S1P2 | (awaits the test of time)
+
+#+end_src
+
+* Problem–Solution Overview
+
+#+begin_src text
+
+   Core problem: 4 bits are insufficient to describe a number spanning orders of magnitude.
+   How do you extract and share the "order of magnitude" information?
+
+         Sharing granularity                     Sharing mechanism
+               |                                        |
+      +--------+--------+                    +----------+----------+
+      |                 |                    |                     |
+  one tier          multi-tier           integer scale         float scale
+  (vanilla BFP)   (MX4, HiF4)           (power-of-2)          (NVFP4)
+                                          cheap but coarse      precise but hardware-expensive
+                                               |
+                                           +---+---+
+                                           |       |
+                                         one     two layers
+                                        layer    (HiF4: E6M2 + E1_8 + E1_16)
+                                        (MX4)
+                                        bit budget too tight, accuracy regresses
+
+
+           ----- direction of evolution ----->
+
+   single-level scale  ->  elements carry own exponent (MXFP4)  ->  upgrade scale precision (NVFP4)
+                                          ->  return to layering but do it properly, three tiers (HiF4)
+
+   The core tension never changed: *within a 4.5 bit/value hardware budget, how do you fit
+   "coarse range + medium fluctuation + fine value" all at once?*
+
+#+end_src
+
+* Insights
+
+** What Is Actually Changing Beneath the Surface
+
+On the surface it looks like "format version numbers keep incrementing." Underneath, it is *an ongoing negotiation over how finely to share the numerical "context" of each value:*
+
+- Early consensus: context should be shared (one scale per group).
+- MXFP4 briefly swung toward: "let every number carry its own context (E2M1)."
+- NVFP4 split the difference: "context is still shared, but represented more precisely."
+- HiF4 returns to layered sharing, while accepting that *no single granularity of context-sharing can cover every scale of variation — you need several layers, each addressing a different scale of fluctuation.*
+
+Underlying this is a fact the community has been slowly internalising: *the distribution of numbers in a neural network is itself hierarchically structured* — a global tensor-level magnitude, per-channel medium-scale drift, and localised outlier spikes. If your format shares context at only one level, it will inevitably fail at another.
+
+** Where Things Might Go Next
+
+Three directions:
+
+1. *Dynamic or adaptive layering*: HiF4's three tiers are fixed as E6M2 / E1_8 / E1_16, but different layers and different attention heads clearly have different requirements at each tier. A natural next step is layer-wise or head-wise tuning of the bit allocation across the three tiers.
+2. *The same idea applied to 3-bit*: Now that layered precision has been worked out thoroughly for 4-bit, the obvious question is whether a HiF3 analogue can be built. At 8 states per element, the relative gain from multi-tier micro-exponents may actually be larger.
+3. *Co-design with sparsity and MoE routing*: 4-bit quantisation, activation sparsity, and MoE routing all pursue the same goal of "drop the bits that don't matter." The interfaces between these three techniques are still messy and largely unco-designed.
+
+* Integrity Check
+
+- *Problem as axis* — The thread "how do you share the order of magnitude of a number" runs throughout; individual papers are supporting evidence. OK
+- *Plain-language test* — Dense jargon is avoided throughout; analogies like "Russian nesting dolls" and "metres as a unit" are used. OK
+- *Difference as core* — Each section opens with "it saw this problem in the previous paper." OK
+- *No naked jargon* — E6M2, binades, and similar terms are all preceded by plain-language scaffolding. OK
+- *Unbroken causal chain* — The argument from vanilla BFP to HiF4 is causally connected at every step. OK
+- *Honest* — HiF4 is a 2026 preprint with no follow-up critics yet; the paper-river does not force a frontier extension. The MX4 → MXFP4 → NVFP4 → HiF4 comparison chain is sourced from the papers' own introductions and is trustworthy. The HiF8 8-bit line appears only as background context and is not spliced into the 4-bit main thread.
+
+* Meta-Information
+
+- Target paper: HiFloat4 Format for Language Model Inference (arXiv:2602.11287, Huawei Ascend, 2026)
+- Provenance depth: 4 layers (vanilla BFP → MX4 → MXFP4 → NVFP4 → HiF4), a critique chain explicitly laid out in the paper's own introduction
+- Frontier extension: none yet — HiF4 is too recent (2026) for clear follow-up critical work to exist
+- Related work from the same lab: HiF8 (arXiv:2409.16626), also from Huawei Ascend, the 8-bit counterpart sharing the same philosophy (tapered precision, hierarchical precision allocation) — readable as HiF4's spiritual predecessor

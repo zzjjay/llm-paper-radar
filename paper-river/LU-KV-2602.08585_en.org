@@ -1,0 +1,218 @@
+#+title:      Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+#+date:       [2026-05-29 Fri 03:51]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T035144-en
+#+source:     https://arxiv.org/abs/2602.08585
+#+authors:    Ziyao Tang, Pengkun Jiao, Xinhang Chen, Wei Liu, Shiyong Li, Jingjing Chen (Fudan University, Baidu)
+#+venue:      arXiv preprint, February 2026
+
+* One-liner
+
+Which tokens should be evicted from the KV cache? This is the story of an idea that evolved from "drop everything outside the window" all the way to "compute a return-on-investment for each individual attention head."
+
+* Provenance Map
+
+#+begin_example
+                                 [Root Problem]
+                                       |
+                                       v
+   2023      StreamingLLM       The first few tokens mysteriously can't be dropped
+   (drop outside window)         "attention sink" phenomenon
+                                       |
+                                       v
+   2023      H2O                  Only "heavy hitters" really matter
+   (keep highest cumulative        Cumulative attention score -> top-K
+    scores)
+                                       |
+                                       v
+   2024      SnapKV               Use the question itself to judge token importance
+   (keep high scorers in           Observation window at end of prompt
+    query window)
+                                       |
+                                       v
+   2024      AdaKV                Each head shouldn't share the same budget
+   (entropy-driven allocation)     Allocate by attention entropy per head
+                                       |
+                                       v
+   2026      LU-KV  *(this paper)* High score now ≠ useful later
+   (global opt on "long-horizon    Offline budget-utility curves per head
+    utility")
+                                       |
+                                       |---> Parallel branches:
+                                              CriticalKV (consider Value magnitude)
+                                              KeyDiff    (Key vector geometry)
+                                              HeadKV     (task-prior allocation)
+                                              CAKE       (spatial spread)
+#+end_example
+
+* Forward Narrative: From "Drop Outside the Window" to "ROI per Head"
+
+** Starting Point: Why the KV Cache Must Evict Tokens at All
+
+During Transformer inference, every newly generated token must attend to the (Key, Value) pairs of all preceding tokens. That collection of (K, V) pairs is the KV cache. The trouble is: as context length grows, the cache grows linearly and eats through GPU memory. A one-million-token context can exhaust an entire H100 just on cache storage alone.
+
+The most naïve fix: keep only the most recent N tokens in a sliding window and discard the rest. The cost is obvious — the model loses access to distant information. Every subsequent development in this line is an attempt to answer the same question: *"Which old tokens can we safely drop, and which cannot we drop?"*
+
+** Paper 1: StreamingLLM (2023) — Discovering the "Undiscardable" Tokens
+
+Once the naïve sliding window was deployed, something strange turned up: dropping the very first few tokens caused the model to collapse abruptly. These were ostensibly "meaningless" positions — BOS tokens, punctuation — yet somehow they were untouchable.
+
+*StreamingLLM* gave this phenomenon a name: *attention sink*. Their explanation: softmax must distribute probability mass somewhere, and the earliest tokens — by virtue of positional encoding — naturally become that "drain." The probability that has nowhere else to go pools there.
+
+The fix is elegantly simple: *always retain the initial few tokens plus the recent window*. Everything in between gets dropped. Long-context inference was suddenly stable.
+
+#+begin_example
+  StreamingLLM retention strategy:
+  [token_0 token_1 token_2 ... <dropped middle> ... token_{T-W} ... token_T]
+   ^^^^ sinks                                    ^^^^^^^^^^^^^^^^^^^^ window
+#+end_example
+
+*What it leaves unsolved:* Is the entire middle stretch truly useless? If the one token that actually answers your query happens to fall in the middle, it is silently discarded.
+
+** Paper 2: H2O (2023) — Not All Middle Tokens Are Equal
+
+StreamingLLM painted the middle with one broad stroke, but that middle segment contains "heavy" tokens. How do you identify them?
+
+*H2O (Heavy Hitter Oracle)* observed that not every token attracts the same amount of attention over time. Tallying up "how much cumulative attention each historical token has received from subsequent queries" reveals a long-tail distribution — a small minority of tokens absorb the vast majority of attention. These are the *heavy hitters*.
+
+The fix: stop keeping tokens by position (beginning / recent) and instead keep by *cumulative attention score* — top-K heavy hitters survive, the rest are evicted.
+
+#+begin_example
+  StreamingLLM:  retain by position  ->  beginning + recent
+  H2O:           retain by score     ->  whoever has been attended to most
+#+end_example
+
+*What it leaves unsolved:* The cumulative attention score is a historical signal — it reflects how much attention a token has received in the past. But is the token that future decoding steps will actually need always the one that ranked highest in the past? A token no one cared about yet might become critically relevant one sentence later. That case has no answer here.
+
+** Paper 3: SnapKV (2024) — Let the Query Itself Predict Importance
+
+H2O looks at attention that has already happened. SnapKV pushes further: since the entire prompt has already been prefilled, the query vectors in the *tail section of the prompt* — representing the model having "just finished reading the question" — provide an unusually strong signal about future relevance.
+
+The fix: designate a short tail segment of the prompt as an *observation window*, and use the queries in that window to score all earlier tokens. Whoever is attended to most by those queries gets retained. This is more focused than H2O's cumulative score because it locks onto tokens that are relevant to the *current task*.
+
+#+begin_example
+  H2O:    scores tokens using cumulative attention from all past queries
+  SnapKV: scores tokens using attention from only the prompt-tail window
+          (more task-specific)
+#+end_example
+
+*What it leaves unsolved:* Whether using H2O or SnapKV, both methods share one hidden assumption — *every attention head receives the same token budget*. Say the total budget is 8K tokens across 32 heads; each head gets exactly 256. But heads clearly specialize: some track short-range syntax, others anchor long-range context. A uniform budget is necessarily wasteful.
+
+** Paper 4: AdaKV (2024) — Heads Deserve Different Budgets
+
+AdaKV lifts the perspective from "selecting tokens within a single head" to "allocating budget across heads." The argument: a head with a *flat* attention distribution (high entropy) needs more budget — its information is spread across many tokens, so retaining few means leaking much. A head with a *sharp* distribution (low entropy) focuses on only a handful of tokens; a small budget suffices.
+
+The fix: pool all candidate tokens from all heads into a single global pool, and greedily pick the global top-K by proxy score. Each head's final allocation falls out naturally from the score ranking.
+
+#+begin_example
+  H2O / SnapKV: each head selects independently, with equal fixed budget
+  AdaKV:        all heads share one pool, global top-K, budget adapts to scores
+#+end_example
+
+*What it leaves unsolved:* Global top-K sounds smart, but it smuggles in a dangerous assumption — *proxy scores across different heads are comparable*. In practice, Head A and Head B may operate on entirely different score scales. Pooling them and sorting is like mixing Celsius and Fahrenheit readings in the same ranking. Worse yet: a high-scoring token within a head is not guaranteed to actually contribute to future generation — it may reflect a momentary attention preference that turns out to be noise in the long run.
+
+** Paper 5: LU-KV (2026, This Paper) — Compute the ROI for Each Head
+
+LU-KV reframes the problem entirely. It says: stop arguing about whose score is highest — that is a false question. The real question is: *"If I give one additional token of budget to a particular head, how much future-generation information do I recover?"*
+
+This is a marginal utility perspective. The approach has three concrete steps:
+
+*Step 1: Define "Long-horizon Utility" as the gold standard*
+
+For token position j in head (l, h), its true value is: across a future decoding window of K steps, what is the maximum magnitude this token can contribute to the output vector? Formally — look K steps ahead, find the maximum ~|attention * value * W_O|~. This is called *Oracle Importance*.
+
+Any heuristic score (H2O's cumulative, SnapKV's observation window) is merely an approximation of this Oracle Importance. The gap between approximation and oracle is the *Optimality Gap*.
+
+*Step 2: Offline calibration of "budget–utility" curves*
+
+For each head, run a calibration dataset offline and trace the curve: "when this head is allocated b tokens, how much of its Oracle Importance is preserved?" This produces a monotonically increasing, marginally decreasing curve per head.
+
+#+begin_example
+  utility ^
+          |          .------ Head A: saturates quickly, extra budget wasted
+          |         /
+          |        /            .---- Head B: long-term gains, extra budget worthwhile
+          |       /            /
+          |      /            /
+          |_____/____________/_______>  budget
+#+end_example
+
+*Step 3: Convex-hull relaxation + marginal-utility greedy allocation across heads*
+
+Take the convex hull of each curve, then distribute the total budget one unit at a time, always giving the next unit to the head with the highest current marginal return. Continue until the budget is exhausted. This is a combinatorial optimization problem; the convex-hull relaxation guarantees that the greedy solution is close to the global optimum.
+
+#+begin_example
+  AdaKV:  compare "whose score is highest" -> select tokens  (horizontal comparison)
+  LU-KV:  compare "whose marginal return is highest" -> allocate budget
+          (distribute funds across heads)
+#+end_example
+
+Key insight: the framework is *metric-universal* — the proxy score ~π~ can be H2O, SnapKV, KeyDiff, or anything else. LU-KV computes the optimal budget allocation on top of any of them. It does not replace the token-selection method; it replaces the *cross-head budget allocation* method.
+
+* Problem–Solution Compression Map
+
+#+begin_example
+   Stage        Problem Observed                  New Action
+  ------------------------------------------------------------------
+  StreamingLLM  Naive sliding window crashes       Always keep initial sinks + recent window
+                when dropping the first tokens
+       |
+       v
+  H2O           Middle segment also contains       Keep top-K by cumulative attention score
+                heavy hitters
+       |
+       v
+  SnapKV        Cumulative score is too diffuse,   Score with prompt-tail observation window
+                not task-specific
+       |
+       v
+  AdaKV         Equal budget per head is wasteful  Global top-K pool, budget follows scores
+       |
+       v
+  LU-KV         Scores across heads are            Offline budget-utility curve per head;
+                incomparable; score ≠ future        allocate by marginal return across heads
+                utility                             (any proxy score can plug in)
+#+end_example
+
+* Parallel Branches (Contemporary Directions)
+
+LU-KV focuses on the "how to allocate budget" dimension. Several parallel lines of work were evolving simultaneously, refining the *intra-head* side (which token to select):
+
+- *CriticalKV (2025)*: Redefines importance — not just attention magnitude, but also Value vector magnitude and the resulting perturbation to the final output after projection.
+- *KeyDiff (2025)*: Ignores attention scores entirely; uses *Key vector geometry* instead — a K vector that is geometrically "unique" is considered important.
+- *HeadKV (2025) / CAKE (2025) / PyramidKV (2024)*: Also address cross-head budget allocation, but use structural priors (task type, layer position) rather than learning curves from data the way LU-KV does.
+
+LU-KV is *orthogonal* to these directions: a new scoring function like KeyDiff can be plugged directly into LU-KV as the proxy ~π~, letting LU-KV's curves determine the optimal budget distribution on top of it.
+
+* The Core: What Is Actually Changing Along This Line
+
+On the surface this is a story about "smarter KV cache eviction," moving step by step from position → score → task → cross-head → marginal return.
+
+One level deeper, the entire trajectory is a *migration from local heuristics to a global optimization objective*:
+
+1. *StreamingLLM*: heuristic (positional rule)
+2. *H2O / SnapKV*: heuristic scores (proxy importance)
+3. *AdaKV*: global greedy, but still trusting heuristic scores
+4. *LU-KV*: expels heuristic scores from the decision stage — scores are only used to select tokens within a head; the budget-allocation step is driven by real, calibrated *long-horizon utility*
+
+One level deeper still, this is an *awakening to the incomparability of scores*. Earlier methods implicitly assumed "high score = important" and that global ranking was therefore valid. LU-KV is the first to say explicitly: scores from different heads cannot be compared horizontally; you must first learn each head's "score → true utility" transfer function before making any allocation decision.
+
+The same shift has occurred in many other fields — in machine learning, for instance, the move from raw probabilities to calibrated probabilities, or from top-K accuracy to expected calibration error. It is always the same cognitive leap: *the proxy metric is not the oracle; stop conflating the two.*
+
+* Where This Line Goes Next
+
+LU-KV drills the "cross-head budget allocation" problem all the way down to marginal utility, but several obvious next hops remain:
+
+1. *From offline to online*: The budget-utility curves currently rely on offline calibration and are zero-overhead lookup tables at inference time. Someone will build *dynamic online calibration* — curves that adapt as the input distribution shifts.
+2. *From head-level to finer granularity*: The current atomic unit is the head. Could one *draw separate curves by token type (entities, numbers, connectives, …)*? That would push the LU-KV idea one level further down.
+3. *Joint optimization with quantization*: "Eviction" is currently binary (keep or drop). Combining with *KV cache quantization* — storing unimportant tokens at lower bit-width rather than discarding them — would fold eviction and compression into a single optimization.
+4. *Unifying prefill and decoding*: The curves are fixed at the end of prefill, but attention patterns evolve during decoding, making those curves stale. Future work will pursue *rolling calibration* that updates across decoding steps.
+
+Overall trend: KV cache optimization is rapidly shifting from "engineering optimization" into a sub-field of "combinatorial optimization + calibrated learning." That is a healthy development — there is now a concrete, scoreable objective function to optimize against.
+
+* Honest Annotations
+
+- The critical-improvement relationships among StreamingLLM, H2O, SnapKV, and AdaKV are *explicitly cited and compared in LU-KV's Related Work and Methodology sections*.
+- CriticalKV, KeyDiff, HeadKV, CAKE, and PyramidKV are concurrent works cited by LU-KV; they do not sit on the main critique chain and are therefore listed under "Parallel Branches."
+- The "Where This Line Goes Next" section is extrapolation based on the evolutionary arc of this line of work, not claims made in the paper itself.
+- The provenance trace reaches four effective layers (StreamingLLM / H2O / SnapKV → AdaKV → LU-KV); going further back than StreamingLLM would enter the domain of basic Transformer / sliding-window fundamentals, where no meaningful "critical improvement" relationship exists.

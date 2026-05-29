@@ -1,0 +1,227 @@
+#+title:      Extending Puzzle for Mixture-of-Experts Reasoning Models with Application to GPT-OSS Acceleration
+#+date:       [2026-05-29 Fri 04:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T040914-en
+#+source:     https://arxiv.org/abs/2602.11937
+#+authors:    Bercovich, Ailon, Anisimov, ... El-Yaniv (NVIDIA, 24 authors)
+#+venue:      arXiv:2602.11937v2 (NVIDIA Technical Report, Mar 2026)
+
+* The River of Problems
+
+How do you run a trained large model with tens to hundreds of billions of parameters on a fixed set of GPUs — fast, accurate, and without retraining from scratch?
+
+The same bottleneck resurfaces again and again in this river: to "think deeper," models either grow larger (more experts) or stretch their context (longer reasoning traces). Both hit hardware ceilings — one starves memory bandwidth, the other exhausts KV cache capacity. Every generation asks the same question: can we push both walls back without touching training, by restructuring alone?
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: scale models up without linearly scaling compute
+  | Solution: pack many "experts" into one layer; each token activates only a few
+  v
+[2020] Beltagy et al. - Longformer (window attention)
+  |
+  | Problem: attention is O(L^2) in sequence length; long documents are intractable
+  | Solution: each token attends only to its W nearest neighbors;
+  |           KV usage drops from O(L) to O(W)
+  v
+[2023] Xiao et al. - StreamingLLM (attention sinks)
+  |
+  | Problem: naively truncating the KV cache causes immediate model collapse
+  | Solution: keep a few "sink" tokens at the front; add a sliding window;
+  |           streaming inference becomes stable
+  v
+[2024-25] Grattafiori / Bercovich - Llama-Nemotron + Puzzle
+  |
+  | Problem: redeploying a trained dense LLM on new hardware requires retraining
+  | Solution: decompose the network into a "block library"; use NAS + integer
+  |           programming to select a heterogeneous architecture per layer
+  v
+[2026] Bercovich et al. - Extending Puzzle to gpt-oss-puzzle-88B  <-- target paper
+  |
+  | Problem: porting Puzzle to MoE + long-reasoning models; all old scorers break
+  | Solution: heterogeneous expert pruning + long-context-sensitive window scoring
+  |           + FP8 KV + RL stitching
+  v
+[2026] HyperNova-60B (Multiverse Computing)
+       A contemporaneous alternative compression route for gpt-oss-120B, for comparison
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al.: Split One Layer into Many Experts, Call Only a Few Each Time
+
+*** What Problem Did It See
+
+The standard recipe then was: smarter model = wider and deeper network. But doubling parameters meant doubling compute — nobody could afford that. The real waste wasn't "too many parameters"; it was "every token has to pass through all parameters." A sentence like "Nice weather today" has no business using the full capacity of the network.
+
+*** Its Solution
+
+Slice the FFN layer into N small experts (e.g., 128), and place a tiny router in front. For each incoming token, the router picks only the top-k experts to compute (typically k=2). Total parameter count can explode, but per-token compute stays bounded.
+
+Analogy: Previously a company held an all-hands meeting for every project. Now it switches to "summon the 2 most relevant colleagues for each question." The payroll grows, but meeting costs stay flat.
+
+*** Why It Worked (and What New Holes It Left)
+
+It decoupled "model capacity" from "per-token compute" — the foundational idea behind modern large models. Switch Transformer, DeepSeek-V3, Qwen3, and gpt-oss all follow this path.
+
+The hole it left: experts are not equally important. Some are barely ever called; within some layers, experts are highly redundant. Nobody cared in 2017 — everyone was focused on "how do we even train this." That hole waited nine years to be systematically filled — which is exactly what this paper does.
+
+** 2020 | Longformer: Attention Doesn't Need to See the Whole Room, Just the Nearby Stretch
+
+*** What Problem Did It See
+
+Why is running Transformers on long documents so slow? Because every token computes a score against every preceding token. A 10K-token input produces a 10K × 10K attention matrix — storing it alone takes gigabytes. The KV cache grows linearly with length. A single legal contract brings the GPU to its knees.
+
+*** Its Solution
+
+Each token attends only to its W nearest neighbors via a sliding window. Attention complexity drops from O(L²) to O(L·W); the KV cache drops from O(L) to O(W), decoupled from sequence length.
+
+Analogy: At a noisy party you really only make out words from people within two meters. The brain already knows distant sounds can be dropped — and that actually improves efficiency.
+
+*** Why It Worked (and What New Holes It Left)
+
+For many tasks (language modeling, locally-dependent structure) distant tokens genuinely don't matter much. But it left two holes: (1) *some tasks truly need global context* (coreference resolution, long-range reasoning); (2) *swapping all layers to window attention causes collapse* — certain layers serve as global routing channels for long-range alignment. Those two holes were answered separately by StreamingLLM and Puzzle.
+
+** 2023 | StreamingLLM: For Streaming Inference, Don't Truncate Everything — Keep a Few "Anchor Tokens"
+
+*** What Problem Did It See
+
+If you naively truncate the KV cache to keep only the most recent W tokens, the model immediately breaks — perplexity spikes. Longformer's window was baked in during training, so it holds; plugging a window into a fully trained model only at inference time causes collapse.
+
+*** Its Solution
+
+The key observation: models treat the very first tokens as an "attention sink" — softmax always has probability mass to distribute, and when there is nowhere to put it, it falls on the beginning. By permanently keeping those few sink tokens and appending a sliding window, the model can stably process millions of tokens in a stream.
+
+*** Why It Worked (and What New Holes It Left)
+
+It showed everyone that *attention in a trained model* has structured preferences; blindly modifying KV triggers hidden dependencies. This became the baseline warning for all subsequent work on modifying attention at inference time.
+
+The hole it left: which layers and heads actually need global context? Which can safely be switched to window attention? StreamingLLM didn't answer that — it only provided a universal fallback. That question had to wait.
+
+** 2024–25 | Llama-Nemotron + Puzzle: Cast "Architecture Selection" as an Integer Program
+
+*** What Problem Did It See
+
+By 2024, deployment had become painful: the same Llama-3 70B needed to run on A100, H100, single-GPU, eight-GPU, short-context, and long-context configurations — each hardware target has a different optimal structure. Retraining every time the hardware changes is not economically viable.
+
+Worse, prior NAS work assumed training from scratch, making it incompatible with an already-trained large model.
+
+*** Its Solution
+
+Puzzle introduced *decomposed post-training NAS*:
+
+1. For each layer, assemble a "block library" — several candidate blocks (different head counts, different FFN widths, with/without attention, etc.).
+2. Key trick — *replace-1-block scoring*: to assess a candidate block, "plug" it into its position in the original model and measure how much the final output changes. Only one block is swapped at a time, no retraining, and scores are additive.
+3. Add measured latency for each block on the target hardware, then solve a Mixed Integer Program (MIP) to select the optimal block at every layer.
+4. After selection, run a short distillation pass to "heal" the seams.
+
+Analogy: Previously, buying clothes meant full bespoke tailoring. Puzzle is like disassembling the wardrobe into interchangeable parts (collar, sleeves, pockets), labeling each part with "how good it looks when worn" and "how much it costs to make," then letting the integer program assemble the best-value outfit.
+
+*** Why It Worked (and What New Holes It Left)
+
+Puzzle achieved 1.7–2.1× speedup on Llama-3 with almost no accuracy loss. It turned "model architecture" from an art problem into a solvable optimization problem.
+
+It left three holes — precisely what this paper (gpt-oss-puzzle-88B) is here to fill:
+
+1. *What about MoE?* Puzzle's block library was designed for dense FFNs. A MoE layer has 128 experts — how do you score them? Prune them? Respect the expert-parallelism deployment constraints?
+2. *How do you choose window attention layers?* What signal tells you "this layer can safely switch to window without accuracy loss"? Puzzle's replace-1-block score is a local next-token MSE, which is inherently blind to long-range dependencies.
+3. *How do you evaluate reasoning models?* The model doesn't just answer correctly or not — it generates reasoning traces of variable length. A model that looks faster per token, if its traces are twice as long, may actually be slower end-to-end. That is a new cost curve.
+
+** 2026 | gpt-oss-puzzle-88B: Pushing Puzzle to MoE + Long-Reasoning Models
+
+*** What Problem Did It See
+
+When trying to apply Puzzle to gpt-oss-120B (an open-source MoE reasoning model), three components of the prior work were insufficient:
+
+- *MoE experts cannot be swapped as entire blocks*: each layer has 128 experts with vastly different importance, but Puzzle's granularity is a full layer.
+- *No suitable score for long-context attention pruning*: for 120B in 128K-context scenarios, the KV cache is the true bottleneck, yet replace-1-block's next-token MSE cannot see long-range dependencies.
+- *Throughput metrics lie for reasoning models*: doubling tok/s means nothing if the trace also doubles, leaving request-level latency unchanged.
+
+*** Its Solution
+
+Four components stitched together:
+
+1. *Heterogeneous expert pruning.* For each MoE layer, build a block library that retains 8, 16, 32, 64, or all 128 experts — chosen independently per layer. Scoring uses not next-token loss but an *expert contribution score* (remove this expert; measure the MSE of the MoE layer's output), averaged over tokens. The result is stark: early MoE layers are critically important; later layers are highly redundant — so later layers are pruned aggressively, early layers barely touched.
+2. *Long-context-sensitive window-attention scoring.* Rather than local MSE, the full AA-LCR (Artificial Analysis Long-Context Reasoning) benchmark is used to identify which 8 of the 18 attention layers can safely switch from full attention to an 8192-token sliding window.
+3. *Distillation + RL stitching.* 84B tokens of distillation heal the seams; an RL phase follows, but two variants are trained under different effort recipes (one high-effort, one mixed-effort) and their weights are averaged — preventing a single RL run from inflating trace length.
+4. *FP8 KV-cache quantization.* On top of existing MXFP4 expert weights, FP8 KV quantization (max-calibrated, power-of-two scales) cuts KV cache capacity in half again.
+
+*** Why It Worked (and What New Holes It Left)
+
+The scorecard: 1.63× long-context speedup and 1.22× short-context speedup on 8×H100; 2.82× on a single H100. Accuracy across reasoning-effort settings lands at 100.8%–108.2% of the original (some benchmarks even exceed it).
+
+The more important byproduct: the authors explicitly state that *per-token throughput is misleading*, and propose request-level efficiency (throughput divided by average generated tokens per request) as the correct metric. This is the first time in this river that "reasoning trace length" is treated as a first-order constraint inside the optimization objective.
+
+New holes:
+
+- Window-layer selection is scored against one benchmark (AA-LCR) — could it overfit that benchmark's distribution?
+- Weight-averaging of RL checkpoints works well in practice but lacks interpretability — why does this averaging not hurt accuracy? Still a black box.
+- The pipeline depends heavily on NVIDIA's internal training stack (Megatron-LM, LNPT dataset); community reproduction requires assembling the entire ecosystem.
+
+* Frontier Extensions
+
+A contemporaneous comparison: *HyperNova-60B* (Multiverse Computing, 2026) also compresses gpt-oss-120B, but takes a different path — more aggressive parameter reduction, resulting in high per-token throughput but longer reasoning traces, which at the request level offer no net advantage. This neatly corroborates the central argument of this paper.
+
+As of May 2026, gpt-oss-puzzle-88B is the latest milestone on the *post-training NAS for MoE reasoning models* trajectory. The next logical directions:
+
+- Fold the RL phase into the search loop rather than treating it as a final patch;
+- Treat individual experts as first-class citizens in the NAS search space (currently only "how many to keep" can be chosen, not "which ones to regroup");
+- Refine long-context scoring below the layer level to the head level, deciding per head whether to apply a window.
+
+* A Single Diagram
+
+#+begin_example
+                Timeline ---------------------------------------------------------->
+
+   Capability Scaling (grow)                              Compression & Deployment (shrink)
+   -------------------------                              ---------------------------------
+   2017 MoE
+   "Many experts per layer,
+    activate only a few"  ----> Models grow larger ----> Deployment grows painful ---->  Puzzle (2024)
+                                                                                         "NAS for dense LLMs"
+                                                                                               |
+   2020 Longformer                                                                             |
+   "Window attention                                                                           |
+    solves O(L^2)"  ----> Long docs tractable ----> Long traces choke KV ---->               |
+                                                                                               |
+   2023 StreamingLLM                                                                           |
+   "Keep sink tokens;                                                                          v
+    modifying KV at inference                                                         gpt-oss-puzzle-88B (2026)
+    no longer crashes"  ----> Streaming viable ----> Which layers can switch? ---->  [This paper's target]
+                                                                                               |
+                                                                                    MoE heterogeneous pruning
+                                                                                    + window-layer selection (AA-LCR scoring)
+                                                                                    + FP8 KV
+                                                                                    + dual-variant RL merge
+                                                                                               |
+                                                                                               v
+                                                                                    Request-level efficiency
+                                                                                    becomes the new optimization target
+                                                                                    (per-token tok/s is no longer enough)
+#+end_example
+
+* Insight
+
+On the surface this line of work is about "making LLMs run faster." At its core, what is really happening is a *generational shift in the optimization objective*:
+
+- *Generation 1 (2017–2020)*: The objective is parameter capacity vs. compute — MoE is the answer.
+- *Generation 2 (2020–2023)*: The objective is sequence length vs. memory — window attention + sinks are the answer.
+- *Generation 3 (2024–2025)*: The objective is "trained model vs. diverse hardware" — Puzzle formalizes it as NAS + MIP.
+- *Generation 4 (2026, this paper)*: The objective becomes *per-request cost* — not how fast tok/s is, but "how many tokens, how much time, how many dollars does it take to answer one question."
+
+This is a quiet but profound pivot: in the reasoning-model era, *generation length is itself an endogenous variable* that can be amplified as a side effect of compression. Optimizing "speed per token" in isolation gets undermined by the model's own traces. The Puzzle team is among the few to have elevated this into a first-class metric.
+
+Where does this go next? Two directions seem likely:
+
+1. *Lower the search space to the expert level*: NAS currently only chooses "how many experts to keep"; the next step is "regroup, merge, or select different subsets per token."
+2. *Treat trace length as a controllable variable*: unify the RL phase, inference-time stop policy, and effort budget into a single optimization loop so the model learns by itself "when it is time to stop thinking."
+
+* Takeaways
+
+At least three points from this paper can be applied directly to your research or engineering practice:
+
+1. *If you are doing model compression*: ask yourself first — is your metric per-token or per-request? Once downstream models "think for a long time," per-token metrics will inevitably mislead you. Add a trace-length-normalized metric to your evaluation suite.
+2. *If you are doing architecture search*: Puzzle's replace-1-block idea (swap one block at a time, additive scores, integer-program synthesis) generalizes to any "trained baseline + heterogeneous target structure" scenario, not just LLMs.
+3. *If you are building long-context systems*: do not assume "any layer can be swapped to window attention equally safely." Run a genuine long-context task (not next-token loss) as a layer-sensitivity analysis before deciding which layers to convert. This is the most directly reusable methodology in the paper.

@@ -1,0 +1,208 @@
+#+title:      Attn-QAT: 4-Bit Attention With Quantization-Aware Training
+#+date:       [2026-05-29 Fri 04:26]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T042634-en
+#+source:     https://arxiv.org/abs/2603.00040
+#+authors:    Peiyuan Zhang, Matthew Noto, Wenxuan Tan, Chengquan Jiang, Will Lin, Wei Zhou, Hao Zhang
+#+venue:      arXiv 2026
+
+* The River of the Problem
+
+The attention mechanism is the most expensive component in large language models. Can we slash its arithmetic precision from 16 bits to 4 bits — letting GPUs run faster and consume less memory — without sacrificing model quality?
+
+The problem is hard because attention has an inherently skewed distribution. Its intermediate results look like a whip: most values cluster near zero, with a handful of wildly large outliers. FP4, a new format with only 15 representable values, simply chops off nearly all the information when the whip cracks. People solved the linear layers long ago; attention has resisted for nine years. This river is about how to make attention humble enough to move into a 4-bit house.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNNs are sequential and slow
+  | Solution: rely entirely on attention, discard recurrence
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | Problem: the N×N attention matrix is too large to fit in memory
+  | Solution: tiling + recompute instead of store in backward (IO-aware)
+  v
+[2024] Zhang et al. - SageAttention (v1)
+  |
+  | Problem: attention is still FP16/BF16 at inference; still expensive
+  | Solution: quantize Q/K to INT8 at inference, smooth outliers
+  v
+[2024] Zhang et al. - SageAttention2
+  |
+  | Problem: INT8 still not frugal enough — can we go INT4?
+  | Solution: per-thread INT4 + more aggressive outlier smoothing
+  v
+[2025] Zhang et al. - SageAttention3
+  |
+  | Problem: Blackwell has native FP4 tensor cores that need to be fed
+  | Solution: microscaling FP4 + two-level P quantization
+  v                                                  + inspiration
+[2026] Zhang et al. - Attn-QAT  <-- target paper         | (linear-layer QAT)
+  |                                                       | DeepSeek-V3, FP8-LM,
+  | Problem: SageAttention3 is PTQ; 4-bit quality suffers | NVFP4 pretraining,
+  | Solution: first to truly embed QAT in FlashAttention  | LLM-QAT, BitNet a4.8
+  |           backward pass
+  v
+[2025] Dao et al. - FlashAttention-4 (cutting-edge forward kernel)
+       future integration target
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Attention Is All You Need: Letting the Model See the Whole Sentence at Once
+
+*** What Problem Did It See
+
+At the time, machine translation and language modeling were dominated by RNNs/LSTMs. The trouble with RNNs is that they must read from the first word to the last, one step at a time, with no parallelism. The longer the sentence, the slower the training — like squeezing toothpaste one drop at a time. And when two distant words needed to "communicate," the signal had to propagate through dozens of recurrent steps, blurring along the way.
+
+*** Its Solution
+
+Vaswani et al. took a bold approach: throw out all the recurrence. Every word directly computes a "match score" with every other word in the sentence, pulling in the information of whoever is relevant. This is attention — a query Q computes dot products with a set of keys K, softmax normalizes the result, then a weighted sum over values V is taken. Everything is computed in one shot, letting the GPU parallelize freely.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The parallelism gain is real, but the cost is computing an N×N attention matrix, where N is the sequence length. As N grows, this matrix explodes memory. That is the buried trap: attention is elegant, but it is the sworn enemy of long contexts. For the next five years, half the deep-learning community fought that N×N problem.
+
+** 2022 | FlashAttention: If It Won't Fit, Don't Store It
+
+*** What Problem Did It See
+
+By 2022, everyone wanted longer contexts, but that N×N table simply could not fit in the GPU's fast on-chip SRAM. It had to live in slow HBM, and computing attention meant shuttling data back and forth many times. The bottleneck was not arithmetic — it was data movement.
+
+*** Its Solution
+
+Tri Dao realized: there is no reason to store that big table in full. Tile Q, K, and V into small blocks, process one block at a time, accumulate partial results directly into the output, and never materialize the full intermediate matrix. For the backward pass? Recompute instead of saving. It sounds like redundant work, but because it eliminates memory traffic, it is actually faster. This is "IO-aware" attention.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It saved memory and ran faster — everyone adopted it. But FlashAttention fused the forward and backward passes into a single tightly integrated operator. Its backward relies on an identity (reconstructing the attention probabilities P from the logsumexp saved during the forward pass) that implicitly assumes the forward and backward use the same numerical precision. That assumption is the powder keg for the next four years: the moment you lower the forward precision (FP8, FP4) while keeping the backward in BF16, the identity breaks and gradients explode.
+
+** 2024 | SageAttention: Dressing Inference Attention in an 8-Bit Suit
+
+*** What Problem Did It See
+
+FlashAttention fixed the memory problem, but attention arithmetic was still in BF16. Linear layers had long enjoyed INT8/FP8 inference, yet attention remained untouched — the biggest cost at inference time. Why had nobody quantized attention? Because the distribution of QK^T before softmax is treacherous: a few tokens produce attention scores that are enormous outliers. A naive INT8 clip destroys them.
+
+*** Its Solution
+
+SageAttention was the first to make 8-bit attention "plug and play." Two key ideas: first, subtract the mean from Q and K (called "Q/K smoothing") to push the distribution toward center, making outliers less extreme; second, keep the attention probabilities P in FP16 for high precision, and quantize only the QK^T and PV steps. The result: nearly 2× faster inference with negligible quality loss.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It proved that attention can be quantized. But it only touched inference, not training; and the 8-bit headroom was already fully used. The next step would be INT4, where the outlier problem is ten times worse, and the smoothing trick would no longer be enough.
+
+** 2024 | SageAttention2: One More Notch Down to 4 Bits
+
+*** What Problem Did It See
+
+8 bits saved half the bandwidth, but Blackwell GPUs were on the horizon with INT4/FP4 throughput double that of INT8. Staying at INT8 meant leaving half the hardware's potential on the table. But INT4 has only 16 representable values — any outlier throws everything into chaos.
+
+*** Its Solution
+
+SageAttention2 made quantization granularity much finer — not "one scale factor shared across a whole block," but per-thread (each GPU thread gets its own scale). Combined with more aggressive Q/K smoothing, this made INT4 attention viable in practice.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It pushed the PTQ + heuristic-smoothing approach all the way to INT4. But the further you compress, the heavier the cost: preprocessing pipelines, complex statistics, a growing zoo of per-thread state to manage. And all of this is a patch applied at inference time — the model weights were never told during training that they would eventually be quantized to 4 bits. In essence, it is locking the stable door after the horse has bolted.
+
+** 2025 | SageAttention3: Embracing FP4 + Microscaling
+
+*** What Problem Did It See
+
+Beyond INT4, Blackwell also natively supports FP4 (including NVFP4 with microscaling). FP4 is better than INT4 at representing distributions with long tails, because floating-point naturally spans multiple orders of magnitude. But FP4 has only 15 values — still desperately few.
+
+*** Its Solution
+
+SageAttention3 embraced the microscaling standard: a small block (e.g., 16 or 32 values) shares a single FP8 scale factor, while each individual value is stored as FP4. This captures FP4 compute benefits while locally adapting to the distribution of each region via per-block scaling. For the attention probabilities P, they introduced "two-level quantization" — one coarse pass, one fine pass — to preserve the small-probability terms as well as possible.
+
+*** Why It Worked (and What New Pit It Dug)
+
+By this point the PTQ line had been pushed to its limit. The paper itself acknowledges: FP4 attention quality still degrades noticeably. The reason is fundamental — you are applying a pile of training-oblivious patches to a problem that should have been addressed at training time. The more complex the patches, the heavier the inference preprocessing, and the lower the quality ceiling. It was time to change the paradigm: tell the training phase that quantization is coming.
+
+** 2026 | Attn-QAT: The First True QAT Inside Attention
+
+*** What Problem Did It See
+
+Linear layers have had QAT for years (quantization-aware training: simulate quantization error during training so the model learns to be robust to low precision). But nobody had done it for attention. Why? Because FlashAttention's backward pass is a highly fused operator containing an implicit assumption that forward and backward share the same numerical precision. A naive FP4 forward + BF16 backward breaks that identity, causing gradient explosions.
+
+Worse still: every previous FP4 attention paper relied on hand-crafted heuristics — Q/K smoothing, two-level P quantization. Could you instead drop all heuristics entirely and simply let training teach the model to work natively in FP4?
+
+*** Its Solution
+
+Two guiding principles:
+
+1. *The backward pass must also recompute P in low precision.* FlashAttention's backward reconstructs the attention probabilities; since the forward already computed them in FP4, the backward should recompute them in FP4 too, keeping both sides consistent.
+2. *Fix the implicit precision assumption in the backward.* Concretely, this means introducing a high-precision auxiliary output O' that restores the identity that only held under full precision.
+
+These two principles are then implemented in fused Triton kernels: FP4 forward, QAT-aligned FP4 backward. Result: without any outlier-smoothing heuristics, the quality loss from FP4 attention is largely recovered by QAT; end-to-end speedup is 1.5× on an RTX 5090.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It works because it moves the problem to the right level: not "how do we salvage quality at inference" but "let's settle the account at training time." Remaining challenges: it has only been validated on the RTX 5090 (a consumer GPU); the forward kernel is not yet integrated with FlashAttention-4's SM100 implementation; QAT inevitably adds training overhead whose scalability remains to be demonstrated.
+
+* Frontier Extensions
+
+The most recent point on this line is Attn-QAT itself. It points toward a clear integration target: once the FlashAttention-4 (Dao et al., 2025) CuTe-DSL forward kernel stabilizes, replacing the Attn-QAT training stack's forward with it should further unlock FP4 compute on large datacenter GPUs.
+
+On a parallel axis, FP4 training for linear layers (NVFP4 pretraining, FP4 all the way, Optimizing LLM training with FP4) is already ahead — only after attention QAT is resolved does end-to-end FP4 training of a full transformer truly close the loop. From this perspective, Attn-QAT is the last missing brick in the "FP4 end-to-end" wall.
+
+* One Diagram to See It All
+
+#+begin_example
+                        Attention Quality Fidelity
+                            ^
+                FP16/BF16   |  (Transformer 2017, FlashAttention 2022)
+                  Original  |   "Full-precision era"
+                            |   Saving memory != saving compute
+                ----------- |  -------------------------------------
+                            |
+                INT8 infer  |  (SageAttention 2024)
+                  PTQ       |   Plug-and-play, but inference-only
+                            |   8-bit compute budget fully spent
+                ----------- |  -------------------------------------
+                            |
+                INT4 infer  |  (SageAttention2 2024)
+                  PTQ +     |   Finer-grained scale + heavier smoothing
+                  heuristic |   Preprocessing grows ever heavier
+                  patches   |
+                ----------- |  -------------------------------------
+                            |
+                FP4 infer   |  (SageAttention3 2025)
+                  PTQ +     |   Microscaling + two-level P quantization
+                  micro-    |   Quality ceiling can no longer be held
+                  scaling   |
+                ----------- |  -------------------------------------
+                            |
+                FP4 train   |  (Attn-QAT 2026)   <-- paradigm shift
+                  QAT       |   Training is told quantization is coming
+                  aligned   |   Zero heuristics, quality recovered
+                  backward  |
+                            |
+                            +-------------------------------------------> Time
+                          2017    2022    2024    2025    2026
+
+         Dimension evolution:  Precision: BF16 -> INT8 -> INT4 -> FP4 -> FP4
+                                Phase:     train -> infer -> infer -> infer -> train
+                                Weapon:    algo  -> IO   -> PTQ  -> PTQ  -> QAT
+#+end_example
+
+* Insights
+
+On the surface, this line looks like "precision keeps dropping." At its core, it is "the problem keeps being moved earlier."
+
+At first, everyone patched things at inference time — quantization, smoothing, per-thread scales, all after-the-fact fixes. Generation after generation of patches, each layer paying a preprocessing tax, until FP4 made the bill truly unpayable. The turning point of Attn-QAT is moving the same problem from the inference end to the training end: rather than desperately forcing a model that knows nothing about low precision to endure FP4, simply tell it during training "you will be FP4," and let it evolve its own internal resistance.
+
+This is a recurring pattern — *the earlier a physical constraint is exposed to training, the more the model will find internal representations that adapt to it.* Linear-layer INT8/FP8/FP4 training walked the same road: PTQ → QAT → native low-bit training. Attention lagged by a few years, not for lack of ideas, but because FlashAttention's fused backward was too hard to open up; nobody wanted to break it apart. Attn-QAT broke it apart, and the road is clear.
+
+The next directions are obvious: (1) native pretraining with FP4 attention + FP4 linear layers end-to-end, no longer in two stages; (2) scale-up validation after FlashAttention-4 integration; (3) the reverse question — if attention can be QAT-trained, will the remaining high-precision strongholds like softmax and LayerNorm fall next?
+
+* Takeaways
+
+Research finding: *When an optimization path starts accumulating patches, it is a signal the paradigm needs to change.* Watching the SageAttention series grow increasingly complex preprocessing from v1 to v3 should have been the tell that PTQ was approaching its ceiling and the real breakthrough lay upstream — in the training phase.
+
+Engineering finding: *Don't be afraid to break apart someone else's fused operator.* FlashAttention is the foundation of nearly everyone's infrastructure, but its fused backward was exactly the roadblock for QAT. When there is no way around something, take it apart and rewrite it — don't treat "it's the standard" as a reason to leave it untouchable.
+
+The practical takeaway: in your own domain, if you find that performance increasingly depends on hand-crafted heuristics, ask yourself — should this problem be moved to the training stage? If you are working on low-precision inference optimization, keep a close eye on the QAT line; it will eventually absorb the PTQ work you are doing now. If you work on infrastructure (compilers, kernels, runtimes), be wary of designs that rigidly weld multiple precision assumptions together in the name of fusion — leaving a door open is worth far more than the small overhead it saves.

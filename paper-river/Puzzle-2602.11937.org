@@ -1,0 +1,223 @@
+#+title:      Extending Puzzle for Mixture-of-Experts Reasoning Models with Application to GPT-OSS Acceleration
+#+date:       [2026-05-29 Fri 04:09]
+#+filetags:   :paper:river:
+#+identifier: 20260529T040914
+#+source:     https://arxiv.org/abs/2602.11937
+#+authors:    Bercovich, Ailon, Anisimov, ... El-Yaniv (NVIDIA, 24 authors)
+#+venue:      arXiv:2602.11937v2 (NVIDIA Technical Report, Mar 2026)
+
+* 问题之河
+
+一个已经训练好的、几百亿到上千亿参数的大模型，怎么在一张（或一组）固定型号的 GPU 上，跑得又快、答得又准，还不重新训一遍？
+
+这条河里反复出现的卡点是同一句话：模型为了"想得更深"，要么把网络做大（更多专家），要么把上下文拉长（更长推理轨迹）。两件事都顶到硬件的天花板上——一个吃显存带宽，一个吃 KV cache 容量。每一代人想的都是：能不能不动训练，只动结构，把这两堵墙往后推一点。
+
+* 溯源地图
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | 问题: 想把模型做大但又不想算力线性涨
+  | 解法: 一层里塞很多"专家"，每个 token 只点亮少数几个
+  v
+[2020] Beltagy et al. - Longformer (window attention)
+  |
+  | 问题: 注意力对序列长度是 O(L^2)，长文档跑不动
+  | 解法: 每个 token 只看附近的 W 个邻居，KV 用量从 O(L) 降到 O(W)
+  v
+[2023] Xiao et al. - StreamingLLM (attention sinks)
+  |
+  | 问题: 真正去截断 KV，模型立刻崩
+  | 解法: 保留最前面几个 "sink" token，剩下用 window，长流推理才稳
+  v
+[2024-25] Grattafiori / Bercovich - Llama-Nemotron + Puzzle
+  |
+  | 问题: 训练好的稠密 LLM 想换硬件部署，每次都重训不现实
+  | 解法: 把网络拆成"积木库"，用 NAS + 整数规划挑出一套异质结构
+  v
+[2026] Bercovich et al. - Extending Puzzle to gpt-oss-puzzle-88B  <-- 目标论文
+  |
+  | 问题: 把 Puzzle 搬到 MoE+长 reasoning 模型时，老打分器全失灵
+  | 解法: 异质专家裁剪 + 长上下文敏感的窗口打分 + FP8 KV + RL 缝合
+  v
+[2026] HyperNova-60B (Multiverse Computing)
+       同期另一条压缩 gpt-oss-120B 的路线，作为对照
+#+end_example
+
+* 演化叙事
+
+** 2017 | Shazeer 等: 把"一层"拆成一堆专家，每次只叫几个上工
+
+*** 它看到了什么问题
+
+那年的标准做法是：想要更聪明，就把网络做更宽、更深。但参数翻一倍，算力也翻一倍，没人扛得起。问题不是"参数太多"，而是"每个 token 都要把所有参数过一遍"——这一步是浪费。一句"今天天气真好"，根本用不上整张网络的容量。
+
+*** 它的解法
+
+把 FFN 这一层切成 N 个小专家（比如 128 个），前面再放一个小小的 router。每来一个 token，router 只挑 top-k 个专家算（典型 k=2）。参数总量可以爆炸，但每 token 的算力被限制住。
+
+类比：以前是一家公司每个项目都让所有员工开会；现在改成"按问题领域召集 2 个最对口的同事"，工资单照样涨，开会成本却没变。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"模型容量"和"每 token 算力"解耦了——这是现代大模型的根。后来 Switch Transformer、DeepSeek-V3、Qwen3、gpt-oss 全是这条路。
+
+留下的坑：专家不是均匀重要的。有些专家几乎不被叫到，有些层的专家之间高度冗余。但 2017 年时没人关心这个，因为大家都在拼"怎么训得起来"。这个坑要等 9 年才有人系统地去填——就是本文做的事。
+
+** 2020 | Longformer: 注意力不要看全场，看身边一段就够
+
+*** 它看到了什么问题
+
+Transformer 跑长文档为什么慢？因为每个 token 都要对前面所有 token 算一个分数。10K token 的输入，注意力矩阵就是 10K × 10K，光存下来就 GB 级别。KV cache 还要随长度线性涨。一篇法律合同就让 GPU 跪了。
+
+*** 它的解法
+
+每个 token 只看自己前后 W 个邻居（一个滑动窗口）。注意力复杂度从 O(L²) 降到 O(L·W)，KV cache 从 O(L) 降到 O(W)，跟序列长度脱钩。
+
+类比：你在嘈杂的派对里听人说话，其实只听清楚旁边 2 米内的人——大脑早就知道远处的声音可以丢，效率反而更高。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+对很多任务（语言建模、局部依赖）来说，远处的 token 真的没那么重要。但留下两个坑：(1) *少数任务真的需要全局*（比如指代消解、长程推理）；(2) *直接把所有层换成 window 会塌方*——某些层是负责"远距离对齐"的全局通道。这两个坑分别由 StreamingLLM 和 Puzzle 来回答。
+
+** 2023 | StreamingLLM: 想流式跑就别全截，留几个"地基 token"
+
+*** 它看到了什么问题
+
+如果只是简单地把 KV cache 从头截掉、只保留最近 W 个 token，模型立刻发疯——困惑度暴涨。Longformer 那种 window 在训练时就用了，所以稳；可现成模型只在推理时套 window，会崩。
+
+*** 它的解法
+
+观察到：模型把前几个 token 当成"注意力垃圾桶"——softmax 总有点概率要放出去，没地方放就放给开头。把这几个 sink token 永远保留下来，再加上一个移动窗口，模型就能稳定地处理几百万 token 的流。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它告诉所有人：*已训练模型* 的 attention 是有结构性偏好的，盲目改 KV 会触发隐藏依赖。这成了后续所有"在推理阶段动 attention"工作的基本提醒。
+
+留下的坑：到底哪些层、哪些 head 是真的需要全局上下文？哪些可以安全换成 window？StreamingLLM 没回答，只是给了一个 universal 的兜底方案。
+
+** 2024-25 | Llama-Nemotron + Puzzle: 把"挑结构"当成一道整数规划
+
+*** 它看到了什么问题
+
+到了 2024 年，部署变成了一件痛苦的事：同一个 Llama-3 70B，要在 A100、H100、单卡、八卡、短上下文、长上下文上各跑一遍，每种硬件最优的结构都不一样。如果每换一次硬件就重训一次，没人玩得起。
+
+更糟的是，前人 NAS（神经架构搜索）都假设"从头训"，跟一个已经训好的大模型不兼容。
+
+*** 它的解法
+
+Puzzle 提出 *decomposed post-training NAS*：
+
+1. 对每一层，准备一个"积木库"——几个候选块（不同 head 数、不同 FFN 大小、有/无 attention 等等）。
+2. 关键技巧 *replace-1-block scoring*：要评估某个候选块好不好，把它"插"到原模型的对应位置，看模型最终输出变化多少。一次只换一块，不重训，分数可加。
+3. 加上每块在目标硬件上的实测延迟，解一个混合整数规划（MIP），选出每层的最优组合。
+4. 选完之后做一次短期蒸馏，把缝合的伤口"愈合"。
+
+类比：以前买衣服要全套定制；Puzzle 是把衣柜拆成可换的零件（领子、袖子、口袋），给每个零件标好"穿上之后多好看"和"做工要花多少钱"，然后整数规划帮你拼出最划算的一套。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+Puzzle 在 Llama-3 上拿到了 1.7-2.1× 提速，几乎不掉点。它把"模型架构"从一个艺术问题变成了一个可求解的优化问题。
+
+留下三个坑——这正是本文 (gpt-oss-puzzle-88B) 要解的：
+
+1. *MoE 怎么办*：原 Puzzle 的积木库是为稠密 FFN 设计的，MoE 一层有 128 个专家，怎么打分？怎么裁？怎么不破坏专家并行的部署约束？
+2. *Window attention 怎么选*：用什么信号判断"这层能换成 window 不掉点"？原 Puzzle 的 replace-1-block 打的是次 token 的局部 MSE，对长程依赖天生看不见。
+3. *Reasoning 模型怎么评*：模型不只是答对答错，还会生成长短不一的 reasoning trace。一个看起来更快的模型，如果 trace 长了 2 倍，端到端反而更慢——这是个新的成本曲线。
+
+** 2026 | gpt-oss-puzzle-88B: 把 Puzzle 推到 MoE + 长 reasoning 模型上
+
+*** 它看到了什么问题
+
+要把 Puzzle 套到 gpt-oss-120B（一个开源 MoE reasoning 模型）上时，前作的三个零件都不够用：
+
+- *MoE 的专家不能整块替换*：每层 128 个专家，重要性差别巨大，但 Puzzle 的积木是"整层"。
+- *长上下文的注意力裁剪没有合适分数*：120B 在 128K 上下文场景里，KV cache 才是真正的瓶颈，而 replace-1-block 的 next-token MSE 看不到远距离依赖。
+- *Reasoning 模型的吞吐指标会骗人*：tok/s 翻倍，如果 trace 也翻倍，请求级别延迟反而没变。
+
+*** 它的解法
+
+四件事缝合：
+
+1. *异质专家裁剪*。给每个 MoE 层准备一个积木库——保留 8、16、32、64 或全部 128 个专家的版本，每层独立挑。打分时不靠 next-token loss，改成 *专家贡献分*（去掉这个专家，MoE 层输出的 MSE 是多少），再做 token 维度的平均。结果非常直白：模型前几层 MoE 极其重要，后面的层冗余得多——所以后段大刀阔斧裁，前段几乎不动。
+2. *长上下文敏感的 window-attention 打分*。直接用 AA-LCR（Artificial Analysis Long-Context Reasoning）整套 benchmark 跑分，而不是局部 MSE，去判断哪 8 层（共 18 层）可以从全局注意力换成 8192 token 的滑动窗口。
+3. *蒸馏 + RL 缝合*。84B token 蒸馏把替换的伤口愈合；再跑一段 RL，但用两个不同 effort 配方训出两个变体（一个高 effort 一个混合 effort）做权重平均，避免单一 RL 把 trace 越拉越长。
+4. *FP8 KV-cache 量化*。在已有 MXFP4 专家权重之上，加一层 FP8 KV 量化（max-calibrated、scale 取 2 的幂），把 KV cache 容量再砍一半。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+成绩单：8×H100 上长上下文 1.63× 提速、短上下文 1.22×；单卡 H100 上 2.82×。准确率在不同 reasoning effort 上 100.8%-108.2%（部分还反超原模型）。
+
+更重要的副产品：作者明确说 *per-token 吞吐量是骗人的*，应该用 request-level efficiency（吞吐量 / 每请求平均生成 token 数）来衡量。这是这条河第一次把"reasoning trace 长度"作为一阶约束放到优化目标里。
+
+新坑：
+
+- 选层是用一个 benchmark (AA-LCR) 来打分的，会不会过拟合那一个 benchmark 的分布？
+- RL 检查点平均虽然好用，但解释性差——为什么这样平均不掉点？还是黑箱。
+- 这套流程深度依赖 NVIDIA 自己的训练栈（Megatron-LM、LNPT 数据集），社区想复现还要凑齐整个生态。
+
+* 前沿延伸
+
+同期出现的对照线：*HyperNova-60B*（Multiverse Computing, 2026）也是把 gpt-oss-120B 压缩了，但走的是另一条路——更激进地砍参数，结果 per-token 吞吐高，但 reasoning trace 也变长，到了 request 级别反而没占到便宜。这恰好印证了本文的核心论点。
+
+截至 2026 年 5 月，gpt-oss-puzzle-88B 是这条 *post-training NAS for MoE reasoning models* 路线上的最新一站。下一步合理的方向：
+
+- 把 RL 阶段也并入搜索循环，而不是放在最后做修补；
+- 把"专家"作为一等公民放进 NAS 搜索空间（现在只能选"保留多少个"，不能选"重组哪几个"）；
+- 长上下文打分还能更细：不只是层级别，而是 head 级别决定要不要 window。
+
+* 一张图看懂
+
+#+begin_example
+                时间轴 ------------------------------------------------------------>
+
+   能力扩展 (做大)                                                  压缩部署 (做小)
+   ------------------                                              ------------------
+   2017 MoE
+   "每层多专家,
+    只点亮少数"  ----> 模型越来越大 ----> 部署越来越痛 ---->  Puzzle (2024)
+                                                              "稠密 LLM 的 NAS"
+                                                                    |
+   2020 Longformer                                                   |
+   "window attention                                                 |
+    解 O(L^2)"   ----> 长文档跑得动 ----> 长 trace 又卡 KV ---->     |
+                                                                    |
+   2023 StreamingLLM                                                 |
+   "保留 sink token,                                                 v
+    推理期改 KV 不崩"  ----> 流式可用 ----> 哪些层能换? ---->  gpt-oss-puzzle-88B (2026)
+                                                              [本文目标]
+                                                                    |
+                                                              MoE 异质裁剪
+                                                              + window 选层 (AA-LCR 打分)
+                                                              + FP8 KV
+                                                              + RL 双变体合并
+                                                                    |
+                                                                    v
+                                                              request-level efficiency
+                                                              成为新的优化目标
+                                                              (per-token tok/s 不够了)
+#+end_example
+
+* 洞见
+
+这条线表面是"怎么把 LLM 跑快一点"，骨子里发生的事是 *优化目标的代际更迭*：
+
+- *第一代 (2017-2020)*：目标是参数容量 vs 算力——MoE 是答案。
+- *第二代 (2020-2023)*：目标是序列长度 vs 内存——window attention + sink 是答案。
+- *第三代 (2024-2025)*：目标是"训练好的模型 vs 多样化硬件"——Puzzle 把它形式化成 NAS+MIP。
+- *第四代 (2026, 本文)*：目标变成 *请求级成本*——不是 tok/s 多快，而是"答完一个问题花多少 token、多少时间、多少美元"。
+
+这是个静悄悄但很深的转折：reasoning 模型时代，*生成长度本身是一个内生变量*，会被压缩手段反向放大。所以单独优化"每 token 多快"会被自己的 trace 反噬。Puzzle 团队是少数把这件事变成 first-class metric 的。
+
+下一步往哪走？合理猜测两个方向：
+
+1. *搜索空间下沉到专家级别*：现在 NAS 只能选"保留几个专家"，下一步是"重组、合并、按 token 选不同子集"。
+2. *Trace 长度作为可控变量*：把 RL 阶段、推理时的 stop policy、effort budget 都纳入同一个优化循环，让模型自己学会"什么时候该停止想"。
+
+* 启发
+
+对你的研究/工程实践，至少三点可以直接用：
+
+1. *如果你在做模型压缩*：先问自己——你的指标是 per-token 还是 per-request？一旦下游模型会"想很久"，per-token 指标必然骗你。给自己加一条 trace-length normalized 的 metric。
+2. *如果你在做架构搜索*：Puzzle 的 replace-1-block 思路（一次只换一块、分数可加、整数规划合成）适用于任何"有训好基线、想要异质结构"的场景，不限 LLM。
+3. *如果你在做长上下文系统*：不要假设"window attention 哪层换都一样"。用一个真正的 long-context 任务（不是 next-token loss）做层级敏感性分析，再决定换哪几层。这是本文最容易复用的方法论。

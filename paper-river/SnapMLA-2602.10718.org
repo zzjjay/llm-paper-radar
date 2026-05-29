@@ -1,0 +1,213 @@
+#+title:      SnapMLA: Efficient Long-Context MLA Decoding via Hardware-Aware FP8 Quantized Pipelining
+#+date:       [2026-05-29 Fri 04:03]
+#+filetags:   :paper:river:
+#+identifier: 20260529T040341
+#+source:     https://arxiv.org/abs/2602.10718
+#+authors:    Yifan Zhang, Zunhai Su, Shuhao Hu, Rui Yang, Wei Wu, Yulei Qian, Yuchen Xie, Xunliang Cai (Meituan)
+#+venue:      arXiv 2026
+
+* 一句话
+
+为什么 DeepSeek 那套"压缩 KV 缓存"的注意力机制，到了 FP8 这一步就跑不动了——SnapMLA 倒着把这条 FP8 加速链一节节挖回去，看见了一个被所有人忽略的小尾巴：RoPE。
+
+* 溯源地图
+
+#+begin_src text
+
+  2017                     2022             2023            2024                 2025                 2026
+   |                        |                |               |                    |                    |
+   v                        v                v               v                    v                    v
+
+  Attention            FlashAttention    FlashAttn-2     MQA/GQA            MLA (DSv2/v3)         FlashMLA           SnapMLA
+  Is All You Need  -->  (tile + recom)  --> (split-K) --> (share K,V)  -->  (low-rank KV)  -->   (FA for MLA)  -->   (FP8 MLA)
+   "标准注意力"            "I/O 才是瓶颈"   "GPU 占用低"   "KV 太占显存"      "再压一个数量级"      "FA 适配 MLA"        "再降一半带宽"
+        |                       |              |              |                    |                    |                  ^
+        |                       |              |              |                    |                    |                  |
+        +-----------------------+--------------+--------------+--------------------+--------------------+------------------+
+                                              FlashAttn-3 (FP8) ----------------------------------+
+                                                "在 H100 上用 FP8 跑标准注意力"                   |
+                                                                                                  v
+                                                                                            被 SnapMLA 改造
+
+  每根箭头标注: "后者看到了前者的什么问题"
+
+  Attention      --[太慢, 显存爆炸]--> FlashAttention
+  FlashAttention --[GPU 没吃满]-----> FlashAttention-2
+  Standard MHA   --[KV cache 太大]--> MQA/GQA
+  MQA/GQA        --[共享头掉精度]---> MLA
+  Pre-Hopper     --[H100 没用上]----> FlashAttention-3
+  MLA + FA3      --[FA3 套不上 MLA]-> FlashMLA
+  FlashMLA       --[BF16 还是慢]----> SnapMLA (FP8)
+  SnapMLA -------+
+                 |
+                 +--> 看见: RoPE 那一小撮值跟其他不一样
+
+#+end_src
+
+* 故事: 一条线被一节节逼出来
+
+** Beat 0 —— 标准注意力 (2017): 起点
+
+最朴素的写法。每个 token 算 Q、K、V 三个向量。Q 跟所有 K 算相似度，softmax 一下，再加权 V。
+
+公式简单，问题也简单: 当序列长度变成 8K、32K、128K，那张 Q*K 的相似度矩阵就是 N x N。32K 的话就是 10 亿个数。算得慢，更要命的是显存——一张 A100 80GB 都装不下。
+
+这里就埋了第一颗钉子: 注意力的瓶颈不在算力，在显存搬运。但 2017 年没人意识到。
+
+** Beat 1 —— FlashAttention (2022): "I/O 才是瓶颈"
+
+Tri Dao 看了一眼说: 你们 GPU 显存搬来搬去，根本没在算。注意力慢不是因为计算多，是因为那个 N x N 的中间矩阵反复在 HBM (显存) 和 SRAM (片上高速) 之间来回搬。
+
+他的解法极朴素: 把注意力切成小块 (tiling)，每一小块都在片上 SRAM 里算完，softmax 也想办法分块算完。中间结果根本不落地。
+
+结果: 显存从 O(N²) 降到 O(N)，速度反而更快。
+
+留下的问题: 这个分块方案在 GPU 占用率 (occupancy) 上还有空间——很多线程在等。
+
+** Beat 2 —— FlashAttention-2 (2023): "GPU 还没吃满"
+
+FA1 是按 batch 和 head 切的，剩下的并行度不够，A100 上的算力没榨干。
+
+FA2 把切的方式翻过来——按序列长度也切一刀 (split-K)，重新设计了循环顺序，让更多 warp 同时干活。
+
+到这里"标准注意力"这条线，在 Ampere (A100) 上算是定型了。
+
+但与此同时，另一条线开始变粗——*KV cache*。
+
+** Beat 3 —— MQA / GQA (2019/2023): "KV 太占显存"
+
+推理阶段，每生成一个新 token，都得保留前面所有 token 的 K 和 V。32 层 x 32 头 x 4096 维度 x 32K token——KV cache 经常比模型权重还大。
+
+MQA (Multi-Query) 说: 所有头共享同一份 K、V，只让 Q 多头。
+GQA (Grouped-Query) 折中: 几个头共享一组 K、V。
+
+立竿见影地降显存。但代价是: 表达能力下降，长上下文上掉点。
+
+** Beat 4 —— MLA (DeepSeek-V2/V3, 2024): "再压一个数量级"
+
+DeepSeek 看 GQA 觉得不够狠。它问: 既然 K、V 大部分信息冗余，能不能干脆把 KV 压缩到一个 *低维潜空间* 里，用的时候再投影回来？
+
+这就是 *Multi-head Latent Attention*。每个 token 只存一个低维向量 (latent KV)，需要 K、V 时通过两个投影矩阵实时还原。KV cache 从几十 GB 砍到几 GB。
+
+但 RoPE (旋转位置编码) 在这套压缩里水土不服: RoPE 跟绝对位置耦合，没法和"压缩潜变量"一起被压。DeepSeek 的妥协是 *decoupled RoPE*——把 K 拆成两半: 大头是被压缩的"内容部分"，小尾巴是没压缩的"位置部分 (RoPE)"，两半拼接。
+
+这个小尾巴，就是后面所有故事的引爆点。
+
+** Beat 5 —— FlashAttention-3 (2024): "把 FP8 用起来"
+
+Hopper (H100) 出来了，自带 FP8 张量核，理论吞吐是 BF16 的两倍。但 FA2 不会用。
+
+FA3 把整个 kernel 重写一遍: 异步搬运、warp 之间流水、关键的乘法用 FP8。还有一招很巧——*on-the-fly transposition*: WGMMA 指令对操作数的内存布局非常挑剔，FA3 在寄存器里实时转置，让所有 GEMM 都能直接喂进去。
+
+但 FA3 的设计假设是: *整个注意力数据流是同质的 (uniform)*。所有 K、V 都按一样的方式做 FP8 量化，一套 scale 走到底。
+
+而 MLA 的 K 是异质的——一半压缩内容，一半 RoPE 小尾巴。FA3 的"统一 FP8 数据通路"踩到了这个不对称的结构，直接套用就会出问题。
+
+** Beat 6 —— FlashMLA (2025): "把 FA 适配 MLA"
+
+DeepSeek 自家先动手: 把 FA 的 tiling 和异步机制移植到 MLA 的 latent KV 上，写了 FlashMLA。这一步主要解决"FA 假设的 KV 布局" vs "MLA 的低秩 KV 布局"之间的鸿沟。
+
+但 FlashMLA 还是 BF16。decode 阶段——一个一个 token 往外吐的时候——带宽还是吃紧。下一步显然是 FP8。
+
+可一旦想上 FP8，前面所有伏笔同时引爆。
+
+** Beat 7 —— SnapMLA (2026): 三个雷一起拆
+
+SnapMLA 把"FP8 + MLA + decode"放在一起的时候，发现 FA3 那套方案在三个地方崩了。
+
+*雷一: RoPE 这个小尾巴量纲完全不一样*
+
+他们做了直方图: 内容部分的数值紧紧聚在 0 附近，普通分布。RoPE 部分能甩到正负 1000，还有一条长长的离群点尾巴。
+
+如果硬用一套 FP8 scale 去量化整根 K 向量，RoPE 那撮值要么爆，要么把内容部分压成 0。FP8 只有 8 bit，根本没法兼顾两个量级差三个数量级的子向量。
+
+*解法很直接*: RoPE 部分根本不量化，保留 BF16。只对内容部分上 FP8。叫 *RoPE-Aware Per-Token Quantization*。
+
+为什么要 per-token 而不是更省的 per-tensor 或 per-block？因为 decode 是逐 token 生成的，新 token 来一个量化一个，per-token 最自然。per-block 的话总会留下"块尾的不完整 token"，要写一堆 buffer 管理代码，而且实验显示精度还差一截。
+
+*雷二: PV GEMM 的 scale 对不上*
+
+MLA 为了省显存，K 和 V 在缓存里其实共享同一份 latent 表示。FA3 的 k-major layout 要求 V 的量化 scale 沿着"K 的 token 维度"分布——但这个维度在 PV GEMM (P x V，attention 概率乘 V) 里恰好是 *reduction 维度*，是被求和掉的那一维。
+
+标准的 FP8 GEMM 是这样工作的: 算完之后乘一个 scale 就完事 (per-tensor) 或乘一列 scale (per-row)。但 reduction 维上的 scale 没法在 GEMM 之后再补——它们已经被加在一起，scale 信息丢了。
+
+他们的解法是把 PV 计算流水线重新设计了一遍，让 scale 在被 reduction 吞掉之前就以正确方式参与运算。论文里叫 *Quantized PV Computation Pipeline Reconstruction*。
+
+*雷三: 没人写过这种 kernel*
+
+vLLM、SGLang 这些主流推理框架没有现成的"MLA + FP8 + decode"代码。SnapMLA 干脆从头写了一套端到端的 kernel，把异步 copy、量化、GEMM、dequant 拼成一条不间断的流水。叫 *End-to-End Dataflow Optimization*。
+
+*结果*: 长输出场景吞吐最高提升 1.91x，精度跟 BF16 baseline 几乎一样。
+
+* 问题-解法总览
+
+#+begin_src text
+
+  +-----------------------------------------------------------------------+
+  |                      KV 缓存的演化, 一条挤水分的线                    |
+  +-----------------------------------------------------------------------+
+
+  [问题]                            [解法]                       [新问题]
+
+  N x N 矩阵装不下显存       -->  FlashAttention 分块         -->  GPU 没吃满
+                                  (省显存, I/O 优化)
+
+  GPU 没吃满                 -->  FA2 重排循环 + split-K      -->  KV cache 太大
+                                  (Ampere 跑满)
+
+  KV cache 太大              -->  MQA/GQA 共享 K/V            -->  长上下文掉精度
+                                  (粗暴减头数)
+
+  GQA 掉精度还是占地方       -->  MLA 低秩压缩 latent KV      -->  RoPE 没法压, 拆出小尾巴
+                                  (DeepSeek-V2/V3)
+
+  H100 FP8 用不上            -->  FA3 统一 FP8 通路 + WGMMA   -->  假设 KV 同质, 不适配 MLA
+                                  (Hopper 提速)
+
+  FA3 不适配 MLA             -->  FlashMLA: FA 移植到 latent  -->  仍是 BF16, decode 带宽紧
+                                  (DeepSeek 自家)
+
+  MLA decode 想上 FP8        -->  SnapMLA 三件套:             -->  ?
+                                   1. RoPE 留 BF16, 其他 FP8
+                                   2. PV pipeline 重构对齐 scale
+                                   3. 自己造端到端 kernel
+                                  ==> 1.91x 吞吐, 精度持平
+
+  +-----------------------------------------------------------------------+
+
+  内核观察: 整条线的隐藏主角是 "异质性"
+  ----------
+  - MHA 是同质的: 所有头平等, FA 系列爽快通用
+  - GQA 引入了第一道异质: 头分组
+  - MLA 引入了第二道异质: K 的子向量, 压缩部分 + RoPE 部分
+  - SnapMLA 终于直面这道异质: 不再追求 "一套数据通路打天下",
+    而是 "对每个子结构用最合适的精度"
+
+#+end_src
+
+* 洞见
+
+*1. 这条线的真问题不是"加速"，是"异构化"*
+
+表面上每一代都在"更快、更省"。但底层悄悄发生的事是: 注意力机制本身从一个 *同质结构* (所有 K 平等) 不断变成 *异质结构* (压缩部分 + 位置部分 + 不同精度需求)。
+
+而所有的 kernel 优化 (FA、FA2、FA3) 都建立在"同质性"假设上。MLA 是第一个真正打破这个假设的设计，但前两年大家都在用"打补丁"的方式硬塞 (FlashMLA)。SnapMLA 是第一个承认: 这个结构必须异构对待，量化策略也得跟着异构。
+
+*2. RoPE 是这条线上一个反复被低估的角色*
+
+最早 RoPE 只是个位置编码方案，谁会想到它在 MLA 里成了第一个"压不动的子向量"，在 FP8 量化里又成了第一个"量不了的子向量"。每一代新机制都在 RoPE 这儿绊一下。
+
+下一步如果有人重新设计 *FP8 友好的位置编码*——比如能跟内容部分共用 scale 的位置表示——可能会比继续优化 kernel 更有价值。
+
+*3. 下一步往哪走*
+
+- *FP4 / NVFP4 在 Blackwell 上的 MLA 适配* —— FP8 这条路 SnapMLA 已经走通，下一档精度更低，异构性的问题会更严重，可能逼出更激进的"分子向量量化"方案
+- *训练阶段的 FP8 MLA* —— SnapMLA 只解决推理 decode。训练阶段反向传播对数值更敏感，同样的 RoPE 异构问题在梯度里会更难处理
+- *把 MLA 的潜空间设计跟量化策略一起协同设计* —— 现在是"先有 MLA，再去想怎么量化"。如果把"量化友好"作为 MLA 设计的一阶约束，可能会得到完全不同的架构
+
+* 诚实标注
+
+- *确认的引用关系*: SnapMLA 明确批判/改进 FA3 和 FlashMLA。明确建立在 DeepSeek-V2/V3 MLA 之上。
+- *推测的关系*: SnapMLA 与 KIVI、KVQuant、RotateKV 的关系——论文只是在引言简单列了它们作为"KV 量化方向的背景工作"，并未直接对比。我把它们放在地图里只是为了让读者理解"KV 压缩"这条平行线，不是 SnapMLA 直接的前驱。
+- *没找到第 5 层奠基*: Attention is All You Need (2017) 是当然的起点，但 SnapMLA 没有递归批判它——这是为了把演化线讲完整而补的源头节点，不是论文自己的引用链。
+- *后续工作*: 2026 年 5 月发表，目前还没有清晰的"后续批判它的工作"被广泛引用，所以"前沿延伸"那一段写成了"下一步可能往哪走"。

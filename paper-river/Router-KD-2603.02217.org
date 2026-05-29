@@ -1,0 +1,271 @@
+#+title:      Is Retraining-Free Enough? The Necessity of Router Calibration for Efficient MoE Compression
+#+date:       [2026-05-29 Fri 04:32]
+#+filetags:   :paper:river:moe:compression:
+#+identifier: 20260529T043218
+#+source:     https://arxiv.org/abs/2603.02217
+#+authors:    Sieun Hyeon, Jaeyoung Do
+#+venue:      arXiv 2026 (preprint, 2026-02-10)
+
+* 这条线讲的是什么
+
+一个被所有人忽略十年的简单问题：
+
+  *如果你把专家换了，那个负责"分派任务"的小调度员怎么办？*
+
+MoE 模型的核心是一群专家加一个路由器。路由器看到一个 token，决定派给哪几个专家。整个生态都在卷专家——怎么把专家剪掉一半、合并一批、压缩成低秩——但路由器从来没人动。
+
+这篇论文的发现简单到让人尴尬：你把专家改了，路由器还按老地图找人，那不就找错门了吗。
+
+所以倒读这条线，不是去看"MoE 压缩怎么越做越精巧"，而是去看一个更朴素的问题：*一个为旧世界训出来的调度员，在新世界里到底有多失灵*。
+
+* 溯源地图
+
+#+begin_src text
+
+  2017                2021              2024 Jan        2024 Oct
+  +--------------+   +------------+   +-----------+   +-----------+
+  | Shazeer MoE  |-->| Switch     |-->| Mixtral   |-->| HC-SMoE   |
+  | (sparse gate)|   | Transformer|   | (8 expts) |   | (merging) |
+  +--------------+   +------------+   +-----------+   +-----------+
+        |                   |              |              |
+        | 让 MoE 真          | 一个 token    | 开源 MoE     | 第一次系统
+        | 工作的"路由"       | 只走一个      | 落地         | 地"砍专家"
+        v                                  |              v
+  独立想法                                  v          2025
+                                       DeepSeekMoE     +-----------+
+                                       /Qwen3-MoE      | REAP      |
+                                       (128 细粒度)    | (pruning) |
+                                            |          +-----------+
+                                            |              |
+                                            |              | 用 router
+                                            v              | gate 决定
+                                       专家又多又小         | 剪哪个
+                                                          v
+                                       +---------------------------+
+                                       |  Router-KD (本文, 2026)   |
+                                       |  问：你们都改了专家，      |
+                                       |  路由器怎么不更新一下？    |
+                                       +---------------------------+
+
+#+end_src
+
+* 第零层：Shazeer 2017 —— 给神经网络装了个调度员
+
+在这之前，神经网络是"全员上岗"——每个参数对每个输入都要算一遍。模型想变大，算力就跟着线性涨。这条路撞墙了。
+
+Shazeer 那篇 "Outrageously Large Neural Networks" 干的事，用一句话说：
+
+  *与其让所有专家都看每个题目，不如先派一个调度员看一眼题目，决定派给哪两三个专家。*
+
+这就是 *Sparse MoE*。一个 token 进来，先过一个小小的"门"（router/gate），门挑出 top-k 个专家，只有这几个专家算，剩下的睡觉。模型参数可以做到极大（容量大），但单次推理的算力只跟那 k 个专家有关。
+
+留下的伏笔： 那个"门"是和专家一起训出来的。它学到的是"看到 X 类 token 就派给 3 号专家"——一张深深绑死了当下专家身份的地图。
+
+* 第一层：Switch Transformer 2021 —— 把 k 砍到 1，证明这条路能落地
+
+Shazeer 的方案虽然漂亮，但 top-2/top-4 路由在分布式训练里通信开销巨大。Switch Transformer 看到了这个问题，做了一刀很激进的简化：
+
+  *每个 token 只去 1 个专家。*
+
+(top-1 路由)
+
+这听起来像在自残——表达力少了一大半。但他们证明：只要专家足够多、训练稳定性处理好，单专家路由能 scale 到万亿参数。MoE 从一个炫技 idea 变成了一个工业级方案。
+
+留下的伏笔： 整个社区开始接受"专家很多"是常态。一旦专家多到几十上百，路由器面对的就不再是"在 4 个选项里选"，而是"在 128 个选项里选 top-8"——一张更复杂、更依赖专家身份的地图。
+
+* 第二层：Mixtral 2024 —— 把 MoE 开源，所有人开始关心怎么部署它
+
+Switch 是 Google 内部的事，社区拿不到模型。Mixtral 8x7B 把这件事变成了大众问题：
+
+  *一个 47B 参数的开源 MoE，性能逼近 70B dense 模型，但你要装得下 47B 才能跑。*
+
+Mixtral 用的是 8 个专家、每 token 选 2 个的 *粗粒度 MoE*。问题立刻浮出水面：
+
+  - 推理算力只有 13B 的量级，但显存要扛 47B
+  - 大部分时间 6 个专家在睡觉，硬件资源被"占着不用"
+
+这个矛盾直接催生了一整条压缩研究线：*既然大部分专家平时不用，能不能干脆把它们处理掉？*
+
+留下的伏笔： Mixtral 只有 8 个专家。它太"宽"了——一个专家就是 7B，剪一个掉一大块能力。这条线在 Mixtral 上玩不开，得等更细粒度的 MoE 出现。
+
+* 第二层并行：DeepSeekMoE / Qwen3-MoE —— 把专家切得又多又小
+
+差不多同时，DeepSeek 和 Qwen 走了另一条路：
+
+  *把专家数量从 8 涨到 128，每个专家做小一点。*
+
+(细粒度 MoE，fine-grained MoE)
+
+这就给压缩开了大门。128 个专家里剪掉几十个，每次只损失 0.78% 的容量，可调空间巨大。从此压缩研究有了真正能玩的目标——*在 128 选 8 的世界里，哪些专家最该砍？*
+
+* 第三层：HC-SMoE 2024 —— 第一次系统地"合并专家"
+
+HC-SMoE 是 ICML 2025 的工作，看到了第一个明确的问题：
+
+  *Mixtral 这种粗粒度 MoE，每个专家都很重要，你不能直接扔。但也许可以"功能相似的专家合并成一个"。*
+
+它的做法：
+
+  1. 拿一批校准数据过模型，记录每个专家的输出
+  2. 用层次聚类，按输出相似度把专家分组
+  3. 同组的专家加权平均成一个
+
+(retraining-free expert merging via hierarchical clustering)
+
+这里有个微妙的细节：HC-SMoE 强调用 *专家输出* 而不是 *router logits* 来聚类。理由是——router 是数据集相关的，换个 benchmark 就漂了。
+
+  *他们已经隐约意识到："router 不太可信"，但解决方案是绕开 router，不是修 router。*
+
+留下的伏笔： 合并完了，路由器还在指着"3 号专家"，但 3 号已经变成了"3 号和 7 号的平均"。这张地图过期了，但没人觉得是个事。
+
+* 第三层并行：REAP 2025 —— 用 router 的 gate value 决定剪谁
+
+REAP（Cerebras Research）走了相反的方向：
+
+  *别合并了，合并会"功能子空间坍缩"。直接剪。*
+
+他们的核心论点：合并两个专家的本质是把 router 对它们的"独立选择权"砍掉了，因为合并后 router 只能整体调用，不能分开。这个损失是不可逆的。
+
+REAP 的剪枝标准：
+
+  显著性 = router 给这个专家的门控值 x 专家输出的范数
+
+(router gate value × activation norm)
+
+也就是说，*REAP 第一次显式地依赖了 router 的输出*。它信任 router 告诉它"谁不重要"。剪完之后，router 还是那个 router，只是某些专家的索引被 mask 掉了。
+
+留下的伏笔： REAP 信任 router 来挑该剪谁，但剪完之后没人问一句——*那 router 现在指着的那些"还活着"的专家，权重还合理吗？* 它派给 3 号的概率是基于"还有 1-128 号一起竞争"算出来的。现在只剩 80 个专家了，这个概率分布还对吗？
+
+* 第三层并行：MoBE / TD-MoE —— 把专家做低秩分解
+
+第三条线是"编辑专家"——MoBE、TD-MoE 这些方法把专家矩阵做 SVD/Tucker 分解，保留主成分，扔掉小奇异值。专家个数不变，但每个专家瘦身了。
+
+逻辑还是一样：*改了专家，路由器不动*。
+
+* 第四层：Router-KD 2026 —— 把所有人忽略的那个问题问出来
+
+到这里，三条线都跑了一阵子：剪、并、编。各自卷各自的"怎么动专家"，性能恢复到一定程度就卡住了。
+
+这篇论文的作者做了一件谁都能做、但谁都没做的事：
+
+  *他们把压缩前后的 router 输出画了出来。*
+
+(Section 3.5, Figure 2 of the paper)
+
+实验：拿 Qwen3-30B-A3B-Instruct，100 条 ELI5 数据，比较压缩前后 router 的 routing probability。结果：
+
+  - L1 距离在多数层上明显发散
+  - top-8 专家选择重合率随层数加深而崩塌
+  - 三种压缩范式（剪、并、编）都有这个问题，剪枝最严重
+
+这就把"router 还在指错门"这件事从直觉变成了证据。
+
+** 解法：只动路由器，专家冻住
+
+既然问题是路由器没跟上，那就单独训练路由器。但又要保持"免重训"的精神（不能去 fine-tune 专家，否则成本就回去了）。
+
+Router-KD 的设计：
+
+  1. *冻住*所有专家、所有 transformer 层、所有 embedding —— 只让 router 那几个矩阵的参数动
+  2. *老师* 是未压缩的原模型，*学生* 是压缩后的模型
+  3. *损失* 是 next-token 分布的 KL 散度（带温度 τ）：
+
+#+begin_src text
+
+  L_RKD(x) = (τ² / N_x) · Σ_t  m_{t+1} · D_KL( p_T^(t) || p_S^(t) )
+
+  其中 p_T, p_S 是 softmax(logits / τ) 的软分布
+       N_x 是有效 token 数
+
+#+end_src
+
+  4. *数据* 是 C4 上的无标签文本
+
+这是一个极小的训练——router 在每层就是个 hidden_dim × num_experts 的矩阵，加起来占模型不到 1% 的参数。一张卡几小时就能跑完。
+
+** 结果与一个微妙的反例
+
+Router-KD 在 Qwen3（128 专家、细粒度）上对剪、并、编三种范式都明显有效。但在 Mixtral（8 专家、粗粒度）上几乎不动。
+
+作者的解释很漂亮：
+
+  *Mixtral 只有 8 选 2，组合数 C(8,2) = 28。Qwen3 是 128 选 8，组合数约 1.4 × 10¹²。*
+
+路由空间太小，原 router 的输出几乎是 one-hot 的——没多少"软"信息可以蒸馏。细粒度 MoE 的路由本身就是个高熵决策，所以 KD 才有戏。
+
+这个反例反过来印证了主张：*问题确实是路由器，但路由器要"有得调"才行*。
+
+* 问题-解法压缩总览
+
+#+begin_src text
+
+                    问题                              解法                       留下什么
+                    -----                            -----                       --------
+  Shazeer 2017     全员算太慢                 装一个 router 派任务            router 和专家绑死
+                       |
+                       v
+  Switch 2021      多专家通信成本高               top-1 路由                  专家数量越做越多
+                       |
+                       v
+  Mixtral 2024     开源 MoE 显存爆炸           粗粒度 8 选 2 + 量化             一个专家就是 7B，
+                       |                                                     不能轻易动
+                       v
+  DeepSeek/Qwen3   想压缩但粒度太粗           把专家切到 128 个                组合空间巨大，
+                       |                                                     路由复杂
+                       v
+                  +---------+ +---------+ +---------+
+                  | HC-SMoE | |  REAP   | | MoBE/   |    三条独立的"动专家"
+                  | (合并)  | | (剪枝)  | | TD-MoE  |    技术路线
+                  +---------+ +---------+ +---------+
+                       |          |           |
+                       +----------+-----------+
+                                  |
+                                  v
+                       三条线都假设："专家变了，
+                       router 还能用"——
+                       但 *没人验过这个假设*
+                                  |
+                                  v
+  Router-KD 2026  把假设验了，发现 router 偏了    冻住专家，
+                                                   只对 router 做软标签 KD     细粒度 MoE 上
+                                                                              普适有效
+
+#+end_src
+
+* 这条演化线背后真正在发生什么
+
+表面看，这是 MoE 压缩技术的迭代。但往下看一层，发生的是：
+
+  *从把 MoE 当成"一堆专家"，到把 MoE 当成"一个有调度系统的整体"。*
+
+早期的 MoE 研究关注怎么训好路由（load balancing loss、auxiliary loss 一堆）。但部署阶段，所有人下意识地把路由器当成"一个固定的查表函数"，把它和专家分开看。压缩研究继承了这个分裂——动专家很热闹，动路由器没人想。
+
+Router-KD 的价值不在于那个 KL loss 多巧妙（这是最普通的蒸馏），而在于它把"路由器是模型的一部分，会随专家变化而失灵"这件事说穿了。
+
+这其实是一个 *视角的反转*。在压缩的语境里，过去十年大家都在问"专家怎么压"，没人问"路由是不是还匹配"。这就像我们在讨论怎么裁员，却忘了 HR 系统里那些岗位描述也得跟着更新。
+
+* 下一步最可能往哪走
+
+1. *联合优化路由和压缩* —— 不再是先压完再标定，而是在剪枝/合并的同时把路由的更新纳入目标函数。REAP 的"router gate × activation"显著性会演化成"router 蒸馏 loss"显著性。
+
+2. *细粒度 MoE 上的更激进压缩* —— Router-KD 揭示了"router 是个被低估的自由度"。这意味着同样的精度损失下，压缩比可能可以推得更高。
+
+3. *Mixtral 这条粗粒度线被边缘化* —— 论文的反例说明，未来 MoE 压缩的主战场必然是 fine-grained 模型，这和 DeepSeek/Qwen 的方向一致。
+
+4. *推理时动态路由* —— 既然 router 可以离线 KD，也许可以在线根据输入调整路由策略（per-domain router、test-time router adaptation）。
+
+* 诚实标注
+
+- 倒推到 Shazeer 2017 是直接的，引用关系明确。
+- HC-SMoE / REAP / MoBE / TD-MoE 是论文中 explicitly 作为 baseline 对比的，关系确凿。
+- DeepSeekMoE 这一支没有在论文标题中出现，但 Qwen3-MoE 的"128 细粒度"架构在论文中是核心实验对象，DeepSeekMoE 是这一支的开创者，所以放进溯源地图。
+- 前沿延伸（这篇论文之后的工作）暂时找不到——论文 2026-02-10 才发，社区还没消化完。这条线的"后续"留白，等后续 paper-river 时再补。
+
+* 主要参考
+
+- 本文：[[https://arxiv.org/abs/2603.02217][Is Retraining-Free Enough? The Necessity of Router Calibration for Efficient MoE Compression]] (Hyeon & Do, 2026)
+- REAP：[[https://arxiv.org/abs/2510.13999][REAP the Experts: Why Pruning Prevails for One-Shot MoE compression]] (Lasby et al., 2025)
+- HC-SMoE：[[https://arxiv.org/abs/2410.08589][Retraining-Free Merging of Sparse MoE via Hierarchical Clustering]] (Chen et al., ICML 2025)
+- Mixtral：[[https://arxiv.org/abs/2401.04088][Mixtral of Experts]] (Jiang et al., 2024)
+- Switch Transformer：[[https://arxiv.org/abs/2101.03961][Switch Transformer]] (Fedus et al., 2021)
+- Sparsely-Gated MoE：[[https://arxiv.org/abs/1701.06538][Outrageously Large Neural Networks]] (Shazeer et al., 2017)

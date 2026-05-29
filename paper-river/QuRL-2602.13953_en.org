@@ -1,0 +1,253 @@
+#+title:      QuRL: Efficient Reinforcement Learning with Quantized Rollout
+#+date:       [2026-05-29 Fri 04:23]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T042323-en
+#+source:     https://arxiv.org/abs/2602.13953
+#+authors:    Yuhang Li, Reena Elangovan, Xin Dong, Priyadarshini Panda, Brucek Khailany
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+Training a reasoning large model, 70% of the time is not spent computing gradients — it is spent waiting for the model to emit answers one token at a time. Can this be made faster?
+
+Why is it hard? Because training a reasoning LLM is a strange beast: you must first let the model "think" through a long chain-of-thought, then find out whether that step was correct, and only then go back and adjust it. This "thinking" process is called rollout — autoregressive decoding, one token after another, with no parallelism. The entire GPU compute pipeline stalls right here.
+
+To make matters worse: the full-precision model used for training decodes slowly, yet practitioners in the inference world long ago quantized models to INT8/FP8 and made them fly. Can we import that approach into training so that rollout also runs on a quantized model? It sounds simple, but the moment you do it the mathematical foundations of reinforcement learning begin to shake — the policy that samples and the policy that gets updated are no longer the same, importance-sampling ratios blow up, and training collapses. The whole field keeps circling the same question: how do you sample with a "fast but imprecise" quantized model without blowing up training?
+
+* Source Map
+
+#+begin_example
+[2015] Schulman et al. - TRPO
+  |
+  | Problem: policy-gradient steps that are too large cause collapse
+  | Solution: add a trust-region constraint, bound the KL divergence
+  v
+[2017] Schulman et al. - PPO
+  |
+  | Problem: TRPO's second-order constraint is too expensive
+  | Solution: use clipping to keep the ratio inside [1-eps, 1+eps]
+  v
+[2024] Shao et al. - GRPO (DeepSeekMath)
+  |
+  | Problem: PPO must train a critic, which is costly for reasoning tasks
+  | Solution: drop the critic; sample G answers per prompt,
+  |           compute relative advantage within the group
+  v
+[2025] Guo et al. - DeepSeek-R1  +  RLVR paradigm established
+  |
+  | Problem: reasoning models need long CoT; rollout takes 70% of training time
+  | (this is QuRL's pain-point origin)
+  v
+[2025] Fu et al. - AReaL / Decoupled PPO
+  |
+  | Problem: on-policy serial pipeline is slow; want async operation
+  | Solution: decouple "sampling policy" from "update policy",
+  |           allow off-policy training
+  v
+[2025] Liu et al. - FlashRL
+  |
+  | Problem: want to accelerate rollout with a quantized model, but
+  |          kernel differences between training and inference engines
+  |          cause abnormally large importance-sampling ratios
+  | Solution: Truncated Importance Sampling (TIS) — clip extreme ratios
+  v
+[2026] Li et al. - QuRL  <-- this paper
+  |
+  | Problem: TIS works within 500 steps, but long-horizon training still
+  |          collapses; and weight updates are smaller than quantization
+  |          error, effectively freezing the model
+  | Solution: (1) Adaptive Clipping Range — dynamically adjust the clip window
+  |           (2) Update-Aware Quantization — amplify updates via invariant scaling
+  v
+[???] The story beyond this point has yet to be written
+#+end_example
+
+* Evolutionary Narrative
+
+** 2015 | TRPO: Attaching a Safety Rope to Policy Gradients
+
+*** What problem did it see?
+
+Policy gradients are the most elementary idea in RL — push the policy toward higher reward. But "push" has no calibration. Push too little and learning stalls; push too hard and you jump in one step to a completely different policy, that new policy may be terrible, the next round of sampled data is all garbage, and training collapses outright.
+
+*** Its solution
+
+Before each update, draw a circle: the KL divergence between the new and old policy cannot exceed this radius. This is the trust region. Walk freely inside the circle; if you step outside, you are pulled back.
+
+*** Why it works (and where it buries a new pitfall)
+
+It converts "how far to move" from a hyperparameter into a constraint. The cost: each step requires solving a constrained optimization problem, computing second-order derivatives and doing conjugate-gradient iterations — an engineering nightmare. That nightmare is the starting point for the next paper.
+
+** 2017 | PPO: Replacing the Second-Order Constraint with a First-Order Clip
+
+*** What problem did it see?
+
+TRPO is mathematically elegant but an engineering disaster. Every step demands an approximation of the Fisher information matrix and a line search. Deep-learning researchers did not want any of that.
+
+*** Its solution
+
+Forget the constraint entirely; instead manipulate the objective directly. Compute the probability ratio R = π_new / π_old and forcibly clamp R to [1-ε, 1+ε]. If R escapes this window, clip it back.
+
+*** Why it works (and where it buries a new pitfall)
+
+Simple enough to run with first-order SGD. For the next decade, virtually all large-model RL training was built on PPO. But PPO has a hidden cost: it requires a critic network to estimate advantages — for a reasoning LLM, training a separate critic is enormous overhead.
+
+** 2024 | GRPO: Throwing Away the Critic
+
+*** What problem did it see?
+
+Reasoning tasks have a special property: you can sample many answers to the same question and there is a clear correctness criterion. If I can draw 16 answers to one prompt, I already know how much better or worse each answer is relative to the group average. Why train a separate critic to estimate that?
+
+*** Its solution
+
+For each prompt q, sample G responses {o_1, ..., o_G}. After computing rewards, normalize within the group to obtain each response's relative advantage A_i. The full PPO clipping mechanism is kept intact; the critic network is discarded.
+
+*** Why it works (and where it buries a new pitfall)
+
+DeepSeekMath used this to achieve stunning mathematical-reasoning results; DeepSeek-R1 pushed it to the summit; RLVR (reinforcement learning with verifiable rewards) became the standard paradigm for training reasoning models. But the paradigm carries an unavoidable cost: G responses per prompt, each a long CoT — rollout accounts for 70% of training time. All GPUs sit waiting for the model to spit out tokens one by one.
+
+** 2025 | AReaL / Decoupled PPO: Separating "Sampling" from "Updating"
+
+*** What problem did it see?
+
+GRPO is on-policy — you must sample with the current latest policy, then update, then sample again. A strictly serial chain. But rollout takes 70% of the time. Can one group of GPUs keep sampling (using a slightly stale policy) while another group keeps updating?
+
+*** Its solution
+
+Split the policy into two roles: the behavior policy samples, and the proximal policy is updated and clipped against. The two are allowed to differ. The importance-sampling ratio is redefined between these two policies. This is Decoupled PPO.
+
+*** Why it works (and where it buries a new pitfall)
+
+Now asynchronous, throughput improves. But the decoupling also opens a door: if the behavior policy can differ from the proximal policy, could the behavior policy simply be an "accelerated" version of the proximal policy? A quantized one, perhaps? That is FlashRL's entry point.
+
+** 2025 | FlashRL: Letting the Quantized Model Do the Sampling
+
+*** What problem did it see?
+
+Since the behavior policy and proximal policy need not match, make the behavior policy run faster — quantize it to INT8. Inference engines like vLLM and SGLang already fly with quantized models; rollout time can be cut immediately.
+
+But there is a trap: training engines (HuggingFace, Megatron) and inference engines (vLLM, SGLang), even when loading the same model, produce slightly different probabilities due to kernel implementation differences. In importance sampling this tiny discrepancy is amplified — the ratio R = π_train / π_inference can occasionally spike to 10^5. Such extreme ratios cause gradient explosion.
+
+*** Its solution
+
+Truncated Importance Sampling (TIS): place an upper bound C on the ratio; anything above C is treated as C. The message: "if the two engines diverge too much on a token's probability, ignore that token's gradient."
+
+*** Why it works (and where it buries a new pitfall)
+
+Training is stable within 500 steps. But the QuRL authors found that beyond 1000 steps, the KL divergence between the behavior and proximal policies begins growing exponentially — from 0.002 to 0.025 (a 12× increase) — and training eventually collapses. TIS truncates extreme values, but truncation itself introduces systematic bias into the gradient estimate. The more frequently truncation fires, the more biased the gradient.
+
+There is a deeper problem that FlashRL never even noticed: the mismatch in scale between quantization error and weight updates.
+
+** 2026 | QuRL: Two New Pillars
+
+*** What problem did it see?
+
+Setting aside all the problems others already solved, QuRL identifies two entirely new pain points:
+
+*Pain point one: long-horizon training collapse.* The Decoupled PPO clipping mechanism was designed under an implicit assumption — the gap between behavior and proximal policies comes mainly from temporal lag (off-policy staleness). In QuRL their gap comes primarily from quantization noise. These two sources of discrepancy have different characters, and the old clip window [1-ε, 1+ε] is no longer appropriate for quantization noise. TIS discards "extreme-ratio" tokens, but those tokens may carry important information — especially tokens with positive advantage; incorrectly clipping them throws away learning opportunities.
+
+*Pain point two: weight updates swallowed by quantization.* In each RL update, the change in weights is roughly α·G, where α is the learning rate (10^-7 to 10^-6) and G is the gradient. This magnitude is far smaller than the precision of INT8 quantization. In other words, the model weights nominally changed a little, but quantization rounds the change away — the quantized behavior actor looks identical to the unupdated one, and the model is effectively frozen.
+
+*** Its solution
+
+*Adaptive Clipping Range (ACR)*: dynamically adjust the clip window. Concretely, define the ratio r = π_proximal / π_truncated_behavior and absorb this r into the clip term. When r < 1 (i.e., truncation fired), expand the upper bound to (1+ε)/r, allowing more positive-advantage tokens to pass through. When r ≈ 1, the behavior is identical to TIS. The logic: "if I truncated you, I'll relax the limit on you as compensation."
+
+*Update-Aware Quantization (UAQ)*: a one-time weight rescaling before training begins. Borrowing SmoothQuant's invariant scaling idea — divide weights by s, multiply the corresponding activations by s, leaving the output unchanged. SmoothQuant uses this to reduce quantization error; QuRL flips the direction: choose s > 1 to make weights smaller (quantization error shrinks by a factor of s), while during backpropagation activations are larger (gradients grow by a factor of s). The two effects together improve the ratio of weight update to quantization noise by s². A value of s = 1.5 is stable for both INT8 and FP8.
+
+*** Why it works (and where it buries a new pitfall)
+
+ACR and UAQ are not about "patching quantization error" — they acknowledge quantization error's existence and let the training dynamics adapt around it. This represents a posture shift from "fighting quantization" to "coexisting with quantization."
+
+Results: on DeepScaleR, INT8 QuRL beats the full-precision baseline by 1.7% (55.5% vs 49.6%). On AIME 2024, INT8 QuRL brings accuracy back from near 0 (vanilla quantization) to 33.1% — and on FP8 even exceeds the BF16 baseline.
+
+New pitfalls: ACR assumes that ratio bias comes mainly from quantization; if quantization is more aggressive (below INT4) will this assumption hold? The s=1.5 in UAQ is empirical — is there a more principled strategy? KV cache quantization is excluded because vLLM's implementation is not yet good enough — an obvious next target.
+
+* Frontier Extensions
+
+QuRL is an ICLR 2026 paper (v1 posted February 2026) and is the most recent work on this problem line. At the time of retrieval, no subsequent paper explicitly criticizing or improving QuRL has appeared — the river's leading edge stops here.
+
+Foreseeable next directions (drawn from the paper's own limitations and concurrent signals):
+- Revisiting ACR under more aggressive quantization (INT4 / NVFP4)
+- Joint optimization of KV cache quantization and weight-activation quantization
+- Unifying training and inference engines (eliminating the root-cause probability inconsistency rather than patching it after the fact with TIS / ACR)
+
+* One Diagram to Understand It All
+
+#+begin_example
+          [ Reasoning LLM Training = rollout takes 70% of the time ]
+                                    |
+                                    v
+           Question: how to speed up RL training with long CoT?
+                                    |
+        +---------------------------+---------------------------+
+        |                                                       |
+        v                                                       v
+  [Change the algorithm]                            [Change execution strategy]
+    |                                                       |
+    v                                                       v
+  TRPO -> PPO -> GRPO                                Decoupled PPO
+  (trust region)(clip) (drop critic)                 (async sampling)
+                  |                                          |
+                  +------------------+-----------------------+
+                                     |
+                                     v
+                     [Let rollout run on a quantized model]
+                                     |
+                       +-------------+-------------+
+                       |                           |
+                       v                           v
+               Problem A: train/inference    Problem B: importance-sampling
+               engine probability            ratios for quantized actor
+               inconsistency                are unstable
+                       |                           |
+                       v                           v
+               FlashRL (TIS)               FlashRL (TIS)
+                       |                           |
+                       +-------------+-------------+
+                                     |
+                                     v
+                  [Usable within 500 steps; long-horizon still collapses]
+                                     |
+                       +-------------+-------------+
+                       |                           |
+                       v                           v
+             Problem A': clip window       Problem B': weight update < quant error
+             wrong for quantization noise  (model is frozen)
+                       |                           |
+                       v                           v
+             QuRL: ACR                    QuRL: UAQ (invariant scaling)
+                       |                           |
+                       +-------------+-------------+
+                                     |
+                                     v
+                  [INT8/FP8 training stable; 55.5% vs 49.6%]
+
+  Dimension          | Old solution        | New solution        | Nature of shift
+  -------------------|---------------------|---------------------|-----------------------
+  Policy update      | TRPO trust region   | PPO clip            | 2nd-order -> 1st-order
+  Value estimation   | PPO critic          | GRPO group-relative | function est. -> sampling
+  Sample & update    | on-policy serial    | decoupled async     | synchronous -> decoupled
+  Rollout speed      | full-precision      | quant model + TIS   | slow+exact -> fast+biased
+  Long-run stability | TIS truncation      | ACR dynamic clip    | defensive -> adaptive
+  Update visibility  | (nobody noticed)    | UAQ amplification   | ignored -> explicit
+#+end_example
+
+* Insights
+
+On the surface this river looks like a straightforward technical iteration — PPO → GRPO → quantized rollout. Look deeper and it is a posture shift in the RL training paradigm.
+
+*First-order shift*: from "strictly maintain on-policy" to "acknowledge and manage off-policy bias." TRPO forcibly kept new and old policies close via a trust region; PPO softened the constraint with clipping; Decoupled PPO simply accepted that the behavior and update policies need not match, as long as importance sampling corrects adequately; QuRL goes further and accepts that the two policies can differ enormously (quantization noise) — what matters is not eliminating the difference but making the clipping mechanism sensitive to it. This line of RL research is continuously loosening the "on-policy" shackle, because in the modern large-model era the bottleneck is not statistical efficiency but wall-clock time.
+
+*Second-order shift*: training and inference, two historically separate engineering stacks, are eating into each other. The inference world embraced quantization, KV caches, vLLM/SGLang years ago; the training world stayed at full precision. Decoupled PPO tore the seam open; FlashRL was the first to bring a quantized inference engine into the training loop; QuRL systematically repairs all the numerical pathologies exposed by that migration. This foreshadows a future where the boundary between training and inference frameworks grows increasingly blurry — a single "training step" will simultaneously run BF16 backward passes and FP8 forward decoding.
+
+*Third-order shift*: researchers are beginning to care about micro-level questions like "gradient magnitude vs. quantization granularity" that previously lived only in QAT literature. UAQ is not a new invention (invariant scaling is a SmoothQuant staple), but it is the first time the technique is applied in the direction of "amplifying updates" rather than "reducing error." This hints at a broader design principle — in the intersection of RL and quantization, every tool borrowed from pure PTQ or pure QAT needs its objective function reconsidered.
+
+Where will this go next? Two directions seem likely: first, more aggressive precision (INT4, mixed-precision rollout) paired with more aggressive ACR variants; second, eliminating the training/inference engine gap entirely by sharing the same kernels on both sides, removing the need for TIS / ACR at the root. The second path is more thorough but carries an extremely high engineering bar.
+
+* Takeaways
+
+*On doing research*: QuRL is a reminder — do not fixate on SOTA numbers; fixate on which step consumes 70% of the time. Problems like this tend to fall off the radar of RL papers (which track reward curves) and off the radar of quantization papers (which track accuracy retention). They grow precisely at the seam between two fields. Problems at the seam attract fewer researchers, demand higher expertise (both RL and quantization), and repay effort generously.
+
+*On finding problems*: notice how QuRL's two discoveries were made — one by running FlashRL a bit longer (>1000 steps) until it collapsed; the other by computing "the magnitude of weight updates vs. the magnitude of quantization error." Neither required a theoretical breakthrough. What they required was "finishing the experiment that others stopped early" and "measuring what others never bothered to measure." The first is patience; the second is care.
+
+*Actionable parts*: if you do RL training, check your rollout time fraction — if it exceeds 30%, it is worth trying the QuRL approach; if you do quantized inference, look at FlashRL/QuRL as a form of "continual training" after deployment (the quantized model serves directly as the actor); if you build frameworks, take the training/inference unification question seriously — it may become a mainstream requirement within two or three years.

@@ -1,0 +1,273 @@
+#+title:      ManifoldKV: Training-Free KV Cache Compression via Euclidean Outlier Detection
+#+date:       [2026-05-29 Fri 03:45]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T034509-en
+#+source:     https://arxiv.org/abs/2602.08343
+#+authors:    Debajyoti Datta, Trishala Neeraj, Bibek Paudel, Vyom Sharma, Subhabrata Mukherjee
+#+venue:      arXiv preprint, Feb 2026 (Hippocratic AI)
+
+* The River of Problems
+
+Model context windows keep growing — 4K, 32K, 64K, 128K — but KV cache memory scales linearly. A 70B model processing 100K tokens can need 60 GB of VRAM for the cache alone.
+
+The problem in one sentence: *the cache can't hold everything, so tokens must be evicted. But which ones?*
+
+What makes this river hard to navigate is that you don't know which tokens matter. Attention weights are one signal, but they must be recomputed at every step. The geometric properties of the token vectors themselves are another signal — but which geometric property to look at has cycled through several generations of answers over five years: attention scores, vector norms, angles, and then Euclidean distances. Each generation replaced the last because *some token was quietly slipping through the cracks*.
+
+This river traces how the question "how important is this token?" transformed from "count its attention" all the way into "find the outliers on a geometric manifold."
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Establishes the origin of KV cache: the attention mechanism
+  | itself requires caching historical K and V
+  v
+[2023] Pope et al. / Kwon et al. - vLLM / PaLM Inference
+  |
+  | Problem: cache grows linearly; long contexts don't fit
+  | Solution: none yet — the problem is just put on the table
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem: sliding window drops the beginning and breaks generation,
+  |          even though the beginning seems unimportant
+  | Solution: keep the first N "attention sink" tokens + sliding window
+  |           (no scoring — purely position-based)
+  v
+[2023] Zhang et al. - H2O
+  |
+  | Problem: position-based is too coarse; important tokens can appear anywhere
+  | Solution: track cumulative attention scores; keep the high scorers
+  |           (requires computing attention)
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Problem: H2O must update scores every step — slow
+  | Solution: use an "observation window" to compute attention once at
+  |           the end of prefill, then decide what to keep
+  v
+[2024] Devoto et al. - KNorm
+  |
+  | Problem: even one-shot attention is expensive; can we just look at K itself?
+  | Solution: rank tokens by ||k||_2; keep the largest (pure geometry, zero attention)
+  v
+[2025] Park et al. - KeyDiff
+  |
+  | Problem: norm alone is too coarse; direction carries semantics too
+  | Solution: score by cos(k_i, mu) against the centroid;
+  |           keep those whose direction is most "outlying"
+  v
+[2026] Datta et al. - ManifoldKV  <-- target paper
+  |
+  | Problem: cosine normalizes away magnitude — 10*mu and 0.1*mu score the same
+  | Solution: use Euclidean distance ||k_i - mu||_2, which captures both
+  |           angle and magnitude; for 64K contexts, replace the global
+  |           centroid with a local centroid from a 4K sliding window
+  v
+[2026+] ?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Sliding Window + Keep the First Few
+
+*** What problem did it see?
+
+The most naive approach — "when the cache is full, drop the oldest tokens" (sliding window) — causes LLMs to collapse outright, producing incoherent text. Xiao et al. investigated and found that models pour enormous attention onto the very first few tokens in a sequence, not because their content matters, but because softmax must distribute probability somewhere, and the initial tokens become a kind of "attention drain."
+
+Once the sliding window discards these sink tokens, softmax has nowhere to dump residual attention, and the entire distribution collapses.
+
+*** Their solution
+
+No scoring at all — purely position-based: always keep the first N tokens (attention sinks) plus a sliding window of the most recent M tokens. Everything in between is discarded.
+
+*** Why it works (and where the next trap is buried)
+
+It solves the engineering question of "why does a sliding window crash?" — not the selection question of "which tokens genuinely matter?" The large middle section is discarded indiscriminately. If your answer is buried in the middle, the model instantly forgets it.
+
+The next paper had to answer: *can we evict by importance rather than by position?*
+
+** 2023 | H2O: Keep Whoever Gets the Most Attention
+
+*** What problem did it see?
+
+StreamingLLM's position-based retention is blunt. In a long document, important facts — names, numbers, key events — can appear at any position. Position and importance are only weakly correlated.
+
+*** Their solution
+
+Maintain a "cumulative attention score" for each token — the sum of all attention weights every future query places on it. High scorers survive; low scorers get evicted. This is the "Heavy Hitter Oracle," the origin of the H2O name.
+
+*** Why it works (and where the next trap is buried)
+
+Attention is the model's own judgment: "how many times am I going to look back at this token?" Using it as a proxy for importance is far more accurate than position-based retention.
+
+But there's a cost: you *must compute attention* to obtain these scores. Every time a new token is generated, every historical token's score must be updated. This embeds H2O inside the generation loop, adding overhead at every single step.
+
+The next paper had to answer: *can we score everything once rather than updating at every step?*
+
+** 2024 | SnapKV: Score Everything Once with an Observation Window
+
+*** What problem did it see?
+
+H2O's "accumulate attention at every step" is especially wasteful during prefill — you've already computed the full N×N attention matrix in one pass, yet still have to accumulate scores in a second pass. Redundant work.
+
+*** Their solution
+
+After the prefill phase, select a small "observation window" from the tail of the prompt (e.g., the last 32 tokens) and look at how much attention those tokens pay to everything earlier. Tokens that receive high attention are kept. This is computed once; the decision is frozen before decoding begins.
+
+*** Why it works (and where the next trap is buried)
+
+It turns "scoring" from a *continuous online* process into a *one-time offline* one. Cost drops dramatically. On long-context benchmarks it reaches 83.9%.
+
+But look more carefully: it still depends on attention computation. Attention is O(N²), and that's still a burden for very long contexts. Moreover, attention-based methods can only do this trick at prefill time; they're unfriendly to pure decoding scenarios.
+
+The next paper had to answer: *can we skip attention entirely and judge from the K vectors themselves?*
+
+** 2024 | KNorm: Just Look at How Long the Vector Is
+
+*** What problem did it see?
+
+Even fast attention scoring still requires computing attention. If the K vectors themselves already encode "how important is this token?", why take the roundabout path through a query?
+
+Devoto et al. made an observation: plotting all K vectors revealed that tokens with large ‖k‖_2 tend to be key tokens — entities, numbers, proper nouns.
+
+*** Their solution
+
+As simple as it gets: si = ‖ki‖_2. Rank by vector norm; keep the largest. No attention required whatsoever.
+
+*** Why it works (and where the next trap is buried)
+
+It opens a new path: *purely geometric scoring*. No query, no softmax, no N².
+
+But it's too coarse — only 52.8% on RULER, more than 30 points below SnapKV. Why? Looking only at magnitude throws away all directional information. Two tokens may both be "long," but one points in the direction of "this is a name" while the other points toward "this is a stopword." KNorm cannot tell them apart.
+
+The next paper had to answer: *the geometric approach is right, but norm alone is insufficient — direction must be included.*
+
+** 2025 | KeyDiff: Keep Whoever Looks Least Like the Average Direction
+
+*** What problem did it see?
+
+KNorm uses magnitude only and discards direction. Flipping that around: what kind of direction is actually important?
+
+KeyDiff's intuition: average all K vectors to get a centroid μ, representing "the typical direction in this context." Semantically important tokens — names, numbers — should look *different* from this average direction. So "larger angle from the centroid" means more worth keeping.
+
+*** Their solution
+
+si = 1 - cos(ki, μ). Keep tokens with the largest cosine distance from the centroid μ (which is just the mean K vector).
+
+On 64K contexts this reaches 81.1%, versus KNorm's 52.8% — a 28-point jump that proves "direction" carries more semantic signal than "magnitude."
+
+*** Why it works (and where the next trap is buried)
+
+It lifts "geometric outlier detection" from one dimension (magnitude) to two (direction + magnitude — in principle). Theoretically stronger.
+
+But KeyDiff *uses only direction* — cosine normalizes away magnitude entirely. The paper provides a crisp counter-example: consider two tokens k1 = 10·μ and k2 = 0.1·μ. They point in exactly the same direction (both parallel to μ), so cosine gives both a score of 1 (maximally similar — most evictable). Yet k1 is 100× longer than k2 — geometrically they are completely different objects. KeyDiff treats them identically.
+
+Even more damaging are "radial outliers": a token ki = α·μ with α ≫ 1 is scored by cosine as maximally similar to the centroid and *gets evicted*. But it is geometrically the most extreme token in the cache and very likely encodes critical semantics. KeyDiff systematically misfires on exactly these cases.
+
+The next paper had to answer: *don't normalize away magnitude — capture both direction and magnitude at once.*
+
+** 2026 | ManifoldKV: Euclidean Distance Captures Both Angle and Magnitude (Plus a Sliding-Window Fix for Long Contexts)
+
+*** What problem did it see?
+
+Two inherited holes from KeyDiff:
+
+1. *Tokens with the same direction but different magnitudes are indistinguishable*: cosine treats 10μ and 0.1μ the same.
+2. *Radial outliers are systematically mislabeled*: a token that is collinear with the centroid but enormously long gets cosine's worst score and is evicted — exactly backwards.
+
+And one newly identified problem — *centroid dilution*: once the context exceeds 32K tokens, averaging everything produces a μ that resembles nobody in particular, making every token roughly equidistant from it. Both KeyDiff and a global-centroid ManifoldKV lose discriminative power at 64K. In the paper, 32K still reaches 82.3%, but 64K collapses to 35.2%.
+
+*** Their solution
+
+Two steps.
+
+*Step one — replace cosine with Euclidean distance*: si = ‖ki − μ‖_2. Expanding the square:
+
+  ‖ki − μ‖² = ‖ki‖² + ‖μ‖² − 2‖ki‖·‖μ‖·cos(ki, μ)
+             = (magnitude term) + (constant) + (magnitude × angle)
+
+Of the three terms: magnitude information is back, angle is present, and the constant is the same for all tokens so it doesn't affect ranking. Three lines of code; both "directional outlier" and "magnitude outlier" are captured simultaneously.
+
+*Step two — windowed local centroid for long contexts*: instead of computing a global μ, partition the sequence into 4K-token windows and compute a local centroid μ_w for each; each token's score is its Euclidean distance to *its own window's* μ_w. Tokens within a window share a semantic cluster, so μ_w is still a meaningful "typical direction" — discriminative power is restored. This variant is called WindowedManifoldKV.
+
+Result: on 64K contexts the score climbs from 35.2% back to 84.3% (+49 points), surpassing KeyDiff's 81.1% by 3.2 points.
+
+*** Why it works (and where the next traps are buried)
+
+It pushes the geometric line to a relatively clean endpoint: the geometric information you want (direction + magnitude) is fully captured by one Euclidean distance; the failure of global averaging on long sequences is handled by the sliding window.
+
+The paper also makes a foundational empirical observation: K vectors live on a ~9-dimensional low-dimensional manifold (estimated via Two-NN, consistently 8–9 dimensions across four model architectures, regardless of head dimension). This explains why a 4K window (far more than the ~20–50 samples needed for ~9 dimensions) is sufficient, and why the method achieves 95–96% zero-shot across different architectures.
+
+Remaining open traps:
+- Window size is a hard-coded hyperparameter (4K performs best, but the paper does not explain why 4K rather than 3K or 5K — it merely observes that 4K aligns with "the optimal context length for global ManifoldKV").
+- Local centroids may be discontinuous at window boundaries — a token straddling two windows belongs to which one? The paper does not address this.
+- The "9-dimensional manifold" finding is intriguing but purely empirical; there is no theoretical account of why.
+
+* Frontier Extensions
+
+ManifoldKV is a February 2026 paper, only a few months old at the time of writing. *No publicly available paper has yet specifically critiqued or extended ManifoldKV.*
+
+But following the directions it opens, several paths can be anticipated:
+
+1. *Geometric scoring + quantization / attention hybrids*: the paper itself notes that ManifoldKV can be composed seamlessly with AdaKV (per-head adaptive budget allocation) as an "orthogonal" technique. The likely next step is combining geometric scoring + per-head budget + quantization (KIVI, KVQuant) into a unified stack rather than single-point SOTA improvements.
+2. *Dynamic window sizes*: 4K is hard-coded. A likely follow-up will make the window size adapt to content — smaller windows when topic shifts are dense, larger windows for long continuous narratives.
+3. *Learned centroids*: the centroid is currently a simple mean. With even a small amount of training or calibration, the centroid could be made more semantically representative, yielding more robust handling of radial outliers.
+4. *From "scoring function" to "importance field"*: geometric scoring still operates in a "score each token independently" framework. Future work will almost certainly model inter-token dependencies — in multi-needle tasks, for example, several tokens must be *jointly* retained to answer the question; independent scoring will miss them.
+
+* The Whole Picture in One Diagram
+
+#+begin_example
+                  Magnitude     Direction     Magnitude+Dir    Long Context
+                  (radial)      (angular)     (both)           (>32K)
+                  ----------    ----------    -------------    -----------
+StreamingLLM    | ignored      ignored       position-based   sliding window + sinks
+2023            | (by position)                               naturally handles it
+
+H2O             | ignored      ignored       cumulative attn  global attn
+2023            |                                             must recompute all
+
+SnapKV          | ignored      ignored       obs-window attn  global attn
+2024            |                                             computed once
+
+KNorm           | ||k||_2      ignored       magnitude only   centroid issue
+2024            | (1-D)                                       not yet exposed
+
+KeyDiff         | ignored      cos(k, mu)    direction only   global mu
+2025            | (cosine                                     64K: mu dilutes
+                |  normalizes                                 -> collapses
+                |  it away)
+
+ManifoldKV      | all three    both          ||k - mu||_2     Windowed:
+2026 (this      | terms                                       4K local mu
+paper)          | included                                    -> 84.3%
+#+end_example
+
+Read horizontally: how "importance" is judged evolves in three stages — position → attention → geometry.
+
+Read vertically: each generation uses one more signal than the last — position → attention score → magnitude → magnitude + direction → magnitude + direction + local context.
+
+* Core Insight
+
+What is really happening across this entire lineage is not "finding a better scoring function" — it is *progressively compressing the semantic concept of "importance" into cheaper and cheaper geometric measures*.
+
+- StreamingLLM uses *position* — so cheap it requires no model signal at all, but can only prevent engineering collapse, not select by content.
+- H2O / SnapKV use *attention* — the model's own judgment, most accurate, but expensive (O(N²)).
+- KNorm / KeyDiff / ManifoldKV go the opposite direction: *translating "importance" into geometric properties of the K vectors themselves*, so no query, no softmax, and O(N·d) suffices.
+
+This is a classic pattern of "back-propagating from a downstream signal to an upstream representation": first use the expensive but accurate signal (attention) to establish what important tokens look like, then find a cheap geometric proxy in K-vector space (first magnitude, then angle, then Euclidean distance). Each generation seeks a description that is "cheaper yet loses less information."
+
+The "9-dimensional manifold" finding implies that *K-vector space has structure*, and importance may simply be some elementary geometric concept on that manifold — distance, density, outlierness. If this holds, the next generation might skip Euclidean distance surgery entirely and operate directly on the manifold: computing a token's distance to the manifold's principal axes, or its degree of isolation in the manifold's local density.
+
+Predicted next evolutionary step: *from "distance to centroid" to "local sparsity on the manifold."* The centroid is an aggregated point that discards structure; local manifold density preserves far more.
+
+* Lessons for Research Practice
+
+1. *Don't reach for the most expensive signal first.* H2O and SnapKV both use attention; the geometric line ultimately wins because cheap solutions scale. When you find yourself thinking "I need X to make this judgment," first ask: "can I approximate X from a more upstream signal?"
+2. *A simple geometric counterexample can split a whole paper open.* ManifoldKV's entire argument rests on a single pair of counterexamples: k1 = 10μ and k2 = 0.1μ. One minimal case that cosine cannot distinguish underwrites the entire paper. Actively hunting for counterexamples when reading a baseline is far faster than looking for theoretical gaps.
+3. *Local vs. global is a recurring structural failure.* From StreamingLLM's sliding-window sinks to ManifoldKV's local centroid — "global aggregation breaks on long sequences" is a failure mode that reappears constantly. Whenever you design something that depends on "averages," "centroids," or "global statistics," ask upfront: once the sequence grows long enough, does this global quantity still mean anything?
+4. *"Just measure the basic geometry" routinely outperforms expectations.* Two-NN reveals that K vectors live on a 9-dimensional manifold — this kind of basic descriptive measurement is severely undervalued in the LLM era. If you are stuck on a method and unsure how to improve it, first visualize the geometric properties of the representations; you will often stumble onto an opportunity.
+
+The practical takeaway: the next time you design an inference optimization algorithm, ask three questions — "can I avoid calling the model?" "can I replace the global aggregate with a local one?" "do I have a minimal geometric counterexample that shows exactly where the baseline goes wrong?" Think these three questions through, and you may already have the next ManifoldKV in hand.

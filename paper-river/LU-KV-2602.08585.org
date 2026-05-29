@@ -1,0 +1,210 @@
+#+title:      Predicting Future Utility: Global Combinatorial Optimization for Task-Agnostic KV Cache Eviction
+#+date:       [2026-05-29 Fri 03:51]
+#+filetags:   :paper:river:
+#+identifier: 20260529T035144
+#+source:     https://arxiv.org/abs/2602.08585
+#+authors:    Ziyao Tang, Pengkun Jiao, Xinhang Chen, Wei Liu, Shiyong Li, Jingjing Chen (Fudan University, Baidu)
+#+venue:      arXiv preprint, February 2026
+
+* 一句话
+
+KV cache 该扔掉哪些 token？这是一条从 "扔最近以外的全部" 一路演化到 "为每个注意力头单独算一笔投资回报率" 的路。
+
+* 溯源地图
+
+#+begin_example
+                                 [问题源头]
+                                       |
+                                       v
+   2023      StreamingLLM       前几个 token 神秘地不能扔
+   (扔窗口外的)                   "attention sink" 现象
+                                       |
+                                       v
+   2023      H2O                  "重击者" 才是关键
+   (累加分数最高的留)               累计注意力分数定 top-K
+                                       |
+                                       v
+   2024      SnapKV               用问题问出 token 重不重要
+   (问题窗口里高分的留)             prompt 末尾的观察窗
+                                       |
+                                       v
+   2024      AdaKV                每个头不该用一样的预算
+   (按熵动态分配)                   按 attention entropy 分配
+                                       |
+                                       v
+   2026      LU-KV  *(本篇)*       眼下分高不等于将来有用
+   (按"长期效用"做整体优化)         离线画 budget-utility 曲线
+                                       |
+                                       |---> 并行延伸:
+                                              CriticalKV (考虑 Value 大小)
+                                              KeyDiff    (用 Key 向量几何)
+                                              HeadKV     (按任务先验分配)
+                                              CAKE       (空间分散度)
+#+end_example
+
+* 正向叙事: 从 "扔窗口外" 到 "算每个头的回报率"
+
+** 起点: 为什么 KV cache 必须扔东西
+
+Transformer 推理时, 每生成一个 token, 都要看一遍前面所有 token 的 (Key, Value) 对。这堆 (K, V) 对就叫 KV cache。问题是: 上下文窗口越长, 这堆缓存线性增长, 显存就被吃光了。100 万 token 的上下文, 光是缓存就能撑爆一张 H100。
+
+最朴素的办法: 只保留最近 N 个 token, 像一个滑动窗口, 老的丢掉。代价是, 模型看不到远处的信息了。所有后面的演化, 都是在回答同一个问题: *"什么样的老 token 可以扔, 什么样的不能扔?"*
+
+** 第一篇: StreamingLLM (2023) — 发现"扔不得"的那些 token
+
+朴素滑动窗口跑起来后, 大家发现一件怪事: 把最开头那几个 token 也扔掉, 模型会突然崩。明明只是几个 BOS/标点之类的"无意义"位置, 凭什么不能扔?
+
+*StreamingLLM* 把这个现象起了个名字, 叫 *attention sink* (注意力下水道)。他们的解释是: softmax 必须把概率分散出去, 总要有个地方"接住"那些被分出去的注意力。最开头几个 token 因为位置编码的关系, 自然成了那个"下水道"。
+
+解法极简单: *永远保留最初的几个 token + 最近的窗口*。中间的全扔。这一下, 长上下文推理稳了。
+
+#+begin_example
+  StreamingLLM 的留存策略:
+  [token_0 token_1 token_2 ... <扔掉中间> ... token_{T-W} ... token_T]
+   ^^^^ sink                                  ^^^^^^^^^^^^^^^^^^^^ window
+#+end_example
+
+*它留下的新问题:* 中间那一大段, 真的全是没用的吗? 一个回答你问题的关键 token 如果不幸落在中间, 那就废了。
+
+** 第二篇: H2O (2023) — 中间的也分轻重
+
+StreamingLLM 一刀切, 但中间段里其实有"重磅 token"。怎么识别?
+
+*H2O (Heavy Hitter Oracle)* 的观察是: 不是所有 token 被注意到的次数都一样。统计一下"每个历史 token 被后续 query 累加了多少注意力", 你会看到一个长尾分布 — 少数 token 拿走了绝大部分注意力。这帮少数派叫 *heavy hitters* (重击者)。
+
+解法: 不再按位置 (开头/最近) 留, 而是按 *累加注意力分数* 留 top-K。重击者保, 其他扔。
+
+#+begin_example
+  StreamingLLM:  按位置留   ->  开头 + 最近
+  H2O:           按分数留   ->  哪个被注意得多就留哪个
+#+end_example
+
+*它留下的新问题:* "累加注意力分数高"是历史的, 反映的是过去这个 token 被关注了多少。但未来生成时, 真正会被需要的 token, 一定就是历史上注意力高的吗? 当下没人关心的 token, 下一句突然就被关心了, 怎么办?
+
+** 第三篇: SnapKV (2024) — 用问题本身预判
+
+H2O 看的是"已经发生的注意力"。SnapKV 想得更狠一点: 既然 prompt 已经全部 prefill 完了, 在 prefill 阶段, 模型已经"读完了问题", *prompt 末尾这一小段* 的 query 对前面所有 token 的注意力, 就是一个非常强的"未来重要性"信号。
+
+解法: 取 prompt 末尾的一小段作为 *观察窗 (observation window)*, 用这个窗口里的 query 去看前面的 token, 谁被关注得多就留谁。这一招比 H2O 的累加分数更聚焦, 因为它锁定了"和当前任务真正相关的 token"。
+
+#+begin_example
+  H2O:    用历史里所有 query 的累加注意力来打分
+  SnapKV: 只用 prompt 末尾这一小段的注意力来打分 (更针对任务)
+#+end_example
+
+*它留下的新问题:* 不论是 H2O 还是 SnapKV, 都假设了一个东西 — *每个注意力头分到的预算是一样的*。比如总预算 8K, 32 个头, 那每个头各 256 个 token。可注意力头明明各有分工: 有的头专门盯短距离, 有的头专门管远距离上下文。一刀切的预算, 一定是浪费。
+
+** 第四篇: AdaKV (2024) — 头与头, 不该一视同仁
+
+AdaKV 把视角从"单头里选 token"抬到"跨头分预算"。他们的论点是: 注意力分布 *扁平* 的头 (entropy 高的头) 需要更多预算 — 因为信息分散在很多 token 里, 留得少就漏得多; *尖锐* 的头 (entropy 低的头) 只看少数几个 token, 给少点也够。
+
+解法: 跨所有头, 把所有候选 token 放进一个大池子, 按代理分数 top-K 全局贪心地选。最后每个头分到多少, 自然就由分数高低决定。
+
+#+begin_example
+  H2O / SnapKV: 每个头独立选, 预算固定相等
+  AdaKV:        所有头扔一锅, 全局 top-K, 预算自适应
+#+end_example
+
+*它留下的新问题:* 全局 top-K 看似聪明, 但它默认了一件危险的事 — *不同头的代理分数是可比的*。可现实是, 头 A 和头 B 用的分数尺度可能根本不一样, 把它们放进一个池子排序, 等于把"摄氏度"和"华氏度"混着比。更糟的是: 一个头里分数高的 token, 不一定真的对未来生成有贡献 — 它可能只是当下注意力的瞬间偏好, 长期看反而是噪声。
+
+** 第五篇: LU-KV (2026, 本篇) — 算每个头的"投资回报率"
+
+LU-KV 把问题彻底重构。它说: 别再争"谁的分数高", 那是个伪命题。真正该问的是 — *给某个头多分一个 token 的预算, 能挽回多少未来生成的信息?*
+
+这是一个边际收益 (marginal utility) 的视角。具体三步:
+
+*第一步: 定义"长期效用 (Long-horizon Utility)" 当作金本位*
+
+对于一个 token 位置 j, 它在头 (l, h) 里的真正价值是: 在未来若干步解码窗口里, 这个 token 能贡献给输出向量的最大幅度。用公式说就是 — 看未来 K 步, 最大的 ~|attention * value * W_O|~ 是多少。这叫 *Oracle Importance*。
+
+任何启发式分数 (H2O 的累加, SnapKV 的观察窗) 都只是这个 Oracle Importance 的近似。近似有偏差, 就有 *Optimality Gap*。
+
+*第二步: 离线画"预算 - 效用"曲线*
+
+对每个头, 离线跑一遍校准数据集, 画出: "这个头分到 b 个 token 时, 留住的 Oracle Importance 总量是多少"。得到一条单调递增、边际递减的曲线。
+
+#+begin_example
+  utility ^
+          |          .------ 头 A: 很快饱和, 多给浪费
+          |         /
+          |        /            .---- 头 B: 长期受益, 多给值得
+          |       /            /
+          |      /            /
+          |_____/____________/_______>  budget
+#+end_example
+
+*第三步: 在所有头之间做 "凸包松弛 + 边际效用贪心" 分配*
+
+每条曲线取凸包, 然后从总预算里, 每一份都分给"当下边际收益最高的那个头"。一直分到预算耗尽。这是个组合优化问题, 凸包松弛保证了贪心解接近全局最优。
+
+#+begin_example
+  AdaKV:  比"谁的分数最高" -> 选 token  (横着比)
+  LU-KV:  比"谁的边际收益最高" -> 给预算 (按头分钱)
+#+end_example
+
+关键洞察: 这个框架是 *metric-universal* 的 — 你的"代理分数"用 H2O 也行, 用 SnapKV 也行, 用 KeyDiff 也行, LU-KV 都能在上面算出最优预算分配。它不替代选 token 的方法, 它替代的是 *跨头分预算* 的方法。
+
+* 问题-解法压缩图
+
+#+begin_example
+   阶段        看到的问题                       新动作
+  ------------------------------------------------------------------
+  StreamingLLM 朴素滑窗扔开头会崩            永远保留开头 + 最近窗口
+       |
+       v
+  H2O         中间段也有重磅 token          按累加注意力分数留 top-K
+       |
+       v
+  SnapKV      累加分数太散, 不针对任务      用 prompt 末尾观察窗打分
+       |
+       v
+  AdaKV       每个头一样预算太浪费          全局 top-K, 预算随分数走
+       |
+       v
+  LU-KV       不同头分数不可比, 且分数      离线画每个头的"budget-utility"曲线
+              不等于未来效用                 按边际收益跨头分预算
+                                            (任何分数都能用)
+#+end_example
+
+* 并行延伸 (同时代的其他方向)
+
+LU-KV 走的是 "怎么分配预算" 这条线。同时代还有几条平行的演化路径, 都在打磨 *intra-head* 那一面 (选哪个 token):
+
+- *CriticalKV (2025)*: 重新定义重要性 — 不只看 attention 大小, 还看 Value 向量的大小和投影后对最终输出的扰动。
+- *KeyDiff (2025)*: 完全不看 attention 分数, 改用 *Key 向量的几何特征* — 哪些 K 向量"独特"哪些就重要。
+- *HeadKV (2025) / CAKE (2025) / PyramidKV (2024)*: 也是跨头分配预算的方向, 但用的是结构先验 (任务类型、层位置), 不像 LU-KV 那样从数据中学曲线。
+
+LU-KV 和这些方向是 *正交* 的: KeyDiff 之类的新分数可以直接插进 LU-KV 当作 ~π~, 让 LU-KV 用它的曲线去分预算。
+
+* 内核: 这条演化线背后真正在变什么
+
+表面看是 "KV cache 怎么扔得更聪明", 一步步从位置 → 分数 → 任务 → 跨头 → 边际收益。
+
+往下看一层, 整条线其实是一个 *从局部启发式到全局优化目标* 的搬移过程:
+
+1. *StreamingLLM*: 启发式 (位置规则)
+2. *H2O / SnapKV*: 启发式分数 (代理重要性)
+3. *AdaKV*: 全局贪心, 但仍然信启发式分数
+4. *LU-KV*: 把"启发式分数"从决策环节里赶出去 — 启发式只用来选 token, 分预算这一步用真实的、可校准的 *长期效用* 来做
+
+更深一层, 这是一个 *承认"分数不可比"的觉醒*。早期方法都假装"高分 = 重要", 全局排序自然成立。LU-KV 第一次明确说: 不同头里的分数不能横着比, 必须先把每个头的"分数 → 真实效用"的转换函数学出来, 再做决策。
+
+类似的事在很多领域发生过 — 比如机器学习里, 从 raw 概率到 calibrated probability, 从 top-K accuracy 到 expected calibration error。这都是同一个认知跃迁: *"代理指标 (proxy)" 不等于 "真值 (oracle)", 别再混用了。*
+
+* 下一步会去哪
+
+LU-KV 把 "跨头分预算" 这个口子凿到了边际效用, 但还有几个明显的下一跳:
+
+1. *从离线到在线*: 现在的 budget-utility 曲线靠离线校准, 推理时是 zero-overhead 查表。下一步会有人做 *动态在线校准* — 不同输入分布下, 曲线本来就不该一样。
+2. *从 head-level 到更细粒度*: 现在最小单位是头。能不能 *按 token 类型 (实体/数字/连接词等) 分别画曲线*? 这是把 LU-KV 的思想再往下推一层。
+3. *和 quantization 联动*: 现在的"扔"是 binary (留或不留)。和 *KV cache 量化* 联动 — 不重要的 token 不必扔, 而是用低 bit 存 — 把扔和压综合优化。
+4. *统一 prefill 和 decoding 阶段*: 现在的曲线是预 fill 阶段就定下的, decode 中 attention pattern 变了, 曲线就过期。下一步会有人做 *滚动校准*。
+
+整体趋势: KV cache 优化从 "工程优化" 加速变成 "组合优化 + 校准学习" 的子领域。这是好事 — 至少有明确的目标函数可以打分了。
+
+* 诚实标注
+
+- StreamingLLM, H2O, SnapKV, AdaKV 之间的批判改进关系, *已经被 LU-KV 论文的 Related Work 和 Methodology 章节明确引用并对比*。
+- CriticalKV, KeyDiff, HeadKV, CAKE, PyramidKV 是 LU-KV 引用的同期工作, 不在主批判链上, 列入"并行延伸"。
+- "下一步会去哪" 是基于这条演化线的推测, 不是论文原文断言。
+- 五层溯源实际只挖到了 4 层 (StreamingLLM/H2O/SnapKV → AdaKV → LU-KV), 因为 StreamingLLM 之前再往上就是基础 Transformer / 滑动窗口的常识范畴, 没有有意义的"批判改进"关系可挖。
