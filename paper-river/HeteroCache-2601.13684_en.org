@@ -1,0 +1,295 @@
+#+title:      HeteroCache: A Dynamic Retrieval Approach to Heterogeneous KV Cache Compression for Long-Context LLM Inference
+#+date:       [2026-05-29 Fri 10:13]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T101334-en
+#+source:     https://arxiv.org/abs/2601.13684
+#+authors:    Zhiyuan Shi, Qibo Qiu, Feng Xue, Zhonglin Jiang, Li Yu, Jian Jiang, Xiaofei He, Wenxiao Wang
+#+venue:      ACL 2026 Main Conference
+
+* The Problem River
+
+Why does asking a large model to read an entire book before answering questions get progressively slower and more memory-hungry as it reads?
+
+When Transformers decode each new token, they must look back at the "Key" and "Value" representations of every preceding token. These two tensors are cached — that's the KV cache. The longer the context, the larger the cache: at 128K tokens, a 7B model's KV cache can balloon to tens of gigabytes, far exceeding the model weights themselves. GPU memory cannot hold it; memory bandwidth cannot sustain it.
+
+But there is a peculiar split: the MInference team found that in a 128K context, just 4K tokens carry 96.4% of the attention mass. The vast majority of the cache is simply dead weight.
+
+So generation after generation of researchers have asked the same question: can we discard the unimportant tokens and keep only the critical ones?
+
+It sounds simple, but the trap is buried in two words — *attention drift*. A token that looks irrelevant at step 100 may suddenly become pivotal at step 5,000. Discard it early and it is gone forever. This whole river swirls around one question: how to discard aggressively yet safely.
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM
+  | Sees: long context causes collapse
+  | Fix:  keep a few leading tokens + a recent-K sliding window
+  v
+[2023] H2O
+  | Sees: position heuristics are too naive
+  | Fix:  keep "heavy hitters" by cumulative attention score
+  v
+[2024] SnapKV  -------+
+  | Sees: computing scores during decoding is too late   \
+  | Fix:  use attention in the prefill tail window        \
+  v                                                        \
+[2024] PyramidKV ------+                                    +-- (static eviction branch)
+  | Sees: uniform budget per layer is wrong   |               Shared flaw: eviction is irreversible;
+  | Fix:  more budget in lower layers,        |               attention drift is ignored
+  |       less in higher layers               |
+  v                                           |
+[2025] CAKE ------------+
+  | Sees: inter-layer budget can be smarter
+  | Fix:  cascading adaptive allocation
+  v
+                        - - -  (branch point)  - - -
+                        v
+[2024] Quest -------+
+  | Sees: fully static is wrong, but all pages still reside on GPU
+  | Fix:  slice KV into pages; dynamically select which pages
+  |       participate in attention at decode time
+  v                |
+[2025] ShadowKV ---+
+  | Sees: GPU memory is not enough → must offload          (dynamic retrieval branch)
+  | Fix:  low-rank K stays on GPU; V is moved to CPU         Shared flaw: coarse granularity,
+  v                |                                          heavy I/O, misses fine-grained deps
+[2025] OmniKV -----+
+  | Sees: decide per layer which tokens to pull back
+  | Fix:  CPU retrieval at whole-layer granularity
+  v
+[2026] HeteroCache  <-- this paper
+  | Sees: the granularity is fundamentally wrong; look at "heads"
+  | Fix:  budget by head role; pivot heads asynchronously trigger retrieval
+  v
+[????] Not there yet. The likely next step is finer (token × head) granularity,
+       or porting this framework to MoE / reasoning models.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: The First Lifeline for Long-Context Collapse
+
+*** What problem it saw
+
+The most naive approach is a sliding window — attend only to the most recent K tokens. But experiments showed that once the very first few tokens are also discarded, the model immediately starts hallucinating. Those earliest tokens act as an "anchor"; without them the model loses its footing.
+
+*** Its solution
+
+Keep two segments: the first few "attention sink" tokens (roughly 4), plus a sliding window at the tail. Everything in between is discarded.
+
+*** Why it worked (and what new trap it set)
+
+It uncovered a mechanism-level fact: softmax forces attention weights to sum to 1, so when nothing is genuinely important, attention mass gets dumped onto the leading tokens. Those first tokens are therefore untouchable.
+
+But the strategy is a pure *position heuristic* — it looks only at where a token sits, not what it says. A crucial sentence in the middle of a document gets discarded all the same. That is precisely what the next paper set out to fix.
+
+** 2023 | H2O: Scores Instead of Positions
+
+*** What problem it saw
+
+StreamingLLM handed decision power to token position, but the truly important tokens need not sit at the start or end. What matters is how much actual attention they receive.
+
+*** Its solution
+
+Accumulate, during decoding, the total attention score each token receives. High-scoring tokens ("heavy hitters") are kept; low-scoring ones are evicted. When the budget is full, the token with the lowest cumulative score is dropped.
+
+*** Why it worked (and what new trap it set)
+
+A Pareto distribution appears universally in Transformer attention — a small fraction of tokens captures most of the attention mass. Keeping by score is in principle far smarter than keeping by position.
+
+New trap: scores are *accumulated*. A token that receives no attention in the first 1,000 steps has a low score and gets evicted. But it may be exactly what the model needs from step 2,000 onward — classic *attention drift*. Once evicted, it can never be recovered.
+
+** 2024 | SnapKV: Finish the Work Before Generation Begins
+
+*** What problem it saw
+
+H2O dynamically evicts during decoding — updating scores and ranking at every step is itself expensive. Could the important tokens be selected once and for all during prefill (the large forward pass before decoding starts)?
+
+*** Its solution
+
+It exploits an observation: the tail segment of the prefill ("observation window") is a strong predictor of what the generation will attend to. Inspect where the tail window's attention lands among earlier tokens; those are the important ones. Keep them; discard the rest. From that point the KV cache is frozen.
+
+*** Why it worked (and what new trap it set)
+
+In practice this is both fast and accurate — on many benchmarks it approaches full-cache quality at a fraction of the cost. The methodological cost, however, is *static commitment*: once selected, the token set never changes. If the user's query requires a dependency that only becomes visible thousands of steps later, prefill had no way to know, and that token is gone.
+
+PyramidKV followed up immediately with one correction: SnapKV gives every layer the same budget, but in reality lower layers need broad coverage while higher layers benefit from sparse focus. It allocates budget in a pyramid shape — wide at the base, narrow at the top — squeezing out another increment of quality.
+
+** 2025 | CAKE: Pushing Inter-Layer Allocation to the Limit
+
+*** What problem it saw
+
+PyramidKV's pyramid is a fixed shape. The optimal inter-layer allocation actually varies by task and sample — QA and summarization require very different shapes.
+
+*** Its solution
+
+Cascading + adaptive. Each layer dynamically claims budget based on its own "preference signal"; earlier layers go first, and the remainder cascades to later ones.
+
+*** Why it worked (and what new trap it set)
+
+CAKE pushes the static branch to the edge of what it can achieve: budget allocation is now layer-adaptive.
+
+But every paper in this lineage (StreamingLLM → H2O → SnapKV → PyramidKV → CAKE) shares one *root assumption*: what is evicted cannot be recovered. As long as attention drift exists, this branch has a hard ceiling. To break through it, the system must be allowed to *retrieve*.
+
+** 2024 | Quest: Slice into Pages, Invoke on Demand
+
+*** What problem it saw
+
+If we refuse to let tokens die outright, can they "sleep" instead — invisible to computation most of the time, but callable when needed?
+
+*** Its solution
+
+Partition the KV cache into fixed-size pages (e.g., 16 tokens each). Represent each page with a lightweight summary (min/max statistics). During decoding, use summaries to quickly estimate which pages are likely important; let only those pages participate in attention. All other pages are skipped.
+
+*** Why it worked (and what new trap it set)
+
+For the first time, "dynamic selection" reached practical speed — far faster than dense attention with controllable accuracy loss.
+
+Two new traps: (1) all pages still reside permanently on the GPU — *no memory is saved*. (2) page granularity is too coarse — typically only one or two tokens per page are truly relevant, yet the whole page must be loaded.
+
+** 2025 | ShadowKV: Running When GPU Memory Runs Out
+
+*** What problem it saw
+
+Quest does not solve the memory problem. At 224K context, KV cache exceeds 100 GB — one A100 or H100 cannot hold it.
+
+*** Its solution
+
+It observes that the singular values of the Key matrix decay rapidly — a low-rank approximation suffices. Keep the low-rank K on GPU as an "index"; move the full V to CPU memory. At decode time, use the GPU-side low-rank K to estimate which V slices to fetch, then pull them back from CPU.
+
+*** Why it worked (and what new trap it set)
+
+Memory pressure is shifted to CPU DRAM (much cheaper), while the ability to retrieve any token is preserved.
+
+New trap: PCIe bandwidth between CPU and GPU is one to two orders of magnitude slower than GPU memory bandwidth. Each large transfer costs hundreds of microseconds. Retrieval still operates at page/chunk granularity, and I/O cost dominates the total decode latency.
+
+** 2025 | OmniKV: Deciding What to Pull Back at the Layer Level
+
+*** What problem it saw
+
+ShadowKV's low-rank approximation plus page-level retrieval still misses fine-grained dependencies. Could a more accurate signal determine which tokens to pull back?
+
+*** Its solution
+
+It observes that the token sets attended to by different layers differ substantially. Retrieval is performed per layer — each layer independently decides which tokens to fetch from CPU.
+
+*** Why it worked (and what new trap it set)
+
+"Per layer" is more faithful to actual attention structure than "per page," and accuracy improves accordingly.
+
+New trap: layer granularity is still too coarse. A typical layer has 32 heads, and each head's attended token set can differ dramatically. Pulling back tokens for the entire layer means paying the cost of the most demanding head on behalf of all others. HeteroCache's benchmarks show it is more than 40× faster than OmniKV on the same hardware — a stark measure of how wasteful this layer-level granularity is.
+
+** 2026 | HeteroCache: Drop One Level Finer, Down to the Head
+
+*** What problem it saw
+
+From SnapKV to OmniKV, the entire river has been tuning "what unit to save / what unit to retrieve" — token / page / layer. HeteroCache argues the unit is simply wrong. The true source of heterogeneity is at the *head* level.
+
+It makes two measurements:
+
+First, the *temporal dimension*. Track each head and observe whether its "important token set" changes during generation. The result reveals two kinds of heads: some are extremely stable (the same few tokens remain important throughout), while others drift dramatically (the attended token set turns over every hundred steps or so). Stable heads need only a tiny budget; drifting heads need a large budget or the ability to retrieve dynamically.
+
+Second, the *spatial dimension*. Different heads within the same layer often attend to highly overlapping token sets — one head can serve as a representative for an entire group.
+
+*** Its solution
+
+Classify each head along two axes — stability and uniqueness — into four roles:
+
+- *Anchor head*: stable + unique. Small budget, permanently on GPU.
+- *Volatile head*: drifting + unique. Large budget, receives extra resources.
+- *Pivot head*: stable + similar to other heads. Elected "representative"; monitors drift.
+- *Satellite head*: drifting + similar to other heads. Fully offloaded to CPU.
+
+At runtime, pivot heads observe their own attention distribution on GPU. When drift is detected, they *asynchronously* trigger a fetch of the relevant tokens from CPU for the satellite heads in the same group. Asynchrony is the key — the transfer overlaps with the current step's computation, hiding PCIe latency behind arithmetic.
+
+*** Why it worked (and what new trap it set)
+
+Three problems are solved simultaneously:
+
+1. *Nothing is permanently discarded.* CPU acts as a backup store; any token can be recalled — attention drift is eliminated at the root.
+2. *The granularity is right.* Decisions are made per head rather than per page or per layer — each head pays for exactly what it needs.
+3. *Latency is hidden.* Asynchronous retrieval plus pivot monitoring turns the PCIe bottleneck into a background activity.
+
+Results: 3× decode speedup at 224K context, SOTA on LongBench / InfiniteBench, more than 40× faster than OmniKV.
+
+New trap (looking ahead along this river): head roles are determined by offline calibration, assuming they transfer across tasks. But different tasks (QA vs. CoT vs. code generation) may require different classifications. Furthermore, the drift threshold that triggers pivot retrieval is a hyperparameter — making it adaptive is the natural next step.
+
+* Frontier Extensions
+
+As of May 2026, HeteroCache (v2, revised April 2026) is the most recent mainstream work on this river. It has just been accepted to ACL 2026 Main Conference, and follow-on work is still fermenting.
+
+Plausible next directions (extrapolated from the river's trajectory; *no papers confirmed yet*):
+
+- *Token × head joint granularity* — HeteroCache acts at head granularity but still uses pages along the token dimension. Could the next step represent the cache as a sparse (head, token) tensor?
+- *Adapting to reasoning models* — HeteroCache has been tested on DeepSeek-R1-Distill, but CoT-heavy models exhibit very different KV cache growth patterns (extremely long decodes) and may need dedicated strategies.
+- *MoE settings* — head behavior may vary even more dramatically across experts; how should head profiling be performed?
+
+* One Diagram
+
+#+begin_example
+   "The harder you evict, the faster you run — but drift will make you regret it"
+   ---------------------------------------------------------------------------> time
+
+  Position heuristic   Score heuristic      Decide once at prefill, then freeze
+  StreamingLLM         H2O                  SnapKV / PyramidKV / CAKE
+   [.][.][.] ...         . [#][#][#].        [calibrate -> freeze]
+                                                       |
+                                                       | ceiling: "evicted = gone forever"
+                                                       v
+                                            ====== branch point ======
+                                                       |
+                                                       v
+                                     "Allow retrieval, but I/O is the new bottleneck"
+
+          page granularity    page + offload      layer granularity
+          Quest               ShadowKV            OmniKV
+          [GPU]               [GPU<->CPU]         [layer-wise pull]
+             \                     |                    /
+              \                    |                   / shared flaw:
+               \                   |                  /  granularity too coarse,
+                \                  |                 /   I/O too heavy
+                 v                 v                v
+                         +-------------------+
+                         |   HeteroCache     |
+                         | head granularity  |
+                         | + async I/O       |
+                         | pivot monitoring  |
+                         | satellite offload |
+                         +-------------------+
+                                  |
+                                  v
+                            3x decode @ 224K
+                            40x vs OmniKV
+                            SOTA on LongBench
+
+  Vertical axis:  granularity grows finer   token-set -> page -> layer -> head
+  Horizontal axis: degrees of freedom grow   irreversible eviction -> async recall
+#+end_example
+
+* Insights
+
+Reading this river, what emerges is not "yet another KV cache compression method" but a remarkably clear *convergence of understanding*:
+
+*Phase 1 (StreamingLLM ~ CAKE) — cognitive illusion*: the implicit belief that if scores are computed accurately enough and budgets allocated cleverly enough, one can identify the "permanently important" token subset. The entire static branch rests on the assumption that importance can be determined once and for all. But attention drift invalidates that assumption — importance is a *function of time*, not a static property.
+
+*Phase 2 (Quest ~ OmniKV) — admitting the error, but shifting the cost*: the community abandons "decide once," allows retrieval, but retrieval means data movement and data movement means I/O. The entire dynamic branch then stalls on retrieval granularity — coarser granularity wastes I/O bandwidth; finer granularity inflates management complexity.
+
+*Phase 3 (HeteroCache) — questioning the underlying assumption*: everyone had implicitly assumed "tokens are the fundamental unit; heads are homogeneous." But heads are precisely where heterogeneity lives — some heads are inherently stable, others inherently drifting; some are redundant with their neighbors, others uniquely specialized. Once this is acknowledged, the optimal strategy becomes obvious: treat each head according to its role, use CPU as a backup store, and let stable heads act as scouts.
+
+The real shift running beneath this river is a move from *optimizing the Transformer as a black box* toward *modeling it as a heterogeneous system* — acknowledging that different internal components play different roles, and allocating resources accordingly. This mode of thinking will resurface when the same ideas are applied to MoE, reasoning models, and agentic inference.
+
+Where is the river most likely to go next? *Making the classification itself dynamic.* HeteroCache still requires an offline calibration pass to assign head roles — which is, at heart, a new form of "decide once and freeze." A truly complete solution would allow head roles, budgets, and thresholds to be adjusted online as task and context evolve. That is the last mile this river has not yet finished.
+
+* Takeaways
+
+This river offers clear guidance on how to find research problems:
+
+1. *Fix your gaze on a pain point that keeps reappearing.* The KV cache problem has been attacked for three years; each generation fails at the same spot and is then surpassed. Identifying such "recurring failure points" is usually the surest path to the next breakthrough.
+
+2. *Granularity is always worth questioning.* Whenever you see a method doing "Y at unit X," ask: is X the right unit? What happens one level finer? One level coarser? Nearly all of HeteroCache's contribution comes from pushing granularity down from layer to head.
+
+3. *Static assumptions are a gold mine.* Any design that makes a one-time decision and then freezes is worth attacking: SnapKV's prefill calibration, H2O's cumulative scores, HeteroCache's own offline head profiling — each is a latent starting point for the next paper.
+
+4. *Measure before you design.* HeteroCache's most important contribution is not the four-quadrant classification scheme; it is the two measurement quantities — stability score and similarity score. The measurements revealed that heads are heterogeneous in ways no one had previously articulated; only that insight made the classification possible. Without the right measurement, even the cleverest taxonomy is just intuition dressed up as engineering.
+
+The takeaway: the next time you read a chain of papers in a field, don't read them in isolation. Lay them on a timeline and draw a map of "what each predecessor saw, and what the new work sees that its predecessor missed." The dominant tension in the field and the most promising next direction will surface almost automatically.
