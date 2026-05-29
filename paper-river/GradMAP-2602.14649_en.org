@@ -1,0 +1,241 @@
+#+title:      GradMAP: Faster Layer Pruning with Gradient Metric and Projection Compensation
+#+date:       [2026-05-29 Fri 02:41]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T024103-en
+#+source:     https://arxiv.org/abs/2602.14649
+#+authors:    Hao Liu, Guangyan Li, Wensheng Zhang, Yongqiang Tang
+#+venue:      arXiv preprint, Feb 2026
+
+* Who Is the Main Character of This River
+
+Not the GradMAP paper itself.
+
+The main character is a problem that has gone unsolved for a decade: *how do you make a large model smaller without making it dumber*.
+
+This question was asked of image-classification networks in 2015 and is still being asked of large language models in 2026. Every few years someone offers an answer, people use it for a while, and a new pitfall appears. The pit deepens; new arrivals come to fill it. GradMAP is the most recent stretch of this river.
+
+The line below traces from the oldest source all the way downstream, examining exactly what each generation saw as the fatal flaw in what came before.
+
+* Source Map
+
+#+begin_example
+  2015                2023               2024               2025              2026
+  ----                ----               ----               ----              ----
+
+  Magnitude       LLM-Pruner         SLEB                ShortGPT          GradMAP
+  Pruning    -->  (Ma et al.)   -->  (Song et al.)  -->  (Men et al.) -->  (this paper)
+  (Han et al.)    LLaMA neuron       iterative mask      cosine layer      gradient +
+  weight-level    structured         layer eval          importance        projection
+                  pruning            (slow)              (no recovery)     compensation
+                       \                 \                   \                  ^
+                        \                 \                   v                  |
+                         \                 \             LLM-Streamline ---------+
+                          \                 \            (Chen et al.)
+                           v                 v           retrain to recover
+                       Wanda             BlockPruner          (heavy)
+                       (Sun et al.)      MKA / UIDL
+                       unstructured      various
+                       magnitude+act     compensation
+                                         tricks
+#+end_example
+
+The main trunk of the river is: *weights -> neurons -> entire layers* — scissors that get ever larger — together with the two eternal sub-problems of *measuring importance* and *recovering after the cut*.
+
+* I. The Source: Is Dropping Small Weights Enough? (Han 2015)
+
+In 2015, deep learning was still focused on image classification, and models were already getting uncomfortably large. Han et al. noticed a very plain fact: many weights in a neural network are nearly zero and contribute nothing.
+
+*Their solution*: rank all weights by absolute value and zero out the smallest 90%. The model still ran; accuracy dropped only slightly.
+
+It sounded elegant. But after a few years of use, two pits appeared:
+
+1. *Hardware didn't cooperate*: randomly zeroing out weights produces a sparse matrix. GPUs are not fast at sparse matrix operations unless special sparse kernels are available. After all that effort, the model was smaller on paper, but actual inference speed barely improved.
+2. *The wrong weights were being selected*: a small absolute value does not mean unimportant. A weight may be tiny yet connected to a highly active input, so their product is a large contribution. Judging by the weight alone leads to misjudgment.
+
+The second pit was patched in the LLM era by Wanda, which multiplies weight magnitude by input-activation magnitude to form a new importance score. The hardware pit was never fully resolved.
+
+So people thought: instead of pruning scattered individual weights, why not prune *whole structures* — an entire neuron, an entire attention head? After such a cut the matrix is genuinely a size smaller, and the GPU benefits directly.
+
+This is structured pruning, whose landmark paper is LLM-Pruner.
+
+* II. The Second Generation: Prune Entire Groups of Neurons (LLM-Pruner, 2023)
+
+LLM-Pruner performed the first serious structured pruning of multi-billion-parameter models like LLaMA. It treats a coupled group of weights (for example, the input and output weights of a single FFN neuron) as a unit: prune together or not at all.
+
+*What it saw in Han's line*: pruning individual weights yields a sparse matrix that is impractical for deployment. Pruning a whole group of coupled neurons makes the matrix genuinely smaller, and inference genuinely faster.
+
+*The new pits it left behind*:
+
+1. *Accuracy drops sharply*: neuron-level pruning disrupts the coordination among all remaining layers, requiring a round of fine-tuning to recover. Fine-tuning a 7B model is not cheap.
+2. *Compression ratio has a ceiling*: removing 20% of neurons is feasible, but removing 40% essentially collapses the model.
+3. *Irregular structural changes*: every layer ends up a different shape, which complicates deployment.
+
+At this point someone raised a more radical question: *why not prune an entire Transformer layer?*
+
+A layer is a single self-contained block. Remove it, and the surrounding layers connect directly; the model architecture is unchanged, just shallower. Almost no code changes are needed, and inference becomes faster immediately.
+
+This is the beginning of layer pruning — the river enters its third stretch.
+
+* III. The Third Generation: Remove Entire Layers (ShortGPT / Laco, 2024–2025)
+
+ShortGPT asked the simplest possible question: *which Transformer layers are doing essentially nothing?*
+
+Its metric is called Block Influence (BI): measure how similar a layer's output is to its input. If the output is nearly identical to the input (cosine similarity close to 1), the layer is acting as an identity function and can be removed without consequence.
+
+*What it saw in LLM-Pruner*: pruning down to neuron granularity is cumbersome; pruning whole layers is cleaner, requires less post-hoc fine-tuning, and is easier to deploy.
+
+*The pits it left behind*:
+
+1. *Similarity does not equal uselessness*: if a layer's input and output look alike, that does not mean the layer contributed nothing. It may be performing a critical micro-adjustment — nudging a token's representation just slightly in the right direction. That gentle nudge can determine the answer to a downstream task. Looking only at similarity misses this. This is precisely the point that GradMAP later criticizes ShortGPT on most forcefully.
+2. *No cleanup after pruning*: ShortGPT prunes and walks away. Accuracy loss is simply accepted.
+
+To address the first pit, SLEB was proposed.
+
+* IV. Third Generation Continued: Measure Importance via Loss Change (SLEB / BlockPruner, 2024)
+
+SLEB distrusted cosine similarity. Its argument: "To test whether a layer matters, the most direct approach is to actually remove it and see how much the model's loss rises."
+
+Its procedure: temporarily mask out each layer in turn, run a forward pass, and record the loss. The layer whose removal raises the loss the least is the best candidate for pruning. Remove it, then repeat the entire round with the remaining layers.
+
+*What it saw in ShortGPT*: surface-level similarity is just an appearance; what matters is a layer's effect on the final task objective.
+
+*The new pits it left behind*:
+
+1. *Prohibitively slow*: selecting each layer to prune requires a full forward pass with every remaining layer masked in turn — O(L×K) forward passes to prune K layers. On a 7B model, the wall-clock time jumps from minutes to hours. This is the first pain point GradMAP sets out to solve.
+2. *Still no recovery*: like ShortGPT, it prunes and moves on.
+
+* V. Third Generation Again: Recover After Pruning (LLM-Streamline / UIDL, 2024)
+
+By the second half of 2024, a common realization had emerged: *no matter how carefully you select layers to prune, accuracy will fall. Selecting well is necessary but not sufficient — you also need a way to pull the accuracy back up.*
+
+LLM-Streamline's approach: insert a lightweight network (a small MLP or a thin layer) at the location of the removed block, and use distillation to make it mimic what was pruned away.
+
+UIDL (Gromov et al.) is more direct: after pruning, run a quick round of QLoRA fine-tuning on the entire model.
+
+*What they saw in ShortGPT / SLEB*: pruning without any recovery causes accuracy to collapse, especially at compression ratios above 40%.
+
+*The new pits they left behind*:
+
+1. *Recovery itself is slow and expensive*: training a small bridging network or running QLoRA both require substantial calibration data and GPU time. The total cost reverts to the LLM-Pruner era.
+2. *Calibration-data sensitivity*: the recovery network's generalization is suspect, because it is sensitive to the distribution of the data used to train it.
+
+At this point the problem landscape is extremely clear:
+
+- *Measuring importance*: either imprecise (cosine similarity) or slow (loss-masking)
+- *Post-pruning recovery*: either absent or expensive
+
+Whoever can do both quickly and well wins.
+
+GradMAP arrives.
+
+* VI. The Present: GradMAP's Two-Move Strategy (2026)
+
+GradMAP surveys all the pits dug by its predecessors along this river and proposes two things, each targeting one pain point.
+
+** Move One: Use Gradient Magnitude to Measure Importance
+
+No cosine similarity. No loss-masking. It uses *gradients*.
+
+The intuition: run one forward-plus-backward pass on a batch of samples, and every layer receives a set of gradients. If a layer's gradients are universally small, the loss is insensitive to that layer's parameters, meaning its removal will have little effect on the loss.
+
+Concretely: sum the L2 norm of all parameter gradients within a layer to obtain that layer's "importance score." Layers with low scores are pruned.
+
+*How this differs from SLEB*: SLEB "actually removes the layer and runs a full forward pass," requiring O(L) forward passes per layer selected. GradMAP "runs one backward pass and reads all layers' gradients simultaneously" — O(1) backward passes per selection decision. Pruning K layers costs K backward passes, not K×L forward passes.
+
+*How this differs from ShortGPT*: ShortGPT measures only how similar a layer's output is to its input — it looks at *representational similarity in feature space*. GradMAP looks at *the partial derivative of the loss with respect to that layer's parameters* — directly capturing the layer's contribution to the task. A layer that looks nearly identity but is task-critical will be wrongly killed by ShortGPT; GradMAP will keep it.
+
+This move resolves the tension between being fast and being accurate.
+
+** Move Two: Projection Compensation Matrix
+
+After layers are removed, the output distribution of the remaining layers drifts — a surviving layer suddenly receives input from a layer it was never originally connected to, and the statistical properties have shifted.
+
+LLM-Streamline's response is to *insert a new network at the pruned location*. GradMAP's response is to *adjust one weight matrix in one of the surviving layers*.
+
+The procedure:
+
+1. Identify the layer whose output drifts most severely after pruning (typically only one or two layers drift noticeably; others are largely unaffected).
+2. Left-multiply that layer's down-projection weight matrix by a small learned matrix W'.
+3. Train W' to make this layer's post-pruning output match its pre-pruning output as closely as possible. At the end, absorb W' into the original weight matrix; no extra parameters appear at deployment time.
+
+*How this differs from LLM-Streamline*:
+
+- LLM-Streamline trains an entire small network to mimic the pruned block. GradMAP trains a single matrix to align the distributional mean shift. The latter involves orders of magnitude fewer parameters.
+- LLM-Streamline changes the model structure (a new segment is added). GradMAP does not change the structure (W' is absorbed into existing weights).
+- LLM-Streamline must train to convergence, which takes time. GradMAP trains one matrix in a matter of minutes.
+
+*How this differs from UIDL*: UIDL applies QLoRA fine-tuning to the entire model, touching all layers. GradMAP touches one layer and one matrix only.
+
+This move settles the old debt that recovery must be expensive.
+
+** Combined Effect
+
+The numbers reported in the paper: 4× pruning speed, with accuracy uniformly better than SLEB, ShortGPT, and MKA across benchmarks. At the extreme compression ratio of 40%, competing methods collapse; GradMAP remains stable.
+
+* Problem–Solution Overview
+
+#+begin_example
+  Problem axis            Solution evolution                                Cost
+  ------------            ------------------                                ----
+
+  What granularity to prune?
+  --------------------------
+  Weights (2015)          -> simple brute force, sort by |w|               hardware-unfriendly
+  Neuron groups (2023)    -> prune all coupled weights together (LLM-Pruner)  needs fine-tune
+  Entire layers (2024+)   -> remove whole Transformer blocks               accuracy collapse
+
+  How to measure whether a layer is important?
+  --------------------------------------------
+  Input/output similarity (ShortGPT)  -> one forward pass                 wrongly kills critical layers
+  Mask and observe loss rise (SLEB)   -> O(L*K) forward passes            extremely slow
+  Gradient magnitude (GradMAP)        -> O(K) backward passes, fast+accurate  <-- current best
+
+  What to do about accuracy loss after pruning?
+  ---------------------------------------------
+  Nothing (ShortGPT, SLEB)            -> zero cost                        large accuracy loss
+  Insert small distillation net (LLM-Streamline) -> train whole network   slow, changes structure
+  Full-model QLoRA (UIDL)             -> fine-tune all layers              expensive
+  One matrix in one layer (GradMAP)   -> one matrix, one layer, absorbable <-- current lightest
+
+  GradMAP = gradient layer selection  +  projection compensation
+          = "accurate and fast"        +  "light and stable"
+#+end_example
+
+* Where Does This River Flow Next
+
+Pull the entire line straight and look at what has actually happened.
+
+On the surface, *pruning granularity* has grown coarser: weights → neurons → entire layers. The technique keeps getting blunter.
+
+But at a deeper level, what has been changing is *the researchers' understanding of "importance"*:
+
+- 2015: importance = magnitude of the parameter itself (look at *presence*)
+- 2023: importance = a parameter's structural dependencies with neighbors (look at *position in the graph*)
+- 2024 early: importance = similarity between a layer's input and output (look at *representational change*)
+- 2024 mid: importance = effect of masking the layer on the loss (look at *task impact*)
+- 2026: importance = gradient of the loss with respect to that layer's parameters (look at *task sensitivity*)
+
+Each generation has pulled the concept of "importance" *closer to the task objective* — from static parameter features toward dynamic task response.
+
+The second, quieter thread is that *recovery methods have grown lighter*:
+
+- Early: no recovery — just accept the damage
+- Middle: train an entire segment of network to recover (heavy)
+- Now: train one matrix, absorb it into the existing weights (light)
+
+Recovery has moved from "adding something" to "adjusting something" — from structural modification to parameter nudging. The underlying insight is that most of the damage caused by pruning is *distributional shift*, and distributional shift can be corrected by a single linear transformation. There is no need to relearn functionality; alignment is enough.
+
+Two guesses about where the river flows next:
+
+1. *Gradients can be used at finer resolution*: GradMAP uses the L2 norm of parameter gradients. But gradients carry both direction and structure. For instance, one could examine whether gradient directions across different tasks are consistent, to distinguish "task-universal" layers from "task-specific" ones. Removing task-specific layers may not harm general capability.
+2. *The compensation matrix will become a universal paradigm*: the idea of "one matrix handles distributional drift" may spill out of layer pruning into quantization, distillation, model merging, and every other setting that requires distribution alignment. At its core it is a lightweight distribution aligner, and its scope of application is far broader than layer pruning alone.
+
+The next stretch of this river will most likely not be yet another pruning method, but rather *transplanting the "select with gradients + compensate with projection" paradigm into other compression tasks*.
+
+* Honest Annotations
+
+- ShortGPT, SLEB, BlockPruner, LLM-Streamline, UIDL, and MKA are all explicitly named by GradMAP either as direct targets of criticism or as comparison baselines; their citation relationships are confirmed.
+- Wanda and LLM-Pruner are cited by GradMAP when introducing the general background of pruning, as representatives of unstructured and structured pruning respectively; they are not direct targets of criticism.
+- Han et al. 2015 is the origin of the entire pruning field and is cited by nearly every subsequent paper. GradMAP cites Han et al. 2015b as the canonical example of classical pruning.
+- No follow-up work citing GradMAP has been found. The paper was posted in February 2026; as of May 2026 no publicly available papers citing it exist. The forward-looking extension section is therefore absent — nothing has been fabricated.
+- The two "next steps" are reasonable extrapolations from the evolutionary trajectory described above, not explicit roadmaps from any paper.

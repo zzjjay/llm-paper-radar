@@ -1,0 +1,337 @@
+#+title:      ARKV: Adaptive and Resource-Efficient KV Cache Management under Limited Memory Budget for Long-Context Inference in LLMs
+#+date:       [2026-05-29 Fri 10:00]
+#+filetags:   :paper:river:kvcache:quantization:en:
+#+identifier: 20260529T100000-en
+#+source:     https://arxiv.org/abs/2603.08727
+#+authors:    Jianlong Lei, Shashikant Ilager (University of Amsterdam)
+#+venue:      ACM/IEEE CCGRID 2025 (arXiv Feb 2026)
+
+* The River of Problems
+
+In one sentence: when an LLM reaches the hundred-thousandth word of a conversation, the notepad in its head that tracks "what was said before" (the KV cache) can grow larger than the model itself. The question is how to make it — when memory runs out — *forget the unimportant, compress the semi-important, and retain the critical* — rather than applying a blunt, uniform cut.
+
+Why is this problem hard? Why has it resisted clean solutions for three or four years?
+
+- *The future is unknowable*: to decide whether "this token still matters," you need to know what will be asked next. But the next token has not been generated yet — there is no way to know.
+- *One-size-fits-all is expensive*: compress everything to 2-bit and math problems collapse immediately; retain everything and a 64 GB GPU cannot hold a long conversation with a 70B model.
+- *Every layer is different*: shallow Transformer layers handle syntax, deep layers handle reasoning — their tolerance for "dropping a token" differs by orders of magnitude. Yet the vast majority of methods treat all layers identically.
+- *The online vs. offline dilemma*: offline analysis of per-layer sensitivity is accurate, but becomes stale the moment the model or task changes; online decisions are flexible, but recomputing every step burns more overhead than the savings are worth.
+
+Every paper on this river is attempting to move one small step within these four constraints.
+
+* The Source Map
+
+#+begin_example
+[2023] H2O (Zhang et al., NeurIPS)
+  |
+  | Problem identified: KV cache grows linearly; a 70B model on long context overflows GPU memory
+  | Solution: rank by cumulative attention score; keep only the top-20% "heavy hitter" tokens
+  v
+[2024 Spring] SnapKV (Li et al., NeurIPS)
+  |
+  | Problem identified: H2O recomputes scores at every generation step — non-trivial overhead;
+  |                     importance can actually be determined before generation begins
+  | Solution: examine attention of the last few prompt tokens; pick what to keep in one shot
+  v                                   \
+[2024 Spring] PyramidKV (Yang et al., ACL Findings)   |
+  |                                   |
+  | Problem identified: a uniform budget K across all layers wastes resources —
+  |                     deep layers actually need far fewer tokens
+  | Solution: assign a different budget per layer, following a pyramid distribution
+  v                                   |
+   (the eviction branch matures here)  |
+                                       |  A separate branch running in parallel:
+                                       v
+[2023] KIVI (Liu et al.)              [2024] KVQuant (Hooper et al., NeurIPS)
+  |  2-bit quantization of all KV;    |  3-bit quant, learned scales, 10M-token context
+  |  no tokens are dropped            |
+  |                                   |
+  +-----------------+-----------------+
+                    |
+                    | Problem identified: full quantization collapses on GSM8K-style reasoning
+                    | (ARKV experiment: at budget 512, base-quant accuracy ≈ 0.01)
+                    v
+[2024] Q-Hitter (Zhang et al., MLSys)  <- first to merge the two branches
+  |
+  | Problem identified: the "important tokens" selected by H2O are not necessarily
+  |                     quantization-friendly; quantization also corrupts the importance
+  |                     scores themselves
+  | Solution: joint score = attention importance × quantization friendliness;
+  |           keep tokens that score high on both, then quantize them to 4-bit
+  | Limitation: quantization friendliness is computed *offline* — a static table,
+  |             one value per layer, fixed at deployment
+  v
+[2026 Feb] ARKV (Lei & Ilager, CCGRID)  <- this paper
+  |
+  | Problem identified: Q-Hitter still bundles "importance" and "quantization tolerance"
+  |                     into a single top-K selection — binary keep/drop, no middle ground;
+  |                     and the offline table cannot adapt to different tasks or inputs
+  | Solution: three states (Original / Quantized / Evicted) + online statistics
+  |           — three moments (entropy / variance / kurtosis) computed per layer
+  |           to dynamically split the budget across the three tiers
+  v
+[2026 Feb+]  KVTuner / MixKVQ / "Don't Waste Bits!" / PM-KVQ
+              (each pushes one edge of ARKV further)
+#+end_example
+
+* The Evolutionary Narrative
+
+The papers below are not isolated results — each one solves a concrete pain point left by the one before it. Walking this line, you will see how a simple intuition ("keep important tokens, drop the rest") is incrementally pushed toward a far more nuanced view: "importance is layer-dependent, dynamic, and coupled with quantization."
+
+** 2023 | H2O: Discovering That Most Tokens in the KV Cache Are Just Along for the Ride
+
+*** What problem it saw
+
+Before H2O, KV cache management was largely ignored — every token had to be kept, because "what if a later attention query needs it?" The result: LLaMA-70B on long context consumed tens of gigabytes for the KV cache alone, more than the model weights themselves.
+
+*** Its solution
+
+H2O made an observation that was both simple and striking: accumulate how many times each token has been attended to over history, and you find the distribution is extremely long-tailed — *20% of tokens absorb more than 80% of total attention*. The remaining 80% are ignored by everyone and can be dropped. That top 20% are called heavy hitters.
+
+In practice: at every generation step, update cumulative attention scores for all history tokens, retain the top K, and evict the rest from cache.
+
+*** Why it works — and what pits it digs
+
+It works because attention is inherently sparse — most queries focus on a small subset of keys. Dropping the tokens nobody looks at is nearly imperceptible to the model.
+
+But it digs three pits that the rest of the river must eventually fill:
+
+1. Recomputing cumulative scores at every step *is not cheap* (SnapKV inherits this)
+2. *The same K is used across all layers*, ignoring that sensitivity varies by orders of magnitude between shallow and deep layers (PyramidKV inherits this)
+3. Once a token is evicted it is *gone forever* — if the model suddenly needs it later, that context is simply missing (Q-Hitter and ARKV use quantization as a middle tier to mitigate this)
+
+** 2024 Spring | SnapKV: Can We Compute Importance Once, Before Generation Starts?
+
+*** What problem it saw
+
+H2O updates cumulative attention scores at every decoding step. When the cache is already large, this update itself becomes a bottleneck. SnapKV noticed an interesting phenomenon: *how the last few dozen tokens of your prompt "look at" the preceding context reliably predicts how the entire decoding phase will look at it.*
+
+*** Its solution
+
+So: after the prompt arrives, run a one-shot analysis — take a small trailing window (the "observation window") as a probe, examine its attention distribution over the prefix, select top-K, and evict everything else. During decoding, nothing changes.
+
+*** Why it works — and what pits it digs
+
+It works because LLM attention patterns are fairly stable within a conversation, and the prompt tail's "field of view" genuinely predicts subsequent behavior.
+
+New pit: *the price of prediction is rigidity*. Once decoding begins and the topic shifts, newly generated tokens may need to refer to a token that was judged "unimportant" during the prompt phase and has already been discarded. SnapKV's core limitation is "decide once, execute forever."
+
+ARKV later absorbs the observation-window idea directly (W=32 in the paper), but replaces "decide once" with "decide continuously."
+
+** 2024 Spring | PyramidKV: Different Layers Have Different Appetites — Why Force the Same Budget?
+
+*** What problem it saw
+
+Both H2O and SnapKV treat all Transformer layers as "the same thing" — push budget K down, every layer keeps K tokens. PyramidKV empirically found that *deep-layer attention is highly concentrated while shallow-layer attention is diffuse*. In other words, deep layers need only a handful of key tokens; shallow layers need more. A uniform cut either wastes budget or hurts accuracy.
+
+*** Its solution
+
+Assign different budgets per layer, arranged in a pyramid shape — larger budgets at the bottom (shallow layers), smaller at the top (deep layers).
+
+*** Why it works — and what pits it digs
+
+It works because different Transformer layers genuinely operate at different levels of abstraction, and "attention concentration" is a real signal.
+
+New pit: the pyramid shape is a *hand-crafted prior* — based on the general observation that deep layers are more concentrated than shallow ones, but for a specific model and task the actual curve may look quite different. Forcing a pyramid may not be optimal. ARKV later replaces this prior with per-layer empirical statistics (entropy / variance / kurtosis).
+
+** 2023–2024 | KIVI / KVQuant: A Different Road — Don't Drop, Just Compress Everything
+
+*** What problem they saw
+
+The H2O family's "drop tokens" approach saves memory but carries a fundamental risk: *evicted tokens never come back*. If halfway through generation the model wants to reference a token that was condemned, that context is gone. KIVI and KVQuant reasoned in the opposite direction: keep all tokens, but store them with fewer bits.
+
+*** Their solutions
+
+- KIVI: 2-bit quantization, separate schemes for K and V, no retraining required
+- KVQuant: 3-bit + learned scales + grouped quantization, claims support for 10M-token contexts
+
+*** Why it works — and what pits it digs
+
+It works because information is preserved — every token is still there, just slightly blurred. On short tasks the degradation is nearly lossless.
+
+But ARKV's experiments hit this approach hard: at a 512-token budget on GSM8K math problems, *the pure-quantization baseline achieves accuracy 0.010* — essentially random guessing. The reason is that mathematical reasoning is extremely sensitive to numerical precision; small errors at each step multiply into catastrophe. Moreover, keeping all tokens means *attention computation still scales linearly* — quantization saves storage but not compute.
+
+This branch and the eviction branch must be merged — and that is where Q-Hitter enters.
+
+** 2024 | Q-Hitter: The First to Merge Drop and Compress — But Statically
+
+*** What problem it saw
+
+The most naïve merger would be "run H2O to select important tokens, then quantize them." Q-Hitter empirically showed this is a trap — *quantization corrupts the attention scores themselves*, causing the wrong heavy hitters to be selected; simultaneously, *the tokens H2O selects as important are not necessarily quantization-friendly* (they may be precisely the outlier-heavy ones).
+
+In short: chaining two independently optimal solutions gives 1+1 < 1.
+
+*** Its solution
+
+Design a joint score S = attention importance × quantization friendliness. Only tokens that score high on both are retained; they are then quantized to 4-bit. Tokens that are important but fragile to quantization, or quantization-friendly but unimportant, are both discarded.
+
+*** Why it works — and what pits it digs
+
+It works because it genuinely recognizes that "importance" and "quantization tolerance" are two independent dimensions that must be jointly optimized.
+
+New pits — the exact points ARKV directly attacks:
+
+1. *Quantization friendliness is computed offline* — a static value per layer, calculated before deployment and fixed thereafter. This means a different task or different input can render the table stale.
+2. Still a *binary decision*: keep (and quantize) or drop — *there is no three-tier structure of "keep at original precision / keep quantized / evict"*.
+3. Maintaining a per-layer sensitivity table couples the method tightly to model architecture, adding complexity.
+
+** 2026 Feb | ARKV: Three States + Online Statistics — The Most Fine-Grained Form on This Branch So Far
+
+*** What problem it saw
+
+ARKV's introduction names two core challenges:
+
+1. *Token importance is layer-sensitive* — the same token may be noise in a shallow layer and critical in a deep one. All prior methods assume cross-layer importance is uniform.
+2. *Token quantization tolerance is also heterogeneous* — quantizing a token that should not be quantized causes far more damage than mis-quantizing an unimportant one.
+
+PyramidKV solved half the problem with its prior pyramid (layer heterogeneity); Q-Hitter solved the other half with an offline table (quantization heterogeneity). But neither is sufficiently dynamic or fine-grained.
+
+*** Its solution
+
+Upgrade Q-Hitter's binary decision to a *three-state* classification: each token is either Original (full-precision bf16), Quantized (compressed to fp8), or Evicted (dropped).
+
+How is the per-layer budget computed? This is ARKV's cleverest contribution. During the prefill phase it computes three statistics from each layer's attention distribution:
+
+- *Entropy H*: how dispersed is the attention? (high dispersion → every token matters → keep more)
+- *Variance V*: how large are the differences among tokens?
+- *Kurtosis K*: are the tails of the distribution heavy? (many outliers)
+
+These are combined into an OQ score q_ℓ = H^(1/τ₁) · V^(1/τ₂) · K^(1/τ₃), then normalized to give each layer an OQ ratio ρ_ℓ. High ρ_ℓ → this layer is sensitive → allocate more budget to "original precision"; low ρ_ℓ → allocate more to "quantized," less to original.
+
+During decoding, a lightweight heavy-hitter score S_k = μ_k + γ·σ_k² ranks tokens per layer, and the layer budget splits them into three tiers.
+
+*** Why it works — and what pits remain
+
+Why it works:
+
+- *Three tiers instead of two* — the model gains a "not sure whether to drop" middle option; fp8 preserves secondary information at very low cost
+- *Entropy / variance / kurtosis* essentially characterize "how concentrated this layer's attention is" — more faithful to actual data than a pyramid prior
+- *14.4% quantization rate* — this figure is telling: ARKV saves memory primarily through eviction (~78%), with quantization accounting for only ~14% and the rest kept at original precision. Quantization is "insurance for semi-important tokens," not the main lever for memory savings
+
+Empirical results: 4× memory compression, ~97% of LongBench accuracy, 86% throughput; GSM8K accuracy 0.789 (base model: 0.791) versus pure quantization at 0.010.
+
+Pits not yet filled:
+
+1. The three temperature parameters τ₁=7.774, τ₂=5.407, τ₃=5.528 were tuned with Optuna — *they may need re-tuning for a different model*
+2. Only *fp8* is supported as a quantization precision — no flexible 2/4/8-bit tiers
+3. The decision granularity is *token-level*; it does not extend to channel-level or head-level
+
+These three pits are exactly what the relay papers of 2026 are each chewing on.
+
+* Frontier Extensions
+
+ARKV was posted in February 2026. In the months immediately before and after, at least four papers continued pushing the same problem from different angles.
+
+** 2026 Feb | KVTuner (arXiv 2502.04420)
+
+Frames per-layer sensitivity estimation as an *offline Pareto search* — sacrificing online adaptability in exchange for a more accurate inter-layer precision allocation. A direct contrast with ARKV: ARKV is "lightweight online statistics," KVTuner is "heavyweight offline optimality." Both approaches have their market.
+
+** 2026 Feb | "Don't Waste Bits!" (arXiv 2604.04722)
+
+Extends ARKV's "two precision tiers (bf16 / fp8)" to *four tiers: {2-bit, 4-bit, 8-bit, FP16}*, using a small learned controller (conditioned on token frequency / quality score / attention variance / entropy) to select the bit-width. The design is explicitly inspired by Huffman coding — high precision for important tokens, low precision for unimportant ones, with proportions determined by the data.
+
+It directly inherits ARKV's attention-statistic ideas (entropy + variance) but refines the "three states" into a "continuous bit allocation."
+
+** 2026 Dec | MixKVQ (arXiv 2512.19206)
+
+Pushes decision granularity from *token-level down to channel-level*. The observation is that outlier channels exist within the key cache — it is not the entire token that is hard to quantize, but specific dimensions within it. MixKVQ also brings the query into the picture: whichever channels matter for the current query receive higher precision.
+
+This extends ARKV's "token importance" idea into a new dimension — the channel dimension.
+
+** 2026 | PM-KVQ (OpenReview)
+
+A specialized variant targeting *long-CoT reasoning models* (DeepSeek-R1 and similar): block-wise (rather than layer-wise) precision allocation, combined with positional interpolation calibration. Outperforms the state of the art by 8% on 7B–70B long-CoT LLMs.
+
+Can be understood as a task-specialized fusion of PyramidKV and ARKV for reasoning-model scenarios.
+
+* A Single Diagram
+
+#+begin_example
+                  Problem: KV cache devours GPU memory — how to compress it?
+
+  Time -->     2023               2024                 2026 -->
+
+  Branch A:  [H2O]  --> [SnapKV]  --> [PyramidKV]                 (eviction)
+  "drop       |          |              |                              |
+  unimportant"|          |              |                              |
+  tokens"     v          v              v                              |
+           cumulative  one-shot      per-layer                         |
+           attention   selection at  budget allocation                 |
+           + heavy-    prompt time   + pyramid shape                   |
+           hitter      + observation                                   |
+                       window                                          |
+                                                                       |
+                                                                       v
+  Branch B:  [KIVI]                  [KVQuant]                         |
+  "keep all   |                       |                                |
+  tokens but  v                       v                                |
+  compress"   2-bit quantization      3-bit + learned scales           |
+                                                                       |
+                                           \                           |
+                                            \                          |
+  Merged:                                 [Q-Hitter, 2024]             |
+  "keep the                               static joint scoring         |
+  important &                             + offline sensitivity table  |
+  compression-                                   \                     |
+  friendly"                                       \                    |
+                                                   v                   v
+                                            [ARKV, 2026 Feb]  <--------+
+                                            Three states (Orig/Quant/Evict)
+                                            + online per-layer OQ statistics
+                                            (entropy / variance / kurtosis)
+                                                    |
+                          +-------------------------+------------------+
+                          |                 |                          |
+                          v                 v                          v
+                    [KVTuner]       ["Don't Waste Bits!"]        [MixKVQ]
+                    offline Pareto  continuous bit allocation    channel-level
+                    layer precision {2, 4, 8, 16}-bit            query-aware
+                    search
+
+  Running thread: decision granularity  "global" -> "layer" -> "token" -> "channel"
+                  decision timing       "offline" -> "prefill" -> "online decoding"
+                  decision options      "keep/drop" -> "keep/compress/drop" -> "continuous bits"
+#+end_example
+
+* Insights
+
+Reading this river, three genuinely significant shifts emerge — ones that matter far more than "yet another KV cache paper":
+
+** I. Granularity Is Sinking
+
+#+begin_example
+  Global K -->  Layer K -->  Token level -->  Channel level
+  (H2O)      (PyramidKV)      (ARKV)          (MixKVQ)
+#+end_example
+
+Each level down adds one more dimension of modeled heterogeneity, and savings climb accordingly. But *the cost of online decision-making climbs with it*. ARKV's use of three moments (entropy / variance / kurtosis) to compute OQ ratios is effectively finding a sweet spot between "fine-grained enough" and "cheap enough."
+
+** II. The Boundary Between "Drop" and "Compress" Is Dissolving
+
+In the H2O era, eviction and quantization were two independent branches doing their own thing. Q-Hitter first acknowledged that they must be jointly optimized. By ARKV, "drop / compress / keep" has become *three sample points on a continuous spectrum*. In "Don't Waste Bits!" that spectrum becomes a fully continuous bit allocation.
+
+*The ultimate form of the next step: for every token, every channel, every timestep, independently decide a precision value between 0 and 16 bits.* That value will be computed in real time by a lightweight controller.
+
+** III. Attention Statistics Are Becoming the Interface for "Model Self-Awareness"
+
+What is genuinely deep about ARKV is this: it trains nothing, changes no architecture — *using only three scalar statistics derived from the attention matrices the model itself produces* — and from those infers the sensitivity of every layer. This is a kind of built-in health monitor for the model.
+
+This idea is far broader than KV cache management. *Any decision about "which parameters / activations / layers matter more"* — pruning, inference routing, expert selection — can read signals from the higher-order moments of attention without depending on additional calibration data or a training phase.
+
+The most likely next directions:
+
+1. Make ARKV's "statistics → precision allocation" into a *learnable module* (already started: "Don't Waste Bits!")
+2. Fuse "online decisions" with hardware kernels — currently ARKV's throughput is 86%, meaning decision overhead still costs 14%
+3. Apply to MoE models — expert selection is fundamentally the same problem as "which parameters matter right now," structurally isomorphic to KV cache management
+
+* Takeaways
+
+This river offers several concrete lessons about how to find problems worth solving:
+
+1. *Do not solve compound problems by chaining two independent stages.* Before Q-Hitter, everyone did "eviction first, then quantization" because both subproblems had mature solutions. But optimizing them separately gives 1+1 < 1. Real progress came from acknowledging that they *corrupt each other* and must be jointly modeled.
+2. *Intermediate states are often gold mines.* ARKV's biggest design innovation — moving from binary "keep/drop" to ternary "keep/compress/drop" — looks trivially obvious in hindsight, yet the field spent three years on the binary version without anyone adding that middle tier. Whenever you see a field stuck in a binary debate, ask: "Is there a 1.5 option?"
+3. *Hand-crafted distribution shapes (pyramid, linear, exponential) will always be displaced by data-driven alternatives.* PyramidKV assumes deep layers need smaller budgets — broadly correct. ARKV directly measures the true statistics of each layer — more accurate. Any "allocate according to shape X" scheme is waiting to be replaced by "allocate according to measured data."
+4. *Lightweight statistics beat heavy learned modules.* ARKV trains no retaining head (unlike Locret) and maintains no learned scale (unlike KVQuant) — it just computes three scalar statistics. In online decision settings, "fast to compute" beats "accurate to compute," because decision overhead directly eats into the savings.
+5. *The most convincing experiments are not averages but cliff-edge contrasts.* ARKV's 0.789 vs. pure quantization's 0.010 on GSM8K at budget 512 — that single number is more impactful than all the ~97% LongBench results combined. Finding the scenario where prior methods *fall off a cliff* is the most effective way to motivate a paper's contribution.
+
+This means you can take any one of the five points above and apply it to whatever domain you are working in: Is your problem being solved by two chained independent stages? Does your method implicitly assume some prior distribution shape? Does your experiment contain a scenario where the competition falls off a cliff? If the answer to any of these is no, there is a potential next paper waiting.

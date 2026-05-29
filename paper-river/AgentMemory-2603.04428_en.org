@@ -1,0 +1,315 @@
+#+title:      Agent Memory Below the Prompt: Persistent Q4 KV Cache for Multi-Agent LLM Inference on Edge Devices
+#+date:       [2026-05-29 Fri 03:01]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T030145-en
+#+source:     https://arxiv.org/abs/2603.04428
+#+authors:    Yakov Pyotr Shkolnikov
+#+venue:      arXiv 2603.04428, Feb 2026
+
+* The River of Problems
+
+Your MacBook is running a 10-agent workflow: one writes code, one reviews, one tests, one plans, and six more are domain experts. Every agent carries its own conversation history — "the project context," "the previous discussion," "the user's requirements" — all of which must be stored as KV cache inside attention.
+
+Here's the problem: M4 Pro has 24 GB of total memory. Subtract the model itself (~7 GB) and the OS, and the budget left for KV cache is roughly 10 GB. A single Gemma 3 agent at 8K context uses 3 GB of FP16 KV cache.
+
+Ten agents. Thirty gigabytes. It doesn't fit.
+
+So what do you do? The standard approach: whichever agent is currently speaking keeps its cache in memory; the rest get evicted. When an evicted agent is called back, its complete conversation history is re-fed into the model and attention is recomputed from scratch — that is, *re-prefill*. At 4K context, this step takes 15.7 seconds. Every agent switch means waiting.
+
+This sounds like a pure engineering problem, but it's actually the far edge of a thread that has run through four years of large-model inference research: from "how do we fit more concurrent requests on one GPU," to "can different requests share a common prefix," to "can KV cache be compressed," to "can KV cache be offloaded to CPU or SSD," and finally to "on an edge device, where multiple agents each maintain their own conversational state, how do we make attention state behave like virtual memory — paging in and out of disk?" Each step was someone filling in a dimension that the previous generation left blank.
+
+* The Source Map
+
+#+begin_example
+[2022] Yu et al. - Orca (OSDI)
+  |
+  | Sees: requests have unequal lengths; traditional batching waits on
+  |       the slowest one.
+  | Fix:  iteration-level scheduling — every forward step, requests can
+  |       join or leave.
+  | Gap left: no discussion of KV cache memory management; assumes HBM
+  |           is large enough.
+  v
+[2023] Kwon et al. - vLLM / PagedAttention (SOSP)
+  |
+  | Sees: KV cache fragments HBM, capping concurrency.
+  | Fix:  slice KV cache into fixed-size pages, managed via a page table;
+  |       free pages when requests finish.
+  | Gap left: free = discard. The same prefix will be recomputed next time.
+  v
+[2023] Sheng et al. - FlexGen
+  |
+  | Sees: a single GPU can't hold a large model + KV cache.
+  | Fix:  three-tier offload GPU -> CPU -> SSD with compressed transfers.
+  | Gap left: targets offline throughput; every access crosses PCIe, high
+  |           latency.
+  v
+[2024] Zheng et al. - SGLang / RadixAttention
+  |
+  | Sees: vLLM discards prefixes; re-prefilling a shared system prompt
+  |       repeatedly is wasteful.
+  | Fix:  index all prefixes in a radix tree; match on token IDs and reuse.
+  | Gap left: still in memory, gone on restart; token-ID matching breaks
+  |           under BPE drift.
+  v
+[2024] Liu et al. - KIVI;  Hooper et al. - KVQuant
+  |
+  | Sees: KV cache consumes more VRAM than model weights in long-context
+  |       settings.
+  | Fix:  quantize KV cache to 2–4 bit (KIVI uses different granularity
+  |       for keys vs. values); quality barely degrades.
+  | Gap left: all in-memory work; nobody asked whether the quantized cache
+  |           could be written to disk.
+  v
+[2025] Liu et al. - LMCache
+  |
+  | Sees: in datacenter settings, moving FP16 KV cache across GPU/CPU/SSD
+  |       is expensive.
+  | Fix:  tiered offload + reuse (3.66× latency reduction).
+  | Gap left: written for datacenters; no consideration of UMA, agent
+  |           isolation, or single-threaded constraints on edge devices.
+  v
+[2026] Barrios - vllm-mlx (Feb 2026, concurrent work)
+  |
+  | Sees: no native MLX prefix caching on Apple Silicon.
+  | Fix:  port vLLM's paged attention to MLX; FP16, fully in-memory.
+  | Gap left: FP16 overflows at 5 agents × 8K context (15 GB > 9.6 GB
+  |           budget); volatile on restart or sleep; does prefix caching,
+  |           not per-agent isolation.
+  v
+[2026] Shkolnikov - Agent Memory (this paper)
+  |
+  | Sees: on edge devices running multi-agent workflows, none of the above
+  |       is sufficient:
+  |   - vLLM/SGLang: memory-only, gone on power-off
+  |   - KIVI/KVQuant: quantize but never persist
+  |   - LMCache: built for datacenters, no agent isolation
+  |   - vllm-mlx: FP16 overflow, volatile
+  |   - llama.cpp: has Q4 KV + slot save, but requires manual API calls,
+  |                no LRU, no block pool, no orchestration
+  | Fix:  combine all four concerns — Q4 quantization + per-agent-isolated
+  |       block pool + safetensors persistence to disk + batched Q4
+  |       attention across agents.
+  | Makes attention state into "virtual memory": block pool = page table,
+  | SSD = swap space, naturally interleaved multi-agent execution provides
+  | temporal slack that hides disk I/O behind decode time.
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | Orca: First to Acknowledge "Requests Are a Stream, Not a Batch"
+
+*** What Problem It Saw
+
+Before Orca, LLM inference services batched requests: collect N requests, push them through the GPU together, and wait until the slowest one finishes emitting all its tokens before the whole batch is considered done. Short requests were held hostage by long ones, and GPU utilization suffered badly.
+
+*** Its Solution
+
+Orca proposed *iteration-level scheduling*: the unit of scheduling is not a "request" but a single forward pass. After every token step, the scheduler can decide — drop a finished request, admit a new one. This became the foundation of every "continuous batching" implementation that followed.
+
+*** What It Left Open
+
+Orca solved the queuing problem but assumed all KV caches fit in HBM. It said nothing about *memory management*.
+
+** 2023 | vLLM: Treat Memory Like a Pageable Dictionary
+
+*** What It Saw That Others Missed
+
+Orca allowed requests to come and go at any time, but each request still needed *one contiguous block of KV cache space*. Requests vary wildly in length — 200 tokens here, 8,000 tokens there. Pre-allocating the maximum wastes memory; under-allocating fails long requests. HBM fragmentation became severe.
+
+*** Its Solution
+
+vLLM borrowed the OS concept of paged virtual memory: chop the KV cache into fixed-size *pages* (e.g., 16 tokens each), and give every request a page table recording where its pages live. Physical memory is filled wherever space is available, resulting in near-zero fragmentation and 2–4× throughput gains.
+
+This mechanism is *PagedAttention*.
+
+*** What It Left Open
+
+vLLM frees all of a finished request's pages back to the pool. But in a multi-agent world, "request finished" is a fiction — the agent will come back for many more turns. Re-prefilling every time is equivalent to giving every agent amnesia on each wakeup.
+
+** 2024 | SGLang: Don't Discard — Share Prefixes
+
+*** What It Saw That Others Missed
+
+If ten concurrent requests all start with the same system prompt, vLLM computes the prefix KV ten times over. That's a 10× waste.
+
+*** Its Solution
+
+SGLang indexes all previously seen prefix KV caches in a *radix tree*. When a new request arrives, it matches the longest common prefix by token ID and reuses the cached result, only prefilling the unshared tail. Throughput rises another 5×.
+
+*** What It Left Open
+
+Two issues:
+
+1. *Token-ID matching* seems natural, but BPE tokenizers are context-sensitive — the same phrase placed after different contexts may tokenize differently. Identical character prefix, different token IDs: no cache hit.
+2. *The radix tree lives in memory.* A server restart, memory pressure eviction, or device sleep wipes it. Every cold start begins from zero.
+
+** 2024 | KIVI / KVQuant: The KV Cache Is Already a Heavy Hitter
+
+*** What They Saw That Others Missed
+
+By 2024 a counterintuitive fact had emerged: in long-context models, *KV cache consumes more VRAM than the model weights themselves*. Llama-2 70B at 4K context: weights 140 GB, KV cache 40 GB. Scale to 32K context and the KV cache races toward 320 GB.
+
+The community had been quantizing weights from FP16 down to INT4 for years; the KV cache had been sitting at FP16 untouched the whole time.
+
+*** Their Solutions
+
+- *KIVI* observed that keys and values have different statistical structures: keys exhibit structure along the channel dimension (each column has a characteristic bias), while values are more uniform along the token dimension. Quantizing keys per-channel and values per-token, both at 2 bits, yields almost no quality loss.
+- *KVQuant* performs finer per-layer sensitivity analysis and pushes LongBench to 1M context.
+
+*** What They Left Open
+
+Both works assume the KV cache remains in memory throughout; the goal is just to make it smaller. Nobody asked: can the quantized cache be written to disk? Can it be reused across sessions?
+
+** 2023–2025 | FlexGen / LMCache: Actually Moved It Out, But the Scene Was Wrong
+
+*** What They Saw
+
+FlexGen (2023) was the first serious attempt at spilling KV cache to CPU and even SSD, targeting offline throughput on a single GPU running a large model. LMCache (2025) productized the idea with tiered caching, cutting enterprise-scenario latency by 3.66×.
+
+*** Their Solutions
+
+A three-tier cache — GPU → CPU → SSD — with data migrating based on access frequency. FlexGen also applied per-token compression.
+
+*** What They Left Open
+
+Both were written for *datacenters*:
+
+- They assume PCIe or NVLink bandwidth is the relevant bottleneck and that offload cost is tolerable.
+- Neither does *per-agent isolation* — the concern is "how do I maximize throughput given my GPU memory," not "how do I keep ten agents' state separate."
+- Neither addresses "does the cache survive a restart?" — for a 24×7 datacenter worker, that's a non-issue.
+
+Edge devices are a completely different regime. Memory is 24 GB soldered in place. There is no PCIe cliff; UMA means the SSD-to-RAM bandwidth ratio is only ~40× (M4 Pro: 273 GB/s memory vs. 7 GB/s SSD, ratio ~2.6%) — nothing like the 28× PCIe-to-HBM gap that makes datacenter spilling painful. In other words, *UMA devices are uniquely well-suited to paging KV cache to disk* — a structural property that every previous datacenter solution had left unexploited.
+
+** 2026-Feb | vllm-mlx: The First Native Attempt on Apple Silicon
+
+*** What It Saw
+
+By early 2026, people running LLMs on Apple Silicon had noticed: llama.cpp uses GGML and underperforms MLX; MLX itself has no prefix caching. Barrios ported vLLM's paged attention and continuous batching to MLX, producing vllm-mlx.
+
+*** Its Solution
+
+Native MLX paged KV cache, SHA-256-deduplicated prefix cache, and continuous batching. Throughput 21–87% higher than llama.cpp.
+
+*** What It Left Open
+
+The paper's head-to-head comparison lands three direct hits:
+
+1. *FP16.* In multi-agent scenarios, five agents at 8K context require 15 GB, exceeding the 9.6 GB budget; caches get evicted and cold starts resume.
+2. *Volatile.* A server restart, device sleep, or memory pressure event destroys everything.
+3. *Prefix caching is not agent isolation.* vllm-mlx assumes a shared prefix exists to cache; multi-agent workloads involve each agent's own private conversational state — there is no shared prefix to exploit.
+
+llama.cpp does support Q4 KV and slot save/restore, but these require manual API calls, with no LRU, no block pool, and no agent orchestration — it supplies the raw ingredients but the kitchen is unfinished.
+
+** 2026-Feb | This Paper: Installing Virtual Memory Inside Attention
+
+*** What It Saw
+
+Reading the above timeline as a whole, by early 2026 multi-agent workloads on edge devices were missing one thing: *an end-to-end solution*.
+
+- Orca supplied the scheduling principle.
+- vLLM supplied page-based management.
+- KIVI/KVQuant supplied quantization methods.
+- FlexGen/LMCache supplied the offload template.
+- vllm-mlx supplied the MLX implementation.
+- llama.cpp supplied the parts but not the assembly.
+
+Nobody had combined them — and in particular nobody had wired together "Q4 quantization + persistence to disk + batched Q4 attention across multiple agents" as a single coherent system.
+
+*** Its Solution
+
+Four components organized around the virtual-memory analogy:
+
+1. *Block pool* — a KV cache pool partitioned by agent ID, each agent backed by its own safetensors file. Equivalent to per-process isolated page tables.
+2. *Q4 quantization pipeline* — KV cache read from disk, resident in memory, and fed into attention, all in Q4 format throughout (uint32 packed + bfloat16 scale/bias, group size 64). FP16 → Q4 memory compression ratio: 0.281, saving 72%.
+3. *Character-level prefix matching* — sidesteps SGLang's BPE token-ID drift problem by comparing prompt characters directly.
+4. *BatchQuantizedKVCache* — something absent from the MLX upstream: multiple agents' Q4 caches batched together within a single forward pass, which is the key to merging two agents' decode steps into one Metal kernel dispatch.
+
+The spirit of the whole system: *treat attention state as virtual memory*.
+
+- Block pool = page table
+- SSD safetensors = swap file
+- Naturally interleaved multi-agent execution = temporal prefetching (while one agent is decoding over 1–3 seconds, the next agent's cache is quietly streaming in from disk; the 500 ms reload is fully hidden behind the previous agent's output)
+
+*** Measured Results
+
+On M4 Pro / Gemma 3 12B / 4K context:
+
+- Cold-start prefill: 15.7 s
+- Warm (reload Q4 cache from disk): 577 ms
+- Hot (cache already in memory): 719 ms
+
+At 32K, warm TTFT is 136× faster than cold start. Within the same 10 GB budget, Q4 fits 4× as many agents as FP16. Quality loss from Q4 quantization: Gemma −0.7%, Llama +2.8%, DeepSeek +3.0% perplexity — consistent with KIVI/KVQuant reported figures.
+
+*** What It Leaves Open
+
+Listed by the author in the Limitations section:
+
+1. *Single device.* Multi-device extension would require Thunderbolt or network cache transfer.
+2. *Fixed bit-width.* Every layer uses Q4; no adaptive 2–4 bit selection as in RotateKV or CommVQ.
+3. *Only three models tested* (Gemma 3 12B, DeepSeek-Coder-V2-Lite 16B, Llama 3.1 8B); 70B+ untested.
+4. *Cache is tightly coupled to the model.* One model upgrade invalidates all cached agent memory. RAG text chunks survive model changes; KV caches do not.
+5. *No PyTorch / CUDA port.* The engineering details are MLX-specific (single-threaded runtime, lazy evaluation, etc.) and would need rethinking on other backends.
+
+* Problem–Solution Overview
+
+#+begin_example
+                  what's in HBM/RAM        cross-session?    multi-agent?
+                  ===================      ==============    =============
+  Orca (2022)        full FP16 KV           no                ad-hoc batch
+  vLLM (2023)        paged FP16             no                share page pool
+  SGLang (2024)      paged + radix tree     no                token-id prefix
+  KIVI/KVQuant (24)  2-4 bit KV             no                N/A
+  FlexGen (2023)     compressed + offload   no                N/A (1 GPU)
+  LMCache (2025)     tiered (GPU/CPU/SSD)   no (datacenter)   no isolation
+  vllm-mlx (2026)    paged FP16 on MLX      no                prefix-shared
+  llama.cpp          Q4/Q8 + slot save      manual            no orchestration
+  -------------------------------------------------------------------------
+  AgentMemory        Q4 in block pool       YES (safetensors) YES (per-agent
+                     + batched Q4 attn      survives restart   isolation +
+                                                               batched Q4)
+
+  Analogy progression:
+    Orca       = cooperative multitasking scheduler (early Mac OS era)
+    vLLM       = demand paging
+    SGLang     = memory deduplication (KSM)
+    KIVI       = memory compression (ZRAM)
+    LMCache    = multi-level cache hierarchy
+    vllm-mlx   = port all of the above to Apple Silicon
+    This paper = complete the virtual memory story: page table + swap +
+                 automatic page-in/page-out for attention state
+#+end_example
+
+* The Core Insight
+
+On the surface this thread looks like an engineering evolution in "ever-finer KV cache management." What is actually happening underneath is:
+
+*LLM inference systems are retracing the forty-year arc of operating system design.*
+
+- 2022 Orca = cooperative multitasking (early Mac OS)
+- 2023 vLLM = paged virtual memory
+- 2024 SGLang = shared pages (mmap shared segments)
+- 2024 KIVI = memory compression
+- 2025 LMCache = multi-level cache hierarchy
+- 2026 this paper = a complete swap file; attention state now carries full virtual-memory semantics — it can exceed physical memory, it can be isolated per process, and it can persist across reboots.
+
+What drove this progression was a very concrete pressure: *agents multiplied*. Running one agent on an LLM is well served by vLLM. Running ten agents simultaneously, each with its own context, on a 24 GB MacBook — that is what forced virtual-memory-level abstractions into existence.
+
+One layer deeper: this paper is viable precisely because Apple Silicon's UMA architecture collapses the bandwidth gap between SSD and RAM to roughly 40×, rather than the datacenter situation of a 28× PCIe cliff followed by another bus hop. *Hardware structure determines which software abstractions make sense.* On a datacenter GPU, spilling to SSD is so slow that LMCache had to confine its attention to the GPU–CPU boundary. On UMA, spilling to SSD suddenly becomes practical, and "persistent attention state" becomes a product-grade feature rather than a throughput footnote.
+
+* Where This Line Goes Next
+
+Following this thread, the three most natural forward directions are:
+
+1. *Shared attention state across devices.* Two MacBooks synchronizing agent caches over Thunderbolt — the equivalent of upgrading virtual memory to distributed shared memory (DSM). The paper mentions this but does not pursue it.
+2. *Adaptive bit-width.* Per-layer or even per-token bit selection (2/4/8 bit) based on sensitivity. RotateKV, CommVQ, and QuantSpec are already doing this for single-session settings; the open problem is combining adaptive quantization with persistence.
+3. *Decoupling cache from model.* This is the deepest gap. Today, one model upgrade zeros out all agent memories. What is needed is a representation of attention state that is *transferable across models* — perhaps dequantizing KV caches into some model-agnostic embedding space and projecting into the new model's KV geometry. If that were solved, an AI agent could finally have long-term memory that does not suffer amnesia every time the base model is updated.
+
+The third direction is the true shape of the problem. Everyone so far has been solving "how do we fit, retain, and move the KV cache" — but a KV cache is intrinsically *the model's internal state over a piece of text, expressed in the basis of its own weights.* The moment the weights change, the state loses its meaning. That is the essential ceiling of the current path.
+
+* Caveats
+
+- The Orca → vLLM → SGLang chain is made explicit in the paper. KIVI/KVQuant are cited but constitute parallel work rather than a direct "identify-and-fix" relationship with this paper's predecessors.
+- The LMCache → this paper connection is explicit: "datacenter solution doesn't apply, so we built the edge version."
+- vllm-mlx is the most direct head-to-head competitor in the paper, with concurrent development timelines (Dec 2025 – Feb 2026).
+- The forward-looking directions mentioning RotateKV, CommVQ, and QuantSpec come from the paper's own future-work section; they do not represent work that has already built on this paper.

@@ -1,0 +1,288 @@
+#+title:      MoBiQuant: Mixture-of-Bits Quantization for Token-Adaptive Elastic LLMs
+#+date:       [2026-05-29 Fri 02:55]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260529T025553-en
+#+source:     https://arxiv.org/abs/2602.20191
+#+authors:    Dongwei Wang, Jinhee Kim, Seokho Han, Denis Gudovskiy, Yohei Nakata, Tomoyuki Okuno, KhayTze Peong, Kang Eun Jeon, Jong Hwan Ko, Yiran Chen, Huanrui Yang
+#+venue:      arXiv preprint, 2026
+
+* What Problem This River Is Solving
+
+A large model must serve two very different users at once: one running on a
+phone, happy to wait 2 seconds, wanting to save power and memory; another
+running on a server, demanding sub-second responses. The catch is that you do
+not want to train a separate quantized model for each scenario — that is far
+too expensive. The ideal state is: *one copy of the weights in memory, with
+bit-width switched on demand at runtime* — 2-bit when speed matters, 8-bit
+when accuracy matters, all from the same weight file.
+
+Every paper in this river is chasing that goal, but each step gets bitten by
+the same obstacle: when you compress FP16 weights into low-bit integers, a
+handful of unusually large values — "outliers" — stretch the quantization
+range wide open, squeezing the majority of small values into the same bucket
+and wasting all the precision.
+
+Digging backward, you can see how this obstacle was tamed step by step — and
+how it grew a new form in the "one set of weights, many precisions" setting.
+
+* Source Map
+
+#+begin_example
+
+    [2022] GPTQ              <-- Makes PTQ feasible at LLM scale
+       |
+       |  Problem: outliers blow up the quantization range, precision wasted on tails
+       v
+    [2022] SmoothQuant       <-- Migrates outliers from activations to weights
+       |
+       |  Problem: just relocating; total outlier mass unchanged
+       v
+    [2024] AWQ               <-- Leaves outliers in place but protects the channels that carry them
+       |
+       |  Problem: still per-channel scaling; outlier channels remain tricky
+       v
+    [2024] QuaRot / SpinQuant <-- Orthogonal rotation spreads outliers across all channels
+       |
+       |  Problem: all of the above are tuned for a *single* bit-width
+       |        switching to another bit-width causes collapse
+       v
+    [2024] Any-Precision LLM <-- One set of weights supports multiple bit-widths simultaneously
+       |
+       |  Problem: all tokens share the same precision; wasteful
+       v
+    [2025] MatQuant          <-- Integer bit-plane "Matryoshka" nesting
+       |
+       |  Problem: token-level variation ignored
+       |        when precision switches, "sensitive tokens" migrate
+       v
+    [2026] >>> MoBiQuant <<< <-- Token-adaptive mixture-of-bits
+       |
+       |  Discovery: outlier migration —
+       |        the "hard-to-quantize tokens" shift across bit-widths
+       v
+    [???] Next: cross-model / cross-hardware cooperative precision scheduling?
+
+#+end_example
+
+* Forward Narrative
+
+** Stop 1: GPTQ — Making Post-Training Quantization Work at LLM Scale
+
+Before GPTQ, compressing a ten-billion-parameter model to 4-bit was nearly a
+dead end. Classical post-training quantization (PTQ) worked on small models
+but fell apart on LLMs — one misquantized weight column turned its error into
+a mountain by the time it propagated through later layers.
+
+GPTQ's solution is *greedy column-wise error compensation*: each time a column
+of weights is quantized, the resulting error is immediately redistributed onto
+the as-yet-unquantized columns, so that future columns "know how much debt has
+already accumulated" and adjust themselves to compensate. Mathematically, the
+inverse Hessian distributes the compensation weights.
+
+This turned "LLM + PTQ" from impossible into a baseline. But GPTQ addressed
+*algorithmic stability*; it did not look at a more fundamental issue: a small
+number of very large outliers in the weights and activations were dominating
+the quantization range.
+
+** Stop 2: SmoothQuant — Moving Outliers from Activations to Weights
+
+Outliers in activations (the intermediate values computed at each layer) are
+far more extreme than those in weights. Some activation channels can be
+hundreds of times larger than the median. This means that if you also want to
+quantize activations (for faster matrix multiplications), those few outlier
+channels will stretch the entire quantization range.
+
+SmoothQuant's insight is elegant: *the matrix product X·W equals (X/s)·(s·W)*,
+where s is a diagonal scaling matrix. So you divide activations by s and
+multiply weights by s — activations become well-behaved, at the cost of
+slightly harder-to-quantize weights. But because weight outliers are much
+milder to begin with, offloading some of the activation extremity onto them
+leaves both sides quantizable.
+
+This is "problem relocation." The total outlier mass does not decrease; it
+simply moves from the harder-to-quantize place (activations) to the
+easier-to-quantize place (weights).
+
+** Stop 3: AWQ — Protect Rather Than Relocate
+
+SmoothQuant assumed outliers are spread uniformly, but AWQ noticed that *only
+about 1% of weight channels truly matter* — the ones whose corresponding
+activation magnitudes are largest. If you can preserve that 1% at higher
+precision and aggressively compress the other 99% to 4-bit, model quality
+barely drops.
+
+AWQ does not actually store that 1% at a separate higher precision (hardware
+would hate that). Instead, it *multiplies those important channels by a scaling
+factor* to reduce their quantization error, and inversely scales the
+unimportant channels to cancel the effect on the matrix product. The
+mathematical output of the matrix multiplication is unchanged, but
+quantization error is redistributed to places that affect the output least.
+
+This refined the outlier problem from "global relocation" to "channel-level
+fine-grained accounting." But it is still per-channel: an entire column is
+either an outlier channel or it is not.
+
+** Stop 4: QuaRot / SpinQuant — Spreading Outliers via Rotation
+
+If outliers always concentrate in a few channels, can they be *scattered*?
+
+QuaRot and SpinQuant introduce a new tool: before quantization, multiply both
+weights and activations by an orthogonal rotation matrix R (e.g., a Hadamard
+matrix). Because R·R^T = I, the matrix-product result is unchanged, but in the
+rotated tensor the outliers that were concentrated in a few channels are *spread
+evenly across all channels*.
+
+An analogy: originally 100 cups hold a kilogram of water in one cup and a few
+grams in each of the others; after rotation every cup holds roughly the same
+amount. With similar magnitudes everywhere, quantization wastes no precision.
+
+This was a major victory in the outlier war. By this point, LLM quantization
+at *a single fixed bit-width* was largely solved. The GPTQ → AWQ → QuaRot
+line brought 4-bit to near-lossless quality.
+
+But all these methods share one assumption: *the target precision is fixed*. A
+rotation matrix and scaling factors tuned for 4-bit are no longer optimal at
+2-bit.
+
+** Stop 5: Any-Precision LLM — One Set of Weights, Many Bit-Widths
+
+Why share one set of weights across multiple precisions? Because deployment
+scenarios are constantly shifting: peak daytime load demands speed at 3-bit;
+low overnight load permits 8-bit for accuracy. Storing a separate copy of the
+weights for every precision is memory-prohibitive.
+
+Any-Precision LLM uses *incremental upscaling*: first quantize a 3-bit model,
+then treat those 3-bit integers as the "lower 3 bits" and append bits upward
+to get 4-bit, 5-bit, … up to n-bit. With one n-bit weight in memory, you read
+only as many bits as you need; a bit-plane memory layout makes this
+"read-by-bit" efficient.
+
+This step changed *quantization from a one-shot decision into a nested
+hierarchy*. But it still treats all tokens identically — at 3-bit every token
+goes through 3-bit.
+
+** Stop 6: MatQuant — Integers Are Already Nested
+
+MatQuant pushes "nesting" to its logical extreme. Its key observation: the int8
+data type *already has* a Matryoshka structure — the high 4 bits of an int8 are
+an int4, and the high 2 bits are an int2. So you do not need to "separately
+store" lower-precision models; the lower-precision model *already lives inside*
+the higher-precision one.
+
+Its training objective simultaneously optimizes all three slices — int8, int4,
+int2 — through co-training and co-distillation, so that the low-precision loss
+feeds back as a constraint on the high-precision weight distribution. The
+result is that int2 accuracy is 4–7% higher than a standalone int2 model,
+because it benefits from the co-optimization with int8.
+
+At this point, "one model, many precisions" looks very clean at the *model
+level*. But one thing remains unaddressed: *the variation between tokens*. Does
+a simple function word really need the same quantization precision as a complex
+technical term?
+
+** Stop 7: MoBiQuant — Outlier Migration and Token-Adaptive Precision
+
+The authors of MoBiQuant watched the per-token quantization error as they
+switched to 4-bit, 3-bit, and 2-bit, and noticed something nobody had caught
+before — they call it *outlier migration*:
+
+#+begin_quote
+At different bit-widths, the "hard-to-quantize tokens" are not the same tokens.
+#+end_quote
+
+In other words, the tokens that cause model degradation at 4-bit are a
+different set from those that cause degradation at 2-bit. This means that
+MatQuant's "one set of weights, uniform precision for all tokens" approach must
+always sacrifice something — there will always be a batch of tokens that is
+particularly difficult to handle at some precision.
+
+MoBiQuant's answer is a two-step approach:
+
+1. *Many-in-One Recursive Residual Quantization*: a recursive residual structure
+   embeds multiple precisions into a single set of weights without introducing
+   new scaling factors every time the precision changes (a cost that
+   AnyBCQ/MatQuant still pay).
+
+2. *Token-Aware Router*: a lightweight learned router dynamically assigns a
+   precision to each token. Simple tokens take the 2-bit path; "sensitive
+   tokens" that cross the outlier migration boundary take 4-bit or even 8-bit.
+
+This amounts to carrying the outlier war down to *token granularity*. Previous
+methods fought outliers at the level of weight channels and model layers;
+MoBiQuant is the first to say "outliers also migrate in the token dimension."
+
+The result is throughput 1.34× higher than the previous any-precision SOTA,
+while quality matches or exceeds PTQ baselines tuned for a single fixed
+precision.
+
+* Problem-Solution Overview
+
+#+begin_example
+
+  Problem Level            Solution                      Who              Remaining Issue
+  ------------------------------------------------------------------------------------------
+  LLM too large to run    PTQ + column-wise error comp  GPTQ             Outliers blow up range
+  Activations have outliers  Math-equivalent relocation  SmoothQuant      Total outlier mass unchanged
+  Unequal channels        Protect 1% key channels       AWQ              Still per-channel
+  Channel granularity too coarse  Orthogonal rotation    QuaRot/SpinQ     Tuned for one precision only
+  One precision = one model  Bit-plane shared layout    AnyPrec LLM      All tokens same precision
+  Still multiple copies needed  High bits ⊇ low bits    MatQuant         Token variation ignored
+  Token inequality        Measure outlier migration     >>MoBiQuant<<    Cross-hardware co-scheduling?
+                        + token-aware router
+
+#+end_example
+
+* What Is Really Happening Beneath This River
+
+On the surface this looks like "quantization becoming ever more refined." But
+the deeper transformation is: *outliers have shifted from enemies to be
+eliminated into resources to be modeled*.
+
+- GPTQ era: outliers are error sources, held down by algorithmic compensation
+- SmoothQuant: outliers are burdens, moved to shoulders that can bear them
+- AWQ: outliers are signals, telling us which channels matter
+- QuaRot: outliers are a distributional problem, dissolved by rotation
+- MatQuant: precision switching is a nesting structure, let the data type carry it
+- MoBiQuant: outliers are *dynamic*, they migrate with precision — so assign precision per token
+
+Each step looks at the object "outlier" with *finer resolution*: from static,
+global, and in-need-of-elimination "problems," to dynamic, local, and
+routable "features."
+
+* Where Does the River Go Next
+
+If outliers migrate in the token dimension, do they also migrate in the
+*request dimension*? That is, different users' queries may have inherently
+different "outlier profiles" — could precision scheduling be done at the
+batching layer?
+
+Another direction: MoBiQuant's router is learned offline. The next step may be
+a *dynamically adaptive router* — one that adjusts in real time based on the
+current KV cache state, the current batch load, and the current hardware power
+budget. That would transform quantization from a "model property" into a
+"runtime property" entirely.
+
+* Honest Annotations
+
+- The GPTQ → SmoothQuant → AWQ → QuaRot line of outlier handling is the
+  widely accepted evolutionary arc in LLM quantization, with clear citation
+  relationships
+- The Any-Precision LLM → MatQuant step is a reasonable inference (both pursue
+  "one set of weights, many precisions"), but MatQuant's primary baselines are
+  OmniQuant + QAT, not Any-Precision LLM. The two are better described as
+  parallel explorations rather than a strict critique-and-response relationship
+- MoBiQuant explicitly lists AnyPrecision LLM, AnyBCQ, and MatQuant as
+  baselines; the critique relationship at that layer is stated directly in the
+  paper
+- "Outlier migration" is a term coined by this paper; the narrative here
+  interprets it as "hard-to-quantize tokens shift their identity across
+  precisions" — a reasonable reading based on the abstract, but the precise
+  definition should be confirmed against the paper's experimental section
+- The "Where does the river go next" section is purely speculative
+
+* References
+
+- MoBiQuant: https://arxiv.org/abs/2602.20191
+- MatQuant (Nair et al., 2025): https://arxiv.org/abs/2502.06786
+- Any-Precision LLM (Park et al., ICML 2024): https://arxiv.org/abs/2402.10517
+- QuaRot, SpinQuant, AWQ, SmoothQuant, GPTQ: see MoBiQuant paper reference list

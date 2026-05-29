@@ -1,0 +1,240 @@
+#+title:      MoBiQuant: Mixture-of-Bits Quantization for Token-Adaptive Elastic LLMs
+#+date:       [2026-05-29 Fri 02:55]
+#+filetags:   :paper:river:quantization:llm:
+#+identifier: 20260529T025553
+#+source:     https://arxiv.org/abs/2602.20191
+#+authors:    Dongwei Wang, Jinhee Kim, Seokho Han, Denis Gudovskiy, Yohei Nakata, Tomoyuki Okuno, KhayTze Peong, Kang Eun Jeon, Jong Hwan Ko, Yiran Chen, Huanrui Yang
+#+venue:      arXiv preprint, 2026
+
+* 这条河在解什么问题
+
+一个大模型，要同时服务两种用户：手机上跑的，能等 2 秒就行，希望省电省内存；
+服务器上跑的，要求秒级响应。问题是，你不想给每种场景训一个单独的量化模型，那
+太贵了。最理想的状态是：*一个模型权重在内存里，运行时按需切换比特宽度*——
+要快就 2bit，要准就 8bit，全在同一份权重上。
+
+这条线的所有论文都在追这件事，但每一步都在被同一只拦路虎咬：把一个 FP16 的
+权重压成低位整数时，少数几个数值特别大的 "outlier"（离群值）把整个量化区间撑
+开，多数小数值被挤进同一个格子里，精度全废了。
+
+倒着挖回去，你会看到这只拦路虎怎么一步步被驯服——又怎么在 "一份权重多种精度"
+这个新场景里，长出了新的形态。
+
+* 溯源地图
+
+#+begin_example
+
+    [2022] GPTQ              <-- 把 PTQ 做到 LLM 规模能跑
+       |
+       |  问题: outlier 把量化范围撑爆, 精度全浪费在尾巴上
+       v
+    [2022] SmoothQuant       <-- 把 outlier 从激活搬到权重里
+       |
+       |  问题: 只是搬家, outlier 总量没变
+       v
+    [2024] AWQ               <-- 不动 outlier, 但保护承载它们的通道
+       |
+       |  问题: 还是 per-channel 缩放, outlier 通道仍然棘手
+       v
+    [2024] QuaRot / SpinQuant <-- 用正交旋转把 outlier 抹平到全通道
+       |
+       |  问题: 所有这些都为"单一比特宽度"调优
+       |        切到别的比特就崩
+       v
+    [2024] Any-Precision LLM <-- 一份权重, 多种比特宽度同时支持
+       |
+       |  问题: 所有 token 共享同一精度, 浪费
+       v
+    [2025] MatQuant          <-- 整数位级的"套娃"结构
+       |
+       |  问题: token 层面的差异没考虑
+       |        切精度时, "敏感 token" 会迁移
+       v
+    [2026] >>> MoBiQuant <<< <-- token 自适应混合比特
+       |
+       |  发现: outlier migration
+       |        在不同比特宽度下,"难量化的 token"会换位
+       v
+    [???] 下一步: 跨模型/跨硬件的协同精度调度?
+
+#+end_example
+
+* 正向叙事
+
+** 第一站: GPTQ —— 让大模型也能后训练量化
+
+在 GPTQ 出现之前，把一个百亿参数模型压到 4bit 几乎是死路。传统的训后量化
+（PTQ）方法在小模型上够用，搬到 LLM 上就崩盘——一个权重定点错了，误差在
+后面层里被放大成一座山。
+
+GPTQ 的办法是 *逐列贪心补偿*：每量化一列权重，就立刻把这次产生的误差摊
+到还没量化的列上，让后面的列"知道前面已经欠了多少账"，主动调整自己来补
+偿。数学上是用 Hessian 的逆来分配补偿权重。
+
+这件事把"LLM + PTQ"从不可能变成了基线。但 GPTQ 解决的是 *算法稳定性*
+问题，它没看到一个更根本的事：权重和激活里，少数几个数值特别大的 outlier
+正在主宰量化区间。
+
+** 第二站: SmoothQuant —— 把 outlier 从激活搬到权重
+
+激活值（也就是模型每层算出来的中间结果）里的 outlier 比权重里的烈得多。
+有些通道的激活能比中位数大上百倍。这意味着如果你要把这些激活也量化（为了
+更快的矩阵乘），少数 outlier 通道会把整个量化范围撑开。
+
+SmoothQuant 的洞察很巧：*矩阵乘法 X·W 等于 (X/s)·(s·W)*，s 是个对角缩
+放矩阵。所以可以把激活除以 s，把权重乘以 s——激活变平整了，代价是权重变
+得难一点。但因为权重的 outlier 本来就温和得多，把激活的烈度部分转嫁过来，
+两边都还能量化。
+
+这是一次"问题搬家"。outlier 总量没减少，只是从一个更难量化的地方（激活）
+搬到了一个更容易量化的地方（权重）。
+
+** 第三站: AWQ —— 不搬家, 直接保护
+
+SmoothQuant 假设了 outlier 是均匀分布的，但 AWQ 注意到：*只有大约 1% 的
+权重通道真正重要*——它们对应的激活幅度特别大。如果能把这 1% 保留成更高
+精度，其他 99% 大胆压成 4bit，模型质量几乎不掉。
+
+AWQ 不真把那 1% 单独存高精度（那硬件实现太麻烦），而是给那些重要通道
+*乘上一个缩放因子* 让它们的量化误差变小，给不重要通道反向缩放抵消。整
+个矩阵乘的数学结果不变，但量化误差被重新分配到了不那么影响输出的地方。
+
+这一步把 outlier 问题从"全局搬家"细化到"分通道精打细算"。但本质还是
+per-channel 的——一整列要么是 outlier 通道要么不是。
+
+** 第四站: QuaRot / SpinQuant —— 用旋转把 outlier 抹平
+
+如果 outlier 总是集中在某几个通道里，那能不能把它们 *打散*？
+
+QuaRot 和 SpinQuant 引入了一个新工具：在量化之前，给权重和激活同时乘上一
+个正交旋转矩阵 R（比如 Hadamard 矩阵）。因为 R·R^T = I，矩阵乘的结果不
+变，但旋转后的张量里，原来集中在几个通道的 outlier 被 *均摊到所有通道*。
+
+打个比方：原来 100 个杯子里有一个装了一斤水，其他都装一两；旋转之后，每
+个杯子都装约 0.11 斤。每个杯子的量级接近，量化就不浪费精度了。
+
+这是 outlier 之战的一次大胜利。到这一步，*单一比特宽度* 下的 LLM 量化基
+本被攻克。GPTQ→AWQ→QuaRot 这条线，4bit 已经能做到几乎无损。
+
+但所有这些方法都有一个共同假设：*目标精度是固定的*。你为 4bit 调出来的
+旋转矩阵和缩放因子，换到 2bit 就不再最优。
+
+** 第五站: Any-Precision LLM —— 一份权重, 多个比特
+
+为什么要一份权重多个比特？因为部署时场景千变万化：白天高峰要快，跑 3bit；
+夜里负载低，跑 8bit 求精度。如果每种精度都存一份权重，内存吃不消。
+
+Any-Precision LLM 的做法叫 *incremental upscaling*：先量化出一个 3bit 模
+型，然后把这个 3bit 整数当作"低 3 位"，往上加位得到 4bit、5bit……直到 n
+位。这样一份 n bit 的权重在内存里，你想用几位就只读几位，bitplane 的内存
+布局让这种"按位读"高效可行。
+
+这一步把 *量化是单次决策* 改成了 *量化是嵌套层级*。但它还是把所有 token
+一视同仁——3bit 时所有 token 都按 3bit 走。
+
+** 第六站: MatQuant —— 整数本来就是套娃
+
+MatQuant 把"嵌套"这件事推到极致。它的关键观察：int8 这个数据类型 *本身*
+就有 Matryoshka 结构——int8 的高 4 位就是一个 int4，高 2 位就是一个 int2。
+所以你不需要"另存"低精度模型，低精度模型 *已经在* 高精度模型里。
+
+它的训练目标是同时让 int8、int4、int2 三个切片都好用——共训练（co-training）
+和共蒸馏（co-distillation）让低精度的损失反过来约束高精度权重的分布。结果
+是 int2 的精度比单独训练的 int2 模型还高 4%~7%，因为它"沾光"了 int8 的协
+同优化。
+
+到这一步，"一个模型多种精度"在 *模型层级* 已经做得很漂亮。但有一件事仍
+然没有被处理：*token 之间的差异*。一个简单的连接词和一个复杂的专业术语，
+真的需要同样的量化精度吗？
+
+** 第七站: MoBiQuant —— outlier migration 与 token 自适应精度
+
+MoBiQuant 的作者切到 4bit、3bit、2bit 时盯着每个 token 的量化误差看，发
+现了一件之前所有人没注意到的事——他们叫它 *outlier migration*：
+
+#+begin_quote
+在不同比特宽度下，"难量化的 token"会换位。
+#+end_quote
+
+也就是说：在 4bit 下让模型崩的那批 token，跟 2bit 下让模型崩的那批 token，
+不是同一批。这意味着 MatQuant 那种"一份权重、所有 token 同精度"的做法在
+低位时一定会有牺牲——总有一批 token 在某个精度下特别难处理。
+
+MoBiQuant 的回答是两步走：
+
+1. *Many-in-One Recursive Residual Quantization*：用一种递归残差结构把多
+   种精度嵌进同一份权重里，避免每换精度就引入新的缩放因子（这是
+   AnyBCQ/MatQuant 还在付的代价）。
+
+2. *Token-Aware Router*：训练一个轻量路由器，给每个 token 动态分配精度。
+   简单 token 走 2bit，跨越 outlier migration 边界的"敏感 token"走 4bit
+   甚至 8bit。
+
+这相当于把 outlier 战争打到了 *token 粒度*——以前的方法都在权重通道和模
+型层级上解决 outlier，MoBiQuant 第一次说"outlier 在 token 维度也会跑"。
+
+结果是吞吐量比之前 SOTA 的 any-precision 方法高出 1.34 倍，同时质量追平
+甚至超过为单一精度专门调过的 PTQ baseline。
+
+* 问题-解法总览
+
+#+begin_example
+
+  问题层级           解法                       谁解的           留下什么问题
+  --------------------------------------------------------------------------------
+  LLM 太大跑不起   PTQ + 逐列误差补偿        GPTQ           outlier 撑爆量化区间
+  激活有 outlier  数学上等价搬到权重         SmoothQuant    outlier 总量没减
+  通道间不平等    保护 1% 关键通道           AWQ            还是 per-channel
+  通道维度太粗    正交旋转抹平 outlier       QuaRot/SpinQ   只为单一精度调优
+  一精度一模型    bitplane 内存布局共享      AnyPrec LLM    所有 token 同精度
+  仍要存多份      int8 高位就是 int4/int2    MatQuant       token 差异没考虑
+  token 不平等   测出 outlier migration     >>MoBiQuant<<  跨硬件协同?
+                + token-aware router
+
+#+end_example
+
+* 这条线背后真正在发生什么
+
+表面上看是"量化越做越精细"。但更深的转变是：*outlier 从被消除的敌人, 变成
+了被建模的资源*。
+
+- GPTQ-时代：outlier 是误差源，靠算法补偿压住
+- SmoothQuant：outlier 是负担，挪到能扛的肩膀上
+- AWQ：outlier 是信号，告诉我们哪些通道重要
+- QuaRot：outlier 是分布问题，旋转一下就化解
+- MatQuant：精度切换是嵌套结构，让数据类型自己承担
+- MoBiQuant：outlier 是 *动态* 的，会随精度迁移——索性按 token 分配精度
+
+每一步都是在把"outlier"这个对象 *看得更细*。从静态的、全局的、需要消除
+的"问题"，变成动态的、局部的、可以路由的"特征"。
+
+* 下一步往哪走
+
+如果 outlier 在 token 维度会迁移，那它会不会在 *请求维度* 也迁移？也就是
+说，不同用户的查询本身就有不同的"outlier 偏好"，能不能在 batching 层做精
+度调度？
+
+另一个方向：MoBiQuant 的 router 是学出来的。下一步可能是 *router 本身也
+是动态的*——根据当前 KV cache 的状态、当前 batch 的负载、当前硬件的功耗预
+算实时调整。这就把量化从"模型属性"彻底变成"运行时属性"了。
+
+* 诚实标注
+
+- GPTQ → SmoothQuant → AWQ → QuaRot 这条 outlier 处理线，是 LLM 量化领域
+  公认的演进脉络，引用关系明确
+- Any-Precision LLM → MatQuant 这一跳是合理推断（同样追求"一份权重多种精
+  度"），但 MatQuant 论文本身的主要 baseline 是 OmniQuant + QAT，而非
+  Any-Precision LLM。两者更像是并行探索，不是严格批判关系
+- MoBiQuant 明确把 AnyPrecision LLM、AnyBCQ、MatQuant 列为 baseline，这一
+  层的批判关系是论文里直接陈述的
+- "outlier migration" 是论文自己提出的术语，本叙述把它解读为"难量化的
+  token 在不同精度下换位"——这是基于摘要描述的合理理解，细节定义需以正文
+  实验为准
+- "下一步往哪走"部分纯属推测
+
+* 参考
+
+- MoBiQuant: https://arxiv.org/abs/2602.20191
+- MatQuant (Nair et al., 2025): https://arxiv.org/abs/2502.06786
+- Any-Precision LLM (Park et al., ICML 2024): https://arxiv.org/abs/2402.10517
+- QuaRot, SpinQuant, AWQ, SmoothQuant, GPTQ: 见 MoBiQuant 论文引用列表

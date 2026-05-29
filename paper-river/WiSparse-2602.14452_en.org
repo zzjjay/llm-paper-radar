@@ -1,0 +1,196 @@
+#+title:      WiSparse: Boosting LLM Inference Efficiency with Weight-Aware Mixed Activation Sparsity
+#+date:       [2026-05-29 Fri 02:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T023822-en
+#+source:     https://arxiv.org/abs/2602.14452
+#+authors:    Lei Chen, Yuan Meng, Xiaoyu Zhan, Zhi Wang, Wenwu Zhu (Tsinghua)
+#+venue:      arXiv 2026 (preprint)
+
+* The Problem River
+
+Every time a large model generates a token, it has to haul tens of billions of weights out of GPU memory. Yet for any given input, the vast majority of neurons are not doing any real work — their outputs are essentially zero. This raises the central question: *Can we make inference load only the weights that are "actually working," without retraining the model at all?*
+
+It sounds simple, but researchers have been iterating on it for seven years. The difficulty lies in three hard knots:
+- Early models (using ReLU) naturally had half their neurons output exactly 0, making it easy to identify "who is doing work." Modern models switched to SwiGLU/GELU — outputs are never exactly 0, only "small." So how small is unimportant enough?
+- Looking at whether the activation (input) is large is the most intuitive criterion. But sometimes the input is small while the corresponding weight is very large; their product still matters significantly — killing these "small activation × large weight" channels breaks the model.
+- Even with the right criterion, how much should you prune? Applying the same ratio to every layer reveals that some layers collapse at the slightest pruning, while others survive even 70% sparsity. A uniform cut is wasteful.
+
+WiSparse is the latest stretch of this river. Tracing it backward, you reach the source: DejaVu in 2023.
+
+* Source Map
+
+#+begin_example
+[2023.10] DejaVu (Liu et al.)
+  |   Predicts which neurons will output 0 this time in a ReLU model, skips them entirely
+  |   --> Remaining gap: only works for ReLU; modern LLMs all use SwiGLU
+  v
+[2024.04] CATS (Lee et al.)
+  |   Sets a threshold in SwiGLU; treats values below the threshold as 0
+  |   --> Remaining gap: can only prune half of MLP (gate/up); global sparsity is capped
+  v
+[2024.08] TEAL (Liu et al.)
+  |   Not just MLP — prunes the entire hidden state uniformly by magnitude
+  |   Greedily assigns a sparsity ratio to each layer
+  |   --> Remaining gap: only looks at activation magnitude, ignores the corresponding weight magnitude
+  v
+[2025.05] WINA (Chen et al., Microsoft)
+  |   Criterion adds the L2 norm of the weight column: score = |x_i| * ||W_:,i||_2
+  |   --> Remaining gaps: 1) weight norm is a static dead score, not true "importance"
+  |                        2) all layers use the same formula and the same ratio; layer-wise sensitivity ignored
+  v
+[2026.02] WiSparse (Chen et al., Tsinghua)  <-- target paper
+      Criterion: each layer learns an exponent alpha; score = |x_i| * ||W_:,i||^alpha
+      Allocation: evolutionary algorithm distributes budget across blocks first,
+                  then greedy search distributes within each block to individual layers
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | DejaVu: Discovering "Contextual Sparsity" Itself
+
+*** What Problem It Saw
+
+LLM inference was absurdly slow back then — OPT-175B generating a single token required hauling 350 GB of weights from memory to the SMs. But Liu et al. stared at the outputs downstream of ReLU for a long time and noticed something concrete: for any specific input, 95% of the FFN neurons output exactly 0. The weights behind those zero-output neurons don't need to participate in computation at all — if you could know in advance "which neurons will be 0 this time," you could skip 95% of the memory traffic.
+
+Prior sparsity methods were all "static": either weights were permanently pruned, or the model had to be retrained. But the model's *in-context learning ability* depended on having all weights intact — touch them and the model degrades.
+
+*** Its Solution
+
+Train a small two-layer MLP as a "predictor." Feed it the current layer's input; it outputs "which neurons in the next layer will activate." The predictor is lightweight enough to run asynchronously — while the previous layer computes attention, the predictor is already computing which weights the next MLP layer will need.
+
+*** Why It Works (and Where the Next Pit Is)
+
+ReLU's hard cutoff (negatives all become 0) turns "which neurons will activate" into a learnable binary classification problem. But that is also where the pit lies: *it only works for ReLU models.* When the Llama and Mistral generation switched to SwiGLU and GELU, outputs were never exactly 0 — only "very small." DejaVu's predictor had nothing to grab onto.
+
+** 2024.04 | CATS: Relaxing "Equals 0" to "Below a Threshold"
+
+*** What Problem It Saw
+
+DejaVu completely failed on the new generation of LLMs. SwiGLU outputs are smooth with no natural zeros. But Lee et al. observed: *even without exact zeros, the absolute values of most activations are genuinely small.* The overall distribution is zero-centered with heavy tails — only a handful of "outliers" are truly large; everything else is near zero.
+
+*** Its Solution
+
+Set a threshold τ; any activation with |activation| < τ is treated as 0. How is the threshold set? Using a small calibration dataset, estimate the distribution of each layer and set τ so that the sparsity ratio meets the target. The pruning targets are the gate and up projections inside the SwiGLU MLP.
+
+*** Why It Works (and Where the Next Pit Is)
+
+The long tail of the smooth distribution makes magnitude-based truncation a reasonable approximation. But CATS *only touches two matrices inside the MLP* — the q/k/v/o projections of attention and the MLP's down projection are untouched. As a result, the global model sparsity is capped at roughly 25–30% before accuracy drops — most of the memory traffic remains.
+
+** 2024.08 | TEAL: Spreading Sparsity Across the Entire Model
+
+*** What Problem It Saw
+
+CATS left half the model untouched. But Liu et al. (a different Liu from DejaVu) looked carefully at every hidden state in Llama and found something interesting: *almost every distribution is a zero-centered unimodal distribution* — roughly Gaussian before the MLP and Laplacian inside it. In other words, CATS's idea of "treat small ones as 0" could in principle be applied in front of any matrix projection.
+
+*** Its Solution
+
+Apply magnitude truncation to the inputs of *every* linear layer in the model. The catch is that different layers have very different sensitivity — the MLP's down projection is particularly robust (the Laplacian distribution is more concentrated around 0), while attention's q/k projections are quite brittle. So TEAL uses a greedy search: given a total sparsity budget, let robust layers absorb more and fragile layers absorb less. Paired with a custom fused kernel, it achieves 40–50% global sparsity and an end-to-end speedup of 1.5–1.8×.
+
+*** Why It Works (and Where the Next Pit Is)
+
+Expanding the battlefield from "local MLP" to "the entire model" is the crucial turning point that actually reduces memory traffic in a meaningful way. But TEAL leaves one core assumption untouched: *deciding whether an input channel matters means only looking at the size of the activation.* This assumption breaks down in certain layers — and the next paper attacks exactly this point.
+
+** 2025.05 | WINA: Bringing Weights into the Criterion
+
+*** What Problem It Saw
+
+Chen et al. (Microsoft) focused on TEAL's failures: some channels have modest activations, yet their corresponding weight columns are exceptionally "heavy" — very large L2 norms. The product |x_i| * ||W_:,i|| is still significant, but TEAL treats it as 0 and prunes it, causing the output to drift. The reverse also holds: some channels have large activations but very small weights; keeping them wastes quota.
+
+*** Its Solution
+
+Change the criterion from |x_i| to |x_i| * ||W_:,i||_2 — activation magnitude multiplied by the L2 norm of the corresponding weight column. The paper also provides a theoretical justification: under the assumption that weight columns are orthogonal, this criterion yields a tighter upper bound on output error. In practice, it outperforms TEAL by roughly 2–3 points on Qwen-2.5, Llama-2, and Phi-4.
+
+*** Why It Works (and Where the Next Pit Is)
+
+This is the first work to explicitly acknowledge that "importance is a joint product of weight and activation." But WINA also leaves two pits:
+- The L2 norm of a weight column is a *fixed, static scalar*. Does it truly represent "how much this column influences the final output"? Across different layers and positions, the contribution pattern of weights can vary enormously — a dead scalar is obviously too coarse.
+- WINA doesn't touch the allocation problem. Every layer uses the same formula and the same sparsity ratio. But TEAL already established that inter-layer sensitivity differences are enormous; a uniform cut is wasteful.
+
+The next paper sets out to fill both pits at once.
+
+** 2026.02 | WiSparse: Learning the Weight of the Weights, Giving Each Block Its Own Budget
+
+*** What Problem It Saw
+
+WiSparse's two observations map directly onto WINA's two pits:
+- *Observation 1*: In layers like o_proj of Llama-3.1-8B, the variance of weight columns is much larger than that of activations. For some channels (e.g., channel 2244 in the paper's example), the activation is small but the weight column norm ranks at the very top. WINA's linear ||W||_2 can already catch this, but *how much weight* should be given to the weight term versus the activation term across different layers should be tunable — not a fixed multiplicative product.
+- *Observation 2*: Pruning different blocks independently to 50% sparsity shows that some blocks' perplexity spikes by 15%, while others barely change or even drop slightly. Moreover, this sensitivity *does not vary monotonically with depth* — some shallow layers are brittle, some middle layers are brittle, and some deep layers are surprisingly robust. A uniform sparsity ratio is clearly unreasonable.
+
+*** Its Solution
+
+For Observation 1 — *weight-aware activation sparsification*: Change the criterion to |x_i| * ||W_:,i||^alpha_l — where each layer learns its own exponent alpha_l. The value of alpha_l is found via a lightweight grid search that minimizes reconstruction MSE on a calibration set. alpha=1 recovers WINA; alpha=0 recovers TEAL; intermediate values differ layer by layer. In other words, each layer decides for itself "how much I depend on the weight term."
+
+For Observation 2 — *mixed-granularity sparsity allocation*: A coarse-to-fine two-stage approach:
+1. *Block level* (coarse): Use an evolutionary algorithm to distribute the global sparsity budget across all transformer blocks, leaving more room for sensitive blocks.
+2. *Layer level* (fine): Within each block, greedily allocate the budget among individual linear layers (q/k/v/o/gate/up/down), minimizing the block's output reconstruction error.
+
+Combined: at 50% sparsity on Llama-3.1, WiSparse preserves 97% of the dense model's performance — 2.23 points above the strongest baseline — with a 21.4% end-to-end inference speedup.
+
+*** Why It Works (and Where the Next Pit Is)
+
+It assembles all the dimensions that accumulated along this river — *which criterion (TEAL/WINA)*, *how to allocate the budget (TEAL's intra-layer greedy)*, *whether to consider weights (WINA)* — into a unified framework, makes each dimension tunable, and then uses search to calibrate them together.
+
+But the pits are also visible:
+- alpha_l, block budgets, and layer budgets all depend on search — if the calibration data is biased or too small, the search may overfit.
+- alpha is a scalar; its effect on an entire weight column is still a homogeneous scaling. The true "column importance" may not be expressible as ||W||^alpha at all — a more structured representation may be needed.
+- Global 50% sparsity is still far from the 95% sparsity DejaVu claimed for ReLU models. The true sparsity ceiling in the SwiGLU era has not yet been reached.
+
+* Frontier Extensions
+
+WiSparse is a February 2026 preprint; no work explicitly critiquing it has appeared yet. But the tensions in this line of research are clear — the next steps will most likely go in two directions:
+1. *Learn the criterion itself*, rather than just learning a scalar alpha — for example, using a small predictor (returning to the DejaVu approach) that directly learns to output "which channels should activate."
+2. *Co-optimize with quantization and speculative decoding* — the sparsity + quantization + speculative decoding triple is the true stack of current mainstream systems; diminishing returns from optimizing sparsity alone are inevitable.
+
+As of now (2026-05), WiSparse is the latest stop on the "training-free SwiGLU activation sparsity" river.
+
+* One Diagram
+
+#+begin_example
+                      Prunable scope         Criterion (who gets pruned)    Budget allocation
+                   +----------------+ +-----------------------------+ +------------------+
+[2023] DejaVu      | ReLU MLP only  | | Predictor learns "is it 0?" | | Natural 95%      |
+                   +----------------+ +-----------------------------+ +------------------+
+                            |                       |                          |
+                            v                       v                          v
+[2024.04] CATS     | SwiGLU MLP     | | |activation| > τ             | | Fixed per layer  |
+                   +----------------+ +-----------------------------+ +------------------+
+                            |                       |                          |
+                            v                       v                          v
+[2024.08] TEAL     | Every layer    | | Sort by |activation|         | | Greedy cross-layer|
+                   +----------------+ +-----------------------------+ +------------------+
+                                                    |                          |
+                                                    v                          |
+[2025.05] WINA     | Every layer    | | |x| * ||W||_2               | | Still uniform    |
+                   +----------------+ +-----------------------------+ +------------------+
+                                                    |                          |
+                                                    v                          v
+[2026.02] WiSparse | Every layer    | | |x| * ||W||^alpha_l         | | Evolutionary +   |
+                   +----------------+ +-----------------------------+ | Greedy           |
+                                       alpha_l learned per layer      +------------------+
+                                                                       Block + layer level
+
+Horizontal axis: time ---->   Vertical axis: all three dimensions advancing together
+#+end_example
+
+* Insight
+
+Pulling the whole river straight and looking at it, what is really happening is not "algorithms getting better" — it is *the concept of "importance" being pried open layer by layer*:
+
+- DejaVu era: "importance" = hard on/off switch for a neuron (is it 0 or not?)
+- CATS era: "importance" = continuous activation magnitude
+- TEAL era: "importance" = relative magnitude at every position across the whole model (calibrated per layer)
+- WINA era: "importance" = activation × weight column norm (product of two static signals)
+- WiSparse era: "importance" = activation × (weight norm)^layer-specific exponent + inter-layer budget (each layer has its own criterion recipe)
+
+Each generation *parameterizes "importance" more finely* — from a fixed criterion, to per-layer tunable, to jointly tunable at both block and layer granularity. But all methods still sit inside the same paradigm: *using static signals (norm, magnitude) to estimate dynamic importance.* The true next leap is probably *making the importance estimator itself a differentiable sub-network* — returning to DejaVu's "predictor" path, but applied to SwiGLU models. In other words, this river may be looping back to its 2023 starting point, but carrying all the criterion knowledge accumulated over these five years.
+
+A less obvious shift is also underway: this line of work has always flown the "training-free" banner. But look closely — WiSparse is already running an evolutionary algorithm to search for alpha values and block budgets. The cost of calibration, search, and tuning is no longer trivial. How much longer the "training-free" label can hold is an open question.
+
+* Takeaways
+
+This means you can:
+
+1. *When doing research, separately list "what prior work got right" and "the dimension prior work didn't see."* WiSparse's two observations follow exactly this structure — it doesn't refute TEAL or WINA; it says "you saw X but didn't see Y." This style of incremental paper is the easiest to establish and the easiest to get cited.
+2. *The budget-allocation problem is always more valuable than the criterion problem.* From TEAL to WiSparse, the largest practical gains come from "how much to prune each layer," not from upgrading the criterion from magnitude to weight-aware. The criterion sets the ceiling; the allocation determines how close you can get to it.
+3. *Any "X-free" method pushed to its limit becomes "X-lite."* Training-free methods that search enough parameters start to blur the cost boundary with training-based methods. When you see a new method advertising "training-free," instinctively ask: what is its calibration + search cost?
+4. *The backward-reading approach is especially useful for engineering papers.* Every generation's introduction critiques the previous generation; stringing those critiques together gives you the true evolutionary logic of the sub-field — more compact than any survey, because it is the practitioners' own version of the evolutionary history.

@@ -1,0 +1,298 @@
+#+title:      Agent Memory Below the Prompt: Persistent Q4 KV Cache for Multi-Agent LLM Inference on Edge Devices
+#+date:       [2026-05-29 Fri 03:01]
+#+filetags:   :paper:river:
+#+identifier: 20260529T030145
+#+source:     https://arxiv.org/abs/2603.04428
+#+authors:    Yakov Pyotr Shkolnikov
+#+venue:      arXiv 2603.04428, Feb 2026
+
+* 问题之河
+
+你的 MacBook 上跑着一个 10-agent 的工作流：一个写代码、一个 review、一个测试、一个 planner，再加六个专家。每个 agent 都有自己的对话历史——「这个项目的上下文」「之前的讨论」「用户的要求」——加起来都得记在 attention 的 KV cache 里。
+
+问题来了：M4 Pro 一共 24 GB 内存，扣掉模型本身（约 7 GB）和操作系统，能给 KV cache 的预算大约 10 GB。一个 Gemma 3 在 8K 上下文下，每个 agent 的 FP16 KV cache 占 3 GB。
+
+10 个 agent，30 GB。装不下。
+
+那怎么办？常规做法：哪个 agent 当前在说话，就把它的 cache 留在内存里；其他的踢出去。等踢出去的 agent 重新被叫醒，把它当时的完整对话历史重新喂进模型，重新算一遍 attention——也就是 *re-prefill*。在 4K 上下文下，这一步要 15.7 秒。每次切 agent 都要等。
+
+这个问题听起来很「工程」，但它其实是过去四年大模型推理系统的一条主线在最末端的体现：从「怎么让一台 GPU 装下更多并发请求」，到「不同请求之间能不能共享前缀」，到「KV cache 能不能压缩」，到「能不能把 KV cache 挪到 CPU/SSD」，最后到「在边缘设备上，多个 agent 各有各的对话状态，怎么让 attention state 像虚拟内存一样进出磁盘」。每一步都是有人把前一代忽略的某个维度补上去。
+
+* 溯源地图
+
+#+begin_example
+[2022] Yu et al. - Orca (OSDI)
+  |
+  | 立: 不同请求长度不一，传统 batch 在最长那条上等。
+  | 解法: iteration-level scheduling，每一步都可以加入/退出请求。
+  | 留下的坑: 没说 KV cache 内存怎么管，假定 HBM 够大。
+  v
+[2023] Kwon et al. - vLLM / PagedAttention (SOSP)
+  |
+  | 看到的问题: KV cache 在 HBM 里碎片化，导致并发上不去。
+  | 解法: 把 KV cache 切成固定大小 page，用页表管理；请求结束就释放。
+  | 留下的坑: 释放=丢掉。下一次同样的前缀来还得重算。
+  v
+[2023] Sheng et al. - FlexGen
+  |
+  | 看到的问题: 单 GPU 装不下大模型 + KV cache。
+  | 解法: GPU -> CPU -> SSD 三级 offload，压缩传输。
+  | 留下的坑: 面向 throughput 离线场景，每次访问都走 PCIe，延迟差。
+  v
+[2024] Zheng et al. - SGLang / RadixAttention
+  |
+  | 看到的问题: vLLM 丢前缀，相同 system prompt 反复 prefill 是浪费。
+  | 解法: 用 radix tree 把所有前缀缓存起来，token-id 匹配就复用。
+  | 留下的坑: 仍然在内存里，重启就没了；按 token id 匹配遇到 BPE 漂移就失败。
+  v
+[2024] Liu et al. - KIVI;  Hooper et al. - KVQuant
+  |
+  | 看到的问题: KV cache 比模型权重还吃显存，单 session 都装不下长上下文。
+  | 解法: 把 KV cache 压到 2-4 bit (KIVI 按 channel/token 维度不同处理)，
+  |       质量基本不掉。
+  | 留下的坑: 全是内存里的事，没人把量化后的 cache 写到盘上。
+  v
+[2025] Liu et al. - LMCache
+  |
+  | 看到的问题: 数据中心场景下，FP16 KV cache 在 GPU/CPU/SSD 间搬运代价大。
+  | 解法: 分层 offload + 复用 (3.66x 延迟降低)。
+  | 留下的坑: 给数据中心写的，没考虑边缘设备的 UMA、agent 隔离、单线程约束。
+  v
+[2026] Barrios - vllm-mlx (Feb 2026, 并行工作)
+  |
+  | 看到的问题: Apple Silicon 上没有 MLX 原生的 prefix caching。
+  | 解法: 把 vLLM 的 paged attention 思路移植到 MLX，FP16，全内存。
+  | 留下的坑: FP16 装不下多 agent；服务器一重启缓存全丢；
+  |           做的是 prefix caching 不是 agent 隔离。
+  v
+[2026] Shkolnikov - Agent Memory (本篇)
+  |
+  | 看到的问题: 边缘设备上跑 multi-agent，前面那一连串工作都不够：
+  |   - vLLM/SGLang: 只在内存里，关机就没了
+  |   - KIVI/KVQuant: 只量化不持久化
+  |   - LMCache: 给数据中心写的，没有 agent 隔离
+  |   - vllm-mlx: FP16 装不下，volatile
+  |   - llama.cpp: 有 Q4 KV + slot save，但要手动 API 调用，没 LRU 没编排
+  | 解法: 把上面四件事捏到一起——Q4 量化 + 按 agent 隔离的 block pool
+  |       + 直接写 safetensors 持久化 + 多 agent 之间 batched Q4 attention。
+  | 让 attention state 变成「虚拟内存」: block pool 是页表，SSD 是 swap，
+  | 多 agent 交错运行天然提供时间冗余，让磁盘 I/O 藏在 decode 后面。
+#+end_example
+
+* 演化叙事
+
+** 2022 | Orca: 第一次承认「请求是流，不是批」
+
+*** 它看到了什么问题
+
+在 Orca 之前，LLM 推理服务把请求打 batch 跑：凑够 N 个请求一起塞进 GPU，等到最慢的那个出完所有 token，整批才算完。短请求要陪长请求一起等，GPU 利用率惨。
+
+*** 它的解法
+
+Orca 提出 *iteration-level scheduling*：调度的最小单位不是「请求」而是「一次 forward pass」。每跑完一个 token，调度器都可以决定：这个请求出完了就剔掉，新请求随时可以加进来。这就是后来所有「continuous batching」实现的祖宗。
+
+*** 留下了什么坑
+
+Orca 解决了「怎么排队」，但默认所有请求的 KV cache 都能塞进 HBM。它没回答 *内存* 怎么管。
+
+** 2023 | vLLM: 把内存当成一本可分页的字典
+
+*** 它看到了什么前人没看到的
+
+Orca 让请求可以随时进出，但每个请求要 *一整块连续的 KV cache 空间*。问题是请求长度差很多——有的 200 token，有的 8000 token。预留最大值就浪费，预留小了就装不下长请求。HBM 碎片化得很厉害。
+
+*** 它的解法
+
+vLLM 借用操作系统的「分页虚拟内存」思路：把 KV cache 切成固定大小（比如 16 token 一块）的 *page*，每个请求维护一张「页表」记录自己的 page 在哪。物理内存哪里有空就放哪。结果是几乎零碎片，吞吐量 2-4 倍。
+
+这个机制叫 *PagedAttention*。
+
+*** 留下了什么坑
+
+vLLM 在请求结束时把它占的 page 全释放回池子。但 multi-agent 的世界里，「请求结束」是个伪概念——agent 还要再聊很多轮。每次都重新 prefill 等于让 agent 全失忆。
+
+** 2024 | SGLang: 别扔，按前缀共享
+
+*** 它看到了什么前人没看到的
+
+如果 10 个并发请求都用同一段 system prompt 起头，vLLM 给每个请求各算一遍前缀的 KV，浪费 10 倍。
+
+*** 它的解法
+
+SGLang 用 *radix tree* 把所有出现过的前缀 KV cache 索引起来。新请求来的时候，按 token id 匹配最长公共前缀，命中的部分直接复用，只 prefill 没共享的尾巴。吞吐量再涨 5 倍。
+
+*** 留下了什么坑
+
+两个：
+
+1. *按 token id 匹配* 看起来天经地义，但 BPE tokenizer 是上下文敏感的——同一句话拼在不同后文之后，可能切出不同 token。前缀字符相同 token 不同，就匹配不上。
+2. *radix tree 在内存里*。服务器重启、内存压力大被驱逐、设备睡眠都会让它消失，下次冷启动还是从零。
+
+** 2024 | KIVI / KVQuant: KV cache 自己就是个大胖子
+
+*** 它看到了什么前人没看到的
+
+到 2024 年大家发现一个反直觉的事：长上下文模型里，*KV cache 比模型权重还吃显存*。Llama-2 70B 在 4K 上下文下，权重 140GB，KV cache 40GB；到了 32K，KV cache 直接奔 320GB 去了。
+
+模型权重大家已经从 fp16 砍到 int4 砍了无数回，KV cache 反而一直 fp16 没动过。
+
+*** 它们的解法
+
+- *KIVI* 发现 key 和 value 的统计性质不同：key 在 channel 维度上有结构（每列有偏好），value 在 token 维度上更均匀。所以 key 按 channel 量化、value 按 token 量化，两者都到 2 bit，几乎不掉点。
+- *KVQuant* 做更精细的 per-layer 敏感度分析，把 LongBench 推到 1M context。
+
+*** 留下了什么坑
+
+它们都假设 KV cache 一直在内存里，只是「想办法让它占小一点」。从来没人问：能不能写到盘上？跨 session 还能不能用？
+
+** 2023-2025 | FlexGen / LMCache: 真把它挪出去过，但场景不对
+
+*** 它们看到了什么
+
+FlexGen（2023）是第一个认真做「把 KV cache spill 到 CPU 甚至 SSD」的工作，面向单 GPU 跑大模型的离线 throughput 场景。LMCache（2025）把这个思路工程化，做了分层缓存，把企业级场景的延迟降了 3.66 倍。
+
+*** 它们的解法
+
+GPU -> CPU -> SSD 三级 cache，按访问频率搬运；FlexGen 还做了 token 维度的压缩。
+
+*** 留下了什么坑
+
+它们都是写给 *数据中心* 的：
+
+- 假设 PCIe / NVLink 带宽够，offload 代价能接受
+- 没有 *按 agent 隔离*——它们关心的是「我有多少 GPU 内存，怎么把 KV cache 塞进多级 cache 让吞吐最高」
+- 也没解决「重启之后 cache 是否还在」这个问题，对数据中心 24x7 跑的 worker 这无所谓
+
+边缘设备的世界完全是另一套：内存就 24 GB 焊死，UMA 没有 PCIe 那个坎，但 SSD 带宽相对内存只差 1 个量级（M4 Pro：273 GB/s 内存 vs 7 GB/s SSD，ratio ~2.6%——不像 PCIe vs HBM 那种 28 倍悬崖）。换句话说，*UMA 设备特别适合 KV cache 进出磁盘*——这是个完全没被前面这些数据中心方案利用的结构特性。
+
+** 2026-Feb | vllm-mlx: Apple Silicon 上的第一次原生尝试
+
+*** 它看到了什么
+
+到 2026 年初，Apple Silicon 上跑 LLM 的人发现：llama.cpp 用 GGML，性能比 MLX 差；MLX 本身又没有 prefix caching。Barrios 把 vLLM 的 paged attention + continuous batching 移植到了 MLX，做出 vllm-mlx。
+
+*** 它的解法
+
+MLX 原生的 paged KV cache、按 SHA-256 去重的 prefix cache、continuous batching。吞吐比 llama.cpp 高 21-87%。
+
+*** 留下了什么坑
+
+跟本篇作者的对比试验直接戳了它三刀：
+
+1. *FP16*。多 agent 场景下，5 个 agent 在 8K 上下文就要 15 GB，超出 9.6 GB 预算，cache 被挤掉，回到冷启动。
+2. *Volatile*。服务器重启就丢，设备睡眠就丢，内存压力就丢。
+3. *做的是 prefix caching 不是 agent isolation*。它假设你有共享前缀；multi-agent 是每个 agent 各自的对话状态，没有共享前缀给你 cache。
+
+llama.cpp 倒是支持 Q4 KV + slot save/restore，但要手动调 API，没有 LRU、没有 block pool、没有 agent 编排——它给你提供了原料，但厨房没装修。
+
+** 2026-Feb | 本篇: 把虚拟内存装进 attention
+
+*** 它看到了什么
+
+把上面这条线串起来看，到了 2026 年初，边缘设备上跑 multi-agent 工作流缺的是一个 *整体方案*：
+
+- Orca 给了调度原理
+- vLLM 给了页式管理
+- KIVI/KVQuant 给了量化方法
+- FlexGen/LMCache 给了 offload 模板
+- vllm-mlx 给了 MLX 实现
+- llama.cpp 给了零件但没装
+
+没有人把这些捏到一起，特别是没有人把「Q4 量化 + 持久化到盘 + 多 agent 之间 batched Q4 attention」这三件事打通。
+
+*** 它的解法
+
+四个零件按虚拟内存的类比组织起来：
+
+1. *Block pool*——按 agent ID 隔离的 KV cache 池，每个 agent 一份独立的 safetensors 文件。相当于「按进程隔离的页表」。
+2. *Q4 量化 pipeline*——KV cache 从盘上读、留在内存、进 attention，全程都是 Q4 格式（uint32 packed + bfloat16 scale/bias，group size 64）。fp16 -> Q4 的内存压缩比是 0.281，省 72%。
+3. *字符级前缀匹配*——绕过 SGLang 那个 BPE token-id 漂移坑，直接比较 prompt 的字符。
+4. *BatchQuantizedKVCache*——MLX 上游没有的东西：让多个 agent 的 Q4 cache 在同一次 forward pass 里被批处理。这是「让两个 agent 的 decode 步骤合并成一次 Metal kernel 调度」的关键。
+
+整套系统的精神：*把 attention state 当虚拟内存看*。
+
+- block pool = 页表
+- SSD safetensors = swap 文件
+- multi-agent 天然交错 = 时间维度的 prefetch（一个 agent 在 decode 的 1-3 秒里，下一个 agent 的 cache 已经在偷偷从盘上读，500ms 的 reload 完全藏在前一个的输出后面）
+
+*** 它的实测
+
+在 M4 Pro / Gemma 3 12B / 4K 上下文：
+
+- 冷启动 prefill: 15.7 s
+- Warm（从盘上 reload Q4 cache）: 577 ms
+- Hot（cache 已在内存）: 719 ms
+
+到 32K，warm TTFT 比冷启动快 136 倍。同样 10 GB 预算下，Q4 装下的 agent 数是 FP16 的 4 倍。Q4 量化带来的质量损失：Gemma -0.7%、Llama +2.8%、DeepSeek +3.0% perplexity，跟 KIVI/KVQuant 报告的水平一致。
+
+*** 它留下了什么坑
+
+作者自己列在 Limitations 里的：
+
+1. *单设备*。多设备扩展要 Thunderbolt 或网络传 cache。
+2. *固定 bit-width*。所有层都用 Q4，没用 RotateKV/CommVQ 那种自适应 2-4 bit。
+3. *只测了 3 个模型*（Gemma 3 12B、DeepSeek-Coder-V2-Lite 16B、Llama 3.1 8B），70B+ 没验。
+4. *Cache 跟模型绑死*。模型升级一次，全部 cache 作废。RAG 文本块不会，KV cache 会。
+5. *PyTorch / CUDA 端口未做*。MLX 单线程、惰性求值这些 MLX-only 的工程细节得换。
+
+* 问题-解法总览
+
+#+begin_example
+                  what's in HBM/RAM        cross-session?    multi-agent?
+                  ===================      ==============    =============
+  Orca (2022)        full FP16 KV           no                ad-hoc batch
+  vLLM (2023)        paged FP16             no                share page pool
+  SGLang (2024)      paged + radix tree     no                token-id prefix
+  KIVI/KVQuant (24)  2-4 bit KV             no                N/A
+  FlexGen (2023)     compressed + offload   no                N/A (1 GPU)
+  LMCache (2025)     tiered (GPU/CPU/SSD)   no (datacenter)   no isolation
+  vllm-mlx (2026)    paged FP16 on MLX      no                prefix-shared
+  llama.cpp          Q4/Q8 + slot save      manual            no orchestration
+  -------------------------------------------------------------------------
+  AgentMemory        Q4 in block pool       YES (safetensors) YES (per-agent
+                     + batched Q4 attn      survives restart   isolation +
+                                                               batched Q4)
+
+  类比演进:
+    Orca       = 操作系统的协作多任务调度
+    vLLM       = 内存分页
+    SGLang     = 内存去重 (KSM)
+    KIVI       = 内存压缩 (ZRAM)
+    LMCache    = 多级缓存
+    vllm-mlx   = 把上面这套搬到 Apple Silicon
+    本篇       = 把 attention state 做成「虚拟内存」: 页表 + swap + 自动换页
+#+end_example
+
+* 内核洞见
+
+这条线表面上是「KV cache 怎么管得更精细」的工程演化，背后真正在发生的是：
+
+*LLM 推理系统正在重走操作系统四十年走过的路。*
+
+- 2022 Orca = 协作式多任务 (像早期 Mac OS)
+- 2023 vLLM = 引入页式虚拟内存
+- 2024 SGLang = 共享页（mmap 共享段）
+- 2024 KIVI = 内存压缩
+- 2025 LMCache = 多级 cache 层级
+- 2026 本篇 = 把 swap 文件做完整，attention state 真正具有「虚拟内存」语义——可以远大于物理内存，可以跨进程隔离，可以跨重启持久
+
+而推动这条路的是一个特别具体的压力：*agent 多了起来*。一个 agent 跑 LLM 这事 vLLM 就够了；十个 agent 一起跑、各有各的上下文、还要在一台 24 GB 的 MacBook 上跑，这才把虚拟内存级别的抽象逼出来。
+
+更深一层：这篇论文之所以能成立，是因为 Apple Silicon 的 UMA 架构让 SSD 和 RAM 的带宽差距只有 ~40 倍，而不是 PCIe 那种 28 倍悬崖之外还要再走总线。*硬件结构决定了哪种软件抽象有意义*——在数据中心 GPU 上，spill to SSD 的延迟代价让 LMCache 不得不专注于 GPU/CPU 之间的事；在 UMA 上，spill to SSD 突然变得可行，于是「持久化 attention state」第一次成为一个产品级特性而不是 throughput 优化。
+
+* 下一步会往哪走
+
+顺着这条线最可能的三个方向：
+
+1. *多设备共享 attention state*。两台 MacBook 之间用 Thunderbolt 同步 agent cache，等于把虚拟内存升级到分布式共享内存（DSM）。文中点过但没做。
+2. *自适应 bit-width*。每层、甚至每 token，按敏感度选 2/4/8 bit。RotateKV、CommVQ、QuantSpec 已经在做单 session 的版本，需要把它们和持久化结合起来。
+3. *Cache 跟模型解耦*。这是最深的坑。现在升级一次模型，所有 agent 的「记忆」全清零。需要一种「在模型之间可迁移的 attention state」表示——可能是把 KV cache 反量化回某种模型无关的 embedding 表示，再投影到新模型的 KV 空间。如果做出来，AI agent 才真的能有「不会因为基模更新而失忆」的长期记忆。
+
+第三个方向是问题真正的形状。前面所有人都在解「怎么把 KV cache 装下、留住、传走」，但 cache 的本质是 *模型在它自己 weight 上对一段文本的内部状态*——一旦 weight 变了，状态就失去意义。这是当前路径的本质天花板。
+
+* 不确定项
+
+- Orca → vLLM → SGLang 这条链是论文里明确的；KIVI/KVQuant 是引用但不构成直接「批判改进」关系，是「平行的另一类工作」。
+- LMCache → 本篇 的关系是「数据中心方案不适用，所以我们做边缘版」，引用关系明确。
+- vllm-mlx 是论文里明确做了 head-to-head 对比的最直接对手，时间上是并行工作（2025-12 到 2026-02）。
+- 前沿延伸里 RotateKV、CommVQ、QuantSpec 是论文 future work 段点名提到的方向，不是已经接续本篇的工作。

@@ -1,0 +1,280 @@
+#+title:      Fast KV Compaction via Attention Matching
+#+date:       [2026-05-29 Fri 02:49]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T024916-en
+#+source:     https://arxiv.org/abs/2602.16284
+#+authors:    Adam Zweiger, Xinghong Fu, Han Guo, Yoon Kim
+#+venue:      arXiv 2602.16284 (MIT CSAIL), Feb 2026
+
+* The Problem River
+
+A language model has just read a 60k-token medical record and is ready to answer a doctor's questions. In GPU memory, that record has been compacted into a massive "memory table" — the KV cache — one row per token. Now the doctor wants to ask ten questions, and every time the model must scan the entire table: shuffle data, compute attention. The bigger the table, the slower each answer and the lower the concurrency.
+
+The most intuitive shortcut is "have the model write a summary" — compress sixty thousand words into two thousand, then answer from the summary. The price: information lost in the summary is gone for good, and a critical diagnosis may have lived in exactly the row that was discarded.
+
+A more aggressive alternative operates not at the text level but directly on the KV "memory table" itself. Can we compress sixty thousand rows into six hundred while the model barely notices? Over the past two years three schools of thought have emerged: drop unimportant rows (H2O, SnapKV, KVzip), merge similar rows (KVMerger), and the most elaborate approach — "learn a small table as parameters" (Cartridges).
+
+Each school has seen the scars left by the previous one. This paper — Attention Matching — stands on everyone's shoulders and asks a question nobody had pressed to its conclusion: *If we require directly that "attention behavior is unchanged after compression," can we sidestep training entirely and flatten the table by solving a small least-squares problem?*
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.) - Attention sink + sliding window
+  |
+  | Claim: keeping just the first few tokens + a recent sliding window
+  |        is enough for the model to generate indefinitely.
+  | Problem: content dropped from the middle is gone forever;
+  |          QA over long documents loses critical facts.
+  v
+[2023] H2O (Zhang et al.) - Heavy Hitter eviction
+  |
+  | Problem seen: "most recent" is not the only thing that matters;
+  |               tokens with high accumulated attention scores — "Heavy Hitters" — matter most.
+  | Fix: accumulate attention scores per KV, keep top-k, drop the rest.
+  | Hole left: scores are query-specific, so a different question invalidates
+  |            the pruned cache; also: dropped tokens still contributed to
+  |            the softmax denominator — their "mass" is now missing.
+  v
+[2024] SnapKV (Li et al.) - Use the trailing prompt window to predict importance
+  |
+  | Problem seen: H2O needs to see the query before deciding what to keep,
+  |               which is too late for the prefill stage.
+  | Fix: use a short suffix of the prompt as a "scout query" to score
+  |      earlier KVs in advance.
+  | Hole left: still query-aware; breaks under multiple distinct queries.
+  v
+[2024] DuoAttention (Xiao et al.) - Split heads into two classes
+  |
+  | Problem seen: not all attention heads need long context; some are purely local.
+  | Fix: learn a binary mask — label each head "retrieval" or "streaming."
+  | Hole left: binary is too coarse; a head is either fully kept or fully cut,
+  |            with no "keep 30%" middle ground.
+  v
+[2025] KVzip (Kim et al., NeurIPS oral) - Score by reconstruction quality
+  |
+  | Problem seen: all prior methods are query-specific.
+  | Fix: let the model try to "replay" the original text using the compressed KV
+  |      (next-token prediction); reconstruction quality becomes the importance score.
+  |      Compress once, reuse for any query.
+  | Hole left: still "hard eviction" — collapses at high compression ratios (50x).
+  v
+[2025] Cartridges (Eyuboglu et al., HazyResearch) - Train a small table directly
+  |
+  | Problem seen: drop/merge methods are confined to a subset of the original KV space;
+  |               there is no reason those original vectors are the optimal representation.
+  |               Quality collapses at high compression ratios.
+  | Fix: abandon "which tokens to keep." Instead train a small KV table (e.g. 100 rows)
+  |      as free parameters via prefix-tuning, using synthetic "self-study"
+  |      dialogues for context distillation. Achieves 50x compression with
+  |      near-full quality.
+  | Hole left: *slow*. Every new context requires several GPU-hours of training —
+  |            unsuitable for on-the-fly use.
+  v
+[2026] Attention Matching (Zweiger et al.)  <-- this paper
+  |
+  | Problem seen: Cartridges took the right direction (latent space) but used
+  |               the wrong tool (gradient training). If the goal is "unchanged
+  |               attention behavior," you don't need to train a whole network —
+  |               you just solve a small least-squares problem per head.
+  | Fix: cast "match attention output + match attention mass" as linear sub-problems;
+  |      solve bias with NNLS, values with OLS — done in seconds.
+  | Result: matches Cartridges quality at 100× the speed.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: The First Admission That "We Can't Keep Everything"
+
+*** What Problem It Saw
+
+In 2023, everyone wanted LLMs to handle unbounded conversations, but the KV cache would OOM after a while. The brute-force fix was a sliding window — keep only the most recent N tokens and drop the rest. The moment you dropped them, the model started hallucinating.
+
+*** Its Solution
+
+Xiao's group discovered an unexpected phenomenon: the very first tokens — even semantically vacuous ones like "The" — receive extremely high attention scores at every layer. These are *attention sinks*. Preserving those few sinks plus a recent sliding window is enough to keep the model stable.
+
+*** The Hole It Left
+
+Everything in the middle is permanently gone. For pure generation (chat) this suffices, but for long-document QA the critical facts often live in exactly that discarded middle section. The next paper came to fix this.
+
+** 2023 | H2O: Not the Most Recent — the "High-Scoring" Ones
+
+*** What Problem It Saw
+
+StreamingLLM assumed "only the recent context matters." The H2O team observed that during generation, attention scores concentrate on a small number of tokens — which they called *Heavy Hitters*. These can appear anywhere in the document, not necessarily near the end.
+
+*** Its Solution
+
+After prefill, accumulate the attention score each KV receives and keep the top-k. Drop the rest. This substantially outperforms pure sliding-window approaches on generation tasks.
+
+*** The Hole It Left
+
+Two problems: (1) the ranking is query-dependent — subsequent queries that use the same pruned cache may be poorly served; (2) the act of dropping has a side effect — the remaining KVs must "represent" the total attention mass of the original T tokens in the softmax denominator; without correction, the softmax scale is underestimated. Attention Matching later strikes precisely here.
+
+** 2024 | SnapKV: Use the Prompt Tail as a Scout
+
+*** What Problem It Saw
+
+H2O requires seeing the query before scoring. In practice, we want the KV cache compressed during prefill — waiting until the user asks a question before compressing incurs unacceptable latency.
+
+*** Its Solution
+
+The key insight: use a short suffix of the prompt (e.g., the last 64 tokens) as a "proxy query," and score earlier KVs with those tokens' attention patterns. Because the prompt already hints at the task direction, this proxy score correlates well with the true query's needs.
+
+*** The Hole It Left
+
+The multi-query problem is still unsolved. Given the same document, if a user asks "What is the patient's diagnosis?" and then "What is the medication dosage?", the relevant KVs for each question are entirely different. A single SnapKV pass locks in one set of survivors.
+
+** 2024 | DuoAttention: Different Heads Do Different Jobs
+
+*** What Problem It Saw
+
+The previous methods all operated in the token dimension — deciding which tokens to keep. Xiao's new observation was that attention *heads* are the real unit of variation. Some heads are "retrieval heads" that fetch information across long distances; others are "streaming heads" that only look at nearby tokens. The former need the full cache; the latter need only a sliding window.
+
+*** Its Solution
+
+Learn a binary mask: each head is labeled either "retrieval" (keep everything) or "streaming" (keep only sinks + sliding window). The overall compression ratio is determined by the fraction of streaming heads.
+
+*** The Hole It Left
+
+Binary is too coarse — a head is either fully preserved or cut all the way down, with no "keep 30%" middle ground. This paper converts that binary switch into a continuous knob: how many KVs each head is allocated is determined by a continuous sensitivity curve.
+
+** 2025 | KVzip: Score by How Well the Model Can Reconstruct the Original Text
+
+*** What Problem It Saw
+
+All prior methods are query-dependent — once compressed, the cache only serves that class of queries well. But in real deployments the same long document gets queried repeatedly (a codebase, a legal document, a medical record). Re-compressing on every query is expensive; not re-compressing is inaccurate.
+
+*** Its Solution
+
+KVzip proposes a clever *query-agnostic* importance score: let the LLM attempt to "replay" the original text (next-token prediction) using the compressed KV cache. If removing a particular KV degrades reconstruction, it is important. Compress once, reuse for any subsequent query.
+
+*** The Hole It Left
+
+KVzip is still "hard eviction." At moderate compression ratios (3–4×) it performs very well — NeurIPS oral acceptance. But at high ratios (50×, 100×), no matter how accurate the scoring, hard eviction collapses. This paper will show that at extreme compression ratios, any hard-eviction method breaks down; the latent-space route is mandatory.
+
+** 2025 | Cartridges: Stop Selecting — Train a Whole New Small Table
+
+*** What Problem It Saw
+
+Eyuboglu's group (HazyResearch, Christopher Ré lab) identified a fundamental ceiling: no matter how clever your selection, you are always picking from a *subset of the original KV space*. Yet there is no reason to believe those original KV vectors constitute the optimal compressed representation.
+
+*** Its Solution
+
+Abandon the "which tokens to keep" framing entirely. Inspired by prefix-tuning: treat a small KV table (e.g., 100 rows) as free trainable parameters and perform context distillation using synthetic "self-study" dialogues — the small table's outputs learn to mimic those of the original long context.
+
+The results are striking: 50× compression still roughly matches original performance, far surpassing all eviction methods. They call each trained table a *Cartridge* — like a printer ink cartridge, one document gets one cartridge.
+
+*** The Hole It Left
+
+It is fatally *slow*. Each Cartridge takes several GPU-hours to train. For relatively static documents (a book, a codebase) the cost can be amortized, but whenever context changes frequently (one-off queries, newly arriving emails), the training cost far exceeds the inference savings. This paper attacks exactly that bone.
+
+** 2026 | Attention Matching (Zweiger et al.): Solve Equations, Don't Train a Network
+
+*** What Problem It Saw
+
+Looking back along the whole timeline, the authors seized on a key observation: Cartridges uses gradient training because it targets "minimize downstream loss" — a non-convex objective that demands gradient descent. But if we replace it with a *more direct* objective — "make the compressed attention *output* and *mass* match the original at every layer and every head" — that objective decomposes into a collection of linear least-squares sub-problems, each with a closed-form solution.
+
+No gradients. No full network training. No GPU-hours. A few linear systems, solved in seconds.
+
+*** Its Solution
+
+Each KV head is handled independently in three steps:
+
+1. *Select which keys to keep*: use OMP (Orthogonal Matching Pursuit) greedily — add one key at a time, whichever reduces the residual most — or, for speed, simply pick the top-k by mean attention score.
+2. *Fit a per-token bias β*: solve a non-negative least squares (NNLS) problem. This β directly addresses the "mass underestimation" bug in H2O/KVzip — because T − t tokens were dropped, the remaining t tokens must be *reweighted* so that the softmax denominator still represents the total mass of the original T tokens.
+3. *Fit the compacted values*: ordinary least squares (OLS), closed-form, one shot.
+
+On top of this, a non-uniform head budget is assigned: each head has a different sensitivity to compression, measured offline with a single sensitivity scan. Sensitive heads get more KV budget; insensitive heads get aggressively cut. This budget allocation is *input-independent* — it depends only on model architecture — so it is computed once and reused forever.
+
+*** Why This Works
+
+The deepest insight is the introduction of β. Every prior eviction method implicitly assumed "the surviving tokens retain their original attention weights." But softmax is an irreducibly nonlinear operation — you cannot simply select t tokens out of T and expect the denominator to be unchanged. Attention Matching explicitly acknowledges this: "I must amplify the influence of surviving keys to compensate for the lost mass" — and it directly solves for the amplification factor β.
+
+Result: on QuALITY, LongHealth, QASPER, and LongBench v2, 50× compression matches Cartridges quality but runs *100× faster*. A 60k-token medical record on a single H200 compacts in seconds to minutes; Cartridges takes hours.
+
+*** Holes That Remain
+
+- The price of closed-form solutions is "per-head independent optimization" — cross-head coordination is ignored. Cartridges captures it automatically through end-to-end training.
+- The self-study step still requires generating reference queries over the long context (139 seconds for a 60k-token context). For fully real-time use one must fall back to the cheaper "context-prefill" mode, with a slight quality drop.
+- Stacking with summarization: the paper shows that summarizing first and then applying AM-OMP can achieve ~200× total compression. But this reintroduces the old problem of information lost in the summary.
+
+* Frontier Extensions
+
+As of May 2026, this line of work is still iterating rapidly. A few directions worth watching:
+
+- *Training-free vs. training-amortized contest*. Attention Matching has claimed the "fast" summit; Cartridges holds the "peak quality + amortizable" summit. Will a "light-training" middle ground emerge — initialize with AM's closed-form solution, then gradient-finetune for a few minutes?
+- *Hardware co-design*. The compacted KV produced by AM is compatible with FlashAttention at inference time, while Cartridges' training phase is hardware-heavy. A kernel optimized for "short KV + per-head heterogeneous budgets" would further widen AM's latency advantage.
+- *Online compaction*. The paper already experiments with online (compress-while-generating) mode on AIME. If this path matures, "unbounded generation" need no longer rely solely on sliding windows — the model can continuously compact old KVs into a small table as it generates.
+
+* One Diagram to Understand It All
+
+#+begin_example
+
+           Compression Approach Evolution Tree (KV cache reduction)
+
+  Original KV (T tokens)
+       |
+       +-- [token space] ----------+----- [latent space] ----------+
+       |                           |                               |
+   Summarization (lossy)      Drop/merge tokens             Train/solve a small table
+       |                           |                               |
+       v                    +------+------+               +--------+--------+
+                            |             |               |                 |
+                   Pick by position  Pick by importance  Gradient train   Solve equations
+                            |             |               |                 |
+                   StreamingLLM   H2O / SnapKV       Cartridges       *Attention*
+                   (sink+window)  KVzip / DuoAtt   (Eyuboglu 2025)   *Matching*
+                                                   hours/document     seconds/document
+                                                   best quality       equivalent quality
+                                                                      100x faster
+
+
+  The default assumption broken by each generation:
+
+  +----------------------------------------------------------------------+
+  | StreamingLLM:  keep head + recent -> middle can be dropped           |
+  |                (collapses on QA)                                     |
+  | H2O:           score by cumulative attention -> query-dependent      |
+  | SnapKV:        use prompt tail as proxy query -> breaks on multi-Q   |
+  | DuoAttention:  split heads into two classes -> binary too coarse     |
+  | KVzip:         score by reconstruction quality -> collapses at high  |
+  |                compression ratios                                    |
+  | Cartridges:    train a small table directly -> slow (GPU-hours)      |
+  | *AM (this)*:   closed-form solution + bias correction                |
+  |                -> 100x faster, equivalent quality                    |
+  +----------------------------------------------------------------------+
+
+  AM's key trick:
+
+  After dropping T - t tokens, the softmax denominator is underestimated ->
+  add a per-token bias beta to the surviving t keys ->
+  solve for beta via NNLS so that attention mass is conserved
+  + solve for compacted values via OLS
+  ==> turns "train prefix-tuning" (non-convex) into convex sub-problems
+
+#+end_example
+
+* Insights
+
+A recurring tension throughout this river is the gap between *apparent* and *actual*.
+
+The earliest intuition for KV compression was "identify and keep the important tokens" — importance sounds like a natural and self-evident concept. But from H2O through KVzip, each generation refined the scoring, yet the performance curve still falls off a cliff above 50× compression. Why? Because the act of "selecting" embeds a subtly wrong ontological assumption: *the original KV vectors are the optimal compressed representation*.
+
+Cartridges was the first to challenge that assumption — stop selecting; train an entirely new table. The result held up at 50× compression. But the tool Cartridges chose (gradient training) was brought in to handle "intractable downstream loss" — it solved the representation problem while making the objective function needlessly complex.
+
+What Attention Matching does is: given that you have already decided to "learn a new table," the objective need not be downstream loss. Switch to "preserve attention behavior," and that objective decomposes into linear systems. The representational revolution (Cartridges) + objective function simplification (from downstream loss back to attention matching) = a table in seconds.
+
+One layer deeper: *the evaluation criterion determines the method*. Measured by perplexity, H2O-class methods are fine at moderate compression; once evaluation shifts to long-document QA and retrieval tasks where extreme compression ratios are non-negotiable, the entire eviction paradigm breaks down. This paper exists because the community pushed evaluation toward LongHealth, LongBench v2 — genuinely long documents, genuinely open-ended QA — which exposed every method's ceiling and opened the space for latent + closed-form solutions.
+
+What to bet on next? I would bet on a *mixed stack*: summarization (coarse 10× compression) + Attention Matching (another 20×) + a tiny Cartridge trained for the hottest queries (another 5×). Each layer uses the cheapest tool to achieve the compression ratio it handles best. This mirrors storage hierarchies (register → L1 → L2 → RAM) — there is no single optimum, only the right stack for the right access pattern.
+
+* Takeaways
+
+This river offers three concrete lessons for how to think about compression problems:
+
+1. *First ask whether the objective function can be changed.* When every method in a field shares the same objective (e.g., downstream loss + gradient training), look for a *more direct but weaker* proxy objective (e.g., this paper's "match attention output") that might admit a closed-form solution. Stepping back to make the target itself simpler often has more leverage than improving the optimizer for the original target.
+2. *Acknowledge the side-effects of nonlinearity.* The softmax denominator couples all keys together; you cannot simply drop a subset and expect the survivors to be unaffected. Before any "grouping operation," ask: *is there a conserved quantity that is being broken, and does it need to be explicitly restored?* This paper's β exists to restore softmax mass conservation.
+3. *Stack methods by access pattern; do not chase a single optimum.* There is no silver bullet for KV compression. Short context, one-off query → StreamingLLM or H2O is sufficient. Medium context, multiple queries → KVzip. Long context, repeated queries → Cartridges. Long context, one-off query, and speed matters → Attention Matching. Understand your access pattern first, then choose the method; do not let "the latest paper" make the decision for you.
+
+Practical action: if you are currently building a long-document RAG pipeline or a long-context serving system, try the `adamzweiger/compaction` repository this week — according to the paper's own benchmarks, a 10–50× compression demo on Qwen3-4B or Llama-3.1-8B takes only a few minutes to run, giving you an immediate comparison against your current baseline.
