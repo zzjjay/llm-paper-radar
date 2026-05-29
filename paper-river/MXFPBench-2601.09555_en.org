@@ -1,0 +1,248 @@
+#+title:      Benchmarking Post-Training Quantization of Large Language Models under Microscaling Floating Point Formats
+#+date:       [2026-05-29 Fri 10:51]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T105118-en
+#+source:     https://arxiv.org/abs/2601.09555
+#+authors:    Manyi Zhang, Ji-Fu Li, Zhongao Sun, Haoli Bai, Hui-Ling Zhen, Zhenhua Dong, Xianzhi Yu
+#+venue:      arXiv 2601.09555 (2026)
+
+* The Problem River
+
+Squeezing a hundred-billion-parameter model onto a single card and making it run fast and accurately. How?
+
+The difficulty is this: a model contains a small number of very large values and a vast majority of very small ones. If you try to pack them all into one uniform "small bin," either the large values overflow and get clipped, or the small values pile up indistinguishably. Every generation of research has wrestled with this — some shift values, some rotate them, some redesign the bins themselves. By late 2025, hardware vendors simply introduced a new kind of bin called *MXFP*, grouping every 32 numbers together and giving each group its own scale. Everyone assumed the old tricks would transfer. This paper tried every old trick and found: they don't.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Finding: large-model activations hide "outliers" — compress and it collapses
+  | Fix: pull outliers out and compute them in FP16; everything else in INT8
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: mixed precision above is slow; also only fixes activations, not weight compression error
+  | Fix: use Hessian information to compensate weight quantization error layer by layer
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Problem: activation outliers still not cured; difficulty imbalanced between weights and activations
+  | Fix: multiply each channel by a scale, migrating some "hardness" from activations to weights
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem: SmoothQuant treats all weights equally; critical weights get compressed too
+  | Fix: identify the 1% "salient weights" and protect them from being over-compressed
+  v
+[2024] Ashkboos et al. - QuaRot  (+ SpinQuant)
+  |
+  | Problem: all of the above patch around outliers — can we make them vanish altogether?
+  | Fix: apply orthogonal rotations to scatter weights and activations, spreading outliers evenly
+  v
+[2023] Rouhani et al. - OCP Microscaling (MX) specification
+  |
+  | Not a direct critique — a hardware-level new bin: every 32 numbers share one power-of-2 exponent scale
+  | NVIDIA Blackwell / AMD CDNA4 both support it natively
+  v
+[2026] Zhang et al. - This paper (MXFPBench)
+  |
+  | Problem: all the PTQ tricks above were designed for INT formats — do they still work on MXFP?
+  | Finding: MXFP8 is essentially free; MXFP4 is hard, and rotation methods actually get worse
+  |          The real bottleneck is not the weights or activations — it is the power-of-2 scale itself
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): The First Clear Look at "Outliers"
+
+*** What Problem It Saw
+
+Before LLM.int8(), the received wisdom for compressing models was simple: scale weights and activations from FP16 down to INT8 proportionally. This worked fine on small models. But once a model exceeded roughly 6.7 billion parameters, accuracy fell off a cliff.
+
+Dettmers examined the failure and found the culprit: *a small handful of "giant" values hiding in the activations*. The vast majority of activations sit in the range ±1, but a few dimensions can reach tens or even hundreds. If you set your scale factor by the maximum value, those giants squeeze every other value into a cluster around zero, destroying the information they carried.
+
+*** Its Solution
+
+Simple and blunt: pull those "giant dimensions" out and let them continue through a FP16 high-precision path; the remaining 99% go through INT8. Merge the two results at the end.
+
+*** Why It Worked (and What New Hole It Left)
+
+It was the first demonstration that *the bottleneck in large-model quantization is distributional, not mathematical*. A handful of dimensions cause all the damage.
+
+But the solution had two problems. First, hardware dislikes a mixed pipeline that alternates between INT8 and FP16 — it is slow. Second, it only addressed the activation side; how to better compress the weights was left unanswered.
+
+** 2022 | GPTQ: On the Weight Side, Can We Precisely Compensate for Error?
+
+*** What Problem It Saw
+
+The mixed-precision scheme of LLM.int8() was too heavy. Frantar and colleagues asked: can we compress weights aggressively (to INT4, say), but compensate for each quantization error mathematically as we go, so that the overall layer output stays nearly unchanged?
+
+*** Its Solution
+
+They adapted a technique from 1990, OBQ (Optimal Brain Quantization): each layer has a Hessian matrix that records how changing weight i affects the optimal values of other weights. GPTQ made this efficient — quantize weights column by column, and after each one use the inverse Hessian to propagate the quantization error onto the weights that have not been compressed yet.
+
+*** Why It Worked (and What New Hole It Left)
+
+It established the principle that *quantization is not just rounding — it is a compensation game*. Once a value is distorted, other values can absorb some of that distortion, keeping the aggregate loss small.
+
+The hole: it only compresses weights; activations remain FP16. To truly save both memory and compute, activations must be compressed too. But the "giants" in the activations were still there, unsolved.
+
+** 2023 | SmoothQuant: Move Some "Hardness" from Activations to Weights
+
+*** What Problem It Saw
+
+Xiao saw through something: activations have giants; weights are comparatively well-behaved. Both sides were given the same size "compression bin," which meant the bins were too small where it was hard and wastefully large where it was easy. Could the *workload be balanced*?
+
+*** Its Solution
+
+For each channel c, find a scale s_c: divide all activation values in that channel by s_c, and multiply all weight values in that channel by s_c. Mathematically equivalent (the matrix product a·W is unchanged), but distributionally: activations become tamer, weights become slightly steeper. The whole thing becomes easier to compress.
+
+*** Why It Worked (and What New Hole It Left)
+
+It identified a deeper regularity: *quantization difficulty can be "transferred" between the two sides of an operator*. This idea would be reused repeatedly.
+
+The hole: SmoothQuant treats all weight channels identically. But some weight channels matter far more than others — when "hardness" is shifted over to the weight side, it lands on critical weights just as much as on trivial ones.
+
+** 2023 | AWQ: Not All Weights Are Created Equal
+
+*** What Problem It Saw
+
+Lin and colleagues found that roughly *0.1%–1% of weights* are pivotal — this tiny fraction determines most of the model's capability. The other 99% can be compressed however you like with little consequence. SmoothQuant treated everything equally, meaning those critical 1% were compressed to average standards. Painful.
+
+The key observation: which weights matter? Look at their corresponding *activations*. Channels with large activations correspond to "salient" weights.
+
+*** Its Solution
+
+Assign each channel a protective scale factor derived from activation magnitude. Channels with large activations get a scale that reduces compression on their weights, preserving fidelity. Other channels are compressed normally.
+
+*** Why It Worked (and What New Hole It Left)
+
+AWQ pushed weight-only quantization to 4 bits at nearly no accuracy loss. The philosophy — keep high precision where it matters, compress hard where it doesn't — was inherited by many subsequent methods.
+
+But *AWQ and SmoothQuant were both patches*: finding scales, shifting difficulty, protecting the important. The outliers themselves had not disappeared; they had merely been worked around. Could they be made not to exist at all?
+
+** 2024 | QuaRot / SpinQuant: If Outliers Are the Root of Trouble, Make Them Vanish
+
+*** What Problem It Saw
+
+Ashkboos and colleagues noticed that every prior method was dancing around *outliers confined to a few fixed channels*. But were those channels genuinely "special"? Or were they just an artifact of a particular choice of coordinate system?
+
+If it is merely a coordinate choice — then change the coordinate system and the outliers scatter.
+
+*** Its Solution
+
+Insert two *orthogonal rotation matrices* R and R⁻¹ on either side of the weight matrix W. Mathematically identical (R·R⁻¹ = I), but after rotation: the outliers that had been concentrated in a few channels are now spread evenly across all channels. Every value becomes roughly the same magnitude, and quantization becomes easy.
+
+QuaRot used a fixed Hadamard rotation; SpinQuant learned the rotation on a calibration set.
+
+*** Why It Worked (and What New Hole It Left)
+
+This was a *conceptual upgrade*: from "route around outliers" to "abolish outliers." On INT4, QuaRot and SpinQuant were SOTA.
+
+The hole — though no one noticed it at the time. Everyone was playing in the INT4 world. Then hardware vendors threw in something new: MXFP.
+
+** 2023 → 2025 | OCP Microscaling Specification: Hardware Introduces a New Kind of Bin
+
+*** What Problem It Sought to Solve
+
+INT quantization has a perennial weakness: too little dynamic range. INT8 can represent a ratio of at most 256 between its largest and smallest values. Deep-learning tensors routinely span differences of thousands to one. You must supply a separate scale factor per tensor, per channel, or at even finer granularity, aligning INT's range to the tensor's actual range. Finer granularity is more accurate but more expensive.
+
+*** Its Solution
+
+OCP (Open Compute Project) together with a consortium of vendors proposed *Microscaling (MX)*: every 32 numbers share one power-of-2 exponent scale (called UE8M0 — an 8-bit unsigned exponent with no mantissa). Each individual number is itself a small floating-point value — MXFP8 uses E4M3 or E5M2; MXFP4 uses E2M1.
+
+In other words: each element is floating-point (providing local dynamic range), plus a block-level power-of-2 scale (providing global dynamic range). This is a hybrid of floating-point and block quantization.
+
+*** Why This Matters
+
+NVIDIA Blackwell and AMD CDNA4 both bake it into silicon with native MXFP4 matrix-multiply support. That means *MXFP4 is genuinely several times faster than FP16* — not just saving memory, but saving compute.
+
+There is one detail everyone overlooked: the scale is forced to be a *power of 2*. That means the optimal floating-point scale — if it is not a power of 2 — must be rounded to the nearest power of 2. This is a squeezed degree of freedom.
+
+** 2026 | MXFPBench: Port the Full Toolkit to the New Bins and See What Still Works
+
+*** What Problem It Saw
+
+MXFP hardware had arrived, but PTQ algorithms were all designed for INT quantization. The implicit assumption in the community was: "just swap the quantization function and GPTQ/AWQ/SmoothQuant/QuaRot should work as before."
+
+Zhang and colleagues were skeptical. They took 7+ PTQ algorithms, 15 benchmarks, and 3 model families, and ran every combination across MXFP8/MXFP4.
+
+*** Its Solution
+
+No new algorithm is invented; this is *an experiment*. But the experimental design is careful: PTQ methods are categorized by what they modify — channel scaling, error compensation, rotation, affine transformation — and the fate of each category on MXFP is tracked.
+
+*** What It Found
+
+Three counter-intuitive conclusions:
+
+1. *MXFP8 is essentially free*: W8A8 is nearly lossless, and it makes almost no difference which PTQ algorithm you use. This means the 8-bit debate is over; just switch.
+2. *On MXFP4, rotation methods actually get worse*: QuaRot and SpinQuant are SOTA on INT4, but on MXFP4 they lose to the simplest baseline, round-to-nearest (RTN). Why? MX applies a separate scale to each group of 32, and the structured outliers that naturally occur per group can be absorbed by that group-level scale. Rotation scatters the outliers uniformly — now every group is equally "unremarkable," and the group-level scale's advantage evaporates. *The technique that saves the day in the INT world actively destroys MXFP's built-in advantage.*
+3. *The real bottleneck is not the algorithm — it is the scale itself*: Because UE8M0 forces a power-of-2, the optimal floating-point scale is rounded to the nearest power of 2, introducing systematic error. Keeping the scale in higher precision (not forcing power-of-2) substantially improves results. Additionally, multiplying the input by 0.75 before quantization (the "unbiased FP4" trick from Tseng et al. 2025) rescues another chunk: on a 7B model at W4A4 it drops PPL from 104 to 49.
+
+*** Why It Worked (and What New Hole It Left)
+
+It pulled the community back from "PTQ generalizes" to "PTQ is format-dependent." *MX is not a drop-in replacement for INT — it is an entirely different numerical regime.* Algorithms must be redesigned for it.
+
+The remaining hole: W4A4 under MXFP still carries a 4–14% accuracy loss, and no one yet knows how to fully recover it.
+
+* Frontier Extensions
+
+** 2025 | MR-GPTQ: Rebuilding GPTQ "Born for FP4"
+
+Egiazarian and colleagues stopped treating GPTQ as a generic compressor applied to FP4, and instead *rewrote GPTQ's core specifically for FP4* — adding block-wise Hadamard transforms and format-aware optimizations. This directly validates the paper's central thesis: "PTQ must be redesigned for MXFP." MR-GPTQ is the first milestone on that new road.
+
+** 2026 | This Paper's "Pre-Scaling" Fix
+
+The paper itself closes with a fix that is almost shockingly simple: multiply the input by 3/4 before quantization. The reason: the maximum representable value in FP4 and the effective integer boundary do not coincide, producing a systematic bias. The factor 3/4 removes it. This was first found by Tseng 2025 in a training context and transfers cleanly to PTQ.
+
+* One Diagram
+
+#+begin_example
+        "Where are the giants? How to handle them?"  -->  "The bin itself has changed — does the old playbook apply?"
+
+Timeline -->  2022          2022            2023             2023           2024              2023-25           2026
+              LLM.int8      GPTQ            SmoothQuant      AWQ            QuaRot/SpinQuant  MX spec           MXFPBench
+              ----------    ----------      ----------       ----------     ----------        ----------        ----------
+Conceptual    "See the       "Compensate     "Balance the     "Weights are   "Rotate outliers  "New hardware,    "INT tricks
+upgrade:       giants"        on weights"     difficulty"      unequal"       out of existence"  new bins"         fail"
+                                                                                                                 "Scale is
+                                                                                                                  the disease"
+
+Core          Activation     Weight          Activation vs.   Which weights  Can outliers      Dynamic range     PTQ vs.
+tension:      outliers       compression     weight           matter         be eliminated?    vs. precision     format
+                             error           imbalance                                                           mismatch
+
+Solution      Mixed          Hessian         Channel-scale    Salient-weight Orthogonal        Block float +     Format-aware
+essence:      precision      compensation    migration        protection     rotation scatter   shared 2^x scale  PTQ redesign
+
+Hole left:    Hardware-      Weights only    Ignores weight   Outliers       Group structure   Power-of-2        W4A4 still
+              unfriendly                     importance       persist        disrupted         scale is biased   degrades
+#+end_example
+
+* Insight
+
+Tracing this river, a larger recurring theme emerges: *the community's understanding of "where the bottleneck is" has steadily migrated downward.*
+
+- **First phase (2022)**, the bottleneck was located at the *algorithm level*: how to distribute bits cleverly and how to compensate for quantization error.
+- **Second phase (2023–2024)**, the bottleneck was understood as a *numerical distribution problem*: outliers. Once you could eliminate outliers (via rotation), the problem was solved.
+- **Third phase (2026)**, this paper pushes the gaze further down to *the numerical representation itself*: it is not that the algorithm is insufficiently clever, nor that the distribution has not been smoothed enough — the *scale (the power-of-2 constraint of UE8M0) is inherently biased.*
+
+Each time the bottleneck migrates downward, it is because the tricks available at the layer above have been exhausted. At the MXFP level, no matter how clever the algorithm, it cannot rescue 4-bit precision, because the ceiling is set by the format — the optimization space is bounded by hardware.
+
+This suggests the next steps may go in two directions:
+
+1. *Retreat one layer up*: abandon the paradigm of "do software optimization on top of hardware-given formats" and return to the training phase. QAT (quantization-aware training) will come back into focus. This paper's findings amount to declaring: "PTQ on MXFP4 is already near its ceiling."
+2. *Dig one layer down*: co-design the format with hardware vendors. For instance, replace UE8M0 with UE5M3 (allowing the scale to carry a mantissa, not forced to a power of 2), or make the block size variable instead of fixed at 32. This requires hardware-software co-design.
+
+The second path is already beginning to happen: the most interesting "fix" in this paper — keeping the scale in higher precision — is essentially *temporarily circumventing the hardware format constraint in software*. Such workarounds are not sustainable; they will inevitably push the next generation of hardware format design.
+
+* Takeaways
+
+Two lessons for researchers:
+
+First, *"assume generality" is the most expensive assumption you can make*. A field uses a set of methods for five years, and everyone feels those methods "should probably work" in any new setting. The most valuable work in such moments is not to invent new methods but to *systematically falsify the generality assumption* — which is exactly what this paper does. An undergraduate-level experimental design (cross-product evaluation) yielded a conclusion that reorients the whole community.
+
+Second, *the location of the bottleneck migrates*. Each generation's star method corresponds to a specific bottleneck hypothesis. When you find that "no matter how much I optimize, nothing moves," it is often not because you are not clever enough — it is because *the bottleneck has shifted to a layer you cannot touch*. At that point, either change layers (QAT instead of PTQ) or partner with the people who own that layer to change it together (push hardware format evolution).
+
+The practical implication: the next time you approach a "mature field" looking for a research contribution, resist the urge to immediately add a new method. First ask: *"where has the previous generation's assumption been quietly violated?"* — and you may find your next MXFPBench.

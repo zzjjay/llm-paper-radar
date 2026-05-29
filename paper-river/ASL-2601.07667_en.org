@@ -1,0 +1,420 @@
+#+title:      Adaptive Layer Selection for Layer-Wise Token Pruning in LLM Inference
+#+date:       [2026-05-29 Fri 10:34]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T103403-en
+#+source:     https://arxiv.org/abs/2601.07667
+#+authors:    Rei Taniguchi, Yuyang Dong, Makoto Onizuka, Chuan Xiao
+#+venue:      arXiv 2026
+
+* The Problem River
+
+When an LLM processes long text, it must cache the key/value tensors for every
+token in the context into GPU memory. With hundreds of thousands of context
+tokens, that cache consumes all available memory. The question is: can we cut
+that cache by ninety percent and still get answers that are just as accurate?
+
+What makes this hard: you don't know which tokens matter. Ask "where's the
+needle in the haystack" and the needle is the crux; ask "summarize the whole
+document" and the entire haystack matters. A token that looks unimportant at
+layer 5 may become the pivot of the model's decision at layer 25. Any
+one-size-fits-all pruning strategy will inevitably collapse on some class of
+tasks.
+
+Generation after generation of researchers has been answering the same question:
+*At which layer, with what signal, and by dropping which tokens can we save
+memory without losing reasoning quality?* ASL is the current downstream end of
+this river.
+
+* Source Map
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al.)
+  |  Problem: sliding window discards the first few tokens → model collapses
+  |  Solution: always keep the first 4 "attention sink" tokens
+  v
+[2023.06] H2O (Zhang et al.)
+  |  Problem: keeping head/tail isn't enough — important "heavy" middle tokens are missed
+  |  Solution: tokens with high cumulative attention scores = heavy hitters → keep dynamically
+  v
+[2024.04] SnapKV (Li et al.)
+  |  Problem: full cumulative scoring is expensive and single-token focus misses clusters
+  |  Solution: use a "observation window" at the prompt tail to vote; pooling captures whole clusters
+  v
+[2024.06] PyramidKV (Cai et al.)
+  |  Problem: retaining the same number of tokens per layer is wasteful — upper layers already focus on just a few
+  |  Solution: allocate cache budget in a pyramid: more tokens in lower layers, fewer in upper layers
+  v
+[2024.09] GemFilter (Shi et al.)
+  |  Problem: all prior methods compress only after the full prefill — the prefill itself is not accelerated
+  |  Solution: an early layer is already sufficient to identify key tokens — two forward passes, first pass acts as filter
+  v
+[2025.02] FastKV (Jo et al.)
+  |  Problem: two forward passes waste computation — can we do it in one?
+  |  Solution: one forward pass; prune once at a fixed TSP layer (e.g., layer 15)
+  v
+[2026.01] ASL (this paper)
+     Problem: "fixed layer 15" is a guess — it fails on hard tasks (KV retrieval)
+     Solution: stop guessing — monitor token-ranking variance; prune when the model signals convergence
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.09 | StreamingLLM: Keeping the Model Coherent Indefinitely
+
+*** What problem it saw
+
+Early on, the most intuitive fix for an oversized KV cache was a sliding
+window—keep only the most recent N tokens. But once deployed, the problem was
+immediate: as soon as the context exceeded the window length, model output
+collapsed into gibberish. All the content was recent—so why did it break?
+
+*** Its solution
+
+Xiao et al. examined the attention maps and spotted something strange: the model
+consistently allocated enormous attention mass to the *very first few tokens*,
+even if those tokens were meaningless (e.g., a BOS symbol). They called this
+"attention sinks." The cause is buried in softmax—scores must sum to 1, so when
+the model has nothing particularly interesting to attend to, it dumps its mass
+onto the first token.
+
+The fix is elegantly simple: keep the sliding window, but *permanently anchor
+the first 4 tokens so they are never evicted*. Memory overhead is negligible,
+yet the model can generate stably for millions of tokens.
+
+*** Why it works — and what new pit it digs
+
+It solves "long generation without collapse," but it is fundamentally a
+hack—what is preserved is not "important content" but "the softmax dumping
+ground." The large middle span of tokens that actually carry semantics is still
+slid away. Ask "where is the needle?" and the needle has long since left the
+window.
+
+The next natural question follows immediately: can we identify *which middle
+tokens are genuinely important* and keep those?
+
+** 2023.06 | H2O: Heavy Tokens Surface on Their Own
+
+*** What problem it saw
+
+StreamingLLM keeps the head and tail, discarding the middle. But critical
+information is often buried in the middle—a specific number or name somewhere
+deep in a long prompt. Pruning by position inevitably loses it.
+
+*** Its solution
+
+Zhang et al. found that attention scores follow a *power-law distribution*: a
+small minority of tokens absorbs the vast majority of attention. They called
+these "heavy hitters" (H2).
+
+H2O's strategy: during each generation step, accumulate the total attention
+score each token has received across all steps so far. High score = heavy
+hitter, keep; low score = bystander, evict. A recent local window is also
+retained. The cache thus contains two categories: heavy hitters + recency.
+
+*** Why it works — and what new pit it digs
+
+The power law is real—a small cluster of tokens genuinely props up the entire
+attention landscape. But H2O's scoring signal is *historical accumulation*:
+every token must be attended to by every generated query before its cumulative
+score is known. This means:
+
+1. Expensive—every step must update scores for all tokens
+2. It measures "was important in the past," not "will be important in the
+   future"—naturally unfriendly to long-prompt / short-answer scenarios such as
+   most RAG pipelines
+
+The next generation must answer: can we skip the full history and use some
+local signal from the prompt itself to identify heavy tokens faster and more
+accurately?
+
+** 2024.04 | SnapKV: The Prompt Tail Votes on What Matters
+
+*** What problem it saw
+
+H2O must wait for generation to begin before accumulating scores. Yet in many
+scenarios the prompt itself already determines which passages the answer depends
+on—for example, "Answer the following question based on the passage below:
+[long document] Question: X." By the time the prompt is read, the model
+effectively already knows where the focus should be.
+
+Moreover, H2O scores tokens individually, which can shred a coherent phrase into
+scattered tokens and lose local context.
+
+*** Its solution
+
+Li et al. introduced two changes:
+
+1. *Observation window*: retain a small segment at the end of the prompt (e.g.,
+   the last 32 tokens) and use that segment's queries to score all preceding
+   tokens retroactively. "Where the tail is looking is where it matters."
+2. *Pooling*: apply 1D average pooling (e.g., window size 7) over the raw
+   scores before selecting tokens. Instead of picking isolated high-score
+   tokens, this selects *clusters* of high scores, capturing coherent semantic
+   spans rather than scattered individual tokens.
+
+*** Why it works — and what new pit it digs
+
+The observation window plus pooling became so practical that nearly every
+subsequent KV cache compression paper adopted SnapKV's scoring pipeline. But
+SnapKV retains *the same number of tokens in every layer* by default. The
+problem: attention behavior differs dramatically across layers—lower layers are
+diffuse, upper layers are sharply focused. Allocating the same budget to each
+layer leaves lower layers potentially under-budgeted and upper layers
+definitively wasteful.
+
+** 2024.06 | PyramidKV: Allocate Budget by Layer
+
+*** What problem it saw
+
+The PyramidKV team observed a clear pattern: as depth increases, attention
+becomes progressively concentrated on fewer and fewer tokens. They called this
+the "pyramid-shaped information funnel"—lower layers cast a wide net, upper
+layers strike with precision.
+
+Since upper layers already attend to just a handful of tokens, retaining 256
+versus retaining 64 makes almost no difference there. SnapKV's uniform
+allocation is pure waste in the upper layers.
+
+*** Its solution
+
+Allocate the budget as a pyramid: lower layers keep more (e.g., 1024 tokens),
+upper layers keep fewer (e.g., 64), with a linear decrease in between. The total
+budget is unchanged, but the distribution now matches the true "upper layers are
+sparse" reality. Which specific tokens to keep within each layer still follows
+SnapKV's observation-window-plus-pooling vote.
+
+*** Why it works — and what new pit it digs
+
+PyramidKV was the first to treat the *layer dimension* as an independent
+optimization axis—prior work selected tokens; PyramidKV began selecting "how
+many tokens per layer." This direction is correct, but problems remain:
+
+1. It selects the *per-layer budget*, not *where to make the pruning
+   decision*—every layer must still compute full attention to score tokens
+2. The prefill stage is not accelerated at all—a long prompt still forces every
+   token through every layer
+
+Next question: can we prune at one shallow layer so that subsequent layers never
+even see the discarded tokens?
+
+** 2024.09 | GemFilter: An Early Layer Is Already a Good Enough Filter
+
+*** What problem it saw
+
+PyramidKV saves decode-time memory but not prefill compute. Yet prefill is the
+dominant cost—routing a 128K-token context through all layers takes enormous
+time and memory.
+
+Shi et al. discovered a counterintuitive fact: *the attention pattern of an
+early layer (e.g., layer 13 in LLaMA-3.1-8B) already pinpoints the critical
+tokens with high accuracy.* You don't need to run to the last layer to know what
+matters.
+
+*** Its solution
+
+Two forward passes:
+1. *First pass (filter)*: run only up to layer 13, examine that layer's
+   attention, and select the top-k tokens (e.g., 1024).
+2. *Second pass (inference)*: truncate the original 128K-token sequence to those
+   1024 tokens and run the full model from scratch.
+
+This sounds like extra work, but: the first pass covers only ~1/3 of the model;
+the second pass processes only ~1/100 of the original sequence length. Total
+cost is far below one full pass over 128K tokens.
+
+*** Why it works — and what new pit it digs
+
+GemFilter was the first to show that prefill can be accelerated, and that
+*shallow layers are sufficient* for token selection. But two forward passes still
+means running one segment twice. Can we do it in a single pass—prune in place at
+layer 13, then continue forward with the reduced sequence?
+
+** 2025.02 | FastKV: One Pass, Prune in Place at the TSP Layer
+
+*** What problem it saw
+
+GemFilter's two passes carry two redundancies: the first pass is discarded
+immediately after filtering; the second pass re-computes what was already done.
+At its core, GemFilter hard-couples "filtering" to "inference"—the filter layer
+is also the restart point for all computation.
+
+*** Its solution
+
+Jo et al. proposed *Token-Selective Propagation* (TSP):
+
+1. A single forward pass, computing layer by layer from 0 upward.
+2. Upon reaching the designated TSP layer (e.g., layer 15), perform a one-shot
+   prune—select the top-k tokens and *propagate only those k tokens' hidden
+   states forward*.
+3. All subsequent layers process only those k tokens; the effective sequence
+   length is cut by an order of magnitude right there.
+
+It also decouples "how many tokens to propagate forward" from "how many KV pairs
+to cache at decode time"—the former controls prefill speedup, the latter
+controls decode memory. Two independent knobs.
+
+*** Why it works — and what new pit it digs
+
+FastKV is clean and elegant: one forward pass, faster prefill, controllable
+decode memory. But it hard-codes the TSP layer—layer 15 for LLaMA-3.1-8B,
+layer 19 for Mistral-Nemo. These are hand-tuned values that "look fine on most
+tasks."
+
+That is exactly where the trouble lies. ASL's Figure 1 lands a direct blow on
+FastKV: on *KV retrieval* tasks, pruning at a fixed layer 15 causes accuracy to
+fall off a cliff. The intuition is straightforward—hard tasks require the model
+to reason through more layers before it knows "which tokens I actually need to
+look at." Pruning at layer 15 means making that decision for the model before it
+has finished thinking.
+
+** 2026.01 | ASL: Let the Model Say "I've Figured It Out"
+
+*** What problem it saw
+
+From PyramidKV to FastKV, every "layer choice" was *preset*—empirical values
+derived from average behavior across tasks. But the depth at which attention
+converges is actually *task-dependent*:
+
+- Simple language modeling: converges around layer 5
+- Long-document summarization: converges around layer 12
+- Multi-hop KV retrieval: may not converge until layer 20+
+
+A fixed layer will inevitably fail on some task class.
+
+*** Its solution
+
+Taniguchi et al. reasoned: instead of guessing, *listen to the model itself.*
+They focused on one observable quantity—*the variance of token rankings*:
+
+1. Start observing from some shallow layer (e.g., layer 10).
+2. At each layer, rank all tokens by their attention scores.
+3. Measure how much the *rankings of the same top-k tokens* have shifted across
+   the most recent 8 layers.
+4. Small ranking change = the model has stabilized on which tokens matter = safe
+   to prune now.
+5. Rankings still shifting = the model hasn't finished deciding = wait one more
+   layer.
+
+Concretely, they compute "relative variance"—dividing the current layer's
+variance by the variance at the initial observation layer. When this ratio drops
+below a threshold (e.g., 0.3), pruning is triggered. The division normalizes the
+signal, making the threshold transferable across different tasks.
+
+After pruning, ASL coordinates with SnapKV: for the discarded tokens' KV caches
+accumulated before the prune layer, SnapKV further compresses them during
+decode; layers after the prune point process only the surviving top-k tokens.
+
+*** Why it works — and what new pit it digs
+
+ASL's core insight: *attention convergence is an observable signal.* No task
+labels needed, no classifier to train—just look at the variance of the
+model-generated rankings.
+
+It transforms "which layer to prune at" from a static hyperparameter into a
+runtime decision. Simple tasks trigger pruning at layer 12; hard tasks wait
+until layer 25; the budget matches automatically. Experiments in the paper show
+that ASL does recover the accuracy gap that FastKV loses on hard tasks.
+
+Remaining pits: the threshold τ is still a hyperparameter (though the paper
+reports 0.3 generalizes well); the observation window L_obs is also fixed; and
+ASL only decides *where to prune*—*which tokens to prune* still uses SnapKV's
+observation-window voting. If future work shows SnapKV's scoring is itself
+flawed, ASL will be dragged down with it.
+
+* Frontier Extensions
+
+ASL is a January 2026 paper and currently represents the leading edge of this
+line of work. Several foreseeable directions follow:
+
+- *Joint adaptation*: "layer selection" is now adaptive, but "which tokens to
+  select" still uses SnapKV's static rules. The next step may make token
+  selection adaptive too—dynamically choosing the retention strategy based on
+  query type.
+- *Multi-stage pruning*: ASL performs a single one-shot prune at one layer. If
+  different sub-tasks converge at different depths, progressive pruning at
+  multiple layers may be needed.
+- *Training-time integration*: ASL is training-free, which is both its virtue
+  and its ceiling. Explicitly training the model to recognize "when it has
+  already converged" could produce a much cleaner signal.
+
+* One Diagram to See It All
+
+#+begin_example
+                   The KV cache compression river
+              ------------------------------------------
+          (which tokens to keep)          (at which layer to prune)
+                  |                                |
+   2023  StreamingLLM ----.                no pruning at any layer;
+         head + tail       \               all layers run fully
+                            |
+   2023  H2O ---------------+              no pruning at any layer
+         high cumulative    /
+         attention         /
+                          /
+   2024  SnapKV ---------'               no pruning at any layer
+         obs-window vote + pool
+                                                   |
+   2024  PyramidKV ---------------------+    per-layer budget allocation
+         (SnapKV scoring)               |    more at bottom, fewer at top (static)
+                                        |
+   2024  GemFilter --------------------+    prune at an early layer
+         (shallow attn as filter)       |    two forward passes (static layer)
+                                        |
+   2025  FastKV  ---------------------+      prune in place at TSP layer
+         (SnapKV scoring)              |     one forward pass (static layer)
+                                       |
+   2026  ASL    ----------------------'      variance signal triggers pruning
+         (SnapKV scoring)                    one forward pass (dynamic layer)
+
+   Evolution →  from "keep all" to "keep selectively";
+                from "wait for full compute then prune" to "prune mid-compute";
+                from "guess the layer" to "let the model say when it's ready"
+#+end_example
+
+* Insight
+
+On the surface this river is about "how to compress the KV cache." At its core
+it is a recurring cognitive shift: *from static heuristics to dynamic observable
+signals.*
+
+- Generation 1 (StreamingLLM / H2O): use global statistics (position /
+  cumulative scores) for static decisions.
+- Generation 2 (SnapKV / PyramidKV): use local statistics (observation window /
+  inter-layer decay patterns) for static decisions.
+- Generation 3 (GemFilter / FastKV): move the decision point inside the
+  prefill, but still at a static layer.
+- Generation 4 (ASL): the decision point itself becomes dynamic—monitor a
+  *runtime convergence signal* and let the model tell you when to prune.
+
+Each generation finds the next variable frozen by the previous generation's
+static assumptions and makes it dynamic. The logical next step is: *token
+selection itself* also becomes runtime-adaptive (every current method still uses
+the fixed observation-window-plus-pooling scoring pipeline).
+
+At a deeper level, this line of work reveals a general methodology: *when your
+system performs unevenly across different inputs, find a runtime signal that
+distinguishes those inputs—rather than continuing to tune hyperparameters.*
+
+* Takeaways
+
+What this river suggests about how to do research:
+
+1. *"General" isn't always general*—FastKV's fixed TSP layer looks fine across
+   most tasks, but ASL tears it open with one neglected hard task class. Find a
+   subset of inputs that a method quietly avoids, run your experiment there, and
+   you often expose the gap in the current SOTA.
+
+2. *Adaptive methods always live downstream of static rules*—any widely adopted
+   paper that contains an "empirical value" or "fixed layer" is the attack
+   surface for the next paper. Ask yourself: could this be determined dynamically
+   from the input?
+
+3. *Observation signals are cheaper than trained signals*—ASL changed no model
+   weights, added no classifier, and used ranking variance as its signal. Many
+   judgments that seem to "require training" can actually be replaced by a
+   runtime statistic—provided you are willing to stare at the intermediate
+   outputs.
+
+Bottom line: the next time you read a SOTA paper, flip straight to the
+hyperparameter table. *The values that have been fixed there are the titles of
+the next paper.*

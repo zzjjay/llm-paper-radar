@@ -1,0 +1,285 @@
+#+title:      ARCQuant: Boosting NVFP4 Quantization with Augmented Residual Channels for LLMs
+#+date:       [2026-05-29 Fri 10:29]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260529T102932-en
+#+source:     https://arxiv.org/abs/2601.07475
+#+authors:    Haoqian Meng, Yilun Luo, Yafei Zhao, Wenyuan Liu, Peng Zhang, Xindian Ma
+#+venue:      arXiv preprint, 2026
+
+* The River of the Problem
+
+Squeezing a multi-hundred-GB large model onto a consumer GPU while keeping inference both fast and accurate — this problem has been wrestled with repeatedly over the past four years. Every six months someone declares "we finally did it," only for the next group to discover that at even harsher bit-widths, the old tricks fall apart.
+
+What makes it hard? Large models contain a handful of "outlier" channels — the vast majority of weights and activations are well-behaved, but a few values are a hundred times larger than their neighbors. When you compress everything down to 4 bits (only 16 representable values), those outliers either get clipped or they drag every other value down with them. Generation after generation of research is, at its core, answering the same question:
+
+*How do you accommodate the outliers inside a format that hardware can actually run?*
+
+* The Provenance Map
+
+#+begin_example
+[2022.08] Dettmers et al. - LLM.int8()
+  |
+  | Problem: Naive INT8 quantization collapses on models ≥ 6.7B
+  | Finding: Emergent outlier channels are the culprit
+  | Solution: Isolate outlier channels in FP16; quantize the rest to INT8
+  v
+[2022.11] Xiao et al. - SmoothQuant
+  |
+  | Problem: Mixed-precision requires special kernels that slow inference
+  | Insight: Hard activations = easy weights; the difficulty can be transferred
+  | Solution: Mathematically shift activation outliers into the weights
+  v
+[2022.10] Frantar et al. - GPTQ
+  |
+  | Problem: Want lower bit-width (W4); SmoothQuant can't hold up
+  | Solution: Use Hessian second-order info to reconstruct weights column by column
+  | Limitation: Only touches weights; activations stay in FP16
+  v
+[2024.04] Ashkboos et al. - QuaRot
+  |
+  | Problem: W4A4 is needed for real bandwidth savings, but outliers in activations are untamed
+  | Solution: Hadamard rotation spreads outlier energy uniformly across all channels
+  v
+[2024.09] NVIDIA Blackwell - NVFP4 hardware format
+  |
+  | Change: Hardware natively supports per-16-element micro-scaling
+  | Implication: Outliers are naturally "block-isolated"; they no longer poison the whole tensor
+  v
+[2026.01] Meng et al. - ARCQuant  <-- target paper
+  |
+  | Problem: Rotation breaks NVFP4's block isolation, making things worse
+  | Solution: Re-quantize outlier channels separately and concatenate them onto the matrix
+  v
+[Concurrent] ResQ / SVDQuant / MicroMix / FGMP - still exploring mixed precision
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022.08 | LLM.int8() — The First Acknowledgment That "Outliers" Are an Intrinsic Property of Large Models
+
+*** What problem did it see?
+
+Before LLM.int8(), the received wisdom was that quantization was a safe bet: chop FP16 down to INT8, and the model will lose only a tiny sliver of accuracy. The Dettmers team applied this recipe to OPT-6.7B and 175B and got a shock — accuracy didn't dip a little; it collapsed entirely.
+
+Digging in, they found something strange: almost every value behaved perfectly, but along certain dimensions (called "feature channels"), a handful of values had absolute magnitudes *hundreds of times* larger than their neighbors. These "outlier channels" *emerged* once a model exceeded roughly 6.7B parameters — absent in small models, inevitable in large ones.
+
+*** Its solution
+
+Since these channels were so precious, just don't quantize them. LLM.int8() splits the matrix into two parts: outlier channels are kept in FP16 and computed separately; the remaining 99% travels the INT8 path. The two results are summed.
+
+This is an "accept reality" solution: outliers are not a bug — they are a feature of large models.
+
+*** Why it works (and what new problem it buries)
+
+The intuition is simple — use a precision sledgehammer only where it's needed. Compute 99% of channels cheaply; spend the expensive compute budget on the troublesome 1%.
+
+But the cost is obvious: you need *two different-precision data streams* running through the same matrix simultaneously. There is no native mixed-precision GEMM kernel on GPU; you must write your own — and the result is barely faster than plain FP16. The pressure passes to the next paper.
+
+** 2022.11 | SmoothQuant — The Mathematically Equivalent "Transfer Trick"
+
+*** What problem did it see?
+
+LLM.int8() stopped the model from collapsing, but it didn't make it faster. The mixed-precision kernel was a *bottleneck*, and the code complexity was staggering. Xiao et al. asked a blunt question: can we route every channel through the same INT8 path?
+
+*** Its solution
+
+The core of SmoothQuant is a small mathematical sleight of hand. In the matrix multiplication ~Y = XW~, you can insert a diagonal matrix ~s~:
+
+~Y = (X / s)(s * W) = X'W'~
+
+Mathematically identical. But the physical meaning changes: you *shrink* the outlier channels in activation ~X~ (by dividing by a large number) while *enlarging* the corresponding weight columns. Weights are typically well-behaved — their distribution is flat, and a little amplification doesn't hurt. The difficulty of the activations has effectively been "moved" into the weights. Both sides become INT8-friendly.
+
+*** Why it works (and what new problem it buries)
+
+This is a classic "share the burden" move. The activation side is too steep and the weight side is too flat; shave the steep one down and lift the flat one up, and the overall variance drops.
+
+But the cost can't be hidden: *some of the difficulty has been pushed onto the weights*. INT8 can absorb it because it has 256 representable values. But what if someone wants to go to 4 bits — only 16 values? The weights can no longer bear the load. The next generation of research has to start over.
+
+** 2022.10 | GPTQ — The "Fine-Sculptor" School That Only Touches Weights
+
+*** What problem did it see?
+
+After SmoothQuant, everyone wanted to push to W4 (4-bit weights) — weights account for ~80% of model size, so compressing them gives the best cost-effectiveness. But naively combining SmoothQuant with INT4 immediately broke down: 4-bit capacity is too small; the smoothing trick can't fit inside it.
+
+Frantar et al. chose a different route: leave activations alone entirely and push weight quantization to its limit.
+
+*** Its solution
+
+GPTQ is a second-order optimizer. It processes the weight matrix column by column: after quantizing a column, it *feeds the resulting error back* into the remaining unquantized columns using Hessian information, letting them compensate.
+
+Analogy: you're carving a wooden sculpture and every cut leaves a slight distortion. GPTQ adjusts the angle of the next cut based on the distortions so far, minimizing total error.
+
+*** Why it works (and what new problem it buries)
+
+Column-by-column compensation exploits a fact: the influence of different columns in a matrix multiply is coupled. The error from one column can be absorbed by another. That is why GPTQ can compress a 175B model to W4 and still keep it usable.
+
+But it has a fundamental blind spot: *activations remain in FP16*. You save storage, but memory bandwidth and compute bit-width are not pushed to their limits. For genuine end-to-end acceleration, activations must be compressed too — but activations harbor those cursed outliers. The problem is kicked back to square one.
+
+** 2024.04 | QuaRot — One Rotation to "Erase" Outliers
+
+*** What problem did it see?
+
+To do W4A4 (both weights and activations at 4 bits), you must confront activation outliers head-on. LLM.int8()'s "keep FP16" approach violates the spirit of pure 4-bit operation. SmoothQuant's "shift to weights" can't survive at 4 bits. GPTQ simply ignores activations.
+
+The old outlier problem had circled back around.
+
+*** Its solution
+
+QuaRot relies on an elegant physical intuition: outliers "stick out" only because they are concentrated in a few dimensions. If you *rotate* the entire vector space so that energy spreads uniformly in all directions, the outliers disappear.
+
+Concretely: multiply both sides of the matrix multiplication by a *Hadamard matrix* ~H~ and its inverse ~H^{-1}~ (since ~H * H^{-1} = I~, this is an exact equivalence). The beauty of the Hadamard matrix is that it "scatters" any vector so that all elements have similar magnitudes.
+
+Outlier channels? Gone. Every channel is roughly the same size.
+
+*** Why it works (and what new problem it buries)
+
+This is a "pull the rug out" move — it doesn't *handle* outliers; it *eliminates the concept* of outliers. After rotation the distribution is uniform, and 4-bit quantization becomes straightforward.
+
+But in 2026 this approach ran into a hardware-level problem. NVIDIA Blackwell's NVFP4 format introduces "fine-grained block isolation": every 16 elements share one scale, so an outlier naturally pollutes only its own tiny block.
+
+QuaRot's rotation spreads the outlier energy *across all 16-element blocks*, elevating the dynamic range of every block, which is strictly worse. The paper measures it empirically: QuaRot on Llama 3.1-8B with NVFP4 is *worse than the most naïve RTN (Round-To-Nearest)*.
+
+Rotation-based methods and fine-grained hardware collide head-on for the first time.
+
+** 2024.09 | NVFP4 Hardware Format — The "Block Isolation" That Rewrites the Rules
+
+*** What problem did it see?
+
+Every prior method assumed quantization scales were "one per row" or "one per tensor" — meaning a single outlier raises the scale for the entire row/tensor and drags every neighbor down with it.
+
+But what if hardware natively supports *one scale per 16 elements*? The blast radius of an outlier is then locked to those 16 elements.
+
+*** Its solution
+
+NVIDIA Blackwell introduces NVFP4: every 16 E2M1 (4-bit float) elements share one E4M3 scale, plus a per-tensor FP32 scale for fine adjustment. Tensor Cores support this natively; the hardware handles per-block scaling automatically.
+
+Analogy: the old world used "one thermometer per classroom" — one feverish child caused the whole class to be reported as running hot. NVFP4 is "one thermometer per four students" — the feverish child affects only their small group.
+
+*** Why it works (and what new problem it buries)
+
+This is a *hardware design* response to a question that has plagued algorithm researchers for years. Outliers are no longer global contaminants.
+
+But it also makes old algorithmic tools obsolete: the premise of rotation-based methods is "globally reorganize the distribution," which is precisely what NVFP4 neither needs nor likes.
+
+The new format demands a new algorithm. Enter ARCQuant.
+
+** 2026.01 | ARCQuant — "Add a Few More Columns" Within Hardware Constraints
+
+*** What problem did it see?
+
+NVFP4's hardware format is elegant, but it demands *uniform precision* — Tensor Cores refuse to mix NVFP4 and FP8 inside the same MMA instruction. This shuts out every "mixed-precision" approach (Atom, QUIK, ResQ, SVDQuant, MicroMix): they all require keeping outlier channels in higher precision.
+
+The rotation family (QuaRot and descendants) is discredited by NVFP4's block isolation — empirically falsified.
+
+Smoothing is long out of steam at 4 bits.
+
+The ARCQuant team recognized: to get NVFP4 right, you must respect two inviolable rules — *uniform precision* and *preserve block isolation*. The question is what room is left inside those two rules.
+
+*** Its solution
+
+Return to the essence of GEMM. A matrix multiply ~Y = X * W^T~ has ~X~ of shape (N, K) and ~W~ of shape (M, K), yielding result (N, M). The middle dimension ~K~ is the "reduction dimension" — all K products are summed to produce one output element.
+
+ARCQuant's move: *extend the matrix by a few columns in the K direction*.
+
+Concretely: use calibration data to identify S outlier channels; quantize them to NVFP4 as ~Q(X_o)~; compute the residual ~R_o = X_o - dequant(Q(X_o))~ and *quantize the residual to NVFP4 as well*, obtaining ~Q(R_o)~; then concatenate ~Q(R_o)~ onto the end of the original matrix ~Q(X)~, while copying the corresponding S weight columns to the matching position in the weight matrix.
+
+What gets computed is:
+
+~Y ≈ Q(X) * Q(W)^T + Q(R_o) * Q(W_o)^T~
+
+But these two terms are actually a single *enlarged (N, K+S, M)* GEMM — all data is NVFP4, and standard kernels consume it directly.
+
+Analogy: previously you wanted to give the top student private tutoring (mixed precision), which violated school rules. Now you let the top student *attend the class twice* — absorbing 80% the first time, patching the remaining 20% the second time. Both passes use the regular classroom, but the combined result approaches that of a gifted-track class.
+
+*** Why it works (and what new problem it buries)
+
+The elegance is that it *translates "raising precision" into "increasing computation."* The former violates hardware constraints; the latter merely makes the matrix a bit longer (S is typically 1/64 to 1/16 of total K). The paper reports that the worst-case error bound of NVFP4 double-quantization is *comparable to MXFP8* — two passes at 4 bits approaching one pass at 8 bits.
+
+Practical results: near-FP16-baseline quality on LLaMA/Qwen, and up to *3× faster than FP16* on RTX 5090 / RTX PRO 6000.
+
+Remaining open questions? Identifying which channels are outliers requires *calibration data* — potentially fragile under distribution shift at inference time. S is a hyperparameter that must be tuned to balance accuracy and speed. These are natural entry points for follow-on work.
+
+* Frontier Extensions
+
+ARCQuant is a January 2026 paper and represents the current frontier of this line. Other concurrent directions still being explored:
+
+- *ResQ* (Saxena et al., 2025): low-rank residual decomposition to preserve outliers
+- *SVDQuant* (Li et al., 2024): SVD-based low-rank outlier branch
+- *MicroMix* (Liu et al., 2025): mixing MXFP4/MXFP8 on Blackwell
+- *FGMP* (Hooper et al., 2025): NVFP4 + FP8 mixing, but without native hardware support
+
+None of these has fully resolved the "uniform precision" hardware constraint. ARCQuant is the cleanest publicly available approach that respects it — its stance is "redesign the algorithm within the NVFP4 hardware framework" rather than "force old algorithms into new hardware."
+
+The next wave of research will most likely appear around: (1) training-aware NVFP4 rather than PTQ-only; (2) extending the residual-channel scheme to KV cache quantization; (3) adaptive selection of S rather than manual hyperparameter tuning.
+
+* A Single Diagram
+
+#+begin_example
+        How the outlier problem evolved
+        ================================
+
+Time -->  2022                2024           2026 (NVFP4 era)
+          ----                ----           ----------------
+Precision
+W8A8     LLM.int8 -- keep FP16
+              |   (mixed precision)
+              v
+         SmoothQuant -- shift to weights
+              |   (uniform INT8)
+              |
+W4A16         |
+              v
+            GPTQ -- second-order weight reconstruction (ignores activations)
+              |
+              v
+W4A4        QuaRot -- rotation "erases" outliers
+              |
+              | <hardware revolution: NVFP4 block isolation>
+              v          rotation backfires; no longer applicable
+              X     [QuaRot on NVFP4 < RTN]
+              |
+              v
+       ARCQuant -- augment columns, keep precision uniform
+                     (outlier channels re-quantized and concatenated along K dim)
+
+
+        The "problem" running through the entire timeline is the same one:
+        ------------------------------------------------------------------
+        What do you do about outliers?
+        ------------------------------------------------------------------
+
+        The essential move of each generation:
+          LLM.int8     : Isolate  (you're different; you go through a separate path)
+          SmoothQuant  : Transfer (you're not the burden; push it to someone else)
+          GPTQ         : Ignore activations; compensate only in weights
+          QuaRot       : Erase    (scatter the very concept of "sticking out")
+          NVFP4 hardware: Contain (your damage is limited to 16 elements)
+          ARCQuant     : Double-quantize + concatenate — resurrects "special treatment"
+                         entirely within uniform precision
+#+end_example
+
+* Insight
+
+On the surface this timeline looks like "bit-width being pushed ever lower." One layer deeper it is "the attitude toward outliers changing." One layer deeper still, something more fundamental appears —
+
+*The coupling between algorithms and hardware is reversing direction.*
+
+The 2022–2024 story is *algorithms accommodating hardware*: hardware offered only FP16 and INT8, and algorithms wracked their brains to fit models inside those two slots. Researchers' creativity was consumed finding equivalent transformations that general-purpose kernels could execute.
+
+After NVFP4, the story becomes *hardware anticipating the pain points of algorithms and proactively redesigning itself*. Blackwell baking "per-block independent scale" into Tensor Cores is the hardware team's response after reading three years of quantization papers — they concluded that "the locality of outliers" is a real problem worth solving in silicon.
+
+ARCQuant occupies an intriguing position: it is among *the first algorithms to genuinely accept the new hardware constraints*. Rather than complaining "why won't you let me do mixed precision," it asks "within NVFP4's rules, what can I still do?" That posture has been rare in recent years.
+
+What comes next? Hardware–algorithm *co-evolution*: future GPU designs may wire the concept of "residual channels" directly into GEMM instructions, driving the overhead of ARCQuant-style approaches toward zero. Simultaneously, QAT (quantization-aware training) will resurge, because once the target hardware format is known, models can be shaped from the start to be "NVFP4-friendly."
+
+* Takeaways
+
+Tracing this timeline yields three highly practical methodological lessons:
+
+1. *Conservation of problems* — The outlier problem was independently re-invented five times (isolate → transfer → erase → contain → re-isolate). Any field's core problems are finite in number; everyone is describing the same thing in different languages. If you can recognize "ah, this is yet another incarnation of the outlier problem" while reading a paper, your reading efficiency will double.
+
+2. *Constraints catalyze creativity* — ARCQuant's "add columns" solution was not a bolt-from-the-blue insight; it was *forced out* by NVFP4's hardware constraints: you cannot change the precision, so the only remaining degree of freedom is the dimension. Tight constraints are actually a gift. When you hit a dead end in your own work, ask: "If some constraint I assumed was flexible is actually fixed, which other dimensions can still move?"
+
+3. *Don't fight the hardware* — The biggest losers in this timeline are not any particular algorithm; they are *all the mixed-precision approaches that ignored hardware trends*. Atom, QUIK, and ResQ are all clever, but they have no future on Blackwell. To assess an algorithm's long-term value, ask *whether it runs with the direction of hardware evolution* — that judgment matters far more than "how fast does it run today."
+
+Bottom line: the next time you see a quantization paper claiming "lower bit-width + new format," ask three things first — Does it preserve the precision uniformity the hardware requires? How does it handle outliers? Is the kernel it uses standard? These three questions will let you judge within two minutes whether the work is genuinely operating within the new hardware framework, or just pouring old wine into a new bottle.

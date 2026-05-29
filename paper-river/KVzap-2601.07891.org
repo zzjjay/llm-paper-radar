@@ -1,0 +1,310 @@
+#+title:      KVzap: Fast, Adaptive, and Faithful KV Cache Pruning
+#+date:       [2026-05-29 Fri 10:36]
+#+filetags:   :paper:river:
+#+identifier: 20260529T103658
+#+source:     https://arxiv.org/abs/2601.07891
+#+authors:    Simon Jégou, Maximilian Jeblick (NVIDIA)
+#+venue:      arXiv 2026-02, code in NVIDIA/kvpress
+
+* 问题之河
+
+大模型聊到几万、十几万个 token 的时候，显存里那一摞 KV cache 就变成了头号绊脚石——一个 Llama1-65B 处理 128k 上下文，光 KV 就要 *335 GB*。这条研究线一直在追问同一件事：*能不能在不掉精度的前提下，把这堆 KV 扔掉一大半？*
+
+这个问题难，是因为它有两个互相打架的目标。要扔得准，就得知道哪些 token 之后真的没人会再看——可未来的 query 还没来，你只能猜。猜的方式越聪明越准，但也越慢；慢到 prefill 时间翻倍，就没人愿意用，哪怕精度无损。于是 KV cache 压缩论文几十篇，没一篇真的进了 vLLM/SGLang/TRT-LLM 这种生产推理引擎。
+
+KVzap 这篇正是想把这堵墙撞开。
+
+* 溯源地图
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | 看到的问题: 长上下文跑着跑着崩溃
+  | 解法: 只留"开头几个 attention sink + 最近一段窗口"
+  |       —— 完全不看内容，纯按位置
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | 看到的问题: 中间那些 token 也不是平等的——
+  |             有少数"重击者"被反复 attend
+  | 解法: 累计历史 attention 分数，留 heavy hitters
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | 看到的问题: 历史 attention 不等于未来 attention
+  | 解法: 偷看 prompt 最后一小段当"侦察窗口"，
+  |       用它来预测之后 generation 会 attend 谁
+  v
+[2025] Expected Attention (Devoto et al.)
+  |
+  | 看到的问题: 侦察窗口只在 prompt 末尾起作用，
+  |             离场景越远预测越糊
+  | 解法: 直接对未来 query 分布做高斯假设，
+  |       解析地算每个 KV 的期望注意力 + 用 ||W_O v|| 归一化
+  v
+[2025] KVzip (Kim et al.)                          [2025] DMS (Łańcucki et al.)
+  |                                                  |
+  | 看到的问题: 所有"预测未来 query"的招               | 看到的问题: 所有 post-hoc 打分都是事后诸葛
+  |             都还是猜，oracle 还没出现              | 解法: 端到端训一套 per-token 的可微剔除策略
+  | 解法: 让模型把 prompt "复读"一遍，                |       (Gumbel-sigmoid + KL loss)
+  |       看它自己 attend 哪些位置 ——                 |
+  |       自带 oracle 的 query-agnostic 打分          |
+  |                                                  |
+  | 缺陷: prefill 要跑两遍，                          |
+  |       而且没法 decode 时用                        |
+  v                                                  |
+[2026] KVzap (Jégou & Jeblick) <-----------------+
+        |
+        | 把 KVzip 的 oracle 分数当 ground truth，
+        | 训一个轻量 MLP，从 hidden state 直接预测分数。
+        | + 用 DMS 的 thresholding 风格做剔除
+        | + 用 StreamingLLM 的 sliding window 兜底
+        |
+        | 结果: prefill / decode 都能用,
+        |       2-4x 压缩，几乎不掉点,
+        |       overhead < 1.1%
+#+end_example
+
+* 演化叙事
+
+** 2023 | StreamingLLM: 只信"开头"和"最近"，其他全扔
+
+*** 它看到了什么问题
+
+最早期的长上下文推理踩了一个奇怪的坑：把 KV cache 满了之后，按 FIFO 顺序扔掉最早的 token，模型就开始胡言乱语。注意，不是慢慢退化，是断崖式崩溃。
+
+*** 它的解法
+
+观察到一个反直觉的现象：Transformer 的注意力总是异常关注序列开头的那几个 token——哪怕这些 token 跟问题毫无关系。Xiao 等人管这些叫 *attention sink*。解法很粗暴：永远保留最前面的 4 个 token + 最近一个滑动窗口的 token，中间的全部扔掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为 attention sink 是 softmax 的数学伪影——softmax 必须把概率分到某处，开头那几个就成了"垃圾桶"。保住它们，模型就不崩。
+
+但代价显而易见：*它根本没看内容*。一篇 50k token 的合同里，关键条款如果不在开头也不在结尾，就被扔了。压缩率高、速度快、但只适合"流式聊天"这种不要求精确回忆的场景。
+
+下一篇的起点：能不能根据内容来决定留谁？
+
+** 2023 | H2O: 历史上被 attend 越多的越该留
+
+*** 它看到了什么问题
+
+StreamingLLM 只看位置，不看内容。但显然有些中间的 token 比另一些重要——比如"主语"通常被反复回指，"标点"基本无人问津。
+
+*** 它的解法
+
+H2O 提出 *Heavy Hitter Oracle*：在生成过程中累加每个 token 被 attend 的总分数，留下分数最高的那一小撮"重击者"，加上一个最近窗口。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是第一次把"重要性"这件事数据化了——不再是位置启发式，而是基于实际 attention 行为。
+
+但它隐含一个赌博：*过去被关注 = 未来会被关注*。在很多任务上这是错的。比如长上下文 QA，问题在最后才出现，前面被反复 attend 的可能是干扰信息，真正的答案区段在解码前一直被冷落。压缩率一上去，关键信息就被早早扔了。
+
+下一篇的起点：能不能不靠"历史"，而是直接预测"未来"会 attend 谁？
+
+** 2024 | SnapKV: 偷看 prompt 的尾巴当侦察兵
+
+*** 它看到了什么问题
+
+H2O 的 heavy hitter 是用整段历史 attention 累计出来的，但 generation 阶段真正用到的注意力模式，往往和 prompt 中间段的模式很不一样。等模型生成完才知道谁重要，已经晚了。
+
+*** 它的解法
+
+SnapKV 提出一个简单的"侦察窗口"：在 prefill 完之后、generation 之前，用 prompt 末尾的最后 K 个 token（典型 32）作为"代表查询"，看它们 attend 哪些 KV，按这个分布做 top-k 选择。
+
+直觉是：prompt 末尾通常包含了用户的问题或指令，它的 attention 模式最接近后续 generation 会展现的模式。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是第一次显式把"预测未来 query"作为目标，而不是事后统计。在 needle-in-haystack 类任务上效果明显比 H2O 好。
+
+但它的预测器太弱：*只是 prompt 的最后 32 个 token*。如果 generation 走出几千个 token 的推理链，越到后面它的 attention 模式离侦察窗口越远，预测就越不准。对 reasoning 任务尤其致命。
+
+下一篇的起点：能不能给"未来 query"一个更稳的数学模型？
+
+** 2025 | Expected Attention: 把未来 query 当随机变量，解析求期望
+
+*** 它看到了什么问题
+
+SnapKV 的"侦察"本质上是用一个具体样本去估计一个分布。Devoto 等人想得更彻底：你不需要任何样本，hidden state 的统计性质就够你算出未来 query 的期望了。
+
+*** 它的解法
+
+假设未来某一层的 query 向量 q 服从一个高斯（均值方差从训练分布拟合），那么 q 和已有 KV 的 attention 期望 E[a(q, k_i)] 可以解析地算出。再加上一个重要细节：分数要乘上 *‖W_O · v_i‖ / ‖h‖*——这一项衡量 KV 实际贡献给残差流的"能量"。一个 attention 分数很高、但 value 向量很小的 token，其实是噪声。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把启发式变成了一个有明确假设的估计器，而且 *归一化项 ‖W_O v‖/‖h‖* 后来被 KVzap 直接吸收进来变成 KVzip+。
+
+但高斯假设是个粗糙的近似，输入分布偏离训练时它就退化。更根本的问题是：它仍然在"猜"未来 query，没法绕开这个猜。
+
+下一篇的起点：能不能干脆不猜，让模型自己告诉你哪些 KV 它真的需要？
+
+** 2025 | KVzip: 让模型复读自己，找出真正用到的 KV
+
+*** 它看到了什么问题
+
+到 2025 年，KV cache pruning 已经卷出了二十多种方法（参见 Awesome-KV-Cache-Compression 仓库），但全都没逃出"预测未来 query"这个框框。Kim 等人提出一个根本性的反转：*不要预测，去测量*。
+
+*** 它的解法
+
+构造一个 *复读 pretext task*：把原 prompt 拼成
+
+#+begin_example
+user:    <prompt>
+Repeat the previous context exactly.
+assistant: <prompt>
+#+end_example
+
+让模型把 prompt 完整复述一遍。然后看复述阶段每个位置的 attention 都 attend 到了原 prompt 的哪些 KV。一个 KV 如果在复读中从来没被 attend，说明信息已经在别的 KV 里冗余了，可以扔。打分公式：
+
+#+begin_example
+s_i = max over j in repeated prompt of a_{j,i}
+#+end_example
+
+这是当下 KVpress leaderboard 上的 SOTA，最高能压 4×。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它管用是因为复读是个 *query-agnostic* 的测试——不依赖任何具体下游任务，纯粹考察 KV 之间的内部冗余。这才是真 oracle。
+
+但它把自己钉死在两个死角：
+1. *Prefill 要跑两遍*（原 prompt + 复读版），延迟翻倍以上。生产环境直接劝退。
+2. *Decode 阶段完全用不了*——你总不能在生成中间还插一段复读吧？对 reasoning 任务（输出几千 token）这就废了。
+
+下一篇的起点：能不能保留 KVzip 的"oracle 质量"，但把它两个死角都补上？
+
+** 2025 | DMS: 跟 KVzap 平行的另一条路——端到端学剔除策略
+
+*** 它看到了什么问题
+
+所有上面那些方法都是 *post-hoc*：模型训练完了，再事后想办法剔除 KV。Łańcucki 等人觉得这事应该从根上解决：让模型自己学会"哪些 token 该被扔"。
+
+*** 它的解法
+
+Dynamic Memory Sparsification (DMS) 给每个 token 加一个可学习的 *eviction gate*，用 Gumbel-sigmoid 做可微采样，loss 同时包含
+- KL 散度：要求剔除后的输出分布接近原模型
+- 稀疏惩罚：鼓励多剔除
+
+整套端到端训出来，KV pair 在 attention 之前就被剔除（所以叫 sparsified prefilling），还能用 thresholding 自适应控制压缩率。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它是端到端的——理论上 ceiling 比所有 post-hoc 方法都高。
+
+但代价是 *要训新 checkpoint*，而且没有公开权重。对想直接用现成大模型的人不友好。
+
+它和 KVzip 形成了 2025 年的两条主路：KVzip 走 *测量+剔除* 的 post-hoc 路线、不动模型；DMS 走 *学习+剔除* 的 in-training 路线、要改模型。KVzap 出场，是把这两条路线缝在一起。
+
+** 2026 | KVzap: 用 KVzip 的分数当老师，蒸馏一个 MLP 学生
+
+*** 它看到了什么问题
+
+KVzip 的复读 oracle 分数是金的，但代价（prefill 2x + 不能 decode）太高。如果能 *把这个分数预测出来* 而不是真去复读一遍，问题就解了。
+
+而能 *预测* 这件事本身有个数学上的暗示：transformer 的 hidden state 已经编码了关于"这个位置之后会被怎样使用"的全部信息——毕竟所有 attention 计算都是从 hidden state 派生的。
+
+*** 它的解法
+
+三步缝合：
+
+1. *KVzip+*：把 KVzip 的打分公式加上 Expected Attention 的归一化项 ‖W_O v_i‖/‖h_j‖，作为更干净的训练目标
+2. *训一个 surrogate*：每层一个轻量模型（Linear 1.1M 参数，或 2-layer MLP 76M-210M 参数），输入 hidden state h_t（维度 D_h），输出每个 head 的预测分数 log(s+)（维度 H）。训练数据是从 Nemotron 预训练数据采样的 1.2M 对 (h, log(s+))
+3. *学 DMS 的剔除方式*：用 *固定阈值 τ* 做剔除（不是固定 top-k），从而 *输入自适应*——信息密的 prompt 自动留更多，冗余 prompt 自动留更少。再叠一个 w=128 的 sliding window 保住最近上下文
+
+整套流程：
+
+#+begin_example
+def compress(hidden_states, keys, values, kvzap_model, threshold, window=128):
+    scores = kvzap_model(hidden_states)
+    scores[..., -window:] = float("inf")    # 保护最近 window
+    indices = torch.where(scores >= threshold)
+    return keys[indices], values[indices]
+#+end_example
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+第一，*验证了一个非平凡的假设*：KVzip 那个昂贵的 oracle 分数能从 hidden state 单点预测出来——R² 在 0.6-0.8 之间，惊人地高。第二，因为只用 hidden state，所以 *prefill 和 decode 都能跑*——KVzip 的两个死角同时解开。第三，overhead 算下来 *< 1.1%*，已经够生产用。
+
+留下的新坑：
+- 仍然不是 training-free（surrogate 要训）
+- 各 head 剔除数量不一样，需要 PagedAttention 风格的变长 kernel；从压缩比变成 wall-clock speedup 还有工程缝要补
+- R² ≈ 0.7 意味着仍有约 30% 方差解释不了，再压下去精度还是会跌
+
+但相对前作，这是第一次 *fast / phase-agnostic / faithful 三件事同时满足* 的方法——也就是它论文里那个"四大 criteria"框架的意义。
+
+* 前沿延伸
+
+截至 2026-02，这是这条线的最新进展。值得关注的几个相邻方向：
+
+- *DSA in DeepSeek V3.2*：彻底放弃 post-hoc，把稀疏注意力做进 pre-training。不减 KV 内存，只减计算。和 KVzap 正交，可以叠加。
+- *MLA / Linear Attention*（Kimi-Linear, Nemotron3 Nano）：从架构层面把 KV cache 做小，T 轴和 D 轴一起压。和 KVzap 也正交。
+- *KIVI / ZipCache 量化*：把保留下来的 KV 降到 INT4 甚至 INT2。和 pruning 完全互补——pruning 决定 *留谁*，量化决定 *怎么存*。
+
+合理推测：下一篇真正接 KVzap 的工作，会是 *把 surrogate 训练融进预训练*，让 DMS 的端到端理想和 KVzap 的工程友好同时成立。
+
+* 一张图看懂
+
+#+begin_example
+                                    谁该留？
+                                       |
+            +--------------------------+---------------------------+
+            |                          |                           |
+        "看位置"                   "看历史"                    "看未来"
+            |                          |                           |
+   [2023 StreamingLLM]          [2023 H2O]                        |
+    开头 + 最近窗口             累计 attention 分数                |
+    内容 unaware                 重击者假设                        |
+    快、但盲                     post-hoc                          |
+                                  |                                |
+                                  v                                |
+                          [2024 SnapKV]                            |
+                          用 prompt 末尾                            |
+                          做"侦察窗口"                              |
+                          预测后续 attention                        |
+                                  |                                |
+                                  v                                |
+                          [2025 Expected Attention]                |
+                          假设 query ~ N(mu, sigma)                |
+                          解析期望 + ||W_O v|| 归一化               |
+                                  |                                |
+                                  v                                |
+                          [2025 KVzip]                             |
+                          让模型复读 prompt                          |
+                          看哪些 KV 真被 attend                      |
+                          oracle, 但 prefill 2x + 不能 decode      |
+                                  |                                |
+                                  |    [2025 DMS] 端到端学剔除      |
+                                  |        要改训练 / 要新权重       |
+                                  +--------+-----------------------+
+                                           |
+                                           v
+                                  [2026 KVzap]
+                                  hidden state -> MLP -> 预测 KVzip+ 分数
+                                  + DMS 风格阈值剔除 (输入自适应)
+                                  + StreamingLLM 风格 sliding window
+                                  ----------------------------------
+                                  fast + prefill/decode 双用 + 2-4x 无损
+                                  overhead < 1.1%
+#+end_example
+
+* 洞见
+
+这条演化线表面看是"打分函数越变越聪明"，但深层在发生三个更根本的转变：
+
+1. *从"预测未来"到"测量内部冗余"，再到"用 hidden state 一步抄答案"*。这是认知论的转变。前两代都在做某种统计学猜测；KVzip 不猜了，干脆让模型实测；KVzap 发现这个"实测结果"其实早就编码在 hidden state 里了，只需要一个浅层 readout。这暗示一件事——*神经网络的中间表示里藏着的可用信号，比我们以为的多得多*，很多看似需要昂贵推理才能得到的量，本质上是一次 linear probe 的距离。
+
+2. *从"全局规则"到"输入自适应"*。早期方法（StreamingLLM, H2O, AdaKV）都是固定预算——压缩率 50% 就 50%，不管 prompt 是密是疏。KVzap 用 thresholding 让压缩率自己浮动——一个简单的 prompt 自动留少，一个信息密的 prompt 自动留多。这其实是 DMS 提出的范式，但 KVzap 第一次让它在 post-hoc 设定下也可行。下一代 KV 管理，"动态预算"应该会成为默认。
+
+3. *从"算法卷"到"工程合规"*。论文里那个"4 criteria"（fast / phase-agnostic / opt-friendly / faithful）其实是在喊话——*算法精度不是终点，能塞进 vLLM 才是*。20 多种 pruning 方法没一个进生产，是这条线最大的尴尬。KVzap 选择把"工程上能用"列为一阶约束，这种思路转变本身就是一个洞见：在 LLM 推理这个领域，*能落地 = 真贡献*，剩下都是 leaderboard 数字游戏。
+
+* 启发
+
+- *找问题时，先列约束再选解法*。KVzap 真正的功劳不是技术新——它就是个蒸馏。功劳是 *把 4 个工程约束（fast + 两阶段都能用 + 兼容 FlashAttention + 不掉精度）一起摆上桌*，然后所有不满足的方案自然出局。做研究找问题时，把硬约束先全部列出来，再看现有方法谁全过——这个交集往往就是真正的机会。
+
+- *昂贵 oracle + 廉价 surrogate*，是一个能反复套用的模式。先用一个不计代价的"金标准"方法（KVzip 复读、Expected Attention 解析）跑出 ground truth，再用一个 hidden state 上的 linear/MLP probe 把它学下来。同样的模式用于 speculative decoding、reward modeling、value head 蒸馏都成立。
+
+- *只要相邻几代论文同时存在，下一篇大概率是"缝合 + 工程化"*。2025 年 KVzip 提供了 oracle，DMS 提供了 thresholding-style eviction，Expected Attention 提供了归一化项——KVzap 就是把这三块按"能进 vLLM"这个目标缝在一起的成品。盯住一个领域里 *同年并行* 的几条线，下一篇 SOTA 往往就在它们的笛卡尔积里。
+
+- *中间表示里藏着的信号比想象多*。KVzap 验证了 hidden state 能 *单点* 预测一个原本需要复读整个 prompt 才能算出的全局分数（R² ≈ 0.7）。这说明很多看似需要昂贵计算才能得到的量，已经隐式存在于网络中间层，等着被 probe 出来。你下一次遇到"这个量必须跑完整推理才能得到"的论断，先怀疑一下，再 linear probe 一下。

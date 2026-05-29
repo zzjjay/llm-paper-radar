@@ -1,0 +1,313 @@
+#+title:      KVzap: Fast, Adaptive, and Faithful KV Cache Pruning
+#+date:       [2026-05-29 Fri 10:36]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T103658-en
+#+source:     https://arxiv.org/abs/2601.07891
+#+authors:    Simon Jégou, Maximilian Jeblick (NVIDIA)
+#+venue:      arXiv 2026-02, code in NVIDIA/kvpress
+
+* The Problem River
+
+When large models process tens of thousands or even hundreds of thousands of tokens, the KV cache sitting in GPU memory becomes the primary bottleneck — a Llama1-65B handling a 128k context requires *335 GB* for KV alone. This research thread has been chasing the same question all along: *Can we discard a large fraction of these KVs without sacrificing accuracy?*
+
+The difficulty lies in two mutually opposing goals. To discard precisely, you need to know which tokens future queries will never revisit — but those future queries haven't arrived yet, so you can only guess. The smarter your guessing strategy, the more accurate it is, but also the slower; once prefill latency doubles, no one wants to use it regardless of how lossless it is. As a result, among the dozens of KV cache compression papers published, not a single one has made it into production inference engines like vLLM, SGLang, or TRT-LLM.
+
+KVzap is precisely trying to break through this wall.
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | Problem observed: long-context runs crash midway
+  | Solution: keep only "a few attention sinks at the start + a recent sliding window"
+  |            —— purely positional, no content awareness
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | Problem observed: middle tokens are not equal —
+  |                   a small number of "heavy hitters" get attended repeatedly
+  | Solution: accumulate historical attention scores, keep heavy hitters
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Problem observed: historical attention ≠ future attention
+  | Solution: peek at the last segment of the prompt as a "scout window"
+  |           and use it to predict which KVs generation will attend
+  v
+[2025] Expected Attention (Devoto et al.)
+  |
+  | Problem observed: the scout window only works near the prompt tail;
+  |                   predictions degrade further from that point
+  | Solution: assume a Gaussian distribution over future queries,
+  |           analytically compute expected attention per KV + normalize by ||W_O v|| / ||h||
+  v
+[2025] KVzip (Kim et al.)                          [2025] DMS (Łańcucki et al.)
+  |                                                  |
+  | Problem observed: all "predict future queries"   | Problem observed: all post-hoc scoring
+  |                   methods are still guesses;     |                   is inherently after the fact
+  |                   no oracle has appeared yet     | Solution: train an end-to-end per-token
+  | Solution: have the model "repeat" the prompt     |           differentiable eviction policy
+  |           and observe which positions it attends |           (Gumbel-sigmoid + KL loss)
+  |           —— query-agnostic scoring with a       |
+  |              built-in oracle                     |
+  |                                                  |
+  | Drawback: prefill runs twice,                    |
+  |           and it cannot be used during decoding  |
+  v                                                  |
+[2026] KVzap (Jégou & Jeblick) <-----------------+
+        |
+        | Treats KVzip's oracle scores as ground truth,
+        | trains a lightweight MLP to predict scores directly from hidden states.
+        | + Uses DMS-style thresholding for eviction
+        | + Uses StreamingLLM-style sliding window as a safety net
+        |
+        | Result: works during both prefill and decode,
+        |         2-4x compression with negligible quality loss,
+        |         overhead < 1.1%
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Trust Only "the Beginning" and "the Recent" — Discard Everything Else
+
+*** What Problem It Saw
+
+Early long-context inference stumbled into a strange trap: once the KV cache was full and the oldest tokens were evicted in FIFO order, the model started generating nonsense. Not a gradual degradation — a cliff-edge collapse.
+
+*** Its Solution
+
+The authors observed a counterintuitive phenomenon: Transformer attention consistently focuses abnormally on the very first tokens in a sequence, even when those tokens are completely unrelated to the question. Xiao et al. called these *attention sinks*. The fix is blunt: always keep the first 4 tokens plus a recent sliding window, and discard everything in between.
+
+*** Why It Works (and What New Problem It Plants)
+
+It works because attention sinks are a mathematical artifact of softmax — softmax must distribute probability somewhere, and the opening tokens become the "garbage bins." Preserve them and the model doesn't collapse.
+
+But the cost is obvious: *it never looks at content at all*. A critical clause buried in the middle of a 50k-token contract — not at the beginning, not at the end — simply gets thrown away. High compression, fast execution, but only suitable for "streaming chat" scenarios that don't require precise recall.
+
+Starting point for the next paper: Can we decide what to keep based on content?
+
+** 2023 | H2O: The More a Token Has Been Attended, the More It Deserves to Stay
+
+*** What Problem It Saw
+
+StreamingLLM only looks at position, not content. But clearly some middle tokens matter more than others — subjects tend to be referenced repeatedly, while punctuation is rarely attended.
+
+*** Its Solution
+
+H2O proposes the *Heavy Hitter Oracle*: during generation, accumulate the total attention score each token receives, then keep the highest-scoring "heavy hitters" plus a recent window.
+
+*** Why It Works (and What New Problem It Plants)
+
+This is the first time "importance" is operationalized as data — no longer a positional heuristic, but grounded in actual attention behavior.
+
+But it makes an implicit gamble: *past attention = future attention*. This is wrong for many tasks. In long-context QA, the question appears only at the end; the segments repeatedly attended earlier may be distractors, while the actual answer region sits cold until decoding begins. Once compression is aggressive, critical information gets discarded early.
+
+Starting point for the next paper: Can we skip "history" and directly predict who will be attended in the future?
+
+** 2024 | SnapKV: Peek at the Prompt's Tail as a Scout
+
+*** What Problem It Saw
+
+H2O's heavy hitters are computed by accumulating attention over the entire history, but the attention patterns that actually matter during generation often look very different from those in the middle of the prompt. By the time the model finishes generating and you know who mattered, it's too late.
+
+*** Its Solution
+
+SnapKV proposes a simple "scout window": after prefill and before generation, use the last K tokens of the prompt (typically 32) as "representative queries," observe which KVs they attend, and perform top-k selection based on this distribution.
+
+The intuition: the end of the prompt usually contains the user's question or instruction, so its attention pattern most closely resembles what subsequent generation will exhibit.
+
+*** Why It Works (and What New Problem It Plants)
+
+This is the first method to explicitly target "predicting future queries" rather than performing post-hoc statistics. On needle-in-haystack tasks it clearly outperforms H2O.
+
+But its predictor is too weak: *just the last 32 tokens of the prompt*. When generation runs a reasoning chain thousands of tokens long, the attention pattern drifts further and further from the scout window, making predictions increasingly unreliable. Especially damaging for reasoning tasks.
+
+Starting point for the next paper: Can we give "future queries" a more stable mathematical model?
+
+** 2025 | Expected Attention: Model Future Queries as Random Variables, Analytically Compute Expectations
+
+*** What Problem It Saw
+
+SnapKV's "scouting" is essentially using one concrete sample to estimate a distribution. Devoto et al. go further: you don't need any sample at all — the statistical properties of the hidden state are sufficient to compute the expectation over future queries analytically.
+
+*** Its Solution
+
+Assume the future query vector q at a given layer follows a Gaussian (mean and variance fitted from the training distribution). Then the expected attention E[a(q, k_i)] between q and each existing KV can be computed in closed form. A crucial detail is added: scores are multiplied by *‖W_O · v_i‖ / ‖h‖* — a term that measures the "energy" a KV actually contributes to the residual stream. A token with high attention score but a tiny value vector is just noise.
+
+*** Why It Works (and What New Problem It Plants)
+
+It transforms a heuristic into an estimator with explicit assumptions, and the *normalization term ‖W_O v‖/‖h‖* is later absorbed directly into KVzap as part of KVzip+.
+
+But the Gaussian assumption is a coarse approximation that degrades when the input distribution departs from training. More fundamentally, it is still *guessing* future queries — there is no way around that.
+
+Starting point for the next paper: Can we simply stop guessing and let the model tell us which KVs it truly needs?
+
+** 2025 | KVzip: Let the Model Repeat Itself and Find the KVs That Are Actually Used
+
+*** What Problem It Saw
+
+By 2025, KV cache pruning had spawned more than twenty methods (see the Awesome-KV-Cache-Compression repository), but none had escaped the frame of "predicting future queries." Kim et al. propose a fundamental inversion: *don't predict — measure*.
+
+*** Its Solution
+
+Construct a *repetition pretext task*: concatenate the original prompt as
+
+#+begin_example
+user:    <prompt>
+Repeat the previous context exactly.
+assistant: <prompt>
+#+end_example
+
+Let the model fully repeat the prompt. Then observe which KVs each position in the repetition phase attends back to in the original prompt. A KV that is never attended during repetition signals that its information is redundant — covered by other KVs — and can be discarded. The scoring formula:
+
+#+begin_example
+s_i = max over j in repeated prompt of a_{j,i}
+#+end_example
+
+This is the current SOTA on the KVpress leaderboard, achieving up to 4× compression.
+
+*** Why It Works (and What New Problem It Plants)
+
+It works because repetition is a *query-agnostic* test — independent of any specific downstream task, it probes purely the internal redundancy among KVs. This is a genuine oracle.
+
+But it locks itself into two dead ends:
+1. *Prefill must run twice* (original prompt + repetition version), more than doubling latency. Immediately disqualifying in production.
+2. *It cannot be used during the decode phase* — you can hardly insert a repetition pass in the middle of generation. This breaks it entirely for reasoning tasks with multi-thousand-token outputs.
+
+Starting point for the next paper: Can we preserve KVzip's oracle quality while fixing both of its dead ends?
+
+** 2025 | DMS: A Parallel Track — Learn the Eviction Policy End-to-End
+
+*** What Problem It Saw
+
+All of the methods above are *post-hoc*: the model is trained first, and KV eviction is figured out afterward. Łańcucki et al. argue the problem should be solved at the root — let the model learn for itself which tokens should be evicted.
+
+*** Its Solution
+
+Dynamic Memory Sparsification (DMS) attaches a learnable *eviction gate* to each token, uses Gumbel-sigmoid for differentiable sampling, and optimizes a loss that combines:
+- KL divergence: the output distribution after eviction should stay close to the original model's
+- Sparsity penalty: encourage discarding more
+
+Trained end-to-end, KV pairs are evicted *before* attention is computed (hence "sparsified prefilling"), and adaptive thresholding gives input-dependent control over compression rate.
+
+*** Why It Works (and What New Problem It Plants)
+
+It is end-to-end — its theoretical ceiling is higher than any post-hoc method.
+
+But the cost is *requiring a new checkpoint*, and no public weights are available. Not friendly to users who want to apply compression to existing large models out of the box.
+
+DMS and KVzip defined the two main tracks of 2025: KVzip takes the *measure-then-evict* post-hoc route without touching the model; DMS takes the *learn-then-evict* in-training route requiring model modification. KVzap enters to stitch the two together.
+
+** 2026 | KVzap: Use KVzip's Scores as Teacher, Distill an MLP Student
+
+*** What Problem It Saw
+
+KVzip's repetition oracle scores are gold, but the cost — prefill 2× + no decode support — is prohibitive. If those scores could be *predicted* rather than computed by actually running a repetition pass, the problem dissolves.
+
+The very possibility of prediction carries a non-trivial mathematical implication: the transformer's hidden states already encode everything about "how this position will be used later" — after all, all attention computations are derived from hidden states.
+
+*** Its Solution
+
+Three-way fusion:
+
+1. *KVzip+*: augment KVzip's scoring formula with Expected Attention's normalization term ‖W_O v_i‖/‖h_j‖, yielding a cleaner training target
+2. *Train a surrogate*: one lightweight model per layer (Linear at 1.1M parameters, or a 2-layer MLP at 76M–210M parameters), taking hidden state h_t (dimension D_h) as input and outputting predicted scores log(s+) per head (dimension H). Training data: 1.2M (h, log(s+)) pairs sampled from Nemotron pretraining data
+3. *Adopt DMS-style eviction*: use a *fixed threshold τ* rather than fixed top-k, making eviction *input-adaptive* — information-dense prompts automatically retain more KVs, redundant prompts automatically retain fewer. Topped off with a sliding window of w=128 to protect recent context
+
+Full pipeline:
+
+#+begin_example
+def compress(hidden_states, keys, values, kvzap_model, threshold, window=128):
+    scores = kvzap_model(hidden_states)
+    scores[..., -window:] = float("inf")    # protect the most recent window
+    indices = torch.where(scores >= threshold)
+    return keys[indices], values[indices]
+#+end_example
+
+*** Why It Works (and What New Problems Remain)
+
+First, it *validates a non-trivial hypothesis*: KVzip's expensive oracle scores can be predicted from a single hidden-state vector — R² lands between 0.6 and 0.8, surprisingly high. Second, because only hidden states are used, it *works during both prefill and decode* — KVzip's two dead ends are resolved simultaneously. Third, overhead comes to *< 1.1%*, production-viable.
+
+Remaining open problems:
+- Still not training-free (the surrogate must be trained)
+- Each head evicts a different number of KVs, requiring variable-length kernels in the style of PagedAttention; bridging the gap from compression ratio to wall-clock speedup still needs engineering work
+- R² ≈ 0.7 means roughly 30% of variance remains unexplained; push compression harder and quality will still eventually drop
+
+Relative to prior work, this is the first method to *simultaneously satisfy fast / phase-agnostic / faithful* — which is exactly the point of the "four criteria" framework in the paper.
+
+* Frontier Extensions
+
+As of 2026-02, this represents the state of the art in this line of work. A few adjacent directions worth watching:
+
+- *DSA in DeepSeek V3.2*: abandons post-hoc entirely, baking sparse attention into pre-training. Reduces compute but not KV memory. Orthogonal to KVzap and composable.
+- *MLA / Linear Attention* (Kimi-Linear, Nemotron3 Nano): shrinks the KV cache at the architecture level, compressing both the T axis and the D axis simultaneously. Also orthogonal to KVzap.
+- *KIVI / ZipCache quantization*: reduces retained KVs to INT4 or even INT2. Fully complementary to pruning — pruning decides *who stays*, quantization decides *how they are stored*.
+
+A reasonable extrapolation: the next paper that directly builds on KVzap will *integrate surrogate training into pre-training*, so that DMS's end-to-end ideal and KVzap's engineering friendliness can coexist.
+
+* One Diagram
+
+#+begin_example
+                                    Who should stay?
+                                           |
+            +--------------------------+---------------------------+
+            |                          |                           |
+      "look at position"         "look at history"           "look at future"
+            |                          |                           |
+   [2023 StreamingLLM]          [2023 H2O]                        |
+    start + recent window       accumulate attention scores        |
+    content-unaware             heavy-hitter assumption            |
+    fast, but blind             post-hoc                          |
+                                  |                                |
+                                  v                                |
+                          [2024 SnapKV]                            |
+                          use prompt tail                           |
+                          as a "scout window"                       |
+                          predict subsequent attention              |
+                                  |                                |
+                                  v                                |
+                          [2025 Expected Attention]                |
+                          assume query ~ N(mu, sigma)              |
+                          analytic expectation + ||W_O v|| norm    |
+                                  |                                |
+                                  v                                |
+                          [2025 KVzip]                             |
+                          have model repeat the prompt              |
+                          observe which KVs are truly attended      |
+                          oracle, but prefill 2x + no decode       |
+                                  |                                |
+                                  |    [2025 DMS] learn eviction   |
+                                  |        end-to-end, needs new   |
+                                  |        training / new weights  |
+                                  +--------+-----------------------+
+                                           |
+                                           v
+                                  [2026 KVzap]
+                                  hidden state -> MLP -> predict KVzip+ scores
+                                  + DMS-style threshold eviction (input-adaptive)
+                                  + StreamingLLM-style sliding window
+                                  ----------------------------------
+                                  fast + prefill/decode both + 2-4x lossless
+                                  overhead < 1.1%
+#+end_example
+
+* Insights
+
+On the surface, this evolutionary line looks like "scoring functions getting progressively smarter," but at a deeper level three more fundamental shifts are taking place:
+
+1. *From "predict the future" to "measure internal redundancy," then to "read off the answer from hidden states in one shot."* This is an epistemological shift. The first two generations make some form of statistical guess; KVzip stops guessing and runs an empirical measurement; KVzap discovers that the measurement result was already encoded in the hidden state all along, and only a shallow readout is needed. This implies something significant — *the usable signal buried in neural network intermediate representations is far richer than we assumed*. Many quantities that seemingly require expensive inference to obtain are, in essence, one linear probe away.
+
+2. *From "global rules" to "input-adaptive" behavior.* Early methods (StreamingLLM, H2O, AdaKV) operate with a fixed budget — 50% compression means 50%, regardless of whether the prompt is dense or sparse. KVzap uses thresholding to let the compression rate float — a simple prompt automatically retains less, an information-dense prompt automatically retains more. This paradigm was introduced by DMS, but KVzap is the first to make it viable in a post-hoc setting. "Dynamic budget" should become the default for the next generation of KV management.
+
+3. *From "algorithmic competition" to "engineering compliance."* The paper's "4 criteria" framework (fast / phase-agnostic / optimizer-friendly / faithful) is essentially a public declaration — *algorithmic accuracy is not the finish line; fitting inside vLLM is*. The fact that 20+ pruning methods have never made it into production is the greatest embarrassment of this entire research line. KVzap's choice to treat "deployable" as a first-order constraint is itself an insight: in LLM inference, *landing in production = real contribution*; everything else is leaderboard arithmetic.
+
+* Takeaways
+
+- *When scoping a problem, enumerate constraints before choosing a solution.* KVzap's real contribution is not technical novelty — it is fundamentally a distillation. The contribution is *placing all four engineering constraints (fast + works in both phases + compatible with FlashAttention + lossless) on the table at once*, after which every method that fails any constraint naturally drops out. When framing a research problem, list all hard constraints first, then check which existing methods satisfy all of them — the gaps in that intersection are often where the real opportunity lives.
+
+- *Expensive oracle + cheap surrogate* is a reusable pattern. First run a no-holds-barred "gold standard" method (KVzip repetition, Expected Attention's closed form) to produce ground truth, then train a linear/MLP probe on hidden states to reproduce it. The same pattern applies to speculative decoding, reward modeling, and value-head distillation.
+
+- *Whenever several consecutive-generation papers coexist, the next paper is most likely "fusion + engineering."* In 2025, KVzip provided the oracle, DMS provided thresholding-style eviction, Expected Attention provided the normalization term — KVzap is simply the product of stitching those three pieces together under the goal of "fits in vLLM." Track the *simultaneously parallel* threads in a field, and the next SOTA is usually somewhere in their Cartesian product.
+
+- *The signal hidden in intermediate representations exceeds our imagination.* KVzap demonstrates that a hidden state can *single-handedly* predict a global score that originally required repeating the entire prompt to compute (R² ≈ 0.7). This shows that many quantities deemed to require full inference are already implicitly present in the network's intermediate layers, waiting to be probed. The next time you encounter the claim that "this quantity can only be obtained by running complete inference," be skeptical first, then run a linear probe.
