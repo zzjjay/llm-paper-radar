@@ -1,0 +1,280 @@
+#+title:      MASQuant: Modality-Aware Smoothing Quantization for Multimodal Large Language Models
+#+date:       [2026-05-29 Fri 00:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T005441-en
+#+source:     https://arxiv.org/abs/2603.04800
+#+authors:    Lulu Hu, Wenhu Xiao, Xin Chen, Xinhua Xu, Bowen Xu, Kun Li, Yongliang Tao (Alibaba Cloud)
+#+venue:      CVPR 2026
+
+* The Problem River
+
+To fit a large model onto a phone or a cheap GPU, weights must be compressed from 16-bit floats down to 4- or 8-bit integers. The trouble is: certain "troublemaker" channels inside the model carry activation values ten to a hundred times larger than the rest, and those outliers wreck quantization accuracy the moment they show up.
+
+This problem thread has been evolving since 2022: first the outliers were discovered (LLM.int8()), then people tried to flatten them (SmoothQuant), then searched for the optimal flattening strength adaptively (AWQ), then made that strength learnable (OmniQuant), then found that multimodal models introduce more than one kind of outlier (MBQ), and finally we arrive at MASQuant: the realization that a single smoothing factor simply cannot handle multiple modalities — text, image, and audio operate on completely different scales.
+
+What makes the problem hard is that the smoothing operation itself carries a mathematical constraint ("computational invariance"): you cannot smooth arbitrarily without breaking the matrix-multiply equivalence used at inference. Every step is a tightrope walk between "smooth harder" and "don't break inference consistency." In the multimodal era, that tightrope is nearly impossible to walk — until MASQuant found that low-rank compensation could bridge the gap.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Discovery: A handful of "outlier channels" in LLM activations carry values
+  |            tens of times larger than the rest. Naive 8-bit quantization
+  |            collapses entirely on models above 6.7B parameters.
+  | Solution:  Pull those channels out and compute them in FP16;
+  |            run all other channels in INT8.
+  |            (Mixed precision, but deployment is inelegant.)
+  v
+[2022] Xiao et al. - SmoothQuant
+  |
+  | Problem:  Mixed precision is ugly and hardware-unfriendly.
+  |           Can we "smooth away" the outliers so everything can be quantized?
+  | Solution: A mathematical trick — assign each channel a scale factor s,
+  |           divide activations by s and multiply weights by s.
+  |           Activations become tame; weights get slightly wilder.
+  |           The matrix-multiply result is unchanged ("computational invariance").
+  | Formula:  s_i = max|x_i|^β / max|w_i|^(1-β), where β is a global hyper-param.
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem:  SmoothQuant's β is chosen by intuition — one value for all layers,
+  |           requiring manual tuning per model and task.
+  | Solution: Turn β into a searched value — sweep β over a small calibration
+  |           dataset and pick the one that minimizes reconstruction error.
+  |           Also highlights the insight that "important weights deserve protection."
+  v
+[2023] Shao et al. - OmniQuant
+  |
+  | Problem:  Even searching β, the shape of s is still locked to the β formula.
+  |           The true optimal s may not follow that form at all.
+  | Solution: Treat the entire S matrix as a learnable parameter and optimize
+  |           end-to-end to minimize quantization reconstruction error.
+  |           s is now free to take any shape.
+  v
+[2024] Li et al. - MBQ (CVPR 2025)
+  |
+  | Problem:  Porting LLM quantization methods to MLLMs degrades accuracy.
+  |           Investigation shows image-token activations are ~20× larger than
+  |           text-token activations (MQuant made the same observation).
+  |           Searching β without distinguishing modalities buries text statistics.
+  | Solution: Still the SmoothQuant framework, still searching β — but weight
+  |           different modality tokens differently during the search so that
+  |           smaller modalities are not drowned out. Also introduces
+  |           gradient-weighted error balancing.
+  | Limitation: Fundamentally still "one s serves all modalities";
+  |             just a smarter search.
+  v
+[2026] Hu et al. - MASQuant (this paper, CVPR 2026)
+  |
+  | Problem:  With three modalities (text, vision, audio), activation ranges
+  |           differ by 10–100×. No matter how cleverly s is searched,
+  |           a single s can only accommodate the dominant modality;
+  |           the rest are over-smoothed — the authors call this
+  |           "smoothing misalignment."
+  | Solution: Learn a separate s per modality. But that would require storing
+  |           multiple quantized weight copies — defeating the purpose.
+  |           So they apply SVD whitening to decompose the difference between
+  |           per-modality weights into low-rank matrices: store one text-baseline
+  |           weight plus a lightweight low-rank patch per modality,
+  |           assembled at inference time.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering the "Outlier Channels" Inside LLMs
+
+*** What problem did it see?
+
+Before 2022, quantization was mostly done on vision models. Compressing to 8-bit integers seemed unproblematic. Dettmers applied the same recipe to large language models — and beyond OPT-6.7B, accuracy fell off a cliff. The culprit: a handful of activation channels (fewer than 0.1% of the total) with values up to 70× larger than the rest. Quantize those channels and the entire matrix-multiply accuracy is destroyed.
+
+*** Its solution
+
+A blunt but effective workaround: pull those outlier channels out and keep computing them in FP16; push everything else through INT8. This is called "mixed-precision decomposition."
+
+*** Why it worked (and what hole it left)
+
+It acknowledged the hard fact that outliers cannot be quantized, and simply routed around them. The cost: engineering ugliness — hardware must maintain two parallel compute paths, and the FP16 portion is non-trivial in size. It told us outliers exist, but not how to tame them. The next paper asked: can we make the outliers disappear?
+
+** 2022 | SmoothQuant: "Moving" the Outliers over to the Weights
+
+*** What problem did it see?
+
+LLM.int8()'s isolation of outliers is passive defense. The root cause is that the activation side of the matrix multiply Y = XW has huge values, while the weight side W has a relatively flat distribution. Could some mathematical transformation shift the "bigness" from activations toward weights? Activations become gentle, weights become slightly more dynamic — and both sides become quantizable.
+
+*** Its solution
+
+Introduce a diagonal matrix S (one scale factor s_i per channel) and rewrite Y = XW as Y = (X·S⁻¹)·(S·W). The result is identical, but X·S⁻¹ has tamed outliers and S·W is still quantizable.
+
+How to set s_i? Formula: s_i = max|x_i|^β / max|w_i|^(1-β), with β a global hyper-parameter, typically 0.5.
+
+This is the founding paper of the "computational invariance" paradigm — use an equivalent transformation to make distributions more amenable to quantization.
+
+*** Why it worked (and what hole it left)
+
+Mathematically guaranteed to be lossless; engineering-wise enables pure INT8. It landed with immediate impact, and the entire subsequent PTQ direction followed its lead.
+
+But two holes remained: (1) β is chosen by intuition — the optimal value varies across models and layers; (2) the formula only produces scale factors of a "power-law" form — the true optimal s may not look like that at all.
+
+** 2023 | AWQ: Stopping the Guesswork on β
+
+*** What problem did it see?
+
+SmoothQuant ties the entire scaling scheme to a single global β — too coarse. Different tasks, models, and layers should have different optimal β values. Manually tuning β is tedious and unreliable.
+
+*** Its solution
+
+Calibration: run a small batch of samples, sweep β over a range, and pick the value that minimizes reconstruction error. Each layer can now have its own β. AWQ also makes a deeper observation: "not all weights matter equally" — a small set of critical weight channels accounts for most of the accuracy, so protecting them is sufficient.
+
+*** Why it worked (and what hole it left)
+
+Turning a hand-crafted hyper-parameter into a data-driven search — the canonical progression from manual to data-driven design.
+
+The hole persists: β is still a scalar, so the shape of s_i is still locked to that formula. If the optimal s_i follows some unusual distribution, AWQ cannot find it.
+
+** 2023 | OmniQuant: Making s a Fully Learnable Parameter
+
+*** What problem did it see?
+
+If having s's shape locked to the β formula is the limitation, just remove the lock — let s be learned directly rather than generated by a formula.
+
+*** Its solution
+
+Treat S itself as a neural-network parameter and optimize it via backpropagation to minimize "the difference between quantized output and original output." Every element of s is free; nothing is tied to max|x|/max|w| anymore.
+
+Formally: S* = arg min_S L(Q(X·S⁻¹)·Q(S·W), X·W).
+
+*** Why it worked (and what hole it left)
+
+The ultimate "let s be free" — able to reach any optimum unreachable by the β formula. It searches any shape of s that β could never express.
+
+But s is still "one set of parameters serving all inputs." No matter what data you feed in, the scale factors are fixed. In the pure-text LLM era this is fine because activation distributions are roughly consistent.
+
+Then multimodality arrived.
+
+** 2024 | MBQ: The First Compromise in the Multimodal Era
+
+*** What problem did it see?
+
+Applying LLM quantization methods to MLLMs caused accuracy loss. Investigation: image-token activations are approximately 20× larger than text-token activations (MQuant made the same discovery concurrently). When searching β without distinguishing modalities, text-token statistics get overwhelmed.
+
+*** Its solution
+
+Still the SmoothQuant framework, still searching β — but assign different weights λ_m to different modality tokens during the search, so smaller modalities are not drowned out. Also introduces gradient-weighted error balancing.
+
+*** Why it worked (and what hole it left)
+
+It acknowledged that "modality difference" is a first-order problem. But the solution is essentially "adjust the search weights" — the final output s is still a single set: one scale factor serving all modalities simultaneously.
+
+That is exactly where MASQuant begins.
+
+** 2026 | MASQuant: One s Can No Longer Serve Three Modalities
+
+*** What problem did it see?
+
+With three modalities (text + vision + audio, as in Qwen2.5-Omni), activation ranges across modalities differ by 10–100×. A single unified s can only accommodate the dominant modality; the activations of all other modalities are excessively flattened — the authors call this phenomenon *Smoothing Misalignment*.
+
+Formally: if s_i = max_m(R_i^m) / max|w_i| (taking the largest range across all modalities), then s is entirely calibrated to the "largest modality." When other modalities use this s, their activations get squeezed nearly to zero, and quantization noise swamps the signal.
+
+The authors provide a theorem: SQNR (Signal-to-Quantization-Noise Ratio) degrades exponentially as a function of the unevenness of inter-modality range ratios.
+
+*** Its solution
+
+Two steps:
+
+Step one — *Modality-Aware Smoothing (MAS)*: learn a separate s_m for each modality independently. The motivation is obvious — if one s is insufficient, give each modality its own.
+
+But this breaks the original purpose of quantization: you would need to store a separate quantized weight Q(S_m · W) per modality. Three modalities mean three copies of weights, which increases storage.
+
+Step two — *Cross-Modal Compensation (CMC)*: store only the text copy Q(S_t · W) as the baseline. For every other modality, approximate the difference ΔW between that modality's true weight S_m·W and the baseline using a low-rank matrix L₁L₂. At inference, combine baseline + low-rank patch.
+
+Key technique: directly truncating the SVD of ΔW works poorly because ΔW is not necessarily low-rank. Instead they apply *SVD whitening* — first compute a whitening transform T from the covariance of X·S⁻¹, then truncate the SVD of T·ΔW. This borrows the idea from SVD-LLM v2's weight compression work, but applying it to cross-modal compensation is novel. They prove this procedure yields the optimal low-rank approximation that minimizes the output residual.
+
+*** Why it works (and what holes it leaves)
+
+The elegance: the seemingly storage-breaking design of "one weight set per modality" is compressed back to "one baseline weight + a few lightweight patches" via low-rank compensation. Smoothing misalignment is eliminated while computational invariance is preserved.
+
+Remaining open questions:
+- How do you choose the rank r for patches? Too low and compensation is insufficient; too high and storage overhead grows.
+- As the number of modalities grows (video, 3D, …), will the low-rank patches multiply without bound?
+- Patches are learned offline; what happens with mixed-modality inputs not seen during calibration?
+
+* Frontier Extensions
+
+As of March 2026, MASQuant represents the latest advance in this line. Several predictable next directions:
+
+- *Dynamic compensation*: current patches are pre-learned per modality; future work may decide compensation online per input token, akin to mixture-of-experts routing.
+- *Joint optimization of MAS + CMC*: the two steps are currently decoupled; end-to-end joint optimization may unlock further headroom.
+- *Porting this paradigm to other "heterogeneous" settings*: e.g., within long-context models, tokens at different positions also exhibit different activation distributions — could "group-wise scaling + low-rank compensation" be transplanted there?
+
+Rotation-based methods (QuaRot / SpinQuant) take a different route — using orthogonal matrices instead of diagonal ones for the computational-invariance transform. A merger between that line and the MASQuant line may be the next destination.
+
+* One Diagram
+
+#+begin_example
+                    The central tension of this line:
+                   "Smooth harder" vs "Inference consistency"
+                                |
+                                v
+
+  Smoothing aggressiveness              Computational invariance constraint
+
+  Discover outliers     [LLM.int8 2022]       Mixed precision, route around them
+   |                                           One weight, but two compute paths
+   |
+   v
+  Flatten outliers      [SmoothQuant 2022]    Y=(XS^-1)(SW)
+   |                                           Global β, s defined by formula
+   |
+   v
+  Adapt β per layer     [AWQ 2023]            Search β
+   |                                           One weight, different β per layer
+   |
+   v
+  Free s entirely       [OmniQuant 2023]      Learn s
+   |                                           One weight, s of any shape
+   |
+   v                    (enters multimodal era)
+  Weight search by      [MBQ 2024]            One weight, one s
+  modality                                     (one s serves all modalities — compromise)
+   |
+   v
+  One s per modality  [MASQuant 2026]        One baseline weight
+  + low-rank                                   + low-rank patch / modality
+  compensation                                 (invariance + modality diversity)
+
+  Horizontal axis: time      Vertical axis: "degrees of freedom of the scale factor" grow
+                                  (single global → per layer → arbitrary learned → per modality)
+#+end_example
+
+* Insights
+
+What is truly happening along this line is not "progress in compression technology" — it is the *gradual liberation of degrees of freedom*.
+
+Each generation loosens one constraint: first loosening "must use mixed precision" (SmoothQuant), then loosening "β must be a fixed global constant" (AWQ), then loosening "s must follow a formula" (OmniQuant), then loosening "one s must serve all modalities" (MASQuant).
+
+Each loosening expands the space of achievable optima by an order of magnitude; simultaneously, the new freedom must be absorbed by a new mathematical tool (data-driven search / end-to-end optimization / low-rank whitening) — otherwise deployment breaks.
+
+At a deeper level, this is a *universal pattern in AI systems design*: every era harbors a "strong assumption made for simplicity's sake," and when that assumption can no longer bear the load of a more complex scenario, it must be dismantled. The cost is always new complexity, and where you hide that complexity (parameterization? low-rank factorization? runtime? compile time?) determines the engineering aesthetics of the next generation.
+
+MASQuant's choice — hiding modality differences inside "low-rank patches" — is an elegant middle ground: neither the brute force of "one s for everything," nor the excess of "one full weight copy per modality," but rather "baseline + patch." I am willing to bet this pattern will be reused in many other settings.
+
+The most likely next evolutionary steps:
+
+1. *From modality groups to input groups*: rather than grouping by "text / vision / audio," group dynamically by the statistical properties of the input. Patch routing can be made far more fine-grained.
+2. *Merging with the rotation school*: QuaRot / SpinQuant use orthogonal matrices for computational invariance; combining them with MASQuant's diagonal-matrix + low-rank compensation may open substantially more room.
+3. *Quantization-friendly multimodal alignment baked into training*: all of the above is PTQ — quantization is an afterthought. If training explicitly encouraged "activation ranges to be alignable across modalities," the problem might be absorbed at the source.
+
+* Takeaways
+
+*Lessons for doing research*: find problems by hunting for "neglected common-sense assumptions." Every generation after SmoothQuant did not invent a new algorithm — it *excavated an assumption the previous authors had quietly smuggled in*: β is a constant? s follows a formula? s is shared across all modalities? Dig one out and you have a CVPR paper.
+
+The MASQuant team's identification of "smoothing misalignment" is beautifully executed — they took an intuitive nuisance and turned it into a theoretically characterized phenomenon (complete with a proven theorem about SQNR degradation). Naming + theoretization is the key step that elevates "engineering experience" into "academic contribution."
+
+*Lessons for finding problems*: look in the direction of "systems growing more complex." LLM quantization research ran for three years and seemed nearly saturated — then MLLMs arrived and reshuffled every method. Omni-modal models, long context, multi-turn agent interaction … each new layer of complexity exposes the hidden assumptions of prior methods.
+
+*What you can use*:
+
+- If you are working on MLLM inference optimization, the "per-modality smoothing + low-rank compensation" framework can be adopted directly. Code is open-sourced: alibaba/EfficientAI.
+- If you are designing MoE or multi-task systems, "baseline weights + task-specific low-rank patches" is a paradigm worth referencing — it offers one more layer of "computational equivalence" guarantee compared to vanilla LoRA.
+- If you are looking for a paper angle: go through the assumptions of the SmoothQuant / AWQ / OmniQuant family and ask which assumption breaks first in the new scenario you care about (multilingual? long sequences? code models?).

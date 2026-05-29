@@ -1,0 +1,151 @@
+#+title:      FreeAct: Freeing Activations for LLM Quantization
+#+date:       [2026-05-29 Fri 00:40]
+#+filetags:   :paper:river:quantization:en:
+#+identifier: 20260529T004035-en
+#+source:     https://arxiv.org/abs/2603.01776
+#+authors:    Xiaohao Liu, Xiaobo Xia, Manyi Zhang, Ji-Fu Li, Xianzhi Yu, Fei Shen, Xiu Su, See-Kiong Ng, Tat-Seng Chua
+#+venue:      arXiv 2026
+
+* One-liner
+
+Along the LLM quantization timeline, everyone spent three years doing the same thing — *knocking down the outlier spikes in activations*. SmoothQuant migrated the spikes to the weights; the QuIP family scattered them with random rotations; QuaRot/SpinQuant baked rotations into end-to-end inference; FlatQuant relaxed rotations to affine transforms; and now FreeAct tears out the last iron rule — "the transform must be an invertible one-to-one map" — by acknowledging that *activations are inherently low-rank and simply do not require a bijection*.
+
+* Provenance Map
+
+#+begin_src
+                  [2022]                  [2023]                 [2024]                  [2025]                [2026]
+                    |                       |                      |                       |                      |
+   LLM.int8() ----> SmoothQuant -------+    |                      |                       |                      |
+   (mixed-prec.)    (per-channel       |    |                      |                       |                      |
+                     scaling)          |    |                      |                       |                      |
+                                       v    v                      |                       |                      |
+                                  QuIP --> QuIP# (Hadamard +       |                       |                      |
+                                  (random  E8 lattice, 2-bit)      |                       |                      |
+                                   orth.)   |                      |                       |                      |
+                                            +--> QuaRot -----------+----> SpinQuant -------+----> FlatQuant ------+----> FreeAct
+                                                 (rotation,              (learned rotation,      (affine,              (drop the one-to-one
+                                                  end-to-end W4A4)        Cayley)                 Kronecker)            constraint; per-token)
+                                                                                                                          ^
+                                                                                                                          |
+                                                                                                                  rank-deficient activation
+                                                                                                                  (MagR, L4Q)
+#+end_src
+
+Every arrow is not "inspired by" but "dissatisfied with" — each paper saw a concrete unsolved problem left by the one before it. Let us walk through them in order.
+
+* How the Problem Grew (Forward Narrative)
+
+** The Starting Point: Outlier Spikes in Activations
+
+In 2022, practitioners running LLM inference stumbled on a persistent nuisance. For every matrix multiply Y = X·W, the weights W were well-behaved, but the activations X were wild — specifically: *among several hundred channels, a handful always had values 100× larger than the rest*. If you tried to quantize the whole tensor to INT8 with a single range, you had to stretch that range to accommodate those spikes, which squeezed all the remaining hundreds of channels into a tiny interval like [-1, 1] — effectively using only 1–2 bits for them. Accuracy collapsed immediately.
+
+Dettmers's LLM.int8() tried a brute-force workaround: keep those spike channels in FP16 and run the rest in INT8. The intuition was right, but it was hardware-unfriendly — you had to dynamically detect which channels were spikes, route them down two separate paths, and the result was actually slower than pure FP16.
+
+** First Move: SmoothQuant — Relocate the Spikes
+
+In 2023 the Xiao team spotted a small mathematical trick. Given Y = X·W, for any diagonal matrix s you can write Y = (X·diag(1/s)) · (diag(s)·W) and the result is identical. Divide activations by s, multiply weights by s, the matrix product is unchanged.
+
+And here is the opportunity — *the weights are naturally tame and can absorb the load*. Raise s a little for the spike channels, the activations get flattened, and all their "fury" is transferred to the corresponding rows of the weights, which can still cope. The network goes from "one side wild, one side flat" to "both sides acceptable." Quantize everything to INT8 — no mixed precision, pure W8A8 — and throughput actually improves.
+
+But SmoothQuant left a loose end: *the spikes did not disappear, they just moved*. At 8 bits this relocation works; at 4 bits neither side can take it. And what about sub-4-bit weights? SmoothQuant never touched that question.
+
+** Second Move: QuIP — Don't Relocate, Disperse
+
+The Chee team in 2023 attacked from a different angle. Their argument: *outlier spikes are fundamentally a wrong-coordinate-system problem*. If you could find a rotation that spreads the weight matrix so that large and small values are uniformly distributed across all directions, the concept of "outlier channel" ceases to exist.
+
+Mathematically this is "incoherence" — the weight matrix and its Hessian are not aligned with any coordinate axis. The recipe: multiply both sides by a random orthogonal matrix. Energy formerly concentrated on a few axes gets rotated out across all directions, and the distribution becomes approximately Gaussian. This *actually eliminates* spikes rather than relocating them. Combined with adaptive rounding, 2-bit quantization worked for the first time.
+
+QuIP opened two new problems, however. One: *multiplying by a random orthogonal matrix is expensive* — Kronecker factorization is needed for speed, which is engineering-awkward. Two: after rotation the weights become an isotropic Gaussian ball, and using scalar quantization — "round each coordinate independently" — to quantize a ball is like cutting a sphere with a cuboid knife. Enormous waste.
+
+** Third Move: QuIP# — Use a Round Knife for a Round Ball
+
+The Tseng team in 2024 closed both loose ends at once.
+
+Random orthogonal matrices too expensive? Switch to the *Hadamard transform*. Hadamard is a special orthogonal matrix that looks like a ±1 checkerboard; multiplying by it requires only additions and subtractions, O(n log n), far faster than general matrix multiply. The theoretical incoherence guarantee still holds.
+
+Cutting a sphere wastefully? *Use a round knife* — the E8 lattice, the provably optimal sphere packing in 8-dimensional space. Replace scalar quantization — "round each number independently" — with "look up the nearest lattice point for every group of 8 numbers together." That is the right tool for a Gaussian ball. For the first time, 2-bit accuracy matched others' 3-bit, and 3-bit matched others' 4-bit.
+
+But QuIP# was still a *weights-only* method. Activations and the KV cache were untouched. Storage shrank, but compute still ran in FP16 — end-to-end inference speed never truly took off.
+
+** Fourth Move: QuaRot — Push Hadamard All the Way to End-to-End
+
+The Ashkboos team's key 2024 observation: *the Hadamard idea from QuIP# generalizes perfectly to activations*, as long as one engineering problem is solved — the rotation must not become extra overhead at inference time.
+
+They borrowed the "computational invariance" trick from SliceGPT: insert a pair R and R^T between two layers; the outer matrix products are unchanged. Then fold R offline into the neighboring weights — *at inference time the rotation is invisible*, having occurred only at compile time. Only the K and V projections inside attention, where folding is infeasible, retain a small online Hadamard.
+
+The result: weights, activations, and KV cache all run in INT4; end-to-end W4A4 inference speed genuinely improves; no mixed-precision residual channels.
+
+The catch: *these Hadamard matrices were randomly chosen, never tuned*. On harder-to-quantize models like LLaMA-3, accuracy loss remained visible.
+
+** Fifth Move: SpinQuant — Learn It Instead of Picking Randomly
+
+The Liu team in 2024 ran a controlled experiment: keeping the same QuaRot architecture but swapping different random Hadamard matrices caused downstream accuracy to vary by up to 13 points. This showed *the choice of rotation matrix had enormous headroom that random selection was simply leaving on the table*.
+
+So learn it. Parameterize the rotation matrix as a point on the orthogonal manifold and optimize it on a small calibration set using Cayley updates. Foldable rotations get folded; non-foldable ones (inside attention) keep online Hadamards. The accuracy drop on LLaMA-3 was largely recovered.
+
+SpinQuant's remaining tail: *what is learned is still an orthogonal matrix*. Orthogonality preserves distances and angles; rotating a distribution "disperses" it but *cannot reshape distributions of different forms into a single flat distribution*. Each layer's activations have their own characteristic shape; forcing the same orthogonal family onto all of them always leaves something that cannot be flattened.
+
+** Sixth Move: FlatQuant — Not Orthogonal, Flat
+
+The Sun team in 2025 argued: *what quantization needs is not incoherence but flatness*. The quantization grid is uniform, so you want the distribution to be uniform (flat) too. Orthogonality is just one special path to flatness; there is no reason to insist on it.
+
+Relax to *affine transforms* — learn a separate A matrix for each layer so that layer's weights and activations become as flat as possible. This introduced new problems: the affine map may not invert cleanly, and a full matrix multiply is too costly at inference. Their solution: factorize A as a Kronecker product of two small matrices (parameters drop from d² to 2d), then fuse the transform and quantization into a single kernel. Runtime overhead fell from QuaRot's ~26% to ~7%, and on LLaMA-3-70B W4A4 FlatQuant beat SpinQuant by 7.5 points.
+
+FlatQuant relaxed the constraint dramatically, but one last rule still stood: *the activation-side transform P must be paired with a weight-side inverse P^-1*. This is the "one-to-one" shackle inherited all the way from QuIP — whatever transform you apply to activations, the weights must undo it exactly on their side so that Y = X·W stays intact.
+
+** The End Point: FreeAct — The One-to-One Constraint Is an Illusion
+
+The Liu team's FreeAct identifies a premise everyone assumed but nobody questioned: *why does the activation transform need an invertible matrix at all?*
+
+The mathematical origin is Y = X·W = X·P·P^-1·W, so if activations are multiplied by P, weights must be multiplied by P^-1. It looks like an iron law.
+
+But they point out one fact: *the activation matrix X is itself low-rank*. This is especially pronounced in dLLM and MLLM settings — visual tokens, text tokens, and masked tokens each occupy their own low-dimensional subspace. The set of transforms equivalent to P *within the subspace spanned by X* is far larger than "P is the unique invertible". In other words, you do not need a strict P^-1; it suffices to recover the transformation within the subspace that X spans.
+
+This breaks open the one-to-one requirement. How is it used in practice? *The weight side retains one shared static transform* (guaranteeing foldability and zero runtime overhead), while *the activation side gets a separate transform matrix for each token type* — one for visual tokens, one for text tokens, one for masked tokens. Each token type takes its own optimal "flattening path," and the weight side only needs to face the common projected space.
+
+This fits the dLLM/MLLM reality perfectly — distributions of different token types were always far apart, and forcing a single transform to serve all of them inevitably compromised. FreeAct lets each token type speak for itself, yielding a 5.3% improvement.
+
+* Problem–Solution Summary (One Table)
+
+#+begin_src
+       Problem                              Solution                        Remaining Issue
+  -----------------------------     -------------------------     -----------------------------
+  Activation spikes; INT8 collapses    LLM.int8(): mixed precision     Slow on hardware; engineering-awkward
+  Spikes stuck in fixed channels       SmoothQuant: shift via s        Both sides crack at 4-bit
+  Relocation incomplete; weights go low-bit  QuIP: random orthogonal scatter    Rotation expensive + scalar cutting wastes
+  Rotation expensive; sphere cut badly QuIP#: Hadamard + E8 lattice   Weights only; inference still FP16
+  Activations/KV not quantized         QuaRot: fold rotation in, end-to-end   Rotation is random, untuned
+  Random rotation wastes headroom      SpinQuant: learn the rotation   Orthogonal family not flexible enough
+  Orthogonal can't reshape odd distributions FlatQuant: affine + Kronecker  Activation/weight still one-to-one
+  One-to-one limits each token type    FreeAct: per-token activation transforms  ? (next paper)
+#+end_src
+
+* What Is Really Happening Beneath This Timeline
+
+On the surface it looks like technical iteration — scaling → random rotation → Hadamard → learned rotation → affine → free transform.
+
+But *underneath it is a progressive unbinding of symmetry constraints*:
+
+1. SmoothQuant assumes activations and weights must be handled *together*, but preserves *formal symmetry* (multiply and divide by the same s)
+2. QuIP elevates "symmetry" to *geometric symmetry* (orthogonal matrices preserve structure)
+3. QuaRot/SpinQuant extend this geometric symmetry *end-to-end* and allow it to be *learned*
+4. FlatQuant abandons *geometric* symmetry and keeps only *algebraic* symmetry (invertible is enough)
+5. FreeAct abandons *algebraic* symmetry and keeps only *functional* equivalence (equivalence within X's subspace suffices)
+
+Each step asks the same question: *is this constraint actually necessary?* Then finds it is not, loosens it slightly, and quality improves.
+
+At a deeper level, the entire timeline is progressively reunderstanding "activations." Early work treated them as uncontrollable noise sources. The middle period treated them as geometric objects amenable to coordinate change. FreeAct treats them as low-rank, multimodal, token-type-driven mixture distributions — *activations finally have their own structure instead of being a subordinate variable of the weights*.
+
+* Where Things Might Go Next
+
+1. *Dynamic transforms*. FreeAct still buckets by token type (visual / text / mask) — discrete, human-defined buckets. One step further is dynamically selecting a transform for each token based on its actual distribution — akin to MoE but acting at the quantization layer.
+2. *Training-time awareness*. All these methods are post-training. If the model knew during training that it would eventually be quantized this way, the low-rank structure of activations could be explicitly encouraged, giving quantization more room to breathe.
+3. *Cross-layer coupling*. FlatQuant and FreeAct both design transforms independently per layer. But the low-rank structure of activations is correlated across layers — the token types in one layer determine the activation structure in the next. A jointly optimized transform family across layers might squeeze out a few more points.
+
+* Honest Annotations
+
+- The main thread QuIP → QuIP# → QuaRot → SpinQuant → FlatQuant → FreeAct consists of methods explicitly listed as comparison baselines and named in FreeAct's critique sections; citation relationships are confirmed.
+- SmoothQuant and AWQ, as representatives of the *scaling school*, are explicitly named in FreeAct's introduction as the earlier generation; citation relationships are confirmed.
+- LLM.int8() is not directly named in FreeAct (FreeAct's starting point is later); I included it because it is SmoothQuant's own stated predecessor. If you trace only FreeAct's direct lineage, you can start the clock at SmoothQuant.
+- FreeAct's own technical details (the specific form of the per-token transforms, the theoretical derivation of rank deficiency) were not available to me in a complete PDF; they were reconstructed from the abstract and the introduction of v1, so the technical sections may contain simplifications.
+- "Where things might go next" is entirely my speculation and does not appear in the paper.

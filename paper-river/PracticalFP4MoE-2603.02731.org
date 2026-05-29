@@ -1,0 +1,256 @@
+#+title:      Practical FP4 Training for Large-Scale MoE Models on Hopper GPUs
+#+date:       [2026-05-29 Fri 00:47]
+#+filetags:   :paper:river:
+#+identifier: 20260529T004728
+#+source:     https://arxiv.org/abs/2603.02731
+#+authors:    Wuyue Zhang, Chongdong Huang, Chunbo You, Cheng Gu, Fengjuan Wang, Mou Sun (Zhejiang Lab)
+#+venue:      arXiv preprint, March 2026
+
+* TL;DR
+
+一条问题线：MoE 模型大到训不动 → 用更少的比特装数字 → FP8 在 Hopper 上跑通了 → FP4 在 Blackwell 上跑通了 → 但全世界 95% 的卡是 Hopper，硬件不给 FP4 算力怎么办？
+
+这篇论文的答案：*不让 FP4 参与算，只让 FP4 参与"存"和"传"*。算还是 FP8，但显存里和卡间传输的字节砍一半。Hopper 上也能薅到 FP4 的省内存红利。
+
+* 溯源地图
+
+#+begin_src
+            +-------------------+
+            | MoE scaling 困境   |  Lepikhin 2021 (GShard)
+            | "专家越多越省算,   |  Mixtral 2024
+            |  但激活和通信爆炸" |  DeepSeek-V3 (Zhao 2025a)
+            +---------+---------+
+                      |
+                      v "用更少 bit 救命"
+            +-------------------+
+            | FP8-LM (Peng 2023)|  低精度训练可行的奠基
+            +---------+---------+
+                      |
+                      v "per-tensor 精度不够,
+                         block-wise 才稳"
+            +-------------------+
+            | Microscaling (MX) |  Rouhani 2023
+            | OCP MX 规范 2023   |  统一 MXFP8/6/4 编码
+            +---------+---------+
+                      |
+              +-------+--------+
+              |                |
+              v FP8 量级落地    v FP4 量级前沿
+   +-------------------+   +---------------------+
+   | DeepSeek-V3 FP8   |   | Tseng 2025 MXFP4    |
+   | 671B MoE 训练成功 |   | 6.7B + SR + RHT     |
+   | (Zhao 2025a)      |   +---------+-----------+
+   | + DeepEP/DeepGEMM |             |
+   | (Zhao 2025b)      |             v
+   +---------+---------+   +---------------------+
+             |             | NVFP4 (NVIDIA 2025) |
+             |             | Chmiel 2025 全 FP4   |
+             |             | 都依赖 Blackwell     |
+             |             +---------+-----------+
+             |                       |
+             +-----------+-----------+
+                         |
+                         v "Hopper 没有 FP4 算力,
+                            但我也想要 FP4 的省内存"
+                +-----------------------+
+                | * This paper (2026.03) |
+                | MXFP4 软仿真 + FP8 算   |
+                | 671B MoE on Hopper     |
+                | -14.8% 显存 / +12.5% 速 |
+                +-----------------------+
+#+end_src
+
+* 倒读 5 层
+
+** Layer 1 -- 直接被批判/被改进的对象
+
+*目标论文* (这篇) 站在哪儿、踩着谁：
+
+- *DeepSeek-V3 (Zhao 2025a)*：在 Hopper 上用 block-wise FP8 把 671B MoE 训出来了。本文继承它的 671B 规模、Hopper 平台、blockwise FP8 思路，但批判它"激活和 all-to-all 通信还是 FP8，能再砍"。
+- *Tseng et al. 2025 (MXFP4 training, AISTATS 2025)*：证明了 MXFP4 + 随机舍入 + 随机 Hadamard 变换在反向传播上能近无损，但*只在 6.7B 规模*验证，且*依赖 Blackwell 的原生 FP4 算力*。本文批判"规模小、平台依赖死"。
+- *NVFP4 训练 (NVIDIA 2025b) 与 Chmiel 2025 (FP4 All the Way)*：全 FP4 端到端训练可行，但同样*要 Blackwell*。Hopper 用户看着流口水却没法用。
+- *Wang et al. 2025 (FP8 flow for MoE)*：警告"BF16 ↔ FP8 来回转格式会把低精度的好处吃干净"。本文继承这个教训，明确反对 ~FP4 ↔ BF16 ↔ FP8~ 三跳链。
+
+** Layer 2 -- 上一层踩着的
+
+- *Peng et al. 2023 (FP8-LM)*：把"训练用 FP8"从想法做成了能跑的代码。是 DeepSeek-V3 和后面所有 FP8/FP4 工作的爹。它解决的问题是"FP8 动态范围太窄，per-tensor 缩放搞不定"，办法是 per-tensor + delayed scaling + 动态范围监控。
+- *Mishra et al. 2025 (MXFP8 recipes)*：把 MX 思想落到 FP8 上，证明 block-wise power-of-two scale 配合随机舍入能匹配 BF16 收敛。是 MXFP4 的方法论模板。
+- *Open Compute Project MX 规范 2023*：定义了 MXFP8/6/4 这套统一编码（每 32 元素一个 power-of-two scale）。是 Tseng、Mishra、本文共用的"语法"。
+
+** Layer 3 -- 再上一层
+
+- *Rouhani et al. 2023 (Microscaling data formats for deep learning, arXiv:2310.10537)*：微缩放的奠基论文。回答的问题是"per-tensor 一个 scale 太粗，per-element 一个 scale 太贵，那中间地带在哪？"——答案是"每个小 block (32 个元素) 共享一个 scale"。后来的 MXFP8/6/4、OCP 规范都从这里长出来。
+- *Micikevicius et al. 2017/2018 (Mixed Precision Training, FP8 formats)*：把 FP16/FP8 训练从理论推向 NVIDIA 主流栈。
+
+** Layer 4 -- 再上一层
+
+- *Micikevicius 2017 (Mixed Precision Training, ICLR 2018)*：第一次把"权重存 FP32，算用 FP16，再 cast 回去"这个 master-weight + loss scaling 的范式立起来。所有"用更少 bit 训练"的论文都坐在这把椅子上。
+- *MoE 这条线的源头*：Shazeer et al. 2017 (Outrageously Large Neural Networks)，第一次把 sparsely-gated MoE 大规模做起来。后来的 GShard、Mixtral、DeepSeek-V3 全是它的孩子。
+
+** Layer 5 -- 奠基
+
+- *IEEE 754 (1985)*：浮点数的圣经。所有"sign + exponent + mantissa"的故事从这里开始。本文 Section 3 大段在讨论 subnormal、guard bit、sticky bit、RTNE，全是 IEEE 754 的方言。
+- *Mixture-of-Experts 概念本身*：Jacobs & Jordan 1991 (Adaptive mixtures of local experts)。
+
+到这里递归终止：再往下就是浮点数学和 30 年前的神经网络理论了。
+
+* 前沿延伸 -- 这篇之后
+
+截至 2026 年初公开的进展（可能不完备）：
+
+- *GPT-OSS-120B (OpenAI 2025)* 据传也用 FP4 训练，但*没有公开任何配置*。本文是第一个把 671B FP4-on-Hopper 完整开源的工作。
+- *Blackwell 普及后*：本文的"软仿真 FP4"是 Hopper 过渡期的方案。一旦 B200 普及，原生 MXFP4 GEMM 就能用，本文的 bitwise 转换 kernel 会变成"历史里的桥梁"，但*"FP4 存 + FP8 算"的非对称设计哲学*会延续——因为即使 Blackwell 上 FP4 算力够了，反向传播仍然需要更高精度，本文的非对称思路反而更通用。
+- *未公开但可预测的延伸方向*：把 FP4 推到优化器状态（Adam moments）、把"软仿真"扩到更老的 A100/H800 弱卡、用本文的 FP4 通信压缩思路扩到 pipeline parallelism。
+
+* 演化叙事 -- 问题怎么长出来的
+
+下面正着讲。从 2017 年开始，一路追到这篇。
+
+** 起点：模型越大越好，但是装不下
+
+2017 年前后，所有人都发现一个规律：把神经网络做大，效果会更好。但 *"大"是要付钱的*——参数越多，显卡显存装不下，反向传播算梯度更慢。
+
+最直接的省钱办法：*别用 FP32 (32 比特浮点) 存权重，用 FP16 (16 比特) 就好*。一下子省一半。
+
+但是直接换成 FP16 训不出来——精度太低，梯度更新会被吃掉。Micikevicius 在 2017 年提出 *Mixed Precision Training*：权重存一份 FP32 做"主权重"，算的时候 cast 到 FP16 用，更新的时候再 cast 回去。再配一个 loss scaling 让小梯度不被截断成零。这套范式一立起来，所有后续的"低精度训练"都站在它的肩上。
+
+*留下的问题*：FP16 还是有点贵，能不能再砍？
+
+** 砍到 FP8：Peng 2023 把它做能跑
+
+到了 2023 年，NVIDIA H100 (Hopper) 出来，硬件原生支持 *FP8*（8 比特浮点）。理论上比 FP16 再省一半显存、再快一倍。
+
+但 FP8 比 FP16 难太多了——*动态范围太窄*。FP16 能表达 1e-8 到 6e4，FP8 (E4M3) 只能表达 1e-3 到 448。激活值和梯度只要稍微大一点小一点就溢出/下溢。
+
+Peng 等人的 FP8-LM 把这事做能跑了，办法是：*per-tensor 动态缩放* + 延迟统计每个张量的最大值。这是 FP8 训练第一个真正能跑出来的方案。
+
+*留下的问题*：per-tensor 一个 scale 还是太粗。一个张量里既有大值又有小值，统一缩放会让小值掉精度。
+
+** 中间地带：微缩放 (Microscaling, MX)
+
+2023 年 Rouhani 等人提出 *Microscaling*：*别用 per-tensor 一个 scale，也别 per-element 一个 scale，每 32 个元素共享一个 scale*。粒度刚好——比 per-tensor 细 100 倍，但元数据开销可控（每 32 个 8-bit 元素加 1 个 8-bit scale，开销 3.1%）。
+
+这套思路被 Open Compute Project 写成正式规范，催生了一家子：*MXFP8*（每 32 个 8-bit + scale）、*MXFP6*、*MXFP4*（每 32 个 4-bit + scale）。MX 给所有"再往下砍比特"的工作铺好了路。
+
+*留下的问题*：MX 是个标准，但*"4 bit 真的能训出大模型吗？"* 没人知道。
+
+** 砍到 FP4：但只在 Blackwell 上
+
+2025 年 Tseng 等人在 AISTATS 上证明：MXFP4 + 随机舍入 + 随机 Hadamard 变换，能把*反向传播*跑通，6.7B 模型近无损。同年 NVIDIA 推 *NVFP4*（更小的 block size + E4M3 scale），Chmiel 等人做出 *FP4 All the Way*（全 FP4 端到端训练）。
+
+12B 模型用 FP4 训出近 FP8 的精度——这事终于成了。
+
+但*所有这些工作都依赖 NVIDIA Blackwell (B200) GPU 的原生 FP4 Tensor Core*。Hopper (H100/H800) 没有 FP4 算力。
+
+这就出现一个尴尬局面：*全世界 95% 在跑生产训练的卡是 Hopper，但 FP4 的好处只有 Blackwell 用户能享受*。
+
+*留下的问题*：能不能让 Hopper 用户也吃到 FP4 的红利？
+
+** 与此同时：MoE 把"显存和通信"问题放大
+
+平行另一条线。2017 年 Shazeer 提出 *Mixture-of-Experts (MoE)*：每个 token 只激活一部分专家，让"模型大但计算少"成为可能。2021 年 Google 的 *GShard* 把 MoE 工程化，2024 年 Mistral 的 *Mixtral*、DeepSeek-V3 (Zhao 2025a) 把 MoE 推到 671B 规模。
+
+但 MoE 有个隐藏的代价：*激活内存和 all-to-all 通信暴涨*。每个 token 要送到正确的专家上，每张 GPU 既要存中间激活，又要和其他 GPU 来回传专家输入输出。MoE 越大，这个"传输和缓存"的开销越压死人。
+
+DeepSeek-V3 用 *blockwise FP8 + DeepEP (FP8 通信库) + DeepGEMM (FP8 kernel)* 做到了在 Hopper 上训 671B MoE。这是迄今为止 FP8-on-Hopper 最完整的成功案例。
+
+*留下的问题*：DeepSeek-V3 的激活和通信都是 FP8。还能不能再砍一半？答案是"FP4 一定能砍"——但 Hopper 没有 FP4 算力。
+
+** 这篇论文：拆分"算"和"存"
+
+所有线索汇到这篇。问题清单：
+
+1. *目标*：MoE 671B 模型在 Hopper 上吃到 FP4 的省内存和省通信红利。
+2. *约束*：Hopper 没有 FP4 Tensor Core。
+3. *陷阱*：Wang 2025 已经警告——~FP4 ↔ BF16 ↔ FP8~ 来回 cast 会把低精度的好处吃光。
+
+这篇的关键创新不是"如何在 Hopper 上做 FP4 计算"——做不到。而是 *承认做不到，然后绕过去*：
+
+#+begin_src
+   想要 FP4 的好处   |  能在 Hopper 上做  |  做法
+   ----------------+--------------------+-----------------
+   省显存 (存激活)  |  能                |  激活存成 MXFP4
+   省通信带宽       |  能                |  all-to-all 传 MXFP4
+   省算力 (做 GEMM) |  不能              |  GEMM 还是 FP8
+#+end_src
+
+*把"算"和"存/传"解耦*。算继续用 Hopper 原生的 FP8 算力，存和传压成 FP4。这样 Hopper 用户可以拿到 FP4 的*一半*红利（内存 + 通信），失去另一半（算力），但已经够香了。
+
+要让这个 design 真的跑起来，本文的两个核心技术贡献是：
+
+1. *直接 FP8 ↔ FP4 bitwise 转换 kernel*。不走 BF16 中间桥。手写 bit 操作（处理隐式 leading bit、subnormal、guard bit、RTNE 舍入）把 FP8 (E4M3) 直接重映射到 FP4 (E2M1) 和反向。
+2. *scaling-aware 行列布局转换*。MXFP4 的 32-元素 block scale 需要在行存和列存之间转换，本文设计了"scale 计算优先 → 异步 write-back" 的流水线，让 scale 计算和后续 compute kernel overlap，把开销藏掉。
+
+外加一个工程贡献：*前向用 FP4，反向退回 FP8*。这是经验性的结论——他们发现反向时的额外 FP4→FP8 dequant 开销，超过了用 FP4 传梯度省下的通信开销。所以非对称：*激进的前向 + 保守的反向*。
+
+结果：671B MoE on Hopper，激活内存 -14.8%（11.8 GB），吞吐 +12.5%（1157 → 1302 tokens/GPU/s），收敛和 FP8 baseline 持平。
+
+* 问题-解法压缩总览
+
+#+begin_src
+  问题                           解法                           留下的新问题
+  ---------------------------- -----------------------------  ---------------------------
+  模型太大装不下 (2017)         混合精度 FP16 + master FP32     FP16 还是贵
+  (Micikevicius 2017)
+                                                              v
+  FP16 还是贵                   per-tensor FP8 + 动态缩放       per-tensor 太粗
+  (Peng 2023, FP8-LM)
+                                                              v
+  per-tensor 太粗               每 32 个元素一个 power-of-2     "4 bit 真能训吗"
+  (Rouhani 2023, MX)             scale 的 microscaling
+                                                              v
+  4 bit 能训吗                  MXFP4/NVFP4 + 随机舍入 + RHT    只能在 Blackwell 上
+  (Tseng 2025, Chmiel 2025)
+                                                              v
+  Hopper 没 FP4 算力            激活/通信 FP4 + 算用 FP8        MoE 通信仍是瓶颈
+  Wang 2025 又警告              不要 BF16 中转
+                                                              v
+  *把"算"和"存/传"拆开*          *直接 FP8 ↔ FP4 bit 转换*       (待后续)
+  (This paper, 2026)            *前向激进 + 反向保守*
+                                *scale 计算与 compute overlap*
+#+end_src
+
+* 洞见 -- 这条演化线背后真正在变什么
+
+表面上：比特数在变小 (32 → 16 → 8 → 4)。
+
+但更深层有几个隐藏的转变：
+
+** 1. 从"精度均匀" 到"精度结构化"
+
+最早的混合精度只分两档：master FP32 + compute FP16。FP8 时代开始 *按"位置"分配精度*——权重一档，激活一档，梯度一档。到了 MX 时代，*按"32 元素 block"分配精度*。到本文，*按"前向 vs 反向"分配精度*，*按"算 vs 存 vs 传"分配精度*。
+
+精度从"标量参数"变成了"精度分配的设计空间"。这是一个范式转移：未来的低精度训练设计，本质是 *精度路由问题*——决定每一个 tensor、每一个阶段、每一个用途用多少 bit。
+
+** 2. 从"硬件先行" 到"软件夺权"
+
+FP16、FP8、FP4 这一路砍下来，原本都是 NVIDIA 出新卡 → 学术界用新格式 → 工业界跟进。Blackwell 上的 FP4 也是这条路。
+
+本文反着走：*硬件没给我 FP4 算力，那我软件仿真 FP4 的存和传*。这是从"等硬件"到"绕硬件"的转变。同样的思路可以推到 ROCm/MI300 上的"软仿真 MXFP4"、A100 上的"软仿真 MXFP8"。一旦"低精度训练"被拆解成"存、传、算"三个独立的设计变量，"软件能补硬件的洞"就成了通用策略。
+
+** 3. 从"全栈一致" 到"接口为王"
+
+DeepSeek-V3 自己写 DeepGEMM、自己写 DeepEP，全栈定制。本文反过来——*plug-in 到 Transformer Engine 的 blockwise FP8 recipe*，定义清楚 ~BF16ToFP4Row~、~FP4RowToFP8Row~、~FP4RowToFP8Col~ 三个转换 kernel 作为接口，剩下的复用现有栈。
+
+这预示着：低精度训练正在从"垂直整合的大工程"演化为"标准化的精度转换层 + 现有训练栈"。未来谁定义了"精度转换接口的事实标准"，谁就拿到生态位。
+
+** 4. 下一步最可能往哪走
+
+- *精度路由器*：自动决定每个 tensor 在每个阶段用多少 bit。从手工规则（前向 FP4 反向 FP8）走向学习/搜索得到。
+- *软仿真 FP4 扩散到所有非 Blackwell 卡*：H800、A100、MI300、华为 910 都会有自己的"软 FP4"实现。
+- *把 FP4 推到优化器状态*：Adam 的 m、v 还是 FP32，下一刀会切在这里（已有 8-bit Adam，4-bit Adam 是必然）。
+- *通信压缩成为独立设计变量*：本文已经在做了——通信用 FP4，算用 FP8。未来通信精度会比计算精度更激进，因为带宽永远比算力贵。
+
+* 给外行讲完这条线 -- 一句话
+
+人们想训更大的模型，但显卡装不下，于是开始砍比特数：从 32 砍到 16，再砍到 8，再砍到 4。每砍一刀都要解决"精度不够、范围太窄"的新问题。每次解法都是"把缩放因子做得更精细——从整个张量一个 scale，到每 32 个数一个 scale"。但砍到 4 bit 时遇到一个分叉：要 4 bit 算力得买 Blackwell 卡，全世界大多数人用的还是 Hopper 卡。*这篇论文的聪明之处是把"算"和"存/传"拆开*——算还是 FP8，但存和传压成 FP4，让 Hopper 用户也能吃到一半的红利。代价是要手写一堆 bitwise 转换 kernel，把 FP4 直接搬到 FP8 而不经过中间格式。结果：在 671B 的 MoE 模型上，省 14.8% 显存，提速 12.5%，收敛不掉。
+
+* 诚实标注
+
+- 引用关系基于本文的 Related Work 章节和参考文献列表，*以下是高置信度链路*：
+  - 这篇 → DeepSeek-V3 (Zhao 2025a) → Peng 2023 → Micikevicius 2017
+  - 这篇 → Tseng 2025 / Chmiel 2025 → OCP MX 规范 2023 → Rouhani 2023
+  - 这篇 → Wang 2025 (FP8 flow MoE)
+- *中等置信*：把 Shazeer 2017、Jacobs & Jordan 1991 接到 MoE 起源——本文没直接引，是基于领域常识补的根。
+- *找到的层数*：5 层（含奠基），符合预期。
+- *后续工作信息不全*：GPT-OSS-120B 的 FP4 训练只有传言无公开文档，本文承认这一点。这意味着"前沿延伸"那一节大部分是基于趋势的预测而非引用证据。

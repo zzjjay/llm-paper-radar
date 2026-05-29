@@ -1,0 +1,291 @@
+#+title:      Bielik-Q2-Sharp: A Comparative Study of Extreme 2-bit Quantization Methods for a Polish 11B Language Model
+#+date:       [2026-05-29 Fri 00:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T005006-en
+#+source:     https://arxiv.org/abs/2603.04162
+#+authors:    Jakub Prejzner
+#+venue:      arXiv 2026
+
+* The River of the Problem
+
+An 11-billion-parameter language model normally requires 22 GB of VRAM just to load. Can we compress it to 3 GB so it runs on a consumer GPU — or even a phone — without a meaningful drop in reasoning quality?
+
+This question has never been cleanly solved in thirty years. The difficulty sits in a strange place: most weights in a model are unimportant, but if you get even a handful of the critical ones wrong, the whole model collapses. How do you know which ones are critical? And how do you preserve them without access to the full training history?
+
+Worse still: we now want to compress every weight down to *2 bits* — meaning each weight can take only 4 distinct values. This approaches the information-theoretic floor. The thirty-year-old puzzle of "which weights matter" is amplified a hundredfold under this pressure. Bielik-Q2-Sharp is the furthest downstream point this river has reached so far.
+
+* Map of Origins
+
+#+begin_example
+[1990] LeCun et al. - Optimal Brain Damage (OBD)
+  |
+  | Problem: Neural networks are too large; how do we prune useless weights?
+  | Solution: Use second-order derivatives (diagonal of the Hessian)
+  |           to assign an "importance score" to each weight
+  |
+  | Buried problem: Assumes the Hessian is diagonal — it isn't
+  v
+[1993] Hassibi & Stork - Optimal Brain Surgeon (OBS)
+  |
+  | Problem: OBD prunes the wrong weights by ignoring inter-weight coupling
+  | Solution: Use the full Hessian inverse; when pruning one weight,
+  |           immediately adjust all the remaining weights to compensate
+  |
+  | Buried problem: Computing H^-1 is too expensive for modern networks
+  v
+[2022] Frantar & Alistarh - OBQ (Optimal Brain Quantization)
+  |
+  | Problem: OBS only handles pruning, not quantization;
+  |          and nobody had scaled it to modern model sizes
+  | Solution: Extend the OBS framework to quantization
+  |           (pruning = quantizing to 0); speed up the algorithm
+  |
+  | Buried problem: Still O(d^3) per row; a 175B model would take years
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: OBQ recomputes the Hessian inverse for every row — can't scale to 175B
+  | Solution: Drop greedy ordering; scan columns left-to-right;
+  |           one Cholesky factorization shared across all rows
+  |
+  | OPT-175B quantized to 3-4 bit in 4 GPU-hours. Collapses at 2 bit.
+  v
+[2023] Chee et al. - QuIP (Quantization with Incoherence Processing)
+  |
+  | Problem: GPTQ collapses at 2 bit because the weight matrix
+  |          has a few "spike" directions
+  | Solution: Before quantizing, multiply the weights by a random orthogonal
+  |           matrix to "smear" them (incoherence), so no direction
+  |           is special; then run GPTQ
+  |
+  | Buried problem: Random orthogonal matrices are slow;
+  |                 scalar rounding wastes the resulting spherical structure
+  v
+[2024] Tseng et al. - QuIP#
+  |
+  | Problem: QuIP is slow; scalar rounding ignores the spherical distribution
+  | Solution: Replace random orthogonal with Hadamard (fast);
+  |           use E8 lattice codebook for vector quantization
+  |           (optimal sphere-packing in 8D); add one fine-tuning pass
+  v
+[2026] Prejzner - Bielik-Q2-Sharp  <-- target paper
+  |
+  | Problem: All the above methods were validated mainly on English models.
+  |          Do they hold for a morphologically complex, data-scarce language
+  |          like Polish?
+  |          A new hole is found: rotation-based methods score high on
+  |          likelihood benchmarks but collapse during autoregressive
+  |          generation ("MC-generation dissociation")
+  v
+[2026+] ParoQuant / ReSpinQuant / ButterflyQuant / InfoQuant ...
+  Exploring sub-2-bit regimes and fixing generation collapse in rotation methods
+#+end_example
+
+* Evolutionary Narrative
+
+I dug this line up in reverse; now I'll tell it forward. Each paper exists because the previous one had a specific, concrete failure.
+
+** 1990 | OBD: Turning "which weights matter" into a math problem
+
+*** What problem it saw
+
+In the 1990s, as neural networks began to grow, a naive instinct said "prune useless connections." But how do you know which connections are useless? By intuition? By absolute weight magnitude? Neither is reliable — a weight with a tiny absolute value can still be critical if it sits in a sensitive part of the network, and removing it can cause a collapse.
+
+*** Its solution
+
+LeCun's group borrowed a second-order Taylor expansion from physics: expand "how much does the loss rise if we remove this weight?" into a Taylor series. The first-order term is near zero at a trained model (we're near a local minimum), so the second-order term dominates — that is, the *Hessian matrix* determines each weight's importance score.
+
+To keep computation tractable, they used only the diagonal of the Hessian. Importance of a weight = (weight value squared) × (second derivative at that position). Prune those with the lowest scores.
+
+*** Why it worked (and what pit it left)
+
+This was the founding move that turned pruning from craft into mathematics. The cost was the diagonal assumption — it implicitly says "weights don't affect each other." In reality weights are coupled: remove one and the optimal values of the rest shift. OBD ignored this entirely.
+
+** 1993 | OBS: Removing the diagonal assumption
+
+*** What problem it saw
+
+Hassibi and Stork directly challenged OBD: how do you know you're pruning the right weights? They ran experiments showing that OBD's diagonal assumption frequently prunes the wrong connections — especially in well-trained networks where inter-weight coupling is precisely what dominates.
+
+*** Its solution
+
+Use the *full* Hessian inverse H^{-1}. Two things happen simultaneously:
+1. Compute a true importance score for each weight that accounts for coupling.
+2. Once weight w_q is pruned, immediately apply a closed-form update to *all remaining weights* to cancel as much of the induced error as possible.
+
+It's like demolishing a building column while simultaneously redistributing the load to the other columns.
+
+*** Why it worked (and what pit it left)
+
+This "prune-one, compensate-all" second-order recipe became the template for every successor. But it requires computing H^{-1}, which is prohibitively expensive at scale — even a network with a million parameters was painfully slow, let alone today's billion-parameter models. This performance wall froze the line for nearly thirty years.
+
+** 2022 | OBQ: Extending OBS from pruning to quantization, and scaling it up
+
+*** What problem it saw
+
+Frantar and Alistarh noticed something almost forgotten: the OBS second-order framework is not restricted to pruning. Pruning is just "set a weight to zero" — what if you set it to the nearest integer instead? That's *quantization*. Yet for 30 years nobody had taken this equivalence seriously and run it on modern models.
+
+*** Its solution
+
+OBQ = OBS for Quantization. Replace "prune one weight" in the master formula with "quantize one weight to the nearest discrete value"; keep the second-order compensation unchanged. Add engineering optimizations to handle networks with a few billion parameters.
+
+*** Why it worked (and what pit it left)
+
+This was the first attempt to connect the second-order compensation idea to modern large models. But OBQ is still a greedy algorithm — at each step it must select the next easiest-to-compensate weight, then recompute H^{-1}. Complexity is roughly O(d^3) per row. At the 175B scale, estimated runtime: years. The path died against the wall of compute.
+
+** 2022 | GPTQ: Drop greedy ordering, scale to 175B
+
+*** What problem it saw
+
+Frantar didn't give up. OBQ dies because of greedy ordering — but why does it have to be greedy? If you fix the order (say, scan columns left to right), is the result too bad to use? He ran the experiment and found: slightly worse, but nowhere near catastrophically so.
+
+*** Its solution
+
+GPTQ is a brute-force engineering simplification:
+1. No ordering search — scan the weight matrix column by column, left to right.
+2. One Cholesky factorization of H^{-1}, shared across all rows.
+3. Lazy batch updates to saturate memory bandwidth.
+
+Result: OPT-175B quantized to 3-4 bit in 4 GPU-hours, with negligible quality loss. This was the moment large-model quantization became practically usable.
+
+*** Why it worked (and what pit it left)
+
+It worked because it accepted "near-optimal" in exchange for massive engineering feasibility — a profound engineering trade-off.
+
+But the pit appears at more aggressive compression ratios. 3 bit is fine; at *2 bit*, GPTQ starts to collapse. The reason: both the weight matrix and the Hessian have a small number of extreme directions (outlier directions). When weights are compressed to only 4 possible values, second-order compensation cannot recover the error concentrated in these spike directions — the error explodes there.
+
+** 2023 | QuIP: Smear the weights before quantizing
+
+*** What problem it saw
+
+Chee's group pinpointed the root cause of GPTQ's 2-bit collapse: the weights and the Hessian have *spikes* in certain directions. If a direction is especially prominent ("incoherent"), quantization error concentrates and detonates there.
+
+*** Its solution
+
+Introduce a mathematical property called *incoherence*: a matrix is "coherent" if it looks roughly the same in every direction. Hadamard transforms and random orthogonal matrices can make any matrix coherent.
+
+The recipe: before quantizing, multiply the weight matrix W on both sides by random orthogonal matrices U and V, producing U·W·V. Now W has no spike directions — *no weight is special*. Run GPTQ on the transformed matrix. After quantization, multiply back by U^T and V^T to restore.
+
+*** Why it worked (and what pit it left)
+
+This was the first time 2-bit quantization was truly usable. The key insight: instead of laboriously compensating spike directions, eliminate the spike directions first.
+
+But QuIP still has two inefficiencies:
+1. Random orthogonal matrices are slow — expensive to compute and store.
+2. After smearing, the weight distribution is nearly a *sub-Gaussian sphere* (a round ball), but the quantizer still uses scalar rounding — like fitting a round ball into a square grid where the corners are wasted.
+
+** 2024 | QuIP#: Hadamard for speed, E8 lattice to exploit spherical structure
+
+*** What problem it saw
+
+Tseng et al. named both of QuIP's inefficiencies precisely: the random orthogonal matrix is purely slow and can be replaced by a *randomized Hadamard transform*, which is much faster with even better theoretical properties; scalar rounding purely fails to exploit the spherical structure and can be replaced by *vector quantization* — using a codebook of points that are optimally packed inside the sphere. The optimal sphere-packing lattice in 8 dimensions is the *E8 lattice*, an object mathematicians have studied for decades.
+
+*** Its solution
+
+QuIP# = Hadamard smearing + E8 lattice codebook + one fine-tuning pass. Each improvement is independently effective; combined, they bring 2-bit quality close to 4-bit for the first time.
+
+*** Why it worked (and what pit it left)
+
+A victory of stacked improvements. The remaining question: all these methods were validated primarily on English models. Will other languages produce surprises? And is inference actually fine in practice?
+
+** 2026 | Bielik-Q2-Sharp: Port the whole stack to Polish, discover a new pit
+
+*** What problem it saw
+
+Prejzner noticed something the field had overlooked: nearly all the papers above ran experiments only on English models. For a *morphologically rich* language — Polish has 7 grammatical cases — does 2-bit quantization still hold up? What calibration corpus is needed? Whether the calibration methodology matters is itself an open question.
+
+More critically, while systematically comparing QuIP#, SpinQuant, ButterflyQuant, QTIP, VPTQ, and AQLM, he found a phenomenon nobody had flagged: *rotation-based methods (SpinQuant, ButterflyQuant) lose almost no points on multiple-choice benchmarks, but once asked to autoregressively generate continuous text, they start producing incoherent output*. He named this phenomenon *MC-generation dissociation*.
+
+*** Its solution
+
+Engineering brute-force enumeration: take the same Bielik-11B-v2.3-Instruct model, use the same Polish-language Hessian calibration matrix, run all six 2-bit quantization methods, and compare across 22 Polish-language benchmarks.
+
+Findings:
+- *QuIP# E8P12* is the best all-around — at 3.26 GB it reaches 71.92% (the baseline IQ2_XXS scores 72.07%, within statistical noise).
+- *QTIP* is the bits-per-quality efficiency champion — 35% smaller than VPTQ at the same quality.
+- Rotation-based methods collapse on eq_bench (which tests reasoning), because likelihood-based evaluation lets the model *see the correct answer and then rank options*, whereas during generation the model must *step forward one token at a time on its own* — the compressed spike directions accumulate divergence along the generation path.
+
+*** Why it worked (and what pit it left)
+
+This paper's significance is not "which method wins" — it lies in two things:
+
+1. *Running the full method stack through a non-English model*, establishing a credible baseline for non-English communities.
+2. *Exposing MC-generation dissociation* as an industry-wide evaluation blind spot — everyone uses perplexity and multiple-choice to assess quantization quality, but deployed models must *generate*.
+
+The remaining pits: how do you fix the generation failure in rotation-based methods? And can you push below the 2-bit floor?
+
+* Frontier Extensions
+
+After Bielik-Q2-Sharp, this line is still moving fast. A few directions worth tracking:
+
+- *ParoQuant* (2025-11, arxiv 2511.10645) — replaces global rotation matrices with *pairwise rotations* computed online. Matches QTIP quality, crushes QuIP#.
+- *ReSpinQuant* (2026-04, arxiv 2604.11080) — addresses the limitation of SpinQuant's single global rotation by using *per-layer distinct rotations + subspace residual approximation*.
+- *InfoQuant* (2026-05, arxiv 2605.26175) — reframes the role of rotation: not "suppress spikes" but "make the distribution more amenable to quantization." This perspective may precisely explain the MC-generation dissociation Bielik uncovered.
+- *QAM-W* (2026-05, arxiv 2605.26339) — skips learned rotations entirely; uses *block Hadamard + 2D codebooks*, avoiding the fragility of learned components.
+- *BitNet b1.58* (2024-02, arxiv 2402.17764) — a fundamentally different path: no PTQ at all; train from scratch with ternary weights {-1, 0, 1} (1.58 bit). Bypasses the entire rotation paradigm.
+
+* One Diagram
+
+#+begin_example
+                Second-order                Remove spikes         Exploit structure
+                compensation                (rotation smearing)   (E8 codebook)
+                ============                ===================   =============
+1990   OBD --x  Diagonal Hessian (prunes wrong weights)
+        |
+1993   OBS --o  Full H^-1 (too slow)
+        |                                                          ~30-year gap
+        |
+2022   OBQ --o  Extended to quantization (can't run 175B)
+        |
+2022  GPTQ --o  Fixed ordering (collapses at 2 bit)
+        |  \
+        |   \
+2023  QuIP --o-----o  Random orthogonal smearing (slow + ignores spherical structure)
+        |          |
+2024 QuIP# --o-----o-----o  Hadamard + E8 + fine-tuning
+        |          |     (2-bit quality approaches 4-bit)
+        |          |
+2026 Bielik--o-----o-----o  Systematic comparison + Polish validation
+  Q2-Sharp        + MC-generation dissociation discovered (NEW)
+                  |
+2026+        ParoQuant / ReSpinQuant / InfoQuant / QAM-W
+             Fixing rotation paradigm + exploring <2 bit
+
+
+   Core thesis: How do you preserve the handful of critical weights
+                in a large model when you have no access to training history?
+
+   Each generation's answer:
+   - OBD/OBS:    Use second derivatives to identify what matters
+   - OBQ/GPTQ:   Scale the above to modern model sizes
+   - QuIP/QuIP#: Make all weights equally "un-special" before compressing
+   - Bielik:     In real-world scenarios, do these methods actually hold up?
+#+end_example
+
+* Insights
+
+After digging this river up from the bottom, three things stand out:
+
+1. *The thirty-year main thread has only one question: how to use the Hessian to allocate the error budget.* From OBD to QuIP#, every change is a variation on "how do we keep second-order compensation valid at larger scale and more aggressive compression?" The 1993 master formula of "prune one, compensate all" is still driving the 2026 frontier. That kind of continuity is genuinely rare in ML.
+
+2. *Major breakthroughs often come from eliminating the problem rather than solving it.* QuIP's central insight was not "how to better compensate spike directions" but "eliminate the spike directions first." This is a classic perspective flip: instead of working harder in the original problem space, change spaces so the original problem ceases to exist.
+
+3. *The evaluation method is itself a variable.* Bielik-Q2-Sharp's true contribution is not that any particular method won — it's that it exposed *MC-generation dissociation*: the whole field has been evaluating quantization with perplexity and multiple-choice, but deployed models must generate. This means that some "SOTA 2-bit" papers from recent years may not be SOTA at all — they simply *didn't collapse on that particular evaluation dimension*.
+
+Where does the line go next? Two directions:
+- *Downward* — 1.58 bit or lower, but requiring retraining from scratch (the BitNet route).
+- *Fix rotation methods* — repair generation-time collapse within the PTQ paradigm (the ParoQuant / InfoQuant route).
+
+Looking further ahead, "PTQ" as a paradigm may itself be a transitional phase — once inference hardware matures to natively support ternary/binary arithmetic, QAT will absorb PTQ.
+
+* Implications
+
+If you are doing research:
+
+1. *Read papers in reverse.* For any paper you find impressive, find who it criticizes and improves upon, and recurse three levels deep. What you get is not just the knowledge in that paper but the entire intellectual lineage. Inside that lineage you will find: much of what is labeled "novel" is actually an old idea transplanted into a new setting.
+
+2. *Be suspicious of conclusions validated only on English.* Bielik-Q2-Sharp — one researcher, $285 in compute — uncovered a language-adaptation problem an entire field had overlooked. Any *apparently universal* technical claim deserves the question: does this still hold under a different distribution?
+
+3. *Evaluation is your blind spot.* The deepest finding in the Bielik paper came from switching evaluation dimensions — replacing perplexity / MC with generation. When everyone uses the same benchmark suite, the differences live in the benchmarks, not the methods. To find a breakthrough, first question the evaluation.
+
+This means you can: take a second-hand GPU, pick an overlooked application domain (language, task type, evaluation dimension), and find a phenomenon the entire field has missed. That is exactly how Bielik-Q2-Sharp was published.

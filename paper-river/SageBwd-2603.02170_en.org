@@ -1,0 +1,231 @@
+#+title:      SageBwd: A Trainable Low-bit Attention
+#+date:       [2026-05-29 Fri 00:44]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T004412-en
+#+source:     https://arxiv.org/abs/2603.02170
+#+authors:    Jintao Zhang, Marco Chen, Haoxu Wang, Kai Jiang, Ion Stoica, Joseph E. Gonzalez, Jianfei Chen, Jun Zhu
+#+venue:      arXiv preprint, 2026
+
+* The Problem River
+
+The attention mechanism is the heart of the Transformer, but it has a notorious flaw: as sequence length grows, computation explodes quadratically. For a decade, successive generations have tried to reduce the power draw of this heart.
+
+The most direct path is *computing with fewer bits*. GPUs are packed with low-precision INT8/FP8 units; using them can multiply throughput several times over. But there is a wall: people have figured out how to use low-bit arithmetic for *inference*, yet the moment you need *training*—especially pre-training a large model from scratch—low-bit attention breaks down. Loss descends more slowly than full precision, or diverges outright.
+
+The question running through this line of work is: *Why is training so much more demanding than inference? Can low-bit attention really be used to train a model from scratch?*
+
+The difficulty has two roots. First, the gradients inside backpropagation are already small; multiplied by accumulated quantization error, the signal drowns in noise. Second, quantization error from the forward pass flows back through the chain rule, polluting the backward pass even when those backward steps are themselves computed in high precision. The issue is not "can we compute it?" but "after computing it, can we still learn anything?"
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: sequences grow long, O(N^2) attention becomes unsustainable
+  | Solution: start with engineering compression rather than touching the algorithm
+  v
+[2022] Dao et al. - FlashAttention
+  |
+  | Observation: prior optimizations cut FLOPs, but the real bottleneck is memory I/O
+  | Solution: tile the computation, keep intermediates in on-chip SRAM, reduce HBM trips
+  v
+[2024] Dao / Shah et al. - FlashAttention 2 & 3
+  |
+  | Observation: FA1's parallel tiling can be refined; new Hopper GPUs expose FP8 Tensor Cores
+  | Solution: warp-level reordering + FP8 variant; roughly 2× faster again
+  v
+[2025a] Zhang et al. - SageAttention (v1)
+  |
+  | Observation: FA family still uses FP16/BF16; FA3's FP8 drops accuracy
+  | Solution: INT8-quantized attention with per-channel safe-range analysis; plug-and-play for inference
+  v
+[2025b/f] Zhang et al. - SageAttention 2 / 2++
+  |
+  | Observation: a small number of outliers in the attention matrix monopolize INT8's dynamic range
+  | Solution: smooth those outliers + per-thread INT4 for another speedup
+  v
+[2025c] Zhang et al. - SageAttention3 + SageBwd
+  |
+  | Observation: everything so far is inference-only; training has never been touched
+  | Solution: apply INT8 to six of the seven backward MatMuls; fine-tuning works;
+  |           but pre-training converges slowly with a persistent gap
+  v
+[2026] Zhang et al. - SageBwd (this paper)
+  |
+  | Observation: the previous paper left pre-training gap unexplained as "future work"
+  | Solution: dissect every backward term, pinpoint dS as the culprit;
+  |           combine QK-norm and reduced tokens-per-step to match full precision in pre-training
+  v
+[2026+] Concurrent work: Attn-QAT (4-bit) / NVFP4 outlier dynamics
+       ...... low-bit training is racing toward even fewer bits
+
+[Orthogonal thread] Henry et al. 2020 - QKNorm
+       Originally designed to fix softmax saturation in low-resource translation;
+       five years later it becomes a critical stabilizer for low-bit training
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani: Drop the RNN, but Keep an Expensive Heart
+
+Go back to the moment Transformer was born. Before it, sequence modeling meant either RNNs—processing one token at a time, inherently sequential—or CNNs with limited receptive fields. Vaswani cut the RNN entirely, letting any two positions attend directly to each other.
+
+The price of this design was not much noticed at the time: the attention matrix is N×N, so doubling the sequence doubles both compute and memory four times over. In the era of short text that overhead was tolerable. But ten years later, long context, video generation, and inference-heavy workloads arrived, and that O(N²) became the elephant in the room that all subsequent work revolves around.
+
+The debt left behind: attention is too expensive and must be compressed somehow.
+
+** 2022 | FlashAttention: Don't Cut FLOPs—Cut Memory Traffic
+
+Before 2022, the mainstream approach to "speeding up attention" was *approximation*—sparse attention, low-rank decomposition, turning N×N into N×k. Dao looked around and noticed: these methods reduce theoretical FLOPs but rarely produce proportional wall-clock speedups, because the GPU bottleneck is not arithmetic but *data movement*.
+
+His insight cut straight to the hardware: the bandwidth gap between HBM (device memory) and SRAM (on-chip cache) is tens of times, and attention is slow because intermediate results are repeatedly shuffled between the two.
+
+The solution is *IO-aware tiling*: partition Q, K, V into tiles; load one tile into SRAM and complete the full attention sub-computation there before writing results back. The algorithm is *exact*, yet memory accesses drop dramatically. Outcome: BERT training 15% faster, GPT-2 3× faster, Path-X solved for the first time.
+
+The debt left behind: FlashAttention made *exact* attention cheap, but precision remained FP16/BF16. The more aggressive low-bit units on the GPU—INT8, FP8—sat untouched.
+
+** 2024 | FlashAttention 2/3: Fully Harvesting the Hardware Dividend
+
+FlashAttention became the de facto standard almost immediately. Dao quickly found that FA1's parallel partition still had headroom; FA2 redesigned the warp-level work assignment. FA3 then coincided with the Hopper (H100) generation—whose Tensor Cores natively support FP8—so FA3 shipped an FP8 variant.
+
+The distinction: FA1/2 pushed engineering limits further; FA3 was the first to step into *low-bit attention*.
+
+But SageAttention's authors later noted that FA3's FP8 variant is *not plug-and-play* for video diffusion and large generative models—accuracy degrades. FA3 proved "low-bit attention can be computed," but not "low-bit attention works reliably across all models."
+
+The debt left behind: FP8 accuracy is not sufficiently stable; and the entire FlashAttention family still takes an *inference perspective*—fast forward pass, no dedicated backward optimization.
+
+** 2025a | SageAttention (v1): Not FP8—INT8
+
+Zhang's team stepped in and argued: rather than wrestling with FP8's limited dynamic range, use INT8—more mature, broader Tensor Core support, and actually faster. The prerequisite was identifying "where it is safe to quantize."
+
+They decomposed attention: Q×K^T has a relatively well-behaved input distribution and can tolerate INT8; after softmax, P×V is also friendly because P is already in [0, 1]. With per-channel scaling and other details, they produced *plug-and-play* INT8 attention—claiming 2.1× over FA2 and 2.7× over xFormers at inference, with better accuracy than FA3's FP8.
+
+The distinction: the FA family optimizes at the *algorithm level* (IO-aware); SageAttention optimizes at the *numerical level* (low-bit). Two separate threads finally merge.
+
+The debt left behind: attention matrices always contain a handful of *outliers*—certain tokens whose Q or K values are exceptionally large. When forced into INT8, those extremes consume all 256 quantization steps, leaving ordinary tokens with almost no resolution.
+
+** 2025b/f | SageAttention 2 / 2++: Smooth First, Quantize Second
+
+To address outliers, the Sage team borrowed a technique already established in LLM weight quantization—*smoothing*. In short: redistribute the large values in K (e.g., subtract the channel mean) so the distribution flattens, then quantize without wasting steps.
+
+SageAttention2 added systematic outlier smoothing and pushed part of the computation to per-thread INT4. SageAttention2++ is a more efficient engineering implementation.
+
+The distinction: v1 assumed "the distribution is roughly fine, quantize directly"; v2 acknowledged "the distribution is inherently pathological and needs surgery first." This marks a shift toward *admitting data ill-conditioning*.
+
+The debt left behind: no matter how fast, it is still inference-only. The real computational cost of neural networks is *training*—especially pre-training, which consumes hundreds of thousands of GPU-hours. Nobody had brought low-bit arithmetic into training.
+
+** 2025c | SageAttention3 + SageBwd: Finally Daring to Touch Training
+
+SageAttention3 did two things. First, it pushed inference to the extreme—targeting Blackwell GPUs' FP4 Tensor Cores for a 5× speedup over FA. Second, it introduced *SageBwd* for the first time: an INT8-capable backward pass.
+
+Attention backpropagation involves seven MatMuls (dQ, dK, dV, dP, dS, etc.). SageBwd applied INT8 to six of them, leaving the most sensitive one in high precision.
+
+Results split in two:
+- *Fine-tuning*: essentially lossless, matching full precision;
+- *Pre-training*: convergence is achievable, but the loss curve lags full precision with an irreducible gap.
+
+The authors stated honestly in the paper: "pre-training remains to be studied." That single sentence defines the entire motivation for the next paper.
+
+The debt left behind: why does fine-tuning work while pre-training falls behind? Which quantization step is dragging learning down?
+
+** 2026 | SageBwd (this paper): Dissect the Backward Pass, Find the Real Culprit
+
+This paper returns to the promise of the previous one. It invents no new operator and switches no hardware; it does *diagnostic* work: testing the seven backward MatMuls one by one to find which one is sabotaging training.
+
+Four core findings:
+
+*1. dS is the culprit.* The *score gradient dS*—the gradient with respect to attention scores—is the most sensitive to quantization error. All other MatMuls tolerate quantization without issue; once dS is quantized with insufficient precision, the entire gradient direction goes wrong. It does not matter how accurate the forward pass is, because weights are already being updated in the wrong direction.
+
+*2. Tokens per step (TPS) is a hidden switch.* The gap in the previous work appeared at large batch size (2.1M tokens/step). Reducing TPS to 260K allows SageBwd to match full precision. Intuition: with large batches, gradients are averaged over more samples, making each sample's signal weaker and quantization noise proportionally more prominent.
+
+*3. QK-norm is indispensable at large TPS.* During pre-training, the norms of Q and K grow monotonically, eventually saturating softmax's numerical range; at low precision this produces NaN. QK-norm (from Henry 2020, originally a small tool for softmax saturation in low-resource translation) pins the scale of Q and K—and five years later turns out to be the linchpin of low-bit training stability.
+
+*4. Q-smoothing is useless; K-smoothing is essential.* This is counter-intuitive. Earlier SageAttention versions applied smoothing to both Q and K. But experiments in the pre-training setting show that Q-smoothing provides no benefit and actually degrades the precision of dQ. K-smoothing must be retained.
+
+The distinction: v2/v3 optimized from an *operator* perspective (how to compute faster); this paper reverse-engineers from a *training dynamics* perspective (under what conditions learning actually happens). Same code, but understanding "at which hyperparameters it works" closes the problem.
+
+Why it works: it takes the vague curse of "low-bit training is unstable" and decomposes it into a set of *measurable, tunable* switches (TPS, QK-norm, smoothing choices). Once you can measure and tune, engineers have a recipe.
+
+* Frontier Extensions
+
+Low-bit attention training is already pushing toward more aggressive targets in 2026:
+
+- *Attn-QAT (2026)*: quantization-aware training directly at 4-bit attention. SageBwd is still wrapping up INT8 work; Attn-QAT has already jumped to 4-bit.
+- *NVFP4 outlier dynamics (2026)*: studying outlier behavior during pre-training with NVIDIA's new FP4 format. The "K distribution pathology" revealed in this paper is amplified several times at even lower bit-widths, and this thread is being carefully dissected.
+
+It is reasonable to expect that the diagnostic framework SageBwd provides—decompose the seven MatMuls, locate the sensitive one, pair with training tricks—will be reused for these more aggressive formats.
+
+* One Diagram
+
+#+begin_example
+                  PROBLEM                          SOLUTION
+                  =======                          ========
+
+  2017   Attention O(N^2) too costly        Transformer accepts the cost
+            |
+  2022   Bottleneck is data movement,        FlashAttention: tile computation,
+            not arithmetic                     stay in SRAM
+  2024   FP8 accuracy unstable;              FA2/3: FP8 + warp reordering
+            training untouched
+            |
+  2025a  FA never quantized; FP8 drops       SageAttn: INT8 + safety analysis
+            accuracy
+            |
+  2025b  Outliers in attention matrix        SageAttn2/2++: K-smoothing
+            |
+  2025c  Inference maxed out; training       SageAttn3 + SageBwd:
+            still untouched                    INT8 backward (6/7 MatMuls)
+            |                                  ── fine-tune ok
+            |                                  ── pre-train lags behind
+            v
+  2026   Why does pre-train lag?             This paper: diagnostic dissection
+                                             (1) dS is the culprit
+                                             (2) TPS is the switch
+                                             (3) QK-norm is the linchpin
+                                             (4) Q-smoothing is useless
+            |
+            v
+  2026+  Pushing from INT8 toward            Attn-QAT, NVFP4 ......
+            INT4 / FP4
+
+
+   Horizontal axis: time     Vertical axis: abstraction level
+                             (algorithm -> numerical -> training dynamics)
+
+   How the center of gravity in attention optimization has *descended*:
+     Algorithm level (FA, reduce IO)
+        -> Numerical level (Sage v1/2, low-bit)
+           -> Training dynamics level (this paper, scheduling & stability)
+#+end_example
+
+* Insights
+
+Reading through this line of work, I see not a chain of technical iterations but a process of *optimization gravity descending layer by layer*.
+
+At first everyone worked at the *algorithm level* (FlashAttention's tiling). When that was exhausted, attention shifted to the *numerical level* (SageAttention's INT8). When that layer too was nearly wrung dry, the problem was forced down to the *training dynamics level*—no longer "can this operator be computed?" but "under what scheduling policy and stabilization technique can this operator let a model *learn* something?"
+
+Each descent changes the shape of the problem:
+- Algorithm-level problems are about *performance* (quantitative: how many times faster?);
+- Numerical-level problems are about *accuracy* (qualitative: will quality degrade?);
+- Training-dynamics-level problems are about *learning* (systemic: will it diverge? how fast does it converge? what does the loss curve look like?).
+
+The third level is the hardest because it has no closed-form answer—only experiments, ablations, and diagnostic dissection. The value of this paper lies not in inventing a new operator but in *providing a diagnostic methodology*: test each MatMul in the backward pass in isolation; treat training hyperparameters (TPS, normalization) as tunable switches; turn the vague complaint "it's unstable" into a set of actionable prescriptions.
+
+A second hidden insight: *the revival of a "small tool" like QK-norm* is one of the interesting things about research. Henry 2020 originally addressed softmax saturation in low-resource translation—seemingly unrelated to low-bit training. Five years later, because of a shared mathematical structure—*uncontrolled growth of Q and K norms*—it becomes critical in a completely different context. A good small tool does not get discarded by history; it waits for the next person who needs it.
+
+Where this is most likely to go next: *pre-training at INT4 or even FP4*. This paper has laid the diagnostic framework; downstream papers will apply it to lower-bit formats, asking "who is the culprit, what is the switch" all over again. At the same time, the counter-intuitive result of *asymmetric treatment of Q and K* (keep K-smoothing, drop Q-smoothing) will prompt people to reconsider all designs that treat Q and K symmetrically—in the quantized regime, they may simply be two different creatures.
+
+* Takeaways
+
+This evolutionary line offers genuine lessons about *how to do research*.
+
+*1. A seemingly throwaway "future work" sentence is a gold mine.* The phrase "pre-training remains to be studied" in SageAttention3 directly sustains this entire paper. Every good paper's limitation section is the next paper's idea—but you have to take other people's limitations seriously.
+
+*2. Diagnosis is worth more than invention.* The biggest contribution here is not a new operator; it is *decomposing the vague "training instability" into measurable switches*. Many breakthroughs in research are not about inventing something new but about *making a problem measurable*. Once you can measure, you can optimize.
+
+*3. Descending gravity is a universal pattern.* When you find yourself fiercely competing at one level—algorithm, numerical, systems—it may be time to descend to the next. The descent in LLM training over recent years from model architecture → data recipes → training dynamics follows exactly the same script as attention optimization.
+
+Actionable points:
+- If you want to do low-bit training, don't rush to write a kernel first: run an ablation, identify which backward MatMul is dragging performance down;
+- If large-batch training is unstable, adjust TPS and QK-norm before touching the algorithm;
+- Don't assume Q and K must be treated symmetrically—under quantization they may play fundamentally different roles.
