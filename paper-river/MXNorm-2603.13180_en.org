@@ -1,0 +1,229 @@
+#+title:      MXNorm: Reusing MXFP block scales for efficient tensor normalisation
+#+date:       [2026-05-28 Thu 12:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T120000-en
+#+source:     https://arxiv.org/abs/2603.13180
+#+authors:    Callum McLean, Luke Y. Prince, Alexandre Payot, Paul Balança, Carlo Luschi (Graphcore)
+#+venue:      arXiv preprint, 2026
+
+* One-sentence summary
+
+MXNorm replaces the "full-tensor sum-of-squares" step in LLM RMSNorm with the block maximums that MXFP8 quantization already has to compute—reusing the same statistics twice—shrinking the normalisation reduction by 32×, saving 1.3% of one Llama3-8B layer's runtime, and 2.6% under NVFP4.
+
+* Tracing the river upstream
+
+The problem did not emerge from nowhere. It is the collision, in 2026, of two decade-long currents: "how to keep neural-network training stable" and "how to squeeze every last FLOP from GPU hardware."
+
+Digging back five layers yields this skeleton:
+
+#+begin_src text
+                 [2015]                  [2016]                 [2019]
+  BatchNorm   --(how to avoid batch?)-->  LayerNorm  --(is the mean necessary?)-->   RMSNorm
+   Ioffe                                    Ba                             Zhang & Sennrich
+                                                                                |
+                                                                                |  (LLM standard, Llama series)
+                                                                                v
+                                                                          [2023~2025]
+                                                                     MXFP / Microscaling  ----+
+                                                                     (Rouhani, Mishra)        |
+                                                                                              |
+                                                                                              |  (matmul flies, norm drags)
+                                                                                              v
+                                                                                         [2026.03]
+                                                                                          MXNorm
+                                                                                          this paper
+                                                                                              ^
+                                                                                              |
+                                                                             [2025] DyT, FlashNorm, nGPT
+                                                                             (the "skip normalisation entirely" school)
+#+end_src
+
+Notice that *two forces* converge here: one is the evolution of normalisation layers themselves (BatchNorm → LayerNorm → RMSNorm), the other is the march toward ever-lower-precision matrix multiplication (FP16 → FP8 → MXFP8 → NVFP4). MXNorm sits precisely at the intersection—it is neither a smarter normalisation nor a more aggressive quantization scheme, but rather *the seam that joins the two lines*: letting normalisation reuse a by-product of quantization.
+
+The story told forward follows.
+
+* Section 1: BatchNorm's motivation and cost (2015)
+
+Around 2014–2015, convolutional networks could already be stacked dozens of layers deep, but training was fragile. A slightly elevated learning rate blew up the loss; a conservative one stalled learning. Ioffe and Szegedy named the phenomenon *internal covariate shift*: each layer's input distribution was constantly reshuffled by the layers before it, forcing later layers to chase an ever-moving target.
+
+Their fix was direct: before each layer, subtract the batch mean and divide by the batch standard deviation, forcibly snapping activations back to a stable distribution. That was *BatchNorm*. The effect was immediate—large models could be trained with large learning rates—and deep learning entered the "normalise first, then train" era.
+
+But BatchNorm left a loose thread: its statistics are computed *along the batch dimension*. That means:
+
+- The batch must be large enough for the statistics to be reliable;
+- Training and inference behave differently (at inference time there is only one sample, so stored running mean/var must stand in);
+- In sequence models, is each token an independent sample? Does it even count as "batch"? The question has no clean answer.
+
+In the RNN / Transformer era these loose threads became increasingly painful.
+
+* Section 2: LayerNorm switches the reduction axis (2016)
+
+Ba, Kiros, and Hinton saw exactly this problem. Their counter-question was simple: *"If we cannot reduce over the batch dimension, which dimension should we use instead?"*
+
+The answer: the *feature dimension*. Compute mean and variance over all hidden dimensions of a single sample and normalise against those. The change looks minor but is profound:
+
+- A single sample suffices; inference and training are perfectly symmetric;
+- Batch size—even batch = 1—is irrelevant;
+- The operation can be applied independently at every time step of an RNN or Transformer.
+
+That was *LayerNorm*. It lacked BatchNorm's dramatic "cures divergence" story, but by freeing normalisation from batch dependence it was immediately embraced by sequence models. Transformers were born with LayerNorm and used it for years.
+
+Yet LayerNorm left its own loose thread: it requires *both* mean and variance, meaning two reduction passes, two subtractions, two divisions—none of them cheap on a GPU.
+
+* Section 3: RMSNorm drops the mean (2019)
+
+Zhang and Sennrich asked a sharper question: *"Is computing the mean actually useful?"*
+
+Their ablations found that removing the "subtract mean" step and keeping only "divide by root-mean-square" cost almost nothing in model quality and was sometimes more stable. The reasoning holds up: what LayerNorm really contributes is *re-scaling* (controlling the magnitude of activations); *re-centering* (shifting to zero mean) is optional for most tasks.
+
+So they wrote a leaner variant—only RMS, no mean. That was *RMSNorm*, with roughly 64% of LayerNorm's compute and negligible quality loss.
+
+The change looks minor, but it landed right as large language models were taking off. The Llama series adopted RMSNorm from its first release; gpt-oss, DeepSeek-V3, and Qwen followed. By 2024 "LLM norm = RMSNorm" had become the default assumption.
+
+The new loose thread was more subtle: RMSNorm looked cheap enough that no one thought to question it any further.
+
+* Interlude: A parallel branch—MXFP quantization (2023–2025)
+
+Cut to 2023 and a different storyline.
+
+GPU throughput growth has always depended on reducing precision. FP16 → FP8 → FP4: each step roughly doubles matrix-multiply throughput. But pure FP4 has too narrow a dynamic range to represent most tensors. The fix?
+
+Rouhani et al. (Microsoft, 2023) proposed the *Microscaling (MX)* format: slice a tensor into small blocks (typically 32 elements), give each block a shared 8-bit exponent scale factor (E8M0), and store intra-block elements at low precision (E4M3 / E2M1). The dynamic range is carried by the scale; the elements are cheap. Fast *and* representable.
+
+Mishra et al. (NVIDIA, 2025) took this to LLM pre-training at scale, delivering a reproducible MXFP8 recipe. Blackwell / Rubin GPUs support the format natively, and by 2025–2026 MXFP8 / NVFP4 had rapidly become the new training baseline.
+
+At this point the normalisation line and the quantization line were still running in parallel. Until—
+
+* Section 4: MXNorm stitches the two lines together (2026.03, this paper)
+
+The authors of MXNorm spotted something nobody had quite said aloud: *the hardware arithmetic has fundamentally shifted.*
+
+Over the past eight years, matrix-multiply throughput has grown 80× (V100 FP16 125 TFLOPS → GB200 FP4 10 000 TFLOPS). But the CUDA cores that handle normalisation, activation functions, and reductions grew only 5.1×, and HBM bandwidth only 8.9×.
+
+Consequence: those "seemingly cheap" non-matmul operations—like RMSNorm—*now account for a steadily larger share of total runtime*.
+
+Concretely, in one Pre-Norm Transformer layer the execution looks like this:
+
+#+begin_src text
+   High-precision input X
+       |
+       v
+   [RMSNorm]  <-- sum(x^2) over the full tensor, full-tensor reduction
+       |
+   High-precision X_bar
+       |
+       v
+   [MXCast]   <-- max(|x|) per block of 32, then scale and quantize
+       |
+   MXFP8 tensor
+       |
+       v
+   [matmul]
+#+end_src
+
+Staring at this picture, the authors asked the key question: *"RMSNorm computes a sum of squares; MXCast computes a per-block maximum. Why are these two statistics computed separately? Can the block maxima that MXCast already produces be used to recover the RMS?"*
+
+They proved the following: if a tensor's elements are approximately i.i.d., then *a suitable generalised p-mean of the per-block maxima differs from the full-tensor RMS by only a constant factor*. That constant depends only on the block size and the element distribution, and can be estimated offline via Monte Carlo.
+
+MXNorm therefore looks like this:
+
+#+begin_src text
+   High-precision input X
+       |
+       +--> [MXCast: compute block scales m_k = max_b |X_kb|]
+       |              |
+       |              v
+       |        Array of block maxima (K values)
+       |              |
+       |              v
+       |        rho_tilde = c * (mean(m_k^p))^(-1/p)   <-- RMS estimate from K values,
+       |              |                                    not from all D = K*B values
+       v              |
+   X * rho_tilde     /
+       |____________/
+       v
+   Normalised + quantized MXFP8 tensor in one pass
+#+end_src
+
+The key gain: *the reduction volume drops from D to K = D/B*—a 32× reduction for block size 32. One pass over the statistics; two things accomplished.
+
+Viewed as a transformation: converting RMSNorm + MXCast into MXNorm requires only three changes:
+
+1. Delete the full-tensor ~sum(x^2)~ reduction inside RMSNorm;
+2. Reuse the ~max_b |x|~ per block that MXCast is computing anyway;
+3. Apply ~(mean(m_k^p))^(-1/p) * c~ to combine those block maxima into an RMS estimate.
+
+* Section 4 (continued): The new problems MXNorm introduces
+
+There is no free lunch. Using block maxima to estimate the RMS rests on two implicit assumptions:
+
+1. *Enough blocks must exist.* The paper shows the r² accuracy curve: for K ≥ 32 (i.e. D ≥ 1024) the estimate is tight, but on small tensors the error grows. LLM hidden dimensions are typically in the thousands—safely in the accurate regime—so the scheme works in practice.
+2. *Elements must be approximately i.i.d.* and the distribution must be stable enough for a fixed constant c to correct the estimate. If the activation distribution drifts—late in training, in unusual layers, during outlier bursts—the estimate becomes biased. In the paper, MXNorm(p=1) on an 8B model finishes training at loss 2.175 vs RMSNorm's 2.132—*there is a gap*. Switching to p=2 closes it.
+
+The second issue reveals something deeper: a normalisation layer is not only a mathematical operation—it also quietly provides *outlier control*. RMS is a quadratic mean; outliers are amplified and then suppressed. The p-mean of block maxima has a different response curve to outliers. MXNorm therefore requires the right p to remain stable.
+
+* Section 5: The contemporary alternative—skip normalisation altogether
+
+Worth noting: MXNorm pursues "make normalisation cheaper." A contemporaneous school takes the opposite route: *"Given how expensive normalisation is, can we eliminate it entirely?"*
+
+- *DyT* (Zhu et al. 2025, "Transformers without Normalization"): replaces RMSNorm wholesale with a saturating nonlinearity such as ~tanh~. No reduction needed, but elementwise special functions are not fast on GPUs either.
+- *FlashNorm* (Graef 2025): computes the RMS asynchronously, letting the matmul start before the RMS is ready and correcting afterward. Low latency in theory, but using un-normalised values mid-computation risks accumulator overflow.
+- *nGPT* (Loshchilov et al. 2025): constrains weights to the unit hypersphere, removing the need for normalisation entirely. Elegant in principle, but the per-step hypersphere projection adds its own cost.
+
+MXNorm's trade-off: *preserve the mathematical semantics and stability of RMSNorm* (it is still "scale by RMS"), and only reuse a statistic at the engineering level. This makes it the most *drop-in* of all approaches—no other training code needs to change; only the Norm layer is swapped.
+
+* One figure compressing the entire river onto one screen
+
+#+begin_src text
+   Year    Approach          Problem seen                 Core solution                      New problem left behind
+   -------------------------------------------------------------------------------------------------------------------
+   2015    BatchNorm         Deep nets train unstably     Normalise along batch dim           Requires large batch; train/infer asymmetry
+   2016    LayerNorm         Seq. models have no "batch"  Normalise along feature dim         Must compute mean + var (two passes)
+   2019    RMSNorm           Is re-centering necessary?   Compute only RMS, drop mean         Still a full-tensor reduction
+   2023    MXFP              FP8 range too narrow         Block scale + low-precision elems   The scale step itself needs a reduction
+   2025    MXFP8 recipe      How to actually train w/ MX  End-to-end Llama-scale recipe        Normalisation becomes the new bottleneck
+   2025    DyT / FlashNorm   Want to bypass norm          tanh replacement / async RMS         Elementwise is slow too / precision jitter
+   -------------------------------------------------------------------------------------------------------------------
+   2026    MXNorm (this)     matmul flew, norm lagged     Reuse MXCast block maxima           Relies on i.i.d. assumption and choice of p
+                             Can two reduction passes      One reduction, two purposes          p=1 loses points on 8B; p=2 needed
+                             be merged?                   D → D/32                             Estimate biased on small tensors
+#+end_src
+
+* What is really happening in this river
+
+On the surface the story looks like "normalisation keeps getting simpler": BatchNorm (expensive) → LayerNorm (batch-free) → RMSNorm (mean removed) → MXNorm (even the reduction volume is cut).
+
+But the deeper shift is that *the design objective of normalisation layers is changing*:
+
+- 2015–2019: the goal was *training stability*. Preventing deep networks from diverging was paramount; compute cost was secondary.
+- 2019–2024: the goal became *minimal necessary mathematics*. Keep the essential function (controlling activation scale); strip the inessential (re-centering, batch dependence).
+- 2024–2026: the goal is *co-existence with the hardware pipeline*. Normalisation is no longer a self-contained mathematical operation; it must be *fused with quantization, matmul, and memory layout* to matter. A Norm layer's merit is no longer judged only by what it computes, but by *which statistics it shares with its neighbours*.
+
+MXNorm is the clearest specimen of this new phase: it does not invent a new kind of normalisation—it invents *statistic reuse*.
+
+* Where the river might flow next
+
+If this framing is correct, the next step along this line is probably not "a smarter normalisation function" but rather:
+
+1. *The limits of statistic sharing*: beyond RMS derived from MX blocks, are there other quantities—attention softmax maxima, SiLU stabilisation constants, optimiser second moments—that could share the same reduction?
+2. *Fused Norm-Quant-Matmul kernels*: MXNorm merges Norm and Cast; the natural next step is to absorb the subsequent matmul as well, turning the entire "Norm + Linear" pattern into a single fused kernel.
+3. *Statistical robustness for NVFP4 and lower*: the fact that p=1 fails while p=2 succeeds hints that as distributions narrow and precision drops, the demands on statistical estimation become more exacting. Will the constant c(p,B) of Theorem 1 evolve from a "fixed value under a Gaussian assumption" into a "distribution-aware learnable parameter"?
+
+* Honest annotations
+
+- The citation chain BatchNorm → LayerNorm → RMSNorm → MXNorm is *explicitly named* in §1 and §2 of the MXNorm paper (references: ioffe2015, ba2016, zhang2019, rouhani2023, mishra2025).
+- DyT, FlashNorm, and nGPT are *compared side-by-side* in §2 of the paper as contemporaneous alternatives, not as predecessors that MXNorm supersedes—they are parallel answers to the same question.
+- The "cognitive shift" framing (from "training stability" to "hardware co-existence") is my own synthesis, not the paper's words—treat it as interpretive.
+- The "where next" section is extrapolation beyond the paper's scope.
+
+* References
+
+- McLean, Prince, Payot, Balança, Luschi (2026). MXNorm: Reusing MXFP block scales for efficient tensor normalisation. arXiv:2603.13180
+- Ioffe & Szegedy (2015). Batch Normalization.
+- Ba, Kiros, Hinton (2016). Layer Normalization.
+- Zhang & Sennrich (2019). Root Mean Square Layer Normalization.
+- Rouhani et al. (2023). Microscaling Data Formats for Deep Learning.
+- Mishra et al. (2025). Recipes for pretraining LLMs with MXFP8.
+- Zhu et al. (2025). Transformers without Normalization (DyT).
+- Graef (2025). FlashNorm.
+- Loshchilov et al. (2025). nGPT.

@@ -1,0 +1,230 @@
+#+title:      TMPDiff: Temporal Mixed-Precision for Diffusion Models
+#+date:       [2026-05-28 Thu 23:29]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T232913-en
+#+source:     https://arxiv.org/abs/2603.14062
+#+authors:    Basile Lewandowski, Simon Kurz, Aditya Shankar, Robert Birke, Jian-Jia Chen, Lydia Y. Chen
+#+venue:      arXiv 2026-03 (cs.CV)
+
+* The Problem River
+
+A single image requires dozens of model inference passes to "wash" it into existence. Each pass is a full forward through a multi-billion-parameter model. How do you make it faster without destroying the picture?
+
+The fundamental bottleneck of diffusion models lies here — unlike an LLM that emits one token per pass and calls it done, a diffusion model must iteratively "denoise" a noisy image tens or even hundreds of times before it becomes what you wanted. Quantization — replacing 16-bit floats with 8-bit, 4-bit, or even lower integers — is the widely accepted key to acceleration. Yet for a decade everyone has taken one thing for granted: pick a bit-width, tile it uniformly across every denoising step. As if every one of those 50 steps tolerates precision loss equally.
+
+TMPDiff does something simple but punctures a fact the entire field has overlooked — *the time axis* has never been seriously exploited in quantization. Early denoising steps may withstand INT4; late detail-recovery steps may require INT8, or the reverse. Assigning different precision to each step yields higher overall speed and better image quality simultaneously. From Q-Diffusion to PTQD to MixDQ, the field has been mining the *spatial* dimension (different bit-widths for different layers). TMPDiff is the first work to pull the *temporal* dimension out as an independent optimization axis.
+
+* The Source Map
+
+#+begin_example
+[2020] Ho et al. - DDPM
+  |
+  | Problem: generative models either blur (VAE) or destabilize (GAN)
+  | Solution: learn a stable generative process through 1000 denoising steps
+  | Residual: 1000 forward passes — too slow to deploy
+  v
+[2023] Li et al. - Q-Diffusion (ICCV)
+  |
+  | Problem: naive PTQ collapses on diffusion; activation distributions
+  |          vary wildly across timesteps
+  | Solution: per-timestep bucketed calibration; split-shortcut tricks
+  | Residual: still uses *one* bit-width spread over all steps;
+  |           the time dimension is flattened
+  v
+[2023] He et al. - PTQD (NeurIPS)
+  |
+  | Problem: Q-Diffusion fixes single-step calibration but ignores how
+  |          quantization error accumulates across the denoising chain
+  | Solution: decompose error into (correlated noise + uncorrelated noise),
+  |           explicitly correct / absorb each component
+  | Residual: error accumulation is modeled, but precision is still uniform
+  v
+[2024] Zhao et al. - MixDQ (ECCV)
+  |
+  | Problem: uniform bit-width is wasteful — some layers are fragile,
+  |          others are robust
+  | Solution: *spatial* mixed precision — assign different bitwidths
+  |           per layer / per component
+  | Residual: the same layer still uses the same bit across all timesteps;
+  |           the time axis remains locked
+  v
+[2026] Lewandowski et al. - TMPDiff  <-- target paper
+  |
+  | Problem: sensitivity differences across timesteps are untapped —
+  |          a completely open optimization axis
+  | Solution: *temporal* mixed precision — independent bitwidth per step
+  |           + prove error is approximately additive -> collapse
+  |             exponential search to linear
+  |           + bisection-based greedy algorithm for per-step allocation
+  v
+[Future] Spatio-temporal joint mixed precision?
+         (spatial MixDQ × temporal TMPDiff not yet systematically unified)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2020 | DDPM: 1000 Denoising Steps in Exchange for a Stable Generative Process
+
+*** What problem it saw
+
+The two main paths for generative models at the time were VAE and GAN. VAEs trained stably but produced blurry outputs; GANs were sharp but training walked a tightrope — mode collapse was always lurking. Both directions were grinding in dead ends.
+
+*** Its solution
+
+Ho et al. reframed "generation" as "iterative denoising." Start with a real image and gradually add noise until it becomes pure Gaussian — a simple, analytically tractable process. Then train a network to learn how to reverse each noise step. At generation time, start from pure noise and let the model erase noise step by step until an image emerges.
+
+An analogy: instead of asking the model to "paint a cat from nothing," ask it to "look at a scratched-up photo of a cat and erase a little of the damage." The second task is far easier to learn.
+
+*** Why it worked (and what new problem it buried)
+
+Differentiable, stable, theoretically grounded — three wins at once. But the cost is written in plain sight: 1000 forward passes. Even after DDIM and DPM-Solver slashed the step count to 20–50, the bedrock cost of "dozens of forward passes through a multi-billion-parameter model" remains firmly in place. Every subsequent acceleration effort starts from the same sentence: "still too slow."
+
+** 2023 | Q-Diffusion: Quantization on Diffusion Models — But Calibrate per Timestep
+
+*** What problem it saw
+
+The most direct path to accelerating diffusion is quantization — INT8/INT4 was already running smoothly in LLMs, so just borrow the recipe. Except it didn't work. Convert a trained diffusion model to 8-bit naively and the output collapses.
+
+Why is LLM quantization fine but diffusion quantization catastrophic? Li et al. traced it to the root: across different timesteps, the activation distributions of a diffusion model are *completely different*. Early steps are noise-dominated with large activation magnitudes; late steps are detail-dominated with small magnitudes. A single quantizer calibrated on one timestep's data produces severe distortion when applied to another.
+
+*** Its solution
+
+Bucket calibration by timestep. Collect calibration data specific to each denoising step, compute per-step quantization parameters. Add diffusion-specific tricks such as split-shortcut handling. This is the first time anyone wrote "timesteps are heterogeneous" into a quantization algorithm.
+
+*** Why it worked (and what new problem it buried)
+
+It acknowledged the differences among timesteps — but only in the *calibration* stage. Every step still runs at the same bit-width (e.g., all INT8 or all INT4). The deeper question — "do different timesteps also differ in their precision requirements?" — was quietly bypassed. That is precisely the brick TMPDiff comes back to pry loose three years later.
+
+** 2023 | PTQD: Quantization Error Is Not Just Noise — It Accumulates Like Dirty Water Across Denoising
+
+*** What problem it saw
+
+Q-Diffusion made single-step quantization more accurate, but He et al. fixed their gaze on something else: how does quantization error *evolve* across 50 denoising steps? Does it cancel out, or snowball?
+
+Their finding was the latter. Quantization error contains a component correlated with the original signal (systematic bias) and a component that is uncorrelated (resembling extra noise). The former shifts the generated distribution; the latter corrupts fine details.
+
+*** Its solution
+
+Explicitly decompose quantization error into two parts. The correlated part can be absorbed back into the model through a correction coefficient; the uncorrelated part can be treated as additional diffusion noise and "deducted" from the denoising schedule — after all, the model is already denoising, so removing a bit more costs nothing.
+
+Analogy: rather than plugging a leaky pipe (hard), install a downstream water extractor (easy and natural).
+
+*** Why it worked (and what new problem it buried)
+
+PTQD was the first to build a formal model of "quantization error accumulating over time." That analytical framework laid the groundwork directly for TMPDiff — three years later TMPDiff inherits this observation and writes it as the "approximately additive error" ansatz, which becomes the mathematical basis for per-step precision allocation.
+
+But PTQD itself stops at "error correction" and never takes the final step: if different timesteps contribute differently to the total error, why not simply give them *different precision*?
+
+** 2024 | MixDQ: Different Layers Have Different Sensitivities — Give Sensitive Layers More Bits
+
+*** What problem it saw
+
+Where is the biggest waste in uniform quantization? In its refusal to acknowledge a plain fact — *not all layers in a neural network are equally fragile*. The first and last layers tend to be highly sensitive; middle layers tend to be robust. Applying the same low precision everywhere causes the sensitive layers to break first and the whole image to collapse; raising precision everywhere to protect them wastes budget on the robust layers.
+
+*** Its solution
+
+Mixed precision. Measure for each component (layer, channel, or even individual token) "how much does the output degrade if I quantize this more aggressively?" Then allocate bits inversely by sensitivity — high bits for sensitive components, low bits for robust ones. The average bit count drops while perceptual quality is preserved.
+
+This path had already been trodden in the NAS era for classification networks; MixDQ adapts it to diffusion models, handling special structures such as cross-attention and text embeddings.
+
+*** Why it worked (and what new problem it buried)
+
+It mined the heterogeneity in the *spatial* dimension — and it worked: the paper reports that W4A8 achieves comparable quality to W8A8 at higher speed. But the approach carries a hidden assumption: *the sensitivity of a given layer is fixed across all timesteps*. Calibration runs once, bit allocation is fixed, and it never changes across the denoising trajectory.
+
+That is the last pane of glass TMPDiff comes to shatter — sensitivity across timesteps is itself dynamic.
+
+** 2026 | TMPDiff: Different *Timesteps* Deserve Different Precision — An Entirely Independent Optimization Axis
+
+*** What problem it saw
+
+Return to PTQD's observation: quantization error contributions are unequal across timesteps. Early denoising steps can often tolerate more aggressive quantization; late detail-recovery steps may require higher precision (or vice versa, depending on the model). Spatial mixed-precision methods like MixDQ split the "layer" dimension finely, but *treat every timestep identically* — the same layer uses the same bit across all 50 steps.
+
+This means the search has been confined to a single line within a two-dimensional optimization space. The time axis has been completely flattened and ignored.
+
+*** Its solution
+
+Two pieces interlocking:
+
+1. *Error-additivity ansatz* — assume that the quantization errors at individual timesteps contribute approximately additively to the degradation of the final image. This assumption descends directly from PTQD's correlated/uncorrelated decomposition. TMPDiff validates it through two ablation groups: perturbing the precision of a single step and measuring the final output damage, then comparing single-step and multi-step ablations; the results are consistent with "independent per-step accumulation."
+2. *Adaptive bisection search algorithm* — given additivity, exhaustive combinatorial search over all bit-width combinations is unnecessary. Start from a uniform bit configuration; at each iteration, find the pair of steps with the largest sensitivity gap, promote the sensitive step to higher precision and demote the insensitive one, until the target speed budget is met. Complexity drops from O(B^T) to O(T·log B).
+
+Analogy: you need to install air conditioning in 50 rooms on a fixed budget. MixDQ allocates capacity by room size; TMPDiff adds another layer — the same room uses different power levels at different times of day (dawn / noon / night).
+
+*** Why it worked (and what residual problems it leaves)
+
+Numbers tell the story: on FLUX.1-dev, TMPDiff achieves 2.5× speedup over FP16 while retaining 90% SSIM; at matched speed it improves perceptual quality by 10–20% over uniform quantization baselines. Results hold on PixArt-Σ, Sana, and SDXL.
+
+The residual problems are equally clear:
+- The method is currently *orthogonal* to spatial mixed-precision approaches like MixDQ — the paper itself notes the two can be stacked, but a systematic "spatio-temporal joint" framework has not been built.
+- Error additivity is an approximation; for very low bit-widths (INT2/INT3) or very few steps (4–8 steps in fast samplers), the assumption may not hold.
+- The bisection search is greedy and does not guarantee a globally optimal allocation.
+
+* Frontier Extensions
+
+TMPDiff was posted in March 2026 (v1); there are no formal follow-up responses yet. Extrapolating from current trends, the most natural next papers will take one of these directions:
+
+1. *Spatio-temporal joint mixed precision* — optimize the layer dimension (MixDQ) and the time dimension (TMPDiff) simultaneously. The search space is larger but the ceiling is higher.
+2. *Hardware-aware discrete budgets* — the current algorithm assumes INT4/INT8/FP8 can be freely interleaved, but switching bit-widths on real GPUs incurs overhead. The next step is to fold hardware switching costs into the search objective.
+3. *Coupling with few-step samplers* — DPM-Solver, LCM, and Consistency Models have already compressed diffusion to 4–8 steps, where the additivity assumption may break down. How to handle this is an open question.
+
+As of May 2026, TMPDiff is the first paper on the "temporal" axis, and the positions for follow-up work remain vacant.
+
+* One Picture to Understand It All
+
+#+begin_example
+                    Diffusion Model Acceleration — Quantization Track
+                    ==================================================
+
+  Time \ Focus     | Single-step    | Error          | Spatial        | Temporal
+                   | precision      | accumulation   | dimension      | dimension
+  -----------------+----------------+----------------+----------------+----------
+  2020  | DDPM     |   FP32 global  |    -           |     -          |   -
+        |          |   "Prove it can generate first; slow is fine for now"
+        |
+  2023  | Q-Diff   |   INT8 per-step|    -           |     -          |   X
+        |          |   "Timestep distributions differ; bucket calibration;
+        |          |    but still one bit-width for all steps"
+        |
+  2023  | PTQD     |   INT8/4       |  explicit      |     -          |   X
+        |          |   "Error accumulation modeled; precision still uniform"
+        |
+  2024  | MixDQ    |   INT4/8 mixed |  implicit      |   *opened!*    |   X
+        |          |   "Layers differ; but all timesteps treated identically"
+        |
+  2026  | TMPDiff  |   INT4/8 mixed |  additive      |   X            |  *opened!*
+        |          |   "Timesteps also differ — for the first time"
+        |
+  Future| ???      |   ???          |   ???          |   *unified*    |  *unified*
+        |          |   "Spatio-temporal joint, hardware-aware, few-step samplers"
+
+
+  Compressed to one sentence:
+  ----------------------------
+  "All layers, one bit" -> "split bits by layer" -> "split bits by timestep"
+  -> (expected) "split bits jointly by layer and timestep"
+  Each step opens one new optimization axis. TMPDiff opens the *temporal* one.
+#+end_example
+
+* Insight
+
+What is really happening along this line is not "quantization techniques getting ever more refined" — it is *previously ignored optimization dimensions being unearthed one by one*.
+
+DDPM translated "generation" into "iterative denoising" and inadvertently created an entirely new dimension — the timestep. Yet for the next three years, the quantization field treated it as a uniform axis; everyone assumed "all 50 steps are the same." Q-Diffusion first noticed "they are not the same" (different distributions). PTQD first quantified "not the same" (error accumulation). MixDQ redirected that attention toward the *spatial* dimension (inter-layer differences).
+
+TMPDiff's contribution is to pull the gaze back to the axis that was discovered first yet never seriously used — *time*. What it does at the algorithmic level is not complex (a bisection search plus an additivity assumption), but its strategic significance is the establishment of a fact: "this is an independent, additive optimization axis." Once that fact is planted, the whole field will flow work into this new axis.
+
+The deeper pattern: *when a paradigm dominates a field long enough (e.g., "one bit-width for all"), its implicit assumptions come to feel like laws of nature. Breakthroughs often consist not of inventing new algorithms but of discovering "this assumption was never actually required."* MixDQ dismantled the assumption "layers are equivalent." TMPDiff dismantled the assumption "timesteps are equivalent." The next assumption to fall may be "activations and weights are equivalent" or "forward and backward passes are equivalent."
+
+Where will this go next? My bet is "spatio-temporal joint + hardware-aware." Once the joint search space is opened, the problem becomes "how do you find the spatio-temporal optimum under real GPU bit-switch overhead?" That will import the full NAS-era toolkit — reinforcement learning, evolutionary algorithms, differentiable search — wholesale.
+
+* Takeaways
+
+1. *Find the flattened axis first, then design the algorithm* — TMPDiff's algorithm (bisection + additivity) is not complex; the heavy analytical work was already done by prior papers (PTQD's error decomposition). All of TMPDiff's energy goes into "discovering that time is an independently optimizable axis." In a new field, the most valuable contribution is not a new trick but the recognition that a universally accepted assumption can be dropped.
+
+2. *Inherit someone else's observation; make the inference they didn't* — PTQD observed that "quantization error accumulates across timesteps" but stopped at "correction." TMPDiff takes the same observation and pushes it to "then let different steps use different precision." Same fact, different inference, entirely different paper. When reading papers, always ask one more question: "Where else can this observation be pushed?"
+
+3. *Orthogonality sells better than novelty* — TMPDiff repeatedly emphasizes that it is *orthogonal* to MixDQ. This gives readers a clear sense of placement: not a replacement, but an addition. Addition means both sets of authors are happy; addition means cumulative progress. The barrier to entry for "orthogonal" work is much lower than for "competing" work.
+
+4. *Validate theory with the cheapest possible experiments* — TMPDiff's additivity ansatz is validated with just two ablation groups: single-step and multi-step perturbations. No fancy statistical tests, no large-scale datasets. Pinning a theoretical assumption with the cheapest experiment that suffices is the key to writing a good engineering paper.
+
+What this means in practice: enter a new domain, list all the assumptions "everyone takes for granted but no one has actually tested," pick the one that looks most like a "flattened axis," run the cheapest experiment that can falsify it — and the skeleton of a paper is already there.

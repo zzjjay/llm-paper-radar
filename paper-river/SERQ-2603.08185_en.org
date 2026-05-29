@@ -1,0 +1,336 @@
+#+title:      SERQ: Saliency-Aware Low-Rank Error Reconstruction for LLM Quantization
+#+date:       [2026-05-28 Thu 21:27]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T212703-en
+#+source:     https://arxiv.org/abs/2603.08185
+#+authors:    Yeonsik Park, Hyeonseong Kim, Seungkyu Choi
+#+venue:      arXiv preprint, March 2026
+
+* The River of Problems
+
+The most direct way to fit a 70-billion-parameter LLM into a consumer GPU is to compress every number down to a 4-bit integer — capacity drops to a quarter, and you can run cheap INT4 circuits.
+
+But the moment you do that, the model starts talking nonsense.
+
+Why? Because LLM activations contain *outlier channels*: a tiny minority of dimensions whose values dwarf their neighbors by tens or even hundreds of times. If you set your quantization scale to the maximum value, those few monsters stretch the ruler to breaking point, cramming the remaining 99% of values into the same bucket — resolution gone.
+
+This river is one generation after another solving the same problem: *how do you, without retraining the model, tame those monsters so that 4-bit precision delivers 16-bit quality?*
+
+Each generation spotted a new flaw in its predecessor's solution — too much latency, requires retraining, requires inserting an online operator, or accuracy still collapses — and stepped forward with a cleverer trick. SERQ is the newest stretch of this river.
+
+* Source Map
+
+#+begin_example
+[2022] LLM.int8()  Dettmers et al.
+  |
+  | Problem seen:  8-bit direct quantization collapses on large models
+  |                due to a small number of outlier channels
+  | Solution:      Keep outlier channels in FP16; route the rest through INT8
+  |                (mixed precision)
+  | Remaining pit: Outlier channels must be identified online; the FP16
+  |                path scatters memory accesses, significantly increasing latency
+  v
+[2022-2024] SmoothQuant  Xiao et al.
+  |
+  | Problem seen:  Outliers live in activations, which change every token —
+  |                offline handling is nearly impossible
+  | Solution:      Per-channel shrink activations by 1/s, then fold s into
+  |                the previous layer's weights
+  |                -- Move the difficulty from activations (dynamic) to
+  |                   weights (static, can be handled offline)
+  | Remaining pit: After folding, a few "important rows" on the weight side
+  |                start blowing up in error
+  v
+[2023-2024] AWQ  Lin et al.
+  |
+  | Problem seen:  Not all weights are equally important; roughly 1% of
+  |                "salient channels" account for most of the error
+  | Solution:      Use the activation distribution to identify that 1%;
+  |                give them higher precision / special scaling
+  | Remaining pit: Only "protects" salient weights — does not truly "repair"
+  |                the residual left after quantizing them
+  v
+[2024] L^2QER  Zhang et al.
+  |
+  | Problem seen:  After quantization the residual E = W - Q(W) remains;
+  |                dropping it directly hurts accuracy
+  | Solution:      SVD-decompose E; use a rank-r matrix L1*L2 to "add back"
+  |                the residual. Also quantize L1 and L2, forming a
+  |                fully-INT compute path
+  | Remaining pit: L1*L2 requires two sequential multiplications;
+  |                the intermediate result must be re-quantized.
+  |                Under W4A4 that intermediate quantization error is too
+  |                large — accuracy collapses anyway
+  v
+[2026] SERQ  Park, Kim, Choi  <-- target paper
+  |
+  | Problem seen:  Sequential two-factor multiplication + intermediate
+  |                quantization is doomed under W4A4
+  | Solution:      Use *one* low-rank matrix R to repair the residuals of
+  |                "salient rows" directly.
+  |                Three steps: static activation smoothing + salient-row
+  |                residual compensation + offline weight permutation
+  | Current position: First LoRA-style method to beat rotation-based methods
+  |                   (QuaRot / SpinQuant) under W4A4
+  v
+[?] Future work
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Locking the Monsters in a Separate Cage
+
+*** What problem it saw
+
+Compressing GPT-3-scale models from FP16 to INT8 looks harmless on small models, but at the 6.7B-parameter scale performance suddenly collapses — not a gradual slide, but a cliff. Dettmers zoomed in and found that the culprit is concentrated: inside the activation tensors, *a handful of channels* carry values orders of magnitude larger than the rest.
+
+If you set the INT8 scale to the whole matrix's maximum, those monsters stretch the ruler until the remaining 99% of values are squashed near zero — effectively all rounded to zero, information gone.
+
+*** Its solution
+
+Straightforward: *split the stream*. Detect online which channels are monsters, pull them out, and route them through a dedicated FP16 high-precision path; route the well-behaved channels through INT8. Sum the two paths at the end.
+
+*** Why it works (and what new pit it digs)
+
+The core insight of mixed precision: *not every number deserves the same precision*. But the cost is real:
+
+1. Identifying outlier columns online takes time
+2. The FP16 path has scattered memory-access patterns — dense GEMM is impossible, actual throughput halves
+3. There is no path to lower bit widths — at 4 bits even the "well-behaved" channels stop being well-behaved
+
+The question the next generation had to answer: *can we handle this ahead of time instead of online?*
+
+** 2022–2024 | SmoothQuant: Moving the Hard Part from Activations to Weights
+
+*** What problem it saw
+
+LLM.int8()'s online outlier handling is tolerable in the cloud, but on edge devices it is a latency killer. And INT8 is as far as it goes — pushing to INT4 is very hard.
+
+The deeper issue: activations change with every token, so offline analysis can never be complete. But weights are static — once training is done they never change. If the work of "handling outliers" could be *moved from the activation side to the weight side*, the whole thing could be handled offline.
+
+*** Its solution
+
+Mathematically elegant. A linear layer is Y = X * W. Suppose channel j of activation X has a large outlier. Introduce a diagonal scaling matrix diag(s):
+
+#+begin_example
+Y = X * W = (X * diag(s^-1)) * (diag(s) * W)
+          =      X_smooth     *    W_absorbed
+#+end_example
+
+s is chosen per-channel to reflect "steepness". Scale the activations down channel-wise (divide X by s), and fold the same factor into the weights (multiply W by s). Mathematically equivalent, but the activations become tame and easy to quantize.
+
+Moreover, diag(s) can be folded into the *previous layer's* output weights ahead of time — zero online cost.
+
+*** Why it works (and what new pit it digs)
+
+It converts a "dynamic problem" into a "static problem" — a huge step forward. INT8 no longer collapses.
+
+But *there is no escaping the conservation law*: making the activation side smooth makes the weight side steep. What was a well-behaved weight distribution becomes skewed in certain rows after absorbing s. INT8 can absorb this; push to INT4 and the weight side starts blowing up too.
+
+The next question: *exactly which rows on the weight side are especially sensitive, and can we protect only those?*
+
+** 2023–2024 | AWQ: 1% of Weights Determine 90% of the Outcome
+
+*** What problem it saw
+
+SmoothQuant passed the hot potato to the weights. But Lin et al. observed something: weights are not uniformly hard to quantize — *a small number of rows* (roughly 1%) account for the vast majority of the error. And what determines which rows matter is not the magnitude of the weights themselves, but the *energy of their corresponding activation channels*.
+
+If activation channel x_j has high average energy, row j of W gets repeatedly amplified during the multiply-accumulate, and its quantization error is repeatedly amplified too. That is the true definition of *salient weights*.
+
+*** Its solution
+
+Identify that 1% of salient rows and *treat them specially*: quantize them with finer per-channel scaling, or keep them at higher precision. Let the other 99% go through standard INT4.
+
+Experimental result: protecting only 1% causes almost no accuracy drop.
+
+*** Why it works (and what new pit it digs)
+
+AWQ contributed a key conceptual tool: *saliency*. Quantization error is not uniformly distributed — it is highly concentrated. Aiming effort at the hot spots buys large recovery at small cost.
+
+But AWQ only *protects* — it tries to quantize salient weights more accurately. It does not truly *repair* the inevitable residual: the information lost as W - Q(W) cannot be recovered.
+
+The next question: *can a lightweight bypass actually add that residual back?*
+
+** 2024 | L^2QER: Repairing the Residual with SVD, Fully Low-Precision
+
+*** What problem it saw
+
+After quantizing W to Q(W), the residual E = W - Q(W) is nonzero. Discarding it directly hurts accuracy. A line of work (QLoRA, LoftQ, etc.) proposed approximating E with a LoRA-style low-rank product L1 * L2 and adding it back:
+
+#+begin_example
+Y = X * Q(W) + X * L1 * L2
+                ^^^^^^^^^^^ residual compensation path (rank r << d)
+#+end_example
+
+L1 is d×r, L2 is r×d; the overhead is small (roughly 1.6–3%), no retraining required — seemingly perfect.
+
+But Zhang et al. spotted a major problem: *if L1 and L2 stay in FP16*, the compensation path breaks the "fully-INT computation" ideal — the whole pipeline drifts back to mixed precision.
+
+*** Its solution
+
+*Quantize L1 and L2 as well*:
+
+#+begin_example
+Y ~= X_q * W_q + Q(X_q * L1_q) * L2_q
+                  ^^^^^^^^^^^^^^^^^^^^
+                  intermediate value must be re-quantized
+#+end_example
+
+Implementation detail: SVD-decompose E and keep the top-r singular values/vectors to form L1*L2. Combined with INT4 weights + INT8 activations (W4A8), the entire computation stays INT, with almost no accuracy loss at W4A8.
+
+*** Why it works (and what new pit it digs)
+
+The paradigm L^2QER introduced — *main path + quantized low-rank residual compensation path* — became the standard template for LoRA-style quantization. It proved that low-rank repair at W4A8 can be nearly lossless.
+
+But it has a structural flaw that is fully exposed at W4A4:
+
+1. *Intermediate quantization between two sequential multiplications*: the result of X_q * L1_q is a floating-point intermediate that must be Q(⋅)'d again before multiplying by L2_q. Under W4A4, this extra quantization error is large enough to erase the compensation entirely.
+2. *SVD is a global compressor*: the rank budget is spread evenly across all rows, but the error is actually concentrated in a few salient rows — SVD has no targeting ability and wastes capacity.
+
+The next question: *can we use just one low-rank matrix, skip the intermediate quantization, and concentrate all capacity on the salient rows?*
+
+** 2026 | SERQ: One Matrix, Three Steps, Done
+
+*** What problem it saw
+
+L^2QER's two structural flaws — intermediate quantization and SVD spreading resources like seasoning — make it decisively lose to rotation-based methods (QuaRot / SpinQuant) under W4A4.
+
+But rotation methods have their own problems: QuaRot uses random Hadamard, giving high variance in performance; SpinQuant learns the rotation matrix, making calibration extremely expensive. Both require inserting extra rotation operators *online* at inference time, adding latency.
+
+SERQ's question: *can we avoid adding any online operator, skip SVD, use just one low-rank matrix, and beat these rotation methods under W4A4?*
+
+*** Its solution
+
+Stitch together the best ideas from predecessors while patching every one of their flaws. Three steps:
+
+*Step 1: Static activation smoothing (borrowing SmoothQuant's teeth)*
+
+Use a SmoothQuant-style diag(s) to per-channel flatten the activation outliers, folding the steepness into the weights. Completely offline, zero online cost. The side effect — certain rows on the weight side become steep — is handled by the next two steps.
+
+*Step 2: Salient-row residual compensation (borrowing AWQ's eyes)*
+
+After folding in s, assuming the original weights were approximately normally distributed, the *row-wise scale of the folded weights* directly reflects saliency — no need to compute it from activations. Select the r most salient rows W_s (r is the rank; default 128) and compute their residual:
+
+#+begin_example
+R = W_s - Q(W_s)            R is an r × d matrix
+#+end_example
+
+Note: R is *one* matrix — not two factors L1 * L2. At inference:
+
+#+begin_example
+Y ~= X_q * W_q + X_s,q * Q(R)
+                  ^^^^^^^^^^^^
+                  one low-rank multiply over only the salient activation subset
+                  no intermediate value, no re-quantization needed
+#+end_example
+
+This is the core innovation: *replace SVD decomposition with direct index selection*, directing 100% of the rank budget to exactly the rows that need the most repair; the single-matrix structure eliminates intermediate quantization entirely.
+
+*Step 3: Offline weight permutation (clean finish)*
+
+The salient rows must be contiguous for efficient indexing, which requires a row permutation P on W. Correspondingly, the output channel ordering of the upstream layer must change (column permutation). SERQ *folds both permutations into the weights of the neighboring layers*, entirely offline. At inference, all GEMMs consume pre-sorted tensors with zero extra overhead.
+
+*** Why it works (and what new pit it digs)
+
+Three concerns are stitched together cleanly:
+- SmoothQuant handles the activations (but steepens the weights)
+- The salient-row residual matrix repairs the steepened weight portion (and only that ~1%, spending resources where they matter)
+- Permutations are fully offline (zero extra inference cost)
+
+Result: slightly better than L^2QER at W4A8, significantly better at W4A4, and the first LoRA-style method to *beat rotation-based approaches at W4A4*, while requiring a fraction of SpinQuant's calibration cost.
+
+New pits it leaves:
+
+1. The rank (128) of the single matrix R is still a hand-chosen hyperparameter — should different layers use different ranks? Unexplored.
+2. The entire process is *training-free* calibration — no gradients touched. Could a small amount of LoRA fine-tuning add another tier of recovery?
+3. Does the method hold up beyond INT4 at even lower-precision formats (FP4, MXFP4, 2-bit)?
+4. The "approximately normal distribution" assumption for salient rows — does it hold after RoPE / RMSNorm? The paper acknowledges this is an empirical observation, not a theorem.
+
+* Frontier Extensions
+
+SERQ was published in March 2026. As of this survey (May 2026), no published work explicitly critiques and improves upon it. The most relevant recent developments along this line:
+
+- *MX / MXFP4 hardware support* (NVIDIA Blackwell architecture) is bringing 4-bit floating-point formats into the mainstream; SERQ already provides an MXFP4 implementation. This line of work will very likely couple deeply with MX formats, spawning saliency-repair methods designed specifically for MX.
+- *2-bit inference* is the next battlefield. More aggressive low-bit methods such as AQLM and QuIP# are pushing toward 2-bit, but remain on the weight side — how to keep activations in step is an open question. Whether SERQ's "single-matrix salient-row" idea can generalize to 2-bit is a direction worth tracking.
+
+Honestly: this is a rapidly evolving line; revisiting this section in six months will almost certainly require updates.
+
+* One Diagram
+
+#+begin_example
+
+       Outliers = the root cause; no one can avoid them
+                                          Closer and closer to the true source
+                                          ---------------------------------->
+
+Year   Method          Strategy for handling outliers      Cost / remaining flaw
+====   ======          ==============================      =====================
+
+2022   LLM.int8()      Identify outlier channels online;   Split path is slow;
+                       route them through FP16 bypass      cannot go below 8-bit
+
+2022   SmoothQuant     diag(s) moves activation steepness  Conservation law:
+                       into weights (offline)              weight side becomes steep
+
+2024   AWQ             Identify top-1% salient weights;    Only protects, does not
+                       give them special scaling           repair the residual
+
+2024   L^2QER          Fully-INT path + SVD low-rank       Two sequential multiplies;
+                       residual repair                     intermediate quant collapses
+                                                           under W4A4; SVD spreads
+                                                           budget evenly
+
+2026   SERQ            Activation smoothing + single-      Rank still hand-picked;
+                       matrix salient-row residual         normal-distribution
+                       + offline permutation              assumption (empirical, not proven)
+
+
+Core rhythm (this river in one sentence):
+
+  "Handling outliers" is pushed further and further back:
+       Online   ->  Offline          (SmoothQuant)
+       All rows ->  Salient rows     (AWQ)
+       Approximate -> Repair         (L^2QER)
+       Decompose   -> Direct-index   (SERQ)
+
+  Every step cuts away what the previous step was still wasting.
+
+#+end_example
+
+* Insights
+
+Reading this line end to end, the surface story is "4-bit quantization accuracy keeps improving." Underneath, *three cognitive shifts* take turns driving progress.
+
+*First shift — from symmetric to asymmetric.*
+Early methods assumed "all weights and activations deserve the same precision." LLM.int8 was the first to say "no — outliers should be handled separately." That broke the symmetry assumption. Everything else follows from this.
+
+*Second shift — from dynamic to static.*
+LLM.int8's outlier handling happened online; SmoothQuant pushed it offline. This converted a "performance problem" into an "algebra problem" — once things are offline, the full toolkit of matrix theory becomes available.
+
+*Third shift — from uniform approximation to sparse repair.*
+L^2QER's SVD is still in the "uniform compression" mindset (low-rank approximation = globally optimal fit). AWQ saw that the error is sparse. SERQ fully embraces sparsity: *instead of approximating, directly index the most important r rows and repair them*. This shift is really a move *from signal-processing thinking to database thinking* — the question is no longer "how do we best approximate the whole matrix?" but "which rows most need repair — pull them out directly."
+
+*Where does the next step go?*
+Following this line of shifts:
+
+1. The definition of saliency will grow more refined — from "rows" to "blocks" to "arbitrary sparse patterns" — requiring new hardware primitives to match.
+2. The calibration process will be compressed further toward *single-pass forward* or even *zero-shot* — SERQ is already near that limit.
+3. The real next leap may not be on the weight side at all, but in *KV-cache*. In the long-context era, KV-cache memory consumption long ago surpassed weights, but KV-cache outliers are harder to handle (they are dynamic and query-dependent). Whoever can port SERQ's "offline permutation + salient repair" ideas to KV-cache captures the next stretch of the river.
+
+* Takeaways
+
+For researchers:
+
+1. *Conservation laws are a gold mine.* SmoothQuant's identity — "multiply diag(s) into the activation, fold it into the weight" — is really "the hard problem doesn't disappear, but it can be relocated." Find a "problem-relocation formula" in your own domain and you often open a new direction.
+
+2. *Don't treat predecessors' tools as sacred.* L^2QER used SVD because "SVD is the standard approach to low-rank approximation." SERQ stepped back and asked "why SVD at all?" — when the error is sparse, direct indexing beats SVD decisively. Whenever a tool is used by default, there is usually a kick waiting to be made.
+
+3. *Stitching + patching flaws is also innovation.* SERQ did not invent a new first principle — SmoothQuant's smoothing, AWQ's saliency, LoRA-style residual compensation are all pre-existing. Its contribution is *combining the three while patching the flaw in each one*. In mature fields, this kind of "combinatorial innovation" is more achievable than "disruptive innovation."
+
+For engineers (the parts you can use today):
+
+- If you are deploying an LLM at 4-bit: at W4A8, SmoothQuant plus simple salient-row protection is sufficient; at W4A4, residual compensation is mandatory.
+- Everything that can be precomputed offline should be — permutations, scaling, folding. Keep the inference path as short as possible.
+- *Rank = 128* is SERQ's empirical default — use it directly. The number of salient rows is also 128 (the same order of magnitude as ~1% of a 4096 hidden dimension).
+
+One final line: the true protagonist of this river is not "which method is strongest," but *"the judgment of which numbers matter, growing ever more accurate."* At the end of quantization is a database.

@@ -1,0 +1,307 @@
+#+title:      Adapting Methods for Domain-Specific Japanese Small LMs: Scale, Architecture, and Quantization
+#+date:       [2026-05-28 Thu 23:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T234625-en
+#+source:     https://arxiv.org/abs/2603.18037
+#+authors:    Takato Yasuno
+#+venue:      arXiv preprint, March 2026
+
+* The River of the Problem
+
+You want to run, on a consumer GPU with only 16 GB of VRAM, an expert model that speaks Japanese and can answer precise technical questions about Japan's river and sediment-control engineering standards. How do you do it?
+
+Break the problem apart and you find three mutually-compressing demands: (1) the model must be large enough to "understand" specialized knowledge; (2) the model must be small enough to fit in 16 GB; (3) training cost must be low enough that a few thousand domain QA pairs can get you there.
+
+Every paper published on this river over the past decade answers *one part* of that question — how to train a large model at all (Transformer), how to fine-tune it affordably (LoRA, QLoRA), how to deploy it (GGUF, Q4_K_M), how to fit long contexts into the KV cache (GQA), how to transfer an English model to Japanese (Swallow).
+
+By 2026, all the pieces are in place. The author of this paper stacks them together and finds something nobody anticipated: *these components, each designed for a different problem, fight each other when assembled.* Specifically — GQA, invented to save KV cache, degrades severely under the most common 4-bit deployment quantization; while the older, seemingly clunkier MHA architecture actually *improves* in quality after quantization.
+
+This is where the river has arrived today: single-point optimizations have been thoroughly exhausted, and the next generation of problems is about *side effects at the seams*.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNN serial training is slow; sequence length cannot scale
+  | Solution: Full attention, parallelizable; models can be made large
+  v
+[2019] Shazeer - Multi-Query Attention (MQA)
+[2023] Ainslie et al. - GQA: Grouped-Query Attention
+  |
+  | Problem: KV cache explodes with sequence length and head count during inference
+  | Solution: Multiple query heads share the same K/V group; cache shrinks 8x
+  | (Side effect: K/V representational capacity is compressed — a landmine for the future)
+  v
+[2021] Hu et al. - LoRA: Low-Rank Adaptation
+  |
+  | Problem: Full-parameter fine-tuning of a 70B model doesn't fit on a single GPU
+  | Solution: Freeze the backbone; only learn the low-rank delta (B*A)
+  | (But: you still have to load the entire backbone into VRAM)
+  v
+[2022] Dettmers et al. - LLM.int8()
+[2023] Dettmers et al. - QLoRA
+  |
+  | Problem: Even loading the backbone into VRAM is too expensive
+  | Solution: Store the backbone compressed to 4-bit NF4; decode to bf16 for forward pass
+  |           LoRA deltas are still trained in floating point
+  | (But: the merged model after training is back to float)
+  v
+[2023] Gerganov et al. - GGML / GGUF / k-quants (Q4_K_M)
+  |
+  | Problem: After training, the float model is still too large to deploy
+  | Solution: Post-training quantization to mixed 4/6-bit precision, packed into a single file
+  | (But: this recipe was only validated on "pretrained models")
+  v
+[2024] Fujii et al. - Swallow (Japanese continual pre-training)
+  |
+  | Problem: English-pretrained LMs are nearly useless for Japanese technical text
+  | Solution: Continual pre-training on Japanese corpora + vocabulary expansion
+  | (But: can you then safely apply QLoRA fine-tuning + Q4_K_M deployment?)
+  v
+[2026] Yasuno (this paper) - Combining all five steps for the first time
+  Finding: Llama-3 (MHA) series quality after Q4_K_M: +0.01~+0.03
+           Qwen2.5 (GQA) after Q4_K_M: -0.28
+           (GQA's "saved KV" dividend becomes "poor noise tolerance" at quantization time)
+#+end_example
+
+* The Evolutionary Narrative
+
+The main character of this river is *the same predicament wearing different clothes in different eras*: "large models are unaffordable." Each generation tears down one wall, only to find another behind it.
+
+** 2017 | Transformer (Vaswani): Throw Out RNNs, and Models Can Finally Scale
+
+*** What Problem It Saw
+
+LSTM/GRU training computes one token at a time; double the sequence, double the time. GPU utilization is miserable. In practice, model scale is capped by *training time*. Want the model to remember more linguistic knowledge? You need more parameters. But more parameters means slower training, and slower training means you can't feed it more data.
+
+*** Its Solution
+
+Discard RNNs entirely. The attention mechanism lets any position attend to any other position directly; the entire sequence can be fed into a single matrix multiplication at once. GPUs can finally run at full capacity.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Parallelization broke the scale barrier. From that point, LMs followed a "larger is smarter" trajectory — BERT, GPT-2, GPT-3, models growing from hundreds of millions to hundreds of billions of parameters.
+
+But the hole was already dug: attention memory usage is O(sequence length²), and KV cache is O(sequence length × head count × dimension). Every newly generated token during inference requires re-reading all historical K/V entries. The larger the model and the longer the context, the more the KV cache explodes.
+
+The next paper heads straight for that hole.
+
+** 2019/2023 | MQA → GQA (Shazeer, Ainslie et al.): Let Multiple Query Heads Share One K/V Group
+
+*** What Problem It Saw
+
+Once models reached hundreds of billions of parameters, the bottleneck in a single inference pass was not compute but *KV cache bandwidth*. Llama-2-70B at full load with long context can consume dozens of gigabytes for K/V tensors alone. Either sacrifice context length or sacrifice throughput.
+
+MQA's reasoning: do 64 query heads really need 64 independent K/V groups? Try merging them into 1. GQA takes a middle path — form several groups, e.g. 8 query heads sharing 1 K/V group.
+
+*** Its Solution
+
+Only shrink the K/V projections; leave Q projections untouched. Physically, the K and V matrices go from 64 copies to 8 copies, directly cutting the KV cache by 8×.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Empirically the quality loss is almost negligible. Llama-2-70B, Mistral, and Qwen2.5 all adopted GQA. Inference throughput soared.
+
+The hole dug is *very subtle*: every single number in the K/V projection matrices now carries 8× the responsibility. Before, 64 heads each had their own K, and they could cross-correct each other with redundancy; now 8 heads share one K, and that one copy must serve 8 distinct query viewpoints. This means the K/V projections have lower tolerance for parameter perturbation.
+
+This hole won't be discovered until 2026, when quantization research collides with GQA.
+
+** 2021 | LoRA (Hu et al.): Don't Touch the Backbone — Only Learn a Low-Rank "Patch"
+
+*** What Problem It Saw
+
+After GPT-3, every company wanted a domain-specific version. But full fine-tuning of 175B parameters requires 1 TB+ of VRAM just for activations. Even updating only a subset still requires retaining the full computation graph for backpropagation.
+
+*** Its Solution
+
+Decompose the weight update ΔW into two slim matrices: ΔW = B·A, where A is r×k, B is d×r, and r is much smaller than d and k (e.g. r=16). Freeze the original weights W; only train A and B.
+
+Parameter count drops from d×k to r·(d+k) — often two orders of magnitude fewer.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Empirically: the "effective degrees of freedom" needed to fine-tune a large model are intrinsically low, so a low-rank patch is entirely sufficient. LoRA has since become an industry standard.
+
+But LoRA does not solve the "fits in memory" problem — you still have to load W onto the GPU to compute the forward pass. For a 70B model, W alone is 140 GB in fp16.
+
+** 2022/2023 | LLM.int8 → QLoRA (Dettmers et al.): Store the Backbone Compressed to 4-bit; Decode Only When Computing
+
+*** What Problem It Saw
+
+LoRA turned "can't train" into "can't fit in memory." If W itself could be compressed, single-GPU fine-tuning of large models would become feasible.
+
+Naive INT8 quantization introduces too much error, let alone 4-bit. Dettmers first used LLM.int8 to handle activation outliers, enabling near-lossless 8-bit inference of large models. But training was still a step away.
+
+*** Its Solution
+
+QLoRA's three-part toolkit: (1) *4-bit NormalFloat (NF4)* — a non-uniform quantization format designed for normally distributed weights; (2) *double quantization* — quantize the quantization constants themselves; (3) *paged optimizer* — offload to CPU when gradient spikes overflow VRAM.
+
+The backbone W is stored in VRAM as NF4 and decoded to bf16 on demand for the forward pass; LoRA's A and B are still trained in bf16. A 70B model can be fine-tuned on a single 48 GB GPU.
+
+*** Why It Worked (and What New Hole It Dug)
+
+QLoRA turned "can't afford to train" into "can afford to train." Small academic teams could now do large-model domain adaptation.
+
+But QLoRA's 4-bit is used only *during training*. The usual practice afterwards is: merge the LoRA delta back into W and save as float. So what you end up with is a *fine-tuned float model* — just as large for deployment.
+
+The next step is to solve deployment.
+
+** 2023 | GGUF / Q4_K_M (Gerganov et al., llama.cpp): Compress the Trained Model Again and Package It Into a Single Deployment File
+
+*** What Problem It Saw
+
+Float models produced by QLoRA easily reach tens of gigabytes. Engineers wanting to run inference on consumer GPUs or pure CPU still can't fit them. The community needed a standardized *deployment-time* quantization format.
+
+*** Its Solution
+
+GGUF is the name for both a file format and a suite of quantization schemes. The key innovation is *k-quants*: different layers and tensor types use different precisions. For example, Q4_K_M uses 4-bit for most weights, but gives critical layers — attention K/V projections, output projections, etc. — 6-bit precision. Mixed precision compensates for information loss.
+
+The workflow: take a trained float model, scan weight distributions, quantize layer by layer according to k-quants rules, and pack everything into a single .gguf file. Runs on llama.cpp; compatible with CPU, GPU, and Metal.
+
+*** Why It Worked (and What New Hole It Dug)
+
+An 8B model after quantization is approximately 5 GB — fitting on a single GTX 4060 Ti. Q4_K_M shows quality loss <1% on public benchmarks. The 7–13B model era arrived for the masses.
+
+The hole — the one this paper uncovers — is that *all validation was done on "pretrained models."* Nobody systematically asked: on *QLoRA-fine-tuned models*, across different *architectures*, does Q4_K_M still hold up?
+
+Even more critically: the "which layers get extra precision" recipe in k-quants was determined empirically, tuned primarily on MHA architectures (early Llama-1/2). GQA became widespread later, and the k-quants formula was never optimized specifically for GQA.
+
+** 2024 | Swallow (Fujii et al.): Transfer an English LLM to Japanese Technical Corpora
+
+*** What Problem It Saw
+
+Llama-3 was trained predominantly on English corpora. Japanese tokens are fragmented; kanji-kana mixtures are handled poorly; and specialized vocabulary in civil engineering, law, or medicine barely appears in English-dominant training data. Feeding an English Llama-3 directly into Japanese QA tasks produces miserable results.
+
+Multilingual models (such as Qwen2.5) have some Japanese coverage, but Japanese represents only a small share of a multilingual model's training mix, and specialized domains are even thinner.
+
+*** Its Solution
+
+*Continual Pre-training (CPT)*: take Llama-3-8B and continue pre-training it on Japanese web corpora. Two details matter: (1) expand the vocabulary by adding high-frequency Japanese subwords to the tokenizer, reducing token count; (2) redo learning-rate warmup to help the model transition smoothly.
+
+Swallow-8B was produced this way; ELYZA-JP-8B follows a similar approach.
+
+*** Why It Worked (and What New Hole It Dug)
+
+Japanese native-language capability improves dramatically, and token efficiency increases as well. A small domain-specific QA dataset plus QLoRA fine-tuning is then enough to handle specialized domains.
+
+The open question that remains: is the complete pipeline of CPT + QLoRA + GGUF quantization *stable across different architectures*? Nobody had checked.
+
+** 2026 | Yasuno (This Paper): Run the Entire Pipeline End-to-End and Discover GQA's "Quantization Brittleness"
+
+*** What Problem It Saw
+
+Each of the preceding six generations of papers solved one segment of the problem. What the author wants to do is run the *entire end-to-end pipeline*:
+
+  Japanese technical standards corpus → CPT-trained 8B Japanese LM → QLoRA fine-tuning (n=?) → merge → Q4_K_M quantization → deploy on a 16 GB GPU
+
+Three unanswered questions:
+1. How much fine-tuning data is needed? 1000 seems too little; 5000 suggests overfitting — where exactly is the inflection point?
+2. With the same training method and the same domain data applied to different 8B Japanese LLMs (Swallow / ELYZA / Qwen2.5 / Tanuki), which is best suited?
+3. Can that final cut with Q4_K_M be trusted?
+
+*** Its Solution
+
+The author invents no new algorithms. The contribution is a single thing: *systematically running experiments that connect all three questions*:
+
+- Stage 1: Five data scales (1k–5k) run through QLoRA; test-set NLL measured. Conclusion: n=4000 is the minimum (NLL 1.127); 5k begins to overfit.
+- Stage 2: Use n=4000 to train four different base models; LLM-as-judge scoring. Conclusion: Japanese-CPT Llama-3 variants (Swallow, ELYZA) decisively outperform the multilingual Qwen2.5 (2.82 vs 2.42).
+- Stage 3: Apply Q4_K_M to each fine-tuned model and compare f16 vs Q4 scores. Conclusion — this is the turning point of the river — *Llama-3 (MHA) quality actually rises after quantization (+0.01~+0.03), while Qwen2.5 (GQA) drops sharply (-0.28)*.
+
+*** Why This Worked (and What New Holes It Dug)
+
+Why does MHA improve? The author's explanation is *regularization*: Llama-3 trained on QLoRA with n=4000 is mildly overfitted, and the quantization noise from Q4_K_M acts like dropout, suppressing that overfit.
+
+Why does GQA drop so much? This closes the loop on the hole buried in the GQA paper — the K/V projections are already compressed and shared, so each individual number carries 8× responsibility. Now Q4_K_M stacks quantization noise on top of those same projections: *brittleness from sharing* + *noise from quantization* land as a double blow. MHA has 64 copies of K that can cross-correct; GQA has only 8, so an error in one affects eight heads.
+
+New holes left open:
+- The k-quants recipe needs to be *architecture-aware* — for GQA models, should K/V projections be elevated to 8-bit or even fp16?
+- Quantization noise as implicit regularization — can this be exploited deliberately, treating "quantization" as an explicit noise term during training?
+- Is this pattern general? Do Mamba's state-space matrices, or MoE routers, exhibit similar "compression + quantization" stacking brittleness?
+
+* Frontier Extensions
+
+This paper was posted in March 2026, and as of May 2026 explicit follow-on work is still sparse. But several adjacent lines are already in motion:
+
+- *QA-LoRA* (Wu et al., ICLR 2024, cited as [9]): absorbs quantization error during QLoRA training. But it assumes *the same* quantization at training and deployment, whereas this paper reveals the *architecture sensitivity* of deployment quantization (Q4_K_M) — something QA-LoRA does not specifically address. The natural next step here is *architecture-aware QA-LoRA* — using more conservative K/V quantization for GQA models.
+- *OmniQuant* (Shao et al., ICLR 2024, cited as [19]): comprehensive calibration-based quantization, but again validated on pretrained models.
+- *AWQ* (Lin et al., MLSys 2024, cited as [15]): activation-aware quantization that decides which weights matter based on activation magnitudes. In principle this is friendlier to GQA, but whether it maintains its advantage on QLoRA-fine-tuned models has not been systematically tested.
+
+To be honest: *the latest advance on this river is the paper itself.* Its contribution is not a new algorithm but rather *putting the combinatorial side effects on the table* — and that is precisely the starting point for the next wave of research.
+
+* One Diagram to See It All
+
+#+begin_example
+
+  Time ---->  2017       2021       2023            2024              2026
+
+  Scale lock  [Transformer]
+   |           Parallel training
+   v
+  Fine-tune              [LoRA]
+   lock                  Low-rank patch
+   v
+  VRAM lock                         [QLoRA]
+   |                                NF4 backbone + float patch
+   v
+  Deploy lock                       [GGUF Q4_K_M]
+   |                                Mixed-precision packing
+   v
+  Context lock                      [GQA] --------- (KV cache saved 8x)
+   |                                                                  \\
+  Language lock                               [Swallow CPT]            \\
+   |                                           English->Japanese CPT   \\
+   v                                                                    \\
+  Combination                                                     [This paper 2026]
+   lock                                                            CPT + QLoRA + Q4_K_M
+                                                                   collides with GQA brittleness
+                                                                    |
+                                                                    v
+                                                           Next-generation problem:
+                                                           side effects at the seams
+
+
+  Core narrative:  Each generation tears down one wall of "unaffordable models"
+                   Every wall removed -> the next wall appears
+                   By 2026: individual walls are all down
+                   The new problem is not at the single points — it's at the joints
+#+end_example
+
+* Insights
+
+Having read through this entire lineage, the most worth remembering is not Q4_K_M or GQA, but this:
+
+*The past decade was the golden age of single-point optimization. From 2026 onward we enter the era of combinatorial debugging.*
+
+Each generation of papers attacked a single clearly defined bottleneck — parallelism, parameter efficiency, VRAM, KV cache, deployment, language transfer. When each bottleneck was resolved, the researchers checked only "did I solve my one thing?" and almost never checked "what happens when this interacts with everything else?"
+
+Yasuno's paper introduces no new algorithm, but it does something no one had done before: *actually runs the full pipeline end-to-end* and *compares across architectures*. This kind of "combinatorial experiment" is severely undervalued by publication incentives — it isn't glamorous, it won't headline a top-conference main track, and citation counts grow slowly. But in real systems, combinatorial side effects are what consume the most engineering time.
+
+One level deeper: *GQA's brittleness is not GQA's fault at all.* GQA was designed under the assumption that "the downstream pipeline will not compress K/V further." Q4_K_M was designed under the assumption that "the upstream model is MHA-shaped." Both assumptions are individually reasonable — put together, they invalidate each other.
+
+This is a universal pattern: *each act of compression spends from a budget of redundancy; repeated compression causes that budget to go into deficit.*
+
+Where is the river most likely to flow next? My predictions:
+1. *Architecture-aware quantization* — the k-quants recipe customized per architecture, with K/V projections in GQA models receiving added protection.
+2. *Joint quantization–training optimization* — the QA-LoRA idea combined with Q4_K_M's specific layout, tuned end-to-end together.
+3. *Quantization noise as an explicit regularizer* — since MHA + Q4_K_M accidentally achieved a dropout-like effect, systematize it deliberately.
+4. *Combinatorial experiment as a research paradigm* — more papers will take "stack N independent works and evaluate their side effects" as a primary contribution.
+
+* Implications
+
+For *how to find problems*:
+
+- Once a field's obvious gaps have all been filled, the next wave of value lies not in "inventing another component" but in "systematically stacking existing components and running them." This kind of work has low paper-prestige but high engineering value — an underrated high-ROI direction.
+- When searching for problems, add one more question: *these two assumptions each look fine in isolation — do they still hold together?* GQA assumes the downstream won't recompress K/V; Q4_K_M assumes the upstream is MHA — each individually reasonable, and their collision is exactly the finding of this paper.
+- Cross-architecture, cross-stage controlled experiments often reveal deeper underlying laws than purely algorithmic novelty.
+
+For *how to do research*:
+
+- This means you can — take a "mature" field (say, quantization), identify two or three adjacent mature fields (fine-tuning, attention variants), systematically combine them, and almost always find non-trivial side effects.
+- A concrete script: pick an end-to-end pipeline → use ≥2 different "upstream" options + ≥2 different "downstream" options → run the full 2×2 table → identify which cells deviate from single-point conclusions. That is a valuable paper, whether the result is positive ("the combination is robust") or negative ("the combination is brittle").
+
+For *engineering practice*:
+
+- This means: when deploying Japanese or multilingual specialist SLMs, *do not blindly trust Q4_K_M for GQA architectures (Qwen series, Mistral series, Llama-3.1+)*. Run it once at F16, run it again at Q4, and compare.
+- Conversely, MHA architectures (original Llama-3-8B, ELYZA, Swallow-8B) can be used with Q4_K_M confidently, and may even see a small quality gain.
+- Default recommendation for a 16 GB GPU + Japanese technical domain QA: *Swallow-8B + n=4000 QLoRA + Q4_K_M*.

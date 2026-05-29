@@ -1,0 +1,251 @@
+#+title:      LongFlow: Efficient KV Cache Compression for Reasoning Models
+#+date:       [2026-05-28 Thu 21:39]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T213903-en
+#+source:     https://arxiv.org/abs/2603.11504
+#+authors:    Yi Su, Zhenxu Tian, Dan Qiao, Yuechi Zhou, Juntao Li, Min Zhang
+#+venue:      arXiv 2026-03 (Soochow University & ByteDance)
+
+* The River of the Problem
+
+Reasoning models (o1, DeepSeek-R1, Qwen3) can write sixteen thousand words of chain-of-thought for a single question. The issue is not whether they can think — it is that they eat GPU memory alive while doing so. Every newly generated token requires storing its Key/Value pair, and every subsequent attention step must read the entire cache. The longer the KV cache grows, the more memory it consumes and the more bandwidth it burns.
+
+For seven years, from H2O's first discovery that "most tokens are actually unimportant" to LongFlow, the whole lineage has been answering the same question: *which tokens can be discarded, and how do we judge that quickly and accurately?* Each generation believed it had solved the problem; each generation was shown new holes by the next.
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Standard attention: every token must attend to all past tokens.
+  | Side effect: the KV cache must be stored in full; otherwise recomputation is required.
+  v
+[2022] Dao et al. - FlashAttention                      (parallel branch: kernels)
+  |                                                       |
+  | Memory bandwidth is the bottleneck; attention is memory-bound.  |
+  | Fix: tiling + on-chip SRAM, avoiding materializing the full score matrix. |
+  v                                                       |
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)         |
+  |                                                       |
+  | Problem: KV cache grows linearly; long contexts cannot fit.   |
+  | Observation: attention is sparse; a few "heavy hitters" dominate. |
+  | Fix: accumulate attention scores and evict the lowest-scoring tokens. |
+  v                                                       |
+[2024] Li et al. - SnapKV                               |
+  |                                                       |
+  | Problem: H2O must maintain scores during generation — expensive. |
+  | Observation: a small window of queries at the prompt's end predicts importance. |
+  | Fix: compress once after prefill using an observation window; prefill-only. |
+  v                                                       |
+[2024] Guo et al. - VATP                                |
+  |                                                       |
+  | Problem: high attention score ≠ real influence on output.  |
+  | Observation: output = score × value; value norms also matter. |
+  | Fix: importance = attention × ||value||              |
+  v                                                       |
+[2025] Cai et al. - R-KV                                |
+  |                                                       |
+  | Problem: all four prior methods are designed for "long-input short-output". |
+  | Observation: reasoning models are the opposite — short input, long output; CoT repeats. |
+  | Fix: add a redundancy penalty to the importance metric; purpose-built for reasoning. |
+  v                                                       |
+[2026] Su et al. - LongFlow      <-----------------------+
+                                  Integrates with FlashAttention kernel
+  Problem: R-KV/VATP/H2O importance estimation is itself expensive —
+           recomputed at every decoding step, costs grow with length;
+           and this importance logic cannot be fused into FlashAttention,
+           so forced fusion requires shuttling data between HBM and SRAM.
+  Fix: derive importance directly from attention's intermediate results —
+       zero extra storage, zero extra computation, then write a Triton kernel
+       that packages attention + importance + eviction into a single operator.
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2023 | H2O: Attention Is Sparse — Keeping Just the Heavy Hitters Is Enough
+
+*** What Problem It Saw
+
+Before H2O, the core tension in long-context LLMs was this: attention must look at all past tokens, so the KV cache must be kept in full. A 7B model with a 32k context has a KV cache heavier than the model weights themselves. The standard workaround was blunt truncation — drop the earliest tokens when the context grew too long.
+
+But truncation throws away critical information (e.g., instructions in the system prompt), and performance collapses immediately.
+
+*** Its Solution
+
+H2O made one key observation: *real attention distributions are highly sparse*. The vast majority of tokens contribute negligible attention weight most of the time. A handful of tokens — dubbed heavy hitters — persistently attract the bulk of attention.
+
+So why not keep only the heavy hitters and evict the rest? The decision criterion: *cumulative attention score*. At each generation step, each historical token accumulates the attention weight it receives. Tokens with the lowest accumulated score are the eviction targets.
+
+*** Why It Works (and What New Hole It Dug)
+
+It works because transformer attention is naturally sparse — a property that emerges from the architecture itself, not an assumption H2O invented.
+
+But the hole it dug is large: *the cumulative scores themselves must be stored*. To save KV cache, you end up keeping a floating-point "scorecard" for every token. The longer the generation, the larger the scorecard. Worse, every generation step must update all token scores — a non-trivial cost over long sequences.
+
+H2O solved "should we evict?" but left "how much does the judgment itself cost?" completely unanswered.
+
+** 2024 | SnapKV: Decide Early and Be Done — Settle Fates Right After Prefill
+
+*** What Problem It Saw
+
+H2O's running scorecard is especially wasteful with long inputs. If you give the model a 50k-token document to summarize, the prefill phase already reveals which tokens matter — yet H2O keeps updating scores throughout decoding.
+
+Moreover, H2O's rolling judgments mean the KV cache memory layout changes constantly, which is very unfriendly to system-level implementations.
+
+*** Its Solution
+
+SnapKV ran a deceptively simple experiment: use a *small window of queries at the end of the prompt* (the observation window) as representative queries, run one attention pass over the full context, and retain whoever scores highest.
+
+Once prefill ends, the KV cache is compressed to a fixed size and never touched again during decoding.
+
+*** Why It Works (and What New Hole It Dug)
+
+It works because the prompt has typically already "asked its question." The attention distribution just before the model generates its first token is already a strong predictor of which tokens will be needed later — a claim LongFlow later verifies experimentally in Section 3.1.
+
+The new hole: *it only compresses prefill*. If the input is short and the output is long (the reasoning-model regime), SnapKV barely compresses anything, because the compression target (the prompt) had few tokens to begin with.
+
+** 2024 | VATP: Don't Just Look at Attention — Value Norms Count Too
+
+*** What Problem It Saw
+
+H2O and SnapKV both equate attention score with importance. VATP called out this false equivalence.
+
+The attention output formula is ~o = Σ α_i · v_i~. A token's actual contribution to the output is the product of α and v — if α is high but the norm of v is tiny, the token contributes almost nothing; conversely, a middling α with a large v norm may have far greater impact.
+
+H2O treats the norm of v as a constant and ignores it — effectively reading only half the story.
+
+*** Its Solution
+
+Redefine importance as ~α_i × ||v_i||~ — weighting both the attention score and the actual magnitude of the value vector. This is a one-line change, but it is theoretically closer to "how much does evicting this token actually hurt the output?"
+
+*** Why It Works (and What New Hole It Dug)
+
+It works because it targets the true objective — changes to the output — rather than the proxy of attention score magnitude.
+
+The new hole: *the cost rises further*. VATP must compute not only attention scores but also value norms for every candidate token at every step. Over long-output scenarios, this overhead, stacked on top of attention computation itself, consumes a significant slice of wall-clock time.
+
+And VATP still leaves H2O's root problem untouched: importance estimation is a separate step that runs after attention and cannot be folded into FlashAttention's fused operator.
+
+** 2025 | R-KV: Reasoning Models Repeat Themselves — Repeated Tokens Can Be Evicted More Aggressively
+
+*** What Problem It Saw
+
+By 2025, o1 and R1 had changed the game. The paradigm had been "long input, short output"; now it was "short input, long output." CoT traces run tens of thousands of tokens, and large swaths of them are semantically repetitive ("Let me reconsider," "Wait, what I said earlier...").
+
+H2O/SnapKV/VATP's importance metrics are unaware of this. A repeated segment of reasoning trace may exhibit a similar attention pattern to every other segment, get judged "important" repeatedly, and leave behind a pile of redundant KV pairs.
+
+*** Its Solution
+
+R-KV adds a *redundancy penalty* to the importance metric: if a token's semantics closely resemble those of already-retained tokens, its priority is lowered. Purpose-built for the repetitive structure of reasoning traces.
+
+*** Why It Works (and What New Hole It Dug)
+
+It works because it is the first method to explicitly acknowledge that "KV cache compression for reasoning models is a distinct problem." In accuracy terms, R-KV is the strongest baseline in the LongFlow paper.
+
+The new hole: *the more accurate, the more expensive*. Judging redundancy requires computing inter-token similarity, which is itself a non-trivial cost. The LongFlow paper explicitly notes that R-KV's "more complex importance estimation logic" consumes more memory.
+
+At this point the entire lineage had drifted into a peculiar split: each generation, striving for higher accuracy, introduced more extra computation — yet the whole point of compressing the KV cache was to be *fast*.
+
+** 2026 | LongFlow: Importance Is a Byproduct of Attention — Compute It for Free
+
+*** What Problem It Saw
+
+LongFlow distills the entire lineage into three indictments:
+
+1. *Prefill-only doesn't work*: methods like SnapKV that only compress at prefill are nearly useless in long-output scenarios.
+2. *Importance computation is too expensive*: H2O/VATP/R-KV all run a separate scoring pass on top of attention; the cumulative cost is enormous over long generations.
+3. *Cannot be fused with FlashAttention*: every baseline's scoring logic is an independent step that follows attention. Forcing fusion requires shuttling data between HBM and SRAM, erasing the bandwidth savings FlashAttention had already achieved.
+
+The third indictment is the most damning: you think you are saving KV cache, but in practice you are trading a smaller memory footprint for a slower operator — a bad deal.
+
+*** Its Solution
+
+Two core principles:
+
+*Zero-History Estimation*: ignore history; use only the current query. SnapKV already demonstrated experimentally that a very small observation window works fine — so why not shrink it to 1, i.e., the current query?
+
+*Zero-Cost Estimation*: stop running a separate scoring step after attention. Derive importance directly from attention's intermediate results.
+
+The derivation: the ideal eviction criterion for token i is to minimize ~‖o_t − o_t^(\i)‖~. Under the assumption that many tokens are being attended to, the softmax denominator is approximately unchanged, so this difference is approximately ~α_i · v_i~ — which is exactly the weighted value term already being computed in the attention output formula. Taking its L1 norm yields the importance score at zero additional cost.
+
+A Triton kernel then packages FlashAttention, importance estimation, and token eviction into a single operator, slashing attention latency from 47 ms to 8 ms.
+
+*** Why It Works (and What New Hole It Dug)
+
+It works because, for the first time, "deciding which token matters" is no longer an independent task — it is a byproduct of the attention computation itself. This shift in perspective lets LongFlow sidestep all the accumulated cost problems of the previous four generations.
+
+It honestly acknowledges two limitations:
+
+1. *Depends on query stability* — the theoretical guarantee holds only when adjacent queries are similar. In CoT generation adjacent queries are indeed similar (verified experimentally), but sudden topic shifts, tool calls, or high-temperature decoding may break the approximation.
+2. *Decoding only, not prefill* — the current kernel is designed for query length = 1. Long-input-dominated scenarios must fall back to a prefill method such as SnapKV.
+
+* Frontier Extensions
+
+LongFlow is a fresh paper (v2 in 2026-04, first posted 2026-03) and no explicit critiques or follow-up improvements have appeared yet. The river currently stops at LongFlow.
+
+Expected next directions (based on the limitations it identifies itself):
+
+- Unify prefill and decoding under a single operator, eliminating the need to switch between methods
+- Find new proxy signals to replace the "current query" assumption in scenarios with large query drift (multi-turn, tool use, agent loops)
+- Generalize the zero-cost principle beyond KV cache — e.g., attention head pruning, layer skipping
+
+* A Single Diagram
+
+#+begin_example
+                    "Which KV pairs can be dropped, judged quickly and accurately?"
+
+           Accuracy                                        + LongFlow (2026)
+            ^                                              ^ Zero extra computation
+            |                                              | Fused kernel
+            |                          + R-KV (2025)       | "Importance is a byproduct of attention"
+            |                          ^ Redundancy penalty
+            |                          | Targets repetition in reasoning models
+            |              + VATP (2024)
+            |              ^ α × ||v||
+            |              | Don't look at attention alone
+            |  + SnapKV (2024)
+            |  ^ Observation-window one-shot filter
+            |  | Prefill-only compression
+            |  |
+       + H2O (2023)
+       ^  Cumulative attention score
+       |  Heavy-hitter assumption
+       |
+       +-------------------------------------------------------------> Time
+
+       Cost
+        ^
+        |        ============     <- VATP/R-KV: accurate but expensive
+        |    ====
+        |  ===                                     ==     <- LongFlow: accurate and cheap
+        |==                                       =
+        +-------------------------------------------------------------> Direction of evolution
+
+   The key turning point:
+     H2O→R-KV branch: buy more accuracy with extra computation — accuracy rises, cost rises too.
+     LongFlow branch: eliminate the extra computation, making importance a free byproduct of attention.
+#+end_example
+
+* Insight
+
+On the surface, this evolutionary line is about "increasingly refined importance metrics." What is actually happening underneath is *a descent in perspective from the algorithmic layer to the system layer*.
+
+The first four generations (H2O → VATP → R-KV) all operated at the algorithm level: how do we define importance more accurately, more in line with "output loss"? Each generation introduced new statistics, new correction terms, new metadata. Accuracy did keep rising — but every increment of accuracy cost another increment of computation and storage.
+
+LongFlow's breakthrough is not at the algorithm level. Its approximations (substituting the current query for future queries, ignoring softmax denominator changes) are actually *coarser* than R-KV's. The breakthrough is that it changed the evaluation coordinate system: *importance estimation cannot be discussed in isolation from the attention operator*.
+
+Once you accept that constraint, everything else is determined: importance must be computable on-the-fly within FlashAttention's block-wise computation flow. This forces you back to the algebraic structure of the attention output, ~α · v~, and to extracting a signal from that intermediate tensor that already exists. The once-sophisticated importance metric reduces to "take the L1 norm of the weighted value" — simple enough to make you doubt it.
+
+Going deeper: this is a recurrent pattern in LLM inference optimization — *when the algorithmic layer is exhausted, descend to the system layer and reshuffle the deck*. FlashAttention's original story was exactly the same: the attention algorithm did not change; only the IO pattern was rewritten, and performance jumped a full tier.
+
+The most likely next step: push the "zero extra computation" principle upward from KV cache to higher-level optimizations — attention head pruning, layer skipping, draft models for speculative decoding. Any optimization that currently requires "an independent scoring pass" is a candidate for being recast as "a byproduct of the main path" using the same idea.
+
+* Takeaways
+
+For researchers: *when your field starts stacking correction terms, stop and examine the coordinate system*. The H2O → VATP → R-KV chain is a textbook example of incrementally improving a metric. This kind of additive research easily traps itself in a local optimum — everyone competes on "whose metric is more accurate" and no one asks "why does the metric have to be computed independently?" LongFlow's winning move was to change the question: not "what metric is more accurate?" but "what metric can be computed for free inside the FlashAttention kernel?"
+
+Practical takeaways:
+
+- *If you are doing inference optimization*, you can use LongFlow's kernel directly (the paper has open-source code), especially when deploying long-CoT models such as R1 or Qwen3.
+- *If you are designing system-level algorithms*, remember that "system-layer constraints dictate algorithm shape in reverse" — treat the most expensive operator (e.g., FlashAttention) as immovable infrastructure and design your algorithm to fit it, not the other way around.
+- *If you are reading someone else's paper*, "coarser approximation than the competition yet dramatically lower cost" is almost always a signal worth pausing on — it usually means the competition was asking the wrong question.

@@ -1,0 +1,385 @@
+#+title:      SemantiCache: Efficient KV Cache Compression via Semantic Chunking and Clustered Merging
+#+date:       [2026-05-28 Thu 23:37]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T233706-en
+#+source:     https://arxiv.org/abs/2603.14303
+#+authors:    Shunlong Wu, Hai Lin, Shaoshen Chen, Tingwei Lu, Yongqin Zeng, Shaoxiong Zhan, Hai-Tao Zheng, Hong-Gee Kim
+#+venue:      arXiv 2026.03 (cs.CL)
+
+* The River of the Problem
+
+Every time an LLM generates a new token, it must consult a "memory" of every
+preceding token — that memory is the KV cache. The longer the context, the
+larger the cache, the more GPU memory explodes, and the slower inference
+becomes. The question is: can we compress this memory so the model stays
+lean without becoming dumb?
+
+Why is this hard? Every token in that memory *might* be needed by some future
+attention computation. Drop any one of them and you may drop the crux of a
+sentence. That is why this research thread, since 2023, has been caught in
+one central tension: the harder you compress, the more performance degrades.
+A dozen papers have been wrestling with the same trade-off — what makes a
+token "truly important," and how do you safely discard or merge the less
+important ones without reconstructing the original text.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: attention itself is fine, but it requires keeping all past K/V in GPU memory
+  | Consequence: KV cache grows linearly with context length, becoming a bottleneck
+  v
+[2023] H2O (Zhang et al., NeurIPS'23)
+  |
+  | Observed problem: KV cache is huge, but many tokens have near-zero attention scores
+  | Solution: evict tokens whose cumulative attention score is low
+  | Remaining hole: eviction = permanent loss, information is unrecoverable
+  v
+[2024] StreamingLLM (Xiao et al., ICLR'24)
+  |
+  | Observed problem: naively evicting leading tokens crashes the model; early tokens are "attention sinks"
+  | Solution: permanently keep the first few sink tokens + sliding window, discard everything in between
+  | Remaining hole: the entire middle context is cut away — long-document QA breaks completely
+  v
+[2024] SnapKV (Li et al., NeurIPS'24)
+  |
+  | Observed problem: which tokens to keep depends on *what will be asked*
+  | Solution: use an observation window over the query to back-infer which history tokens to keep
+  | Remaining hole: still eviction; what is dropped is gone, one token at a time
+  v
+[2024] CaM (Zhang et al., ICML'24)
+  |
+  | Observed problem: since eviction always loses information, can we *merge* instead of *drop*?
+  | Solution: merge tokens slated for eviction into retained tokens, weighted by attention similarity
+  | Remaining hole: merging still operates at single-token granularity, ignoring semantic boundaries
+  v
+[2025] SepLLM (Chen et al., ICML'25)
+  |
+  | Observed problem: punctuation/separator tokens consistently light up in attention maps — they are natural semantic anchors
+  | Solution: compress each segment into the separator token that follows it; the separator acts as a "summary slot"
+  | Remaining hole: one token per segment is too coarse; the interior still has fine structure worth aggregating
+  v
+[2026.03] SemantiCache  <-- this paper
+  |
+  | Observed problem: all prior methods cut either at token boundaries or at fixed-length blocks,
+  |                   fragmenting natural semantic units such as phrases and clauses
+  | Solution: three-stage pipeline — split into semantic chunks at separators -> GSC greedy clustering within chunks ->
+  |           mean-pool each cluster into a "semantic core" + correct attention with log(cluster size)
+  v
+[2026 Q1-Q2 concurrent/follow-up]
+  AdmTree, COMI, "Read as Human" — pushing compression further toward tree-structured / multi-granularity / human-like reading
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer + KV Cache: the origin of the problem
+
+*** What problem did it see
+
+The attention mechanism requires every new token to compute similarity against
+all historical tokens. Recomputing the Keys and Values of every history token
+from scratch at each step would be an O(n^2) disaster.
+
+*** Its solution
+
+Cache the already-computed K and V, and reuse them at every subsequent step.
+That is where KV cache comes from.
+
+*** Why it worked (and what new hole it buried)
+
+It reduced each generation step from O(n) recomputation to O(n) cache reads,
+eliminating redundant computation. But the cache itself must live in GPU
+memory permanently and grows linearly with context length — tolerable at 8K,
+but it starts bursting GPUs at 32K or 128K. The starting point for the entire
+research thread is: can this ever-growing cache be put on a diet?
+
+** 2023 | H2O: "just kick out the unimportant tokens"
+
+*** What problem did it see
+
+In practice, the vast majority of tokens receive near-zero weight in
+subsequent attention distributions — they sit in the cache doing nothing but
+taking up space. So why not keep only the genuinely "important" minority and
+discard the rest?
+
+*** Its solution
+
+Define a simple metric: cumulative attention score — the total attention mass
+each token has received across all past queries. High-scoring tokens are
+"heavy hitters" and are retained; low-scoring tokens are evicted. The cache
+budget is fixed, and rank determines who stays and who goes.
+
+*** Why it worked (and what new hole it buried)
+
+The intuition is sound — sparse attention is the normal regime for
+transformers. But H2O's fatal flaw is *irreversibility*: once a token is
+evicted, its information is gone forever. If a later query suddenly needs it,
+the model can only hallucinate. This became the scar that every subsequent
+eviction-based method had to live with.
+
+** 2024 | StreamingLLM: "the first few tokens are sacred"
+
+*** What problem did it see
+
+H2O mysteriously crashes during long streaming inference. On investigation,
+researchers found that models assign anomalously high attention to the very
+first tokens — even when those tokens carry no meaningful content. The reason
+is that softmax must allocate weight somewhere; when nothing is genuinely
+important it dumps the mass onto the beginning. This is *attention sink*.
+
+*** Its solution
+
+Simple and blunt: always keep the first few sink tokens, add a sliding window
+over the most recent N tokens, and discard everything in between.
+
+*** Why it worked (and what new hole it buried)
+
+The model no longer crashes and can stream over infinitely long sequences.
+The cost is that the entire middle context vanishes — feed it a 50-page
+document and ask about page 20, and it can no longer see page 20. This
+exposed the fundamental limit of "drop by position": importance and position
+are not the same thing.
+
+** 2024 | SnapKV: "what to drop depends on what will be asked"
+
+*** What problem did it see
+
+Both H2O and StreamingLLM are *task-agnostic* — they have no idea what the
+user will ask next. But in practice, the same history has different important
+tokens depending on the question.
+
+*** Its solution
+
+Introduce an "observation window" — treat a few tokens at the end of the
+prompt as a proxy for the question, use them to score history tokens, and
+decide what to keep based on those scores. What gets retained is precisely
+what is useful for the current query.
+
+*** Why it worked (and what new hole it buried)
+
+Performance improves noticeably because a task signal is now available. But
+the paradigm is unchanged: still eviction, still at single-token granularity.
+Evicted tokens are still dead. That opening is where the CaM school enters.
+
+** 2024 | CaM: "don't kick — merge"
+
+*** What problem did it see
+
+Eviction always risks evicting the wrong token. Since every token still
+carries some information, could we *avoid losing it* by folding its content
+into a token that is being kept?
+
+*** Its solution
+
+For tokens selected for eviction, compute their attention similarity to
+retained tokens and merge their K/V into those retained tokens using weighted
+summation. What was formerly "deletion" becomes "folding."
+
+*** Why it worked (and what new hole it buried)
+
+Information no longer drops off a cliff, and long-context tasks are
+noticeably more stable than H2O-style methods. But CaM still decides merge
+targets at single-token granularity — a modifier inside a noun phrase might
+get folded into a completely unrelated token, scrambling grammatical
+relationships. SepLLM targets exactly this: the idea of *boundaries*.
+
+** 2025 | SepLLM: "punctuation is a natural summary slot"
+
+*** What problem did it see
+
+Looking at attention heat maps reveals a peculiar pattern: commas, periods,
+newlines — tokens that appear meaningless — consistently receive
+disproportionately high attention scores. They behave like paragraph-level
+summary points that the model learned on its own.
+
+*** Its solution
+
+Exploit this observation: compress each run of non-separator tokens into the
+separator token that immediately follows it, letting the separator serve as
+a "condensed version of this segment." At inference time, only the
+separator's K/V are kept; all others are discarded.
+
+*** Why it worked (and what new hole it buried)
+
+For the first time, "semantic structure" entered KV compression. Using
+separators as anchors is more respectful of natural language units than
+dropping by position or by token. But the granularity is still too coarse:
+cramming an entire segment into a single token flattens all internal
+structure — multiple parallel clauses, multiple entities — in one stroke.
+That is precisely the gap SemantiCache steps into.
+
+** 2026.03 | SemantiCache: "compress along semantic hierarchy, not token-by-token"
+
+*** What problem did it see
+
+Surveying all prior methods together, they share the same mistake: either
+they operate at single-token granularity (H2O / SnapKV / CaM), or at
+arbitrary fixed-length chunks (approaches like MoBA, Native Sparse Attention),
+or they are too coarse and cram a whole segment into one token (SepLLM).
+All of this is *semantic fragmentation* — splitting a modifier from its noun,
+severing a conditional clause from its main clause.
+
+*** Its solution
+
+Import the way humans remember long texts and turn it into a three-stage
+pipeline:
+
+1. *Semantic Chunking.* Borrow SepLLM's insight and use separators as
+   natural semantic boundaries to split the sequence into chunks. The
+   separator tokens' own K/V are kept intact; only the content inside each
+   chunk is compressed.
+2. *Greedy Seed-Based Clustering (GSC).* Within each chunk, pick the first
+   unassigned token as a seed and absorb every subsequent token whose cosine
+   similarity to that seed exceeds threshold τ into the same cluster. This
+   is a single-pass O(l^2/2) lightweight clustering that requires no
+   iterative refinement the way k-means does.
+3. *Cluster Merging + Proportional Attention.* Each cluster is mean-pooled
+   into one "semantic core." But merging a cluster of |S| tokens into one
+   dilutes its influence in attention — so a log(|S|) term is added to the
+   logits before softmax, equivalent to multiplying the attention score by
+   cluster size. In other words, "this core represents 5 tokens" — so after
+   softmax it receives 5× the weight.
+
+*** Why it worked (and what new holes remain)
+
+The three pieces fit together tightly:
+- *Splitting* does not break semantic boundaries (inherits SepLLM but
+  preserves intra-chunk detail)
+- *Merging* does not throw away redundancy (inherits CaM but at finer
+  semantic granularity)
+- *Reweighting* prevents merging from diluting influence (this is new —
+  no prior work explicitly addressed "how many tokens should a core speak for
+  in the attention formula")
+
+Empirically, decoding reaches 2.61× speedup while LongBench / NIAH
+performance approaches full-cache quality.
+
+Remaining holes: (a) threshold τ is fixed — the optimal value likely differs
+across layers and heads; (b) GSC's "first unassigned token as seed" is
+order-sensitive — reordering the sequence changes the clustering outcome;
+(c) the method relies on separators, which makes it awkward for languages
+or code that lack explicit punctuation.
+
+* Frontier Extensions
+
+In the wake of SemantiCache (concurrent with 2026 Q1-Q2), the same line is
+already branching:
+
+- *AdmTree* (Li et al., 2026): expands SemantiCache's "one-level clustering
+  within chunks" into an *adaptive semantic tree* — multi-level aggregation
+  where each level's granularity is chosen automatically. This directly
+  answers the unresolved question of "what should τ be": replace a single
+  threshold with a hierarchy.
+
+- *COMI: Coarse-to-fine Context Compression* (Tang et al., 2026): selects
+  which tokens to retain through the lens of marginal information gain,
+  providing a more information-theoretic basis than a cosine-similarity
+  threshold.
+
+- *"Read as Human"* (Tang et al., 2026): formally encodes human reading
+  strategies — close reading (careful attention to key segments) + skimming
+  (quick reading of the rest) running in parallel. This is a more systematic
+  realization of SemantiCache's motivating intuition of "mimicking human
+  memory."
+
+The entire thread has shifted from "how to lose as little as possible" toward
+"how to compress along the hierarchy of human cognition."
+
+* One Diagram
+
+#+begin_example
+                              KV Cache Compression Evolution (compression unit × structural awareness)
+
+   Compression unit
+       ^
+   Paragraph |                                         [SepLLM 2025]
+       |                                              segment -> one separator
+       |                                                       \
+   Chunk  |                              [CaM 2024]             \
+       |                                token -> weighted merge  \
+       |                                                          \
+       |                                                    [SemantiCache 2026]
+       |                                              separator chunk + cluster + proportional attention
+   Token |     [H2O '23]   [Stream '24]   [SnapKV '24]              ^
+       |     evict low-score  evict middle  select by query          |
+       |                                                             |
+       +-----------------------------------------------------> Semantic awareness
+                 None                                               High
+
+   Paradigm shift:
+     eviction (drop)  -->  merging (fold)  -->  semantic-aware merging (fold along semantics)
+        H2O                  CaM                       SemantiCache
+        StreamingLLM         D2O
+        SnapKV               WeightedKV
+
+   Evolution of the core tension:
+     2023: how to pick tokens to drop           (importance = attention score)
+     2024: how to avoid dropping (merge instead) (information conservation is safer than deletion)
+     2025: which boundary to respect when merging (separator = natural anchor)
+     2026: align the whole compression to the levels of language (chunk -> cluster -> core, + reweight)
+#+end_example
+
+* Insight
+
+Compressed to one sentence: *The history of KV cache compression is the
+history of realigning the "unit of compression" from "arbitrary token" to
+"natural language unit," one step at a time.*
+
+Looking one level deeper, what we see is researchers iterating over the very
+definition of "importance":
+- Generation 1: *attention score* as importance → but the model's own
+  attention distribution is biased (the sink phenomenon).
+- Generation 2: inject *task/query signal* → but still a binary decision at
+  token level.
+- Generation 3: shift the frame to *merge instead of delete* →
+  information conservation, but the unit is still wrong.
+- Generation 4: accept that *language itself has structure* → let the
+  compression unit align to that structure (separator chunks, semantic
+  clusters).
+- Then the inevitable new question: if merging dilutes information, what
+  then? Answer: add log(|S|) reweighting before softmax — an elegantly
+  small operation that writes "how many tokens this core represents" directly
+  into the attention formula.
+
+Where might this go next? Two directions seem likely:
+1. *Learn τ* — let the model learn the optimal clustering granularity for
+   each layer and each head, replacing hand-tuning. AdmTree has already
+   opened that path.
+2. *Compression-retrieval integration* — SemantiCache is still a
+   "compress once and done" approach. The natural next step is to fuse it
+   with long-context retrieval: if a query later needs the fine-grained
+   detail inside a merged core, it can look up the original K/V on demand.
+   This is effectively adding a cache-of-the-cache layer on top of
+   compression.
+
+* Takeaways
+
+Lessons for how to find good problems:
+
+1. *Pushing along the same trade-off curve is the wrong direction.* The first
+   three generations of methods all refined "how much to drop / how to
+   select" — and the performance-memory curve flattened. The real
+   breakthrough is SemantiCache's *change of coordinates*: stop asking "which
+   token is best to discard" and ask "what should the minimal unit of
+   compression be."
+
+2. *The phenomena others find too messy to examine are often the gold mine.*
+   SepLLM exists because someone was willing to seriously ask "why do
+   punctuation tokens attract such high attention" — a question many would
+   have dismissed as a model artifact and moved on. A stable anomaly that
+   everyone overlooks is frequently the exact pivot point for the next
+   solution.
+
+3. *Aligning to the natural structure of the domain is almost always the
+   terminal direction.* The endpoint of this thread — and the core argument
+   of SemantiCache — is that natural language is not a sequence of tokens
+   but a hierarchical structure, and compression should not work against that
+   structure. Any work that brings a domain's natural structure into its
+   algorithm is pointed in the right direction; the only question is timing
+   and execution.
+
+Practically speaking: the next time you tackle a "drop / compress / select"
+problem, pause and ask — *is the unit of operation I am using the domain's
+natural unit, or just the convenient engineering unit?* If it is the latter,
+there is a SemantiCache waiting to be written right there.

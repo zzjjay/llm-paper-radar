@@ -1,0 +1,266 @@
+#+title:      LycheeCluster: Efficient Long-Context Inference with Structure-Aware Chunking and Hierarchical KV Indexing
+#+date:       [2026-05-28 Thu 21:29]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T212959-en
+#+source:     https://arxiv.org/abs/2603.08453
+#+authors:    Dongfang Li, Zixuan Liu, Gang Lin, Baotian Hu, Min Zhang
+#+venue:      arXiv 2026.03 (cs.LG)
+
+* The River of Problems
+
+Model context windows keep growing — from 4K all the way to 2M tokens — yet in practice, every time a new token is generated, the entire "past" must be scanned again. This is the fundamental dilemma of long-context inference: the larger the context, the more it can hold, but the harder it becomes to use that content efficiently.
+
+Where exactly is the bottleneck? Memory bandwidth. The attention mechanism itself has been optimized with various kernels; the bottleneck is not computation but the fact that every single step requires reading the enormous KV cache out of GPU memory. Reading the K and V matrices for 1M tokens is far slower than computing over them.
+
+Why have successive generations of researchers kept charging at this problem? Because every solution makes the same trade-off — *look at fewer tokens, but don't miss the critical ones*. How to "look at fewer" and how to "never miss" is the proposition that has kept evolving throughout this river.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNNs can't run fast; sequences must be computed serially
+  | Solution: Fully connected self-attention
+  | Buried debt: As length grows, the KV cache explodes GPU memory
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+[2024] Xiao et al. - StreamingLLM
+  |
+  | Problem: KV cache too large to read efficiently
+  | Solution: Discard some tokens and never read them again
+  | Buried debt: Once discarded, they're gone forever; complex reasoning tasks lose information
+  v
+[2024] Tang et al. - Quest
+  |
+  | Problem: "Permanent forgetting" is too coarse
+  | Solution: Keep everything, but retrieve only the needed pages (64 tokens/page)
+  | Buried debt: Fixed pages cut across semantic boundaries; one relevant token drags in a whole page
+  v
+[2025] Liu et al. - ClusterKV
+  |
+  | Problem: Fixed pages waste retrieval budget
+  | Solution: Don't slice by position; cluster at token level by vector similarity
+  | Buried debt: Clustering scatters "locally adjacent relevant tokens"; re-clustering is expensive, unsuitable for streaming
+  v
+[2025] Zhu et al. - SentenceKV
+  |
+  | Problem: Token-level clustering destroys local coherence
+  | Solution: Use natural sentences as the atomic retrieval unit
+  | Buried debt: Relies on punctuation to split sentences; breaks on code/JSON/tables that lack punctuation; high variance in sentence length
+  v
+[2026] Li et al. - LycheeCluster  <-- target paper
+  |
+  | Problem: Need structural integrity, controlled size, and streaming-updatable indexing simultaneously
+  | Solution: Structure-aware chunking + three-level hierarchical indexing + lazy updates
+  v
+[2025+] RazorAttention, SentenceKV, ...  (orthogonal directions)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al. (Attention Is All You Need): The origin of the memory-hungry monster
+
+*** What problem did it see?
+
+The fundamental flaw of RNNs wasn't accuracy — it was speed. Tokens had to be processed one by one, with no possibility of parallelism. This bottleneck stalled NLP for years.
+
+*** Its solution
+
+Throw out the RNN entirely. Every position computes a similarity score directly against every other position, then takes a weighted sum. This way all positions can be computed in parallel at the same moment, finally letting GPU compute power be fully utilized.
+
+*** Why it worked (and what new debt it buried)
+
+Parallelism took off immediately, and modeling capacity surpassed RNNs. But two time bombs were planted:
+
+- Compute: every position attends to all positions — *O(n^2)*. Fine for short sequences, unsustainable for long ones.
+- Memory: during autoregressive generation, every step must cache all previous K and V values to avoid recomputation — *KV cache grows linearly with sequence length*. When context reaches 1M tokens, generating each new token requires moving gigabytes of KV from HBM; *the bottleneck is data movement, not arithmetic*.
+
+These two debts are what every subsequent paper set out to repay.
+
+** 2023–2024 | H2O & StreamingLLM: "We're not using most tokens anyway — just drop them"
+
+*** What problem did they see?
+
+A large fraction of tokens in the KV cache are almost never attended to — their scores are perpetually at the 0.001 level. If they are never attended to, why should they occupy precious memory?
+
+*** Their solution
+
+Define a retention budget (e.g., keep only 1024 tokens at all times), then use a heuristic (H2O tracks historical cumulative attention scores; StreamingLLM tracks position — keep the first few and the most recent few) to permanently evict "unimportant" tokens.
+
+*** Why it worked (and what new debt it buried)
+
+Memory becomes controllable and throughput rises immediately. The cost: *once evicted, a token is gone forever*.
+
+- A token that seemed unimportant early on may turn out to be critical evidence when generation later pivots to a new topic — and it no longer exists.
+- On multi-hop reasoning, long-document QA, and code generation — tasks that need to revisit the full history — eviction-based methods suffer dramatic accuracy drops.
+
+The natural follow-up question: can we keep everything and just "temporarily skip" rather than permanently delete?
+
+** 2024 | Quest: "Keep everything, but retrieve only the relevant pages each step"
+
+*** What problem did it see?
+
+The "permanent forgetting" of H2O / StreamingLLM is a blunt instrument. The actual need is: *keep all KV* (no information loss) while *reading only a small subset at each generation step* (not bottlenecked by memory bandwidth). This motivated retrieval-based sparse attention.
+
+*** Its solution
+
+Slice the KV cache into fixed-size pages (e.g., 64 tokens per page), maintaining a min-max summary for each page (the per-dimension maximum and minimum values of K). When a new query arrives, use these summaries to quickly estimate "which pages are most likely to contain high-scoring tokens," then bring in only the top-k pages for exact attention.
+
+*** Why it worked (and what new debt it buried)
+
+- Page-level summary scoring *reduces "scanning 1M tokens" to "scanning a few thousand pages"*, dramatically relieving bandwidth pressure.
+- The complete history is preserved, just compressed into an index — no information is lost.
+
+But pages are sliced by position, and a fundamental flaw emerges:
+
+- *Semantics get bisected*: a JSON field, a function definition, a chain of reasoning can span two pages. A page with 0.1% relevant tokens gets dragged in entirely — *budget wasted*.
+- Conversely, genuinely relevant content that happens to straddle a page boundary may split across two pages whose summaries are both unremarkable, causing it to be pruned away.
+
+The natural next question: can we slice by "semantics" rather than by "position"?
+
+** 2025 | ClusterKV: "Cluster by similarity — stop slicing by position"
+
+*** What problem did it see?
+
+Quest's fixed pages are too mechanical, ignoring the actual distribution of K vectors. If K vectors are grouped by similarity into a few hundred clusters, within-cluster coherence is much higher and summary scoring is much more accurate.
+
+*** Its solution
+
+Extract all tokens' K vectors and run global clustering (k-means or similar), producing a centroid per cluster. At retrieval time: the query computes similarity against all centroids, selects the top-k clusters, and fetches the tokens in those clusters for attention.
+
+*** Why it worked (and what new debt it buried)
+
+- Summary precision is a notch above Quest; the same retrieval budget yields more accurate hits.
+
+But treating tokens as an "unordered bag of vectors" discards a critical property — *local coherence*.
+
+- Adjacent steps in a reasoning chain, adjacent lines in code, adjacent fields in a JSON object *may not share high vector similarity* — their relationship is syntactic or logical proximity, not semantic similarity. Clustering scatters them into different clusters.
+- Retrieving the top-k clusters brings back "scattered, globally distributed" tokens, which are actually harder for attention heads to use.
+- There is also an engineering trap: in streaming generation, every new segment of KV theoretically requires re-running k-means — prohibitively expensive, so in practice the index goes stale.
+
+Next step: can we use "natural semantic boundaries" as the unit of division?
+
+** 2025 | SentenceKV: "Use sentences as the minimum unit"
+
+*** What problem did it see?
+
+ClusterKV scatters too finely; Quest slices too rigidly. A middle ground: natural language already has "sentences" as a boundary — terminal punctuation is a natural separator of semantic units.
+
+*** Its solution
+
+Split context on sentence-ending punctuation (`. ? !` etc.), treating each sentence as a chunk and performing retrieval at the chunk level.
+
+*** Why it worked (and what new debt it buried)
+
+- On prose, dialogue, and news text with clear punctuation, results are noticeably better than fixed pages.
+
+But the definition of boundary is too narrow:
+
+- *Code, JSON, tables, and Markdown have no periods*. SentenceKV degrades to "split on newlines arbitrarily" or lumps everything into one giant block.
+- Sentence length variance is extreme — one long sentence can be hundreds of tokens, a short one just a few — *chunk sizes are uncontrollable*, making retrieval budget allocation chaotic.
+
+What is needed is a scheme that both respects semantic boundaries and enforces controlled chunk sizes.
+
+** 2026 | LycheeCluster: Structure-aware chunking + hierarchical indexing + lazy updates — all three together
+
+*** What problem did it see?
+
+Every solution along the preceding timeline addressed only one dimension:
+- Quest solved "no deletion," but sliced mechanically.
+- ClusterKV solved "more accurate summaries," but destroyed locality.
+- SentenceKV solved "semantic boundaries," but only for natural text, with uncontrolled sizes.
+
+And everyone overlooked a more fundamental problem: when the number of clusters itself reaches thousands, *"scan all summaries" becomes a new bottleneck*.
+
+There is also a more subtle streaming trap: when new KV arrives, should the global index be updated? Updating is expensive; not updating means the index goes stale.
+
+*** Its solution
+
+Three-piece kit:
+
+1. *Structure-aware chunking*: greedily accumulate tokens; once a "minimum length" threshold is met, find the nearest high-priority delimiter (newline, sentence-ending punctuation, closing bracket, etc.) and cut there; if "maximum length" is exceeded without finding one, cut hard. In short — *slice along natural boundaries while keeping chunk size under control*. Works stably for code, JSON, prose, and tables alike.
+
+2. *Hierarchical KV indexing*: each chunk is represented by its mean-pooled K vector; spherical k-means on these produces *fine clusters*; clustering the fine cluster centroids again yields *coarse units*. A three-level pyramid: =coarse units → fine clusters → chunks=. Retrieval proceeds top-down, using *the triangle inequality + Cauchy-Schwarz to derive an upper bound on similarity for each branch* — branches whose upper bound is too low are pruned entirely without examining their contents. This reduces retrieval from linear to logarithmic.
+
+3. *Lazy updates*: during streaming generation, new KV goes into a buffer; once enough accumulates to form a chunk, it is grafted onto the nearest existing cluster, the centroid is updated with a moving average, and the radius is monotonically expanded. *No re-clustering; the index stays fresh*.
+
+** Measured Results
+
+- Up to 3.6× end-to-end inference speedup vs. full attention;
+- Accuracy on RULER, LongBench V2, and MATH500 matches or exceeds full attention;
+- Significantly outperforms Quest and ClusterKV, especially on structured data (JSON extraction +15.0%) and CoT tasks that require preserving reasoning-chain integrity.
+
+* Frontier Extensions
+
+** Contemporaneous / Subsequent Work
+
+- *RazorAttention (Tang et al. 2025)*: compresses along a different axis — *different attention heads have different importance*, and caching is applied selectively per head. Orthogonal to LycheeCluster; in theory the two can be stacked.
+- *SentenceKV* itself continues to be developed, but LycheeCluster already subsumes its core idea and extends it to structured data.
+
+The downstream direction of this river is mainly flowing toward two destinations:
+
+1. *Smarter boundary detection*: moving from hand-written rules (punctuation / indentation) toward "using a small model to predict semantic boundaries" — but can the overhead of the small model be pushed below that of a heuristic? No clear winner has emerged yet.
+2. *Co-evolution with hardware / kernel design*: the infrastructure of retrieval-based attention — page tables, PagedAttention, vLLM — is already mature; whether hierarchical indexing can be supported directly by GPU kernels (rather than Python-side scheduling) will determine the ceiling of the next wave of acceleration.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                                Time ->
+   2017             2023-24         2024          2025          2025         2026
+   Attention        H2O /           Quest         ClusterKV     SentenceKV   LycheeCluster
+   Is All You       StreamingLLM
+   Need
+
+Completeness: full   permanent drop  full keep     full keep     full keep    full keep
+   |                  X              OK            OK            OK            OK
+   v
+Slice granularity:   token           fixed page 64 token         natural       structure-aware
+  token                              (by position) (by similarity) sentence     chunk
+                                       |             |             |            (hybrid, controlled size)
+                                    cuts semantics  breaks        fails on      preserves structure
+                                                   locality      structured    + controls size
+                                                                 data
+   v
+Retrieval cost: O(n) -               linear page   linear        linear        O(log n) hierarchical
+                                     scan          cluster scan  sentence scan pruning
+                                                                               (upper bound + triangle ineq.)
+   v
+Streaming update: -  -               incremental   global        incremental   lazy update +
+                                     page add OK   re-clustering sentence OK   moving average
+                                                   expensive
+
+Core metaphor:      "Throw away,     "Cut into a    "Pack into     "Pack into   "Pack into small
+                    never look"      stack of cards, bags by        bags by      boxes inside big
+                                     flip by pos."  similarity,    sentence,    boxes; feel the
+                                                    reach in."     reach in."   box, not the item."
+#+end_example
+
+* Insights
+
+On the surface, this river traces an iteration of KV cache compression techniques; but what is truly changing underneath is *the conception of what constitutes a semantic atom*.
+
+- In the Vaswani era, the atom was implicitly the *token* — the smallest addressable unit;
+- H2O / StreamingLLM still assumed the atom was a token, just labeling each one "keep or evict";
+- Quest promoted the atom to a *page* — a physical slice unit;
+- ClusterKV jumped back to the *token*, but organized by similarity;
+- SentenceKV defined the atom as a *natural semantic unit* (the sentence);
+- LycheeCluster goes further: atom = *structure-aware, size-controlled semantic chunk*.
+
+At a deeper level, this is a shift from "treating data according to storage boundaries" to "treating data according to semantic boundaries." The same theme runs through the entire systems field — databases moving from row stores to column stores to partitions, file systems moving from blocks to extents — always the same motif: *align access patterns with data organization*.
+
+Where is the next step most likely to go? Two directions:
+
+1. *Boundaries learned, not written*: current structure-aware chunking still relies on hand-crafted rules. It is predictable that proposals for "using a model to predict the next optimal split point" will appear.
+2. *Learnable upper-bound estimation*: the triangle inequality provides a mathematically tight upper bound, but it is often loose in practice. If one allows "probabilistic upper bounds" (accepting a small probability of accuracy loss), pruning can be far more aggressive. This line is highly isomorphic to the development of approximate nearest-neighbor search (ANN, HNSW, ScaNN) and the two can borrow from each other.
+
+* Takeaways
+
+**Redesign from scratch vs. patch on top.** Looking back over this river — every paper patched the one before it, until the patches ran out and the next generation had to redefine the fundamental granularity. LycheeCluster's real contribution is not any single engineering optimization, but *re-raising "the choice of atomic unit" as the most foundational design question* — and showing that at the same budget, simply changing the granularity (structure-aware vs. fixed page) yields +15% accuracy.
+
+This implies:
+
+- In engineering, *first ask "is the minimum unit I'm working with a natural one?" before asking "does the algorithm need optimizing?"* Nine times out of ten, choosing the right unit makes the algorithm irrelevant.
+- In research, making "swap some baseline assumption for a more natural value" into a pilot study frequently reveals +N% improvements that feel like free gains — this is exactly the writing template of the LycheeCluster Pilot Study section.
+- For any system design involving indexing / clustering / retrieval, *always ask: Is the hierarchy deep enough? Are the upper bounds too loose? Is incremental update properly amortized?* LycheeCluster answers all three simultaneously — it is a template worth copying.
+
+One final note: *respecting the natural structure of the input is the opening move of almost every system optimization*. It is simple enough to be overlooked, yet its return on investment is remarkably high.

@@ -1,0 +1,260 @@
+#+title:      SVD Contextual Sparsity Predictors for Fast LLM Inference
+#+date:       [2026-05-28 Thu 23:32]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T233211-en
+#+source:     https://arxiv.org/abs/2603.14110
+#+authors:    Georgii Serbin, Kirill Koshkin, Zhongao Sun, Anastasiya Bistrigova, C.C. Korikov
+#+venue:      arXiv 2026 (cs.LG)
+
+* The River of the Problem
+
+A 7-billion-parameter LLM passes all 7 billion parameters for every token it generates. But open up its FFN layers and you will find that each token genuinely needs only about 10% of those neurons. The remaining 90% compute for nothing — their outputs are zero, filtered out by ReLU.
+
+So can we "only compute what is needed"? Sounds obvious. The difficulty is that you must know in advance which neurons will activate before you can skip the others. That "knowing in advance" must itself be cheap — cheaper than just running everything — or you come out behind.
+
+This river spans nearly a decade and asks the same question throughout: *How do you predict, at the lowest possible cost, which neurons will fire next?* Every generation takes a guess, and every generation trips over pits left by the one before.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Idea: not every neuron should participate in every token
+  | But:  requires redesigning the architecture and adding routing gates
+  v
+[2022] Li et al. - The Lazy Neuron Phenomenon
+  |
+  | Finding: ordinary pretrained Transformers are already sparse (>90%)
+  | No architecture change needed — the sparsity is already there
+  v
+[2023] Liu et al. - Deja Vu
+  |
+  | First to turn "sparsity" into "speedup":
+  | trains a small MLP predictor to guess in advance which neurons activate
+  | Pit left: predictor must be trained; sparsity too low when SiLU is used
+  v
+[2024] PowerInfer / ProSparse / TurboSparse
+  |
+  | ReLU-fy the model (fine-tune to swap activation function), sparsity back to 90%+
+  | Makes the Deja Vu approach actually run on consumer GPUs
+  | Pit left: predictor still requires training; PowerInfer needs CPU/GPU hybrid scheduling
+  v
+[2024-25] SparseInfer / TEAL / GRIFFIN / CLADA
+  |
+  | Skip training entirely — infer from activation statistics / thresholds / sign bits
+  | Pit left: all heuristic, no theoretical guarantee; each has its own limits
+  |           (KV cache, prompt-fixed patterns, etc.)
+  v
+[2026] SVDP (this paper) - SVD Contextual Sparsity Predictors
+       No training + theoretical error bound + cross-hardware via standard PyTorch API
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | MoE: Neurons Should Not Be Treated Equally — But You Must Design the Architecture for It
+
+*** What Problem Did It See
+
+The standard recipe since the 1990s: every input runs through the entire network. Shazeer's team's intuition — this is wasteful. A sentence about French translation should invoke the "grammar expert" parameters; a sentence about code should invoke the "code expert" parameters. There was no way to achieve this.
+
+*** Its Solution
+
+Split the FFN into hundreds or thousands of "experts" (each a small FFN) and place a "gating network" in front. The gate glances at the input and lets only the top-k experts work for this token (e.g., 2 out of 1000). All other experts are entirely excluded from the computation.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because the gating network is small, and its decision cost is far lower than running all experts. The total model capacity can be enormous, yet each token only uses a small portion — *total capacity grows, per-step cost stays flat*.
+
+But the pit is obvious: *you must design and train from scratch with a MoE architecture*. A pre-trained dense Transformer cannot use this scheme. The gate must be learned jointly with the whole model. If you already have a standard LLaMA, MoE does not help you.
+
+** 2022 | Lazy Neuron: Wait — Ordinary Transformers Are Already Sparse
+
+*** What Problem Did It See
+
+MoE researchers were busy promoting the benefits of sparse activation. But Li et al. stared at standard dense Transformers and noticed something strange: *these models are already sparse*. On T5-style models with ReLU FFNs, fewer than 10% of FFN neurons actually activate (produce non-zero output) for any given token.
+
+In other words, the sparsity that MoE laboriously introduced at the architectural level is already present in standard pretrained models — *it just hadn't been exploited*.
+
+*** Its Solution
+
+Strictly speaking, this paper is a "diagnosis," not a solution. Its contribution is establishing the "lazy neuron phenomenon" as a fact: sparsity is not MoE's patent; it is a property that spontaneously emerges from ReLU-family activations combined with large-scale training.
+
+*** Why It Worked (and What Pits It Dug)
+
+Once this observation was out, the next step seemed obvious: since 90% of neurons compute for nothing, can we just not compute them?
+
+The pit it left: *the phenomenon is observed, but the activation pattern is input-dependent — you must redetermine which neurons will fire for every new token*. Unlike MoE, which has a ready-made gate, ordinary models have no "know in advance" mechanism. How do you build one that is both fast and accurate?
+
+** 2023 | Deja Vu: Train a Small Neural Network to Predict the Activation Pattern of the Large One
+
+*** What Problem Did It See
+
+Lazy Neuron identified the gold mine but provided no tools to mine it. Liu et al.'s entry point: *since activation patterns correlate with inputs in a learnable way, the pattern itself is learnable* — train a lightweight model that takes the current hidden state and outputs a binary mask of "which FFN neurons will activate."
+
+*** Its Solution
+
+Insert a two-layer MLP as a "predictor" before each FFN layer. In an offline phase, supervise these small MLPs using real activation patterns. At inference, the predictor runs first, produces a sparse mask, and the FFN only computes the neurons in the mask. The predictor's compute cost is far below the FFN compute saved — a net speedup.
+
+The more elegant detail: overlap the predictor's run asynchronously with earlier-layer operations (lookahead), so prediction latency is nearly hidden.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because, while the predictor must be trained, the cost is manageable compared with training a full MoE from scratch. It is also non-invasive — the FFN weights are not touched.
+
+Three pits remained:
+1. *Training cost is non-zero* — every model, every version requires retraining the predictors; change the sparsity target or upgrade the model and you start over.
+2. *Modern LLMs mostly use SiLU/SwiGLU, not ReLU* — these activations do not naturally yield 90% sparsity, so Deja Vu's premise collapses.
+3. *No theoretical guarantee on misprediction* — only empirical accuracy drops; nobody can state "under condition X, recall is guaranteed ≥ Y."
+
+** 2024 | PowerInfer / ProSparse / TurboSparse: First ReLU-fy the Model, Then Let Everyone Run It
+
+*** What Problem Did It See
+
+Deja Vu's approach is correct, but in practice you get LLaMA2 (SiLU) or Mistral (SwiGLU) — sparsity is only 30–50%, and the speedup immediately deflates. On the other side: many people want to run 7-billion-parameter models on their own machines (consumer GPU + large CPU memory), but 24 GB VRAM cannot hold all the weights and throughput is too low.
+
+*** Its Solution
+
+Two parallel tracks:
+
+- *The ReLU-fy track* (ProSparse, TurboSparse): replace SwiGLU with ReGLU or dReLU and lightly fine-tune an existing dense checkpoint to push sparsity back to 80–90%. After the swap, the Deja Vu approach works again.
+- *The systems track* (PowerInfer): observe that under sparse activation, a small set of "hot" neurons is called repeatedly while most "cold" neurons are nearly dormant. Keep hot neurons resident on the GPU and leave cold ones in CPU memory, fetching on demand. Combined with Deja Vu-style predictors, this achieves 11× speedup for a 7B model on an RTX 4090.
+
+*** Why It Worked (and What Pits It Dug)
+
+This generation turned "sparse = faster" from a theoretical claim into a tool accessible to the public — consumer hardware + standard ReLU-ified models + learned predictors: the whole pipeline runs end to end.
+
+But the root pits were not removed:
+1. *Predictors still need training*. Change the sparsity rate or the model and you start over.
+2. PowerInfer depends on CPU/GPU heterogeneous scheduling — *purely homogeneous GPU inference (batch = 1, edge scenarios) does not enjoy all the benefits*.
+3. *Still no theoretical guarantee* — if prediction goes wrong, the accuracy drop is only discovered after running benchmarks.
+
+** 2024–2025 | SparseInfer / TEAL / GRIFFIN / CLADA: Skip Training Entirely — Infer Directly from Statistics
+
+*** What Problem Did It See
+
+"Predictors require training" is an engineering headache: every new model, every new sparsity target, every domain-fine-tuned variant demands a full cycle of data preparation and training. This wave of work asked: *can we skip training entirely and derive a threshold directly from activation statistics?*
+
+*** Its Solution
+
+Each method finds its own angle, but the shared idea is "run a calibration dataset, pick a threshold offline":
+
+- *GRIFFIN*: record which neurons are active during the prefill phase; during decoding, only those "expert neurons" are activated.
+- *TDA*: compute an offline threshold per neuron; compare the pre-activation dot product to the threshold.
+- *TEAL*: apply sparsity directly to the input vector (input sparsity rather than activation sparsity) using a threshold cutoff.
+- *SparseInfer*: for ReLU-ified models, use *sign-bit comparison* to cheaply decide whether the ReLU input is positive — far cheaper than actually computing it.
+- *CLADA*: let the sparsity pattern update dynamically during generation.
+
+Common trait: *zero training, lightweight, plug-and-play*.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because in many scenarios activation distributions are relatively stable, and offline-calibrated thresholds are good enough. Zero training means you can press one button on a new model and go.
+
+But the pits are clear:
+1. *All heuristic*. SparseInfer's sign-bit shortcut "looks reasonable" but nobody has proved when it will fail badly.
+2. *Each has side effects*. GRIFFIN/TDA fix the sparsity pattern per prompt, losing token-level dynamism; CLADA tries to restore dynamism but must recompute the KV cache on every update, which is brutal for long contexts; TEAL cuts the wrong dimension (input vs. activation).
+3. *Missing: a unified, analytically tractable method that can state a recall guarantee*.
+
+** 2026 | SVDP: Use SVD as the Predictor — No Training and a Theoretical Bound
+
+*** What Problem Did It See
+
+The SVDP team surveyed this entire decade-long line and found a gap: *every existing training-free method is an engineering trick, and none can write the sentence "under condition X, the predictor's error is bounded by Y."* This leaves sparse inference perpetually anxious in production — you cannot commit to any guarantee.
+
+A second observation: the SVD line (ASVD, SVD-LLM) demonstrated that low-rank truncated approximation of weight matrices is very effective for static compression, and *naturally carries a mathematical bound*. Yet SVD had always been used as a "compression tool," never as a "predictor."
+
+*** Its Solution
+
+Apply SVD truncation to the FFN's gate matrix W_gate and *use the resulting low-rank approximation A·B·x as the prediction of "which neurons will activate."* The full pipeline:
+
+1. *Offline*: for each layer's W_gate, first apply whitening with calibration data (so the low-rank approximation is optimal over the data distribution rather than in an abstract sense, borrowing from ASVD/SVD-LLM); then compute SVD to obtain A, B.
+2. *Calibrate per-neuron thresholds*: using zero as the threshold produces too many false positives. A greedy algorithm adjusts each neuron's threshold individually, targeting a specified sparsity level while minimizing perturbation to the FFN output. Key: *this greedy procedure has an optimality guarantee* (proved in the paper's appendix).
+3. *Online*: before each FFN, run A·B·x to obtain the mask; the gate and up projections are computed *sequentially* (not in parallel), so that after the gate is computed a second filter pass removes false positives, raising the effective sparsity for the up/down projections.
+4. *Hardware*: a custom CUDA kernel is written; the same logic runs on Huawei Ascend (CANN) using high-level PyTorch APIs — *no need to rewrite low-level code per hardware target*.
+
+*** Why It Worked (and What Pits It Dug)
+
+The fundamental reason it works: SVD truncation has a strict Eckart-Young bound — "how much energy is discarded" is computable, and therefore "how much the predictor errs" is controllable. Whitening tightens the bound for the real data distribution; the greedy threshold calibration explicitly models "how much error each neuron can tolerate" — *every step that was previously empirical is now backed by a proof*.
+
+In practice: across three ReGLU models (ProSparse-LLaMA2-7B, TurboSparse-Mistral, and one other), at 90% sparsity, end-to-end decoding speedup is 1.8×, with benchmark degradation < 1%.
+
+Pits remaining:
+1. *Requires ReGLU/ReLU-family activations* — vanilla SwiGLU still needs to be ReLU-ified first.
+2. *Predictor cost scales as r(d+D)* — rank too large and the overhead erodes the gain; rank too small and accuracy drops; rank is a tunable hyperparameter.
+3. *Sweet spot is single-batch edge inference* — in large-batch server scenarios, the sparse kernel's hardware utilization is actually lower than a dense kernel.
+
+* Frontier Extensions
+
+As of May 2026, SVDP is the latest paper on the "training-free + theoretical guarantee" thread. Several foreseeable directions are already underway:
+
+- *Dynamic rank*: different layers — or even different prompts — use predictors with different ranks. SparseLoRA already explores rank-switching by input in fine-tuning scenarios, but runs fully dense at decode time; this gap will be filled.
+- *Non-ReGLU activations*: Appendix C of the SVDP paper sketches an extension to SwiGLU but leaves it unfinished. This is the obvious next paper.
+- *Co-optimization with quantization and KV cache compression*: the triangular combination of sparsity + 4-bit quantization + KV cache compression has been explored in pairs, but all three together have not been fully integrated.
+- *Theory → adaptivity*: SVDP's greedy calibration uses a fixed sparsity budget. If each token can dynamically adjust its budget based on "how hard this token is," the theoretical framework generalizes naturally.
+
+* One Figure to Understand It All
+
+#+begin_example
+              "How to make large models stop wasting compute"
+                                  |
+                                  v
+    +----------------------------------------------------------+
+    | Date   |  Method            | Source of sparsity | How prediction works       |
+    +----------------------------------------------------------+
+    | 2017   |  MoE (Shazeer)     | Architectural      | Gating network co-trained  |
+    |        |                    | (train from scratch)| with the model             |
+    +----------------------------------------------------------+
+    | 2022   |  Lazy Neuron       | Emerges from       | (observation only,         |
+    |        |  (Li et al.)       | pretraining        |  no solution)              |
+    |        |                    | (zero cost)        |                            |
+    +----------------------------------------------------------+
+    | 2023   |  Deja Vu           | Exploits natural   | Train a small MLP          |
+    |        |  (Liu et al.)      | ReLU sparsity      | (requires training)        |
+    +----------------------------------------------------------+
+    | 2024   |  PowerInfer /      | ReLU-fy the model  | Learned predictor          |
+    |        |  ProSparse /       | first (fine-tune   | + CPU/GPU heterogeneous    |
+    |        |  TurboSparse       |  activation fn)    | scheduling                 |
+    |        |                    |                    | (still requires training)  |
+    +----------------------------------------------------------+
+    | 2024-5 |  SparseInfer /     | Same ReLU          | Offline statistics /       |
+    |        |  TEAL / GRIFFIN /  |                    | thresholds                 |
+    |        |  CLADA             |                    | (zero training, heuristic, |
+    |        |                    |                    |  no theoretical guarantee) |
+    +----------------------------------------------------------+
+    | 2026   |  SVDP (this paper) | Same ReLU          | SVD low-rank approx +      |
+    |        |                    |                    | greedy threshold calib.    |
+    |        |                    |                    | (zero training + bounded)  |
+    +----------------------------------------------------------+
+
+    Main thread:
+      "Sparsity" moves from architecture (MoE) -> emergent phenomenon (Lazy Neuron)
+                 -> engineering-usable (Deja Vu)
+                 -> consumer-accessible (PowerInfer family)
+                 -> zero-training (SparseInfer family)
+                 -> zero-training + provable (SVDP)
+
+    What truly evolved over ten years was not "how to be sparse,"
+    but "how to know — at ever-lower cost and ever-greater control —
+         which neurons to compute next."
+#+end_example
+
+* Insight
+
+Reading the full arc, a clear curve of descending cost and ascending guarantee becomes visible.
+
+Every generation did two things simultaneously: *pulled usage cost downward* (no architecture change → no full retraining → no predictor training → no hardware lock-in), and *pulled controllability upward* (from "run a benchmark and see" → "engineering intuition" → "mathematical bound"). The two did not always advance together — Deja Vu built controllability on empiricism but drove cost down sharply; SparseInfer pushed cost all the way to zero training but retreated controllability to zero. SVDP is a rare paper that pulls both axes at once: its choice of SVD borrows a mathematical tool (the Eckart-Young theorem) to simultaneously gain "no training required" and "error bounded."
+
+At a deeper level: *this line has been quietly completing an identity shift — from "systems speedup trick" to "analyzable algorithmic component."* Early Deja Vu reads like a systems paper; PowerInfer even more so. By SVDP, there are long theoretical appendices proving predictor error bounds. Sparse inference is being absorbed from "engineering black magic" into the domain of numerical analysis. Once it enters that domain, a cleaner formal framework follows naturally — for example, unifying sparsity + quantization + low-rank compression as "apply some structured approximation to the weights + control the approximation error."
+
+Where will the next step most likely go? *An activation-function-agnostic unified framework.* Every method on this line is locked to ReLU/ReGLU, because ReLU provides the hard threshold of "negative → zero" that makes sparsity meaningful. SwiGLU/SiLU lack this property. The next generation must either find an equivalent sparsity definition for SwiGLU or abandon sparsity in favor of "low-rank + quantization" combinations — the latter is already germinating on the SVD-LLM branch.
+
+* Takeaways
+
+Pulling the "why" into full view: *the entire river pursues the same question for a decade — predict which neurons should work*. But every generation's bottleneck is completely different: MoE was bottlenecked by architectural redesign, Deja Vu by training cost, PowerInfer by hardware heterogeneity, SparseInfer by the absence of theory. If you are doing technology selection, *the right question is not "which method to use" but "which class of constraint am I currently blocked by"* — identify the bottleneck correctly and the method choice follows naturally.
+
+For researchers: SVDP's victory lies not in inventing something new but in *connecting two previously separate lines (SVD compression + sparse prediction)*. The SVD-LLM crowd did static weight compression; nobody thought of using it as a "dynamic activation predictor." This kind of "borrow a tool" move is more valuable than "build a new wheel" — *your next good paper is probably hidden at the junction of two already mature fields, waiting to be bridged*.
+
+For practitioners, the landing points are:
+1. *When deploying edge LLMs, use SVDP as the default baseline*: training-free means you need no access to the original dataset; the theoretical bound means you can write an SLA for your customer.
+2. *When doing algorithmic research, track the "cost–guarantee" pair of axes*: how much does your new method move each axis? This is more illuminating than "1.X× faster."
+3. *When making framework decisions, be alert to the ReLU assumption*: most mainstream open-source LLMs use SwiGLU; before applying anything from this line, decide whether you can afford the fine-tuning cost of ReLU-ification.

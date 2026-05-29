@@ -1,0 +1,299 @@
+#+title:      Self-Indexing KVCache: Predicting Sparse Attention from Compressed Keys
+#+date:       [2026-05-28 Thu 23:35]
+#+filetags:   :paper:river:
+#+identifier: 20260528T233513
+#+source:     https://arxiv.org/abs/2603.14224
+#+authors:    Xu Yang, Jiapeng Zhang, Dongyang Zhao, Guo Chen, Zhuo Tang
+#+venue:      arXiv 2603.14224 (cs.LG, Mar 2026)
+
+* 问题之河
+
+大模型推理时，每生成一个 token 都要回头看前面所有 token 的 key/value——这堆历史
+状态被叫做 *KV cache*。上下文一长（几万、几十万 token），KV cache 就会撑爆显存，
+而且每生成一步都要把它整块读一遍，慢到离谱。
+
+问题听起来简单：能不能少存一点、少读一点？但难就难在这三件事互相打架——
+
+1. *省内存* —— 把 KV 量化压扁（4bit、2bit、1bit）
+2. *少读取* —— 只挑最相关的 token 来算（sparse attention）
+3. *不掉精度* —— 既不能漏掉关键信息，也不能让算出来的注意力分数偏掉
+
+每代人解决其中一两个，就会被另一个反咬一口。这条线就是关于"怎么让这三件事不再
+互相拆台"。
+
+* 溯源地图
+
+#+begin_example
+[2022] FlashAttention (Dao et al.)
+  | 看到的问题: 注意力是 O(N^2)，HBM 读写把 GPU 喂不饱
+  | 解法: tiling + recompute，把整块 attention 放进 SRAM 算
+  v
+[2023] H2O (Zhang et al.)
+  | 看到的问题: FlashAttention 算得快，但还是要算"全部 token"
+  |            上下文一长 KV 还是炸
+  | 解法: 砍掉历史 token——只留累计注意力高的 "heavy hitters"
+  v
+[2024] Quest (Tang et al.)
+  | 看到的问题: H2O 一刀切，丢掉的 token 在另一个 query 上可能正好有用
+  | 解法: 不删，而是每步动态挑——把 KV 分页，给每页存 min/max 上下界，
+  |       按当前 Q 估每页相关性，top-k 选页再算 attention
+  v
+[2025] Lserve (Yang et al.)
+  | 看到的问题: Quest 只省了算力，KV 还是全量存着；
+  |            而 KIVI 等 2bit 量化只省了内存，没省算力
+  | 解法: 把 dynamic sparsity 和 low-bit quantization 拼到一起部署
+  |       —— 但 retrieval 用一套索引，存储用另一套量化，两条管线
+  v
+[2026] *Self-Indexing KVCache* (Yang, Zhang, Zhao, Chen, Tang)  <-- 目标论文
+        看到的问题: Lserve 把"挑 token"和"存 token"当两件事，
+                    一份 KV 要养两套元数据，省下来的又被开销吃回去
+        解法: 同一份 1-bit 符号编码，既当索引、又当压缩值
+              ——retrieval 和 dequantization 共用一套表示
+
+旁支 (并行线)：
+  [2024] KIVI (Liu et al.)  纯量化路线：2-bit KV，几乎不掉精度
+  [2024] VQ-based retrieval (Zhang 2024a, Liu 2024a)
+          用向量量化做近邻检索——但 codebook 要 K-means 训
+#+end_example
+
+* 演化叙事
+
+** 2022 | FlashAttention: 把 attention 塞进 SRAM 一口气算完
+
+*** 它看到了什么问题
+
+原版的 self-attention 算 ~softmax(QK^T/√d)V~，中间会显式写出一个 ~N x N~ 的注意
+力矩阵。这玩意儿被反复在 HBM (显存) 里来回搬，GPU 算力空转，瓶颈在内存带宽，不
+在算力。上下文越长，越是 HBM 带宽地狱。
+
+*** 它的解法
+
+不要显式存 ~N x N~ 矩阵。把 Q、K、V 切成小块 (tile)，每个 tile 在片上 SRAM 里完
+成"乘 + softmax + 乘 V"的一整套运算，结果直接累加出去。中间状态不落 HBM。
+backward 不存中间结果，用 recompute 换内存。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+attention 这个算法本身没变——结果一模一样。变的是数据怎么流过芯片。一旦把内存
+访问模式打理好，能省 5-10x 时间，且不掉一点精度。
+
+*留下的坑*: 它只解决了"算得快"，没解决"存得多"。KV cache 还是要原封不动地存——
+长上下文场景下，内存仍然顶天。
+
+** 2023 | H2O: 砍掉"没人看的"历史 token
+
+*** 它看到了什么问题
+
+FlashAttention 让单步 attention 快了，但 KV cache 仍然线性增长。32K、128K 的上下
+文一来，光是存 KV 就把显存吃光，更别提每步要把它整块读一遍。
+
+而且观察发现：注意力分布是高度不均的——大部分 token 几乎从来不被看。算它们等于
+浪费。
+
+*** 它的解法
+
+引入 *Heavy-Hitter Oracle*: 维护每个 token 的"历史累计注意力分数"，分数高的留下
+（heavy hitters），低的直接从 KV cache 里删掉。再加上最近的 "recent window"
+保留近邻 token。整个 KV 永远控制在一个固定预算内。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+观察是对的——attention 的确稀疏。删掉冷门 token，结果通常掉不了几个点。
+
+*留下的坑*: 这是 *静态* 决策。一个 token 在过去的 1000 步里没被看，不代表第 1001
+步的新 query 不需要它。一旦被删就永远找不回来——某些下游任务（needle-in-haystack
+类）会突然崩。
+
+** 2024 | Quest: 别删，每步动态地挑
+
+*** 它看到了什么问题
+
+H2O 的"一删了之"太武断。注意力虽然稀疏，但 *稀疏的位置随 query 变*——前一个
+query 不需要的 token，下一个 query 可能正好要。固定的 heavy-hitter 选择漏掉
+"query-dependent" 的关键信息。
+
+*** 它的解法
+
+KV 全留，但每步只 *算* 一小部分。具体做法：把 KV cache 按页 (page) 切块，每页提
+前算好每个维度的 min/max 边界。decode 时，拿当前 Q 跟每页的边界算一个"相关性上
+界"，按上界 top-k 选 page，只对入选的 page 跑 full attention。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+每步重新挑，自然能适配 query 的需求。min/max 估计是 cheap 的——只要选对页，再算
+精确 attention，结果几乎跟 dense attention 一样。算力省 5-10x。
+
+*留下的坑*:
+
+- KV cache 还是 *全量存* 在显存里——只省了算力，没省内存
+- 每页那套 min/max 上下界、page id 索引 是 *额外* 的元数据，本身要花显存
+- 等于在 KV 之上又多养一份索引结构
+
+** 2024 (并行) | KIVI: 把 KV 压到 2 bit
+
+跟 Quest 同时期，另一条路径：纯量化。KIVI 发现 key 适合 *per-channel* 量化、value
+适合 *per-token* 量化，按这个规则做 2-bit 量化，几乎不掉点。内存直接砍 8x。
+
+但这条线和 sparsity 线 *没有打通*——量化的 KV 算 attention 时还要先反量化回
+fp16，省了内存却没省算力。Quest 和 KIVI 各拿一头，各留一头给对方。
+
+** 2025 | Lserve: 把两条线缝在一起
+
+*** 它看到了什么问题
+
+Quest 省算力但不省内存，KIVI 省内存但不省算力。在长上下文 + 大 batch 的服务场景，
+两头都要省，不然显存或者延迟总有一个崩。
+
+*** 它的解法
+
+工程上把两套东西 *组合* 部署：用 KIVI 风格的低比特量化存 KV，再用 Quest 风格的
+page-level 动态稀疏选 page。inference pipeline 里 retrieval 走索引、storage 走
+量化值。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+显存和算力同时省。在 batch serving 场景下吞吐显著提升。
+
+*留下的坑* (= 目标论文的起点):
+
+- 一份 KV 现在身上挂着 *两套元数据*：retrieval 索引 + 量化 scale/zero-point
+- 这两套是 *独立设计* 的，互不知道对方存在——索引重算一次、反量化又走一遍
+- 节省下来的内存被这些 auxiliary 数据吃掉一大块
+- 而且 retrieval 准不准、量化精不精 是 *分别* 调的，没有耦合优势
+
+一句话：稀疏 + 量化 是 *拼* 起来的，不是 *合* 起来的。
+
+** 2026 | Self-Indexing KVCache: 一份编码，两种身份
+
+*** 它看到了什么问题
+
+Lserve 那种 "compression + retrieval 平行部署" 看上去合理，其实有结构性浪费：你
+存了一份压缩后的 key，又另外存了一份"用于挑 top-k 的索引"，这两份信息高度重叠
+——压缩后的 key 本身就编码了方向信息，为什么不直接拿它去做 retrieval？
+
+*作者的洞察*: top-k attention 选择本质上是按 *cosine similarity* 找最像的 key。
+而 cosine similarity 的方向信息，在 *向量的符号位* 里已经基本编码完了。
+
+*** 它的解法
+
+设计一种 *sign-based 1-bit 向量量化* (VQ):
+
+1. *codebook 构造一遍过*: 不做 K-means 迭代。把 key 按维度分组，每组取 *符号位
+   pattern* 直接作为 cluster id。一次扫描完成，prefill 阶段几乎无开销。
+2. *压缩值 = 索引*: 同一份 1-bit 符号码，既是 key 的低精度表示，也是 retrieval
+   时算近似 cosine similarity 的索引。不再分两套。
+3. *compressed-domain top-k*: 直接在 1-bit 域里用 LUT-GEMV (lookup table 矩阵-向
+   量乘) 算每个 token 跟当前 Q 的近似相似度，挑 top-k 后再去取选中 token 的精确
+   value 跑 attention。custom CUDA kernel 跟 FlashAttention 缝起来。
+4. *sink token* 可选保留头部 64 个 token 的 full precision，提升鲁棒性。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+*重用比拼接强*。Lserve 是 "retrieval 一套 + storage 一套"，本论文是 "同一份符号
+码两种用法"。auxiliary metadata 消失了——省内存的同时省了 retrieval 开销。
+
+汇报数字：KV cache 内存 5x 压缩、sparse attention 算力 6.7x 加速、端到端推理 2x
+（相对 FlashAttention v2）。
+
+*留下的坑*:
+
+- 1-bit 量化精度极限被压到肉眼可见的边缘。再往下没空间了
+- 符号位假设 "方向信息够用"——在 key 分布特别尖、特别长尾的模型上会不会出问题尚
+  待验证
+- 依赖 custom CUDA kernel，移植到非 NVIDIA 硬件（AMD ROCm、TPU）需要重做
+- sink token 这种"补丁"暗示纯 1-bit 还不够稳，是一处 trade-off 痕迹
+
+* 前沿延伸
+
+截至 2026 年 5 月，本论文（2026 年 3 月 15 日 v1）刚发出两个月，公开的直接后续工
+作尚不明朗。但能预判的几条延伸线：
+
+1. *1-bit 之后往哪走?* —— 既然方向信息够，能不能把 value 也大幅压扁？现在的 1-bit
+   只压 key，value 还得相对完整地存。
+2. *VQ codebook 的自适应化* —— 这篇用 sign-pattern 一遍过，等于 codebook 是数据
+   独立的。后续可能出现"轻量自适应 codebook"，在不引入 K-means 开销的前提下提升
+   precision。
+3. *与 MoE / speculative decoding 的组合* —— sparse attention + low-bit KV 已经
+   把 attention 压到底，下一步是和其它推理优化模块的耦合（同样会面临 Lserve →
+   SIKV 的同一种"拼 vs 合"问题）。
+
+* 一张图看懂
+
+#+begin_example
+                  KV cache 优化三件事的"打架历史"
+
+  维度         内存           算力           精度
+  ----         ----           ----           ----
+  2022                       FlashAttn      FlashAttn
+  FlashAttn    (no help)     (tiling)       (no loss)
+
+  2023
+  H2O          砍 token      砍 token       某些任务 drop
+               (静态)         (静态)         (一刀切风险)
+
+  2024
+  KIVI         2-bit KV      (反量化抵消)    几乎无损
+
+  2024
+  Quest        +索引开销      动态 top-k     ~ 无损
+
+  2025
+  Lserve       2-bit + 索引   动态 top-k     ~ 无损
+               (两套元数据)                  (但开销叠加)
+
+  2026
+  *SIKV*       1-bit         compressed-     ~ 无损
+               (无额外索引!)   domain top-k    (sink token 兜底)
+               5x             6.7x sparse
+
+      ====================================================
+      演化趋势:
+
+       静态 ----> 动态 ----> 动态+量化 ----> 动态量化一体化
+        (H2O)    (Quest)     (Lserve)         (SIKV)
+
+       "删掉"    "暂不算"    "压 + 不算"      "压 = 不算"
+
+       fix       per-query   两个模块叠       一份编码两用
+
+      ====================================================
+#+end_example
+
+* 洞见
+
+读完这条线，最深的变化不是"压缩比越来越高"，而是 *系统设计哲学的折叠*。
+
+- *H2O 时代*: 一个模块管"该留哪些 token"
+- *Quest 时代*: 一个模块管"该算哪些 token"
+- *KIVI/量化*: 一个模块管"该怎么存 token"
+- *Lserve 时代*: 三个模块拼装在一起
+- *SIKV 时代*: 三个模块共用一份表示，*不再是三个模块*
+
+这背后是一种"信息复用"的胜利——同样一组 bit，如果能同时承担"存储 + 检索 + 计算
+辅助"的多重职责，系统的整体开销就会塌缩到接近最优。这跟数据库领域 *covering
+index* 的思路同构：当索引同时能服务读和投影，就不需要回表了。
+
+更抽象地说，每当工程系统里出现"两套元数据描述同一件事"，就是一个 *待合并* 的信
+号。Self-Indexing KVCache 干的事情，本质上就是从 KV cache 优化栈里识别出了这种冗
+余并把它消掉。
+
+*下一步最可能往哪走?* 我猜是把同样的"复用"思路推广到 attention 之外——比如让
+embedding、router weight、speculative draft model 共用一套压缩表示。或者反向：能
+不能让 1-bit 编码反过来 *指导训练*（quantization-aware training 的极端版本），让
+模型本身就分布在"sign 友好"的子空间里？
+
+* 启发
+
+如果你做系统、做模型优化、做任何带"多模块协同"的工程：
+
+1. *先找重复*: 凡是看见 "A 模块输出 X，B 模块为了 X 又自己算一次类似的东西"，那
+   就是合并机会。Lserve 到 SIKV 的关键不是发明新算法，是发现"索引和量化值描述的
+   是同一种方向信息"。
+2. *硬件友好优于算法漂亮*: K-means 比 sign clustering 在数学上"更优"，但 sign
+   clustering 一遍过、对 GPU 友好。系统优化里"够好且能跑满硬件"的方案，胜过"理
+   论最优但流水线卡顿"的方案。
+3. *盯住元数据*: 当你的"省" (compression/sparsity) 开始被"元数据" (index, scale,
+   codebook) 反吃掉，说明该重新设计表示，而不是继续往上加 cache。
+
+这意味着你可以——在自己负责的系统里，把"每多一个优化模块就多一份 metadata"的趋
+势拉到一个红线，逼着自己去想：能不能让这些 metadata 共用同一份比特？

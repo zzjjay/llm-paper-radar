@@ -1,0 +1,214 @@
+#+title:      FlashHead: Efficient Drop-In Replacement for the Classification Head in Language Model Inference
+#+date:       [2026-05-28 Thu 23:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T235000-en
+#+source:     https://arxiv.org/abs/2603.14591
+#+authors:    Wilhelm Tranheden, Shahnawaz Ahmed, Devdatt Dubhashi, Jonna Matthiesen, Hannes von Essen
+#+venue:      arXiv 2026 (cs.LG), Embedl
+
+* The Problem River
+
+Shrink a language model small enough to fit on a phone, and you run into something absurd: the very last layer — multiplying the hidden state by the vocabulary matrix to produce a score for every word — can account for 60% of the model's parameters and 50% of its compute. The smaller the model, the more outrageous this fraction becomes. Llama-3.2-1B's output head is heavier than its entire transformer body.
+
+Why so expensive? Because vocabularies keep growing. Llama-3.2 has 128k tokens; Gemma-3 has 256k. Every time a token is emitted, the model must compute one inner product for every entry in that vocabulary, then pick the highest score (greedy) or sample according to the softmax distribution (sampling). That is a dense matrix multiply of shape v × d, where v is vocabulary size and d is hidden dimension.
+
+This river asks one question, over and over: *Can we avoid computing the entire vocabulary every time?* The idea seems obvious — only a handful of tokens will ever actually be chosen, so the rest is pure waste. But the difficulty runs two layers deep. First, you need to know in advance which tokens are "likely" winners — and that prior estimate itself must be cheap. Second, you cannot just return a top-k list, because sampling mode (temperature > 0) needs a complete probability distribution, not a short list of candidates.
+
+Researchers have been guessing at answers for twenty years, and each generation trips over the holes left by the one before.
+
+* Source Map
+
+#+begin_example
+[2005] Morin & Bengio - Hierarchical Softmax
+  |
+  | Proposes: organize the vocabulary as a binary tree, O(V) -> O(log V)
+  | Leaves:   tree structure is fixed before training; requires retraining; heavy bias
+  v
+[2017] Grave et al. - Adaptive Softmax
+  |
+  | Improves: frequency-based clustering (small cluster for high-freq, large for low-freq)
+  | Still:    requires joint training; cluster heads are part of the model
+  v
+[2017] Shim et al. - SVD-Softmax
+  |
+  | First truly training-free method: apply SVD to E
+  | Use low-rank approximation to select top-k, then recompute exactly for those k
+  | Leaves:   accurate only for high-probability tokens; distribution distorted in sampling mode
+  v
+[2018] Zhang et al. - Fast Graph Decoder (FGD)
+  |
+  | Frames "next-token selection" as an ANN retrieval problem
+  | Uses a small-world graph to do nearest-neighbor search in token embedding space
+  | Leaves:   returns only a top-k candidate set, not a probability distribution; no sampling support
+  v
+[2023] Ushio et al. - Vocabulary Trimming
+  |
+  | Simply drops low-frequency tokens (a calibration set decides what to keep)
+  | Leaves:   vocabulary is permanently shrunk; OOD prompts break completely
+  v
+[2026] FlashHead (this paper) - classification head as IR retrieval + multi-probe + probability sampling
+       training-free, full distribution preserved, hardware-friendly, head quantization ready
+#+end_example
+
+* Evolutionary Narrative
+
+** 2005 | Hierarchical Softmax: Organize the Vocabulary as a Tree
+
+*** What Problem It Saw
+
+The naïve softmax requires computing V exponentials and normalizing over V terms. At the time V was only tens of thousands, yet that was already enough to make neural language models impractical to train. The question: can we avoid scanning every word on every step?
+
+*** Its Solution
+
+Arrange the vocabulary as a binary tree, with each word as a leaf. To compute the probability of a word, walk the path from root to leaf — log(V) steps instead of V. Each internal node learns a small classifier that says "go left or go right."
+
+*** Why It Worked (and What New Hole It Left)
+
+The intuition: you don't have to look at every word; you just make a sequence of binary choices.
+
+But the holes are deep. (1) The tree structure is fixed before training — built by word frequency or semantic clustering. Choose it badly and the whole tree is skewed. (2) During training each word takes one path, but at *inference* time, if you want the probability of every word you still have to traverse the entire tree — the speedup is mainly at training time. (3) It cannot drop into an already-trained model; retraining from scratch is required.
+
+The question left for the next generation: can we keep this "hierarchical" intuition but make the structure smarter and co-learned with the model?
+
+** 2017 | Adaptive Softmax: Cluster by Word Frequency
+
+*** What Problem It Saw
+
+The tree in hierarchical softmax was arbitrary. Could the clustering itself be principled? Grave et al. observed that word frequency follows an extremely uneven Zipf distribution — a few hundred high-frequency words account for 90% of all occurrences.
+
+*** Its Solution
+
+Split the vocabulary into a few clusters: a small cluster of high-frequency words, a medium cluster, and a large cluster of rare words. High-frequency words get high-dimensional embeddings; rare words get low-dimensional ones. Each cluster has its own head.
+
+*** Why It Worked (and What New Hole It Left)
+
+The intuition: common words are worth modeling carefully; rare words can get by with a lightweight model. In the RNN era this genuinely delivered 2–10× training speedups.
+
+But the hole it left: cluster heads are still part of the model and must be jointly trained from scratch. You cannot take a pre-trained GPT and "swap in an adaptive head" — it has no idea what your clusters mean. Once the Transformer era arrived and all interesting models had already been trained, this approach became inapplicable.
+
+The question left for the next generation: can we take an *already-trained model* and replace its head with an efficient one, without touching the model itself?
+
+** 2017 | SVD-Softmax: Post-Training Low-Rank Approximation
+
+*** What Problem It Saw
+
+Shim et al. made a simple observation: the embedding matrix E is a large v × d matrix, but its effective rank is far below d. There is massive redundancy.
+
+*** Its Solution
+
+Decompose E via SVD: E ≈ U S V^T. Given a hidden vector h, first compute coarse logits using the low-rank approximation (U S) and (V^T h), select the top-N candidates, then recompute exact logits for only those N tokens using the full matrix.
+
+*** Why It Worked (and What New Hole It Left)
+
+The intuition: high-probability tokens stay high-probability even under a low-rank approximation — so the filtering stage doesn't need to be precise, and the expensive exact computation is confined to a small candidate set.
+
+This was the first truly *training-free* approach. But it has a fatal flaw: distribution distortion. The coarse approximation is accurate only for head tokens; tail token probabilities are badly mis-estimated. Greedy decoding is fine, but in *sampling* mode (temperature > 0, top-p), the truncated tail accumulates non-trivial probability mass and the shape of the distribution is wrong.
+
+The question left for the next generation: can we find a data structure that screens candidates efficiently while preserving the full distribution?
+
+** 2018 | Fast Graph Decoder: The Classification Head as ANN Retrieval
+
+*** What Problem It Saw
+
+Zhang et al. reframed the problem: finding the argmax is just finding the nearest neighbor of a query (the hidden vector h) among a set of keys (token embeddings). That is precisely the problem the ANN (Approximate Nearest Neighbor) community had been polishing for two decades.
+
+*** Its Solution
+
+Build a small-world graph index over all token embeddings. At inference time, start from an entry node and walk edges toward the neighborhood of h.
+
+*** Why It Worked (and What New Hole It Left)
+
+The intuition: the IR community had already driven "nearest neighbor in a billion vectors" down to sub-millisecond latency — just borrow the machinery.
+
+The holes it left: (1) Still returns only a top-k *candidate set*, not a probability distribution — sampling remains unsupported. (2) Graph traversal is *irregular* memory access, deeply unfriendly to wide-parallel hardware like GPUs/NPUs — the theoretical O(log V) does not materialize on real hardware. (3) Proposed in 2018 for the RNN era; nobody had validated it on SLMs.
+
+The question left for the next generation: can we find an IR index that preserves the full distribution *and* is GPU-friendly?
+
+** 2026 | FlashHead: Equal-Size Spherical Clustering + Multi-Probe + Probabilistic Sampling
+
+*** What Problem It Saw
+
+By 2026, deploying small models had become a pressing concern. The FlashHead team surveyed the landscape:
+- SVD-Softmax is training-free but distorts the distribution; no sampling
+- Fast Graph Decoder borrows ANN ideas but returns only top-k, and graph traversal is irregular
+- Adaptive Softmax / ANN-Softmax require retraining; inapplicable to open-source SLMs
+- Vocabulary Trimming permanently shrinks the vocabulary; breaks on OOD inputs
+
+One sentence summarizes the gap: *no existing method simultaneously satisfies "training-free + full distribution + hardware-friendly."*
+
+*** Its Solution
+
+Treat the classification head as a full IR retrieval pipeline, redesigned at every stage for GPUs:
+
+1. *Equal-size spherical K-means*: cluster E using spherical k-means (cosine distance), but *force every cluster to have exactly the same size* v/c. All clusters can then be packed into a regular (c, v/c, d) tensor; GPU access is fully predictable — no padding, no branching.
+2. *Multi-probe scanning*: traditional IVF picks only the single nearest cluster for exact scoring. FlashHead selects *hundreds to thousands* of probes simultaneously, scoring cluster centroids in parallel and using the weights to decide how many tokens from each cluster to score exactly. The search expands from "pick one cluster among hundreds" to "score tens of thousands of clusters in parallel."
+3. *Probabilistic probe sampling*: in sampling mode, multinomial sampling is pushed into the probe-selection stage — probes are drawn proportionally to each cluster's probability mass, and tokens are then sampled within each selected probe. The final sampling distribution is mathematically equivalent to sampling from the full vocabulary softmax. This is the key to escaping the "top-k cannot be sampled" trap.
+4. *Selective quantization*: the first stage (centroid scoring) can be aggressively quantized to low bit-width — because the second stage (exact scoring) provides a backstop. This makes FlashHead the first method that can safely quantize the output head.
+
+*** Why It Worked (and What New Hole It Left)
+
+The intuition: replace "compute 128k multiply-adds" with "use a coarse filter to locate a few hundred highly probable small clusters, then exactly score a few thousand tokens within them." Equal-size clusters plus a large number of probes make the coarse filter accurate enough; the multi-stage design makes sampling mathematically equivalent to full softmax.
+
+Measured results: 1.75× speedup on Llama-3.2-1B, 1.35× on Gemma-3-270M, with negligible quality loss.
+
+New holes: (1) Offline clustering requires one pass over E (a one-time cost, but it can take hours for very large vocabularies). (2) The number of probes is a hyperparameter that needs tuning. (3) The accuracy guarantee is currently empirical; no formal approximation bound has been established.
+
+* Frontier Extensions
+
+As of March 2026, this is the latest development on this line. FlashHead was just published; a companion Hugging Face collection of Llama, Gemma, and Qwen FlashHead variants is already available.
+
+Plausible next directions (speculative, not yet published):
+- Combine FlashHead with speculative decoding — since FlashHead already makes the head fast, the draft model in speculative decoding can be made more aggressive
+- Train models whose embeddings are friendly to equal-size clustering (a lightweight alignment loss), further improving accuracy
+- More extreme quantization: use INT4 or lower in stage one, reducing the head's compute to negligible
+
+* One Diagram
+
+#+begin_example
+              Structure           Train? Full dist.? HW-friendly? Drop-in?
+              =========           ====== ========== ============ ========
+  [2005] HierSoftmax  tree         retrain   yes      moderate      no
+  [2017] AdaSoftmax   freq-cluster joint     yes      reasonable    no
+  [2017] SVD-Softmax  low-rank     free      no(head) matmul        yes
+  [2018] FastGraphDec ANN graph    free      no(topk) poor(graph)   yes
+  [2023] VocabTrim    pruned vocab calibrate no(cut)  excellent     yes
+  [2026] FlashHead    equal-size   free      yes      regular       yes
+                      cluster +
+                      multi-probe +
+                      probe sampling
+
+  Evolution: O(V) -> log(V) -> low-rank -> ANN -> IR + GPU-native + full distribution
+
+  Fundamental shifts:
+    "Classification problem"   ===>  "Retrieval problem"
+    Enumerate vocab, compute logits   NN search in embedding space
+
+    "Approximation = accuracy loss" ===> "Approximation = multi-stage filter + backstop"
+                                          stage-1 quantized, stage-2 exact
+
+    "Top-k candidates"         ===>  "Full-distribution-equivalent sampling"
+                                      push sampling down into the probe-selection stage
+#+end_example
+
+* Insights
+
+Looking at twenty years of this river, the real change is not "algorithms got faster" — it is that *the problem was reframed twice*:
+
+**First reframing (2017–2018):** from "compute softmax" to "find the nearest neighbor." This overnight unlocked the IR community's entire toolbox — SVD, k-means, IVF, small-world graphs. But the reframing was incomplete, leaving two nails: "approximation distorts probabilities" and "GPU-unfriendly access patterns."
+
+**Second reframing (2026, FlashHead):** from "find the nearest neighbor" to "run a hardware-native multi-stage retrieval pipeline." Three key insights:
+1. *Equal-size clusters* are the "translation adapter" that converts IR algorithms into GPU language — traditional IVF uses variable-length clusters because CPUs don't care; GPUs do.
+2. *Probe sampling* is the elegant trick that sidesteps the longstanding "top-k cannot be sampled" obstacle — don't sample from the results; sample *during the filtering process itself*.
+3. *Tolerance for quantization* comes from redundancy: single-stage approximation is fragile under quantization; multi-stage approximation is not — because later stages provide a backstop.
+
+The deeper pattern: *when a field's "old problem" stays stuck, it is often because the underlying hardware assumptions changed while the algorithms kept running on the old hardware model.* Hierarchical softmax and adaptive softmax were both products of the CPU/RNN era; transplanted into the GPU/Transformer era, they never fit. FlashHead is not cleverer — it is simply the first method where someone sat down and rederived every step for the GPU.
+
+The most likely next move: *apply the same thinking to attention.* Attention is fundamentally also "query finds the most relevant keys" — that is an IR problem. Some work (NSA, various KV-cache compression schemes) is already nibbling at this, but nobody has attacked it as systematically as FlashHead does, with equal-size clusters, multi-probe, and probabilistic sampling end-to-end.
+
+* Takeaways
+
+**For researchers:** *Old problems get solved not because new algorithms appear, but because someone realizes the hardware assumptions changed.* Hierarchical softmax was published in 2005; FlashHead applied a similar intuition in 2026. In between, people assumed the problem was "solved" — it had merely been set aside. When hardware shifts, scan back through old problems; there are often big fish to pick up.
+
+**For SLM deployment engineers:** You can use FlashHead today to push 30–75% faster inference on a 1B-class model without touching weights or training pipelines. Ready-made models are already on HuggingFace.
+
+**For systems engineers:** An *"approximate + backstop"* multi-stage architecture is better suited to modern hardware than a *"single-stage exact"* computation — because the early stages can be aggressively quantized and scanned in parallel, while the serial exact-computation tail is shrunk to negligible size. This pattern recurs in ANN search, speculative decoding, and sparse attention; it is worth memorizing as a first-principles design heuristic.

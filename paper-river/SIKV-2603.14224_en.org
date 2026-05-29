@@ -1,0 +1,357 @@
+#+title:      Self-Indexing KVCache: Predicting Sparse Attention from Compressed Keys
+#+date:       [2026-05-28 Thu 23:35]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T233513-en
+#+source:     https://arxiv.org/abs/2603.14224
+#+authors:    Xu Yang, Jiapeng Zhang, Dongyang Zhao, Guo Chen, Zhuo Tang
+#+venue:      arXiv 2603.14224 (cs.LG, Mar 2026)
+
+* The Problem River
+
+During large-model inference, every generated token must look back at all
+preceding tokens' keys and values — this pile of historical state is called the
+*KV cache*. Once the context grows long (tens of thousands, hundreds of thousands
+of tokens), the KV cache blows up GPU memory, and every generation step requires
+reading the entire cache from scratch — absurdly slow.
+
+The problem sounds simple: can we store less and read less? The difficulty lies
+in three goals that fight each other:
+
+1. *Save memory* — quantize and compress KV (4-bit, 2-bit, 1-bit)
+2. *Reduce reads* — compute attention over only the most relevant tokens (sparse attention)
+3. *Preserve accuracy* — neither miss critical information nor bias the computed attention scores
+
+Every generation of work solves one or two of these, only to be bitten by the
+third. This river traces how these three goals stopped tearing each other apart.
+
+* Source Map
+
+#+begin_example
+[2022] FlashAttention (Dao et al.)
+  | Problem seen: Attention is O(N^2); HBM read/write starves the GPU
+  | Solution: tiling + recompute — compute the full attention block inside SRAM
+  v
+[2023] H2O (Zhang et al.)
+  | Problem seen: FlashAttention computes fast, but still computes over ALL tokens.
+  |               Long contexts still explode the KV cache.
+  | Solution: Prune historical tokens — keep only high-cumulative-attention "heavy hitters"
+  v
+[2024] Quest (Tang et al.)
+  | Problem seen: H2O's one-size-fits-all deletion drops tokens another query may need
+  | Solution: Don't delete — dynamically select each step. Partition KV into pages,
+  |           store per-page min/max bounds, estimate per-page relevance for current Q,
+  |           top-k page selection, then run attention only on selected pages.
+  v
+[2025] Lserve (Yang et al.)
+  | Problem seen: Quest saves compute but still stores KV at full size;
+  |               KIVI-style 2-bit quantization saves memory but not compute.
+  | Solution: Deploy dynamic sparsity + low-bit quantization together —
+  |           but retrieval uses one index pipeline, storage uses a separate quantization pipeline.
+  v
+[2026] *Self-Indexing KVCache* (Yang, Zhang, Zhao, Chen, Tang)  <-- target paper
+        Problem seen: Lserve treats "selecting tokens" and "storing tokens" as two separate
+                      concerns. One copy of KV must maintain two sets of metadata,
+                      and the savings are eaten back by the overhead.
+        Solution: The same 1-bit sign encoding serves as both index AND compressed value —
+                  retrieval and dequantization share a single representation.
+
+Side branch (parallel line):
+  [2024] KIVI (Liu et al.)  Pure quantization: 2-bit KV with almost no accuracy loss.
+  [2024] VQ-based retrieval (Zhang 2024a, Liu 2024a)
+          Use vector quantization for nearest-neighbor retrieval —
+          but the codebook requires K-means training.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | FlashAttention: Compute the Whole Attention Block Inside SRAM
+
+*** What Problem It Saw
+
+Vanilla self-attention computes ~softmax(QK^T/√d)V~ and explicitly materializes
+an ~N x N~ attention matrix. This matrix is repeatedly shuttled in and out of HBM
+(GPU memory), leaving the GPU's compute units starved — the bottleneck is memory
+bandwidth, not compute. The longer the context, the deeper the HBM bandwidth hell.
+
+*** Its Solution
+
+Never materialize the ~N x N~ matrix explicitly. Tile Q, K, and V into small
+blocks; inside on-chip SRAM, execute the full "multiply + softmax + multiply by V"
+sequence per tile and accumulate directly into the output. Intermediate states
+never touch HBM. Backward pass avoids storing intermediates by recomputing them.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+The attention algorithm itself is unchanged — results are numerically identical.
+What changed is how data flows through the chip. Fix the memory-access pattern
+and you get 5–10× speedup with zero accuracy loss.
+
+*Pit left behind*: It only solves "compute fast." It does nothing for "store
+efficiently." The KV cache must still be stored in full — memory remains the
+ceiling in long-context settings.
+
+** 2023 | H2O: Prune Historical Tokens That Nobody Looks At
+
+*** What Problem It Saw
+
+FlashAttention accelerated each attention step, but the KV cache still grows
+linearly. With 32K or 128K context, just storing KV exhausts GPU memory, let
+alone reading all of it at every step.
+
+Furthermore, empirical observation reveals that attention distributions are
+highly skewed — most tokens are almost never attended to. Computing over them is
+pure waste.
+
+*** Its Solution
+
+Introduce the *Heavy-Hitter Oracle*: track the cumulative attention score each
+token has received across steps. Tokens with high scores (heavy hitters) are
+retained; low-scoring ones are evicted from the KV cache. A "recent window"
+additionally keeps the most recent tokens. The total KV footprint is bounded to
+a fixed budget.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+The core observation is correct — attention really is sparse. Evicting cold
+tokens typically costs only a small drop in accuracy.
+
+*Pit left behind*: The decision is *static*. A token that went unattended for
+1,000 steps can be critical on step 1,001 for a new query. Once evicted, it is
+gone forever — certain downstream tasks (e.g., needle-in-a-haystack) can
+collapse catastrophically.
+
+** 2024 | Quest: Don't Delete — Dynamically Select Each Step
+
+*** What Problem It Saw
+
+H2O's "delete and forget" is too blunt. Although attention is sparse, *the
+sparse positions shift with the query* — a token irrelevant to one query may be
+exactly what the next query needs. Fixed heavy-hitter selection misses
+query-dependent critical information.
+
+*** Its Solution
+
+Keep all KV, but *compute* over only a small subset each step. Concretely:
+partition the KV cache into pages; precompute per-dimension min/max bounds for
+each page. At decode time, use the current Q against each page's bounds to
+estimate an "upper-bound relevance score"; select the top-k pages by that score;
+run full attention only on the selected pages.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Re-selecting at every step naturally adapts to the query's needs. The min/max
+estimation is cheap — and once the right pages are chosen, exact attention on
+them nearly matches dense attention. Compute savings: 5–10×.
+
+*Pits left behind*:
+
+- The KV cache is still *stored at full size* — only compute is saved, not memory.
+- Per-page min/max bounds and page-id indices are *extra* metadata that themselves
+  consume memory.
+- In effect, Quest maintains a second data structure layered on top of the KV cache.
+
+** 2024 (Parallel) | KIVI: Compress KV Down to 2 Bits
+
+Concurrent with Quest, a separate line of work pursues pure quantization. KIVI
+finds that keys suit *per-channel* quantization while values suit *per-token*
+quantization; applying these schemes at 2-bit precision costs almost no accuracy.
+Memory drops by 8×.
+
+But this line *never merges* with the sparsity line — quantized KV must be
+dequantized back to fp16 before computing attention, so memory savings don't
+translate to compute savings. Quest and KIVI each solved one half and left the
+other half to each other.
+
+** 2025 | Lserve: Stitch the Two Lines Together
+
+*** What Problem It Saw
+
+Quest saves compute but not memory; KIVI saves memory but not compute. In
+long-context, large-batch serving scenarios, both must be saved simultaneously —
+otherwise either memory or latency will eventually break.
+
+*** Its Solution
+
+Engineering integration: deploy KIVI-style low-bit quantization for KV storage
+alongside Quest-style page-level dynamic sparsity for selection. The inference
+pipeline routes retrieval through an index and storage through quantized values.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Both memory and compute are reduced simultaneously. Throughput improves
+significantly in batch-serving settings.
+
+*Pits left behind* (= the starting point for the target paper):
+
+- Each KV entry now carries *two sets of metadata*: a retrieval index + quantization
+  scale/zero-point.
+- The two sets are *designed independently*, with no awareness of each other —
+  the index is recomputed separately, and dequantization runs as a separate pass.
+- The auxiliary data eats back a large fraction of the saved memory.
+- Retrieval accuracy and quantization fidelity are *tuned separately*, with no
+  coupling benefit.
+
+In one sentence: sparsity + quantization are *bolted together*, not *fused*.
+
+** 2026 | Self-Indexing KVCache: One Encoding, Two Roles
+
+*** What Problem It Saw
+
+Lserve's "compression pipeline + retrieval pipeline in parallel" looks reasonable
+but has a structural inefficiency: you store one copy of the compressed key and
+separately store a copy of the "index used to select top-k tokens." These two
+pieces of information are heavily redundant — the compressed key already encodes
+directional information, so why not use it directly for retrieval?
+
+*Authors' insight*: top-k attention selection is fundamentally about finding keys
+with the highest *cosine similarity* to the query. Directional information for
+cosine similarity is already largely encoded in *the sign bits of the vector*.
+
+*** Its Solution
+
+Design a *sign-based 1-bit vector quantization* (VQ) scheme:
+
+1. *Single-pass codebook construction*: No K-means iterations. Keys are grouped
+   by dimension; within each group the *sign-bit pattern* is taken directly as
+   the cluster ID. One scan is sufficient — negligible overhead during prefill.
+2. *Compressed value = index*: The same 1-bit sign code serves both as a
+   low-precision representation of the key and as the index for computing
+   approximate cosine similarity during retrieval. No separate structures.
+3. *Compressed-domain top-k*: Approximate token–query similarity is computed
+   entirely in the 1-bit domain using LUT-GEMV (lookup-table matrix–vector
+   multiply). After top-k selection, the precise values of the selected tokens
+   are fetched to run exact attention. A custom CUDA kernel is fused with
+   FlashAttention.
+4. *Sink tokens*: Optionally, the first 64 tokens are kept at full precision to
+   improve robustness.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+*Reuse beats concatenation.* Lserve is "one set for retrieval + one set for
+storage." This paper is "the same sign bits used two ways." Auxiliary metadata
+disappears — memory is saved while retrieval overhead is eliminated simultaneously.
+
+Reported numbers: 5× KV cache memory compression, 6.7× sparse-attention compute
+speedup, 2× end-to-end inference speedup (relative to FlashAttention v2).
+
+*Pits left behind*:
+
+- 1-bit quantization is pressed close to the visible accuracy cliff — there is no
+  room to go lower.
+- The sign-bit assumption ("directional information is sufficient") may break on
+  models with particularly sharp or heavy-tailed key distributions — not yet
+  thoroughly validated.
+- The approach depends on a custom CUDA kernel; porting to non-NVIDIA hardware
+  (AMD ROCm, TPU) requires redoing the implementation.
+- The sink-token "patch" signals that pure 1-bit is not yet fully stable on its
+  own — a visible trade-off.
+
+* Frontier Extensions
+
+As of May 2026, this paper (v1 from 15 March 2026) has been public for only two
+months, and direct follow-on work is not yet visible. Several foreseeable
+extension directions:
+
+1. *Where does 1-bit go next?* — If directional information is sufficient,
+   can values also be aggressively compressed? The current 1-bit scheme only
+   compresses keys; values must still be stored relatively intact.
+2. *Adaptive VQ codebooks* — This paper uses sign-pattern as a data-independent
+   codebook. Future work may produce "lightweight adaptive codebooks" that improve
+   precision without incurring K-means overhead.
+3. *Combination with MoE / speculative decoding* — Sparse attention + low-bit KV
+   has pushed attention to near its compression floor; the next step is coupling
+   with other inference-optimization modules (which will face the same "bolt vs.
+   fuse" tension that drove the Lserve → SIKV transition).
+
+* One Diagram
+
+#+begin_example
+              The "fighting history" of three KV cache optimization goals
+
+  Dimension      Memory               Compute              Accuracy
+  ---------      ------               -------              --------
+  2022                                FlashAttn            FlashAttn
+  FlashAttn      (no help)            (tiling)             (no loss)
+
+  2023
+  H2O            Drop tokens          Drop tokens          Some-task drop
+                 (static)             (static)             (blunt-cut risk)
+
+  2024
+  KIVI           2-bit KV             (dequant offsets)    Near-lossless
+
+  2024
+  Quest          +index overhead      Dynamic top-k        ~Lossless
+
+  2025
+  Lserve         2-bit + index        Dynamic top-k        ~Lossless
+                 (two metadata sets)                       (but overhead stacks)
+
+  2026
+  *SIKV*         1-bit                Compressed-          ~Lossless
+                 (no extra index!)    domain top-k         (sink tokens as safety net)
+                 5x                   6.7x sparse
+
+      ====================================================
+      Evolutionary trend:
+
+       Static ----> Dynamic ----> Dynamic+Quant ----> Unified Dynamic-Quant
+        (H2O)       (Quest)        (Lserve)              (SIKV)
+
+       "Delete"    "Skip"         "Compress + Skip"     "Compress = Skip"
+
+       Fixed       Per-query      Two modules stacked   One encoding, two uses
+
+      ====================================================
+#+end_example
+
+* Insight
+
+Reading this river, the deepest shift is not "compression ratio keeps climbing"
+but rather *the folding of system-design philosophy*.
+
+- *H2O era*: one module decides which tokens to keep
+- *Quest era*: one module decides which tokens to compute over
+- *KIVI/quantization era*: one module decides how to store tokens
+- *Lserve era*: three modules assembled side by side
+- *SIKV era*: three modules share a single representation — *they are no longer three modules*
+
+Underlying this is a victory of *information reuse*: if the same group of bits
+can simultaneously serve storage, retrieval, and computation assistance, the
+system's total overhead collapses toward the optimum. This is structurally
+identical to the *covering index* idea in database systems: when an index can
+serve both reads and projections, you no longer need to fetch the base table.
+
+More abstractly: whenever an engineering system maintains "two sets of metadata
+describing the same thing," that is a signal of a *pending merge*. What
+Self-Indexing KVCache does, at its core, is identify that redundancy in the KV
+cache optimization stack and eliminate it.
+
+*Where is the next step most likely to go?* The same "reuse" insight will
+probably be pushed beyond attention — for instance, making embeddings, router
+weights, and speculative draft models share a single compressed representation.
+Or in the reverse direction: can 1-bit encoding *guide training* (an extreme
+form of quantization-aware training), nudging the model to place its
+distributions inside a "sign-friendly" subspace from the start?
+
+* Takeaways
+
+If you work on systems, model optimization, or any engineering with
+"multi-module coordination":
+
+1. *Find the duplication first*: Whenever you see "module A outputs X, and module
+   B independently recomputes something similar to X," that is a merger
+   opportunity. The key step from Lserve to SIKV was not inventing a new
+   algorithm — it was recognizing that "the index and the quantized value both
+   encode the same directional information."
+2. *Hardware-friendly beats algorithmically elegant*: K-means is mathematically
+   superior to sign clustering, but sign clustering runs in a single pass and is
+   GPU-friendly. In systems optimization, "good enough and hardware-saturating"
+   beats "theoretically optimal but pipeline-stalling."
+3. *Watch the metadata*: When your "savings" (compression/sparsity) start being
+   eaten back by "metadata" (indices, scales, codebooks), the signal is to
+   redesign the representation — not to keep piling on more caches.
+
+This means you can draw a red line in your own system: every time "adding one
+more optimization module adds one more set of metadata," force yourself to ask —
+can all this metadata share the same bits?

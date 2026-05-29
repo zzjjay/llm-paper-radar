@@ -1,0 +1,352 @@
+#+title:      Adapting Methods for Domain-Specific Japanese Small LMs: Scale, Architecture, and Quantization
+#+date:       [2026-05-28 Thu 23:43]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T234348-en
+#+source:     https://arxiv.org/abs/2603.18037
+#+authors:    Takato Yasuno
+#+venue:      arXiv:2603.18037 [cs.LG], Mar 2026
+
+* The River of Problems
+
+An engineer wants to run a small model on a laptop — one that understands Japan's
+"River and Erosion Control Technical Standards" — offline, with only 8 GB of VRAM,
+and whose answers must be able to cite specific clauses. What can be done?
+
+Everyone in this river shares the same underlying question:
+*How do you teach a multi-billion-parameter language model a specific domain's knowledge
+on ordinary hardware, in a way that it neither forgets nor collapses under compression?*
+
+It sounds like a pure engineering problem, yet every step is blocked by three gates:
+- Training gate: the model is too large; VRAM cannot hold the gradients.
+- Data gate: domain corpora are small — too much causes overfitting, too little doesn't teach.
+- Deployment gate: after training the model must be compressed to a runnable size,
+  and compression almost always costs accuracy.
+
+Each gate has been pried open one layer at a time by prior work. This paper invents no
+new gate. Instead it pushes all three open at once and asks one plain question —
+*when all three must be cleared together, which one breaks first?*
+
+* Provenance Map
+
+#+begin_example
+                                                       Compression branch
+                                                       ==================
+[2022] GPTQ -------+
+                   |
+[2023] AWQ --------+---> [2023~] GGUF / K-quants ------+
+                                                       |
+                                                       v
+[2018] BERT full fine-tuning                           |
+  |                                                    |
+  | Q: copy 1B parameters for every task?             |
+  v                                                    |
+[2019] Houlsby et al. - Adapter Tuning                 |
+  |                                                    |
+  | Q: inserted modules add inference latency         |
+  v                                                    |
+[2021] Hu et al. - LoRA                                |
+  |                                                    |
+  | Q: base model itself doesn't fit in VRAM          |
+  v                                                    |
+[2023] Dettmers et al. - QLoRA <-----------------------+
+  |                                                    (4-bit training + adapters)
+  | Q: does a second GGUF compression after            |
+  |    training cause collapse?                        |
+  | Q: how much data is needed for a low-resource      |
+  |    language + low-resource domain?                 |
+  v
+[2026] Yasuno - JaSAQ (this paper)
+  |        --- Triple question: Scale / Architecture / Quantization ---
+  |
+  | Open issue: GQA architecture degrades sharply under Q4_K_M — reason unclear
+  v
+[~ Future]  Architecture-aware mixed-precision quantization (MXFP4, FP4, layer sensitivity analysis)
+#+end_example
+
+Note: the citation relationships above come from works explicitly named in the target
+paper's Related Work (§2). Houlsby 2019 is the universally acknowledged predecessor of
+LoRA; this paper does not cite it directly, but it is included here to make the PEFT
+lineage fully traceable.
+
+* Evolutionary Narrative
+
+** 2018 | BERT Full Fine-Tuning: to use a pretrained model, retrain the whole thing
+
+*** What problem it saw
+
+The vision community had already proven "pretrain + fine-tune" on ImageNet, but NLP
+never truly learned how to exploit pretraining before BERT. For each new task, the
+options were either to train a model from scratch or to take the entire BERT and update
+every layer and every weight.
+
+*** Its solution
+
+Whether layers were frozen mattered less than this: pretrain + full fine-tuning =
+one set of weights is enough.
+*"One BERT to rule all tasks"* — that was the rallying cry.
+
+*** Why it worked (and what new pit it dug)
+
+Engineers quickly noticed: each new client, each new domain required storing a full
+copy of 340 M or more parameters. Ten tasks meant ten models; storage and deployment
+exploded.
+*Could we store only the "diff," not the whole model?* — that became the starting point
+for the next paper.
+
+** 2019 | Adapter Tuning: insert small modules, train only those
+
+*** What problem it saw
+
+A full fine-tuned copy was too heavy. But simply freezing BERT and training an
+external classification head couldn't learn deep semantics.
+
+*** Its solution
+
+Insert a small "adapter box" (a bottleneck MLP) between every Transformer layer.
+Freeze the backbone; train only these boxes. Each task only adds a few MB of adapter
+weights.
+*Pack the "diff" into detachable small modules.*
+
+*** Why it worked (and what new pit it dug)
+
+Parameter efficiency genuinely improved — storage pressure dropped by two orders of
+magnitude. But two new problems appeared:
+1. Adapters are inserted serially, so every layer traverses an extra small box at
+   inference time — *latency increases*.
+2. During training, the backbone still sits in VRAM at full fp16 — *no VRAM savings*.
+
+The latency problem became the fuse for the next step.
+
+** 2021 | LoRA: instead of "inserting modules," decompose the diff into low-rank matrices
+
+*** What problem it saw
+
+Adapters add a new serial computation path. But the change that fine-tuning actually
+needs to make is likely low-rank in nature — updating a large d×k weight matrix W,
+the number of meaningful directions of change is small.
+
+*** Its solution
+
+Decompose the update ΔW into the product of two slim matrices: ΔW = B·A,
+where B is d×r and A is r×k, with r much smaller than d and k (commonly r=8 or 16).
+During training only B and A are updated; at inference B·A can be merged back into
+the original weights —
+*zero inference latency*, the decisive win over Adapters.
+
+*** Why it worked (and what new pit it dug)
+
+The low-rank assumption fits empirical evidence well: r=8 is often sufficient.
+Storage drops from "hundreds of millions" to "a few million" parameters; deployment
+becomes friendly.
+
+But one longstanding problem at training time remains unsolved:
+to train a 65B model, *the 130 GB+ of fp16 base-model weights must sit in VRAM* —
+LoRA only reduces gradient and optimizer-state memory; *it doesn't slim the base*.
+Consumer GPUs (24 GB) are still out of reach for large models.
+
+The next paper would compress the base model itself.
+
+** 2023 | QLoRA: quantize the base model to 4-bit during training as well
+
+*** What problem it saw
+
+LoRA slimmed down *what to train* but not *what to load*.
+A 65B Llama — just reading the weights into an A100 takes 130 GB;
+a single card is completely out of the question.
+
+*** Its solution
+
+Three things at once:
+1. Base weights compressed to 4-bit *NormalFloat (NF4)* — a nonlinear quantization
+   format designed for normally distributed weights.
+2. *Double quantization* — re-quantize the scale/zero-point values themselves.
+3. *Paged optimizer* — spill gradient peaks to CPU memory when VRAM overflows.
+
+During back-propagation, gradients "pass through" the 4-bit base to compute LoRA
+adapter gradients; the base is never updated. Result: *a 65B model fits on a single
+48 GB card*.
+
+*** Why it worked (and what new pit it dug)
+
+NF4 + double quantization compress weights with little accuracy loss;
+the paged optimizer distributes VRAM peaks to CPU. For the first time the combination
+"consumer hardware + large-model fine-tuning" became practically achievable.
+
+But QLoRA solves the quantization problem at *training time*.
+After training the model is back in fp16/bf16 (LoRA weights are typically
+dequantized when merged into the base). To actually deploy on a laptop
+another round of *inference-time quantization* is needed — usually GGUF Q4_K_M.
+*Does stacking two rounds of quantization cause trouble?* — nobody had systematically
+verified this.
+
+Nor had anyone systematically asked:
+*For a low-resource language (Japanese) plus a low-resource domain (civil engineering
+standards), exactly how much data is needed?*
+
+These two open questions are exactly what this paper sets out to fill.
+
+** 2026 | JaSAQ: open all three gates together — training scale, architecture, deployment quantization
+
+*** What problem it saw
+
+Applying QLoRA to Japan's River and Erosion Control Technical Standards, the author
+quickly ran into three engineering problems that could not be looked up in any prior paper:
+
+1. *Scale gate*: only a few thousand domain QA pairs exist. Is 1,000 insufficient?
+   Will 10,000 cause overfitting?
+2. *Architecture gate*: the same QLoRA recipe fed to Swallow-8B (Llama-3 with Japanese
+   continual pretraining), ELYZA-JP-8B (Llama-3 with Japanese instruction tuning),
+   Qwen2.5-7B (GQA multilingual), and Tanuki-8B (Llama-3 + llm-jp tokenizer) —
+   which base is best suited to a Japanese technical domain?
+3. *Quantization gate*: after QLoRA training, run GGUF Q4_K_M for deployment.
+   How much accuracy is lost?
+
+*** Its solution
+
+No new method is invented. *Rigorous controlled experiments* are run in three stages:
+
+- *Stage 1 — Scale*: train LoRA on Swallow-8B at five sizes n=1k/2k/3k/4k/5k,
+  all with identical r=16 configuration. Evaluate with test-set NLL (not training loss).
+- *Stage 2 — Architecture*: use the optimal n=4000 found in Stage 1 and run identical
+  QLoRA (r=32, alpha=16, dropout=0.05) on four Japanese base models.
+  Use Qwen2.5-14B as judge, scoring 0–3 with emphasis on citation of specific clauses.
+- *Stage 3 — Quantization*: convert all four fp16 models from Stage 2 to GGUF Q4_K_M,
+  re-run the same benchmark, and compare how many points each architecture loses.
+
+*** Why it worked (and what new pit it dug)
+
+Three findings are each direct but had never been stated systematically:
+
+1. *Training loss kept falling, yet test NLL bottomed out at n=4000 (1.127)
+   and rebounded +17% at n=5000* — a validation of LIMA's "less is more" principle
+   applied to domain adaptation.
+2. *Japanese continual pretraining (Swallow / ELYZA) beat multilingual breadth (Qwen2.5)
+   across the board* — under the dual constraint of low-resource language + narrow domain,
+   a language-specialist base matters more than general-purpose width.
+3. *The most counter-intuitive finding*: Llama-3-family models actually *gained slightly*
+   after Q4_K_M, while Qwen2.5 (GQA architecture) degraded sharply by −0.280 points.
+   The author points to GQA: shared KV heads amplify quantization noise across multiple
+   query heads.
+
+The remaining open question is explicit:
+*Why does GQA not tolerate Q4_K_M?* Is it KV sharing amplifying noise, or does
+GGUF's K-quants mixed-bit strategy treat GQA unfavorably? What remedy should be used?
+
+This is precisely the starting point for the wave of "architecture-aware quantization"
+research emerging in 2026.
+
+* Frontier Extensions
+
+This is a new paper from March 2026; forward-looking follow-on work has not yet
+settled into clear form. But the "GQA + aggressive PTQ degradation" problem it
+identifies maps neatly onto several active lines from 2025–2026:
+
+- *MXFP4 / FP4 microscaling floats*: the MXFP4 format promoted by AMD Quark and
+  NVIDIA Blackwell is reportedly more robust than INT4 on GQA models because it
+  preserves floating-point dynamic range. If this line of work consistently beats
+  Q4_K_M, the degradation curve in JaSAQ will need to be redrawn.
+- *Architecture-aware mixed precision*: SpQR and SqueezeLLM proposed long ago to keep
+  sensitive layers at 8-bit while compressing the rest to 4-bit. JaSAQ's finding adds
+  a new dimension to that idea — *attention mechanism type (MHA vs. GQA)*
+  should be a feature in determining which layers are sensitive.
+- *Instruction tuning + quantization co-effects*: no published paper has yet
+  systematically studied the degradation mechanism of the "QLoRA training →
+  GGUF quantization" serial pipeline. JaSAQ is the earliest known empirical work
+  that treats this combination as an independent variable.
+
+To be honest: I have not found any later paper that explicitly cites JaSAQ.
+The above is a reasonable inference about who is likely pursuing the same problems,
+not a documented citation relationship.
+
+* One Diagram
+
+#+begin_example
+                    Storage pressure   VRAM pressure    Deployment pressure
+                    ----------------   -------------    -------------------
+[2018] BERT full FT   one copy/task X    full in VRAM X   server-side only
+                           |                  |                  |
+[2019] Adapter           small box OK   full in VRAM X   box adds latency
+                           |                  |                  |
+[2021] LoRA           low-rank diff OK  full in VRAM X   merge → zero latency OK
+                           |                  |                  |
+[2023] QLoRA          low-rank diff OK  base NF4 OK      trained → must compress again
+                                                                  |
+[2026] JaSAQ (this paper)                            +-- train + GGUF Q4_K_M
+                                                     |        |
+                                                     |        +-- Llama-3 family: OK (even +0.04)
+                                                     |        +-- Qwen2.5 (GQA): collapse -0.28
+                                                     |
+                                                     +-- Scale: n=4000 bottoms out; more → overfit
+                                                     |
+                                                     +-- Base: Japanese continual PT > multilingual width
+
+         ============= One-line summary =============
+         The decade-long progress in "using large models" is essentially
+         the gradual disassembly of "ship everything" into
+         "ship only the diff," then "ship only the compressed diff,"
+         and finally "compressed diff + compressed base + compress again."
+         JaSAQ's contribution is the first systematic demonstration that
+         the final compression step is not equally survivable by all architectures.
+#+end_example
+
+* Insights
+
+Stepping back to view the entire lineage, *every generation of papers is slicing the
+same action from a different angle*: moving some part of "using a large model"
+from full-precision to lean.
+
+- BERT → Adapter: the fine-tuning diff goes lean
+- Adapter → LoRA: the diff goes from serial modules to low-rank matrices
+- LoRA → QLoRA: the base model goes lean at training time (4-bit NF4)
+- QLoRA → the problem JaSAQ reveals: the base goes lean again at deployment time,
+  *but the cost of that leanness begins to couple with architecture*
+
+The deeper shift across this lineage is *the collapse of the universality assumption*.
+The first four generations all assumed "compression methods work for any Transformer" —
+whether INT8, INT4, or NF4, the theoretical analysis only examined weight distributions,
+not attention mechanism design.
+
+JaSAQ is the first paper in this lineage to break that assumption through engineering
+evidence:
+*"The effectiveness of a compression method depends on specific choices made upstream
+in the architecture."*
+The KV sharing that GQA introduced for faster inference happens to create an amplification
+channel for quantization noise.
+
+This is a fork in the road. Future quantization research can no longer simply state
+"my method loses X points on LLaMA" — it must specify
+"how much is lost under MHA / GQA / MLA / at different head counts."
+*The relationship between quantization and architecture has moved from background
+variable to first-class citizen.*
+
+Where does the next step most likely lead? Two directions:
+1. *Architecture-calibrated quantization*: every time a new architecture ships,
+   the quantization method must provide corrections "for GQA," "for MoE," "for MLA."
+2. *Training-time awareness of deployment quantization*: QLoRA's NF4 is training-time
+   compression; deployment's Q4_K_M follows a different set of rules. The next generation
+   of PEFT methods may well train directly in the deployment target's quantization format,
+   closing the loop on the loss that double compression currently incurs.
+
+* Takeaways
+
+For someone building a "low-resource language / narrow domain LLM deployment":
+this paper offers not a new algorithm but *a workable engineering roadmap* —
+roughly 4,000 carefully curated QA pairs beat 10,000; a Japanese continual-pretraining
+Llama-3 base (Swallow) beats multilingual Qwen; for GGUF Q4_K_M deployment prefer
+Llama-3-family bases over GQA-family bases.
+This means *you can run this recipe on your own laptop tonight*.
+
+For someone doing quantization research:
+the era of "universal quantization methods" is ending.
+Your next PTQ paper's experiment table *must be sliced by architecture* —
+you cannot just run LLaMA-7B and publish; you need at minimum MHA / GQA / MLA coverage.
+JaSAQ's −0.280 is an unambiguous warning: cross-architecture generalization is no longer
+a free lunch.
+
+For someone making research judgments:
+pay attention to the value of *"engineering-empirical papers that surface counter-intuitive
+findings."* JaSAQ proposes no new method, claims no SOTA, proves no theorem —
+but with a solid set of controlled experiments it puts a previously overlooked coupling
+(architecture × quantization) squarely on the table.
+Papers like this may not attract impressive citation counts, yet they *change what
+subsequent research is required to report* — a form of influence that is longer-lived.

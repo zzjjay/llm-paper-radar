@@ -1,0 +1,229 @@
+#+title:      MXNorm: Reusing MXFP block scales for efficient tensor normalisation
+#+date:       [2026-05-28 Thu 12:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T120000
+#+source:     https://arxiv.org/abs/2603.13180
+#+authors:    Callum McLean, Luke Y. Prince, Alexandre Payot, Paul Balança, Carlo Luschi (Graphcore)
+#+venue:      arXiv preprint, 2026
+
+* 一句话总览
+
+MXNorm 把 LLM 里 RMSNorm 的"全张量平方和开方"这一步，替换成"复用 MXFP8 量化时本来就要算的 block 最大值"——同一份统计量用两次，张量归一化的 reduction 体量直接缩 32 倍，Llama3-8B 一层省 1.3%，NVFP4 上省 2.6%。
+
+* 这条河往上溯到哪里
+
+问题不是凭空冒出来的：是过去十年"如何让神经网络训练稳定"这条主线，撞上了"如何把 GPU 算力榨干"这条主线，在 2026 年这个时间点交汇出来的。
+
+倒着挖五层，得到这样一条骨架：
+
+#+begin_src text
+                 [2015]                  [2016]                 [2019]
+  BatchNorm   --(怎样不依赖 batch?)-->   LayerNorm  --(均值是不是多余?)-->   RMSNorm
+   Ioffe                                   Ba                          Zhang & Sennrich
+                                                                            |
+                                                                            |  (LLM 标配, Llama 系列)
+                                                                            v
+                                                                       [2023~2025]
+                                                                  MXFP / Microscaling  ----+
+                                                                  (Rouhani, Mishra)        |
+                                                                                           |
+                                                                                           |  (matmul 飞了, norm 慢了)
+                                                                                           v
+                                                                                      [2026.03]
+                                                                                       MXNorm
+                                                                                       本文
+                                                                                           ^
+                                                                                           |
+                                                                          [2025] DyT, FlashNorm, nGPT
+                                                                          (同时代的 "干脆别归一化了" 流派)
+#+end_src
+
+注意这条线有 *两股力* 汇进来：一股是 "归一化层本身怎么演化"（BatchNorm → LayerNorm → RMSNorm），一股是 "矩阵乘怎么变得越来越低精度"（FP16 → FP8 → MXFP8 → NVFP4）。MXNorm 站的位置正好是两股力的交点——它不是在归一化这条线上做更聪明的归一化，也不是在量化这条线上做更激进的量化，而是 *把两条线缝起来*：让归一化复用量化的副产物。
+
+下面正着讲。
+
+* 第一段：BatchNorm 的初衷与代价 (2015)
+
+2014~2015 那会儿，卷积网络已经能堆到几十层，但训练起来非常脆。一旦学习率稍微大一点，loss 直接炸；学习率小，又训不动。Ioffe 和 Szegedy 把这个现象起名叫 *internal covariate shift*：每一层的输入分布在训练过程中被前面的层改来改去，后面的层永远在追一个移动的靶子。
+
+他们的解法很直接：在每一层之前，把这一 batch 的激活减掉均值、除掉标准差，强行拉回到一个稳定的分布。这就是 *BatchNorm*。效果立竿见影——大模型能用大学习率训了，整个深度学习从此进入"先 norm 再训"的时代。
+
+但是 BatchNorm 留了一个尾巴：它的统计量是 *沿 batch 维度* 算的。这意味着：
+
+- batch 必须够大，统计量才稳；
+- 训练和推理行为不一样（推理时只有一个样本，没法算 batch 统计），要拿训练时算好的 running mean/var 顶上；
+- 序列模型里每个 token 是不是独立样本？算不算"batch"？说不清。
+
+到了 RNN / Transformer 时代，这些尾巴变得越来越疼。
+
+* 第二段：LayerNorm 把统计轴换了 (2016)
+
+Ba、Kiros 和 Hinton 看到的就是这个问题。他们的反问很简单：*"如果不能沿 batch 维度算，那沿什么维度算？"*
+
+答案是：沿 *特征维度* 算。也就是对单个样本的所有 hidden 维度求均值方差，归一化。这个改动看起来小，但意义巨大：
+
+- 单样本就能算，推理和训练完全对称；
+- batch 大小再小（哪怕 batch=1）也不影响；
+- 在 RNN / Transformer 的每个时间步上都可以独立做。
+
+这就是 *LayerNorm*。它没有 BatchNorm 那么戏剧化的"治好不收敛"故事，但它把归一化从 "依赖 batch" 解放成了 "只看自己"，所以序列模型一上来就拥抱了它。Transformer 出生时配的就是 LayerNorm，一用就是好几年。
+
+但 LayerNorm 自己也留了一个尾巴：它要算 *均值* 和 *方差* 两个统计量，意味着两遍 reduction、两次减法、两次除法。在 GPU 上每一步都不便宜。
+
+* 第三段：RMSNorm 把均值砍了 (2019)
+
+Zhang 和 Sennrich 的观察更狠：*"算均值这一步，真的有用吗？"*
+
+他们去做消融，发现把"减均值"这一步去掉，只保留"除以 root-mean-square"，模型几乎不掉点，有时反而更稳。逻辑上也合理：LayerNorm 真正起作用的是 *re-scaling*（控制激活的尺度），而 *re-centering*（拉到零均值）对大多数任务可有可无。
+
+所以他们写了一个更瘦的版本——只算 RMS，不算 mean。这就是 *RMSNorm*。计算量大概只有 LayerNorm 的 64%，效果没差。
+
+这个改动看起来不显眼，但赶上了大语言模型起飞的时间点。Llama 系列从一代开始就全线用 RMSNorm；后来 gpt-oss、DeepSeek-V3、Qwen 全跟上。到 2024 年，"LLM 的 norm 就是 RMSNorm"已经成了默认设定。
+
+留下的尾巴这次更隐蔽：RMSNorm 看起来已经够便宜了，便宜到大家不再关心它。
+
+* 插曲：同时代另一条岔路——MXFP 量化 (2023~2025)
+
+把镜头切到 2023 年的另一条线。
+
+GPU 的算力增长全靠"把精度降下来"。FP16 → FP8 → FP4，每降一档矩阵乘吞吐就翻一两倍。但纯 FP4 的动态范围太小，大部分张量装不下。怎么办？
+
+Rouhani 等人 (Microsoft, 2023) 提出 *Microscaling (MX)* 格式：把张量切成小 block（典型 32 元素一块），每块共享一个 8-bit 的指数缩放因子（E8M0 scale），块内元素用低精度（E4M3 / E2M1）存。这样一个 block 内部精度低，但整体动态范围被 scale 撑开了——既快又装得下。
+
+Mishra 等人 (NVIDIA, 2025) 把这套东西落到 LLM 预训练上，给出可复现的配方 MXFP8 recipe。Blackwell / Rubin 这代 GPU 原生支持，于是 MXFP8 / NVFP4 在 2025~2026 年迅速变成训练的新基线。
+
+至此，归一化这条线和量化这条线各跑各的。直到——
+
+* 第四段：MXNorm 把两条线缝起来 (2026.03，本文)
+
+MXNorm 的作者看到了一件别人都没说出口的事：*算力的格局变了*。
+
+过去八年，矩阵乘的吞吐量涨了 80 倍（V100 FP16 的 125 TFLOPS → GB200 FP4 的 10000 TFLOPS）。但 GPU 的 CUDA core（做归一化、激活、reduction 用的那部分）只涨了 5.1 倍，HBM 带宽只涨了 8.9 倍。
+
+结果：那些"看起来很便宜"的非矩阵乘操作——比如 RMSNorm——*占比反而越来越大*。
+
+具体到 Pre-Norm Transformer 的一层里，发生的事情是：
+
+#+begin_src text
+   高精度 input X
+       |
+       v
+   [RMSNorm]  <-- 沿 hidden dim 算 sum(x^2)，全张量 reduction
+       |
+   high-precision X_bar
+       |
+       v
+   [MXCast]   <-- 沿 block(32) 算 max(|x|)，再切块缩放
+       |
+   MXFP8 张量
+       |
+       v
+   [matmul]
+#+end_src
+
+作者盯着这张图看了很久，问出了关键的问题：*"RMSNorm 算的是平方和，MXCast 算的是 block 最大值，这两个统计量为啥要算两遍？能不能用 MX 那批已经算好的 block max，反推 RMS？"*
+
+他们证明了一件事：如果一个张量的元素近似 i.i.d.，那么 *blocks 的最大值的某种平均（generalized p-mean）和整个张量的 RMS 只差一个常数*。这个常数只跟 block 大小和元素分布有关，可以离线用 Monte Carlo 估出来。
+
+于是 MXNorm 长这样：
+
+#+begin_src text
+   高精度 input X
+       |
+       +--> [MXCast 计算 block scales: m_k = max_b |X_kb|]
+       |              |
+       |              v
+       |        block max 数组 (K 个)
+       |              |
+       |              v
+       |        rho_tilde = c * (mean(m_k^p))^(-1/p)   <-- 用 K 个数估 RMS，
+       |              |                                    不用全张量 D=K*B 个数
+       v              |
+   X * rho_tilde     /
+       |____________/
+       v
+   归一化 + 量化一气呵成的 MXFP8 张量
+#+end_src
+
+关键收益：*reduction 的体量从 D 缩到 K = D/B*，对 block size 32 来说就是 32 倍小。一遍统计，两件事干了。
+
+变形视角：把 RMSNorm + MXCast 改造成 MXNorm，只做三件事：
+
+1. 删掉 RMSNorm 里那遍 ~sum(x^2)~ 的全张量 reduction；
+2. 改用 MXCast 已经在算的 ~max_b |x|~（每 block 一个数）；
+3. 套一个 ~(mean(m_k^p))^(-1/p) * c~ 把这些 block max 拼回一个 RMS 估计。
+
+* 第四段（续）：MXNorm 留下的新问题
+
+天下没有白吃的午餐。MXNorm 用 block max 估 RMS，依赖两个隐含前提：
+
+1. *block 数要够多*。论文里给出 r² 曲线：K=32（即 D=1024）以上估计就很准，但小张量上误差会被放大。LLM 的 hidden dim 都是几千，正好踩在准的那一段，所以能用。
+2. *元素近似 i.i.d.*，并且分布稳定到能用一个固定常数 c 校正。一旦激活分布漂移（训练后期、特殊层、outlier 爆发），估计就会偏。论文里 MXNorm(p=1) 在 8B 模型上跑到后期，最终 loss 是 2.175 vs RMSNorm 2.132——*有 gap*。改用 p=2 才追平。
+
+第二个问题其实暴露了更深的事：归一化层不只是一个数学操作，它还在悄悄做 *outlier 控制*。RMS 是平方平均，outlier 一来就被放大、然后被压下去；而 block max 的 p-mean 对 outlier 的响应曲线不一样。所以 MXNorm 必须配对正确的 p 才能稳。
+
+* 第五段：同时代的另一种回答——干脆别归一化
+
+值得一提：MXNorm 这条路是 "把归一化做得更便宜"。但同时代还有一批人在走另一条路：*"既然归一化这么贵，能不能彻底不要？"*
+
+- *DyT* (Zhu et al. 2025, "Transformers without Normalization")：把 RMSNorm 整个替换成 ~tanh~ 之类的饱和非线性。优点是没有 reduction；缺点是 elementwise special function 在 GPU 上也不快。
+- *FlashNorm* (Graef 2025)：异步算 RMS，先让 matmul 跑起来，RMS 算完了再矫正。优点是延迟低；缺点是中途用未归一化的值乘权重，accumulator 容易溢出。
+- *nGPT* (Loshchilov et al. 2025)：把权重约束到单位球面上，根本不需要 norm。优点是优雅；缺点是 optimizer 步要做额外的投影，又贵起来了。
+
+MXNorm 的取舍是：*保留 RMSNorm 的数学含义和稳定性*（仍然在做"按 RMS 缩放"），只在工程实现上偷一个统计量。这让它成为最 *drop-in* 的一个方案——别的训练代码一行不改，只把 Norm 层换掉。
+
+* 一张图把整条线压缩到一屏
+
+#+begin_src text
+   年份     方案            看到的问题                  解法核心                         留下的新问题
+   ----------------------------------------------------------------------------------------------------------
+   2015    BatchNorm       深网训练不稳                沿 batch 维归一化                依赖 batch；推理/训练不对称
+   2016    LayerNorm       序列模型没有"batch"          沿 feature 维归一化              要算 mean+var 两次
+   2019    RMSNorm         re-centering 是不是多余?     只算 RMS，不算 mean              快了但仍是全张量 reduction
+   2023    MXFP            FP8 太窄装不下              block scale + 低精度元素         scale 这步本身要 reduction
+   2025    MXFP8 recipe    MX 怎么真的训出来           落地 Llama 规模训练配方            normalization 反而成了瓶颈
+   2025    DyT / FlashNorm  想绕开 norm                 tanh 替换 / 异步 RMS              elementwise 也慢 / 精度抖
+   ---------------------------------------------------------------------------------------------------------
+   2026    MXNorm (本文)    matmul 飞了 norm 慢了       复用 MXCast 的 block max          依赖 i.i.d. 假设和 p 选择
+                            两遍统计能不能合一?         一遍 reduction 干两件事           p=1 在 8B 会掉点，p=2 才稳
+                            reduction 体量 D 太大       缩到 D/32                        小张量上估计偏差大
+#+end_src
+
+* 这条河真正在发生的事
+
+表面看是 "归一化层不断变简单"：BatchNorm（贵） → LayerNorm（不依赖 batch） → RMSNorm（去掉均值） → MXNorm（连 reduction 体量都砍）。
+
+但更深的转变是 *"归一化层的设计目标"在变*：
+
+- 2015~2019：目标是 *训练稳定性*。怎么让深网不炸是首要问题，计算开销不重要。
+- 2019~2024：目标是 *最小必要数学*。归一化的本质功能（控制激活尺度）保留，多余的（re-centering、batch 依赖）砍掉。
+- 2024~2026：目标是 *与硬件 pipeline 共生*。归一化不再是一个"独立的数学操作"，而是要 *和量化、和 matmul、和 memory layout 拼在一起* 才有意义。一个 Norm 层的优劣，不再只看它做了什么，而看它 *和谁共享统计量*。
+
+MXNorm 是这个新阶段最直白的样本：它不发明新的归一化，它发明"统计量复用"。
+
+* 下一步可能往哪走
+
+如果这个判断对，那么这条线的下一步大概不是 "更聪明的归一化函数"，而是：
+
+1. *统计量共享的极限*：除了 RMS 能从 MX block 推出来，attention softmax 的 max、SiLU 的稳定化常数、optimizer 的 second moment——还有多少东西其实可以共享同一份 reduction？
+2. *Norm-Quant-Matmul 三件套融合*：MXNorm 把 Norm 和 Cast 缝合了，下一步是把后面那个 matmul 也吃进来，整个 "Norm + Linear" pattern 变成一个 fused kernel。
+3. *面向 NVFP4 / 更低精度的统计鲁棒性*：p=1 失败 p=2 才行的事实暗示，分布越来越窄、精度越来越低，对统计估计的要求会越来越精细。Theorem 1 的 c(p,B) 常数会从 "Gaussian 假设下的固定值" 变成 "分布感知的可学参数" 吗？
+
+* 诚实标注
+
+- BatchNorm → LayerNorm → RMSNorm → MXNorm 这条引用链，每一步都是 MXNorm 论文 §1 和 §2 *明确点名* 的（references: ioffe2015, ba2016, zhang2019, rouhani2023, mishra2025）。
+- 同时代的 DyT、FlashNorm、nGPT 三家是论文 §2 *并列对比* 的近邻，不是被 MXNorm 取代的前作，是平行答卷。
+- "认知转变"那段（从"训练稳定"到"硬件共生"）是我自己的概括，不是论文原话——属于推测层。
+- "下一步可能走向"那段也是外推，不在论文范围内。
+
+* 参考
+
+- McLean, Prince, Payot, Balança, Luschi (2026). MXNorm: Reusing MXFP block scales for efficient tensor normalisation. arXiv:2603.13180
+- Ioffe & Szegedy (2015). Batch Normalization.
+- Ba, Kiros, Hinton (2016). Layer Normalization.
+- Zhang & Sennrich (2019). Root Mean Square Layer Normalization.
+- Rouhani et al. (2023). Microscaling Data Formats for Deep Learning.
+- Mishra et al. (2025). Recipes for pretraining LLMs with MXFP8.
+- Zhu et al. (2025). Transformers without Normalization (DyT).
+- Graef (2025). FlashNorm.
+- Loshchilov et al. (2025). nGPT.

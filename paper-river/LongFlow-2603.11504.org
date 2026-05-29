@@ -1,0 +1,251 @@
+#+title:      LongFlow: Efficient KV Cache Compression for Reasoning Models
+#+date:       [2026-05-28 Thu 21:39]
+#+filetags:   :paper:river:
+#+identifier: 20260528T213903
+#+source:     https://arxiv.org/abs/2603.11504
+#+authors:    Yi Su, Zhenxu Tian, Dan Qiao, Yuechi Zhou, Juntao Li, Min Zhang
+#+venue:      arXiv 2026-03 (Soochow University & ByteDance)
+
+* 问题之河
+
+推理模型（o1、DeepSeek-R1、Qwen3）一题能写一万六千字思考，问题不在它会不会想，而在它一边想一边把显存吃光。每多生成一个 token，就要把它的 Key/Value 存一份，下一步注意力要全部读一遍——KV cache 越长，显存越满，带宽越爆。
+
+七年了，从 H2O 第一次发现"其实大部分 token 不重要"到 LongFlow，整条线一直在回答同一个问题：*哪些 token 可以扔，怎么判断又快又准*。每一代都觉得自己解决了，每一代都被下一代发现新的窟窿。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 标准注意力：每个 token 都要看过去所有 token
+  | 副产物：KV cache 必须存全量，否则要重算
+  v
+[2022] Dao et al. - FlashAttention                      (并行支线：算子)
+  |                                                       |
+  | 显存搬运是瓶颈，attention 是 memory-bound              |
+  | 解法：分块 + on-chip SRAM，不再 materialize 整张分数表 |
+  v                                                       |
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)         |
+  |                                                       |
+  | 问题：KV cache 线性增长，长上下文存不下              |
+  | 观察：注意力是稀疏的，少数 "heavy hitter" 占大头     |
+  | 解法：累计 attention score，扔掉得分最低的           |
+  v                                                       |
+[2024] Li et al. - SnapKV                               |
+  |                                                       |
+  | 问题：H2O 在生成时也要维护 score，开销高             |
+  | 观察：prompt 末尾一小段 query 就能预测谁重要         |
+  | 解法：prefill 完后用观察窗一次性筛选，prefill-only   |
+  v                                                       |
+[2024] Guo et al. - VATP                                |
+  |                                                       |
+  | 问题：attention score 高 ≠ 真正影响输出              |
+  | 观察：输出 = score × value，value 的范数也得算       |
+  | 解法：重要性 = attention × ||value||                 |
+  v                                                       |
+[2025] Cai et al. - R-KV                                |
+  |                                                       |
+  | 问题：上面四代都是为「长输入短输出」设计的           |
+  | 观察：推理模型反过来——短输入长输出，CoT 还重复       |
+  | 解法：在重要性里加入冗余惩罚，专为 reasoning 设计     |
+  v                                                       |
+[2026] Su et al. - LongFlow      <-----------------------+
+                                  融合 FlashAttention 算子
+  问题：R-KV/VATP/H2O 的重要性估计本身就很贵，
+        每生成一个 token 都要算一遍，越长越亏；
+        而且这些重要性逻辑无法塞进 FlashAttention，
+        强行融合就要在 HBM/SRAM 之间倒腾数据。
+  解法：重要性直接从 attention 的中间结果里"顺手"算出来——
+        零额外存储、零额外计算，再写一个 Triton kernel
+        把 attention + 重要性 + 驱逐打包成一个算子。
+#+end_example
+
+* 演化叙事
+
+** 2023 | H2O: 注意力是稀疏的，只留 heavy hitter 就够了
+
+*** 它看到了什么问题
+
+在 H2O 之前，长上下文 LLM 的核心矛盾是：注意力要看过去所有 token，所以 KV cache 必须存全量。一个 32k 上下文的 7B 模型，KV cache 比模型权重还重。当时的做法基本是"截断"——上下文太长就丢掉最早的几千 token，简单粗暴。
+
+但截断会把关键信息（比如 system prompt 里的指令）一起扔掉，性能立刻崩。
+
+*** 它的解法
+
+H2O 做了一个关键的观察：*真实的 attention 分布是高度稀疏的*。绝大多数 token 在大多数时候只贡献微不足道的注意力权重。少数几个 token——他们叫 heavy hitter——长期吸引大部分注意力。
+
+那为什么不直接保留 heavy hitter，把其他的扔掉？具体怎么判断？H2O 用 *累积 attention score*：每一步生成时，给每个历史 token 累加它本次收到的注意力权重。累积分最低的 token 就是要驱逐的对象。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为 transformer 学出来的注意力本身就是稀疏的——这是模型架构的自然现象，不是 H2O 凭空假设。
+
+但新坑很大：*累积 score 本身就要存*。你为了省 KV cache，结果要给每个 token 多记一个浮点数当 "积分卡"。生成越长，积分卡越大。更要命的是，每一步生成都要更新所有 token 的积分——这个开销在长序列下并不便宜。
+
+H2O 把"该不该扔"的问题解决了，但"判断本身要花多少钱"这个问题，它没回答。
+
+** 2024 | SnapKV: 早判断早收工，prefill 完就定生死
+
+*** 它看到了什么问题
+
+H2O 的累积积分卡，在长输入场景下尤其浪费。比如你给模型一个 50k 的文档让它总结，prefill 阶段就已经能看出哪些 token 重要——但 H2O 还要在解码阶段继续维护积分。
+
+而且 H2O 的判断是滚动的：每步都可能改主意。这就让 KV cache 的内存布局不停变化，对系统层非常不友好。
+
+*** 它的解法
+
+SnapKV 做了一个看似简单的实验：用 *prompt 末尾一小段 query*（叫 observation window）当作"代表性查询"，让它对全文做一次 attention，谁得分高就保留谁。
+
+prefill 一结束，KV cache 立刻压缩到固定大小，解码阶段不再动。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为 prompt 通常已经"问完了"，模型在生成第一个 token 之前的注意力分布，已经能很好地预示后续生成时需要参考哪些 token——这一点 LongFlow 后来在 3.1 节做实验验证了。
+
+新坑是：*它只压缩 prefill*。如果输入很短输出很长（推理模型的情况），SnapKV 几乎压缩不到任何东西，因为压缩对象（prompt）本来就没几个 token。
+
+** 2024 | VATP: 别只看 attention，value 的范数也算
+
+*** 它看到了什么问题
+
+H2O 和 SnapKV 都把 attention score 当作"重要性"的代名词。VATP 拆穿了这个等号。
+
+attention 的输出公式是 ~o = Σ α_i · v_i~。一个 token 对输出的实际贡献是 α 和 v 的乘积——如果 α 高但 v 的范数特别小，它其实没贡献多少；反过来 α 一般但 v 很大，它的影响反而更大。
+
+H2O 把 v 的范数当成常数忽略了，相当于只看了一半。
+
+*** 它的解法
+
+把重要性重新定义为 ~α_i × ||v_i||~——既看注意力权重，也看 value 的实际大小。这是个一行代码的修改，但理论上更接近"驱逐这个 token 对输出真正造成多少损失"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它更贴近"输出变化"这个真正的目标，而不是"attention 高低"这个代理。
+
+新坑是：*成本进一步上升*。VATP 不光要算 attention score，还要每步算所有候选 token 的 value 范数。在长输出场景下，这个开销叠加上 attention 计算本身，时间被吃掉一大块。
+
+而且 VATP 仍然没解决 H2O 留下的根本问题：重要性估计是注意力之外的一个独立步骤，不能塞进 FlashAttention 的融合算子里。
+
+** 2025 | R-KV: 推理模型会重复，重复的可以多扔
+
+*** 它看到了什么问题
+
+到 2025 年，o1 和 R1 改变了游戏规则——以前是"长输入短输出"，现在是"短输入长输出"。CoT 一写就是上万 token，且经常有大段语义重复（"让我再想想"、"等等，我刚才说的那个..."）。
+
+H2O/SnapKV/VATP 的 importance metric 不知道这件事。一段重复的 reasoning trace 可能每段都有相似的 attention pattern，每段都被判定为"重要"，结果留下大量冗余。
+
+*** 它的解法
+
+R-KV 在 importance metric 里加了 *冗余惩罚*：如果某个 token 的语义和已保留的 token 高度相似，就降低它的优先级。专门为 reasoning 的重复结构设计。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它第一次正面承认"推理模型的 KV cache 压缩是个独立问题"。准确率上 R-KV 是 LongFlow 论文里最强的 baseline。
+
+新坑是：*越准越贵*。判断冗余需要额外计算 token 之间的相似度，这本身又是个非平凡的开销。LongFlow 论文里特别指出 R-KV 因为"more complex importance estimation logic"消耗更多显存。
+
+到这里，整条线陷入了一个奇怪的境地：每一代为了更准，引入了更多额外计算；而压缩 KV cache 的初衷本来就是为了 *快*。
+
+** 2026 | LongFlow: 重要性是 attention 的副产物，顺手就算出来了
+
+*** 它看到了什么问题
+
+LongFlow 把整条线总结成三条罪状：
+
+1. *Prefill-only 不行*：SnapKV 这类只压 prefill 的，在长输出场景几乎没用。
+2. *重要性计算太贵*：H2O/VATP/R-KV 都要在 attention 之外再跑一遍打分，长生成下叠加成本巨大。
+3. *无法和 FlashAttention 融合*：所有 baseline 的打分逻辑都是 attention 之后的独立步骤，强行融合就要在 HBM 和 SRAM 之间倒腾数据，破坏了 FlashAttention 省下来的那点带宽。
+
+最后一条是最致命的：你以为是在省 KV cache，实际是用更慢的算子换更小的显存，得不偿失。
+
+*** 它的解法
+
+两条核心原则——
+
+*Zero-History Estimation*：别看历史，只用当前 query。SnapKV 已经实验证明 observation window 很小都没事，那干脆就用 1（也就是当前 query）。
+
+*Zero-Cost Estimation*：别再做"attention 之后的独立打分步骤"。把重要性直接从 attention 计算的中间结果里抠出来。
+
+具体推导：要驱逐的 token i，理想上是让 ~‖o_t − o_t^(\i)‖~ 最小。在 attention 大量 token 的前提下，softmax 分母近似不变，于是这个差值约等于 ~α_i · v_i~——而 ~α_i · v_i~ 就是 attention 输出公式里那个加权 value，本来就在算！只需要顺手取 L1 范数，重要性就出来了，零额外计算。
+
+再写一个 Triton kernel，把 FlashAttention、重要性估计、token 驱逐打包成单一算子，attention 延迟从 47ms 砍到 8ms。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它第一次把"判断哪个 token 重要"这件事，从一个独立任务，变成了 attention 计算的副产物。这个视角的转变让它绕开了前四代积累的所有成本问题。
+
+但它老实承认了两个限制：
+
+1. *依赖 query 稳定性*——理论保证是"相邻 query 越像，误差越小"。CoT 生成里相邻 query 确实很像（已实验验证），但遇到突然的话题切换、工具调用、高随机解码，可能就不准了。
+2. *只管解码，不管 prefill*——当前算子是为 query length=1 设计的。如果是长输入主导的场景，要回退到 SnapKV 这种 prefill 方法。
+
+* 前沿延伸
+
+LongFlow 是 2026-03 才放上 arXiv 的 fresh paper（v2 在 2026-04），目前还没看到明确批判或改进它的后续工作。这条河暂时停在 LongFlow 这一段。
+
+可以预期的下一步方向（基于它自己点出的局限）：
+
+- 把 prefill 和 decoding 用同一个算子统一起来，不再切换方法
+- 在 query drift 较大的场景（multi-turn、tool-use、agent loop）下找新的代理量，替代"当前 query"这个假设
+- 把 zero-cost 思想推广到 KV cache 之外，比如 attention head 剪枝、layer 跳过
+
+* 一张图看懂
+
+#+begin_example
+                    "哪些 KV 可以扔，判断又快又准"
+
+           准确率                                          + LongFlow (2026)
+            ^                                              ^ 零额外计算
+            |                                              | 融合算子
+            |                          + R-KV (2025)       | "重要性是 attention 副产物"
+            |                          ^ 加冗余惩罚
+            |                          | 反推理模型重复
+            |              + VATP (2024)
+            |              ^ α × ||v||
+            |              | 别只看 attention
+            |  + SnapKV (2024)
+            |  ^ 观察窗一次性筛
+            |  | 只压 prefill
+            |  |
+       + H2O (2023)
+       ^  累积 attention score
+       |  heavy hitter 假设
+       |
+       +-------------------------------------------------------------> 时间
+
+       开销
+        ^
+        |        ============     <- VATP/R-KV: 准但贵
+        |    ====
+        |  ===                                     ==     <- LongFlow: 准且便宜
+        |==                                       =
+        +-------------------------------------------------------------> 演化方向
+
+   核心转折：
+     H2O~R-KV 这一支：用"额外计算"换"更准的重要性"——准确率上升，成本也上升
+     LongFlow 这一支：把"额外计算"砍掉，让重要性成为 attention 的免费副产物
+#+end_example
+
+* 洞见
+
+这条演化线表面上是"importance metric 越来越精细"，背后真正发生的是 *从算法到系统的视角下沉*。
+
+前四代（H2O → VATP → R-KV）都在算法层打转：怎么把重要性定义得更准、更接近"输出损失"？每一代都引入了新的统计量、新的修正项、新的元数据。最后准确率确实在涨，但每涨一点准确率就要多付一份计算和存储。
+
+LongFlow 的突破不在算法层——它的近似（用当前 query 代替未来 query，忽略 softmax 分母变化）甚至比 R-KV *更粗糙*。它的突破在于换了一个评价坐标系：*重要性估计不能脱离 attention 算子来谈*。
+
+一旦你接受这个约束，剩下的事就被规定死了：重要性必须能在 FlashAttention 的 block-wise 计算流里顺手算出来。这就强迫你回到 attention 输出的代数结构 ~α · v~ 上，从这个早就存在的中间张量里取信号。原来高大上的 importance metric，最后归结成"对加权 value 取 L1 范数"——简单到几乎让人怀疑。
+
+更深一层：这是 LLM 推理优化里一个反复出现的模式——*算法层卷不动了，就下沉到系统层重新洗一遍*。FlashAttention 当年也是同样的故事：attention 算法没变，只是把 IO 模式重写了一遍，性能就上一个台阶。
+
+下一步最可能的方向：把"零额外计算"这个原则从 KV cache 推到更上层——attention head 剪枝、layer 跳过、推测解码的 draft model——任何一个目前需要"独立打分"的优化，都可能被同样的思路改写成"主路径副产物"。
+
+* 启发
+
+对做研究的启发：*当你的领域开始堆叠修正项时，停下来看看坐标系*。H2O → VATP → R-KV 这条线，每篇都在前一篇基础上 incrementally 改进 metric。这种叠加式研究很容易陷入局部最优——大家都在比"谁的 metric 更准"，没人问"为什么 metric 必须是独立计算的"。LongFlow 的赢点是换了问法：不是"什么 metric 更准"，是"什么 metric 能在 FlashAttention kernel 里免费算出来"。
+
+落点："能用"的部分——
+
+- *如果你在做推理优化*，可以直接用 LongFlow 的 kernel（论文有开源），尤其是部署 R1/Qwen3 类长 CoT 模型时。
+- *如果你在设计系统级算法*，记住"系统层约束反向规定算法形态"——把最贵的算子（比如 FlashAttention）当成不能动的基础设施，让你的算法适应它，而不是反过来。
+- *如果你在读别人的论文*，"近似比对手更粗糙但成本骤降"通常是个值得停下来想想的信号——这往往意味着对手把问题问错了。

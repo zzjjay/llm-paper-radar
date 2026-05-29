@@ -1,0 +1,213 @@
+#+title:      FlashHead: Efficient Drop-In Replacement for the Classification Head in Language Model Inference
+#+date:       [2026-05-28 Thu 23:50]
+#+filetags:   :paper:river:
+#+identifier: 20260528T235000
+#+source:     https://arxiv.org/abs/2603.14591
+#+authors:    Wilhelm Tranheden, Shahnawaz Ahmed, Devdatt Dubhashi, Jonna Matthiesen, Hannes von Essen
+#+venue:      arXiv 2026 (cs.LG), Embedl
+
+* 问题之河
+
+把一个语言模型缩小到能塞进手机，你会发现一件荒谬的事：模型最后那一层——把 hidden state 乘上词表矩阵、算出每个词的得分——居然能占整个模型 60% 的参数、50% 的算力。模型越小，这块占比越夸张。Llama-3.2-1B 的输出头比 transformer body 还要重。
+
+为什么这么贵？因为词表越来越大。Llama-3.2 是 128k 词、Gemma-3 是 256k 词。每次出一个 token，都要对整张词表里每一个词算一遍内积，从里面挑分数最高的（greedy）或按 softmax 采样（sampling）。这是个 v x d 的稠密矩阵乘法，v 是词表大小，d 是 hidden 维度。
+
+这条河，问的就是同一个问题：*能不能不要把整张词表都算一遍？* 听起来理所当然——只有少数几个 token 会真的被选中，剩下都是浪费。难点在两层：第一，你得先知道哪几个 token "可能"被选中，这个"先知道"本身得便宜；第二，你不能只给出 top-k，因为 sampling 模式（temperature > 0）需要的是一个完整的概率分布，而不是几个候选。
+
+二十年来一代代人都在猜，每一代都被前一代留下的坑绊倒。
+
+* 溯源地图
+
+#+begin_example
+[2005] Morin & Bengio - Hierarchical Softmax
+  |
+  | 提出: 把词表组织成一棵二叉树, O(V) 变 O(log V)
+  | 留坑: 树形结构是训练时定死的; 需要重训; 偏置严重
+  v
+[2017] Grave et al. - Adaptive Softmax
+  |
+  | 改进: 按词频分簇 (高频小簇, 低频大簇)
+  | 仍要: 联合训练; 簇头是模型一部分
+  v
+[2017] Shim et al. - SVD-Softmax
+  |
+  | 第一个真正 training-free: 对 E 做 SVD
+  | 用低秩近似挑 top-k, 再对 top-k 精算
+  | 留坑: 只对高概率 token 准; sampling 模式下分布失真
+  v
+[2018] Zhang et al. - Fast Graph Decoder (FGD)
+  |
+  | 把"找下一个 token"看作 ANN 检索问题
+  | 用 small-world graph 在词嵌入空间里做近邻搜索
+  | 留坑: 只返回 top-k 候选集, 不是概率分布; 不支持 sampling
+  v
+[2023] Ushio et al. - Vocabulary Trimming
+  |
+  | 干脆扔掉低频词 (校准集决定保留谁)
+  | 留坑: 词表永久缩小; OOD prompt 直接崩
+  v
+[2026] FlashHead (本文) - 把分类头做成 IR 检索 + 多 probe + 采样
+       training-free, 保留完整分布, 硬件友好, 对头部量化
+#+end_example
+
+* 演化叙事
+
+** 2005 | Hierarchical Softmax: 把词表组织成树
+
+*** 它看到了什么问题
+
+最朴素的 softmax 在 v 个词上要算 v 次指数和归一化。当年 v 还只是几万，已经让神经语言模型训不动。问题是：能不能不要把所有词都过一遍？
+
+*** 它的解法
+
+把词表组织成一棵二叉树，每个词是一片叶子。要算一个词的概率，只要沿着根到叶子的路径走一遍——log(V) 次而不是 V 次。每个内部节点学一个小分类器，告诉你"该往左走还是往右走"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉是：你不必把所有词都看一遍，你只要做一连串"二选一"。
+
+但坑很深：(1) 树的结构是训练前就定死的，按词频或语义聚类。结构选错了，整棵树都偏。(2) 训练阶段一个词走一条路径，但*推理*阶段你想要每个词的概率，还是得遍历整棵树——加速主要在训练。(3) 没法 drop-in 替换已经训好的模型，必须从头训。
+
+下一代人的问题就来了：能不能保留这个"分层"的思路，但让结构更聪明、和模型一起学？
+
+** 2017 | Adaptive Softmax: 按词频分簇
+
+*** 它看到了什么问题
+
+Hierarchical softmax 的树是拍脑袋定的。能不能让"分簇"这件事本身有道理？Grave 等人注意到：词频分布是极不均匀的 Zipf 分布，几百个高频词占了 90% 的出现次数。
+
+*** 它的解法
+
+把词分成几个簇：高频词一个小簇，中频词一个中簇，低频词一个大簇。高频簇用高维 embedding，低频簇用低维 embedding。每个簇有自己的头。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉是：常出现的词值得用大模型精算，罕见词用小模型差不多就行。这在 RNN 时代真的把训练加速了 2-10 倍。
+
+但留下的坑是：簇头还是模型的一部分，必须从头联合训练。你不能拿一个训好的 GPT 然后"换一个 adaptive head"——它根本不知道你的簇是什么。Transformer 时代到来后，所有模型都已经训完了，这套方法用不上。
+
+下一代人的问题是：能不能 *拿一个训好的模型，事后* 换一个高效的头，不动模型本体？
+
+** 2017 | SVD-Softmax: 训练后做低秩近似
+
+*** 它看到了什么问题
+
+Shim 等人的观察很简单：embedding 矩阵 E 是 v x d 的大矩阵，但它的有效秩远远低于 d。换句话说，里面有大量冗余。
+
+*** 它的解法
+
+对 E 做 SVD，分解成 E ≈ U S V^T。给一个 hidden vector h，先用低秩近似 (U S) 和 (V^T h) 算出粗略 logits，从里面挑出 top-N 候选，然后只对这 N 个候选用原矩阵精算真实 logits。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉是：高概率的 token 在低秩近似下也是高概率的——所以筛选阶段不用太准，精算阶段只对少数候选做。
+
+这是第一个真正 *training-free* 的方法。但它有一个致命问题：分布失真。粗近似只对头部 token 准，尾部 token 的概率被错估。greedy decoding 没问题，但 *sampling* 模式（temperature > 0、top-p）下，被截掉的尾部累积起来概率不小，分布形状是错的。
+
+下一代人的问题是：能不能找一个数据结构，既能高效筛选，又能保留完整分布？
+
+** 2018 | Fast Graph Decoder: 把分类头当 ANN 检索
+
+*** 它看到了什么问题
+
+Zhang 等人重新框定了问题：找 argmax 不就是找一个 query (hidden vector h) 在一堆 key (token embeddings) 里的最近邻吗？这正是 ANN（Approximate Nearest Neighbor）社区研究了二十年的问题。
+
+*** 它的解法
+
+把所有 token embeddings 建一个 small-world graph 索引。推理时从图上某个入口节点出发，沿着边走到 h 的最近邻区域。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉是：IR 社区已经把"在亿级向量里找近邻"的问题打磨到亚毫秒级，借过来用就行。
+
+留下的坑：(1) 还是只返回 top-k *候选集*，不是一个概率分布——sampling 用不了。(2) 图遍历是 *不规则* 内存访问，对 GPU/NPU 这种宽并行硬件非常不友好——理论 O(log V) 在实际硬件上跑不出来。(3) 提出于 2018 年 RNN 时代，没人在 SLM 上验证过。
+
+下一代人的问题是：能不能找一种 IR 索引，既保留完整分布，又对 GPU 友好？
+
+** 2026 | FlashHead: 等大球面聚类 + 多 probe + 概率采样
+
+*** 它看到了什么问题
+
+到了 2026 年，小模型部署成了热点。FlashHead 团队回头看：
+- SVD-Softmax 训练-free 但分布失真，不能采样
+- Fast Graph Decoder 用了 ANN 思想但只给 top-k，且图遍历不规则
+- Adaptive softmax / ANN-Softmax 等需要重训，对开源 SLM 不适用
+- Vocabulary trimming 永久缩词表，OOD 崩盘
+
+总结起来一句话：*没有一个方法同时满足 "训练-free + 完整分布 + 硬件友好"*。
+
+*** 它的解法
+
+把分类头彻底当 IR 检索器，但每一步都为 GPU 重新设计：
+
+1. *等大球面 K-means*：对 E 做 spherical k-means 聚类（余弦距离），但*强制每个簇大小完全相等* v/c。这样所有簇可以打包成一个规整的 (c, v/c, d) 张量，GPU 访问完全可预测——没有 padding、没有分支。
+2. *多 probe（multi-probe）扫描*：传统 IVF 只选最近的一个 cluster 来精算。FlashHead 选 *几百到几千* 个 probe，在簇质心上同时打分，加权决定每个簇被精算多少 token。从"几百个 cluster 选一个"扩展到"几万个 cluster 并行打分"。
+3. *Probabilistic probe sampling*：sampling 模式下，把 multinomial 采样直接搬到 probe 选择阶段——按簇的概率质量采 probe，每个 probe 内部再采 token。这样最终采样分布等价于在完整词表上 softmax 采样。这是绕过"top-k 不能采样"问题的关键。
+4. *选择性量化*：第一阶段（质心打分）可以激进量化到低 bit——因为后面还有第二阶段精算兜底。这是第一个能安全量化输出头的方法。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉是：把"算 12.8 万次乘加"换成"用粗筛找出几百个最可能的小簇，再精算这几百个簇里的几千 token"。等大簇 + 大量 probe 让粗筛足够准，多阶段结构让 sampling 数学上等价于完整 softmax。
+
+实测 Llama-3.2-1B 加速 1.75x、Gemma-3-270M 加速 1.35x，输出质量基本不掉。
+
+新坑：(1) 离线聚类要扫一遍 E（一次性成本，但对超大词表也得几小时）。(2) probe 数量是个超参，要调。(3) 精度保证目前是经验性的，没有形式化的近似上界。
+
+* 前沿延伸
+
+截至 2026 年 3 月，这是这条线的最新进展。FlashHead 刚出，配套的 Hugging Face collection 已经放出 Llama/Gemma/Qwen 的 FlashHead 版本。
+
+可以预期的接下来方向（推测，非已发表）：
+- 把 FlashHead 与 speculative decoding 结合——既然 FlashHead 已经把头变快，speculative decoding 的 draft model 可以更激进
+- 训练时就让模型 embedding 对 equal-size clustering 友好（轻度对齐 loss），进一步提升精度
+- 更极致的量化：第一阶段用 INT4 甚至更低，把头的算力降到可忽略
+
+* 一张图看懂
+
+#+begin_example
+              结构             训练? 完整分布? 硬件友好?  drop-in?
+              ====             ===== ========= =========  ========
+  [2005] HierSoftmax  树        要重训   是      一般       否
+  [2017] AdaSoftmax   词频簇    要联训   是      还行       否
+  [2017] SVD-Softmax  低秩近似  免训练   否(头部) 矩阵乘    是
+  [2018] FastGraphDec ANN图     免训练   否(top-k) 图遍历差  是
+  [2023] VocabTrim    剪词表    要校准   否(缩了) 极好       是
+  [2026] FlashHead    等大簇+   免训练   是       规整张量   是
+                      多probe+
+                      probe采样
+
+  演化方向: O(V) -> log(V) -> 低秩 -> ANN -> IR + GPU-native + 完整分布
+
+  根本转变:
+    "分类问题"    ===>    "检索问题"
+    遍历词表算 logits      在 embedding 空间里找近邻
+
+    "近似 = 精度损失" ===>  "近似 = 多阶段筛选 + 后续兜底"
+                            一阶段量化, 二阶段精算
+
+    "top-k 候选"     ===>  "完整分布等价采样"
+                            把采样下沉到 probe 选择阶段
+#+end_example
+
+* 洞见
+
+这条河看二十年，真正的变化不是"算法更快了"，而是 *问题被重新框定了两次*：
+
+第一次重框（2017-2018）：从"算 softmax"变成"找近邻"。这把 IR 社区几十年的工具箱——SVD、k-means、IVF、small-world graph——一夜间打开。但这次重框不彻底，留下了"近似带来概率失真"和"GPU 不友好"两个钉子。
+
+第二次重框（2026 FlashHead）：从"找近邻"变成"做硬件原生的多阶段检索"。关键洞见有三个：
+1. *等大簇* 是把 IR 算法翻译成 GPU 语言的"翻译适配器"——传统 IVF 用变长簇是因为 CPU 不在乎，GPU 在乎。
+2. *Probe 采样*是绕过"top-k 不能采样"这个老坎的妙招——不要在结果上做采样，要在筛选过程里做采样。
+3. *量化容忍度*来自冗余：单阶段近似怕量化，多阶段近似不怕——因为后续阶段会兜底。
+
+更深的规律：*当一个领域的"老问题"卡住时，往往是因为底层硬件假设变了，但算法还在按旧硬件做*。Hierarchical softmax 和 adaptive softmax 都是 CPU/RNN 时代的产物，搬到 GPU/Transformer 时代水土不服。FlashHead 不是聪明，是终于有人把每一步都为 GPU 重新算了一次。
+
+下一步最可能往哪走：*把 attention 也用同样思路重做*。attention 本质上也是"query 在 key 里找最相关的"——这是 IR 问题。已经有一些工作（NSA、各种 KV cache 压缩）在动这块，但没人像 FlashHead 这样系统地用"等大簇 + 多 probe + probabilistic sampling"做。
+
+* 启发
+
+对做研究的人：*老的问题被解决，常常不是因为有了新算法，而是因为有人意识到硬件假设变了*。Hierarchical softmax 2005 年发表，FlashHead 2026 年用类似思路解决了。中间 20 年人们以为问题已经"解决"了——其实只是被搁置了。当硬件改变时，回头扫一遍旧问题，常常能捡到大鱼。
+
+对做 SLM 部署的人：你可以现在就用 FlashHead 把手头 1B 级模型的推理速度顶上去 30-75%，不动权重、不动训练流程。HuggingFace collection 已经有现成模型。
+
+对做系统的人：*"近似 + 兜底"* 的多阶段结构比 *"单阶段精算"* 更适合现代硬件——因为前一阶段可以激进量化、并行扫描，后一阶段串行精算的部分被缩到极小。这个范式在 ANN 搜索、speculative decoding、稀疏 attention 里反复出现，值得作为一个第一性原则来记住。
