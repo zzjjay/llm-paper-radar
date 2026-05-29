@@ -1,0 +1,208 @@
+#+title:      Astro: Activation-guided Structured Regularization for Outlier-Robust LLM Post-Training Quantization
+#+date:       [2026-05-29 Fri 06:24]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T062437-en
+#+source:     https://arxiv.org/abs/2602.07596
+#+authors:    Xi Chen, Ming Li, Junxi Li, Changsheng Li, Peisong Wang, Lizhong Ding, Ye Yuan, Guoren Wang
+#+venue:      arXiv 2026.02
+
+* The River of Problems
+
+A 70B model's weights alone weigh 140 GB. They won't fit on a single GPU, and inference runs slower than memory bandwidth allows. So from 2022 onward, the entire field has been doing one thing: compress weights to INT4, INT3, or INT2, so large models can run on consumer-grade hardware.
+
+In principle this seems straightforward — mapping 16-bit floats to 4-bit means slotting values into 16 buckets. In practice, compression breaks models. The reason is simple: LLMs contain a small population of *outliers* — in weights, and even more so in activations — whose magnitudes dwarf normal values by tens or hundreds of times. Widen the quantization grid to accommodate them and normal values all crowd into a few central buckets, with catastrophic precision loss; refuse to accommodate them and they get clipped, errors snowball through successive matrix multiplications, and the model starts hallucinating.
+
+From 2022 to 2026 — four years — the entire PTQ (Post-Training Quantization) community has been fighting these outliers. Each generation inherits the scars left by the last and finds a new angle to get around them. The current end of this line is Astro, which argues: "You've all been wrong. We should not be changing how weights are represented — we should be searching for a different but equivalent set of weights."
+
+* The Origin Map
+
+#+begin_example
+[2022] GPTQ
+  | Problem: 4-bit is fine, 3-bit/2-bit collapses entirely
+  | Because: outliers are untreated; quantization error is amplified by activations
+  v
+[2023] AWQ
+  | Problem: outliers still live in the weights, merely "protected"
+  | Because: per-channel scaling isn't enough at 2-bit
+  v
+[2024] QuaRot / SpinQuant
+  | Problem: rotation changes the network structure, adding one matrix multiply at inference
+  | Because: equivalent-transform correctness comes at deployment cost
+  v
+[2024] MagR
+  | Problem: regularization strength is uniform; no theoretical grounding
+  | Because: treats all weights as equal targets of "smaller is better"
+  v
+[2026] Astro  <-- target paper
+        Sees: loss landscape is flat; infinitely many equivalent weights exist
+        Does: scale regularization by activation magnitude; find the weight that is naturally quantization-robust
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Let Quantization Error "Atone" Layer by Layer
+
+*** What Problem It Saw
+
+Before GPTQ, the most naive approach was RTN (Round-To-Nearest) — round each weight to the nearest representable value. This works passably for small models, but for LLMs with billions of parameters, accuracy collapses precipitously below 3-bit. The AdaRound generation realized that "round to nearest" is not necessarily optimal: adjacent weights are correlated, so rounding one weight up means the next should be rounded down to compensate. But AdaRound was designed for small vision models; running it on a 175B GPT-3 was completely infeasible.
+
+*** Its Solution
+
+GPTQ uses the inverse of the Hessian matrix to capture the coupling between weights. The procedure: go layer by layer, and each time a weight is quantized, use the Hessian to compute how much of the resulting error should be redistributed onto the weights not yet quantized, so those weights can adjust and compensate. This is a classic "greedy + atonement" pipeline: at every step, future weights absorb the quantization error introduced by the current step.
+
+The results were immediate. On OPT-175B, GPTQ achieved nearly lossless 4-bit quantization — the first time large-model quantization became practically usable.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+GPTQ's elegance lies in acknowledging that weights are coupled and using second-order information to characterize that coupling. But it has a fatal blind spot — it assumes quantization errors are small, local perturbations. Once outliers appear, the quantization range is stretched, and the resulting errors on normal weights are far too large to be called "small perturbations." At 3-bit and 2-bit, GPTQ simply collapses.
+
+The next problem surfaces: *outliers themselves must be addressed.*
+
+** 2023 | AWQ: Protect the Weight Channels That Matter
+
+*** What Problem It Saw
+
+Researchers quickly discovered that not all weights are equally important. Weights multiplied by high-activation channels — the "salient weights" — cause disproportionate damage when quantized poorly. SmoothQuant took a different approach: migrate activation outliers into the weights via scaling (W8A8), since weights are more tractable. But this stops working at lower bit-widths (W4, W2) because the burden on the weight side becomes too heavy.
+
+*** Its Solution
+
+AWQ reasons in the opposite direction: instead of migrating activations, protect the critical 1% of weight channels. Concretely, it multiplies each channel by a scaling factor s (and divides the corresponding activation by s, keeping the overall computation equivalent), so that salient-channel weights are "amplified" before quantization — a larger absolute value suffers proportionally smaller relative quantization error in a fixed grid.
+
+Analogy: you have 16 slots to store items; double the size of your most valuable item before placing it, and the slot's resolution is now fine enough to represent it faithfully. Downstream, the corresponding inverse scaling restores it.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+AWQ nearly matches floating-point at W4. But the logical ceiling is clear: you are *protecting* outliers, not *eliminating* them. At W2, no matter how the scaling is tuned, a handful of extreme values will still overwhelm the entire quantization grid. Moreover, AWQ's scaling factors are found via heuristic search over a calibration set — there is no deeper principle at work.
+
+The next question: *Is scaling too weak? Can a more powerful equivalent transformation do the job?*
+
+** 2024 | QuaRot / SpinQuant: Use Rotation to "Spread" Outliers Away
+
+*** What Problem It Saw
+
+AWQ uses per-channel scaling — a diagonal matrix. This transformation has limited power: it can only scale channels up or down uniformly; it cannot reshape the distribution of outliers within a channel. If a single channel contains one enormous outlier, no amount of scaling can make it unobtrusive.
+
+*** Its Solution
+
+QuaRot introduces *orthogonal rotation*. The intuition: multiplying a severely skewed vector by a random orthogonal matrix (e.g., a Hadamard matrix) "scatters" outliers across all dimensions, and the resulting distribution becomes much more Gaussian-like. After scattering, each value is moderate, and quantization error is inherently small.
+
+Mathematically this is an equivalent transformation: multiply weights on the left by R, multiply activations on the right by R⁻¹, and model outputs are unchanged. SpinQuant makes R learnable, improving results further.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+Rotation genuinely *eliminates* outliers; accuracy at W4 is excellent, and W3 remains workable. But the cost appears: *one extra matrix multiply at inference*. Either you accept the added latency, or you perform complex kernel fusion to embed the rotation inside the attention operator — requiring operator-level engineering. For deployment teams, this is a nightmare: change the model architecture or the backend, and the fusion solution must be rewritten from scratch. SpinQuant's learnable rotation also requires an expensive optimization run.
+
+The next question: *Can we avoid touching the structure while still neutralizing outliers?*
+
+** 2024 | MagR: Use Regularization to "Suppress" Outliers
+
+*** What Problem It Saw
+
+The rotation camp's trouble is deployment cost. Can we reshape the weights directly during the PTQ phase into a form that is "naturally free of large outliers" — so that quantization needs nothing extra and the deployed model is architecturally identical to the original?
+
+*** Its Solution
+
+MagR adds an *L∞ regularization* term to GPTQ's per-layer reconstruction objective — penalizing the maximum absolute value within each weight row. Equivalently: "while keeping this layer's output unchanged, suppress the extremes of the weights." After suppression, quantization naturally encounters fewer outliers.
+
+This direction is sound. Zero additional inference overhead, fully compatible with GPTQ, deployment-friendly.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+MagR reveals a key insight: *weights are not fixed; there exist many weight configurations that produce nearly identical outputs, and we can choose the one most amenable to quantization.* But its implementation has two deficiencies:
+
+1. Regularization strength is a single fixed hyperparameter applied uniformly to all channels. Yet activation magnitudes across channels span several orders of magnitude — for channels with large activations, a weight outlier causes severe output error; for channels with small activations, a larger weight value barely affects output at all. Uniform treatment is clearly wrong.
+2. The entire objective is heuristic; there is no theoretical justification for "why L∞, why this strength."
+
+The next question: *Can we theoretically derive who should be penalized, and how hard?*
+
+** 2026 | Astro: Let Regularization "Listen" to the Activations
+
+*** What Problem It Saw
+
+Astro pushes MagR's insight one step further while explicitly acknowledging both of MagR's deficiencies. The paper's central observation is: because over-parameterized LLMs converge to *flat minima* — regions where the loss is nearly constant over a large volume of weight space — the original weights Θ are not the unique solution; they are merely one point on a continuous manifold of equivalent solutions. Why not *actively search* this manifold for the weight that is most robust to quantization?
+
+Furthermore, since weight quantization error ultimately gets multiplied by activations to produce output error, the regularization strength for each channel *must* be tied to that channel's activation norm — channels with large activations demand tighter weight control; channels with small activations can afford more slack.
+
+*** Its Solution
+
+Astro derives an output-error upper bound showing that output error ∝ ‖weight quantization error‖ × ‖activation‖_F. The regularization form follows directly: for channel k, the regularization strength α_k is proportional to ‖X^(k)‖_F. Adding this objective to GPTQ's per-layer reconstruction yields weights that are naturally "more compact where activations are larger."
+
+What happens physically: the model first slides along the flat-minima manifold to a point where weights are especially well-behaved in high-activation channels, and standard quantization then proceeds. The entire process requires zero inference-time changes and can be stacked on top of both GPTQ and AWQ.
+
+*** Why It Works (and Where It Plants New Seeds)
+
+Three problems are resolved at once:
+
+- *Theoretical grounding*: the regularization form is derived from an error bound, not guessed
+- *Zero inference cost*: no architecture changes, no added operators
+- *Orthogonal composability*: can be grafted onto GPTQ and AWQ
+
+The cost: one optimization pass over a calibration set is required, which is slower than plain RTN, but roughly three times faster than SpinQuant's learned-rotation approach (as reported on LLaMA-2-7B in the paper).
+
+Remaining open questions (speculative): Astro depends on the flat-minima assumption. If future models — e.g., those trained with aggressive distillation or strong RL — converge to sharp minima, the equivalent manifold shrinks, and this approach may break down.
+
+* Frontier Extensions
+
+As of February 2026, Astro represents the latest step along the "zero inference overhead + theoretically guided regularization" line. Directions worth tracking in parallel:
+
+- *Training-PTQ co-design*: incorporating "quantization friendliness" as part of the pretraining loss (quantization-aware pretraining, QAP) to eliminate outliers at the source
+- *Hardware co-design*: MX-format hardware (MXFP4, MXFP6) is gaining traction, and quantization algorithms are being redesigned for these block-scaled hardware formats
+- *KV-cache quantization*: this paper focuses on weight quantization, but activation/KV quantization pressure is mounting rapidly and represents the next battleground
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  [How to handle outliers]
+                         |
+       +-----------------+------------------+
+       |                 |                  |
+   "Protect them"    "Eliminate them"   "Find an equivalent weight without them"
+       |                 |                  |
+       v                 v                  v
+   AWQ (2023)       QuaRot (2024)       MagR (2024)
+   Per-channel       Orthogonal          L∞ regularization (heuristic)
+   scaling           rotation                |
+       |                 |                  |
+   Extreme values    Inference: +1 mult  Uniform regularization
+   remain                |                  |
+       |                 |                  |
+       +---- all built on ----> GPTQ (2022) <----+
+                  Per-layer Hessian reconstruction
+                         |
+                         | Evolution: drive "extra cost" to zero
+                         | while making "outlier elimination" more thorough
+                         v
+                    Astro (2026)
+              "Flat minima + activation-coupled regularization"
+              Zero inference cost, theory-driven, composable
+
+   [Timeline]
+   2020 -------- 2022 -------- 2023 -------- 2024 -------- 2026
+  AdaRound       GPTQ        AWQ          QuaRot         Astro
+                            SmoothQuant   SpinQuant
+                                          MagR
+#+end_example
+
+* Insights
+
+On the surface, this line iterates quantization algorithms. At a deeper level, what is changing is *how the object called "weights" is conceived*.
+
+- GPTQ treats weights as *fixed* entities; it studies only how to compensate for errors
+- AWQ / QuaRot begin manipulating the weight representation, but still treat the original weights as the unique solution — what they do are *equivalent transformations* (paired T, T⁻¹)
+- MagR / Astro jump to another level of abstraction: the original weights are *not the unique solution* — they are one point on an equivalence manifold. The question is no longer "how do I encode these weights," but "which weights from this equivalence class are best suited for encoding"
+
+This is a classic shift in ontology of the object. From "the object is fixed; I change my viewpoint" to "the object is itself a set; I choose from the set." Once the perspective shifts to the latter, many past trade-offs (accuracy vs. deployment) cease to be genuine trade-offs — they were simply the cost of struggling with the wrong solution point.
+
+The most likely next directions:
+
+1. *Shape the manifold during pretraining* — train the model to converge directly to minima that are especially flat and especially quantization-friendly, so the PTQ phase requires almost nothing
+2. *Apply the same manifold reasoning to KV-cache* — find, within the space of equivalent KV sequences, the one most amenable to quantization
+3. *Converge with sparsification* — quantization and pruning are both about choosing points on equivalence manifolds; they can be jointly optimized
+
+* Lessons
+
+For researchers: when you find that every method in a field is trading off along a "precision vs. overhead" frontier, be suspicious — it almost certainly means everyone shares a wrong premise. Astro's breakthrough is not a cleverer algorithm; it is the act of questioning the premise — accepted unchallenged for three years — that the original weights must be the starting point.
+
+For engineers: this means you can use Astro (or an open-source equivalent) to achieve W4 accuracy close to floating-point without changing a single line of inference code, with deployment costs identical to the unquantized model. If you previously retreated to W8 because of QuaRot's operator-fusion overhead, it is worth reconsidering a push to W4.
+
+For people entering a new field: when you encounter a research line as competitive as PTQ — four years of intense iteration — reading backward is ten times faster than reading forward. Start from the newest paper's "we improve upon X," trace back five levels, and you will reach the real problem the line is solving, rather than drowning in a sea of abbreviations.

@@ -1,0 +1,188 @@
+#+title:      DynSplit-KV: Dynamic Semantic Splitting for KVCache Compression in Efficient Long-Context LLM Inference
+#+date:       [2026-05-29 Fri 14:23]
+#+filetags:   :paper:river:kvcache:compression:
+#+identifier: 20260529T142300
+#+source:     https://arxiv.org/abs/2602.03184
+#+authors:    Jiancai Ye, Jun Liu, Qingchen Li, Tianlang Zhao, Hanbin Zhang, Jiayi Pan, Ningyi Xu, Guohao Dai
+#+venue:      arXiv 2026 (Shanghai Jiao Tong University / Infinigence-AI / SII)
+
+* 一句话定位
+
+一条问题演化线: "长上下文推理时，KV cache 太大装不下，怎么扔掉一部分又不掉精度？" — 从粗暴扔 token，到按块扔，到按句子扔，再到 DynSplit-KV 提出: 哪里该切根本不该写死，应该让模型自己投票。
+
+* 溯源地图
+
+#+begin_src
+                       [问题: KV cache 太大]
+                                |
+                                v
+              FlashAttention (Dao, 2022)
+              "算得快，但 cache 还是全留着"
+                                |
+                  +-------------+--------------+
+                  |                            |
+                  v                            v
+        StreamingLLM (2023)              H2O (2023)
+        "留 sink + 最近窗口"             "按累积 attention 扔"
+                  \                            /
+                   \                          /
+                    +----------+-------------+
+                               |
+                               v  [token-level: 丢了语义结构, 掉 10-30%]
+                               |
+                  +------------+-------------+
+                  |                          |
+                  v                          v
+            Quest (2024)               InfLLM (2024)
+            "按固定 page 选"           "按固定 block 装载"
+                  \                          /
+                   \                        /
+                    +-----------+----------+
+                                |
+                                v  [block-level: 效率好, 但切的位置和语义无关]
+                                |
+                                v
+                         ChunkKV (2025)
+                         "固定 chunk, 比 token 稍好"
+                                |
+                                v
+                  +-------------+--------------+
+                  |                            |
+                  v                            v
+          SentenceKV (2025)            SABlock (2025)
+          "按标点切句子"               "在 cache 预算下自适应块大小"
+                  \                            /
+                   \                          /
+                    +----------+-------------+
+                               |
+                               v  [语义对齐了, 但只对自然语言有效, 变长块拖慢推理]
+                               |
+                               v
+                  *** DynSplit-KV (2026, this paper) ***
+                  "让 attention 自己告诉你哪里能切,
+                   再把变长块映射回定长块"
+#+end_src
+
+* 演化叙事 (问题怎么长出来的)
+
+** 起点: KV cache 是个吞内存的怪兽
+
+Transformer 推理为了不重算前面 token，会把所有 Key 和 Value 缓存下来——这就是 KV cache。短上下文时无所谓，但一旦到长上下文，事情失控: Llama2-13B 跑 128k context，KV cache 单独就吃 80GB——一张 A100 的全部显存。
+
+FlashAttention (Dao, 2022) 把 attention 算得飞快，但它没解决根本问题: cache 仍然是全留的。要进一步加速长上下文，必须扔掉一部分 KV。
+
+那么问题来了: *扔哪些*?
+
+** 第一代答案: 按 token 扔 (StreamingLLM / H2O, 2023)
+
+最直觉的做法——每个 token 自己有个重要度，扔掉不重要的。
+
+- *StreamingLLM* 发现: 开头几个 token (attention sink) 和最近的窗口必须留，剩下的可以扔。简单粗暴，能跑通。
+- *H2O* 更精细: 看每个 token 的累积 attention 分数，分高的留下。
+
+听起来合理，但跑出来掉 10-30% 精度。原因 DynSplit-KV 直接点破: 这些方法 *把 token 当孤立单位来评分*，完全没考虑 token 之间的句法和语义关联。一句话被腰斩，前半句留下来后半句被扔，那留下来的也是噪声。
+
+所以下一代要问: *能不能不按 token 扔，按一整块扔*?
+
+** 第二代答案: 按固定块扔 (Quest / InfLLM, 2024)
+
+把 KV cache 切成固定长度的 block (比如每 32 个 token 一块)，按块来选: 哪个块和当前 query 相关就把整块调进来。
+
+- *Quest* 把每个块的 attention 用块内最大值近似，按近似分排序，选 top-k 个块。
+- *InfLLM* 类似，把 cache 切成定长 block，按近似 attention 动态加载。
+
+这一步的好处是 *变成块级并行*——选 100 个块比选 3200 个 token 快得多，GPU 也喜欢这种规整数据。
+
+但新的问题: 切块的位置是机械的，*每 32 个 token 一刀*，刀口可能正好砍在一个完整短语中间。一句话被切成 "if x >" / "0: y = f(x)" 这种荒唐的两半。精度有改善但天花板被这种机械切分压住了。
+
+ChunkKV (2025) 在这条路上又走了一步，把 chunk 做得稍大、稍灵活，但本质还是 *和语义无关的切分*。
+
+** 第三代答案: 按句子扔 (SentenceKV / SABlock, 2025)
+
+既然问题在 "切的位置不顾语义"，那就让标点来切——句号、逗号、换行处是天然的语义边界。
+
+- *SentenceKV* 在 prefill 阶段直接用预定义标点切，每个句子做成一个紧凑表示，decode 时按 query 相关度调取整句。
+- *SABlock* 更激进，在固定 cache 预算下自适应决定每块多大，但依然依赖预定义的语义符号。
+
+精度终于上来了——自然语言任务上 SentenceKV 比固定块切分高了一截 (论文图里 86% vs 52%)。
+
+但两个新麻烦立刻冒出来:
+
+1. *只对自然语言成立*。代码里冒号、括号、缩进的"分量"和散文里完全不一样——SentenceKV 在代码任务上反而比固定块切分还差 (76% vs 66% 的对比里，对应 DynSplit-KV 在两个场景都 100% 的对照)。预定义标点这条假设在跨场景时崩了。
+2. *变长块严重拖慢推理*。按句子切，每个块大小都不一样，GPU 上没法整齐并行，块内打分和选取要走非规整路径，DynSplit-KV 实测 *多出 73.1% 额外时间*。
+
+所以问题进一步逼到墙角: *能不能既按语义切，又不依赖固定标点，还能像定长块一样高效*?
+
+** 转折: DynSplit-KV (2026) 看到了什么
+
+DynSplit-KV 团队的关键观察非常朴素: 同一个标点 (比如分号)，在自然语言和代码里的"语义分量"差了 45%，在不同模型 (LongChat vs DeepSeek) 里也差了 24%。
+
+预定义标点的根本错误是: *它假定每个分隔符的重要性是先验固定的*。但实际上重要性是 *上下文相关的、模型相关的、动态的*。
+
+那怎么动态评分? 论文给出的妙手是: *让模型自己用 attention 投票*。
+
+对每个候选分隔符位置 i，看 *未来的 token 是怎么 attend 回头的*——如果它们大部分注意力都落在 i 之后的本地窗口、很少落在 i 之前的远处，那 i 就是个好切点 (本地连贯，长程依赖少)。打个分:
+
+#+begin_src
+si = E[future tokens 看本地的 attention] - alpha * E[future tokens 看远处的 attention]
+#+end_src
+
+分高 = 这个位置切下去语义损失小。
+
+这就解决了 *Challenge 1*: 切的位置不再依赖人工标点，而是模型实际计算出来的依赖结构。论文实测 accuracy 提升 49.9%。
+
+但 *Challenge 2* 还在: 按动态打分切出来的块还是变长的，怎么避免 73.1% 的额外开销?
+
+DynSplit-KV 的另一手叫 *V2F (Variable-to-Fixed Mapping)*: 把每个变长块的所有 token 用一对 element-wise max/min 压成一个 *定长摘要*——一个块不管原来多长，对外只露出固定大小的接口。打分用块摘要算，选完 top-k 块后再把块分数广播回块内所有 token，最后整张 attention 表又变成规整定长，GPU 就重新满载了。
+
+效果: 比 FlashAttention 快 2.2x，peak memory 减少 2.6x，精度还是最高。
+
+** 这条线背后真正在发生什么
+
+表面上是技术迭代——token → block → sentence → dynamic。
+
+往深一层看，是 *评分粒度* 和 *评分依据* 两条轴各自爬升:
+
+| 代际             | 切分粒度    | 边界决定者    | 缺陷              |
+|------------------+-------------+---------------+-------------------|
+| StreamingLLM/H2O | token       | 累积 attention| 无视语义结构      |
+| Quest/InfLLM     | 定长 block  | 机械位置      | 切在词中间        |
+| SentenceKV       | 句子        | 预定义标点    | 跨场景失效        |
+| DynSplit-KV      | 动态语义块  | 模型自身的 attention 依赖 | (待考验)          |
+
+真正的转折点是 *把"哪里能切"这个问题从人工先验交还给模型本身*——不再写死规则，而是让模型实际用过的 attention 模式来回答。
+
+这条认知线索其实和 LLM 演化里很多分支同构: scaling law 把架构调优交给数据，DPO 把奖励建模交给偏好对，DynSplit-KV 把切分边界交给 attention——都是 *"让模型自己说"* 替代 *"人写规则"*。
+
+** 下一步可能往哪走
+
+按这个方向外推:
+
+1. *动态评分本身能不能不依赖一次完整 attention 计算?* 现在算 si 还是要先跑一遍 attention，未来或许能用小代理模型或预测器近似。
+2. *把 V2F 的 max/min 压缩换成学习到的压缩头*——element-wise max 是手工的，理论上有更好的可学习压缩。
+3. *从 KV 切分推广到 prompt 切分本身* — 如果模型能自己说哪里是语义边界，那 retrieval、long-doc chunking、agent 记忆系统都可以用同一套打分。
+
+* 问题-解法压缩总览
+
+#+begin_src
+| 年份 | 论文            | 看到的问题                       | 解法                              | 留下的问题                |
+|------+-----------------+----------------------------------+-----------------------------------+---------------------------|
+| 2022 | FlashAttention  | attention 太慢                   | IO-aware 重排计算                 | cache 还是全留            |
+| 2023 | StreamingLLM    | 长上下文 cache 装不下            | 只留 sink + 最近窗口              | 中间被无视, 掉 10-30%     |
+| 2023 | H2O             | 哪些 token 真重要                | 按累积 attention 排序             | 切碎语义结构              |
+| 2024 | Quest           | token 级选取慢                   | 切定长 page, 按近似 attention 选  | 切在词中间                |
+| 2024 | InfLLM          | block 装载要快                   | 定长 block + 动态加载             | 仍然机械切分              |
+| 2025 | ChunkKV         | chunk 比 token 好                | 稍大 chunk                        | 还是不顾语义              |
+| 2025 | SentenceKV      | 应该按语义边界切                 | 用标点切句子                      | 跨场景失效 + 变长慢       |
+| 2025 | SABlock         | cache 预算下自适应块大小         | 预算约束 + 语义对齐               | 仍依赖预定义标点          |
+| 2026 | *DynSplit-KV*   | 边界本身就不该写死               | attention 自评分 (DD-Select)      |                           |
+|      |                 | 变长块拖慢推理                   | 变长→定长映射 (V2F)               |                           |
+#+end_src
+
+* 验收笔记
+
+- *问题是主角*: 整条线讲的是"KV cache 切在哪"这一个问题的演化，论文是配角
+- *因果链*: token 太碎 → 块太机械 → 标点不通用 → 让模型自己定 — 每一步都有"所以"
+- *差异为核*: DynSplit-KV 的两个 challenge 直接对应 SentenceKV 的两个缺陷 (跨场景失效 / 变长开销)，差异在第三代和第四代之间最尖锐
+- *零术语先行*: "attention 自己投票"、"块摘要"、"扔哪些"——大白话先落地，专有名词后跟
+- *诚实标注*: 引用关系来自论文的 Related Works (Section 2)，FlashAttention 是论文显式对比的速度 baseline；后续工作 (post-2026.02) 暂未追溯，因为时点太近

@@ -1,0 +1,254 @@
+#+title:      IntraSlice: Towards High-Performance Structural Pruning with Block-Intra PCA for LLMs
+#+date:       [2026-05-29 Fri 05:21]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T052134-en
+#+source:     https://arxiv.org/abs/2602.01975
+#+authors:    Meng Li, Peisong Wang, Yuantian Shao, Qinghao Hu, Hongjian Fang, Yifan Zhang, Zhihui Wei, Jian Cheng
+#+venue:      arXiv 2026-02
+
+* The River of the Problem
+
+How do you cut away a third of a hundred-billion-parameter language model and still have it run just as well?
+
+The difficulty lives at both ends. First end: what you cut must be cut cleanly — whole rows, whole columns removed — otherwise the GPU feels no speedup at all, and the cut might as well not have happened. Second end: after the cut the model must not collapse; perplexity must not explode; zero-shot capability must not evaporate.
+
+For four years, successive generations of researchers have wrestled with the same tension: the cleaner the cut, the harder the accuracy falls; the more you want to preserve accuracy, the messier the cut has to be. Every time someone thought they had found a way around this dilemma, the next year someone else would point out, "You didn't actually go around it — you just hid the cost somewhere else."
+
+IntraSlice, the paper reviewed here, is exactly that kind of accusation leveled at its predecessor SliceGPT: "You hid the cost inside the residual connections."
+
+* Source Map
+
+#+begin_example
+[2023.01] SparseGPT (Frantar & Alistarh, ICML'23)
+  |
+  | Problem: How to prune a model with tens of billions of parameters in one shot?
+  | Solution: OBS + Hessian approximation, prune column-block by column-block
+  | Buried pitfall: Pruning produces unstructured sparsity — GPU gains nothing
+  v
+[2023.05] LLM-Pruner (Ma et al., NeurIPS'23)
+  |
+  | Problem: Real speedup requires "structured" pruning — remove entire rows/columns
+  | Solution: Dependency graph identifies coupled groups; prune by gradient importance;
+  |           LoRA fine-tuning for recovery
+  | Buried pitfall: Residual connections force all layers to shrink the same embedding
+  |                 dimension in lockstep — collapses at 50% pruning ratio
+  v
+[2024.01] SliceGPT (Ashkboos et al., ICLR'24)
+  |
+  | Problem: How to "slice" rather than just "punch holes"?
+  | Solution: Discovered "computational invariance" in Transformers —
+  |           inserting an orthogonal pair Q/Q^T leaves the output unchanged.
+  |           Use PCA to find Q, then delete rows/columns for minor principal components.
+  | Buried pitfall: Each layer has a different Q; residual path must multiply Q online,
+  |                 adding parameters and corrupting activation distributions;
+  |                 accuracy degrades sharply beyond 30%
+  v
+[2024.03] SVD-LLM (Wang et al., ICLR'25) - side branch
+  |
+  | Concurrent alternative: Don't touch the structure; truncate each weight matrix
+  |                         via SVD directly
+  | Buried pitfall: At high compression ratios, perplexity explodes (>600% degradation)
+  v
+[2026.02] IntraSlice (this paper)
+  |
+  | Problem: Keep PCA's accuracy benefits without letting residuals absorb the cost
+  | Solution: Confine PCA to within each module —
+  |           the transformation matrix fuses directly into weights;
+  |           the residual path stays completely untouched
+  v
+[2025-2026] Frontier: Olica / NIRVANA / SlimLLM / DenoiseRotator
+   Attacking respectively: training-free / calibration sensitivity /
+                            importance metrics / learnable rotations
+#+end_example
+
+* Evolutionary Narrative
+
+To understand how IntraSlice grew into existence, we need to go back to early 2023 — a time when nobody even knew whether models with tens of billions of parameters could be pruned at all.
+
+** 2023.01 | SparseGPT: First Proof That "You Can Prune Half a Giant Model in One Shot"
+
+*** What Problem It Saw
+
+Before SparseGPT, pruning was a toy for small models. VGG16 has only 138M parameters; prune it and retrain — no big deal. But for something like OPT-175B or BLOOM-176B, telling someone "prune it and then fine-tune" is absurd: a single forward pass over all the parameters takes hours, let alone backpropagation.
+
+So in early 2023, the field was essentially pessimistic about whether giant models could be pruned at all.
+
+*** Its Solution
+
+Frantar and Alistarh dusted off a 1993 algorithm called Optimal Brain Surgeon (OBS). The logic of OBS is simple: when you prune a weight, the remaining weights must "mutually compensate," and the compensation is computed from the Hessian matrix. Beautiful in theory, but computing the Hessian on a large model is completely intractable.
+
+SparseGPT's core contribution was a series of approximations to OBS: process weights 128 columns at a time, share the inverse Hessian within each block, and use a "Hessian synchronization" trick so that rows can reuse the same computation. With this, a 175B model can be pruned to 50% sparsity in 4.5 hours.
+
+*** Why It Worked (and Where It Buried the Next Pitfall)
+
+It worked because it accepted a simple fact: over-parameterized giant models contain so much redundancy that deleting half the weights barely hurts, as long as the compensation is computed correctly.
+
+But it left a fatal pitfall: the pruning produces *unstructured* sparsity — zeros scattered arbitrarily across each matrix. Modern GPUs are hyper-optimized for dense matrix multiplication; irregular sparsity forces a slow path. Unless you accept a very rigid pattern like 2:4 (exactly 2 zeros in every group of 4 weights), a SparseGPT-pruned model *does not actually run faster*.
+
+That kicked the ball to the next paper: how do you prune more "neatly"?
+
+** 2023.05 | LLM-Pruner: The First Genuinely "Structured" Attempt
+
+*** What Problem It Saw
+
+SparseGPT's sparsity could not be converted into speed. To make the GPU actually run faster, you need to remove entire rows and columns — leaving a dense, but smaller, matrix.
+
+But in a Transformer, "entire rows and columns" are not yours to take freely. The columns of Q, K, V in attention are coupled; the intermediate dimension between the two FFN layers is coupled; and residual connections bind the embedding dimension of every single layer together into one rope. Pull one column, and six or seven places may collapse simultaneously.
+
+*** Its Solution
+
+LLM-Pruner did something no one had done before for LLMs: automatically build a "dependency graph." Starting from any neuron, follow the dependency chain to find every structure that is coupled to it, collect them into a "group," and prune or keep the entire group together.
+
+Then use gradient information (Taylor-expansion approximation to the Hessian) to score the importance of each group, remove the least important ones, and finally use LoRA on 50K samples for 3 hours of fine-tuning to recover performance.
+
+*** Why It Worked (and Where It Buried the Next Pitfall)
+
+This was the first time anyone achieved "pruned = actually faster" structured pruning on an LLM. At a 20% pruning ratio, roughly 95% of capability is retained.
+
+But the pitfall was hiding in that rope called "residual connection." Residual connections span all layers sharing the same embedding dimension — so if you want to prune the embedding, every layer must *synchronously prune the same amount*. This is a rigid constraint: layer 3 might be highly redundant while layer 27 is already lean, but you can only cut uniformly.
+
+The consequence: total collapse at 50% pruning ratio. LLM-Pruner itself acknowledged "significant degradation and incoherent generation at high pruning ratios."
+
+The next question was immediate: can we escape the constraint that everything must be pruned along the same dimension in lockstep?
+
+** 2024.01 | SliceGPT: Using "Computational Invariance" to Escape the Synchrony Constraint
+
+*** What Problem It Saw
+
+LLM-Pruner's pain point: pruning must follow *the model's original coordinate system*. But that original coordinate system was determined randomly during training and is not necessarily the direction of least redundancy.
+
+What if you could change coordinate systems — concentrate the signal into a few "principal directions" so that the remaining directions can naturally be discarded — and thereby recover more accuracy from the same pruning ratio?
+
+*** Its Solution
+
+Ashkboos et al. discovered a hidden property of Transformers called *computational invariance*: in RMSNorm-connected networks, you can insert an orthogonal matrix Q after any layer and then insert Q^T before the next layer to "undo" it, and the model's output *remains exactly the same*.
+
+Exploiting this, they use PCA to find the optimal Q for each layer — the rotation that concentrates the signal onto a small number of principal components. Then they delete the rows and columns corresponding to the minor principal components, achieving "pruning along the optimal direction."
+
+After pruning 25% of LLAMA2-70B, 99% of zero-shot capability is preserved, and inference compute on a 24 GB consumer GPU drops to 64% of the original. This was the first time structured pruning delivered on all three promises simultaneously: prune more, run faster, lose less.
+
+*** Why It Worked (and Where It Buried the Next Pitfall)
+
+It worked because PCA directly identifies which directions carry the signal; what gets pruned is genuine redundancy, not genuine information.
+
+But the pitfall was buried deeper. Computational invariance requires Q to be "undoable" — the next layer must multiply by Q^T. The problem is that the optimal Q computed for each layer is different. Between adjacent linear layers this is fine: Q and Q^T can be pre-fused into the weight matrices.
+
+But *residual connections cannot be fused*. A residual connection carries the signal from an early layer directly to a late layer, passing through many different Q matrices along the way. So SliceGPT must insert small extra matrices on the residual path to perform *online transformations* — which means (1) extra parameters at inference time, (2) a discounted speedup ratio, and (3) more critically, these insertions *corrupt the activation distributions*, and that corruption accumulates layer by layer along the residual connections.
+
+NIRVANA (2025) noted that SliceGPT "applies PCA per block and is highly sensitive to calibration data" — which is essentially pointing at the fact that activations were already contaminated.
+
+The next question became very specific: can we keep PCA's benefits while completely eliminating the dirty work on the residual path?
+
+** 2024.03 | SVD-LLM: A Side Branch That Serves as a Cautionary Tale
+
+*** What Problem It Saw
+
+SVD-LLM took a different angle: since PCA operates on activations, why not apply singular value decomposition (SVD) directly to *weight matrices* and truncate small singular values? No need to touch activations, no need to change the structure.
+
+*** Its Solution
+
+Introduce a "truncation-aware" data whitening strategy that ties singular value magnitudes directly to compression loss, then add a closed-form weight update as compensation.
+
+*** Why It Worked (and Where It Buried the Next Pitfall)
+
+Usable at low compression ratios. But a damning number appears in the Dobi-SVD paper: at 40% compression, SVD-LLM's perplexity degradation on Wikitext2 reaches *644.7%* — essentially gibberish.
+
+This branch tells us: ignoring activation information and operating only on weights is insufficient. The PCA-on-activation approach (SliceGPT's path) is the one worth pursuing — but the residual contamination problem must be solved.
+
+** 2026.02 | IntraSlice: Confining PCA Inside Each Module
+
+*** What Problem It Saw
+
+SliceGPT's core flaw in one sentence: because PCA is applied *across modules*, Q must pass through the residual path, clean fusion becomes impossible, and activation distributions are corrupted.
+
+What if PCA were confined to a *single module*? Perform PCA only between the input and output of one attention block or one FFN block — that way Q and Q^T are both enclosed within the same block, can be pre-fused into the block's weight matrices, and leave absolutely no trace on the residual path.
+
+*** Its Solution
+
+IntraSlice does two things:
+
+1. An "approximate PCA" method that exploits the internal structure of Transformer modules so that the PCA transformation matrix can be *completely absorbed into weights* without introducing any extra parameters.
+2. A "global pruning-ratio estimator" — previous methods allocated pruning ratios based only on each module's importance score; IntraSlice also accounts for "the activation distribution after PCA compression," because PCA itself shifts the importance distribution.
+
+*** Why It Worked (and Where It Buried the Next Pitfall)
+
+The cleverness of this approach is *acknowledging that "computational invariance" has a boundary*. SliceGPT pushed it to the extreme — seeking a unified rotation across the entire network — and found that the boundary is broken at residual connections. IntraSlice steps back: give up cross-module unification; let each module perform its own locally optimal rotation.
+
+It is less aggressive than SliceGPT (single-module PCA finds a smaller subspace than full-network PCA, in theory), but it is genuinely clean — zero contamination on the residual path.
+
+Remaining pitfalls: single-module PCA inherently captures less global information than full-network PCA, so IntraSlice may still hit a ceiling at very high compression ratios. It also remains dependent on calibration data (PCA itself needs data to estimate covariances), so sensitivity to calibration data is not fundamentally resolved.
+
+* Frontier Extensions
+
+Several concurrent branches (2025–2026) attack different weaknesses:
+
+- *Olica* (ICLR'25 OpenReview): Similar idea to IntraSlice — PCA inside MHA — but more aggressively pursues complete training-free operation.
+- *NIRVANA* (2025.09): Leaves SliceGPT's structure intact and instead attacks its calibration-data sensitivity.
+- *SlimLLM* (2025.05): Abandons the PCA line; improves importance metrics — evaluating by whole channel/head rather than aggregating element-wise.
+- *DenoiseRotator* (2025.05): Replaces SliceGPT's PCA-derived Q with a *learned* Q — a learnable orthogonal transformation that concentrates importance more effectively.
+- *Dobi-SVD* (2025.02): Replaces SVD-LLM's truncation with a "differentiable" variant, enabling end-to-end training.
+
+The overall direction of this river: from "one-shot pruning" toward hybrid "prune + learn + fuse" pipelines.
+
+* One Diagram
+
+#+begin_example
+         The Evolution of the "Two-Front Dilemma" in Structured LLM Pruning
+
+  Time    Method         Coordinate system used  What happens to residuals  Where cost is hidden
+  ----    ------         ----------------------  -------------------------  --------------------
+  2023.01 SparseGPT      Original / element-wise  Untouched                 Hardware can't go fast
+                         (unstructured)
+
+  2023.05 LLM-Pruner     Original / grouped       Forced synchrony          Collapses at 50%
+                         (dependency graph)
+
+  2024.01 SliceGPT       PCA-rotated              Online Q multiplication   Activations corrupted;
+                         (cross-module)                                      sharp drop after 30%
+
+  2024.03 SVD-LLM        Weight SVD               Activations untouched     Explodes at 40%
+                         (side branch)
+
+  2026.02 IntraSlice     PCA-rotated              Fully fused into weights  Single-module view
+                         (intra-module)                                      smaller than global
+
+         Core tension: "Cut cleanly"    vs    "Cut accurately"
+                           /\                       /\
+                           ||                       ||
+              Hardware-friendly (row/col aligned)   Information-faithful (principal-direction aligned)
+
+  The essential shift from SparseGPT to IntraSlice:
+  "Which values to prune"      --->  "Which directions to prune"
+  "Work within the original coordinate system"  --->  "Rotate to the optimal system first, then prune"
+  "One globally unified transform"  --->  "Multiple locally clean transforms"
+#+end_example
+
+* Insights
+
+Reading through this lineage, the surface story is "algorithms keep improving," but underneath, *the very object of pruning itself is changing*:
+
+- SparseGPT prunes *weight values*.
+- LLM-Pruner prunes *dependency-coupled structural groups*.
+- SliceGPT prunes *signal directions in a PCA-rotated space*.
+- IntraSlice prunes the same kind of directions, but *restricts the scope from the full network to a single block*.
+
+Behind this evolution is a deep conceptual shift: researchers gradually realized that the "compression potential" of a Transformer does not live in the weights themselves but in the *geometric structure of the activation signals*. Activations in high-dimensional space actually occupy a low-dimensional manifold; the PCA route is fundamentally about finding the principal directions of that manifold and pruning the dimensions outside it — the genuine redundancy.
+
+But SliceGPT ran headlong into a contradiction between "the global assumption of geometric analysis" and "the local constraints of engineering implementation": you want to find the globally optimal coordinate system, but residual connections force certain directions to remain invariant. IntraSlice's retreat is in fact an admission: rather than chasing a unified-but-contaminated global optimum, it is better to pursue multiple clean local optima.
+
+Where is this river most likely heading next? Almost certainly toward *learnable + local + invariance-aware* combinations — DenoiseRotator is already doing "learnable Q"; the next paper may do "learnable + residual-aware Q," letting the rotation matrix learn by itself "where to unify and where to decouple."
+
+A second hidden direction: combining pruning and quantization in one unified framework. SparseGPT already noted that it shares Cholesky computation with GPTQ, but the structured pruning line dropped that thread. Once IntraSlice fuses PCA into weights, the natural next step is to quantize those fused weights — but the weight distribution after a PCA rotation may be very different from the original, which opens both new pitfalls and new opportunities.
+
+* Takeaways
+
+On how to find problems:
+
+- *Watch for where the cost of a prior solution was hidden*. SliceGPT looks perfect — computational invariance, PCA optimality, real speedup — but IntraSlice found where it hid the cost: the residual path. Every time a solution "looks perfect," the cost does not vanish; it just moves. Track where it moved.
+- *Stepping back is often smarter than pressing forward*. SliceGPT uses global PCA, which is theoretically superior. IntraSlice uses local PCA, which is theoretically weaker. But local PCA fits cleanly within engineering constraints and wins in practice. "An imperfect solution in the right direction" frequently beats "a perfect solution in the wrong direction."
+- *The constraint often is the answer*. Residual connections look like a limitation, but they are a core architectural feature of Transformers. Only solutions that can "coexist peacefully with residuals" have a future — LLM-Pruner tried to ignore them (forced synchrony), SliceGPT tried to pass through them (online transforms), IntraSlice chose to stay inside each block and avoid them. The third path is the most stable.
+
+On how to do research:
+
+- This lineage shows that *the same problem is worth revisiting for a decade*. From OBS in 1993 to IntraSlice in 2026, the core mathematics of pruning has barely changed — it has always been "after deleting, how do you compensate for the loss?" The novelty is entirely in "how to do this correctly under new engineering constraints."
+- *Read papers backward*. If you only read IntraSlice's abstract you will see just another incremental improvement. But follow the accusation it levels at SliceGPT — "severely disrupts activation distributions due to residual connections" — back in time, and you discover this is the core pain point that the PCA pruning line had never resolved in four years. That kind of accusation is where the real information density of a paper lives.

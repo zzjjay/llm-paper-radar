@@ -1,0 +1,251 @@
+#+title:      ScaleBITS: Scalable Bitwidth Search for Hardware-Aligned Mixed-Precision LLMs
+#+date:       [2026-05-29 Fri 06:43]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T064307-en
+#+source:     https://arxiv.org/abs/2602.17698
+#+authors:    Xinlin Li, Timothy Chou, Josh Fromm, Zichang Liu, Yunjie Pan, Christina Fragouli
+#+venue:      arXiv 2026 (Meta Superintelligence Labs / UCLA)
+
+* The Problem River
+
+A 70B model loaded onto a GPU requires 140 GB for weights alone. To fit it on a single card, every weight must be compressed below 4 bits. But the harder you compress, the worse things get — at 3 bits the model is still usable, but at 2 bits it often hallucinates incoherently.
+
+The difficulty is not "how much to compress on average" but "you cannot compress uniformly." Some weights in a model are load-bearing columns — remove one and the building collapses; others are ornamental — cut them and nobody notices. In principle you should allocate more bits to the critical weights and fewer to the decorative ones. But the moment you start "fine-grained allocation," new problems arise:
+
+- GPUs love regular matrix multiplications and hate patchwork layouts — "2 bits here, 4 bits there, one stripe of 8 bits" — irregular memory access can make the result *slower* than uniform compression.
+- A 9B model has billions of weights; the search space for deciding the bit count of each weight is astronomically large.
+- Which weights matter? People have tried Hessians, gradients, and activation magnitudes — no single approach has won out.
+
+So the real question along this line of work is: *How do you automatically and scalably decide the bit count for every block of weights while keeping hardware-friendly access patterns?*
+
+This problem has wound through seven years of research, from small CNNs to large language models, with each generation spotting the blind spot of the one before.
+
+* Source Map
+
+#+begin_example
+[1993] Hassibi & Stork - Optimal Brain Surgeon
+  |
+  | Use second-order derivatives to judge which weights can be pruned
+  | — the conceptual prototype
+  v
+[2019] Wang et al. - HAQ (RL-based per-layer bit search)
+[2020] Dong et al. - HAWQ (Hessian-ranked per-layer bit search)
+  |
+  | Problem: LLMs arrive; layer granularity too coarse,
+  |          search too slow — completely unscalable
+  v
+[2022/23] Frantar et al. - GPTQ
+  |
+  | Problem: Uniform 4-bit is fine; 2–3 bit collapses entirely.
+  |          Weight sensitivity is highly non-uniform;
+  |          forcing the same bit count everywhere doesn't work.
+  v
+[2023] Dettmers et al. - SpQR  /  Kim et al. - SqueezeLLM
+  |
+  | Solution: Isolate the top ~1% sensitive weights and store them in FP16.
+  | Problem:  Scattered sparse storage; GPU memory access becomes fragmented;
+  |           speed drops below uniform compression.
+  v
+[2024-2025] Lee et al. - OWQ  /  Huang et al. - SLIM
+  |
+  | Solution: Instead of individual elements, select sensitive *columns*
+  |           (channels). Access is now regular and hardware-friendly.
+  | Problem:  Granularity too coarse. Sensitive weights are really
+  |           "points," not "columns." Regularity costs accuracy.
+  v
+[2026] Li et al. - ScaleBITS  <-- this paper
+  |
+  | Solution: Reorder channels to push sensitive weights into one corner,
+  |           then assign bits at the 64×64-block level,
+  |           and search for a global optimum with an approximate greedy algorithm.
+  v
+[Future] Bidirectional channel reordering + block-level MP become the new baseline
+#+end_example
+
+* Evolutionary Narrative
+
+** 1993 | OBS: Second-order derivatives tell you which weights can be pruned
+
+*** What problem did it see?
+
+The ancestral pruning question: after a neural network is trained, it has millions of parameters — which ones can be removed without hurting accuracy? Early practitioners used "prune small-magnitude weights," but that ignores a key fact: some small weights lie on critical paths and, once removed, break the model.
+
+*** Its solution
+
+Hassibi and Stork proposed using the *second-order derivative* (Hessian) of the loss with respect to each weight to estimate "how much the loss rises if this weight is removed." That estimate served as a sensitivity score, and weights were pruned in ascending order of sensitivity.
+
+*** Why it worked (and what trap it buried)
+
+The second derivative captures local curvature — it tells you "around the current point, how sensitive is the model to perturbing this weight?" This became the parent idea for all later saliency-based quantization and pruning methods.
+
+But computing the Hessian is feasible for small models; for large models the Hessian matrix simply does not fit in memory. That trap sat dormant for thirty years.
+
+** 2019–2020 | HAQ / HAWQ: Search for a bit count per layer
+
+*** What problem did they see?
+
+By 2019, the quantization field had already split. Uniform precision (e.g., full INT8) was simple but wasteful — sensitivity varied hugely across layers, and the first and last layers were typically the most fragile. Could sensitive layers keep more bits while insensitive layers got fewer?
+
+*** Their solution
+
+HAQ used reinforcement learning as a "bit-allocation agent," searching for the best per-layer bit count while balancing hardware latency against model accuracy. HAWQ took a different route: rank each layer by Hessian eigenvalues and choose bit counts along a Pareto frontier.
+
+*** Why it worked (and what trap it buried)
+
+These were the first methods to treat mixed-precision quantization as a formal resource-allocation problem. HAWQ also transplanted the Hessian idea from OBS into a layer-level granularity.
+
+Two new traps: First, *granularity too coarse* — millions of weights in an entire layer share a single bit count, drowning out sensitive sub-regions. Second, *search too slow* — RL or differentiable search routinely requires thousands of fine-tuning evaluations, manageable in the CNN era but completely intractable for LLMs.
+
+** 2022–2023 | GPTQ: Approximate second-order PTQ for uniform low-bit LLMs
+
+*** What problem did it see?
+
+After ChatGPT, everyone wanted to fit LLMs onto consumer GPUs. Uniform INT4 had become the new baseline, but dropping to 3 or 2 bits caused a cliff-edge collapse in accuracy. The HAQ/HAWQ search machinery simply could not run on a 70B model.
+
+*** Its solution
+
+GPTQ stepped back: no search, fixed bit count for all weights, but it imported the second-order intuition from OBS into post-training quantization (PTQ). It quantizes one column of weights at a time, using Hessian information to "spread" the quantization error across the remaining unquantized columns so that the global loss is minimized. Later, AWQ weighted by activation magnitude, QuIP used random rotation to scatter outliers — all pushing hard along the uniform-precision track.
+
+*** Why it worked (and what trap it buried)
+
+GPTQ made 4-bit LLM PTQ the standard recipe. But the ScaleBITS paper is blunt: *uniform-precision methods simply cannot hold up in the ultra-low-bit regime*. The reason is straightforward: weight sensitivity is highly non-uniform. Forcing all weights to share one bit count is like paying every employee the same wage — some will be so underpaid they go on strike.
+
+** 2023 | SpQR / SqueezeLLM: Protect the ~1% most sensitive weights separately
+
+*** What problem did they see?
+
+GPTQ had reached its limit: push any further and the model breaks. Where does it break? SpQR and SqueezeLLM discovered almost simultaneously that a tiny fraction of weights (< 1%) are extraordinarily sensitive — even a slightly larger quantization error for these "outlier weights" destroys the whole model.
+
+*** Their solution
+
+Straightforward: pull that 1% of sensitive weights out and store them at FP16 precision; quantize the remaining 99% to 2 bits as desired. SqueezeLLM also added a Hessian-based non-uniform quantization grid so that ordinary weights fit their distribution better at low bit counts.
+
+*** Why it worked (and what trap it buried)
+
+It struck at the core: sensitivity is non-uniform, so spend precision only where the non-uniformity is extreme. Model quality recovered immediately, and 2-bit quantization was no longer forbidden territory.
+
+But the new trap was very concrete — *hardware hates scattered sparse patterns*. The 1% of high-precision weights are scattered throughout the weight matrix, forcing the GPU to maintain a "sparse index table" alongside the data, fragmenting the memory-access path. The result: model accuracy went up, but inference throughput dropped below uniform 4-bit. This contradicts the entire purpose of quantization, which is acceleration.
+
+** 2024–2025 | OWQ / SLIM: Elevate sensitivity from "points" to "whole columns"
+
+*** What problem did they see?
+
+If scattered sparse patterns are GPU-unfriendly, can the granularity be changed? OWQ and SLIM observed that while sensitive weights are sparse, they tend to cluster in certain *input channels* (columns). If entire columns are selected — "this column at high precision, that column at low precision" — the layout becomes regular.
+
+*** Their solution
+
+Aggregate sensitivity by channel (column). Every column is either entirely high-precision or entirely low-precision. Aligned with the GPU's column-vectorized memory-access pattern, throughput was recovered without index-table overhead. SLIM further extended the sensitivity metric from raw weight magnitude to an activation-aware score.
+
+*** Why it worked (and what trap it buried)
+
+For the first time, mixed-precision was simultaneously more accurate *and* hardware-friendly. This path looked like the winner.
+
+But ScaleBITS spotted an overlooked fact: *sensitive weights are not distributed by column — they are distributed as points, specifically at the intersection of certain rows AND certain columns.* If you group only by column, you incur two losses: the few sensitive points inside an insensitive column are underprotected, and the many ordinary weights inside a sensitive column are wastefully over-protected. The granularity is still too coarse; bit budget is still being wasted.
+
+** 2026 | ScaleBITS: Reorder channels, then assign bits per block
+
+*** What problem did it see?
+
+Stack up the observations from all four prior generations:
+
+- Uniform precision fails — sensitivity is non-uniform.
+- Pulling out scatter-points fails — hardware-unfriendly.
+- Grouping by column is still insufficient — sensitivity is inherently two-dimensional (rows × columns), not one-dimensional.
+
+ScaleBITS sees one additional layer: when sensitivity is analyzed with the first-order gradient formula, s_{ij} = |g_i^y| · |x_j| · |ΔW_{ij}|, both the *row factor* (output gradient) and the *column factor* (input activation) participate. Sensitive weights therefore naturally form "hot-spot regions" in the matrix — the intersection of certain rows and certain columns is exceptionally bright.
+
+*** Its solution
+
+Three steps:
+
+1. *Bidirectional channel reordering*: Sort rows (output channels) and columns (input channels) by sensitivity so that the most sensitive weights are pushed — through pure row/column permutation — into the top-left corner of the matrix. This is a one-time preprocessing step that does not change the model's mathematical output (provided adjacent layers are permuted to match).
+
+2. *Block-level partitioning*: The reordered matrix is cut into 64×64 blocks (exactly aligned with the GPU Tensor Core tile size). Each block is assigned a single bit count.
+
+3. *Scalable greedy search*: The naive greedy algorithm (at each step, give the most sensitive block one more bit) has O(N²) evaluation cost — too expensive for the number of blocks in an LLM. ScaleBITS' key insight is that *greedy decisions depend only on the relative ranking of marginal gains, not on their absolute values*, so a lightweight sensitivity estimate (a first-order Taylor expansion evaluated on the partially quantized model) can approximate that ranking, skipping costly per-block forward passes.
+
+*** Why it worked (and what trap remains)
+
+All four prior scars are avoided:
+
+- More flexible than uniform precision: each block has its own bit count.
+- More regular than sparse scatter: 64×64 blocks align perfectly with Tensor Cores.
+- More fine-grained than column grouping: 2-D clustering captures true hot spots rather than whole columns.
+- More scalable than HAQ/HAWQ: greedy + approximate ranking reduces O(N²) to feasible on a 9B model.
+
+Results: a continuous, smooth Pareto frontier across the 2.2–3.8 bit range, +36% over GPTQ and +13% over the current strongest sensitivity-aware baseline, *with zero additional inference overhead*.
+
+New traps remain: bidirectional reordering requires that adjacent layers can "co-permute" (residual connections and LayerNorm layers all have to cooperate); the sensitivity estimate is computed in a "partially quantized" state, which is theoretically closer to the true runtime than a full-precision estimate — but the trajectory of that partial-quantization schedule is an engineering problem the paper solves with progressive quantization.
+
+* Frontier Extensions
+
+ScaleBITS is a February 2026 paper and currently represents the leading edge of this line of work. But the direction it points already suggests several extensions:
+
+- *Hardware co-design*: ScaleBITS fixes block size at 64×64 to align with Tensor Cores, but AMD's MXFP4 and next-generation NPU micro-tiles may allow more aggressive 16×16 blocks. Block size, bit set, and sparsity pattern should be treated as joint hyperparameters.
+- *Training-time mixed precision*: This paper is PTQ. Whether QAT / low-precision training can maintain "bidirectional reordering" online is an open question.
+- *Cross-layer bit-budget scheduling*: ScaleBITS applies a global bit budget, but different layers tolerate compression very differently. Layer-aware budget allocation could squeeze out several more percentage points.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                 Evolution of Mixed-Precision Quantization
+
+   Solution granularity
+   ^
+   |
+   | Per-element       SpQR / SqueezeLLM (2023)
+   | (sparse)             * High accuracy but GPU-unfriendly
+   |                      |
+   |                      |
+   | Block 64×64                                ScaleBITS (2026)
+   |                                            * Bidirectional reorder
+   |                                              clusters sensitivity
+   |                                              into one corner
+   |                                            * Blocks align Tensor Core
+   | Per-column                                 * Approximate greedy O(N)
+   |                   OWQ / SLIM (2024-25)       scalable
+   |                   * Regular but too coarse --/
+   |                   |
+   |                   |
+   | Per-layer    HAQ / HAWQ (2019-2020)
+   |              * CNN-era RL / Hessian search
+   |              * Unscalable for LLMs
+   |
+   | None         GPTQ / AWQ / QuIP (2023)
+   | (uniform)    * 4-bit standard recipe
+   |              * 2–3 bit collapses
+   +----------------------------------------------> Time
+        ^                ^                ^
+        |                |                |
+        Discover         Acknowledge      Solve
+        sensitivity      need for         both at once
+        is non-uniform   hardware-friendliness
+#+end_example
+
+* Insights
+
+Tracing seven years of evolution, what is really happening is not "algorithms getting ever more complex" but rather *a gradual clarification of the geometric shape of "sensitivity" itself*.
+
+- First generation (OBS, HAQ): sensitivity is a "layer-level scalar" — one number per layer.
+- Second generation (SpQR): sensitivity is "scattered points" — individual weights sparsely distributed.
+- Third generation (OWQ): sensitivity is a "column vector" — aggregated by channel.
+- ScaleBITS: sensitivity is actually a "two-dimensional hot spot" — jointly determined by row and column, gatherable through a change of coordinates.
+
+Each generation was not wrong; it simply saw one dimension that the previous generation had missed. This is a classic "cognitive dimensionality reduction → re-expansion" arc: first flatten the high-dimensional problem to something tractable (layer, column), then discover the flattening was too aggressive (missing 2-D structure), and finally use a coordinate transform that preserves the 2-D structure while remaining hardware-friendly.
+
+At a deeper level: *hardware constraints are not a limitation — they are part of the problem definition.*
+SpQR beat GPTQ at the algorithm level but was barely adopted in industry because it ignored hardware. ScaleBITS' "block alignment + one-time reordering" writes the hardware constraint directly into the search space. Its victory is not only an algorithmic victory; it is the victory of treating the GPU as a first-class citizen.
+
+The most likely next step: extend the "geometric shape of sensitivity" from two dimensions to three (the cross-layer dimension), or engage directly in hardware co-design — telling chip vendors "give me support for 16×16 tiles with arbitrary 2/3/4/8-bit combinations and I can compress to 2 bits without accuracy loss."
+
+* Takeaways
+
+For researchers, this line of work offers three concrete lessons:
+
+1. *Before redesigning an algorithm for a new platform, re-examine the underlying concept.* The LLM era did not need better algorithms per se — it needed a fresh look at the geometric shape of the old concept "sensitivity" at a new scale.
+
+2. *Treat engineering constraints as design variables.* SpQR did not lose to ScaleBITS on algorithm quality; it lost because it never made the Tensor Core tile a first-class design variable. In today's AI systems work, hardware constraints are part of the problem definition, not an afterthought.
+
+3. *Scalability often comes from finding an "approximate invariant."* ScaleBITS' core algorithmic insight is that greedy decisions depend only on the *ranking* of marginal gains, not on their absolute values — so a cheap approximation suffices. Whenever your method is stuck at O(N²), first ask: "Do I truly need the quantity itself, or merely some ordering relation it induces?"
+
+Practical bottom line: if you are working on LLM deployment, *stop using uniform 4-bit as your default*. Block-level mixed precision with channel reordering is now the more reasonable starting point. If you are doing quantization research, two open problems left by ScaleBITS — cross-layer budget allocation and maintaining reordering during training — are both unoccupied; either is a clean entry point.

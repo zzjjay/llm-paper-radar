@@ -1,0 +1,255 @@
+#+title:      More Than a Quick Glance: Overcoming the Greedy Bias in KV-Cache Compression
+#+date:       [2026-05-29 Fri 05:37]
+#+filetags:   :paper:river:
+#+identifier: 20260529T053741
+#+source:     https://arxiv.org/abs/2602.02199
+#+authors:    Aryan Sood, Tanvi Sharma, Vansh Agrawal
+#+venue:      arXiv preprint, Feb 2026
+
+* 目标论文
+
+*More Than a Quick Glance: Overcoming the Greedy Bias in KV-Cache Compression*
+LASER-KV (Layer Accumulated Selection with Exact-LSH Recall)
+Aryan Sood, Tanvi Sharma, Vansh Agrawal — IIT Roorkee, 2026.
+
+一句话：以前 KV cache 压缩都靠 "注意力分数高的留下"，这篇说这条路本身就错了——
+注意力分数高 ≠ 这个 token 重要，必须再加一个独立的相似度信号才接得住长上下文。
+
+* 溯源地图
+
+#+begin_src
+                  [2018 GPT / Transformer]
+                          |
+                          | KV cache 线性膨胀，长上下文吃光显存
+                          v
+              +-----------+-----------+
+              |                       |
+   [2023 StreamingLLM]         [2023 H2O]
+   保留最前面+最后面            "heavy hitter": 注意力分数高的留下
+              |                       |
+              |     +-----------------+
+              |     | 都是基于"注意力分数 = 重要性"的假设
+              v     v
+       [2024 SnapKV]
+       prompt 阶段就提前选好哪些 token 该留
+              |
+              | 但 budget 是一刀切的固定值，
+              | 不同层 / 不同位置的需求并不一样
+              v
+       +------+------+
+       |             |
+  [2024 Quest]   [2025 PyramidKV]
+  query-aware    层间分配不同 budget:
+  按当前 query    底层散开多留，
+  动态选 token   高层聚焦少留
+       |
+       | 还是吃"贪心选高分"的亏:
+       | 分数稀疏尖峰让结构关键 token 被漏掉
+       v
+  [2024 FINCH]
+  递归压缩:
+  把上下文分块，每块都用 Top-K 压一遍
+       |
+       | 递归压缩会一层一层稀释历史，
+       | 早期的关键 token 经过几轮就没了
+       v
+  [2024 MagicPIG]
+  用 LSH (局部敏感哈希) 当采样器,
+  不再单纯靠 attention score
+       |
+       | LSH 单独用容易漏掉真正的 heavy hitter
+       v
+  [2026 LASER-KV]  <-- 本篇
+  混合: Exact attention (抓 heavy hitter)
+       + LSH (抓结构相似但分数低的)
+       + 累积式预算 (不再递归覆盖历史)
+       + 保护除数 n 控制局部窗口大小
+       |
+       v
+  (待定) 下一步: 学一个 token utility 函数?
+         或者干脆放弃 prune, 走压缩存储路线?
+#+end_src
+
+* 演化叙事: 一个问题怎么一步步逼出 LASER-KV
+
+** 第 0 层: 病根在哪
+
+Transformer 在生成时要把所有看过的 token 的 Key/Value 都缓存下来，下一个 token 要跟它们做注意力。
+上下文越长，KV cache 占的显存就越大，*线性增长*。
+
+一旦想跑 128k token 的上下文，光是 KV cache 就把 H100 吃光了，更别提消费级显卡。
+所以从 2023 年开始，整条研究线就在追一个问题：
+
+#+begin_quote
+显存装不下所有 KV，那我该扔掉哪些？
+#+end_quote
+
+这句话听起来无害，但它背后藏着一个未被检验的假设——*"哪些可以扔"是可判断的*。
+后面所有论文都在为这个假设付代价。
+
+** 第 1 层: 最朴素的两个直觉 — StreamingLLM 和 H2O (2023)
+
+第一拨人想了两个直觉。
+
+*StreamingLLM* 说：开头几个 token 是 "attention sink"（语言模型注意力的归宿），不能扔；
+最近的几个 token 是当前在说的，不能扔；*中间的全扔*。
+这就是滑动窗口。简单粗暴，但只要问题问的是上下文中间的事，模型立刻翻车。
+
+*H2O* 说得更聪明一点：与其拍脑袋决定扔中间，不如*看注意力分数*——
+凡是被高频关注的 token (它们叫 "heavy hitter"，重击者) 就留下，分数低的扔。
+这是第一次把 "token utility" 量化成了 "注意力分数"。
+
+H2O 立下了之后所有工作都默认遵守的法则：*注意力分数 = 重要性*。
+这条法则在 LASER-KV 之前没人正面挑战过。
+
+** 第 2 层: SnapKV — 把"什么时候选"提前 (2024)
+
+H2O 是边生成边扔。每多生成一个 token，就重新算一遍谁该走谁该留。这有两个问题：
+一是开销大，二是早期被扔掉的 token 之后再也回不来了。
+
+SnapKV 看到这一点，提出：*在 prompt 阶段就一次性把该留的选好*。
+办法是用 prompt 末尾的几个 token 当 "观察窗"，看它们注意力打到哪，
+那些位置就是后续生成最可能需要的——把它们留下，其余的全扔。
+
+SnapKV 的贡献是把 KV 压缩从 "在线、贪心" 变成 "一次性、预测式"，但 *它还是在用注意力分数选 token*。
+法则没破。
+
+** 第 3 层: Quest 和 PyramidKV — 注意 budget 怎么分 (2024-2025)
+
+SnapKV 一刀切：所有层、所有位置，留同样数量的 token。这显然太粗。
+
+*Quest* 说：选什么不该只看历史平均注意力分数，要看 *当前 query* 关心什么。
+query-aware 选 token，每一步动态决定哪些 KV 重要。
+
+*PyramidKV* 看到另一个维度的浪费：不同层的注意力模式不一样。
+底层（靠近输入）注意力比较散，需要的 token 多；高层（靠近输出）注意力高度聚焦，需要的 token 少。
+那就*底层多分 budget，高层少分 budget*，像金字塔一样。
+
+到这里这条线已经把 *budget 怎么分* 的花样玩遍了：分给谁（H2O→SnapKV）、按 query 分（Quest）、按层分（PyramidKV）。
+但 *判断标准始终是注意力分数*。
+
+** 第 4 层: FINCH — 试图突破 budget 上限 (2024)
+
+前面所有方法都假设 budget 是固定的。FINCH 不甘心，问：能不能在固定 budget 下处理更长的上下文？
+
+它的办法是 *递归压缩*：把超长上下文切成小块，每块独立做 Top-K 压缩，
+结果传给下一块，再压一次……一层一层压下来，理论上可以处理任意长度。
+
+听起来很美，但 LASER-KV 这篇就是从 FINCH 翻车的地方起家的——
+*每次压缩都用当前 query 的注意力分数当标准*。
+但 token 现在没人关注，不代表后面没人需要。
+递归压一轮就丢一批，几轮下来真正的长距离依赖早就没了。
+
+这也是为什么 LASER-KV 在 128k 上做实验时 FINCH 直接 *归零*（论文 Table 2，QA1-QA6 全部 0%）。
+
+** 第 5 层: MagicPIG — 第一次尝试摆脱注意力分数 (2024)
+
+MagicPIG 是第一个隐约意识到 "注意力分数也许不够用" 的人。它说：
+与其精确算所有 query × key 的注意力分数（贵），不如用 *局部敏感哈希 (LSH)* 当采样器，
+让相似的 query/key 大概率落进同一个桶里，用碰撞概率当近似分数。
+
+这本来是个加速技巧，但它无意中开了一个口子：
+*token 的重要性可以由"它和 query 结构有多像"来判断，而不光是 attention score*。
+
+但 MagicPIG 还是在替代 attention score，没有跟 attention score 并存。结果是它能抓到结构相似的 token，
+但会漏掉真正的 attention heavy hitter——LASER-KV 表里 MagicPIG 单独用时 16k 上 QA2 只有 2%。
+
+到这里，问题第一次浮现出来：
+
+- 只看 attention score（H2O/SnapKV/Quest/PyramidKV/FINCH）：漏掉结构关键 token
+- 只看相似度哈希（MagicPIG）：漏掉真正的 heavy hitter
+
+*两条信号互补。但没人把它们拼起来。*
+
+** 第 6 层: LASER-KV — 把两个信号绑成一个 (2026, 本篇)
+
+LASER-KV 终于把这两条线缝起来了，并且顺手把 FINCH 的递归之伤也治了。三个动作：
+
+1. *不递归，改累积* — budget 不再随每个新块"覆盖前面的选择"，而是 *只追加不覆盖*。
+   每个块选出来的 token 加进 KV cache 就不再动。这样早期关键 token 不会因为后面没人关注被冲掉。
+   论文里管这个叫 "accumulative, append-only memory"。
+
+2. *Exact + LSH 混合选择* — 真正的核心。给定一个 block 的 budget：
+   - 一部分预算（论文里取 75%）走 *Exact attention*：跨所有 layer/head 把注意力分数加起来，
+     选最高的——这是 H2O 风格的 heavy hitter。
+   - 剩下预算（25%）走 *LSH 哈希采样*：从 Exact 选剩下的池子里，按 query 的哈希碰撞概率选——
+     这是 MagicPIG 风格的结构相似度。
+   - 两组合并起来才是最终的 cache。Exact 抓 "大家都看的"，LSH 抓 "长得像 query 但分数被压住的"。
+
+3. *保护除数 n 控制窗口* — 这是个工程细节，但很关键。
+   给定每个 block 的总预算 B，论文用一个除数 n 把它拆成三份：
+   - =2B/n= 留给 "anchors" + "local sliding window"（语法/局部连贯性兜底）
+   - =B - 2B/n= 留给长期记忆池（用上面的 Exact+LSH 选）
+
+   *n 越小，本地窗口越大，生成越稳；n 越大，越多预算花在远距离记忆上*。
+   这给了一个旋钮，专门用来 *把"长距离记忆"和"局部窗口"的影响分离开*——
+   这是 LASER-KV 整个 ablation 的科学价值：它声称之前那些 benchmark 数字混淆了"压缩本身的损失"和"滑动窗口副作用"。
+
+实验上：64k 上下文，LASER-KV 在 QA1 上是 25%，SnapKV 7%，FINCH 22%；
+128k 上下文（最关键），LASER-KV QA1 38%，PyramidKV 25%，FINCH 0%，SnapKV 22%。
+LASER-KV 拉开的差距，正好是 LSH 那 25% 预算抓到的、attention-only 方法漏掉的那部分 token。
+
+* 问题-解法压缩总览
+
+#+begin_src
++----------------------------+------------------------+----------------------+
+| 论文 (年)                  | 看到的新问题           | 解法核心             |
++----------------------------+------------------------+----------------------+
+| StreamingLLM (2023)        | KV 装不下              | 留首尾，扔中间       |
+| H2O (2023)                 | "留中间"不能拍脑袋     | attention 高分留下   |
+| SnapKV (2024)              | 在线选太贵且不可逆     | prompt 阶段一次选完  |
+| Quest (2024)               | 平均分数不反映当前需求 | 按 query 动态选      |
+| PyramidKV (2025)           | 每层 budget 一刀切     | 层间金字塔分配       |
+| FINCH (2024)               | budget 上限锁死长度    | 递归压缩 (代价: 历史 |
+|                            |                        | 被反复稀释)          |
+| MagicPIG (2024)            | attention 贵且不稳     | LSH 哈希采样替代     |
++----------------------------+------------------------+----------------------+
+| LASER-KV (2026)            | attention 分数不是唯一 | Exact (heavy hitter) |
+|                            | 的 token 重要性信号;   | + LSH (结构相似);    |
+|                            | 递归压缩稀释历史;      | 累积不覆盖; 保护除   |
+|                            | 窗口副作用混在压缩里   | 数 n 隔离局部窗口    |
++----------------------------+------------------------+----------------------+
+#+end_src
+
+* 内核: 这条线背后真正发生了什么
+
+表面上是 "怎么压 KV cache 更聪明"。底下其实是一场关于 *token 重要性能不能被单一信号衡量* 的争论。
+
+- *2023-2024*: 大家默认 attention score 就够了，争论只在 "怎么算、什么时候算、给谁算多点"。
+- *2024 MagicPIG*: 第一次有人用另一种信号 (LSH 相似度) 来选，但是 *替代式* 的——结果一边赢一边输。
+- *2026 LASER-KV*: 第一次明确说 "一个信号不够，必须两个信号叠加"，并且做了 ablation 证明。
+
+更深一层：这条线在从 *单视角的贪心* 走向 *多视角的互补*。
+H2O 那个 "heavy hitter" 隐喻很形象，但它假设了重要性是一维的、可排序的。
+LASER-KV 实际上在说：*重要性是多维的，单一排序必有盲区*。
+
+这跟集成学习 / 多视图学习的逻辑一样，只不过这次是用在 KV cache 上。
+
+* 下一步往哪走
+
+按这条线推演：
+
+1. *学一个 utility 函数*：现在 Exact 和 LSH 是两个固定的启发式，权重 0.75/0.25 是手调的。
+   下一步自然是训一个小网络来动态决定每个 token 在不同上下文下的"重要性"。
+   只是这就破坏了 training-free 的优势。
+
+2. *放弃 prune，改压缩存储*：所有 prune 方法都假设"扔掉的就回不来了"。
+   但如果换成"低优先级的 token 用 4-bit 量化存，高优先级保持 FP16"，
+   就能在同样的显存预算下保留更多信息。MagicPIG 团队后来其实就在做这条路。
+
+3. *把这条线往 agent 侧推*：现在所有 benchmark 都是 Babilong 这种 retrieval 任务。
+   一旦放到 agent 的多轮工具调用场景，"哪些 token 重要" 的判断会动态得多，
+   现在所有方法的累积式/递归式策略都会重新需要被设计。
+
+* 诚实标注
+
+- StreamingLLM → H2O → SnapKV → Quest → PyramidKV → FINCH → MagicPIG → LASER-KV 这条线，
+  *每一条引用关系都在 LASER-KV 的参考文献中得到确认*。
+- 但 "StreamingLLM 和 H2O 谁先谁后" 是同期工作，论文里没显式说谁批判谁，我按发表时间排了顺序。
+- "PyramidKV 在 SnapKV 之后" 是引用关系，但 Quest 和 PyramidKV 是否相互意识到了对方、有正面对比，
+  原论文没说，*这里把它们并列是为了叙事方便，不是基于明确的批判关系*。
+- "下一步往哪走" 一节是 *我的推演*，不是论文里写的 future work。论文的 future work 只说了
+  "评估范围有限，需要更多 benchmark"，本身没有方向性指引。
+- 一个具体注意点：本篇是 2026 年 2 月的工作，作者是 IIT Roorkee 的本科/研究生，
+  方法朴素但实验设计干净。它的价值更多是 "确认了 attention score 不够" 这件事，
+  而不是引入了多么复杂的新机制。

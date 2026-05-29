@@ -1,0 +1,188 @@
+#+title:      DynSplit-KV: Dynamic Semantic Splitting for KVCache Compression in Efficient Long-Context LLM Inference
+#+date:       [2026-05-29 Fri 14:23]
+#+filetags:   :paper:river:kvcache:compression:en:
+#+identifier: 20260529T142300-en
+#+source:     https://arxiv.org/abs/2602.03184
+#+authors:    Jiancai Ye, Jun Liu, Qingchen Li, Tianlang Zhao, Hanbin Zhang, Jiayi Pan, Ningyi Xu, Guohao Dai
+#+venue:      arXiv 2026 (Shanghai Jiao Tong University / Infinigence-AI / SII)
+
+* One-Line Positioning
+
+A single evolving question: "During long-context inference, the KV cache is too large to fit in memory — how do we discard part of it without sacrificing accuracy?" — from brute-force token dropping, to block dropping, to sentence dropping, and finally DynSplit-KV's answer: where to split should never be hard-coded; the model itself should vote.
+
+* Lineage Map
+
+#+begin_src
+                       [Problem: KV cache too large]
+                                |
+                                v
+              FlashAttention (Dao, 2022)
+              "Fast computation, but cache is still kept in full"
+                                |
+                  +-------------+--------------+
+                  |                            |
+                  v                            v
+        StreamingLLM (2023)              H2O (2023)
+        "Keep sink tokens + recent window"  "Drop by cumulative attention"
+                  \                            /
+                   \                          /
+                    +----------+-------------+
+                               |
+                               v  [token-level: destroys semantic structure, 10-30% accuracy drop]
+                               |
+                  +------------+-------------+
+                  |                          |
+                  v                          v
+            Quest (2024)               InfLLM (2024)
+            "Select by fixed page"     "Load by fixed block"
+                  \                          /
+                   \                        /
+                    +-----------+----------+
+                                |
+                                v  [block-level: efficient, but split positions ignore semantics]
+                                |
+                                v
+                         ChunkKV (2025)
+                         "Fixed chunk, marginally better than token"
+                                |
+                                v
+                  +-------------+--------------+
+                  |                            |
+                  v                            v
+          SentenceKV (2025)            SABlock (2025)
+          "Split on punctuation"       "Adaptive block size under cache budget"
+                  \                            /
+                   \                          /
+                    +----------+-------------+
+                               |
+                               v  [semantically aligned, but only works for natural language; variable-length blocks slow inference]
+                               |
+                               v
+                  *** DynSplit-KV (2026, this paper) ***
+                  "Let attention tell you where to split,
+                   then map variable-length blocks back to fixed-length blocks"
+#+end_src
+
+* Evolutionary Narrative (How the Problem Grew)
+
+** Starting Point: KV Cache Is a Memory Monster
+
+To avoid recomputing previous tokens during Transformer inference, every Key and Value is cached — this is the KV cache. For short contexts it is manageable, but long contexts make it uncontrollable: Llama2-13B running a 128k context consumes 80 GB for the KV cache alone — the entire memory of a single A100.
+
+FlashAttention (Dao, 2022) made attention computation blazingly fast, but did not address the root problem: the cache is still kept in full. To further accelerate long-context inference, some KV entries must be discarded.
+
+Which brings us to the core question: *which ones to drop?*
+
+** First-Generation Answer: Drop by Token (StreamingLLM / H2O, 2023)
+
+The most intuitive approach — assign each token an importance score and drop the unimportant ones.
+
+- *StreamingLLM* discovered that the first few tokens (attention sinks) and the most recent window must be retained; the rest can be dropped. Simple and crude, but functional.
+- *H2O* is more refined: it tracks each token's cumulative attention score and retains the highest-scoring ones.
+
+Reasonable in principle, but in practice accuracy drops 10–30%. DynSplit-KV identifies the root cause directly: these methods *score tokens as isolated units*, completely ignoring syntactic and semantic relationships between them. When a sentence is split in half — the first part kept, the second discarded — what remains is noise.
+
+This motivates the next question: *can we drop entire chunks rather than individual tokens?*
+
+** Second-Generation Answer: Drop by Fixed Block (Quest / InfLLM, 2024)
+
+The KV cache is divided into fixed-length blocks (e.g., every 32 tokens), and selection operates at the block level: whichever block is relevant to the current query gets loaded.
+
+- *Quest* approximates each block's attention using the block-wise maximum, ranks blocks by this score, and selects the top-k.
+- *InfLLM* follows a similar scheme, dynamically loading fixed-length blocks based on approximate attention scores.
+
+The key gain is *block-level parallelism* — selecting 100 blocks is far faster than selecting 3,200 tokens, and GPUs prefer this kind of regular data layout.
+
+But a new problem emerges: the split positions are mechanical — *a cut every 32 tokens* — which may land in the middle of a complete phrase. A sentence like "if x >" / "0: y = f(x)" gets absurdly halved. Accuracy improves but is capped by this mechanical splitting.
+
+ChunkKV (2025) pushes further along this path, using slightly larger and more flexible chunks, but the fundamental issue remains: *the splits are semantically oblivious*.
+
+** Third-Generation Answer: Drop by Sentence (SentenceKV / SABlock, 2025)
+
+Since the problem is that split positions ignore semantics, let punctuation do the cutting — periods, commas, and line breaks are natural semantic boundaries.
+
+- *SentenceKV* uses predefined punctuation at the prefill stage to cut the context into sentences, compresses each sentence into a compact representation, and retrieves whole sentences by query relevance during decoding.
+- *SABlock* goes further, adaptively deciding block size under a fixed cache budget, but still relies on predefined semantic delimiters.
+
+Accuracy finally improves — on natural-language tasks, SentenceKV substantially outperforms fixed-block splitting (86% vs. 52% in the paper's figures).
+
+But two new problems immediately surface:
+
+1. *Only works for natural language.* In code, colons, brackets, and indentation carry very different "semantic weight" than punctuation in prose — SentenceKV on code tasks actually performs worse than fixed-block splitting (illustrated by the 76% vs. 66% contrast in the paper, where DynSplit-KV achieves 100% in both settings). The predefined-punctuation assumption breaks down across domains.
+2. *Variable-length blocks severely slow inference.* Sentence-based splitting produces blocks of unequal size; GPUs cannot pipeline them uniformly, and per-block scoring and selection must follow irregular data paths. DynSplit-KV measures *73.1% extra latency overhead* from this alone.
+
+The question is now pushed into a corner: *can we split semantically, without relying on fixed punctuation, and still achieve the efficiency of fixed-length blocks?*
+
+** The Turn: What DynSplit-KV (2026) Sees
+
+The key observation from the DynSplit-KV team is disarmingly simple: the same punctuation mark (e.g., a semicolon) carries 45% different "semantic weight" in natural language versus code, and 24% different weight across models (LongChat vs. DeepSeek).
+
+The fundamental error of predefined punctuation is that *it assumes the importance of each delimiter is a fixed prior*. In reality, importance is *context-dependent, model-dependent, and dynamic*.
+
+So how do you score dynamically? The paper's elegant solution: *let the model vote with its own attention*.
+
+For each candidate split position i, examine *how future tokens attend back to earlier positions* — if most of their attention falls within the local window after i and very little falls on distant positions before i, then i is a good split point (locally coherent, few long-range dependencies). The score is:
+
+#+begin_src
+si = E[attention from future tokens to local positions] - alpha * E[attention from future tokens to distant positions]
+#+end_src
+
+A high score means cutting here incurs minimal semantic loss.
+
+This resolves *Challenge 1*: split positions no longer depend on hand-crafted punctuation but on the actual dependency structure computed by the model. The paper reports a 49.9% accuracy improvement.
+
+But *Challenge 2* remains: the dynamically scored cuts still produce variable-length blocks — how do we avoid the 73.1% overhead?
+
+DynSplit-KV's second contribution is *V2F (Variable-to-Fixed Mapping)*: all tokens within a variable-length block are compressed into a *fixed-size summary* using element-wise max and min — regardless of original block length, each block exposes a fixed-size interface to the outside. Scoring is computed on these summaries; after selecting the top-k blocks, block scores are broadcast back to all tokens within each block; the full attention table is then regular and fixed-length again, and the GPU returns to full utilization.
+
+The result: 2.2× faster than FlashAttention, 2.6× reduction in peak memory, with the highest accuracy among all compared methods.
+
+** What Is Really Happening Along This Line
+
+On the surface it looks like a technology stack — token → block → sentence → dynamic.
+
+One level deeper, it is two axes simultaneously climbing: *granularity of selection* and *basis for selection*:
+
+| Generation       | Split Granularity       | Who Decides the Boundary              | Remaining Flaw              |
+|------------------+-------------------------+---------------------------------------+-----------------------------|
+| StreamingLLM/H2O | token                   | cumulative attention                  | ignores semantic structure  |
+| Quest/InfLLM     | fixed-length block      | mechanical position                   | cuts inside phrases         |
+| SentenceKV       | sentence                | predefined punctuation                | fails across domains        |
+| DynSplit-KV      | dynamic semantic block  | model's own attention dependencies    | (yet to be stress-tested)   |
+
+The real turning point is *returning the question "where can we split?" from human priors back to the model itself* — no more hard-coded rules; instead, the model's own attention patterns provide the answer.
+
+This cognitive move is structurally isomorphic to many other branches of LLM evolution: scaling laws delegate architecture tuning to data; DPO delegates reward modeling to preference pairs; DynSplit-KV delegates split boundaries to attention — all instances of *"let the model say it"* replacing *"humans write the rule"*.
+
+** Where This Line Might Go Next
+
+Extrapolating along this direction:
+
+1. *Can the dynamic scoring itself avoid a full attention pass?* Currently computing si still requires running attention once; future work might approximate it with a small proxy model or a predictor.
+2. *Replace the V2F max/min compression with a learned compression head* — element-wise max is hand-crafted; in principle a learnable compressor could do better.
+3. *Generalize from KV splitting to prompt chunking itself* — if the model can identify its own semantic boundaries, the same scoring framework could apply to retrieval, long-document chunking, and agent memory systems.
+
+* Problem–Solution Compressed Overview
+
+#+begin_src
+| Year | Paper           | Problem Identified                         | Solution                                   | Residual Problem                         |
+|------+-----------------+--------------------------------------------+--------------------------------------------+------------------------------------------|
+| 2022 | FlashAttention  | Attention too slow                         | IO-aware reordering of computation        | Cache still fully retained               |
+| 2023 | StreamingLLM    | Long-context cache does not fit            | Keep only sink + recent window             | Middle tokens ignored, 10-30% accuracy drop |
+| 2023 | H2O             | Which tokens truly matter                  | Rank by cumulative attention               | Fragments semantic structure             |
+| 2024 | Quest           | Token-level selection is slow              | Fixed-length pages, select by approx. attention | Cuts inside words/phrases           |
+| 2024 | InfLLM          | Block loading must be fast                 | Fixed-length blocks + dynamic loading      | Still mechanical splitting               |
+| 2025 | ChunkKV         | Chunks better than tokens                  | Slightly larger chunks                     | Still semantically oblivious             |
+| 2025 | SentenceKV      | Should split on semantic boundaries        | Split on punctuation                       | Fails across domains + variable-length slow |
+| 2025 | SABlock         | Adaptive block size under cache budget     | Budget constraint + semantic alignment     | Still relies on predefined punctuation   |
+| 2026 | *DynSplit-KV*   | Boundaries should never be hard-coded      | Attention self-scoring (DD-Select)         |                                          |
+|      |                 | Variable-length blocks slow inference      | Variable-to-fixed mapping (V2F)            |                                          |
+#+end_src
+
+* Review Notes
+
+- *The problem is the protagonist*: the entire lineage traces a single question — "where to split the KV cache" — with each paper as a supporting character
+- *Causal chain*: tokens too granular → blocks too mechanical → punctuation not universal → let the model decide — every step has an explicit "therefore"
+- *Differences as the core*: DynSplit-KV's two challenges map directly onto SentenceKV's two failures (cross-domain breakdown / variable-length overhead); the gap is sharpest between the third and fourth generations
+- *Plain language first*: "attention votes," "block summary," "what to drop" — everyday phrasing lands first, technical terms follow
+- *Honest attribution*: citation relationships come from the paper's Related Works (Section 2); FlashAttention is the explicitly compared speed baseline; follow-up work (post-2026.02) has not been traced, as the time horizon is too recent

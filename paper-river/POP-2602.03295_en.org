@@ -1,0 +1,294 @@
+#+title:      POP: Prefill-Only Pruning for Efficient Large Model Inference
+#+date:       [2026-05-29 Fri 05:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T054634-en
+#+source:     https://arxiv.org/abs/2602.03295
+#+authors:    Junhui He, Zhihui Fu, Jun Wang, Qingan Li
+#+venue:      arXiv 2026
+
+* The River of Problems
+
+Large model inference is slow, costly, and GPU-hungry. Can we cut the model down, run it faster, and still preserve most of the accuracy?
+
+The difficulty lies here: you assume the model is full of "dead weight" you can just trim away — but every time you cut, quality drops sharply. Generation after generation of researchers chased the answer: what is truly "useless"? How do you prune fast and accurately at once? Over a decade of repeated inquiry, each answer became more subtle than the last — until someone realized that the question "useless or not?" was itself wrong. It should not be a property of the model; it should be a property of the *inference phase*. The same layer can be dead weight for one task and indispensable for another.
+
+POP is the paper that stands at that turning point.
+
+* The Source Map
+
+#+begin_example
+[1989] LeCun et al. - Optimal Brain Damage
+  |
+  | Problem: Neural networks have too many parameters — can we cut some?
+  | Solution: Use second-order derivatives to score each parameter's
+  |           "importance"; prune the least important ones.
+  v
+[2023.01] Frantar & Alistarh - SparseGPT
+  |
+  | Problem: OBD was designed for small networks; LLMs are too large to run it.
+  | Solution: Approximate the Hessian layer-by-layer; prune 50% of weights
+  |           in one shot, no retraining needed.
+  v
+[2023.05] Ma et al. - LLM-Pruner
+  |
+  | Problem: SparseGPT prunes individual weights; hardware acceleration is poor.
+  | Solution: Prune "structures" — entire columns, entire attention heads at once.
+  v
+[2024.03] Men et al. - ShortGPT
+  |
+  | Problem: Width pruning (heads/channels) has limited gains. What about depth?
+  | Solution: Compute Block Influence per layer; prune entire layers.
+  v
+[2024.02] Song et al. - SLEB
+  |
+  | Problem: ShortGPT computes importance once; pruned layers interact.
+  | Solution: Prune iteratively — recompute importance after every cut.
+  |
+  | ----- (A parallel line: don't prune the model, change the serving arch.) -----
+  v
+[2024.01] Zhong et al. - DistServe
+  |
+  | Problem: Prefill (digesting input) and decode (emitting tokens) are
+  |          fundamentally different; running both on one GPU causes interference.
+  | Solution: Split them! A dedicated GPU group for prefill, another for decode.
+  v
+[2026.02] He et al. - POP  <-- this paper
+  |
+  | Problem: Every prior pruning method assumes "one pruning fits all" —
+  |          the same crippled model is used for both prefill and decode.
+  |          Yet DistServe already showed these two phases are completely different!
+  | Solution: Stage-aware pruning — skip deep layers during prefill,
+  |           use the full model during decode.
+  v
+[? to be continued]
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1989 | OBD: The First Time a Neural Network Was "Pruned"
+
+*** What Problem It Saw
+
+In LeCun's era, neural networks were tiny by today's standards, yet even after training they felt over-parameterized. Intuition said some weights must be useless — but how do you know which ones? Cutting blindly caused accuracy to collapse.
+
+*** Its Solution
+
+Draw on physical intuition: use second-order derivatives (the diagonal of the Hessian) to estimate "how much will loss rise if I remove this parameter?" Parameters that cause little increase are dead weight and can be cut.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+The math is elegant, but there is one fatal prerequisite: you must be able to compute the Hessian. For a few-thousand-parameter network in 1989 that was fine. Thirty years later, models grew to hundreds of billions of parameters — the Hessian instantly exhausts GPU memory. OBD's spirit lives on, but its algorithm can no longer run.
+
+*Next question*: How do we carry the idea of "prune by importance" onto the back of a hundred-billion-parameter beast?
+
+** 2023.01 | SparseGPT: Making OBD Run on 175 Billion Parameters
+
+*** What Problem It Saw
+
+Giants like GPT-3 and OPT-175B are expensive just to load into memory — and you want to compute a Hessian on top of that? Traditional methods die immediately. Yet industry desperately needed to shrink these models: how much power does a single inference request burn?
+
+*** Its Solution
+
+Smart approximation. Instead of computing a global Hessian, solve a small sparse-regression problem *one layer at a time*, with each layer handled independently. Paired with a carefully designed column-update formula, the entire pruning process can reduce OPT-175B to 50% sparsity in 4.5 hours with nearly no accuracy loss — one-shot, no retraining.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+Decomposing a global problem into local subproblems is the canonical trick of the large-model era. But SparseGPT prunes *individual weights* — the result is a matrix riddled with holes. Algorithmically beautiful; hardware-unfriendly. GPU matrix-multiplication engines love dense structure; handling sparse matrices requires specialized kernels, and the real speedup is far below the nominal sparsity ratio. Remove 50% of weights, and in practice you might get only a 1.2× speedup.
+
+*Next question*: We want "twice as fast," not "50% fewer weights." Can we prune in a way that leaves behind a small, dense model?
+
+** 2023.05 | LLM-Pruner: Prune Structures, Not Isolated Points
+
+*** What Problem It Saw
+
+SparseGPT's unstructured sparsity — snipping here and there — yields no hardware acceleration. What if we removed *entire columns*, entire attention heads, entire MLP channels? The result would be a smaller dense model that every GPU can accelerate natively.
+
+*** Its Solution
+
+LLM-Pruner's core insight is *dependency detection*. Weights in a transformer are not independent — a head's Q-projection and the corresponding O-projection are coupled; removing one without the other breaks the model. It first identifies all "coupled groups that must be pruned together," estimates each group's importance via Taylor expansion, and drops the least important groups.
+
+Finally, three hours of LoRA fine-tuning on 50k examples recovers 95% of performance after removing 20% of parameters.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+The first pruning method to be genuinely hardware-friendly. But it prunes *width* — head count, channel count. The problem: transformers are not very redundant in the width dimension. Push beyond 20% removal and accuracy collapses.
+
+*Next question*: Width is tapped out. What about depth — can we remove entire transformer layers?
+
+** 2024.03 | ShortGPT: Delete Whole Layers, Bluntly
+
+*** What Problem It Saw
+
+LLM-Pruner and its descendants kept attacking width, growing ever more complex — gradients, Hessians, Taylor expansion. But had anyone asked a naive question: are there *entire layers* that are redundant?
+
+ShortGPT measured and found a startling answer: yes, many. Computing the cosine similarity between a layer's input and output revealed that some layers "do almost nothing" — input goes in, nearly the same vector comes out. These are layers with very low Block Influence.
+
+*** Its Solution
+
+Simple enough to seem too simple: define a Block Influence (BI) score that quantifies how much each layer changes its input. Low BI → layer is useless. Sort by BI, prune from the bottom up. No gradients, no training — nearly zero-shot pruning.
+
+Results actually beat the complex methods: removing 25% of layers causes less performance degradation than LLM-Pruner or SliceGPT.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+It revealed a deep truth: *LLMs have far more redundancy in depth than in width*. This is the starting point for all subsequent depth-pruning work.
+
+But ShortGPT has a flaw. It computes BI for all layers once, then prunes in bulk. Layers are not independent — after layer 20 is removed, layer 21's role may shift, but its BI was computed on the original model. Prune aggressively and you get collateral damage.
+
+*Next question*: Can we *recompute as we cut*, so every decision is grounded in the current model state?
+
+** 2024.02 | SLEB: Iterative Pruning — One Cut, One Reassessment
+
+*** What Problem It Saw
+
+ShortGPT removes 5 layers by picking the 5 lowest-BI layers at once. SLEB argues this is wrong: after the first layer is removed, the entire model has changed; the second cut should re-evaluate from scratch, not consult a stale ranked list.
+
+*** Its Solution
+
+Iterative pruning. Remove one layer at a time; after each removal, run the current model through calibration data and recompute every layer's importance; then select the next layer to cut. Each cut is the optimal cut for the *current* model.
+
+The cost is speed — multiple forward passes are required — but accuracy is higher than ShortGPT, especially under aggressive pruning ratios (above 20%).
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+Turning "batch decisions" into "sequential decisions" is a classic move in optimization. But SLEB — and ShortGPT, LaCo, the entire family — all share one *unquestioned assumption*:
+
+*The pruned model is one model, used identically across all inference scenarios.*
+
+During prefill, use this pruned model. During decode, use this same pruned model. Removed layers vanish equally for every task, every phase.
+
+Is that assumption correct?
+
+** 2024.01 | DistServe: Different Phases Deserve Different Resources (A Parallel Thread)
+
+*** What Problem It Saw
+
+This is a separate thread, approaching from the *serving-systems* angle. Zhong et al. observed that LLM inference has *two fundamentally different phases*:
+
+- *Prefill*: Ingest the entire user prompt at once and build the KV cache. Compute-bound, highly parallel, happens once.
+- *Decode*: Emit one token at a time, reading the full KV cache each step. Memory-bandwidth-bound, serial, happens hundreds of times.
+
+Packing both onto the same GPU causes interference: prefill's large-batch computation blocks decode's latency-sensitive requests; TTFT and TPOT cannot be optimized simultaneously.
+
+*** Its Solution
+
+Physical separation. One group of GPUs runs only prefill; another runs only decode. KV caches are transferred between them over high-speed interconnects (NVLink / PCIe 5.0). Each phase independently selects its parallelism strategy and scales independently.
+
+Result: throughput increases more than 7× under strict SLO requirements.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+This paper planted a crucial conceptual seed:
+
+*Prefill and decode are not merely "two steps in a pipeline" — they are two tasks of fundamentally different character. They deserve to be treated differently.*
+
+DistServe cared about *hardware resources* — assign them different GPU configurations. But has anyone considered the model itself?
+
+Should we give them different *model structures*?
+
+*Next question*: What happens when you combine "pruning" with "phase separation"?
+
+** 2026.02 | POP: One Model, Two Pruning Modes
+
+*** What Problem It Saw
+
+POP's authors connected the two threads above and asked the question nobody had asked:
+
+ShortGPT found deep layers to be highly redundant. But the data it used to measure redundancy was a mixture of prefill and decode activations. If we split these two phases and measure separately, what do we see?
+
+The answer overturns intuition:
+
+- *During prefill*: deep layers are nearly dead weight — context encoding is accomplished mainly by shallow and middle layers.
+- *During decode*: deep layers are critical — the final next-token prediction depends precisely on the deep layers.
+
+Every prior pruning method was *misled* by ShortGPT's "layer redundancy" finding. They saw that deep layers are useless during prefill and assumed they are equally useless during decode, cut them, and watched generation quality collapse. Or conversely, to preserve decode quality, they pruned so conservatively that prefill gained no meaningful speedup.
+
+This is a problem hidden for a decade by *incorrectly aggregated statistics*.
+
+*** Its Solution
+
+Stage-aware pruning:
+
+- During prefill, skip deep layers — dramatically accelerating context encoding.
+- During decode, restore the full model — preserving generation quality.
+
+Conceptually simple, but two implementation challenges must be solved:
+
+1. *KV cache consistency*: Layers skipped during prefill never generated their KV entries. When decode restores these layers and they suddenly need to attend to past context, there is no cache to read. POP introduces "independent KV projections" so that restored layers in the decode phase have a clean initialization path.
+2. *Boundary tokens*: Because prefill skips deep layers, the last prompt token is also produced by the shallow model — yet it must be fed to the full model at the first decode step, making the first generated token prone to error. POP designs a boundary-handling strategy to prevent this first-token collapse.
+
+*** Why It Worked — and Where It Buried the Next Problem
+
+Results: on Llama-3.1 / Qwen3-VL / Gemma-3, prefill latency is reduced by up to 1.37×, with negligible accuracy loss.
+
+Deeper significance: POP is the *first pruning work that stops treating a model as a "static object."* The model becomes a "dynamic behavior" — the same parameters are used differently at different inference phases.
+
+New problems opened:
+- The 1.37× speedup is most pronounced for long-prompt scenarios. Short prompts don't have much prefill overhead to save.
+- "Independent KV projections" introduce extra parameters and complexity, raising the engineering bar.
+- Only one pattern has been exploited: "skip deep layers during prefill." What about within the decode phase itself? Early tokens vs. late tokens may also admit different pruning patterns.
+
+* Frontier Extensions
+
+POP is from February 2026 and is still very new (as of May 2026). Several related directions are already in motion:
+
+- *Token-level stage awareness*: Rather than a binary prefill/decode split, decide at each token position how many layers to use (dynamic depth). SkipGPT (2506.04179) is already moving in this direction.
+- *Prompt-aware pruning*: Different prompt types (code vs. conversation vs. long documents) activate different layer combinations (2502.04348, Prompt-based Depth Pruning).
+
+Neither has yet pushed POP's "stage-aware" philosophy to its logical extreme. As of now, POP is the landmark on the line of "apply different pruning for different inference phases."
+
+* One Diagram to Understand It All
+
+#+begin_example
+                    One Diagram: The Cognitive Evolution of LLM Pruning
+
+  What to prune?   |  1989 OBD          2023 SparseGPT      2023 LLM-Pruner
+                   |  ====================================================
+                   |  individual weight   individual weight   entire column/group
+  -----------------+-------------------------------------------------------
+  Which axis?      |              2024 ShortGPT      2024 SLEB
+                   |              ========================
+                   |              entire layer (depth)   iterative layer pruning
+  -----------------+-------------------------------------------------------
+  Which scenario?  |                           2024 DistServe        2026 POP <--
+                   |                           ====================
+                   |                           don't prune model,    same model,
+                   |                           split hardware         prune different
+                   |                                                  layers per phase
+
+      Prune weights → prune structures → prune layers → prune iteratively
+                     → prune by phase → stage-aware pruning
+
+  Key turning points:
+  - SparseGPT → LLM-Pruner  : from "algorithmically elegant" to "hardware-accelerable"
+  - LLM-Pruner → ShortGPT   : from "pruning width" to "pruning depth"
+  - ShortGPT → SLEB         : from "batch decisions" to "iterative decisions"
+  - SLEB → POP              : from "static model" to "dynamic model (reconfigured per phase)"
+  - DistServe → POP         : from "separate hardware per phase" to "separate model per phase"
+#+end_example
+
+* Insights
+
+Reading the full line of work, the deepest impression is: *defining "redundancy" matters ten times more than answering it*.
+
+- OBD defined redundancy as "removal causes loss to rise" → the bedrock of all pruning
+- SparseGPT placed the definition at the "layer-local" level → now computable
+- LLM-Pruner placed it at the "structural group" level → now hardware-fast
+- ShortGPT placed it at the "entire layer" level → now prune more aggressively
+- POP placed it in the *"phase × layer" two-dimensional space* → revealed redundancy that was invisible before
+
+Each generation's progress was not "a smarter algorithm" but "asking a better question." The same data, the same model — change the *dimension along which you aggregate statistics*, and you instantly see new redundancy to exploit.
+
+This points to the next step: refine the *granularity of pruning* further — not just prefill/decode, but token position, prompt type, task category. Pruning will evolve from a "model property" into a "runtime policy" entirely. Ultimately, nothing may be "cut" from the model at all; instead, *which parts to activate will be chosen on the fly* — which is, in essence, a rediscovery of Mixture-of-Experts.
+
+* Takeaways
+
+What this evolutionary arc teaches about *how to find research problems*:
+
+1. *Incorrectly aggregated statistics are a gold mine.* When everyone is optimizing a metric that is actually an *average across several distinct scenarios*, disaggregating by scenario often reveals a completely different picture. POP split "layer redundancy" by prefill/decode and immediately saw what no one had seen before.
+
+2. *Collisions of insights across sub-fields.* The pruning community cared only about models; the serving community cared only about systems. POP's pivotal move was importing DistServe's "phase separation" insight into the pruning world. The next landmark paper is often not inside a sub-field, but in the *gap between two sub-fields*.
+
+3. *"Must be one-size-fits-all" assumptions are the most worth questioning.* Every pruning method assumed "once pruned, always fixed" — the model is a static object. The moment you remove that assumption, the entire problem space reopens.
+
+The practical takeaway: *you can apply this pattern anywhere* — take any widely accepted "global optimization" work (not just pruning — quantization, distillation, sparse attention all qualify), and ask: "Was it misled by incorrectly aggregated statistics? What does it look like when broken down by scenario?" This pattern can bear fruit in every corner of LLM systems optimization.

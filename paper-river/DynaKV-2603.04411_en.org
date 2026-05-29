@@ -1,0 +1,195 @@
+#+title:      One Size Does Not Fit All: Token-Wise Adaptive Compression for KV Cache
+#+date:       [2026-05-29 Fri 06:50]
+#+filetags:   :paper:river:kv_cache:compression:en:
+#+identifier: 20260529T065022-en
+#+source:     https://arxiv.org/abs/2603.04411
+#+authors:    Liming Lu, Kaixi Qiu, Jiayu Zhou, Jushi Kai, Haoyan Zhang, Huanyu Wang, Jingwen Leng, Ziwei He, Zhouhan Lin
+#+venue:      arXiv 2603.04411 (2026)
+
+* Reading Backwards: Starting from One Question
+
+DynaKV makes a single claim: *within the same sequence, not every token deserves the same number of bytes in its KV cache*. BOS tokens, periods, connectives — these tokens barely participate in attention, yet they occupy exactly as much memory as the semantically critical tokens. Giving them an equal compression budget is wasteful.
+
+This seems obvious. But getting the obvious thing right took the field roughly seven years. Looking backwards, every step on this trajectory was forced by a very specific pain left by the previous step:
+
+- KV cache too large to fit → cut half the KV heads
+- Cut too much, quality collapses → switch to grouped sharing
+- Sharing hits its limit, still not small enough → drop sharing, project to low dimensions instead
+- Projection requires training from scratch → switch to post-hoc SVD
+- Post-hoc SVD is a blunt instrument that loses information → switch to elastic nested dimensions
+- Nesting still treats every token identically → dynamically allocate by token importance
+
+Each step was forced by the failure of the one before it. Here is that line.
+
+* The Provenance Map
+
+#+begin_src
+                  Problem: KV cache too large, inference slow and expensive
+                              |
+                              v
+  2019  +----------------+
+        | MQA            |   Cut: all heads share one KV group
+        | Shazeer        |   Win: memory drops dramatically
+        +----------------+   Cost: quality drops dramatically too
+                |
+                | "Full sharing is too aggressive — can we find a middle ground?"
+                v
+  2023  +----------------+
+        | GQA            |   Cut: grouped sharing (not full sharing)
+        | Ainslie et al. |   Win: quality recovers, memory still drops
+        +----------------+   Cost: head count is discrete, compression ratio constrained
+                |
+                | "Discrete granularity is too coarse — want continuous compression"
+                v
+  2024  +----------------+
+        | MLA            |   Cut: project into a low-dimensional latent space
+        | DeepSeek-V2    |   Win: compression ratio continuously tunable
+        +----------------+   Cost: must train from scratch
+                |
+                | "Existing models shouldn't need retraining"
+                v
+  2024  +----------------+
+        | Palu           |   Cut: apply SVD to already-trained weights
+        | (post-train)   |   Win: training-free, applicable to any model
+        +----------------+   Cost: PPL collapses at high compression ratios
+                |
+                | "Fixed rank is too rigid — want elasticity"
+                v
+  2025  +----------------+
+        | MatryoshkaKV   |   Cut: nested dimensions, critical info in early dims
+        |                |   Win: one cache, multiple compression rates
+        +----------------+   Cost: all tokens in a sequence use the same rank
+                |
+                | "Token importance varies by orders of magnitude — why treat them equally?"
+                v
+  2026  +----------------+
+        | DynaKV         |   Cut: allocate rank individually per token
+        | (this paper)   |   Win: quality preserved under extreme compression
+        +----------------+   ?:  is the overhead of dynamic allocation worth it?
+#+end_src
+
+Note: the annotations on each arrow describe *what the successor identified as the predecessor's problem*. Citation relationships are based on DynaKV's own related work section; a few steps (the MQA→GQA→MLA arc as "field consensus") represent industry-accepted evolution, not relationships DynaKV explicitly acknowledges.
+
+* The Forward Narrative: How the Problem Grew
+
+** The First Cut: MQA (2019, Shazeer)
+
+The first person to recognize KV cache as a problem was Shazeer. Working at Google, he observed that during Transformer decoding, GPU memory was dominated not by model weights but by the cache — every time a new token was generated, the Keys and Values of every preceding token had to be retained for the next attention step. A 32-layer, 32-head model caching a few thousand tokens could consume several gigabytes.
+
+His solution was brutally simple: *all query heads share a single set of Keys and Values*. Originally 32 K/V pairs; now 1. Memory drops by a factor of 32 instantly.
+
+The cost was quality collapse. Each head was supposed to attend to different things — some tracking syntax, some tracking long-range coreference, some tracking local patterns. Forcing them all to use one K/V pair is like merging 32 independent specialists into one. Short tasks could muddle through; long tasks fell apart immediately.
+
+But he identified the *problem that everyone afterward was trying to solve*: KV cache is the new bottleneck.
+
+** The Second Cut: GQA (2023, Ainslie et al., Google)
+
+Four years later, the community had accepted KV cache as a bottleneck, but no one was willing to accept MQA's quality loss. GQA did something simple: *don't share everything, don't keep everything independent — share within groups*. Thirty-two query heads split into 8 groups, each group of 4 sharing one K/V pair. Four-times compression, almost no quality drop.
+
+LLaMA-2 70B, Mistral, and nearly every large model released after 2023 adopted GQA. It became the de facto standard.
+
+But GQA has a low ceiling: group count must be an integer. You can only have 1, 2, 4, 8, or 16 groups — not "3.7 groups." If you want 10× or 20× compression, there's no path. The granularity is stuck.
+
+** The Third Cut: MLA (2024, DeepSeek-V2)
+
+The DeepSeek team changed the frame: *instead of working in the head dimension, work in the vector dimension*.
+
+Previously each K was a 128-dimensional vector. MLA first compresses it to, say, 32 dimensions (a "latent"), then projects back to 128 dimensions when needed. The 32-dimensional representation is what actually gets stored; the 128-dimensional form is only reconstructed temporarily during computation.
+
+The elegance of this approach is that the compression ratio is *continuously tunable* — use 32 dimensions for 4× compression, 16 dimensions for 8× compression. GQA's discrete curse is broken. DeepSeek-V2, V3, and R1 all rely on this to push KV cache compression to its limits.
+
+The cost: MLA is a *new architecture*. You must train from scratch. Existing LLaMA, Qwen, Mistral models — their K/V projection matrices are not structured this way. To use MLA, you either retrain (starting from billions of tokens) or use a conversion method like MHA2MLA (which still costs roughly half a pretraining run).
+
+For academia and small teams, this is a prohibitive wall.
+
+** The Fourth Cut: Palu (2024)
+
+Palu inverted the question: *Can I do low-rank compression on an already-trained model, without retraining?*
+
+The method is classical — SVD. Decompose the K/V projection matrix W into two smaller matrices, W ≈ U·V, where the intermediate rank r controls the compression level. At runtime, instead of storing raw K/V values, store their low-rank representations and reconstruct when needed.
+
+This approach is completely training-free. Any LLaMA or Qwen model can be treated this way.
+
+But Palu's fatal weakness is *collapse at high compression ratios*. Numbers from the paper: Llama-3-8B on C4, at 20% retained rank, perplexity spikes to 113.90 — essentially incoherent output. The reason is straightforward: SVD discards the smallest singular values. When you discard 80%, even the smallest ones collectively matter, and reconstruction error explodes.
+
+** The Fifth Cut: MatryoshkaKV (2025)
+
+MatryoshkaKV noticed an engineering reality: *within a single deployment, different requests need different compression ratios*. Short conversations can afford to be generous; long documents must compress aggressively. But Palu requires re-running SVD every time the compression ratio changes, which is impractical.
+
+Its solution borrows from Russian nesting dolls — *represent K/V as a nested structure where critical information occupies the leading dimensions*. Want 50% compression? Take the first half of the dimensions. Want 75% compression? Take the first quarter. One cache, multiple cutting points.
+
+This was an engineering victory. But it *shares a fundamental assumption with Palu and MLA*: every token in the sequence uses the same rank. Whether the token is "the" or a core entity name, it receives identical treatment.
+
+** The Sixth Cut: DynaKV (This Paper, 2026)
+
+DynaKV's insight is simple: *that uniformity is wrong*.
+
+Attention maps have been telling us this for years — the vast majority of tokens are barely attended to in subsequent decoding steps. BOS is an attention sink, special but not requiring high fidelity. Stop words and punctuation carry very little KV information. The tokens that actually carry semantic weight may be only 20–30% of the sequence.
+
+If your compression budget is an average of 6%, compressing every token to 6% is foolish. Let the trivial tokens compress to 1%, redirect the saved budget to critical tokens and bring them up to 15% — the overall average stays at 6%, but quality is completely different.
+
+Technically, DynaKV borrows the idea of *differentiable gating* from syntactic parsing (the PRPN and ON-LSTM line of work). Each token receives a continuous "importance" score, and the score dynamically determines how much rank to retain for that token. The entire process is differentiable and can be fine-tuned end-to-end.
+
+Results: combined with SnapKV (an orthogonal method that drops unimportant tokens entirely), DynaKV retains 94% of LongBench performance while keeping only *6% of the KV cache*. No prior low-rank method has achieved this.
+
+DynaKV also confirms an observation from StreamingLLM — in its learned allocation, BOS consistently receives a high retention score of approximately 0.75.
+
+* Problem–Solution Overview
+
+#+begin_src
+  Evolution of compression "target"   "granularity"         "how compression is obtained"
+
+  MQA:  all heads share KV            uniform               fixed at pretraining time
+
+                                       |                      |
+  GQA:  grouped KV sharing            uniform               fixed at pretraining time
+
+                                       |                      |
+  MLA:  all projected to              uniform               fixed at pretraining time
+        low-dim latent space          (dimension continuous)
+
+                                       |                      |
+  Palu: all projected to              uniform               post-train SVD
+        low-dim latent space                                (zero cost)
+
+                                       |                      |
+  Mat-  all projected to              uniform               post-train nested structure
+  KV:   low-dim latent space          (runtime-switchable)  (zero cost, elastic)
+
+                                       |                      |
+  Dyna- all projected to              per-token allocation  post-train differentiable gating
+  KV:   low-dim latent space          (each token differs)  (lightweight fine-tuning)
+#+end_src
+
+Reading down this table, you can feel that this trajectory is not a single-dimensional evolution but *three dimensions advancing in parallel*:
+
+1. *Compression target*: from coarse-grained heads to fine-grained vector dimensions — getting progressively finer
+2. *How compression is obtained*: from fixed at pretraining time to zero-cost post-hoc — cost getting progressively lower
+3. *Compression granularity*: from a global uniform cut to per-token adaptive allocation — budget assignment getting progressively smarter
+
+DynaKV is the first breakthrough along the third dimension. The first two dimensions have been worked on for years; the third has been untouched — everyone quietly assumed that "all tokens in a sequence are treated equally." DynaKV breaks that assumption.
+
+* The Core Insight and What Comes Next
+
+Reading through this trajectory, what you see is not just progress in KV compression techniques, but a *cognitive shift*:
+
+  Early framing: *KV cache is a homogeneous memory object* — the question is "how do we shrink it overall"
+  Current framing: *KV cache is a heterogeneous information carrier* — the question is "how do we allocate budget according to information density"
+
+This is consistent with a broader trend across LLM inference — MoE allocates compute per token, Speculative Decoding allocates verification cost per token, CoM allocates computation per token. Tokens are no longer uniformly processed units but *individually differentiated entities*. DynaKV brings this paradigm into the memory domain.
+
+Where is the next step most likely to go? Three directions are already visible:
+
+1. *Joint optimization*: DynaKV solves adaptive allocation in the "dimension" axis. SnapKV solves adaptive allocation in the "sequence" axis (which tokens to drop). Someone will join these two, learning dimension allocation and sequence allocation together
+2. *Cross-layer adaptation*: DynaKV currently operates at the per-token level within a layer. Prior work like CommonKV shares a basis across layers. Joint allocation across both the token level and the layer level is an open gap
+3. *Inference-time reallocation*: DynaKV's allocation is learned during fine-tuning. But the same token has different importance in different contexts — dynamically reallocating rank at inference time based on the current attention pattern is a more aggressive next step
+
+One final takeaway: *"uniform treatment" is almost always a field's temporary solution, not its final answer*. Wherever you find "apply the same Y to all X," there is a DynaKV-style paper waiting to appear.
+
+* Honest Annotations
+
+- The MQA → GQA → MLA backbone is an industry-accepted evolutionary path; *it is not an explicitly acknowledged citation chain in the DynaKV paper* — it is supplied from background knowledge
+- The DynaKV → Palu / MatryoshkaKV / MLA line represents *explicitly criticized and compared targets* in the paper's related work section
+- The specific number for Palu at high compression ratio (PPL 113.90 @ 20% rank, Llama-3-8B on C4) comes from DynaKV's experimental tables, not from the Palu paper itself
+- No work from 2026 onward that critiques or improves upon DynaKV was found (the paper is too recent)
+- The "where the next step goes" section is extrapolation based on this evolutionary line, not any explicit claim made in any paper

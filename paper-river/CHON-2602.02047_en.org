@@ -1,0 +1,341 @@
+#+title:      Dissecting Outlier Dynamics in LLM NVFP4 Pretraining
+#+date:       [2026-05-29 Fri 14:30]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T143000-en
+#+source:     https://arxiv.org/abs/2602.02047
+#+authors:    Peijie Dong, Ruibo Fan, Yuechen Tao, et al. (HKUST + Alibaba)
+#+venue:      arXiv preprint, Feb 2026
+
+* The River of the Problem
+
+A question that has circled for seven or eight years without resolution: *why does training large models with fewer bits always produce a small handful of "troublemaker" numbers that ruin the entire game?*
+
+The compute budget for training large models is never enough. Every time we drop one bit (FP32 → FP16 → FP8 → FP4), memory halves and throughput doubles. But with every reduction, the same ghost reappears — *outliers*, those abnormally large values in activations that dwarf their neighbors by ten or a hundred times. Once low-precision formats crush them flat, the entire training run collapses.
+
+Every generation has wrestled with this same ghost. Some tried to scatter it, some tried to give it its own ruler, some tried to train around it. The headwaters of this river trace back to 2022, when someone first looked the ghost squarely in the face. The downstream end is this 2026 paper — *the first to film how that ghost grows, transforms, and settles in over the entire course of training*.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani - Attention Is All You Need
+  |
+  | Buried hazard: the attention mechanism naturally produces extreme
+  |   activations (Softmax creates sharp spikes)
+  v
+[2022] Dettmers - LLM.int8()
+  |
+  | Observed: in models ≥6.7B, 0.1% of activations are "emergent outliers";
+  |   quantizing the whole model destroys quality
+  | Fix: extract outlier dimensions and keep them in FP16;
+  |   run the rest in INT8
+  v
+[2022] Xiao - SmoothQuant
+  |
+  | Observed: Dettmers's trick is an inference patch — ugly in practice
+  | Fix: use a mathematical identity to "migrate" activation difficulty
+  |   onto the weights
+  v
+[2023] Rouhani - Microscaling (MX) Formats
+  |
+  | Observed: SmoothQuant still uses a single per-tensor scale,
+  |   not fine-grained enough for outliers
+  | Fix: hardware-level support — every 32 elements share one scale
+  |   (block-wise)
+  v
+[2023] Peng - FP8-LM  /  [2024] Fishman - FP8 at trillion tokens
+  |
+  | Observed: everything so far is inference quantization.
+  |   Can we train directly in low precision?
+  | Fix: full-pipeline FP8 training with scaling strategies that
+  |   keep outliers from overflowing
+  v
+[2025] NVIDIA - NVFP4 Pretraining Recipe
+  |
+  | Observed: FP8 is now standard; FP4 is the next goldmine.
+  |   MX alone is not fine enough.
+  | Fix: two-level scaling (per-block E4M3 + per-tensor FP32), i.e. NVFP4
+  | Remaining gap: loss still ~1% worse than BF16 at late training
+  v
+[2025] Cao - Metis  /  [2025] Chen - TetraJet-v2
+  |
+  | Observed: NVFP4 loss gap is mainly due to activation outliers
+  |   not being suppressed
+  | Fix: low-rank residual separation (Metis) /
+  |   oscillation reset (TetraJet-v2)
+  | Remaining gap: both treat only activations, not weight outliers;
+  |   and both intervene at a single moment without watching how
+  |   outliers "grow"
+  v
+[2026] Dong et al. - CHON / HCP   <-- this paper
+        First longitudinal dissection of outlier evolution
+          during NVFP4 training
+        Proposes Hot-Channel Patch: bilateral repair of
+          weights AND activations
+        + dedicated protection for post-QK operations
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al. - Attention Is All You Need: The Origin of Everything
+
+*** What Problem It Saw
+
+RNNs had to compute one token at a time — no parallelism, brutally slow. Machine translation and language models of the era were all bottlenecked by this serial constraint.
+
+*** Its Solution
+
+Throw out the RNN entirely and use only attention: every position directly attends to every other position. A single matrix multiplication handles all dependencies at once.
+
+*** Why It Worked — and What New Hazard It Buried
+
+Attention is fully connected and parallelizable, so GPUs fly through it. But the cost was buried in one detail: *Softmax*. Softmax exponentiates a score and then normalizes. This process naturally favors winner-takes-all dynamics — certain positions' activations end up orders of magnitude larger than others.
+
+Nobody cared at the time, because everyone used FP32 and even huge values fit comfortably. This hazard would only detonate once people started trying to save memory.
+
+** 2022 | LLM.int8() - Dettmers et al.: First Looking the Ghost in the Eye
+
+*** What Problem It Saw
+
+At GPT-3 scale (6.7B parameters and above), people tried to use INT8 to accelerate inference and found model accuracy simply collapsed. Loss didn't degrade gradually — it fell off a cliff. Why?
+
+Dettmers printed out the activation values and saw it: in certain *dimensions*, extreme values existed that were *tens or even hundreds of times* larger than the average. These values comprised less than 0.1% of the total, yet they carried most of the model's semantic information. Once you squeezed the whole tensor into INT8's [-127, 127] range, these outliers were either clipped or they crushed all the normal values down to zero.
+
+This was the first time anyone formally introduced the word "outlier" into the LLM quantization conversation.
+
+*** Its Solution
+
+Blunt but effective: extract the 0.1% of dimensions containing outliers and *keep computing them in FP16*, while the remaining 99.9% run in INT8. Mixed precision.
+
+*** Why It Worked — and What New Hazard It Buried
+
+It worked because it accepted reality: outliers are a minority but a critical one, so handle them specially.
+
+The new hazards were equally obvious:
+1. At inference time you must detect on-the-fly which dimensions are outliers — ugly engineering
+2. This is an inference patch; it cannot be used during *training*
+3. It doesn't explain *why* outliers appear in the first place
+
+The next paper would address the first two.
+
+** 2022 | SmoothQuant - Xiao et al.: Migrating the Difficulty
+
+*** What Problem It Saw
+
+Dettmers's mixed-precision scheme was too engineering-heavy and hardware-unfriendly. Xiao wanted a *pure INT8* solution without case-by-case branching.
+
+He noticed that outliers were concentrated on the *activation* side, while the weight distribution was smooth and uniform. The problem was asymmetric — activations were hard to quantize, weights were easy.
+
+*** Its Solution
+
+A small piece of mathematical magic. A linear layer computes Y = X @ W. Insert a diagonal matrix S and its inverse in the middle:
+
+Y = (X / S) @ (S * W)
+
+Mathematically identical, but physically: *activations shrink* (divided by S) and *weights grow* (multiplied by S). The outlier "difficulty" is silently migrated from activations onto the weights, and both sides become "well-behaved."
+
+*** Why It Worked — and What New Hazard It Buried
+
+Elegant. A single invariant derivation turns an asymmetric problem into a symmetric one. But it still uses a *per-tensor* scale — one ruler for the entire tensor. If a tensor contains both outliers and normal values, that ruler either caters to the outliers and sacrifices precision for the rest, or vice versa.
+
+The next paper would address "one ruler isn't enough" at the hardware level.
+
+** 2023 | MX Microscaling Formats - Rouhani et al.: One Ruler per Block
+
+*** What Problem It Saw
+
+SmoothQuant shifted the outliers around, but *local variation* within a tensor still remained. Within one tensor, some segment might be all 0.001-scale values while another is all 100-scale values. One global ruler wastes dynamic range.
+
+*** Its Solution
+
+Introduce *block scaling* at the hardware level: every 32 elements share their own independent scale. The analogy shifts from "one ruler for the whole city" to "one ruler per city block." This is the MX (Microscaling) family of formats — MXFP8, MXFP6, MXFP4, and so on.
+
+*** Why It Worked — and What New Hazard It Buried
+
+The smaller the block, the more adaptive it is to local distribution. This is a *hardware* protocol (OCP standard), meaning next-generation NVIDIA/AMD chips natively support it.
+
+New hazard: 32 elements sharing one scale is still not fine enough. If an outlier is *block-level* — one entire block pulled off-axis by a single extreme value — problems persist. And all of this was still an *inference* story. The next step was pushing it into training.
+
+** 2023-2024 | FP8-LM / Fishman: Crossing the Inference-Training Divide
+
+*** What Problem It Saw
+
+Every previous effort was *post-training quantization* — train the model to completion, then compress it for inference. But training itself still consumed astronomical FP16/FP32 compute. Could we *train* in FP8?
+
+Intuitively hard, because training involves backpropagation and gradients are far more sensitive to numerical precision. Outliers that cause trouble in the forward pass become amplified poison in the backward pass.
+
+*** Its Solution
+
+FP8-LM (Microsoft) and Fishman (originally GraphCore, later followed by NVIDIA) found appropriate per-tensor scaling strategies for *every tensor* in the training pipeline, handling forward pass, backward pass, and optimizer states separately. Paired with the E4M3 / E5M2 FP8 sub-formats (one with wider dynamic range, one with higher precision), used according to context.
+
+*** Why It Worked — and What New Hazard It Buried
+
+It proved that "low-precision training" works at trillion-token scale. FP8 training became the industry standard (Llama-3 and DeepSeek-V3 both use it).
+
+But FP8 is not the destination. Every bit dropped is a gold mine, and FP4 is the next stop. FP4 has only 16 representable values, its dynamic range is breathtakingly narrow, and the already-thin tolerance for outliers drops to zero. That is the bone the next paper had to chew.
+
+** 2025 | NVFP4 Recipe - NVIDIA: Two-Level Scaling to Force FP4
+
+*** What Problem It Saw
+
+Training directly with MXFP4 produced a loss far below BF16. A single block scale from Microscaling was insufficient to tame FP4's narrow dynamic range.
+
+*** Its Solution
+
+NVFP4 = *two-level scaling*.
+- *Inner level*: every 16-element block gets one E4M3 (8-bit float) scale
+- *Outer level*: the entire tensor gets an additional FP32 scale
+
+The analogy: "one ruler per street, and one master ruler per city." Micro-variation within blocks and macro-variation across tensors are both addressed. Combined with an improved training recipe (gradient clipping, BF16 fallback for certain weights, stochastic rounding, etc.), this was the first time FP4 *pretraining* was brought close to BF16 quality.
+
+*** Why It Worked — and What New Hazard It Buried
+
+Two-level scaling leverages the effective dynamic range of FP4 up by several orders of magnitude. Blackwell GPUs support it natively with genuine hardware acceleration.
+
+But NVIDIA itself acknowledged: at late training (learning rate decay phase), NVFP4 is still about *1% worse in loss* than BF16. In LLM pretraining, a 1% loss gap translates to an order-of-magnitude difference in downstream capability. That gap is the starting point of the next paper.
+
+** 2025 | Metis & TetraJet-v2: One-Sided Repair
+
+*** What Problem It Saw
+
+Where does NVFP4's residual gap come from? Both papers localized the source: *activations* still contain outliers that block scaling cannot handle.
+
+Metis (Cao et al.) found that activation outliers concentrate in a small number of dimensions and can be low-rank decomposed for separate high-precision computation. TetraJet-v2 (Chen et al.) found that outliers *oscillate* during training (large one step, small the next) and need online resets.
+
+*** Their Solutions
+
+- *Metis*: decompose activations into "principal component (low-rank) + residual"; route the principal component through high precision and the residual through FP4
+- *TetraJet-v2*: monitor oscillation amplitude per channel; reset optimizer state when it exceeds a threshold
+
+*** Why They Worked — and What New Hazard Remained
+
+Both narrowed the BF16 gap. But they share a common blind spot:
+1. *Only activations are treated; weight outliers are ignored.* Outliers also exist on the weight side, just at different scales
+2. *Snapshot-style intervention* — measure and patch at a particular moment. No one has systematically watched how outliers *grow across the entire training run*
+3. No distinction is drawn between *which operators* are most sensitive to outliers
+
+What the next paper does is first *shoot the documentary* (longitudinal dissection), then *treat both sides*.
+
+** 2026 | CHON / HCP - Dong et al.: Shooting the Documentary + Bilateral Treatment
+
+*** What Problem It Saw
+
+Previous work *scooped a ladle of water* from the outlier river and examined it. But outliers have a *lifecycle*:
+- Early training: *transient spikes* bouncing around everywhere
+- Late training: solidified into *a small number of hot channels* (consistently high-activation channels)
+
+Furthermore, *different architectures* grow different outliers:
+- *Softmax Attention* (e.g., Qwen3): outliers concentrate after Softmax
+- *Linear Attention* (e.g., GLA): per-tensor statistics look mild, but *block-level* spikes remain, rooted in the gating mechanism
+- *SwiGLU in FFN*: the two branches multiply together, amplifying outliers
+
+Most critically, *post-QK operations* (the segment immediately after Softmax or gating) are especially sensitive to quantization, yet no prior work treated them separately.
+
+*** Its Solution
+
+Two components:
+
+1. *HCP (Hot-Channel Patch)*: online detection of hot channels in both *activations and weights* at each step, followed by "residual re-injection" — the FP4-computed result is augmented with a small compensation term that recovers the precision that was crushed away. The key difference from Metis/TetraJet-v2: *it handles both weights and activations simultaneously, not just activations*.
+2. *CHON Recipe*: HCP + dedicated protection for post-QK operations (retained at higher precision / with separate scaling).
+
+*** Why It Worked — and What New Hazards Remain
+
+The BF16 loss gap for GLA-1.3B trained on 60B tokens is reduced from *0.94% to 0.58%* — nearly halved — without downstream accuracy loss.
+
+New hazards (readable between the lines even if the paper doesn't state them explicitly):
+1. HCP requires online hot-channel detection, introducing extra kernel scheduling overhead — how friendly is this to H100/B100 attention-compute overlap?
+2. Validated only on 1.3B + 60B tokens. The "settlement" pattern of hot channels at 70B+ scale or trillion-token runs may differ
+3. The *training-to-inference continuity* is not addressed — can a CHON-trained model continue to run FP4 inference without losing consistency?
+
+* Frontier Extensions
+
+As of May 2026, this paper (released February 2026) represents the latest progress on this line. Related directions worth watching in parallel:
+
+- *Hardware layer*: Blackwell B100/B200 FP4 tensor cores are being rapidly integrated into training frameworks (Megatron, TransformerEngine); CHON-style methods are likely to be incorporated in the second half of 2026
+- *Theory layer*: the *origin* of outlier emergence still lacks a clean mathematical explanation. Sun et al.'s 2024 "massive activations" paper provides observations, but no formal proof of "why Softmax catalyzes hot channels" has appeared
+- *Architecture layer*: if the root cause of outliers genuinely lies in Softmax + SwiGLU, would simply replacing those two operators (e.g., Softmax-free attention, GeGLU variants) be more thorough than patching at training time?
+
+* One Diagram to Understand It All
+
+#+begin_example
+            === The Outlier Gauntlet (2022 -> 2026) ===
+
+  Perspective       Granularity            Timing              Coverage
+  -----------       -----------            ------              --------
+
+ [Inference Quantization]
+  LLM.int8  -----> per-channel split ----> at inference  ----> activations only
+  (2022)            "compute outliers
+                     separately"
+
+  SmoothQuant ----> per-tensor math  ----> one-time      ----> activations+weights
+  (2022)            migration             before infer.        (but one pass only)
+                    "migrate difficulty
+                     onto weights"
+
+  MX formats -----> per-block HW     ----> permanent at  ----> full model
+  (2023)            scale                 hardware level       (block-adaptive)
+                    "one ruler per
+                     32 elements"
+
+ [Training Quantization]
+  FP8-LM /  ------> per-tensor train ----> full training ----> full model
+  Fishman            scaling               pipeline            (FP8 still roomy)
+  (2023-24)          "manage forward
+                      and backward
+                      separately"
+
+  NVFP4 ---------> per-block +       ----> full training ----> full model
+  (2025)           per-tensor             pipeline            (FP4 still ~1% gap)
+                   two-level scale
+
+  Metis /   ------> residual decom-  ----> detect during ----> activations only
+  TetraJet-v2        position /           training            (one-sided, snapshot)
+  (2025)             oscillation reset
+                     "activation
+                      outliers"
+
+  CHON / HCP -----> bilateral        ----> longitudinal  ----> activations+weights
+  (2026)            hot-channel           full training       (bilateral, longitud.)
+                    + post-QK             "watch outliers
+                    protection            grow and patch
+                                          them in real time"
+
+
+       Core trends:
+       (1) Ruler granularity grows finer: tensor -> channel -> block -> hot-channel
+       (2) Battlefield shifts from inference to training:
+             patch -> equivalence transform -> training-time control
+             -> full-lifecycle training control
+       (3) Temporal view shifts from snapshot to longitudinal:
+             photograph -> video
+       (4) Repair scope expands from one side to both:
+             activations only -> activations + weights
+#+end_example
+
+* Insight
+
+Reading the whole river, what is actually happening is not "quantization technology is improving" — it is *humanity's understanding of what information is being transmitted inside a model deepening*.
+
+Four years ago we called outliers "noise" and wanted to *remove* them; later we realized they carry critical signal and must be *protected*; still later we found they have *spatial structure* (specific channels) requiring per-block treatment; now we find they have *temporal structure* (transient early, hot channels late) requiring longitudinal observation.
+
+This is a classic "ghost materializing" process: invisible → visible → shape becomes clear → lifecycle becomes clear → learning to coexist. Each generation's solution is the embodiment of the previous generation's understanding.
+
+*Where the next steps are most likely to go*:
+
+1. *Root-cause engineering* — since outliers are mainly catalyzed by Softmax/SwiGLU, the next generation of architectures may simply replace those two. Examples: Softmax-free attention (e.g., Mamba family), or outlier-aware activation functions
+2. *Training-inference consistency* — CHON-style training-time patching means the patches must also be present at inference, or consistency is lost. A unified "FP4 train + FP4 infer" protocol will emerge
+3. *Formalization* — all current outlier analysis is *empirical* (reasoning from plots). A theoretical framework that can predict "what model size, what data, what architecture, how many training steps will produce how many outliers" has yet to appear. That is the gold mine for the next sub-domain
+
+* Takeaways
+
+This river yields three transferable methodological lessons:
+
+1. *Shoot the documentary first, then prescribe the cure* — everyone before this work measured outliers at some static moment and treated them accordingly. Dong's key contribution is not actually HCP — it is *treating outliers as a phenomenon with a lifecycle* and observing them as such. Whenever facing a problem that "keeps recurring despite repeated fixes," first ask: "Am I looking at a snapshot or a process?"
+2. *Use equivalence transforms to migrate difficulty away from asymmetric problems* — SmoothQuant teaches us: if a problem is hard on side A and easy on side B, find a mathematically equivalent form that moves the difficulty to B. This pattern is reusable in many contexts — gradients, loss functions, model structure can all undergo "difficulty migration"
+3. *Match ruler granularity to phenomenon granularity* — the history of quantization is fundamentally a history of "rulers getting finer." If you are doing any work where a single statistic represents a group of objects, ask yourself: is the granularity appropriate? Are outliers inflating the mean? Do you need per-block / per-channel treatment?
+
+Practical landing points:
+
+- If you are training models with FP8, *watch NVFP4 developments* — it will very likely become the new standard by late 2026
+- If you are doing inference quantization, *don't look only at the outlier distribution at one moment* — the outlier pattern in the mid-to-late training phase is more stable, and a CHON-style detector can assist your inference quantization
+- If you are designing new architectures, *treat outlier-friendliness as a design constraint* — Softmax and SwiGLU are known outlier factories; replace them when you can

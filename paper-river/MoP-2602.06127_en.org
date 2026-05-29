@@ -1,0 +1,288 @@
+#+title:      Compressing LLMs with MoP: Mixture of Pruners
+#+date:       [2026-05-29 Fri 06:04]
+#+filetags:   :paper:river:pruning:llm:en:
+#+identifier: 20260529T060458-en
+#+source:     https://arxiv.org/abs/2602.06127
+#+authors:    Yamamoto, Alcantara, Zacarias, Mugnaini, Ogawa, Pellicer, Costa, Bollis, Reali Costa, Jordao
+#+venue:      arXiv preprint, Feb 2026
+
+* The River of Problems
+
+A 7B-parameter language model needs to run on your laptop — can you cut half its parameters, make it twice as fast, and keep it smart?
+
+This is hard because the model has no "obviously redundant" parts. It is not like a PNG you can JPEG-compress with visible savings — every parameter in a transformer works in concert. Where to cut, how to cut, and how to patch after cutting: each step risks a collapse.
+
+What makes it even more awkward is that you can prune "width" (fewer neurons/attention heads per layer) or prune "depth" (remove entire layers outright). The former is fine-grained but yields little speedup; the latter is blunt but fast. For three years the field charged down these two roads separately, and nobody seriously asked: *why not take both roads at once?*
+
+* Source Map
+
+#+begin_example
+[2023.05] LLM-Pruner (Ma et al.)
+  |
+  | Problem spotted: How to make LLM parameter pruning task-agnostic?
+  | Solution: Use gradient information to find coupled structural groups,
+  |           prune whole groups at once (founding father of width pruning)
+  v
+[2024.01] SliceGPT (Ashkboos et al., ICLR 2024)
+  |
+  | Problem spotted: LLM-Pruner's recovery cost is high on large models
+  | Solution: Exploit RMSNorm "computational invariance" + PCA to slice
+  |           entire rows/columns from weight matrices
+  v
+[2024.03] ShortGPT (Men et al.) -------- The rebel!
+  |
+  | Problem spotted: Everyone is pruning width, but a quick measurement shows —
+  |                  redundancy *between layers* far exceeds redundancy within layers
+  | Solution: Use Block Influence (input/output similarity) to delete entire layers
+  v
+[2024-2025] Depth camp vs. Width camp — parallel evolution
+  |
+  | Depth camp: LaCo (layer merging), Gromov 2025 (deeper layers first),
+  |             LLM-Streamline
+  | Width camp: AMP (Mugnaini 2025, activation-magnitude ranking),
+  |             SlimLLM, AmoebaLLM, CoMe
+  |
+  | Shared ceiling: single-road strategies all plateau
+  |   - Depth only: fast inference but accuracy cliff
+  |   - Width only: good accuracy but almost no speedup
+  v
+[2026.02] MoP: Mixture of Pruners (this paper)
+  |
+  | Problem spotted: Why choose? At every step, pit both roads against each
+  |                  other and take whichever wins — until the target is reached.
+  | Solution: Iterative framework: each round produces a depth candidate and a
+  |           width candidate; a path criterion (KL/PPL/random) picks the winner.
+#+end_example
+
+* Evolutionary Narrative
+
+The protagonist of this lineage is not any particular model, but a question that kept being dodged: *which dimension is actually more redundant in an LLM?* Over three years the answer flipped from "width" to "depth" and back — until someone said "stop choosing, take both."
+
+** 2023.05 | LLM-Pruner: The First Systematic Diet for LLMs
+
+*** What Problem It Saw
+
+Before LLM-Pruner, standard compression techniques (pruning, distillation) were task-specific — you needed a well-defined target task (e.g., cat-vs-dog classification) and pruned for that task. LLMs don't work that way; they must handle hundreds of tasks. Fine-tuning from scratch after every pruning run? Nobody can afford that on tens-of-billions-parameter models.
+
+*** Its Solution
+
+Ma et al. reasoned: instead of targeting a task, target *structure*. Many neurons in a transformer are "coupled" — a head's output in one layer is consumed by certain neurons in the next; cut the upstream and the downstream becomes an orphan. They did three things:
+
+1. *Dependency discovery*: starting from a neuron, trace the compute graph to identify all groups that depend on it.
+2. *Importance scoring*: use first- and second-order gradient information to score each group; low-scoring groups are removed wholesale.
+3. *LoRA recovery*: after pruning, fine-tune with LoRA on a small dataset for a few hours to restore performance.
+
+Result: LLaMA-7B pruned 20%, accuracy drops only 5%.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because LoRA-style parameter-efficient fine-tuning made "prune then patch" cheap. The field gained its first task-agnostic pruning paradigm.
+
+But it dug three pits:
+- Gradient computation requires backward passes, which is memory-hungry on large models.
+- Only width is pruned (attention heads / MLP neurons); the number of layers never changes.
+- On very large models (70B+), recovery cost is still terrifyingly high.
+
+That third pit became the entry point for the next paper.
+
+** 2024.01 | SliceGPT: Using Linear-Algebra Elegance to Cut Recovery Cost
+
+*** What Problem It Saw
+
+LLM-Pruner requires hours of fine-tuning to recover accuracy after pruning. On a 70B model that means multi-GPU training for days. Ashkboos et al. asked: can a *mathematical trick* make the pruned model "naturally" retain much of its performance, reducing dependence on recovery training?
+
+*** Its Solution
+
+They discovered a property of RMSNorm: if you multiply a layer's output by an orthogonal matrix Q and then pre-multiply by Q^T at the next layer's input, the entire network's output is *exactly unchanged*. This is called *computational invariance*.
+
+Since you can freely insert Q without affecting results, choose the cleverest Q: use PCA to find the principal-component directions of the activations, project the weight matrices onto that basis, then *slice away entire rows and columns* corresponding to the least important components.
+
+Result: LLaMA2-70B pruned 25%, zero-shot accuracy preserved at 99%. Inference cost on a consumer-grade 24 GB GPU drops to 64%.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because "pruning weights" was transformed into "pruning in the optimal basis" — in the principal-component basis, removing small coordinates has little effect on output. It is a clean mathematical result that doesn't rely on retraining.
+
+New pit: it still only prunes width (rows/columns); the layer count is untouched. And it carries an implicit assumption: *there is redundancy in the width direction*. The next paper attacks that assumption directly.
+
+** 2024.03 | ShortGPT: The Rebellion — Depth Is Actually More Redundant
+
+*** What Problem It Saw
+
+Men et al. stared at the results of LLM-Pruner and SliceGPT for a long time and noticed something strange: you spent all that ingenuity identifying which neuron to cut or which principal component to drop — but *removing an entire layer seems to work even better?*
+
+They ran the most naïve possible experiment: remove each layer of LLaMA2-7B one at a time and measure accuracy. The result was stunning: many middle layers (especially in the latter half) could be removed with almost no accuracy change.
+
+*** Its Solution
+
+Almost shockingly simple. Define a *Block Influence (BI)* metric:
+
+#+begin_example
+BI(layer_i) = 1 - cosine(input_i, output_i)
+#+end_example
+
+The more similar a layer's input and output are, the more useless that layer is (it barely changed the signal). Rank by BI ascending and delete entire layers.
+
+Result: LLaMA2-13B pruned 24.6%, accuracy preserved at 91.64%. At the same compression ratio, LLM-Pruner achieves only 70.67% and SliceGPT only 63.20%.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because the relationship between LLM training objectives and depth is nonlinear — adding layers yields diminishing returns past a certain point, leaving the extra layers as wasted capacity. *Deleting whole layers* also carries a hidden bonus: it directly shortens the sequential computation path, producing far more speedup than width pruning.
+
+New pits:
+- You cannot prune too many layers. Beyond ~30% the accuracy falls off a cliff — the granularity of "one whole layer" is too coarse.
+- This exposed a fundamental tension: *the depth route is blunt but fast; the width route is precise but slow.*
+
+The field split into two camps.
+
+** 2024–2025 | Two Parallel Evolutions: Depth Camp vs. Width Camp
+
+After ShortGPT, both sides refined their approaches, but nobody crossed over.
+
+*Depth camp* — grinding on "how to choose layers more cleverly":
+- *LaCo* (Yang 2024): instead of deleting layers, *merge* adjacent ones. More information is retained.
+- *Gromov 2025*: theoretical argument that deeper layers should be pruned first, simplifying the selection strategy.
+- *LLM-Streamline* (Chen 2025): further refinements to the BI metric.
+
+*Width camp* — grinding on "how to choose neurons more cleverly":
+- *AMP* (Mugnaini 2025, overlapping authors with this paper): rank heads and neurons by activation magnitude, prune uniformly across layers.
+- *SlimLLM*, *AmoebaLLM*, *CoMe*, *LinearPatch*: various new importance measures.
+
+Both camps published within their own lane. *Nobody systematically asked: can both roads be taken simultaneously?*
+
+That question is MoP's entry point.
+
+** 2026.02 | MoP: Stop Choosing — Let Both Roads Compete at Every Step
+
+*** What Problem It Saw
+
+After finishing AMP, the Jordao team (including Mugnaini) saw one thing clearly:
+
+- Width only: prune 40% and accuracy holds, but inference barely speeds up.
+- Depth only: inference speeds up 40%, but accuracy crashes from 65 to 45.
+
+The two roads are *complementary*. Yet people assumed they had to pick one, because different pruning metrics use different "currencies" — how do you compare "remove one attention head" against "remove an entire layer" and know which is the better deal?
+
+*** Its Solution
+
+MoP's core idea is simple: *let the candidates compete*. At each step:
+
+1. Select a candidate layer to prune (using a layer criterion, e.g., third-from-last).
+2. Compute c_t, the fraction of total parameters that layer represents.
+3. Build two candidate models simultaneously:
+   - *Width candidate*: keep this layer, but prune c_t of parameters globally by width (using AMP).
+   - *Depth candidate*: delete the layer outright.
+4. Give both candidates a brief recovery fine-tune (on a small dataset).
+5. Score both with a path criterion (KL / PPL / random / cosine).
+6. *Commit* the winning road (using its untuned version — fine-tuning was only for fair scoring).
+7. Repeat until the target compression ratio is reached; apply a final LoRA recovery pass.
+
+Note the Easter egg in step 5: they tried KL, PPL, cosine, and *random* — and found that *random* performs about as well as carefully designed metrics. This means that as long as both roads have a chance to be selected, the mixture itself has already won.
+
+Results (LLaMA-2 7B):
+
+| Compression | MoP   | Best single baseline        |
+|-------------+-------+-----------------------------|
+| 20%         | 65.22 | 64.90 (AmoebaLLM)           |
+| 30%         | 61.54 | 61.02 (AMP)                 |
+| 40%         | 55.37 | 53.06 (AMP)                 |
+
+The speedup story is even more striking: at 30% compression, MoP achieves 1.38× speedup — *faster than Yang et al. at 50% compression*.
+
+*** Why It Worked (and What Pits It Dug)
+
+It worked because width and depth have differently shaped "cost curves." Early in compression, width pruning is the better deal (preserves accuracy); late in compression, depth pruning is the better deal (when you've already cut a lot, removing a whole layer hurts less than removing a few neurons). MoP's iterative selection automatically picks the currently cheaper option at every step — it is essentially a *greedy Pareto-frontier search*.
+
+New pits:
+- Every step requires training two candidates before picking one, so *training cost roughly doubles*.
+- The path criterion works even when random, suggesting the framework's "selection intelligence" is still weak — a better metric is waiting to be invented.
+- Only two dimensions are fused. Quantization, distillation, KV-cache compression, and other orthogonal directions have not been integrated.
+
+* Frontier Extensions
+
+MoP is a February 2026 paper and no public follow-up has directly critiqued it yet. Foreseeable directions:
+
+- *Three-dimensional fusion*: add a quantization candidate (INT4 / MXFP4 vs. depth vs. width) inside MoP's iteration, expanding the choice space to three dimensions.
+- *Learned path criterion*: train a small model to predict which road wins at each step, replacing random selection.
+- *Hardware-aware scoring*: let the path criterion consider actual latency on target hardware, not just accuracy (the same 1B parameters pruned from width vs. depth may have very different payoffs on an H100 vs. an edge chip).
+
+As of May 2026, MoP represents the latest public advance along this lineage.
+
+* One Diagram
+
+#+begin_example
+              The "Dimension War" in LLM Compression (2023 – 2026)
+              ======================================================
+
+       Width dimension (W)                        Depth dimension (D)
+       (prune neurons / attention heads)           (prune entire layers)
+            |                                            |
+ 2023.05    | LLM-Pruner                                |
+ (founder)  | task-agnostic, gradient + coupled groups  |
+            | prune 20%, drop 5%, needs LoRA recovery   |
+            v                                            |
+ 2024.01    | SliceGPT                                  |
+            | RMSNorm invariance + PCA                  |
+            | 70B prune 25% keep 99%, elegant            |
+            | but still width-only                      |
+            v                                            |
+ 2024.03    |                              ShortGPT     |
+ (turning   |                  Block Influence:         v
+  point!)   |                  input/output similarity  |
+            |                  -> delete layers         |
+            |                  13B prune 25% keep 91.6%|
+            |                  finding: depth redundancy|
+            |                           > width         |
+            |                                            |
+ 2024-2025  | AMP, SlimLLM,               LaCo,         |
+ (parallel  | AmoebaLLM, CoMe             Gromov,       |
+  advances) | (ever-finer metrics)        Streamline    |
+            |                             (smarter layer|
+            |                              selection)   |
+            |                                            |
+            | <-- No one crosses over. Deadlock: ------> |
+            |     "accuracy first  -> go width"          |
+            |     "speed first     -> go depth"          |
+            |     must pick one                          |
+            |                                            |
+ 2026.02    +----------+ MoP +----------+
+            |          |                |               |
+            | At each step, build one candidate per road|
+            | Short fine-tune, then compete;            |
+            | the winner's road advances                |
+            |                                           |
+            | Result: accuracy beats all single-dim     |
+            |         baselines across the board        |
+            |         40% compression -> 39% speedup    |
+            |                                           |
+            | Easter egg: random selection still wins   |
+            |  — the mixture itself is the victory      |
+#+end_example
+
+* Insight
+
+On the surface this lineage looks like "pruning methods getting more refined." But what is really happening underneath is *researchers being repeatedly proven wrong about where the redundancy lives*.
+
+- 2023 consensus: width has redundancy (LLM-Pruner, SliceGPT).
+- 2024 reversal: no — depth is the bigger source of redundancy (ShortGPT ground everyone's faces in the dirt empirically).
+- 2024–2025 split: the two camps each believe their own dimension matters more.
+- 2026 realization: there is no such thing as "which dimension is more redundant" — *the cost curves of the two dimensions have different shapes*. Early on, width pruning is cheaper; late on, depth pruning is cheaper. The question is not which side to take, but how to switch dynamically.
+
+This is a deep metaphor. Many "camp wars" in ML follow this pattern — people think they are arguing about which method is correct, but every method is correct in a different regime. Real progress is inventing a *selection mechanism* that lets approaches compete. MoP's core contribution is not a new metric; it is a framework that lets old metrics *fight each other*.
+
+Pushed further: MoP shows *even random selection wins*. That means many "refined methods" in the field are essentially only being compared against "do nothing" — the moment you introduce selectivity, half the victory is already yours.
+
+The most likely next step: *learn the selection mechanism itself*. Random → heuristic → learned policy. LLM pruning will become a small AutoML problem.
+
+* Takeaways
+
+For researchers: *when two opposing camps have been fighting for years, look for a way to make them compete rather than picking a side*. That is usually more productive than inventing a third approach.
+
+For engineers: *"why not use both" is a severely underrated methodology*. Many engineering decisions are framed as A vs. B, but the real gains come from iteratively and selectively using A and B together.
+
+For paper readers: *shifting the axis of difference is the real innovation*. MoP has no dazzling new mathematical tools — AMP is someone else's, Block Influence is someone else's, LoRA is someone else's. What it innovates is the *perspective*: reframing "pruning methods" as "pruning candidates" and letting the candidates race. When reading a paper, always ask: "Is this paper changing the technology, or is it changing the way the problem is seen?"
+
+Practical takeaways:
+- In reviews, don't just criticize "the authors used A but not B" — ask "did the authors let A and B compete?"
+- When doing pruning / quantization / compression engineering, adopt MoP's "two candidates per step, pick one" as a default paradigm — whether you are compressing LLMs, CNNs, or KV caches.
+- Generalize this thinking to any "Camp A vs. Camp B" engineering decision (database index selection, scheduling policy, prompt template selection): rather than committing to one, let the runtime pick based on the data.

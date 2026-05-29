@@ -1,0 +1,298 @@
+#+title:      DFlash: Block Diffusion for Flash Speculative Decoding
+#+date:       [2026-05-29 Fri 06:01]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T060120-en
+#+source:     https://arxiv.org/abs/2602.06036
+#+authors:    Jian Chen, Yesheng Liang, Zhijian Liu
+#+venue:      ICML 2026
+
+* The Problem River
+
+During large-language-model inference, why does a GPU capable of hundreds of TFLOPS per second still produce tokens at roughly the speed of human typing?
+
+The root cause is autoregression — the next token cannot be computed until the previous one has landed. GPU compute floats on the surface like duckweed, spending most of its time waiting for memory bandwidth to ferry tokens one by one. A road wide enough for people to walk abreast has been squeezed into a single-file footbridge.
+
+Everyone working on this river is trying to widen that footbridge. But each generation of solutions widens it a little, only to reveal a new bottleneck — until DFlash finally pushes the bottleneck all the way up to the drafting step itself.
+
+* The Source Map
+
+#+begin_example
+[2022] Leviathan et al. - Speculative Decoding
+  |
+  | Observed: autoregressive one-token-at-a-time output, GPU idle
+  | Solution: small model drafts a sequence; large model verifies in parallel
+  v
+[2024] Medusa (Cai et al.)
+  |
+  | Observed: the "small model" is itself autoregressive — still slow
+  | Solution: attach multiple prediction heads to the large model, emit several tokens at once
+  v
+[2024] EAGLE (Li et al.)
+  |
+  | Observed: Medusa heads share no information with each other — poor quality
+  | Solution: lightweight autoregressive drafting at the hidden-state level
+  v
+[2024] EAGLE-2
+  |
+  | Observed: EAGLE uses a fixed draft tree, wasting the token budget
+  | Solution: dynamic tree — expand branches based on confidence scores
+  v
+[2025] EAGLE-3 (SOTA baseline)
+  |
+  | Observed: the draft model is still autoregressive; latency piles up for long drafts
+  | Solution: multi-layer feature fusion + scaling, pushing single-step quality to the limit
+  v
+[ Still bottlenecked: the draft model must unroll serially ]
+  |
+  +-- A parallel river --+
+                         |
+   [2025] LLaDA - Large Language Diffusion Models
+     |
+     | Observed: autoregression is inherently non-parallelisable
+     | Solution: diffusion denoising over an entire text span, emitting tokens at once
+     v
+   [2025] Block Diffusion (Arriola et al.)
+     |
+     | Observed: full-span diffusion collapses in quality on long text
+     | Solution: chunk the text — diffusion within blocks, autoregression across blocks
+     v
+   [2025] DiffuSpec / SpecDiff-2
+     |
+     | Observed: diffusion emits multiple tokens per forward pass — why not use it as a drafter?
+     | Solution: plug a diffusion model into speculative decoding as the drafter
+     v
+[2026] DFlash <----------------- target paper
+  |
+  | Observed: existing diffusion drafters are disconnected from the target model; acceptance rate stalls
+  | Solution: block-diffusion drafter + inject target-model hidden features
+  v
+[ 6× lossless speedup, 2.5× faster than EAGLE-3 ]
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | Speculative Decoding: Let the Small Model Guess First, the Large Model Verifies
+
+*** What problem did it see?
+
+Running a 70B model directly means moving the entire model's weights from memory for every single token emitted. Compute is actually sitting idle — bandwidth is the bottleneck. The hardware can execute hundreds of operations per second, but can only stream weights tens of times per second, so only tens of tokens emerge per second.
+
+*** Its solution
+
+A much smaller "draft model" guesses 5–10 tokens in one shot, then the entire sequence is fed to the large model at once, which verifies each position in parallel.
+
+Accepted positions are adopted directly; the first rejected position discards everything that follows, and generation continues from there.
+
+The cost of one large-model verification pass ≈ the cost of generating one token (because verification is parallel), yet it can advance by 5 tokens at a time. Bandwidth utilization goes up.
+
+*** Why it worked (and where the new trap was buried)
+
+Mathematically elegant: it can be proven that the output distribution is identical to the original model — no quality loss.
+
+But the trap is right there — *when that small model generates those 5 draft tokens, isn't it being autoregressive again?* Yes. If the draft model itself is slow, the whole speedup is dragged back down.
+
+The next generation's job: make the drafting step itself non-serial.
+
+** 2024 | Medusa: Forget the Small Model — Grow Extra Heads on the Large One
+
+*** What problem did it see?
+
+Speculative decoding requires training and maintaining a separate small model — awkward to deploy. And to stay fast the small model must stay small, so draft quality is low and acceptance rates are low. Most critically — *the small model still takes 5 autoregressive steps to produce 5 draft tokens*.
+
+*** Its solution
+
+Abandon the concept of a separate draft model entirely. Attach N prediction heads in parallel to the large model's final hidden state — head 1 predicts the next token, head 2 predicts the one after that, …, head N predicts the Nth future token. One forward pass, N candidates.
+
+No small model. No serial drafting.
+
+*** Why it worked (and where the new trap was buried)
+
+All N heads share the same large-model backbone — simple to deploy. A single large-model forward pass simultaneously yields drafts and probabilities for verification.
+
+New trap: *the N heads never talk to each other*. When head 2 predicts the token two positions ahead, it has no idea what head 1 predicted for the very next position. From its perspective, the next token is an unobserved random variable. Heads further out become increasingly blurry; acceptance rate drops fast.
+
+** 2024 | EAGLE: Draft at the Feature Level — Fast and Context-Aware
+
+*** What problem did it see?
+
+Medusa heads share no information, so draft quality has a low ceiling. But making heads communicate autoregressively brings serial computation right back. Is there a level lighter than tokens where autoregression can still be done?
+
+*** Its solution
+
+Observation: every layer of a large model passes along a hidden state, and that state is where the true semantics live. EAGLE trains a very lightweight autoregressive drafter that operates at the *feature level* — it takes the previous step's hidden feature and token embedding as input, produces the next step's feature, and passes it through a lightweight head to get a token.
+
+Think of it as: the drafter is a "shadow of a miniature large model," fast to run, but it generates hidden features rather than raw tokens.
+
+*** Why it worked (and where the new trap was buried)
+
+Feature-level drafting preserves context; acceptance rates are considerably higher than Medusa.
+
+But it is still serial — drafting token k requires having first drafted token k−1. When you want longer drafts (say 8 tokens) to chase bigger speedups, the latency of the drafting step itself starts to accumulate.
+
+** 2024–2025 | EAGLE-2 / EAGLE-3: Taking Serial Drafting to Its Absolute Limit
+
+*** What problems did they see?
+
+EAGLE uses a fixed-shape draft tree (e.g., 4 candidates per step, 5 steps), but in practice some positions are highly certain (one candidate suffices) while others are ambiguous (many branches needed). A fixed shape either wastes the budget or falls short.
+
+*** Their solutions
+
+EAGLE-2: *Dynamic tree*. Based on per-step confidence, decide which branches to expand further and which to prune. Token budget goes exactly where it matters.
+
+EAGLE-3: Go further — fuse hidden features from multiple layers to feed the drafter, then scale the drafter up. Push single-step quality to the ceiling of what any autoregressive drafting framework can achieve — and become the SOTA on this track.
+
+*** Why it worked (and where the new trap was buried)
+
+EAGLE-3 has squeezed virtually every last drop from the "autoregressive drafting" paradigm.
+
+But the fundamental ceiling has not moved: *drafting is still serial*. Drafting token 8 requires first having tokens 1–7's features. The longer the draft, the slower the drafting, and the speedup gain gets eaten by drafting latency.
+
+This road has reached its end. To go further, a non-serial drafting method is needed — and at that moment, the other river had just arrived.
+
+** 2025 | LLaDA / Block Diffusion: The Other River — Non-Serial Language Models
+
+*** What problems did they see?
+
+This line of work questions something more fundamental: *why must text generation be autoregressive?* Image generation abandoned autoregression long ago — diffusion models can produce an entire image in one shot. Can text do the same?
+
+*** Their solutions
+
+LLaDA: treat an entire text span as an "image," mask everything, then apply diffusion denoising to emit multiple tokens at once, refining iteratively.
+
+It quickly became clear, however, that full-span diffusion collapses in quality on long text — long-range dependencies are too complex for one-shot denoising.
+
+Block Diffusion (Arriola et al.): *diffusion within blocks, autoregression across blocks*. Slice the text into chunks (e.g., 16 tokens per chunk); chunks are generated left-to-right like a GPT, but within each chunk all tokens are emitted at once via diffusion.
+
+This preserves diffusion's parallelism while retaining autoregression's stability across long spans.
+
+*** Why it worked (and where the new trap was buried)
+
+Block diffusion approaches autoregressive LLM quality while being substantially faster to generate.
+
+But as a standalone language model, its absolute quality still falls short of a pure autoregressive large model — it cannot simply replace a production LLM. It needs a setting where speed matters much more than absolute quality ceiling.
+
+That setting? Drafting.
+
+** 2025 | DiffuSpec / SpecDiff-2: The Two Rivers Merge
+
+*** What problems did they see?
+
+The EAGLE line maximised draft quality but drafting must be serial. Block diffusion can emit a sequence in parallel but lags behind autoregressive large models in quality.
+
+Each side has the exact weakness the other side can fix. Why not plug a diffusion model into speculative decoding as the drafter? Parallelism from diffusion, final quality guaranteed by the target model's verification.
+
+*** Their solution
+
+A literal combination: train a small diffusion model as the drafter; one forward pass produces K candidate tokens; hand them to the target large model for parallel verification.
+
+*** Why it worked (and where the new trap was buried)
+
+Drafting is no longer serial — a single forward pass produces an entire draft block.
+
+But a new problem emerges: *the diffusion drafter and the target model live in two separate worlds*. The drafter has no visibility into what the target model is thinking; it can only guess from the token context it has seen. Acceptance rates stall — tokens the drafter finds perfectly reasonable may not satisfy the target model.
+
+The theoretical speedup looks great; the real-world speedup is discounted.
+
+** 2026 | DFlash: Let the Drafter "See" What the Target Model Is Thinking
+
+*** What problem did it see?
+
+The DiffuSpec line proved that "diffusion drafting" is the right direction, but the drafter–target disconnect tanks acceptance rates. The EAGLE line is the exact opposite — drafter and target are tightly coupled (shared features), acceptance rates are high, but drafting is serial.
+
+Can both advantages coexist? Draft with block diffusion (parallel), while feeding the drafter the target model's hidden features (tight coupling)?
+
+*** Its solution
+
+DFlash's drafter is a block-diffusion model: one forward pass emits K draft tokens. The key is that its input includes not only the token context but also the *hidden features already computed by the target model*.
+
+This is effectively grafting EAGLE's tight feature-level coupling onto block diffusion's one-shot parallel generation.
+
+Drafting is no longer serial, and draft quality is high.
+
+*** Why it works
+
+Two independent bottlenecks are broken simultaneously:
+- Drafting latency: reduced from K steps to 1 step (block diffusion)
+- Draft quality: because the drafter consumes target-model features, acceptance rates match or exceed EAGLE-3
+
+Result: 6× lossless speedup, 2.5× faster than EAGLE-3.
+
+* Frontier Extensions
+
+DFlash is among the most recent advances on this line. Foreseeable next steps:
+
+- *Deeper feature injection*: currently only hidden features are injected; future work may bring in attention KV caches, intermediate-layer activations, and richer target-model state
+- *Cross-block diffusion*: current design uses diffusion within blocks and autoregression across them — could multiple blocks diffuse simultaneously with lightweight inter-block coordination?
+- *Adaptive draft length*: dynamically adjust the per-diffusion draft length based on context difficulty
+
+The river is still flowing. But DFlash is the first work to genuinely move "serial drafting" — a long-standing immovable bottleneck — out of the way.
+
+* One Diagram
+
+#+begin_example
+                  Draft quality (acceptance rate)
+                       ^
+                       |
+                       |  [EAGLE-3]      [DFlash]  <- 6×, 2.5× faster than EAGLE-3
+                       |     *              *
+                       |   [EAGLE-2]      / |
+                       |     *           /  |
+                       |  [EAGLE]       /   |
+                       |   *           /    |
+                       | [Medusa]     /     |
+                       |   *         /      |
+                       |[SpecDec]   /  [DiffuSpec/SpecDiff-2]
+                       |   *        *
+                       |          /
+                       |        /
+                       |      /  [Block Diffusion]
+                       |    /        *
+                       |  /  [LLaDA]
+                       |/      *
+                       +------------------------------------>
+                          Serial drafting           Parallel drafting
+
+   ┌──────────────────────┐         ┌──────────────────────┐
+   │  Autoregressive       │         │  Diffusion LM river   │
+   │  drafting river       │ ====>  │  Bottleneck: quality  │
+   │  Bottleneck: serial   │  merge │  not strong enough    │
+   │  Solution: smarter    │        │  Solution: chunking + │
+   │  drafters each gen    │        │  iterative refinement │
+   └──────────────────────┘         └──────────────────────┘
+                  \                     /
+                   \                   /
+                    v                 v
+                ┌──────────────────────────┐
+                │  DFlash:                  │
+                │  Parallel drafting +      │
+                │  target-model features    │
+                │  Both bottlenecks broken  │
+                └──────────────────────────┘
+#+end_example
+
+* Insight
+
+*Bottlenecks migrate.*
+
+The first generation's bottleneck was "large-model inference is slow"; the solution was "draft with a small model." The bottleneck shifted to "the small model itself is slow."
+The second generation discarded the small model in favour of multi-head prediction; the bottleneck shifted to "heads don't share information — poor quality."
+The third generation had heads communicate at the feature level; the bottleneck shifted to "that communication is still serial."
+The fourth generation squeezed every last gain from dynamic trees and scaling; the bottleneck shifted to "the serial paradigm itself."
+
+Each generation believed it was solving the final bottleneck, yet as long as the paradigm stayed fixed, a new bottleneck grew up from within it.
+
+What DFlash actually does is *change the paradigm* — not make autoregressive drafting smarter, but acknowledge that autoregressive drafting has an intrinsic ceiling, then borrow from the neighbouring river (diffusion) a mode of generation that is not serial by nature.
+
+Looking more broadly, *many breakthroughs arise from the confluence of two independently evolved rivers*. Diffusion on its own cannot beat autoregression for LLMs; autoregressive drafting on its own is blocked by seriality; but when the two rivers merge, each side's weakness is neutralised by the other's strength.
+
+What comes next? A predictable direction: once drafting is fully parallelised, the next bottleneck surfaces — verification. Is one large-model forward pass really enough to verify 32 draft tokens? What happens to prefix-attention complexity under long drafts? The river will continue flowing toward the verification side.
+
+* Takeaways
+
+*A method for finding problems: walk upstream.*
+
+If you want to understand a new research direction, don't start with the latest paper. Dig backwards — all the way to the very first problem this line set out to solve. Each paper is a response to the deficiencies of the one before it. Chain together all the "flaw → response" pairs and you hold the true heartbeat of the field.
+
+*Borrow strength across domains.* When a path in your field runs to its end, look at neighbouring fields for anyone doing "formally different but essentially the same" work. When speculative decoding reached the EAGLE-3 ceiling, the rescue party arrived from the image-generation world in the form of diffusion models.
+
+*What this means for you:* the next time you're stuck at an engineering bottleneck, first ask — "is this bottleneck buried in the surface of the paradigm, or in the paradigm's foundations?" Surface-level: keep optimising. Foundational: change the paradigm — and you don't necessarily have to invent the new one yourself. The neighbour might already have it.

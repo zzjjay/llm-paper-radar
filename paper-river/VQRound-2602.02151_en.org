@@ -1,0 +1,252 @@
+#+title:      Revisiting Adaptive Rounding with Vectorized Reparameterization for LLM Quantization
+#+date:       [2026-05-29 Fri 05:34]
+#+filetags:   :paper:river:quantization:en:
+#+identifier: 20260529T053452-en
+#+source:     https://arxiv.org/abs/2602.02151
+#+authors:    Yuli Zhou, Qingxuan Chen, Luca Benini, Guolei Sun, Yawei Li
+#+venue:      arXiv preprint, Feb 2026 (submitted to ICLR 2026, withdrawn)
+
+* The River of the Problem
+
+Compressing a hundred-billion-parameter model from 16-bit to 4-bit means every weight number must be "rounded" onto a small grid. The most naïve approach—rounding each weight to its nearest grid point—turns out to be wrong. But doing "smart rounding" requires pairing every weight with a tiny switch that records "round up or round down." A model with tens of billions of parameters needs tens of billions of switches. The core question of this line of work can be stated in one sentence: *Can we achieve smart rounding without storing tens of billions of switches?*
+
+The difficulty is that both ends of the problem are blocked. On the mathematical side: as early as 2020, researchers proved that each weight's "up/down" choice interacts with all others—they cannot be decided independently and must be treated as one enormous joint optimization problem. On the engineering side: jointly optimizing tens of billions of binary variables crashes GPU memory just on storage, let alone training. For six years, successive generations of researchers have taken turns looking for a way to compress those switches without losing their intelligence. VQRound is the latest attempt along this line.
+
+* Source Map
+
+#+begin_example
+[2020] Nagel et al. - AdaRound
+  |
+  | Problem: Rounding to nearest ignores inter-weight interactions
+  |          (Hessian off-diagonal terms)
+  | Solution: Treat "up or down" as a learnable continuous variable,
+  |           relax with sigmoid + annealing
+  | Open pit: One variable per weight — manageable on ResNet, unscalable on LLMs
+  v
+[2021] Li et al. - BRECQ
+  |
+  | Problem: AdaRound reconstructs layer-by-layer, ignoring cross-layer
+  |          interactions within the same block
+  | Solution: Switch to block-by-block reconstruction, closer to global optimum
+  | Open pit: Number of optimization variables unchanged — still as large as W
+  v
+[2023] Lee et al. - FlexRound
+  |
+  | Problem: AdaRound's additive form cannot leverage the magnitude of
+  |          original weights
+  | Solution: Switch to multiplicative form (element-wise division), letting
+  |           large weights automatically receive larger adjustments
+  | First to run successfully on LLMs, but one independent scale per weight
+  |   → overfits badly with few calibration samples
+  v
+[2024] Shao et al. - OmniQuant
+  |
+  | Observation: The rounding matrix is "hard to optimize in LLM due to its
+  |              huge solution space"
+  | Detour: Stop learning rounding; instead learn clipping thresholds +
+  |         equivalent transformations (LWC + LET)
+  | Open pit: The detour works, but the cross-element error-cancellation
+  |           dividend is left on the table
+  v
+[2025] Lee et al. - LRQ
+  |
+  | Problem: FlexRound's scale matrix is as large as W → severe overfitting
+  |          on LLMs (MMLU accuracy drop)
+  | Solution: Factorize the scale matrix into two low-rank matrices A * B,
+  |           drastically reducing parameter count
+  | Open pit: Low-rank ≈ best L2 approximation ≈ hostile to outliers,
+  |           yet LLM weights are heavy-tailed
+  v
+[2026] Zhou et al. - VQRound  <-- this paper
+  |
+  | Problem: Low-rank compression works for uniform distributions, but LLM
+  |          weights are heavy-tailed; outliers get flattened by low-rank
+  | Solution: Replace low-rank with vector quantization (VQ) — a small
+  |           codebook; each row of the rounding matrix picks its nearest
+  |           codeword
+  |           VQ loss target is L_inf (worst case), not L2 (average)
+  |           → outliers are not sacrificed
+  | Extra:    Emphasizes that initialization is an underrated key factor;
+  |           provides an end-to-end codebook fine-tuning pipeline
+#+end_example
+
+* Evolutionary Narrative
+
+** 2020 | AdaRound: The First to Say "Round to Nearest" Is Wrong
+
+*** What Problem It Saw
+
+Before 2020, every quantization method assumed one thing: to quantize weight 0.73 to 4-bit, you should send it to its nearest grid point (say, 0.75). After writing out the second-order Taylor expansion of the task loss, Nagel et al. found this to be wrong—wrong precisely because of the off-diagonal terms of the Hessian matrix.
+
+The intuition: whether you choose "round up" or "round down" for weight A affects which choice for weight B minimizes the final output error. All weights' up/down decisions are coupled. Independently rounding each weight to its nearest grid point ignores all coupling—it is a purely local greedy strategy. Experiments on CNNs gave a direct counter-example: deliberately rounding certain weights to a farther grid point often produced higher final accuracy.
+
+*** Its Solution
+
+Relax each weight's binary up/down choice into a continuous variable in [0, 1], held in place by a modified sigmoid, and anneal it toward 0 or 1 so that gradient descent can be used. To avoid computing the full global Hessian, the authors assumed it is block-diagonal and optimized each layer independently.
+
+*** Why It Works (and What New Pit It Digs)
+
+It works because intra-layer coupling is partially captured—implicitly, through the layer-wise reconstruction loss.
+
+The pit it digs is scale. AdaRound stores one continuous variable per weight. On ResNet-50 that is tens of millions—manageable. On LLaMA-70B that is tens of billions—just storing these variables exhausts GPU memory, let alone running thousands of optimization steps. This "one variable per weight" design became the ceiling that every subsequent paper over the next five years tried to break.
+
+** 2021 | BRECQ: Upgrading from Layer-Wise to Block-Wise
+
+*** What Problem It Saw
+
+AdaRound optimizes each layer independently. But within a Transformer block, several attention and MLP layers are tightly coupled—a small error in one layer is amplified or cancelled by the next. Optimizing each layer in isolation severs this coupling chain.
+
+*** Its Solution
+
+Replace the single-layer reconstruction unit with a block (several layers grouped together). The optimization objective becomes: "the output of this block should be as close as possible to the FP version's output."
+
+*** Why It Works (and What New Pit It Digs)
+
+By capturing intra-block coupling, BRECQ consistently outperforms AdaRound in accuracy.
+
+But the parameter-scale problem is untouched—each weight still has its own independent rounding variable. BRECQ advanced the "coupling capture" front by one step while leaving "parameter compression" entirely to future work.
+
+** 2023 | FlexRound: The First to Actually Run Adaptive Rounding on LLMs
+
+*** What Problem It Saw
+
+AdaRound and BRECQ both use the form "original value + a learned small offset." Lee et al. observed that this additive form cannot leverage weight magnitude: a large weight of absolute value 5.0 and a small weight of 0.05 enjoy the same absolute adjustment budget, which is clearly unreasonable. A large weight crossing even one grid spacing requires a huge shift; a small weight may never cross a grid boundary no matter how much it is adjusted.
+
+*** Its Solution
+
+Replace additive offsets with multiplicative scale factors (element-wise division). Each weight learns a scale factor s; the rounded value becomes round(w / s) × s. Under the chain rule, the gradient automatically carries a 1/s factor—larger weights automatically get larger scales, and the adjustment range expands proportionally. This is the first time this line of work explicitly adopted "leverage original magnitude" as a design principle.
+
+In experiments, FlexRound was the first to achieve PTQ results on LLMs almost indistinguishable from FP16.
+
+*** Why It Works (and What New Pit It Digs)
+
+Multiplicative form is naturally better suited to heavy-tailed distributions than additive form—that is the core intuition.
+
+But the pit arrives immediately: each weight still has its own independent scale. LLM calibration uses only 128 samples; with tens of billions of independent scales, overfitting is inevitable. The LRQ paper later included a dedicated figure proving this: FlexRound achieves very low RMSE on the calibration set but collapses on the MMLU test set—classic overfitting when parameters vastly outnumber data.
+
+** 2024 | OmniQuant: Sidestepping the Problem Instead of Fighting It Head-On
+
+*** What Problem It Saw
+
+Shao et al. wrote a key sentence directly in their paper: "the rounding matrix is hard to optimize in LLM due to its huge solution space." Translation: with one rounding variable per weight and tens of billions of variables, the solution space is so large that 128 calibration samples cannot constrain it.
+
+*** Its Solution
+
+Abandon rounding learning entirely and learn something else instead—a learnable weight clipping (LWC, learning a truncation threshold dedicated to suppressing outliers) plus a learnable equivalent transformation (LET, migrating activation outliers to the weight side). Both new components have very few learnable parameters combined—no more than tens of millions total—which 128 samples can handle.
+
+*** Why It Works (and What New Pit It Digs)
+
+Accuracy surpasses all previous PTQ methods and even rivals QAT. The cost: this approach completely abandons the "cross-element error cancellation" dividend that AdaRound introduced. It found an exit on the side path of "pruning outliers + variable substitution," but made no further progress on rounding itself.
+
+This left a clear signal for future work: the rounding path is not dead, but continuing along it requires solving the "too many parameters" problem.
+
+** 2025 | LRQ: Compressing the Scale with Low-Rank Matrices
+
+*** What Problem It Saw
+
+FlexRound's scale matrix S is the same size as the weight matrix W—that is the root cause of overfitting.
+
+*** Its Solution
+
+Factorize S into the product of two thin matrices A * B (low-rank decomposition). If W is 4096×4096, S is also 4096×4096, holding 16 million parameters. Replacing it with A: 4096×16 and B: 16×4096 drops the parameter count to 130 thousand—a compression of over 100×.
+
+*** Why It Works (and What New Pit It Digs)
+
+Fewer parameters means less overfitting. LRQ recovers the accuracy on MMLU that FlexRound lost.
+
+But low-rank decomposition carries an implicit assumption: the "main signal" of the original matrix is concentrated in its top few singular vectors. This holds for uniform or Gaussian distributions, but *not for heavy-tailed distributions*. LLM weights are exactly heavy-tailed—a small number of weights have absolute values far larger than the rest; they are not noise but critical signal. When minimizing L2-norm error, low-rank approximation automatically "smears" these outliers into the background, causing the most important weights to be the most distorted.
+
+This pit directly gave rise to VQRound.
+
+** 2026 | VQRound (This Paper): Codebook Instead of Low-Rank, Targeting the Worst Case
+
+*** What Problem It Saw
+
+VQRound's authors articulated the flaw in LRQ precisely: low-rank compression is fundamentally "finding the best approximation in the L2 sense." L2 norm treats all elements equally; outliers get averaged away. But LLM weights are heavy-tailed, and outliers are exactly the parts that must be represented most accurately. In other words: when compressing the rounding matrix, the objective function was chosen wrong.
+
+They also identified something severely underappreciated before: *initialization* of the rounding variables. Previous works focused entirely on objective functions and optimizers, with no serious attention paid to the starting point from which the rounding variables begin optimization. If the initial rounding is too far from the FP residual structure, even the most sophisticated optimizer will fail to converge.
+
+*** Its Solution
+
+Two things:
+
+1. *Replace low-rank with VQ.* Instead of the linear low-rank form A * B, build a small codebook (e.g., 256 vectors) and let each row of the rounding matrix look up its nearest codeword in the codebook. The compression ratio can still exceed 100×, but the optimization objective changes—VQ naturally minimizes the *maximum* distance from each element to its nearest codeword (L_inf), rather than the average (L2). Outlier rows are not sacrificed.
+
+2. *Elevate initialization to a first-class concern.* Working together with existing PTQ pipelines such as GPTQ, VQRound uses their rounding results to initialize the codebook, then fine-tunes end-to-end. Only 128 samples are used, with joint optimization across all layers.
+
+Trainable parameters are reduced to 0.2% of the original.
+
+*** Why It Works (and What New Pit It Digs)
+
+Intuitive explanation: low-rank means "spanning a subspace with a set of continuous directions"; VQ means "assembling from a set of discrete atoms." The former suits smooth distributions; the latter suits the "few critical + many ordinary" structure—which is exactly what LLM weights look like. The L_inf objective further guarantees: no matter how small a critical outlier is, at least one codeword is close enough to it.
+
+New pits dug: codebook size K is a new hyperparameter; how the codebook should be shared or not shared across layers is an open question; and VQ optimization is non-differentiable—the authors work around this with GPTQ initialization and end-to-end fine-tuning, but the theoretical convergence guarantees remain thin.
+
+* Frontier Extensions
+
+VQRound is a February 2026 paper, currently in withdrawn status on OpenReview as an ICLR 2026 submission. A contemporaneous related work, DiVeQ (2025/26), takes a different path—using the reparameterization trick to make VQ itself differentiable—but targets VQ-VAE-style generative models and does not directly connect to LLM PTQ.
+
+An honest one-sentence summary of developments after the target paper: as of the time of writing (May 2026), no direct successor to VQRound appears in the public literature. Whether "codebook instead of low-rank" will become a new standard remains to be seen over the coming year.
+
+* One Figure to Understand It All
+
+#+begin_example
+                 "How to reduce parameters in the rounding matrix"
+
+  Parameter compression ratio
+       ^
+       |
+  100x |                                    LRQ          VQRound
+       |                                 (low-rank A*B)  (VQ codebook)
+       |                                 L2 objective    L_inf objective
+       |                                 hostile to      friendly to
+       |                                 heavy tails     heavy tails
+       |
+   10x |                       OmniQuant
+       |                       (bypasses rounding)
+       |                       learns clipping + LET
+       |
+    1x | AdaRound -- BRECQ -- FlexRound
+       | 1 var/weight   block-wise     multiplicative form
+       | (OK for CNN)   captures       first to work on LLMs
+       |                intra-block    but severe overfitting
+       |                coupling;
+       |                no param saving
+       +------------------------------------------------------>
+       2020         2021         2023         2024        2025-26  Time
+
+
+  The main thread: "How to describe each weight's up/down choice
+                    with fewer learnable parameters"
+
+  AdaRound opens the problem → BRECQ deepens coupling →
+  FlexRound changes the form → OmniQuant detours →
+  LRQ compresses with low-rank → VQRound compresses with codebook
+                                  + aligns with the true distribution
+#+end_example
+
+* Insights
+
+Reading through this entire line, one can see something deeper than "technical iteration": *the main evolutionary thread of quantization research is the process of developing an ever-sharper understanding of what LLM weight distributions actually look like.*
+
+- In the AdaRound era, weights were implicitly assumed to be "roughly uniform," so binary switches were sufficient.
+- FlexRound was the first to take seriously the fact that "weights vary greatly in magnitude," leading to the multiplicative form.
+- LRQ assumed that "the main signal is concentrated in a low-rank subspace"—valid for Gaussian or uniform distributions, but refuted by LLM heavy tails.
+- VQRound directly confronts the "few critical + many ordinary" reality of the true distribution, applying codebook + L_inf as a targeted remedy.
+
+In other words: *every advance is, in essence, adjusting the objective function (L2 vs. L_inf) and the parameterization form (additive vs. multiplicative vs. low-rank vs. codebook) to more faithfully match the true statistical distribution of the weights.* The day someone identifies a new statistical structure in LLM weights (fractal structure, sparse clusters, etc.), the next paper will align a corresponding mathematical object to it.
+
+Where is the next step most likely to go? Two directions:
+
+1. *Distribution-aware mixed compression*—the weight distribution shape can differ dramatically across layers and attention heads. Using the same VQ codebook everywhere is suboptimal. A meta-method that selects the best-matching parameterization per layer is likely to emerge.
+2. *Merging with outlier-aware quantization*—the OmniQuant line (LWC/LET, dedicated to handling outliers) and the rounding line have remained separate. VQRound has already made concessions toward heavy-tailed distributions; the natural next step is to combine "separating outliers" and "codebook-compressed rounding" into a single unified framework.
+
+* Takeaways
+
+This line of work offers a clear methodological template: *when you hit the bottleneck of "too many parameters," do not immediately ask "how do I reduce parameters?" Ask first "does my objective function and parameterization form match the true statistical structure of the data?"* LRQ reduced parameters by 100×, but because it chose the wrong objective function (L2 on a heavy-tailed distribution), its accuracy was surpassed by VQRound.
+
+The practical implication is that you can—
+
+- Whenever you see a paper on "low-rank compression of X," ask first: "Is X's distribution heavy-tailed?" If yes, be skeptical.
+- When designing your own compression method, explicitly write down what distributional assumption you are making implicitly; if empirical data does not conform to that distribution, change the parameterization form before tuning hyperparameters.
+- In domains beyond PTQ—LoRA, KV cache compression, draft model design for speculative decoding—the same logic applies: whenever you use a small set of parameters to approximate a large set, the distributional assumption is the first-principles question.

@@ -1,0 +1,313 @@
+#+title:      Dissecting Outlier Dynamics in LLM NVFP4 Pretraining
+#+date:       [2026-05-29 Fri 14:30]
+#+filetags:   :paper:river:
+#+identifier: 20260529T143000
+#+source:     https://arxiv.org/abs/2602.02047
+#+authors:    Peijie Dong, Ruibo Fan, Yuechen Tao, et al. (HKUST + Alibaba)
+#+venue:      arXiv preprint, Feb 2026
+
+* 问题之河
+
+一个绕了七八年都没绕开的问题：*为什么用更少的比特训大模型，总有那么一小撮"刺头"数字毁掉整盘棋？*
+
+人类训大模型的算力账永远不够花。每往下砍一位（FP32 → FP16 → FP8 → FP4），显存少一半、吞吐量翻一倍。但每一次降位，都会冒出同一个幽灵——*outlier*，也就是激活值里那些比邻居大十倍百倍的"异常大数"。它们一旦被低精度格式压扁，整个网络的训练就崩了。
+
+每一代人都在跟这同一个幽灵搏斗。有人想把它打散，有人想给它单独的尺子，有人想绕过它训练。这条河的源头是 2022 年第一次正眼看见这个幽灵的人，下游是 2026 年这篇——*第一次拍摄到这个幽灵在整个训练过程里如何成长、变形、定居*的论文。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani - Attention Is All You Need
+  |
+  | 留下的坑：注意力机制天然产出极端激活（Softmax 后会有尖峰）
+  v
+[2022] Dettmers - LLM.int8()
+  |
+  | 看见：6.7B 以上模型里，0.1% 的激活值是"涌现 outlier"，
+  |       一旦量化整个模型就废
+  | 解法：把 outlier 抠出来用 FP16 算，其余 INT8
+  v
+[2022] Xiao - SmoothQuant
+  |
+  | 看见：Dettmers 那招是推理补丁，落地丑陋
+  | 解法：用一个数学等式，把激活的难度"搬"到权重上
+  v
+[2023] Rouhani - Microscaling (MX) Formats
+  |
+  | 看见：SmoothQuant 还是 per-tensor 一把尺子，对 outlier 不够细
+  | 解法：硬件级别支持，每 32 个数共享一个 scale（block-wise）
+  v
+[2023] Peng - FP8-LM  /  [2024] Fishman - FP8 at trillion tokens
+  |
+  | 看见：之前都是推理量化。能不能直接用低精度"训练"？
+  | 解法：FP8 全流程训练，缩放策略保住 outlier 不溢出
+  v
+[2025] NVIDIA - NVFP4 Pretraining Recipe
+  |
+  | 看见：FP8 已成标配，FP4 才是下一座金山。MX 还不够细。
+  | 解法：双层缩放（block 内 E4M3 + tensor 级 FP32），即 NVFP4
+  | 留下：在长程训练后期，loss 仍比 BF16 差约 1%
+  v
+[2025] Cao - Metis  /  [2025] Chen - TetraJet-v2
+  |
+  | 看见：NVFP4 loss gap 主要是激活 outlier 没被压住
+  | 解法：低秩残差分离（Metis）/ 振荡重置（TetraJet-v2）
+  | 留下：都只补一边（激活），权重 outlier 没管；
+  |       而且只在某一时刻处理，没看 outlier 怎么"长"出来
+  v
+[2026] Dong et al. - CHON / HCP   <-- 本文
+        第一次纵向解剖 outlier 在 NVFP4 训练中的演化
+        提出 Hot-Channel Patch：weights 和 activations 双侧修补
+        + 对 post-QK 操作单独保护
+#+end_example
+
+* 演化叙事
+
+** 2017 | Vaswani et al. - Attention Is All You Need: 一切的源头
+
+*** 它看到了什么问题
+
+RNN 训练得一个 token 接一个 token 算，没法并行，慢得要死。当时的机器翻译、语言模型都被这个串行瓶颈卡死。
+
+*** 它的解法
+
+把 RNN 整个扔掉，只用 attention：每个位置都直接看所有其他位置。一次矩阵乘法搞定所有依赖。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+注意力是全连接的、可并行的，所以 GPU 跑得飞快。但代价被埋在一个细节里：*Softmax*。Softmax 会把一个分数指数放大，再归一化。这个过程天然倾向于产生"赢家通吃"——某些位置的激活值就是会比别人大几个数量级。
+
+当时没人关心这件事，因为大家都用 FP32，再大也装得下。这个坑要等到大家想节省显存时才会爆。
+
+** 2022 | LLM.int8() - Dettmers et al.: 第一次正眼看见幽灵
+
+*** 它看到了什么问题
+
+到了 GPT-3 那个尺度（6.7B 参数以上），有人想用 INT8 加速推理，结果发现：模型精度直接崩盘。loss 不是缓慢下降，是断崖式跳水。怎么回事？
+
+Dettmers 把激活值打印出来一看——原来在某些"维度"上，存在比平均值大 *几十倍甚至上百倍* 的极端值。这些值占总数不到 0.1%，但它们承担了模型大部分的语义信息。一旦你把整个张量塞进 INT8 的 [-127, 127] 区间，这些 outlier 要么被截断，要么把其他正常值压成 0。
+
+这是第一次有人把"outlier"这个词正式带进 LLM 量化的讨论。
+
+*** 它的解法
+
+简单粗暴：把含 outlier 的那 0.1% 的维度单独抽出来，*仍然用 FP16 算*，剩下 99.9% 走 INT8。混合精度。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为承认现实：outlier 就是少数派但关键派，专门照顾它就行。
+
+新坑也很明显：
+1. 推理时要在线判断"哪些维度是 outlier"，工程上很丑
+2. 这是个推理补丁，不能在 *训练* 里用
+3. 没解释 outlier *为什么* 会出现
+
+下一篇要解决前两个。
+
+** 2022 | SmoothQuant - Xiao et al.: 把难度搬走
+
+*** 它看到了什么问题
+
+Dettmers 的混合精度方案太工程化，硬件不友好。Xiao 想要一个 *纯 INT8* 的方案，不要分情况讨论。
+
+他注意到：outlier 都集中在 *激活* 这一侧，权重那一侧分布很均匀。所以问题不对称——激活难量化，权重好量化。
+
+*** 它的解法
+
+数学上的一个小魔法。一个线性层做的是 Y = X @ W。如果在中间插一个对角矩阵 S 和它的逆：
+
+Y = (X / S) @ (S * W)
+
+数学上完全等价，但物理上：*激活变小了*（因为除了 S），*权重变大了*（因为乘了 S）。Outlier 的"难度"被偷偷从激活搬到了权重头上，激活和权重都变得"温和"。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+漂亮。一个不变量推导，把不对称的问题变对称。但它还是用 *per-tensor* 的 scale——整个张量共用一把尺子。如果张量里既有 outlier 又有正常值，这把尺子要么照顾 outlier 牺牲精度，要么反过来。
+
+下一篇要在硬件层面解决"一把尺子不够用"的问题。
+
+** 2023 | MX Microscaling Formats - Rouhani et al.: 每个小区给一把尺子
+
+*** 它看到了什么问题
+
+SmoothQuant 把 outlier 搬动了，但是张量里数值分布的 *局部差异* 仍然存在。同一个张量里，某一段可能全是 0.001 级别，另一段可能全是 100 级别。一把全局尺子是浪费。
+
+*** 它的解法
+
+硬件层面引入 *block scaling*：每 32 个数共享一个独立的 scale。等于把"全城一把尺子"变成"每条街一把尺子"。这就是 MX（Microscaling）系列格式——MXFP8、MXFP6、MXFP4 等。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+block 越小，对局部分布越自适应。这是 *硬件* 协议（OCP 标准），意味着 NVIDIA/AMD 的下一代芯片都会原生支持。
+
+新坑：32 个数共享一把尺子还是不够细。如果 outlier 是 *block-level* 的（一整个 block 都被一个 outlier 拉偏），还是会出问题。而且——这些都还是 *推理* 的故事。下一步要把它推进训练。
+
+** 2023-2024 | FP8-LM / Fishman: 跨过推理-训练的鸿沟
+
+*** 它看到了什么问题
+
+之前所有这些工作都是 *后训练量化*——模型已经训完，想办法压一压跑推理。但训练本身仍然要花掉 BF16 / FP32 的天文算力。能不能 *训练时* 就用 FP8？
+
+直觉上很难，因为训练有反向传播，梯度对数值精度敏感得多。outlier 在前向里搞破坏，在反向里就是放大数百倍的"投毒"。
+
+*** 它的解法
+
+FP8-LM（微软）、Fishman（GraphCore→后来 NVIDIA 跟进）做的事：找到训练流程里 *每个张量* 的合适缩放策略，前向、反向、优化器状态各自处理。配上 E4M3 / E5M2 两种 FP8 子格式（一个动态范围大一个精度高），分场景使用。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+证明了 "低精度训练" 在 trillion-token 尺度上能 work。FP8 训练成为业界标配（Llama-3、DeepSeek-V3 都在用）。
+
+但 FP8 不是终点。每砍一位都是金矿，FP4 才是下一站。可 FP4 只有 16 个可表示值，动态范围窄到令人发指，outlier 那点容忍度直接清零。这是下一篇要硬啃的骨头。
+
+** 2025 | NVFP4 Recipe - NVIDIA: 双层缩放硬上 FP4
+
+*** 它看到了什么问题
+
+直接用 MXFP4 训练，loss 比 BF16 差太多。Microscaling 一把 block scale 不够压制 FP4 的窄动态范围。
+
+*** 它的解法
+
+NVFP4 = *两层 scale*。
+- *内层*：每个 16 元素 block 用一个 E4M3（8 位浮点）scale
+- *外层*：整个 tensor 再套一个 FP32 scale
+
+等于"每条街一把尺子，每个城市再套一把总尺子"。block 内的微差异和 tensor 间的宏差异都照顾到。配合改进的训练 recipe（梯度裁剪、特定权重的 BF16 兜底、随机舍入等），第一次把 FP4 *预训练* 拉到接近 BF16。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+双层缩放让 FP4 的有效动态范围被"杠杆"放大了几个数量级。Blackwell GPU 原生支持，硬件加速实打实。
+
+但 NVIDIA 自己也承认：训到后期（learning rate decay 阶段），NVFP4 比 BF16 仍差约 *1% loss*。在 LLM 预训练里，1% 的 loss 差距就是一个数量级的下游能力差。这个 gap 就是下一篇的起点。
+
+** 2025 | Metis & TetraJet-v2: 单侧修补
+
+*** 它看到了什么问题
+
+NVFP4 的残余 gap 来自哪？这两篇定位到：是 *激活* 里仍然有 block 顶不住的 outlier。
+
+Metis（Cao 等）发现激活里 outlier 集中在少数维度，可以低秩分解出去单独算；TetraJet-v2（Chen 等）发现 outlier 会随训练 *振荡*（一个 step 大一个 step 小），需要在线 reset。
+
+*** 它的解法
+
+- *Metis*：把激活分成 "主成分（低秩） + 残差"，主成分单独高精度走，残差走 FP4
+- *TetraJet-v2*：监测每个 channel 的振荡幅度，超阈值就 reset 优化器状态
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+都缩小了 BF16 gap。但都有共同的盲区：
+1. *只补激活，不管权重*。outlier 在权重里也存在，只是体量不同
+2. *快照式干预*——在某一时刻测量、修补。没人系统看过 outlier 在 *整个训练过程* 里 *怎么长出来的*
+3. 没区分 *哪些算子* 对 outlier 最敏感
+
+下一篇要做的，就是先 *拍纪录片*（纵向解剖），再 *双侧治疗*。
+
+** 2026 | CHON / HCP - Dong et al.: 拍纪录片 + 双侧治疗
+
+*** 它看到了什么问题
+
+前人都在 outlier 这条河里 *截一瓢水* 来看。但 outlier 是有 *生命周期* 的：
+- 训练早期：到处乱蹦的 *transient spikes*（瞬时尖峰）
+- 训练晚期：固化成 *少数几个 hot channels*（持续高激活的通道）
+
+并且，*不同架构* 长出的 outlier 不一样：
+- *Softmax Attention*（如 Qwen3）：outlier 集中在 Softmax 后
+- *Linear Attention*（如 GLA）：per-tensor 看上去温和，但 *block-level* 仍有尖峰，根源是 gating
+- *FFN 里的 SwiGLU*：两路相乘，会放大 outlier
+
+更要命的是 *post-QK 操作*（Softmax 之后或 gating 之后这一段）对量化特别敏感，前人完全没单独处理。
+
+*** 它的解法
+
+两件事：
+
+1. *HCP (Hot-Channel Patch)*：在线检测每个 step 里激活 *和权重* 两侧的 hot channel，对它们做 "残差再注入"——FP4 算出来的结果加上一个小补偿项，把被压扁的精度找回来。和 Metis/TetraJet-v2 的关键差别是：*同时管权重和激活，而不是只管激活*。
+2. *CHON Recipe*：HCP + 对 post-QK 操作的特殊保护（保留更高精度 / 单独 scale）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把 GLA-1.3B 训 60B tokens 的 BF16 loss gap 从 *0.94% 压到 0.58%*，几乎砍半，且下游精度不掉。
+
+新坑（论文自己没明说但读得出来）：
+1. HCP 需要在线检测 hot channels，引入额外 kernel 调度开销，对 H100/B100 的 attention overlap 友不友好？
+2. 只在 1.3B + 60B tokens 验证过。在 70B+、trillion-token 尺度上 hot channel 的"定居"模式可能不同
+3. 没有涉及 *训练完直接 inference* 的链路一致性——CHON 训出来的模型还能不能继续 FP4 推理？
+
+* 前沿延伸
+
+截至 2026-05，本文（2026-02 发布）就是这条线最新的进展。同期可关注的相关方向：
+
+- *硬件层*：Blackwell B100/B200 的 FP4 tensor core 正在被各家训练框架（Megatron、TransformerEngine）加速整合，CHON 类方法很可能在 2026 下半年被集成
+- *理论层*：outlier 涌现的 *起源* 还没人给出干净的数学解释。Sun 等人 2024 的 "massive activations" 给出了一些观察，但没有"为什么 Softmax 会催生 hot channels"的形式化证明
+- *架构层*：如果 outlier 的根源真的是 Softmax + SwiGLU，那么干脆替换这两个算子（如 SoftMax-free attention, GeGLU 变体）是不是比训练时打补丁更彻底？
+
+* 一张图看懂
+
+#+begin_example
+                      ===  Outlier 的修罗场（2022 -> 2026） ===
+
+  视角              工具粒度              干预时机           覆盖范围
+  ----              --------              --------           --------
+
+ [推理量化]
+  LLM.int8 ----> per-channel 拆分 ----> 推理时         ----> 只激活
+  (2022)          "outlier 单独算"
+
+  SmoothQuant -> per-tensor 数学搬移 --> 推理前一次   ----> 激活+权重
+  (2022)          "把难度搬给权重"                          (但只一刀)
+
+  MX formats  -> per-block 硬件 scale -> 硬件层永久  ----> 全模型
+  (2023)          "每 32 个数一把尺子"                      (块内自适应)
+
+ [训练量化]
+  FP8-LM /    -> per-tensor 训练流缩放-> 训练时全程  ----> 全模型
+  Fishman         "前向后向各自管"                          (但 FP8 仍宽裕)
+  (2023-24)
+
+  NVFP4       -> per-block + per-tensor-> 训练时全程  ----> 全模型
+  (2025)         双层 scale                                 (FP4 仍差 ~1%)
+
+  Metis /     -> 残差分解 / 振荡重置  -> 训练时检测  ----> 只激活
+  TetraJet-v2     "激活的 outlier"                          (单侧,快照)
+  (2025)
+
+  CHON / HCP  -> 双侧 hot-channel    -> 训练全程纵向 ----> 激活+权重
+  (2026)         + post-QK 特保护      "看着 outlier 长大     (双侧,纵向)
+                                       并实时打补丁"
+
+
+
+       核心趋势：
+       (1) 尺子越来越细：tensor -> channel -> block -> hot-channel
+       (2) 战场从推理移到训练：补丁 -> 等价变换 -> 训练时管控 -> 训练全周期管控
+       (3) 视野从瞬时变成纵向：拍照 -> 录像
+       (4) 修补从单侧扩到双侧：只激活 -> 激活+权重
+#+end_example
+
+* 洞见
+
+读完整条线，真正在发生的不是"量化技术在进步"，而是 *人类对"模型里到底在传递什么信息"的认知在加深*。
+
+四年前我们说 outlier 是"噪声"，要 *剔除* 它；后来发现它是关键信号，要 *保护* 它；再后来发现它有 *空间结构*（特定 channels），需要 per-block 处理；现在发现它有 *时间结构*（早期 transient，后期 hot channels），需要纵向观测。
+
+这是一个典型的"幽灵显形"过程：从看不见 → 看见 → 看清形状 → 看清生命周期 → 学会和它共存。每一代解法都是上一代认知的物化。
+
+*下一步最可能往哪走*：
+
+1. *根源工程* — 既然 outlier 主要由 Softmax/SwiGLU 催生，下一代架构可能直接换掉这俩。比如 Softmax-free attention（如 Mamba 系）、或 outlier-aware activation function
+2. *训练-推理一致性* — CHON 类训练时打补丁，意味着推理时也要带着补丁跑，否则一致性丢失。一体化的 "FP4 训练 + FP4 推理" 协议会出现
+3. *理论化* — 目前所有 outlier 分析都是 *经验* 的（看图说话）。一个能预测"什么尺寸模型、什么数据、什么架构、训多少 step 会涌现多少 outlier"的理论框架还没出现。这是下一个 sub-domain 的金矿
+
+* 启发
+
+这条河给我们三个可迁移的方法论：
+
+1. *先拍纪录片，再开药方* — 前面所有人都在某个静态时刻测量 outlier、对症下药。Dong 的关键贡献其实不是 HCP，是 *把 outlier 当成有生命周期的现象* 来观测。在任何"屡修屡犯"的问题面前，先问 "我看的是快照还是过程"
+2. *不对称问题用等价变换搬动* — SmoothQuant 教我们：如果问题在 A 难、在 B 易，找一个数学等价式把难度搬到 B 上去。这个套路在很多地方可复用——梯度、损失函数、模型结构都可以做"难度搬运"
+3. *尺子粒度匹配现象粒度* — 量化的演化史本质是 "尺子越来越细"。如果你在做任何"用一个统计量代表一群对象"的工作，问自己：粒度合适吗？是不是 outlier 在拖大平均值？需不需要 per-block / per-channel？
+
+落点在能用：
+
+- 如果你在用 FP8 训模型，*关注 NVFP4 进展*——它在 2026 年大概率会成为新标准
+- 如果你在量化推理，*别只看单时刻 outlier 分布*——训练中后期的 outlier 模式更稳定，可以用 CHON 风格的检测器辅助你的推理量化
+- 如果你在做新架构设计，*把 outlier 友好性当成一个 design constraint*——Softmax 和 SwiGLU 是已知的 outlier 制造机，能换就换

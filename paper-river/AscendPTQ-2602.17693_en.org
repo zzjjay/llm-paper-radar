@@ -1,0 +1,215 @@
+#+title:      A Case Study of Selected PTQ Baselines for Reasoning LLMs on Ascend NPU
+#+date:       [2026-05-29 Fri 06:40]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T064020-en
+#+source:     https://arxiv.org/abs/2602.17693
+#+authors:    Yuchen Luo, Fangyue Zhu, Ruining Zhou, Mingzhe Huang, Jian Zhu, Fanyu Fan, Wei Shao
+#+venue:      arXiv 2026
+
+* One-liner
+
+Squeezing a 70-billion-parameter model onto a single card — GPUs have spent four years on that road, evolving from "just round it off" all the way to "apply a mathematical transform first, then round." Now someone has ported several representative methods from that evolutionary chain to Huawei's Ascend NPU, and found that the GPU script needs to be rewritten here.
+
+* Provenance Map
+
+#+begin_src
+    [2022]                [2022]               [2023]
+   GPTQ              LLM.int8()           SmoothQuant
+  (Hessian)          (outliers found)     (outlier migration)
+     |                   |                    |
+     |                   v                    v
+     +---------------> outliers are key -------> AWQ (2024)
+                            |             (W4 only)
+                            v
+                       Hadamard rotation
+                       QuaRot/SpinQuant
+                            |               (2024)
+                            v
+                       learn a transform
+                       FlatQuant  (2024)
+                            |
+                            v
+                  ====================
+                  || Ascend PTQ case ||  <-- this paper (2026)
+                  ||  re-tested on   ||
+                  ||      NPU        ||
+                  ====================
+                            |
+            +---------------+---------------+
+            v               v               v
+        GPTAQ           OSTQuant       DartQuant
+        (2025)          (2025)         (2025)
+#+end_src
+
+* The Story
+
+** Stop 0: Why Is This Hard?
+
+Today's large models routinely carry tens of billions of parameters. A single 16-bit float takes 2 bytes, so a 70B-parameter model needs 140 GB just to sit in memory. A top-of-the-line GPU card has 80 GB.
+
+The most obvious saving technique is quantization: compress every weight from a 16-bit float down to a 4-bit integer, cutting the footprint to one quarter. It sounds like converting a high-resolution photo to black-and-white — but models are far more sensitive to precision than photos. A careless compression pass and the model starts producing gibberish.
+
+The simplest compression scheme is called RTN (round-to-nearest): literally just round each value to the nearest representable integer. It works on small models; on large ones it collapses. Why? Because the weight and activation distributions hide a small population of abnormally large values. If you scale those together with the ordinary values and compress uniformly, the ordinary values all get crushed to zero.
+
+Every paper in the chain below is wrestling with exactly that problem.
+
+** Stop 1: GPTQ (2022) — If Independent Rounding Fails, Let Weights Compensate Each Other
+
+The first person to tackle this seriously was Elias Frantar, in the paper GPTQ. He diagnosed RTN's failure: each weight is rounded independently, so errors accumulate unchecked.
+
+His insight: weights are not isolated. If one column is damaged by rounding, a neighboring column can be nudged slightly to compensate. The "how much to nudge" is computed from the second derivative (the Hessian) — which in effect asks: "If I shift this weight by a small amount, how much does the whole layer's output drift?"
+
+Outcome: weights can be compressed to 3–4 bits while the model remains functional.
+
+Unresolved problems: only weights are compressed; activations stay in 16-bit float, so inference is still slow. Outliers in activations are ignored entirely.
+
+** Stop 2: LLM.int8() (2022) — Outliers Are Not Noise, They Are Load-Bearing
+
+Around the same time, Tim Dettmers discovered something striking: certain activation values inside a model are more than 100× larger than the average. These values are not noise — delete them and the model breaks.
+
+His fix was blunt: pull those outlier channels out and compute them in 16-bit; process everything else in 8-bit. It works, but it is ugly from an engineering standpoint — hardware likes uniform tensors, not a mix of "mostly 8-bit plus a handful of 16-bit" streams.
+
+What he did accomplish was naming the real enemy: outliers.
+
+** Stop 3: SmoothQuant (2023) — Can We Move the Outliers?
+
+Guangxuan Xiao asked a clever question: activations have outliers and weights don't — so can we "smooth" the activations and hand the trouble off to the weights?
+
+Mathematically: in the matrix product Y = X·W, divide a column of X by a constant s and multiply the corresponding row of W by s; the result is identical. This effectively moves the "spikes" from the activation side to the weight side.
+
+The weight side starts out flatter, so it can absorb the extra load. After the migration, activations are well-behaved and can be uniformly compressed to 8 bits.
+
+Outcome: W8A8 (weights 8-bit, activations 8-bit) becomes viable.
+
+Unresolved problems: only reaches 8-bit. A more aggressive 4-bit is still out of reach. And the migration ratio s is hand-tuned — the question of how to choose it optimally is left open.
+
+** Stop 4: AWQ (2024) — Flip the Frame: What Matters Is the Weight Side
+
+Ji Lin reversed the perspective: SmoothQuant adjusts weights in order to protect activations. If the goal is only to compress weights (W4) while leaving activations at 16-bit (A16), are activation outliers still a problem?
+
+Yes — because the weight columns that matter most are precisely those multiplied by large activations. Compress those weights poorly, and the large activation magnifies the error into a large output error.
+
+So AWQ does something structurally similar to SmoothQuant but with a different objective: it scales weight columns according to the magnitude of the corresponding activations, protecting the "critical" weights from being flattened during quantization.
+
+Outcome: weights compressed to 4-bit, activations kept at 16-bit (W4A16), with minimal accuracy loss. This is the scheme most people running LLMs locally use today.
+
+Unresolved problems: still per-channel scalar scaling. If outliers are not confined to specific channels but entangled across channels, scaling alone cannot untangle them.
+
+** Stop 5: QuaRot / SpinQuant (2024) — Don't Scale, Rotate
+
+At this point every method was doing per-channel scaling. Saleh Ashkboos stepped back and asked: why must we scale? We can rotate instead.
+
+Mathematically, multiplying a matrix by an orthogonal matrix (such as a Hadamard matrix) does not change the final output, but it can "scatter" the distribution — the outliers that were concentrated in a few channels get spread across all channels. No channel is sharply peaked anymore, so uniform low-bit compression works.
+
+Outcome: W4A4 (both weights and activations at 4-bit) becomes feasible.
+
+Unresolved problems: the Hadamard matrix is fixed; it is not necessarily optimal for any particular model. Could we learn a better rotation?
+
+** Stop 6: FlatQuant (2024) — Then Learn One
+
+Yuxuan Sun parameterized the "rotation matrix": instead of a fixed Hadamard, use a set of small learnable matrices in a Kronecker decomposition. A few minutes of training is enough to learn a model-specific "flattening transform" that outperforms the fixed one.
+
+Outcome: accuracy loss is pushed even closer to zero, with very low overhead (no need to retrain the whole model — only the transform matrices are learned).
+
+By this point the PTQ story on GPUs has reached a stable plateau: apply a learned linear transform to flatten the distribution, then round. The pipeline is clean, the toolchain is mature, and dedicated kernels exist in CUTLASS and Marlin.
+
+** Stop 7: This Paper (2026) — But That's the GPU Script
+
+Yuchen Luo's team looked at all of the above and said: wait — we are running Huawei's Ascend NPU, not a GPU. Does the GPU script still play out here?
+
+They selected four representative methods from the chain — GPTQ, SmoothQuant, AWQ, and FlatQuant — embodying the four main ideas of "weight compensation," "outlier migration," "activation protection," and "learned transform" — and tested them on the DeepSeek-R1-Distill-Qwen series (1.5B / 7B / 14B) and QwQ-32B, models that are specifically designed for reasoning.
+
+Crucially, they chose the hardest evaluation targets: AIME, GSM8K, MATH — tasks that demand long chain-of-thought reasoning. Such tasks are extremely sensitive to errors: one wrong step anywhere in the reasoning chain invalidates the entire answer.
+
+Their findings:
+
+1. *4-bit weight-only quantization (W4A16) is usable on large models* — AWQ and GPTQ can hold up. Large models have enough redundancy to absorb this level of precision loss.
+
+2. *4-bit weight + activation (W4A4) causes "logical collapse" on long-context reasoning tasks* — a new failure mode for aggressive schemes like FlatQuant on the NPU. Short answers are still acceptable; as soon as the model is asked for a long reasoning chain, it drifts into incoherence.
+
+3. *8-bit quantization is stable* — W8A8 produces no surprises.
+
+4. *INT8 accelerates the kernel, but the end-to-end speedup is consumed by dynamic quantization overhead* — the most sobering finding. In theory, a compressed model should run faster; in practice, the cost of computing scaling factors at runtime (dynamic quantization) on the NPU is large enough to erase the kernel-level gain.
+
+** Stop 8: What Comes Next?
+
+The story continues. GPTAQ (2025) patches the error accumulation problem in GPTQ. OSTQuant (2025) and DartQuant (2025) push W4A4 robustness further. But all of them are still extensions of the GPU-era narrative.
+
+The NPU thread has just begun, and it may need to grow its own methods — for example, how to make dynamic scaling static and aligned with NPU operator primitives; or how to redesign the transform form from scratch for NPU architecture.
+
+* Overview: What Each Paper Saw and What It Did
+
+#+begin_src
+Method            Problem seen                       Core solution
+----              ------                             ----
+RTN               (starting point: direct rounding)  divide by max, then round
+                    |
+                    | collapses on large models
+                    v
+GPTQ (2022)       weights rounded independently,     use Hessian to let neighboring
+                  errors accumulate                  weights compensate
+                    |
+                    | activations still float; outliers ignored
+                    v
+LLM.int8() (2022) a few giant values in activations  extract them and compute
+                                                     separately (ugly engineering)
+                    |
+                    | identifies the real enemy: outliers
+                    v
+SmoothQuant       outliers in activations,           divide activation by s,
+(2023)            weights are flat                   multiply weight by s (migrate)
+                    |
+                    | only reaches W8A8; s is hand-tuned
+                    v
+AWQ (2024)        want W4A16 — how to protect        scale critical weight columns
+                  critical weights                   by activation magnitude
+                    |
+                    | per-channel scaling can't handle cross-channel entanglement
+                    v
+QuaRot/SpinQuant  don't scale — use orthogonal       multiply by Hadamard matrix
+(2024)            transform to scatter outliers      to spread distribution
+                    |
+                    | Hadamard is fixed, may not be optimal
+                    v
+FlatQuant (2024)  can we learn a better transform    Kronecker-decomposed small
+                                                     matrices, trained quickly
+                    |
+                    | all of this was validated on GPUs
+                    v
+Ascend case       does it hold on NPU?               empirical result: W4A16 usable,
+(this paper, 2026)  |                                W4A4 collapses on long reasoning,
+                    |                                dynamic quantization overhead
+                    |                                erases kernel speedup
+                    v
+GPTAQ/OSTQuant/   each patches its own gap           GPU-line continuations;
+DartQuant (2025)                                     NPU line just starting
+#+end_src
+
+* What Is Really Changing Along This Line
+
+On the surface it looks like "compressing harder and harder" — from 8-bit to 4-bit to W4A4.
+
+But the deeper shift is *turning quantization from a compression problem into a distribution-shaping problem*.
+
+Early researchers asked: how do we represent a number with as few bits as possible? They eventually realized the true bottleneck is not "how many bits" but "the distribution to be represented is too ill-behaved." So the focus moved from "designing smarter encodings" to "first reshape the distribution into something compressible, then compress it with the simplest possible method."
+
+GPTQ is "local patching." SmoothQuant is "cross-channel transfer." AWQ is "weighting critical positions." The rotation methods are "global scattering." FlatQuant is "learn the optimal scattering." Down the line, preprocessing gets heavier and quantization itself gets simpler.
+
+This paper adds another layer: *every prior paper implicitly assumes the underlying hardware is a GPU.* CUTLASS operators, Triton kernels, Marlin's W4A16 acceleration — all are GPU-ecosystem artifacts. Whether a compressed model actually runs faster on an NPU is an entirely new question — and the preliminary answer is "not necessarily."
+
+This hints that the next generation of PTQ methods may stop chasing lower bit-widths and instead chase *hardware-aligned transform forms*. Whether an algorithm is good will not be judged by accuracy numbers alone, but by whether it can land on the target hardware as an efficient operator.
+
+* Where Things Are Most Likely Headed Next
+
+1. *Static quantization for NPU* — convert dynamic scaling (computing s at each inference step) to static (precomputed), eliminating the runtime overhead on NPU
+2. *Layer-wise mixed-precision policies* — since W4A4 collapses in certain layers, keep those layers at 8-bit; this paper already shows signs of this direction
+3. *Reasoning-chain-aware calibration* — existing calibration datasets are ordinary text, but reasoning models care most about long-chain consistency; calibration methodology may need to be redesigned from scratch
+4. *Co-design of transforms and operators* — the learned transform must not only maximize accuracy but also be compilable to efficient NPU operators
+
+* Honest Caveats
+
+- The citation chain GPTQ → SmoothQuant → AWQ → FlatQuant is confirmed (this paper explicitly uses these four as baselines, and the latter three mutually cite each other)
+- LLM.int8() may not be directly cited in this paper, but it is the universally acknowledged starting point of the outlier-handling lineage that includes SmoothQuant; its placement in the provenance map is a reasonable reconstruction
+- QuaRot/SpinQuant as the direct precursor of FlatQuant (fixed vs. learned transform) is a confirmed relationship
+- The follow-on works GPTAQ / OSTQuant / DartQuant all appear in this paper's references, but the precise critique-and-response relationships among them require deeper reading to confirm
+- The specific experimental findings ("W4A4 collapses on long-context") are drawn from the abstract description, not from standardized conclusions in the cited papers

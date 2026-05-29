@@ -1,0 +1,205 @@
+#+title:      ParisKV: Fast and Drift-Robust KV-Cache Retrieval for Long-Context LLMs
+#+date:       [2026-05-29 Fri 06:30]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T063059-en
+#+source:     https://arxiv.org/abs/2602.07721
+#+authors:    Yanlin Qi, Xinhang Chen, Huiqiang Jiang, Qitong Wang, Botao Peng, Themis Palpanas
+#+venue:      arXiv preprint 2026-02 (under review)
+
+* The Problem River
+
+Once a large model has read a million-token context, generating each new token theoretically requires "looking back" at all one million tokens — this is both slow and memory-intensive. Can we look back at only the small handful that truly matter?
+
+The difficulty is precisely this: you don't know which tokens matter, finding them must be fast and accurate, and your judgment must not "drift" over the course of generation. Over roughly seven or eight years, researchers have cycled through one approach after another — from "drop the unimportant ones" to "keep everything but retrieve only what matters" to "offload the unimportant ones to CPU" — each generation solving the previous generation's problems while opening new ones. ParisKV is the latest stop on this line as of early 2026.
+
+* The Lineage Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Consequence: attention is O(N^2) at length N — 1M tokens blows GPU memory
+  v
+[2023] Zhang et al. - H2O (Heavy Hitter Oracle)
+  |
+  | Observed: KV cache exhausts GPU memory during long generation
+  | Solution:  be bold — keep only "important tokens", permanently discard the rest
+  v
+[2024] Tang et al. - Quest
+  |
+  | Observed: once discarded, tokens can't be recovered — early discards may
+  |           suddenly become critical later
+  | Solution:  keep everything, but retrieve only top-k pages per query step
+  v
+[2024] Liu et al. - RetrievalAttention  /  Chen et al. - MagicPIG
+  |
+  | Observed: keeping everything overflows GPU memory; GPU-side top-k is still slow
+  | Solution:  offload KV to CPU memory, use ANN index (LSH hash sampling) for top-k
+  v
+[2024] Zhang et al. - PQCache
+  |
+  | Observed: LSH recall is erratic; hard to maintain a fixed budget
+  | Solution:  product quantization (PQ) compression + CPU-side clustering
+  |            + fixed 20% retrieval ratio
+  v
+[2026] Qi et al. - ParisKV  <-- target paper
+  |
+  | Observed: PQ / learned clustering "drifts" during long decoding, recall collapses;
+  |           CPU-side search and scheduling become the latency bottleneck
+  | Solution:  analytic (non-learned) random orthogonal rotation + sign-lattice
+  |            clustering, GPU-native collision voting, 4-bit quantization reranking,
+  |            UVA for GPU to pull full-precision KV directly from CPU on demand
+  v
+[?] (As of 2026-05, no clear successor work has appeared publicly)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: The Starting Point of Everything
+
+*** What problem did it see?
+
+RNNs must process one token at a time sequentially; they cannot parallelize, making training on long sequences painfully slow.
+
+*** Its solution
+
+Discard the recurrent structure entirely and rely purely on attention: every position "looks at" all preceding positions simultaneously, computed in parallel.
+
+*** Why it worked — and what new pit it dug
+
+Training became parallel and fast, and models could learn longer-range dependencies. But it buried a time bomb: both the computation and the memory of attention scale as the square of sequence length N. When researchers later tried to build "1-million-token contexts," that bomb detonated — storing each token's Key/Value cache (KV cache) alone was enough to fill GPU memory.
+
+Every story that follows is an attempt to defuse that bomb.
+
+** 2023 | H2O: Drop the Unimportant Ones
+
+*** What problem did it see?
+
+During long generation the KV cache snowballs: every new token requires storing a fresh K and V, permanently occupying GPU memory. After tens of thousands of generated tokens, memory simply overflows.
+
+*** Its solution
+
+Observation: attention scores concentrate heavily on a small number of "heavy hitter" tokens. So — set a fixed budget for the cache, and *permanently discard* the "unimportant" tokens whenever it is exceeded.
+
+*** Why it worked — and what new pit it dug
+
+Memory is now bounded and inference is faster. But "permanently discarding" is a gamble: how do you know that a token unimportant now won't become critical five thousand steps later? If you discard the wrong token, the model can never look back at it, and its answer collapses. This failure mode — "a token discarded early becomes critical late" — is exactly what the next generation set out to fix.
+
+** 2024 | Quest: Don't Discard — Just Set Aside
+
+*** What problem did it see?
+
+Token-dropping schemes like H2O share a fundamental flaw: what's dropped is gone forever. But even though the KV cache is large, you don't actually need to "see" everything at every step — the small subset you need just changes from step to step. The question is not "which tokens should be dropped" but "which tokens should be retrieved."
+
+*** Its solution
+
+Keep the entire KV cache, but partition it into pages and compute a coarse "representative vector" for each page. When a query arrives, first score all representative vectors, select the top-k most relevant pages, and attend only to the tokens within those pages.
+
+*** Why it worked — and what new pit it dug
+
+Nothing is ever discarded, so nothing is lost. But the full KV cache must still reside entirely in GPU memory — a million tokens still don't fit. The problem is simply deferred to the next level: how to make "keeping everything" physically feasible.
+
+** 2024 | RetrievalAttention / MagicPIG: Move to CPU, Use Approximate Search
+
+*** What problem did it see?
+
+Quest's direction was correct, but memory is a hard constraint. GPU memory is limited; long-context KV must go somewhere — CPU memory offers hundreds of GB, but reading from the CPU is slow. Meanwhile, Quest's approach of "score all page representatives then take top-k" starts to slow down at the million-token scale because top-k itself is O(N).
+
+*** Its solution
+
+Two things: (1) offload most KV to CPU memory; (2) build an approximate nearest-neighbor (ANN) index on the CPU, e.g., using LSH (Locality-Sensitive Hashing). Each query step no longer scans all pages; instead it is fed into hash functions and candidates are fetched from a few "collision buckets." MagicPIG uses LSH sampling to estimate attention; RetrievalAttention uses an ANN index.
+
+*** Why it worked — and what new pit it dug
+
+The memory problem is solved — a million tokens fit. But the search has moved from GPU to CPU: CPU scheduling itself is overhead, and data copies from CPU to GPU are additional overhead. LSH recall is also unstable: sometimes the truly most-relevant tokens hash into different buckets and are missed.
+
+** 2024 | PQCache: Product Quantization Compression plus Clustering
+
+*** What problem did it see?
+
+LSH's randomness makes recall unpredictable; the sampling-based attention estimates from MagicPIG are biased. A more "engineering-grade" index is needed: stable recall with a controllable budget.
+
+*** Its solution
+
+Borrow product quantization (PQ) from the ANN search community: split each key vector into several sub-vectors, cluster each sub-vector independently into 256 centroids, and store the result as a few-byte "codeword." At query time, split similarly and use table lookup to compute approximate distances. CPU-side k-means learns the clustering centroids as the index, and a fixed 20% of tokens are retrieved to the GPU for attention.
+
+*** Why it worked — and what new pit it dug
+
+Recall is more stable than LSH, and the budget is well-defined. But it planted the critical pit that ParisKV must solve — *decoding drift*: the clustering centroids are learned during the prefill phase (the moment the prompt is ingested) using the keys available at that instant. As the model generates new tokens step by step, new keys keep arriving and the original centroids become less and less representative of the true key distribution. Figure 1(b) shows this directly: blue centroids learned at prefill drift ever further from the red keys produced during decoding. The result is a recall collapse over long generation. On top of this, the index and search remain on the CPU side, keeping the CPU as the bottleneck.
+
+** 2026 | ParisKV: Analytic Clustering + GPU-Native Search + UVA On-Demand Fetching
+
+*** What problem did it see?
+
+PQCache and MagicPIG share the same root disease: their clustering / hashing is "learned and data-dependent" — once the data distribution shifts, it degrades. In the million-token, long-generation setting, drift is unavoidable and recall collapse is inevitable. Meanwhile the entire pipeline is throttled by CPU-side search and CPU→GPU data transfers.
+
+*** Its solution
+
+Three moves chained together:
+
+1. *Eliminate drift*: ℓ2-normalize each key, then pass it through a shared random orthogonal rotation (SRHT) — this maps all keys and queries to a near-uniform distribution on the unit sphere. Then use a set of *analytic*, data-independent clustering centroids: all sign patterns {±1/√m}^m, covering the sphere uniformly with 2^m directions. Because these are predefined, every newly generated key is always close to some centroid — drift is impossible by construction.
+
+2. *GPU-native coarse filtering*: treat each sub-space assignment as one vote; check whether a key's assigned centroid collides with the query's top centroid in that sub-space. Collisions accumulate scores; high-scoring keys form the candidate set. This is, in essence, multi-hash collision voting running entirely on the GPU.
+
+3. *4-bit quantization reranking + UVA on-demand fetching*: within the candidate set, compute approximate inner products using 4-bit codes (1-bit sign + 3-bit magnitude + a scalar correction term) to rerank. The final selected top-k keys are then fetched at full precision directly from CPU memory via CUDA Unified Virtual Addressing (UVA) — no CPU scheduling, no explicit memcpy.
+
+*** Why it worked — and what new pit it dug
+
+Replacing "learned indexes" with "geometrically predefined indexes" cuts the root of drift entirely rather than patching it (e.g., incremental centroid updates, periodic retraining). Moving the search entirely back to the GPU and bypassing CPU scheduling via UVA brings latency down — 17× faster than MagicPIG and 44× faster than PQCache on million-token decoding. On long-generation tasks like AIME25, pass@8 exceeds both baselines by 40–77 points.
+
+The pits left for the next generation likely lie in: (a) the choice of sub-space dimension m — 2^m centroids means small m gives poor coverage while large m explodes memory; (b) UVA fetching under high concurrency (many parallel requests) may make CPU memory bandwidth the new bottleneck; (c) the 4-bit reranking, despite its correction term, can still underestimate true inner products under extreme distributions.
+
+* Frontier Extensions
+
+As of 2026-05, ParisKV has been out for only three months, and no clear public "successor critique" has emerged. But from the rhythm of this line itself, two directions can be predicted:
+
+- *Retrieval-aware training*: The MoBA / NSA line ("retrieval at training time") is converging with ParisKV-style "retrieval at inference time." The next step may be to bake ParisKV's analytic clustering directly into the model training objective — so that queries and keys are naturally suited to this geometric index from the start.
+- *Cross-request index sharing*: ParisKV is already very fast in the single-request setting, but when thousands of requests share the same long context (e.g., a RAG knowledge base), how to reuse the index and UVA fetching across requests becomes the next engineering bottleneck.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                    KV-Cache Retrieval Evolution (axis: "how is recall performed")
+
+Year  | Approach               | Recall Mechanism             | Physical Location      | Key Flaw
+------+------------------------+------------------------------+------------------------+------------------
+2017  | Full attention         | Not needed                   | GPU                    | O(N^2) OOM
+      |                        |                              |                        |
+2023  | H2O: drop unimportant  | Heavy-hitter score +         | GPU                    | Dropped tokens
+      |                        | permanent discard            |                        | can't come back
+      |                        |                              |                        |
+2024  | Quest: keep but fetch  | Page representative top-k    | GPU                    | Still doesn't fit
+      |                        |                              |                        | in GPU memory
+      |                        |                              |                        |
+2024  | MagicPIG               | LSH sampling                 | CPU index/search       | Unstable recall
+      | RetrievalAttn          | ANN index                    | CPU index/search       | + CPU slow
+      |                        |                              |                        |
+2024  | PQCache                | Product quantization +       | CPU index/search       | Decoding drift
+      |                        | k-means                      |                        |  (core disease)
+2026  | ParisKV                | SRHT + analytic centroids    | GPU throughout         | (left for next
+      |                        | 4-bit reranking              | + UVA on-demand CPU    |  generation)
+      |                        |                              |   fetch                |
+
+Core paradigm shifts:
+   "Drop" --> "Fetch" --> "Offload to CPU, fetch" --> "Offload to CPU, GPU stays in control"
+   "Learned index" --> "Learned index" --> "Geometrically predefined index"
+#+end_example
+
+* Insights
+
+On the surface this line is about "how to compress KV cache." What is really happening underneath is *two metaphorical vicious cycles and their respective breakouts*:
+
+1. *The "learning" vs. "geometry" pendulum.* A decade of deep-learning victories trained researchers to reflexively "learn everything" — including indexes (PQ learns centroids, LSH learns projections). But anything learned is inevitably dependent on its training distribution; once that distribution shifts, it degrades. ParisKV is the first in this line to explicitly abandon "learning the index" — its stance is: uniformly tile the sphere with fixed points, full stop, no learning needed. This is a counter-trend judgment, but it works, because it eliminates drift at the root rather than patching it (incremental centroid updates, periodic retraining, and so on).
+
+2. *The "whack-a-mole" of bottlenecks.* This line illustrates a universal law of systems optimization with unusual clarity: fix the memory bottleneck (offload to CPU) and the bottleneck becomes CPU scheduling; fix CPU scheduling (bring search back to GPU + UVA) and the bottleneck becomes memory bandwidth. The true contribution of each generation of papers is not "how many times faster" — it is "where the bottleneck was pushed next." ParisKV has pushed the bottleneck back to CPU memory bandwidth and PCIe. That is what the next generation must attack.
+
+Prediction: what the next generation will solve is either the "CPU memory bandwidth bottleneck under high concurrency" that ParisKV left behind, or something more aggressive — making the training objective natively compatible with this geometric index so that retrieval and the model itself become one.
+
+* Takeaways
+
+Implications for how to do research:
+
+- *In systems-performance papers, the value is not "X times faster" — it is "where the next bottleneck now lives."* When reading this kind of paper, the question to ask is "where did it push the bottleneck?" not "how much faster is it?"
+- *When a field repeatedly patches problems with learned components and the patches keep piling up, seriously consider the opposite direction: throw out the learning.* ParisKV's SRHT + sign-lattice centroids are geometric tools that the ANN community had thirty years ago; they were sidelined during the deep-learning frenzy — until drift knocked every learned index flat and they stepped back in.
+- *When reading a new paper, dig three layers back first.* Without digging, you see "yet another KV-cache optimization." After digging, you see "the central tension in long-context LLM inference over the past decade." The former you'll forget in two weeks; the latter you'll still be able to use in two years.
+
+The actionable upshot: from now on, whenever you see a paper that "learns Y to accelerate X," instinctively ask "what happens when Y drifts?" If the authors have no answer, that paper will probably be superseded by a geometric approach in the next generation.

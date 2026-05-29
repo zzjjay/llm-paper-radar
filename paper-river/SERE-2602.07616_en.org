@@ -1,0 +1,251 @@
+#+title:      SERE: Similarity-based Expert Re-routing for Efficient Batch Decoding in MoE Models
+#+date:       [2026-05-29 Fri]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T120000-en
+#+source:     https://arxiv.org/abs/2602.07616
+#+authors:    Juntong Wu, Jialiang Cheng, Fuyu Lv, Ou Dan, Li Yuan
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+*A large model that claims to "activate only a small fraction of its parameters" — why does it become slow and memory-hungry the moment it actually serves real users?*
+
+The selling point of MoE (Mixture-of-Experts) is simple: a model has hundreds of "experts" (small FFNs), and each token passes through only two or three of them. It sounds naturally compute-efficient — parameters grow ten times while compute grows only twice.
+
+But that is theory. Once you deploy the model in vLLM and serve dozens of users simultaneously, things go sideways. A batch of 32 users' tokens each picks two or three experts — and after all that picking, the batch has lit up nearly every expert. The "skeleton crew" you were hoping for gets dragged back to full staff by the batch itself.
+
+The decoding phase is memory-bound on top of that: the bottleneck is not compute but the bandwidth required to move expert weights from HBM to SRAM. The more experts are activated, the more data gets moved, and the slower everything becomes.
+
+This thread — from GShard in 2020 to SERE in 2026 — has had successive generations circling the same question: *How do you make MoE genuinely sparse?*
+
+Each generation answered differently. Early work modified the router itself; later work restructured experts; still later work compressed expert weights; and by the time SERE arrived, the authors changed the angle entirely — *leave the experts alone, leave the router alone, and instead attack the redundancy inside the batch*.
+
+* Source Map
+
+#+begin_example
+[2020] Lepikhin et al. - GShard           (Google)
+  |
+  | Contribution: Use top-K routing to partition FFN into N experts;
+  |               each token visits only K of them (K=2).
+  | Limitation:   K is fixed regardless of token difficulty;
+  |               experts overlap heavily in the knowledge they encode.
+  v
+[2024.01] DeepSeek-AI - DeepSeekMoE        (ACL)
+  |
+  | Observation: GShard's experts are too "fat" — each knows a little
+  |              about everything; true specialization is absent.
+  | Solution:    Slice experts finer (mN fine-grained experts) +
+  |              pull out a few "shared experts" to carry common knowledge,
+  |              letting the routed experts focus on narrow domains.
+  | Limitation:  Experts are now more specialized, but the number
+  |              of experts activated per token is still fixed.
+  v
+[2024.03] Huang et al. - Top-P / Dynamic MoE  (arxiv 2403.07652)
+  |
+  | Observation: 2 experts is wasteful for simple tokens and
+  |              insufficient for hard ones.
+  | Solution:    Switch to top-P — pick experts by cumulative softmax
+  |              probability; hard tasks automatically use more experts,
+  |              easy tasks fewer.
+  | Limitation:  Single-token perspective; batch dimension ignored;
+  |              load/unload overhead on edge devices unsolved.
+  v
+[2024.08] Zhong et al. - AdapMoE          (ICCAD)
+  |
+  | Observation: The real bottleneck for edge MoE is on-demand expert
+  |              loading; top-P on edge devices can be even slower
+  |              due to loading jitter.
+  | Solution:    Sensitivity-guided dynamic activation count +
+  |              speculative prefetch + LRU cache.
+  | Limitation:  Still decides per-token which experts to fetch;
+  |              intra-batch similarity among expert calls is ignored.
+  v
+[2025.03] Ai et al. - ResMoE              (KDD)
+  |
+  | Observation: All prior work modifies routing, but the expert weights
+  |              themselves are highly redundant — many experts share
+  |              a common "base" plus a small residual.
+  | Solution:    Extract a public expert via Wasserstein barycenter;
+  |              each original expert = public expert + low-rank residual
+  |              → 75% parameter reduction.
+  | Limitation:  Static compression — a one-time weight rewrite,
+  |              accuracy drop is irreversible;
+  |              experts that must be activated still must be activated.
+  v
+[2026.02] Wu et al. - SERE  ← this paper        (ICLR 2026)
+  |
+  | Observation: Everyone before worked on single-token or static-weight
+  |              angles; nobody looked at the batch:
+  |              32 tokens in a batch × 2 routes each → union covers
+  |              nearly all experts.
+  |              Yet many of those experts are mutually very similar —
+  |              tokens assigned to a secondary expert can be re-routed
+  |              to its "most similar primary expert," letting one
+  |              memory transfer serve more tokens.
+  | Solution:    Similarity-based Expert Re-routing —
+  |              dynamically merge similar expert calls at batch level;
+  |              custom CUDA kernel, plugs into vLLM in one line of code.
+  v
+[2026~] Next steps: Joint KV-cache + expert co-scheduling?
+         Online-learned similarity matrices? Cross-batch expert reuse?
+#+end_example
+
+* Forward Narrative
+
+** 2020 · GShard: Replacing "All Hands on Deck" with "Selective Roll Call"
+
+The story begins with an engineering problem.
+
+Before 2020, making a transformer more capable meant one thing: stack more parameters, burn more compute. Every token passing through an FFN had to traverse the entire weight matrix — double the parameters, double the compute, double the electricity bill.
+
+Google's GShard team hit on a clever fix: instead of routing every token through a complete FFN, split the FFN into N pieces (called "experts") and let a small router glance at each token and select the K most relevant experts (typically K=2), running only those two.
+
+The total parameters are still N times as large (all sitting in memory on standby), but each token consumes only K/N of the compute. This is the starting point of *sparse activation*.
+
+What problems were left behind? Two of them.
+
+First, *K is hard-coded* — whether the token is "the" or "the Schrödinger equation," it sees exactly 2 experts. Simple tokens waste compute; hard tokens don't get enough.
+
+Second, *expert knowledge overlaps heavily*. N experts initialized randomly and trained independently receive no signal saying "you handle syntax, you handle code." The result: each expert knows a little about everything, and genuine specialization is thin.
+
+The rest of the story is essentially taking turns fixing those two problems.
+
+** 2024.01 · DeepSeekMoE: Making Experts Actually "Expert"
+
+The DeepSeek team moved first, attacking the "experts aren't specialized" problem.
+
+Their observation was direct: if every expert knows a little about everything, then top-2 routing is essentially picking "two almost-identical ones" — which is no choice at all. For top-2 to mean something, experts must have a clear division of labor.
+
+Their approach has two steps.
+
+*Step one: shatter the experts.* Start with N=8 fat experts each with hidden_dim 4096. Shatter them into mN=64 thin experts with hidden_dim 512 each, but activate more of them per token (mK=8). Total parameter count and total compute remain the same, but the "selection space" grows eight-fold — finer-grained combinations let each expert focus on a narrower domain.
+
+*Step two: extract shared experts.* Since "common knowledge" being duplicated across every expert is wasteful, explicitly pull out 1–2 experts that are *always* activated to handle capabilities every token needs. The remaining routed experts can then specialize fully.
+
+Results were immediate: DeepSeekMoE 16B matched DeepSeek-7B (dense) using 40% of the compute.
+
+But DeepSeekMoE still did not cut at "K is fixed." The number of experts activated per token remained hard-coded.
+
+** 2024.03 · Top-P / Dynamic MoE: Let Tokens Decide How Many Experts They Need
+
+Huang et al. from Peking University zeroed in on the second problem.
+
+Their logic was refreshingly plain: in NLP some tokens are just easy (grammatical filler words) and some are just hard (pivotal reasoning steps). Assigning the same number of experts to every token is either wasteful or insufficient.
+
+Their solution is *top-P routing*: the router sorts expert scores by softmax, then accumulates from the highest score downward, *stopping only when the cumulative probability exceeds a threshold P*.
+
+- If the top expert already carries 0.9 probability: done, use only that one.
+- If scores are spread thin and none exceeds 0.3: keep accumulating until the sum passes P.
+
+The outcome: complex reasoning tasks (BBH) automatically activate more experts; simple tasks activate fewer. Average activated parameters fall below the top-2 level — with better performance to boot.
+
+The problem left behind: this approach is entirely *single-token in perspective*. Each token decides independently how many experts it wants — great. But what about the batch dimension? Thirty-two tokens each picking their own experts yields a *union* that covers nearly every expert. At the batch level, the activation rate has not come down at all.
+
+** 2024.08 · AdapMoE: A Different Anxiety for Edge Devices
+
+A separate group from Peking University (Zhong et al.) took a different road — they cared about edge deployment.
+
+In a data center, all experts reside permanently in HBM; loading is essentially free. But on consumer or workstation GPUs like the 4090 or A6000, there is no room for all experts. Experts live in CPU memory and are *loaded on demand into GPU memory* — a load that takes tens of milliseconds and stalls inference hard.
+
+AdapMoE's insight: on edge devices, what determines speed is not how many experts are activated but *whether you can fetch the needed experts in advance* and *how high the cache hit rate is*.
+
+They did three things:
+1. *Sensitivity analysis* to decide how many experts to activate per layer — more in shallow layers, fewer in deep ones (because early errors propagate and amplify).
+2. *Speculative prefetch*: use intermediate results from the current layer to predict which experts the next layer will route to, and prefetch them.
+3. *Dynamic programming to allocate cache size per layer*: layers whose expert selection changes frequently get larger caches.
+
+AdapMoE still did not look at intra-batch redundancy. It solved "loading latency," not "the activation rate itself."
+
+** 2025.03 · ResMoE: Change the Angle — Go Directly After the Weights
+
+By this point, the routing-side playbook was nearly exhausted: fixed K, dynamic K, sensitivity-adjusted K… the single-token optimization headroom was running dry.
+
+Ai et al. from UIUC took a completely different direction: *don't touch the router — go after the expert weights themselves*.
+
+Their observation: the N experts produced by training are highly similar in their weights. Plot the weight distributions of N experts and you see them clustering around a common center, each expert being little more than center + small residual.
+
+Could one "public expert" (a barycenter) plus N small residuals compress the entire MoE layer?
+
+They applied the Wasserstein barycenter to construct a shared FFN plus N low-rank residuals. Parameters shrink by 75%; accuracy drops only slightly.
+
+But this is *static* — a one-time rewrite, baked into the weights, irreversible. And at inference time, whichever experts must be activated still must be activated; what is saved is storage and loading bandwidth, not runtime compute.
+
+The deeper issue: this "pre-compression" perspective *treats all batches and all inputs identically*. It assumes the redundancy among experts is fixed. In practice, redundancy is *dynamic* — which experts in a given batch are similar to each other changes with the input.
+
+** 2026.02 · SERE: Everyone Missed the Batch Dimension
+
+Now SERE takes the stage.
+
+Wu et al.'s perspective shift is interesting — they are not doing "+1" on top of prior work; they are pointing out that *everyone before missed the same observation point*:
+
+- GShard, DeepSeekMoE: worked on expert structure
+- Top-P, AdapMoE: worked on per-token activation count
+- ResMoE: worked on static weights
+
+*Nobody addressed the fact that, within a batch, similar experts are being called redundantly.*
+
+SERE's observation is concrete: when vLLM assembles 32 users' tokens into a single batch and runs them through a MoE layer, the routing produces 32 × 2 = 64 expert calls. These calls look sparse in isolation, but *because many tokens route to mutually very similar experts*, the batch collectively activates nearly every expert once over.
+
+If we can identify:
+- which experts within this batch are similar to each other, and
+- redirect tokens from "secondary similar experts" to the "primary similar expert,"
+
+then one expert memory transfer serves more tokens, the total number of activated experts drops, and the memory-bound bottleneck is relieved.
+
+This is *Similarity-based Expert Re-routing*:
+
+1. *Offline*: compute the pairwise expert similarity matrix using CKA (Kornblith 2019).
+2. *Online*: when each batch arrives, inspect which experts are called; re-route tokens from high-similarity secondary experts to the corresponding primary expert.
+3. *Merged execution*: implement re-routing in a custom CUDA kernel; integrates into vLLM with one line of code.
+
+Results: *2.0× speedup* on complex reasoning benchmarks with negligible accuracy loss.
+
+Why no accuracy drop? Because experts with high mutual similarity produce nearly identical outputs for the same token — routing to the primary expert versus the secondary expert falls within noise.
+
+* Problem–Solution Summary
+
+#+begin_example
++-----------------+--------------------+-----------------------+-------------------+
+| Paper           | Problem Observed   | Solution              | What Remains      |
++-----------------+--------------------+-----------------------+-------------------+
+| GShard          | Dense FFN too      | Top-K sparse routing  | Fixed K;          |
+|                 | expensive          |                       | experts not       |
+|                 |                    |                       | specialized       |
+| DeepSeekMoE     | Experts lack       | Fine-grained split +  | K still fixed     |
+|                 | specialization     | shared experts        |                   |
+| Top-P (Huang)   | K should not be    | Dynamic K via         | Single-token only |
+|                 | one-size-fits-all  | cumulative prob.      |                   |
+| AdapMoE         | Edge loading       | Sensitivity +         | Batch redundancy  |
+|                 | jitter             | prefetch + cache      | unaddressed       |
+| ResMoE          | Expert weights     | Barycenter +          | Static; one-time  |
+|                 | are redundant      | low-rank residual     | accuracy drop     |
+| SERE  ← here    | Intra-batch expert | Similarity re-routing | KV cache joint    |
+|                 | redundancy ignored | + CUDA kernel + vLLM  | scheduling?       |
+|                 |                    |                       | Online similarity?|
++-----------------+--------------------+-----------------------+-------------------+
+#+end_example
+
+* What Is Really Happening in This River
+
+On the surface this looks like an iterative "MoE inference acceleration" story — each generation faster than the last.
+
+But the deeper cognitive shift unfolding underneath looks like this:
+
+*Phase one (GShard → DeepSeekMoE): the architecture perspective.* The question asked is "What should an expert look like?" The answer is structural — slice finer, extract a shared component.
+
+*Phase two (Top-P → AdapMoE): the single-token perspective.* The question asked is "Does this one token really need that many experts?" The answer is adaptive in activation count.
+
+*Phase three (ResMoE): the weight perspective.* The question asked is "Can expert weights be compressed against each other?" The answer is static and one-shot.
+
+*Phase four (SERE): the batch perspective.* The question asked is "When the independent routing decisions within a single batch are superimposed, is there net redundancy?" 
+
+This is a shift from "point optimization" to "group scheduling." The first three phases all assumed "each token is independent," so optimization operated at the token or weight level. SERE steps outside that frame and says: *tokens are not independent — they are served together*. In a serving context, a batch is not merely an unfortunate engineering reality; it is a *statistical structure that can be exploited*.
+
+This perspective shift resembles the KV-cache → PagedAttention moment in transformer serving history. Before PagedAttention, each request's KV was independent; after, KV could be shared, paged, and reused across requests. SERE is doing the same thing — just with expert activations as the object of study.
+
+* Where This River Most Likely Flows Next
+
+1. *Joint KV-cache and expert co-scheduling.* Now that the batch perspective has been unlocked, the natural next step is co-scheduling the attention-side (KV) and FFN-side (expert) batch-level redundancies together.
+2. *Online-learned similarity matrices.* SERE currently uses offline CKA for similarity — but similarity is actually a function of the input distribution and should be updated online.
+3. *Cross-batch expert reuse.* If two consecutive batches call a highly overlapping set of experts, can the second batch skip part of the loading?
+4. *Composing with quantization and pruning.* SERE leaves weights untouched, making it orthogonal to static compression approaches like ResMoE — the two can be stacked.

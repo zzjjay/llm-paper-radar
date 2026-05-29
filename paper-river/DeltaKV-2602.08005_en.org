@@ -1,0 +1,220 @@
+#+title:      DeltaKV: Residual-Based KV Cache Compression via Long-Range Similarity
+#+date:       [2026-05-29 Fri 06:34]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T063433-en
+#+source:     https://arxiv.org/abs/2602.08005
+#+authors:    Jitai Hao, Qiang Huang, Yaowei Wang, Min Zhang, Jun Yu
+#+venue:      arXiv preprint, 2026-02
+
+* One-liner
+
+The KV cache that grows with every exchange and eventually exhausts GPU memory has occupied researchers for seven years: first they pruned it, then they pruned it selectively, then they quantized it to low precision, then they computed only part of it. DeltaKV takes the final step — instead of storing raw values, store only the *delta from a distant look-alike*.
+
+* Lineage Map
+
+#+begin_src
+                       2017
+                    [Attention is
+                     All You Need]
+                    Transformer born;
+                    KV cache added as
+                    an engineering aside
+                          |
+                          | Eight years later, long-context
+                          | exploded and that "aside" became
+                          | the memory bottleneck
+                          v
+                       2023
+                  [StreamingLLM]
+                  Simplest eviction:
+                  keep the first few tokens + a trailing window
+                          |
+                          | Too blunt — valuable
+                          | middle tokens are lost
+                          v
+                       2023
+                       [H2O]
+                  Evict by attention score:
+                  low-attention tokens are dropped
+                          |
+                          | Eviction is permanent;
+                          | if you need it later, it's gone
+                          v
+                       2024
+                      [Quest]
+                  Keep everything;
+                  at each step dynamically select
+                  a subset to attend over
+                          |
+                          | Everything is kept, so
+                          | memory is unchanged;
+                          | PCIe shuttling becomes the wall
+                          v
+                       2025
+                     [OmniKV]
+                  Productionize "dynamic selection"
+                  as a KV offloading framework
+                          |
+                          | Memory footprint still 100%
+                          v
+                       2026
+                  >>> [DeltaKV] <<<
+                  If a token looks almost identical
+                  to a distant past token,
+                  just store the difference
+#+end_src
+
+* Evolution: How One Problem Grew Up
+
+** Where it began: the unnoticed by-product (2017, Transformer)
+
+After *Attention is All You Need* ignited the field in 2017, almost every discussion centered on how powerful the attention mechanism was. But the paper quietly buried an engineering detail: during autoregressive generation, to avoid recomputing Q, K, V for all previous tokens on every new step, engineers cached the already-computed Keys and Values and reused them directly.
+
+That was the *KV cache*.
+
+Nobody considered it a problem at the time. Context windows topped out at 512 or 2048 tokens; caching them cost a few megabytes of VRAM — negligible. The paper never even highlighted it; it was just a tidy engineering shortcut.
+
+Yet a fuse had been set: *KV cache size grows linearly with context length*.
+
+Seven years later, the fuse burned through.
+
+** Detonation: the long-context era (2023)
+
+By 2023 people were feeding models documents with tens or hundreds of thousands of tokens. Running the numbers revealed that the KV cache could dwarf the model weights themselves — for a 7B model at 128K context, KV memory can be two to three times the weight footprint.
+
+The first instinct was simple: *delete*.
+
+*** StreamingLLM (2023): the bluntest approach
+
+Its observation: attention exhibits a strange pattern — the very first tokens (even a semantically empty BOS) attract disproportionate attention, a phenomenon called *attention sink*. Recent tokens are also reliably useful.
+
+The fix: *keep the first four tokens plus a recent sliding window; drop everything in between*.
+
+It worked — models at least didn't collapse. But the problem is obvious on reflection: the deleted middle might contain critical information. Ask a model about Clause 3 of a long contract, and if Clause 3 falls in the evicted range, you get nothing.
+
+StreamingLLM solved memory explosion by pretending the middle didn't exist.
+
+*** H2O (2023): smarter eviction
+
+H2O's insight: if you must evict, at least do it according to *importance*.
+
+The observation was finer-grained: the cumulative attention each token has received from all subsequent tokens (called H2, Heavy Hitter) measures its relevance. Low total attention means nobody has bothered with it, so dropping it should hurt less.
+
+The policy became: *rank by cumulative attention score and evict the bottom*.
+
+Smarter — but it introduced a new fuse: *eviction is irreversible*. Low importance now doesn't mean low importance later. The canonical failure case is Retrieval KV: you establish "X = 42" early in the context; the model hasn't used X yet so its attention score is low; H2O evicts it; later when asked for X the model is lost. Papers report SnapKV (same family as H2O) dropping to 0.4 accuracy on such tasks — barely above random.
+
+H2O moved eviction from position-based to importance-based, but didn't change the fact that *eviction = irreversible loss*.
+
+** A change of frame: stop evicting, start selecting (2024, Quest)
+
+Quest was the first work to escape the evict-or-not framing. Its key realization:
+
+*Rather than agonizing over who to delete, keep everything and dynamically pick a small relevant subset to attend over when generating each new token.*
+
+Analogy: H2O expels low-scoring students at enrollment, permanently. Quest keeps every student enrolled but calls on only the relevant ones each class — who gets called next class is decided next class.
+
+This was a genuine conceptual leap: from "compression = discard" to "compression = selective access."
+
+Quest left one very real problem open: *it doesn't actually reduce memory*. All KV entries are retained; only compute is reduced. Memory is the hard constraint in long-context inference, and Quest never touched it.
+
+Engineers responded by offloading KV to CPU RAM or SSDs — and immediately hit the next wall: PCIe bandwidth. Each generation step that decides which tokens to use must transfer them back to the GPU, and that transfer cost crushes latency.
+
+** Productionizing selective access (2025, OmniKV)
+
+OmniKV is the engineering capstone of this branch. Its contributions roughly are:
+
+- A *filter-layer* architecture deciding which KV entries live on GPU and which offload to CPU
+- Packaging the whole pipeline as a drop-in module compatible with production inference engines like vLLM
+
+OmniKV solved what Quest couldn't: making dynamic selection actually run in production. On long-context benchmarks like LongBench, OmniKV finally achieved selective access that neither sacrificed accuracy nor throughput.
+
+But OmniKV's own paper states its biggest weakness plainly: *GPU memory usage remains 100%*. Because it commits to "evict nothing," everything is stored and only placement is managed. At 128K context, memory pressure is still severe.
+
+That was the situation DeltaKV inherited.
+
+** The endpoint: if they look alike, just store the difference (2026, DeltaKV)
+
+DeltaKV's authors stared at OmniKV's lingering "memory still doesn't shrink" problem and made two observations:
+
+*Observation 1*: Computing pairwise similarity between K and V vectors across positions reveals that *over 60% of highly-similar token pairs are more than 16 positions apart*. In other words, a token very frequently has a distant "look-alike" deep in history.
+
+*Observation 2*: Across all tokens, KV vectors share a small number of dominant principal directions — like how every human face shares the rough placement of nose, mouth, and eyes, with individual identity encoded only in fine deviations.
+
+Together these observations suggest a natural idea:
+
+*Instead of storing each token's full KV (expensive), store only its deviation from a distant look-alike (tiny).*
+
+Concretely:
+
+- Every s steps, designate one token as an *anchor*; store its KV in full.
+- For every remaining *compressed token*, do:
+  1. Use L2 distance to find the k most similar anchors in history.
+  2. Average those anchors' vectors into a reference.
+  3. Pass the current KV and the reference through an MLP that projects both into a low-dimensional space.
+  4. *Store only the difference* — this residual is small and encodes compactly.
+- At inference time, decode the residual and add it back to the reference to reconstruct the original KV.
+
+Analogy: you keep a seven-year diary. If today's entry is nearly identical to one from last March (both read "rainy morning, coffee, reading"), you don't write the full entry — you write "see 2025-03-14, plus one extra coffee."
+
+Results: KV cache compressed to 29% of original size (roughly one-third); LongBench / SCBench / AIME long-context benchmarks show almost no accuracy drop; a companion inference engine called Sparse-vLLM handles the sparse, irregular KV layout; end-to-end long-context throughput reaches 2× that of vanilla vLLM.
+
+The elegance: DeltaKV transforms OmniKV's "keep everything, use it smartly" into *"keep only anchors; represent everything else as residuals."* It neither discards irreversibly like H2O, nor fails to reduce memory like Quest/OmniKV — instead it exploits the long-overlooked statistical fact that *KV vectors are massively redundant*, achieving genuine *information compression* rather than mere *positional pruning*.
+
+* Compression Overview: A Cognitive Timeline
+
+#+begin_src
+            "How to handle an ever-growing KV cache"
+                          |
+   +--------+--------+----+----+---------+-----------+
+   |        |        |         |         |           |
+2017      2023      2023      2024      2025        2026
+Trans-   Stream-     H2O     Quest    OmniKV     DeltaKV
+former   ingLLM
+   |        |        |         |         |           |
+Cache     Evict    Evict by  Keep all; Engineer    Residual:
+as        middle   importance dynamic   selective   store
+shortcut  by pos   (irrevers) select    access      only diff
+         (blunt)             (no mem    (prod-      (true
+                              saving)   ready)      compress)
+   |        |        |         |         |           |
+"Cache    "Delete"  "Delete   "Don't    "Make       "They're
+ to skip            smartly"  delete;   dynamic     so alike,
+ recomp"                      select"   select run  store the
+                                        in prod"    delta"
+
+Underlying framing:                     Underlying framing:
+compression = discard                   compression = exploit
+                                        redundancy for encoding
+#+end_src
+
+* Insights
+
+** What is actually changing along this timeline
+
+On the surface it looks like a percentage game — KV compression ratios climbing from 30% to 70% to 90%. But the real cognitive shift has two layers:
+
+*Layer 1: from positional thinking to informational thinking.* Every early method asked "which token *position* should be evicted?" — the first? the last? the low-attention one? This treats position as a proxy for information content. DeltaKV is the first to ask "where is the *information entropy*?" — discovering that a large fraction of the content is redundant and expressible with far fewer bits. This is the essential upgrade from *positional compression* to *information compression*.
+
+*Layer 2: from the deletion paradigm to the coding paradigm.* The H2O era did subtraction: who to drop. The Quest era shifted to selection: who to use. DeltaKV is the first to do genuine *encoding*: how to represent the same information with fewer bits. This is classic data compression thinking — Huffman coding, delta encoding, dictionary coding — applied to KV vectors as semantic objects.
+
+Notice the name "Delta" in DeltaKV. It directly invokes *delta encoding*, a data compression technique from the 1960s. The LLM field spent seven years before someone thought to apply differential coding to semantic vectors.
+
+** Where things are most likely to go next
+
+Two directions:
+
+*Direction 1: compress the anchors too.* DeltaKV still stores some anchor tokens in full. Those anchors are also similar to each other — why not represent them recursively as residuals of one another? Imagine a hierarchical residual tree: a handful of root nodes store complete KV; vast numbers of leaf nodes store layered deltas. This is classic dictionary learning / vector quantization territory.
+
+*Direction 2: smarter learned compressors.* DeltaKV's MLP compressor and decompressor are trained offline. The next step may be *runtime adaptation*: dynamically adjusting the compression codebook based on the current task or document distribution — analogous to prompt tuning, but applied to KV encoding.
+
+A wilder direction: once KV caches are compressed below 5%, will there be a push toward *semantic-level KV caches* — not storing vectors at all, but storing semantic indices and regenerating vectors on demand? At that point the very concept of a KV cache would be overturned.
+
+* Honest Annotations
+
+- DeltaKV → OmniKV: *confirmed*. The paper consistently layers DeltaKV on top of OmniKV in experiments and explicitly states it "complements sparse attention methods such as OmniKV."
+- OmniKV → Quest: *reasonable inference*. Both belong to the dynamic-KV-selection family; OmniKV is the productionized extension of the Quest line of thinking, but whether OmniKV's paper cites Quest as its sole predecessor was not verified during this analysis.
+- Quest → H2O: *strongly correlated*. Quest's core motivation is explicitly framed as a rebuttal to "static eviction methods like H2O that permanently lose critical tokens" — this is standard documented positioning.
+- H2O → StreamingLLM: *parallel contemporaries*. Strictly speaking the two appeared the same year (2023); H2O did not evolve from StreamingLLM. They are arranged here in order of increasing sophistication in the eviction criterion, not chronological derivation.
+- The year labels 2024, 2025, 2026 reflect cited publication dates; some are arXiv preprint dates and may not match formal conference proceedings years.
+- The attribution of "delta encoding" as an intellectual ancestor is narrative framing; DeltaKV's paper does not explicitly cite classical data compression literature.
