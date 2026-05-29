@@ -1,0 +1,233 @@
+#+title:      ScoutAttention: Efficient KV Cache Offloading via Layer-Ahead CPU Pre-computation for LLM Inference
+#+date:       [2026-05-28 Thu 19:52]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T195224-en
+#+source:     https://arxiv.org/abs/2603.27138
+#+authors:    Qiuyang Zhang, Kai Zhou, Ding Tang, Kai Lu, Cheng Li, Zhenyu Yang, Peng Xu, Jiguang Wan
+#+venue:      DAC '26 (Design Automation Conference, 2026)
+
+* The River of Problems
+
+During long-context LLM inference, the KV cache can dwarf the model weights themselves — a single 32k-token Qwen3-32B request demands 8 GB of KV cache alone. When GPU HBM can no longer hold it, what do you do?
+
+The most intuitive answer: move the KV cache to CPU memory (DRAM). But that answer immediately runs into two walls:
+
+- *The I/O wall*: To compute attention, you must transfer KV back from CPU to GPU. PCIe bandwidth (~15 GB/s) is two orders of magnitude slower than HBM (1.9 TB/s).
+- *The compute wall*: Why not let the CPU compute attention locally? Because CPU throughput is ~20× slower than the GPU.
+
+So from the original 2017 Transformer onward, every generation along this line has been doing the same thing: *finding ways to keep the GPU busy while it waits for the CPU or PCIe*. Each generation eliminated one kind of waiting, only to introduce a new one. ScoutAttention is the most recent attempt on this trajectory — its argument is: you cannot let the GPU wait for the CPU to finish; the CPU must start computing a full layer ahead.
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: KV cache grows linearly with sequence length, exhausting HBM
+  | Observation: But attention distributions are actually very sparse;
+  |              <20% of tokens account for >80% of attention weight
+  v
+[2023] H2O - Heavy-Hitter Oracle (NeurIPS '23)
+  |
+  | Solution: Since most tokens are unimportant, just evict them from the KV cache
+  | New problem: Eviction is irreversible — what if a future query needs them?
+  v
+[2024] Quest - Query-Aware Sparsity (ICML '24)
+  |
+  | Solution: Don't evict — skip. Dynamically select top-k blocks per query
+  | New problem: KV cache still lives entirely on GPU; HBM usage unchanged
+  v
+[2024] InfiniGen (OSDI '24)
+  |
+  | Solution: Push unimportant tokens to DRAM; recall them to GPU when needed.
+  |           Predict one layer ahead which tokens the next layer needs,
+  |           overlapping I/O with computation.
+  | New problem: PCIe is still too slow; GPU is idle waiting for I/O 61% of the time
+  v
+[2025] HGCA - Hybrid GPU-CPU Attention (arXiv 2507.03153)
+  |
+  | Solution: Don't recall at all — let the CPU compute attention on offloaded tokens
+  |           (co-attention). GPU handles its portion; results are merged at the end.
+  | New problem: CPU is 20× slower than GPU; GPU now idles waiting for CPU 57% of the time
+  v
+[2026] ScoutAttention (DAC '26) <-- this paper
+        Solution: Three mechanisms working in concert —
+              (1) Both GPU and CPU compute only top-k sparse blocks (cuts CPU workload)
+              (2) CPU starts computing a full layer in advance (extends CPU's time window)
+              (3) Async periodic KV recall (corrects long-term drift)
+
+Side branch (adopted, not critiqued):
+  [2025] NSA (DeepSeek) / MoBA  ----> Provide stronger block-wise sparsification schemes;
+                                       ScoutAttention claims compatibility with both
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: Self-Attention Opens the Door to the KV Cache Burden
+
+*** What Problem It Saw
+
+Before Transformers, sequence modeling relied mainly on RNNs — processing one token at a time, impossible to parallelize. Vaswani et al. could not tolerate this serial constraint; they wanted an architecture that could be fully parallelized during training.
+
+*** Its Solution
+
+Discard the recurrent structure entirely, and let every position attend directly to all other positions in the sequence — this is self-attention. Each token learns a set of Q, K, V vectors; a dot product reveals what to attend to.
+
+*** Why It Worked (and What Trap It Set)
+
+Parallelism arrived, long-range dependencies became tractable, and every large model today follows from this. But two landmines were buried: attention has O(n²) complexity, and to avoid recomputing K and V during decoding, they must be cached (the KV cache) — growing linearly with sequence length. Once people began chasing 32k, 128k, and 1M contexts, the KV cache became a heavier memory burden than the model weights themselves.
+
+** 2023 | H2O: If Attention Is Sparse, Just Delete the Unimportant Tokens
+
+*** What Problem It Saw
+
+The KV cache was too large to fit in HBM. But H2O's authors noticed an interesting phenomenon — *attention distributions are extremely sparse*. Fewer than 20% of tokens account for more than 80% of the attention weight, and certain tokens (dubbed "heavy hitters") are repeatedly attended to across many queries.
+
+*** Its Solution
+
+Since most tokens carry negligible attention weight, there is no reason to retain them. H2O designed an online strategy to identify heavy hitters and evict all other tokens from the KV cache.
+
+*** Why It Worked (and What Trap It Set)
+
+The memory savings were immediate and dramatic. But the approach is *irreversible* — once a token is evicted, if a future query happens to need it, there is no recovery. For multi-turn dialogue or long-form reasoning, where "unimportant now" does not mean "unimportant later," model accuracy degrades. The direction was right, but the method was too blunt.
+
+** 2024 | Quest: Don't Evict — Just Skip During Computation
+
+*** What Problem It Saw
+
+H2O handed control to the "write side" — using history to decide which tokens survive. But the tokens each query cares about are genuinely different per query. If the *read side* could dynamically select tokens based on the current query, you could preserve all information while still saving computation.
+
+*** Its Solution
+
+Quest partitions the KV cache into fixed-size blocks by token order (e.g., 32 tokens per block) and computes a "digest" for each block (a channel-wise min/max summary). At attention time, the query is compared against all digests to select the top-k blocks; full attention is computed only over those blocks.
+
+*** Why It Worked (and What Trap It Set)
+
+Block-wise sparsity brings two advantages: it is query-adaptive (each token selects its own top-k), and the granularity is right — digest retrieval is nearly free, while intra-block computation maps well to GPU memory access patterns. This design was adopted by a long line of subsequent work (MoBA, NSA, and the subject of this analysis, ScoutAttention).
+
+But Quest addresses *compute sparsity*, not *storage sparsity* — the full KV cache still occupies GPU HBM. The memory problem remains unsolved. The next step requires physically moving the cache off the GPU.
+
+** 2024 | InfiniGen: Offload KV to DRAM, Recall on Demand
+
+*** What Problem It Saw
+
+Quest confirmed that each query genuinely needs fewer than 20% of tokens. InfiniGen's authors pushed that observation one step further: if 95% of the cache is unused at any given moment, *it has no business sitting in HBM* — move it to DRAM and recall it temporarily when needed.
+
+*** Its Solution
+
+After prefill, important tokens remain on the GPU; the rest are pushed to DRAM. To prevent PCIe from becoming the bottleneck during decoding, InfiniGen introduces a clever predictor: *while computing layer i's attention, it predicts which tokens layer i+1 will need*, and asynchronously recalls them. In the ideal case, data arrives just in time for layer i+1, overlapping I/O with computation.
+
+*** Why It Worked (and What Trap It Set)
+
+It bridged storage sparsity with compute sparsity and was the first practically deployed KV offloading system.
+
+But it still collided with the PCIe wall — at 4 KB per token KV, PCIe 4×16 delivers only about 800 MB/s usable bandwidth per page (even at page-level granularity, perhaps 15 GB/s), far below HBM's 1.9 TB/s. Even with one-layer-ahead prefetching, *GPU idle time from I/O waiting still accounts for 61% of end-to-end execution*. This means the predictive-prefetch approach has hit a ceiling: no matter how accurate your prediction, the I/O itself is simply too slow.
+
+** 2025 | HGCA: Let the CPU Compute Locally — No More Recalls
+
+*** What Problem It Saw
+
+HGCA looked at InfiniGen's 61% GPU idle time and asked an inverted question: *why must data return to the GPU to be computed?* PCIe is slow, but the CPU is not powerless — a 36-core CPU can sustain roughly 100 GB/s throughput on attention, several times faster than PCIe. Since the data is already in DRAM, *compute it there*.
+
+*** Its Solution
+
+HGCA proposes *co-attention*: the GPU retains a sliding window of the top 25% important tokens and computes full attention on them; the remaining 75% stay in DRAM and are computed by the CPU using a sparse method based on sliding-average weights. The two partial results are then merged to produce the final output. Zero I/O on the critical path.
+
+*** Why It Worked (and What Trap It Set)
+
+PCIe is bypassed entirely, and the I/O bottleneck disappears.
+
+But a new bottleneck surfaces immediately — *the GPU computes attention 20× faster than the CPU*. After the GPU finishes its portion, it must wait for the CPU to complete the rest before merging. Because HGCA requires the CPU to process *all* offloaded tokens (albeit sparsely), at batch size 40, *the GPU idles waiting for the CPU 57% of the time*. Waiting for I/O has been traded for waiting for compute — the balance has flipped, but efficiency has not been recovered.
+
+** 2026 | ScoutAttention (This Paper): Let the CPU Start One Layer Early, and Only Process the Critical Few
+
+*** What Problem It Saw
+
+ScoutAttention examined the failures of the two preceding generations together:
+- InfiniGen waits for I/O — because *transferring data is intrinsically slow*
+- HGCA waits for the CPU — because *the CPU is slow and forced to handle all offloaded tokens*
+
+Both failures share a common form: "The GPU has finished, but the CPU or PCIe is not done yet." The cure requires two things simultaneously: *reduce the CPU's workload* and *start the CPU earlier*.
+
+*** Its Solution
+
+Three mechanisms:
+
+1. *GPU-CPU collaborative block-wise sparse co-attention*. Inherits Quest's top-k block selection but splits the work — the GPU handles the top-k blocks it already holds (roughly 85%); the CPU handles only the small fraction of top-k blocks that are not on the GPU (roughly 15%). The CPU's workload shrinks dramatically.
+
+2. *Layer-ahead CPU pre-computation*. This is the pivotal idea. While computing layer i, the system multiplies the layer-i input X^i by *the next layer's* Q projection matrix W_Q^{i+1} to obtain a predicted next-layer query. Experiments show this prediction achieves a cosine similarity of 0.94–0.97 with the true next-layer query (because Transformer residual connections make adjacent-layer inputs nearly identical). With this predicted query, the CPU can launch layer i+1's attention computation at the very start of layer i. The CPU's effective time window expands from "one attention pass" to "one full transformer layer" — roughly 3× longer.
+
+3. *Async periodic KV cache recall*. As decoding progresses, the set of "important tokens" gradually drifts, and the CPU's block assignment grows. Every few steps (empirically about once every 8.7 layers on average), the hot blocks on the CPU are recalled to the GPU to correct the drift. This recall is performed asynchronously *after* attention is computed — it never enters the critical path.
+
+*** Why It Worked (and What Traps Remain)
+
+Combining reduced CPU workload with an extended CPU time window, the GPU idle fraction drops from HGCA's 57% and InfiniGen's 61% down to just *6%*. On Qwen3-14B, ScoutAttention achieves a 5.1× decoding throughput improvement over FullKV and a 2.1× improvement over prior offloading methods, with only a 2.1% accuracy drop.
+
+Traps laid for future work:
+- The quality of the predicted query depends on residual connections and LayerNorm placement — will this hold for architectures without strong residuals (e.g., Mamba, RWKV)?
+- The async recall interval is a constant determined by offline profiling; it cannot adapt to sudden workload shifts (e.g., a query that abruptly changes topic).
+- The entire design is predicated on a particular GPU/CPU compute ratio where "one full layer ≈ CPU's time to process its top-k blocks." When the next-generation GPU changes that ratio, the balance must be recalibrated.
+
+* Frontier Extensions
+
+ScoutAttention was published in March 2026 and represents the current frontier of this line. Two extension directions are visible:
+
+- *Stronger sparsification foundations*: NSA (DeepSeek, 2025) proposes "natively trainable sparse attention" — baking the sparsity mechanism into training rather than pruning after the fact. MoBA (2025) delegates sparse block selection to a learned router. ScoutAttention explicitly notes in the paper that its framework is orthogonal to these methods (it uses Quest-style selection, but the module is interchangeable). The natural next step is therefore *ScoutAttention-style system scheduling + NSA/MoBA-style training-native sparsity*.
+
+- *Prefill-Decode disaggregation co-design*: DistServe (OSDI '24) deploys prefill and decode on separate clusters; ScoutAttention targets only the decode phase. A likely future direction is an end-to-end protocol in which "the prefill cluster pre-computes digests and hot-token sets and hands them off, and the decode cluster takes over directly."
+
+(No papers citing ScoutAttention have been found yet — it was published only two months ago.)
+
+* One Diagram to Understand It All
+
+#+begin_example
+
+Time   | Dominant approach   | Key constraint           | "What GPU waits for"
+-------+---------------------+--------------------------+----------------------
+2017   | Vanilla attention   | KV cache O(n)            | (problem not yet apparent)
+2023   | H2O                 | Eviction is irreversible | Nothing — but accuracy suffers
+2024   | Quest               | All on GPU, sparse compute | Nothing — but doesn't fit
+2024   | InfiniGen           | Offload + prefetch        | I/O         (61% idle)
+2025   | HGCA                | CPU computes locally      | CPU         (57% idle)
+2026   | ScoutAttn           | CPU layer-ahead + sparse  | Almost nothing ( 6% idle)
+
+                    +-------------------------------------+
+                    | One formula runs through all of it: |
+                    |                                     |
+                    |   T_iter = max(T_GPU, T_CPU+T_IO)   |
+                    |                                     |
+                    | Each generation changes one term:   |
+                    |   H2O    : Cuts input to T_CPU+T_IO |
+                    |   Quest  : Cuts T_GPU (top-k)       |
+                    |   InfiniG: Overlaps T_IO with the   |
+                    |            next T_GPU               |
+                    |   HGCA   : Eliminates T_IO,         |
+                    |            enlarges T_CPU           |
+                    |   Scout  : Cuts T_CPU + overlaps it |
+                    |            with a full T_GPU layer  |
+                    +-------------------------------------+
+
+#+end_example
+
+* Insights
+
+Reading through this entire trajectory, several things rise to the surface:
+
+*1. "Move work to cheaper resources" is an eternal temptation — but cheaper resources usually mean something else is even slower.*
+InfiniGen moved storage to cheap DRAM and found PCIe was slow. HGCA moved computation to the cheap CPU and found the CPU was slow. Every migration breaks one bottleneck while exposing another. ScoutAttention's cleverness lies in *no longer trying to move work wholesale, but instead accepting that both GPU and CPU must work — just staggered in time*.
+
+*2. The real driver of this line has never been "smarter algorithms" — it has been "shifting ratios of hardware compute and bandwidth."*
+H2O and Quest did not consider offloading because in 2023 HBM capacity was not yet critically tight. InfiniGen appeared because long contexts blew HBM wide open. HGCA flipped the approach because CPU compute grew strong enough to handle attention independently. ScoutAttention exists because the GPU/CPU compute ratio happens to make "one full layer" just long enough for the CPU to finish its share. *Once the next GPU generation enlarges HBM (B200 already offers 192 GB) or PCIe 6.0 arrives, the entire optimization balance will tip again.*
+
+*3. Cross-layer exploitation of residual similarity is a severely underappreciated tool.*
+InfiniGen already used adjacent-layer input similarity to predict which tokens the next layer will need. ScoutAttention pushes this to the limit — using the previous layer's input to approximately compute the next layer's query, achieving cosine similarity of 0.94+. This property is a "free lunch" baked into Transformer architecture, yet it is currently exploited almost exclusively for inference acceleration. There may be vast unexplored territory on the training side, the alignment side, and the interpretability side.
+
+*4. This series of papers has been quietly redefining attention from "a mathematical operation" into "a cross-device, cross-time cooperative scheduling problem."*
+The original attention is a single formula. H2O introduced cache management. Quest introduced query-aware compute scheduling. InfiniGen introduced I/O scheduling. HGCA introduced heterogeneous compute scheduling. ScoutAttention introduced cross-layer temporal scheduling. With each added layer of scheduling, the "boundary" of attention expands once more. The ultimate form may be a full distributed dataflow compiler.
+
+* Takeaways
+
+- *How to find problems*: Track the waiting. Every paper is solving the specific moment in the previous paper where "one party was waiting for another." ScoutAttention's engineering value is, at its core, cutting GPU idle time from 61% to 6%. *"What resource is sitting idle" is a better locator of the next research problem than "what resource needs to go faster."*
+
+- *The posture for systems work*: Hardware parameters (HBM, PCIe, CPU/GPU compute ratio, per-layer latency) are not background settings — they are *first-order variables*. InfiniGen's design is built on PCIe 4; HGCA's is built on 36-core CPU throughput; ScoutAttention's is built on a Qwen3 single-layer time of ~900 µs. Change any of these numbers and the conclusions must be rewritten. When reading this kind of paper, list the hardware assumptions first, then examine how tightly the design depends on them.
+
+- *The potential of combinatorial innovation*: ScoutAttention invented no new sparsification method (it uses Quest), no new offloading concept (from InfiniGen), and no new CPU co-computation idea (from HGCA). What it did was *assemble three existing good ideas in the right temporal order*. This means: in a fast-moving field, *"rescheduling existing components" carries research value no less than "inventing new components"* — provided you can see clearly what bottleneck is choking each component and find a new overall framework in which the bottlenecks cancel each other out.

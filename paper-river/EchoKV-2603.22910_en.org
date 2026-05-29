@@ -1,0 +1,299 @@
+#+title:      EchoKV: Efficient KV Cache Compression via Similarity-Based Reconstruction
+#+date:       [2026-05-28 Thu 19:41]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T194144-en
+#+source:     https://arxiv.org/abs/2603.22910
+#+authors:    Shiyu Ji, Yixuan Wang, Yijun Liu, Qingfu Zhu, Wanxiang Che
+#+venue:      arXiv preprint, 2026
+
+* The River of Problems
+
+When an LLM runs over very long contexts, the first thing to blow out GPU memory is not the model weights — it is the pile of notes the model keeps on "what I have seen so far": the KV cache. The longer the text, the larger the notes; the larger the notes, the fewer concurrent requests you can serve and the shorter the context you can sustain.
+
+This line of research asks a single question: *Can we shrink those notes without making the model dumber?*
+
+Why is it hard? Because those notes are the model's working scratchpad. Tear out the wrong page and the reasoning falls apart. Compress too aggressively and the model hallucinates; compress too lightly and you save nothing. What makes it worse is that most compression schemes are one-way surgery — once applied, the model can only ever run in compressed mode; there is no way back to full-cache inference.
+
+Generation after generation of researchers has been maneuvering inside the same triangular constraint: *compress more, hurt less, and keep it reversible*.
+
+* Source Map
+
+#+begin_example
+[2019] MQA (Shazeer)
+  Fast Transformer Decoding: One Write-Head Is All You Need
+  |
+  | Problem: Multi-head attention stores one K/V per head;
+  |          memory explodes at inference time.
+  | Fix: All heads share a single K and a single V (architecture change).
+  v
+[2023] GQA (Ainslie et al.)
+  GQA: Training Generalized Multi-Query Transformer Models
+  |
+  | Problem: MQA shares too aggressively; quality drops noticeably.
+  | Fix: Compromise — split Q heads into g groups, each group
+  |      shares one KV pair (architecture change).
+  v
+[2024] MLA (DeepSeek-V2)
+  DeepSeek-V2: A Strong, Economical, and Efficient MoE
+  |
+  | Problem: GQA still "hard-slices" KV; expressiveness is
+  |          capped by the number of groups.
+  | Fix: Use low-rank projection to compress KV into a small
+  |      latent vector; project back on the fly
+  |      (architecture change; requires training from scratch).
+  v
+[2024] Palu (Chang et al., arXiv:2407.21118)
+  Palu: Compressing KV-Cache with Low-Rank Projection
+  |
+  | Problem: MLA requires retraining; existing Llama/Mistral
+  |          models cannot benefit.
+  | Fix: Apply SVD directly to the projection matrices of a
+  |      trained model; post-hoc compression, no retraining
+  |      needed (modifies projection weights, irreversible).
+  v
+[2025] CommonKV (Wang et al., arXiv:2508.16134)
+  CommonKV: Compressing KV Cache with Cross-Layer Parameter Sharing
+  |
+  | Problem: Palu compresses within each layer; it ignores the
+  |          fact that KV across adjacent layers is very similar.
+  | Fix: Extend SVD sharing across layers; stays competitive
+  |      even at very low budgets
+  |      (still modifies projection weights, still irreversible).
+  v
+[2026] EchoKV (this paper, arXiv:2603.22910)
+  EchoKV: Efficient KV Cache Compression via Similarity-Based Reconstruction
+  |
+  | Problem: Every method above modifies model projections, so
+  |          switching back to full-KV inference is impossible —
+  |          the model is locked into compressed mode even when
+  |          memory is plentiful.
+  | Fix: Leave model weights untouched. Keep a portion of KV,
+  |      train a tiny network to "echo" the discarded portion
+  |      back from the retained portion.
+  v
+[2025-2026] Frontier extensions
+  TransMLA (arXiv:2502.07864):    Upgrades existing models to MLA architecture.
+  X-EcoMLA (arXiv:2503.11132):    Continues training to convert attention to MLA.
+  XKV (arXiv:2503.18893):         Another branch of cross-layer SVD.
+#+end_example
+
+* Evolutionary Narrative
+
+The protagonist of the following story is not any single paper — it is *the KV-cache tumor itself*: how it was planted from the very beginning, and how each generation has tried to cut it out.
+
+** 2019 | MQA: Let All Heads Share One KV
+
+*** What Problem It Saw
+
+Standard Transformer multi-head attention (MHA) works like this: a layer has 32 heads, and each head maintains its own K and V matrices. When decoding a new token, the K and V of every past token must stay in GPU memory. Thirty-two independent heads means the KV cache scales by a factor of 32.
+
+Nobody cared in the era of short contexts. But once you start decoding thousands of tokens, this portion of memory alone dwarfs the model weights.
+
+*** Its Fix
+
+Shazeer asked a question that sounded almost reckless: *Do 32 heads really need 32 copies of KV? Can we get away with just one?*
+
+Let every Query head share the same single Key and Value — Multi-Query Attention. The KV cache instantly shrinks to 1/32 of its original size.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Why doesn't it collapse? Because in the attention mechanism, Q decides "what I am looking for," while K/V decide "what the content looks like." The content does not need multiple copies — you can query the same dictionary with different questions and still get different answers.
+
+New problem: it is too aggressive. Thirty-two heads sharing one copy is still a visible quality drop, especially at larger model scales.
+
+** 2023 | GQA: Not 1 or 32 — Split into Groups
+
+*** What Problem It Saw
+
+MQA is "share everything." MHA is "share nothing." There must be a sweet spot in between — but MQA's paper never went looking for it.
+
+*** Its Fix
+
+Ainslie et al. divided the Q heads into g groups, with each group sharing one KV pair. g=1 collapses to MQA; g=number of heads collapses to MHA. Pick anything in between. Llama-2 70B uses g=8, cutting the KV cache to 1/8 with almost no quality loss.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Intuition: neighboring attention heads already do similar things, so sharing KV within a group loses little. Across groups the behavior differs enough that forced sharing would hurt. "Grouping" is the right granularity.
+
+New problem: g is hardwired into the architecture. Want to squeeze a bit more? You have to change the architecture and retrain. And the compression ratio is capped at 1/g — there is nowhere further to go.
+
+** 2024 | MLA: Compress KV into a Small Latent Vector
+
+*** What Problem It Saw
+
+GQA is fundamentally "hard slicing" — heads are partitioned into groups, full sharing within, full independence across. That granularity is too coarse. The true correlations among attention heads are continuous, not block-structured.
+
+*** Its Fix
+
+DeepSeek-V2 took a different approach: instead of grouping, project all heads' KV jointly into a low-dimensional latent vector via a low-rank projection. When attention is needed, decode the latent back with a learned matrix.
+
+Analogy: MQA/GQA is like binding 32 books into 8 volumes (crude stacking); MLA is like writing a compressed, semantically meaningful summary of all 32 books.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Low-rank projection can learn the true intrinsic dimensionality of KV, without relying on arbitrary human-defined groupings. Under the same memory budget, quality is substantially better. DeepSeek-V2 exploited this to deliver real cost-efficiency.
+
+New problem: this is an *architecture change*. You must pretrain an MLA-flavored model from scratch. Every existing Llama, Mistral, and Qwen model is locked out.
+
+** 2024 | Palu: No Retraining — SVD After the Fact
+
+*** What Problem It Saw
+
+MLA is attractive, but the barrier to entry is too high. The open-source community holds a large stock of pretrained MHA/GQA models, and nobody wants to retrain an entire model just to save some memory.
+
+*** Its Fix
+
+Palu argues: low-rank compression does not have to happen at pretraining time. Take a trained model, apply SVD to its K_proj and V_proj matrices, and factor each projection into two thin matrices. The left thin matrix is absorbed into the model weights; the right thin matrix is kept as an "up-projection." The KV cache then stores only the intermediate low-dimensional hidden state.
+
+Result: no retraining; a few hours of calibration yields a low-rank Llama variant.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Mathematically sound: SVD is the optimal low-rank approximation, and the KV projections of pretrained models are already approximately low-rank, so truncating the high-frequency components loses little.
+
+Two new problems:
+1. *It modifies the model's projection weights.* The model is now permanently in "compressed mode." There is no way to run standard full-cache inference — the projection matrices have been changed.
+2. Compression operates *within a single layer* and ignores cross-layer redundancy.
+
+** 2025 | CommonKV: One More Cut Across Layers
+
+*** What Problem It Saw
+
+Palu looks at one layer at a time. In practice, KV representations in adjacent Transformer layers are remarkably similar — an observation that has been noted repeatedly. Palu leaves that free lunch untouched.
+
+*** Its Fix
+
+CommonKV extends SVD sharing from "within-layer grouping" to "cross-layer sharing": a set of low-rank bases is shared across several adjacent layers. At very low budgets (e.g., 0.3× compression ratio), it outperforms Palu by a clear margin.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Cross-layer similarity is a genuine physical redundancy — compressing it is a fair trade.
+
+New problem: *it still modifies projection matrices.* The "permanently locked into compressed mode" problem inherited from Palu is completely unresolved. In fact, the modification goes deeper — cross-layer sharing alters the model structure itself. Dynamic switching is out of the question.
+
+** 2026 | EchoKV: Don't Touch the Model — Just Train a Tiny "Echo Network"
+
+*** What Problem It Saw
+
+EchoKV turns the whole Palu–CommonKV lineage on its head:
+
+> Do we really need to operate on the *model*? The redundancy in KV cache is plainly in the *data* — why change the projection matrices at all?
+
+More pointedly: in real deployments, *short-context requests* and *long-context requests* arrive mixed together. Short contexts have ample memory and should run full-cache inference for the best quality; only long contexts need to save memory. But once Palu or CommonKV is deployed, there is no going back — short contexts are also stuck running in compressed mode.
+
+*** Its Fix
+
+Move the blade from "model parameters" to "the cache itself":
+
+1. At inference time, for each layer's KV, retain only a slice (e.g., the first m dimensions as a "local cache," plus the full KV from the first layer of the preceding group as a "global cache").
+2. Discard the remaining dimensions outright.
+3. Use a very small network (a linear layer, <50M parameters) to *echo-reconstruct* the discarded dimensions from the retained ones.
+4. The base model is completely untouched.
+
+Transforming Palu's design into EchoKV's design:
+- Remove Palu's "pre-projection compression."
+- Remove Palu's "post-projection decompression."
+- Leave the model weights *exactly where they are.*
+- Insert a small "keep a portion → predict the rest" network into the KV data stream.
+
+That is EchoKV.
+
+Training is lightweight: a two-stage fine-tuning procedure (first an MSE reconstruction loss to warm up, then Output-MSE + FlashAttention alignment to match downstream attention outputs). A 7B model can be calibrated in minutes on a single A100.
+
+*** Why It Works (and Where It Plants a New Problem)
+
+Two observations underpin it:
+- *Cross-layer similarity*: adjacent-layer KV is highly correlated — the full KV from the first layer is sufficient to predict the following layers.
+- *Within-layer similarity*: different heads in the same layer share structure — retaining a small slice is enough to reconstruct the whole.
+
+The most important side effect: model weights are unchanged → when memory is abundant, bypass the echo network entirely and immediately switch back to full-cache inference at zero quality cost. This is something the entire Palu/CommonKV lineage cannot do.
+
+New problems:
+1. The local cache is a hard prefix slice (the first m dimensions), chosen for access efficiency. The authors themselves admit that a smarter dimension-selection strategy might work better.
+2. Keys are harder to reconstruct than Values (the opposite of what Palu found), hinting that K and V may need *different* compression mechanisms — already flagged as the next research direction.
+
+* Frontier Extensions
+
+EchoKV is freshly published; contemporaneous and slightly earlier work attacks the same problem *from the opposite direction*:
+
+** 2025 | TransMLA / X-EcoMLA: Upgrade Existing Models to MLA
+
+TransMLA (arXiv:2502.07864) and X-EcoMLA (arXiv:2503.11132) take a different route: since MLA is desirable, instead of abandoning existing models, *continue training* to convert a GQA model into an MLA model. In other words, they try to lower the barrier from "must pretrain from scratch" to "a modest amount of continued training."
+
+Divergence from EchoKV: the TransMLA line still modifies the architecture and is still irreversible. EchoKV offers a different answer — *don't touch the architecture at all*. EchoKV's paper explicitly uses TransMLA as a baseline and claims to outperform it at most compression ratios.
+
+** How to Read the Relationship Between the Two Lines
+
+Think of it as the same problem split along a fault line:
+- *Architecture camp* (MLA → TransMLA → X-EcoMLA): low-rank compression should be baked into the model, the deeper the better.
+- *Data camp* (Palu → CommonKV → EchoKV): low-rank compression should stay in the KV data stream; keep the model clean.
+
+EchoKV is the most radical step the data camp has taken so far — unwilling to modify even the model's projection weights.
+
+* One Figure to Tie It All Together
+
+#+begin_example
+                  KV Cache Compression: Evolutionary Overview
+                  ============================================
+
+Year     2019      2023       2024        2024       2025         2026
+          |         |          |           |          |            |
+Method   MQA  -->  GQA  -->   MLA   -->  Palu  -->  CommonKV --> EchoKV
+                               \                                  /
+                                +--> TransMLA / X-EcoMLA (parallel branch)
+
+What is  Arch      Arch       Arch        Model      Model        Nothing
+touched  (head     (head      (latent     (proj.     (proj.       (only KV
+         sharing)  grouping)  proj.)       SVD)       cross-layer  data stream)
+                                                      SVD)
+
+Revers.? no        no         no          no         no           YES
+Pretrain?yes       yes        yes         no(calib.) no(calib.)   no(minutes)
+
+         "hard slice" -----> "learned compression" -> "post-hoc" -> "post-hoc guess"
+          (coarse)              (fine-grained)         (changes weights) (no weight change)
+
+
+  Compression intensity (1x = full)
+    1x  o MHA (starting point)
+        |
+   1/4  o
+        |
+   1/8  o GQA (Llama2 70B)
+        |
+  1/16  o MLA (DeepSeek-V2)
+        |
+  1/32  o MQA / Palu / CommonKV / EchoKV (modern low-budget)
+
+  Can you dynamically switch back to full-cache inference?
+    MQA / GQA / MLA / Palu / CommonKV / TransMLA  -- No
+    EchoKV                                        -- Yes (core selling point)
+#+end_example
+
+* Insight
+
+After reading all six papers, what is actually evolving is not the "compression ratio" — it is *the position of compression in the system stack*.
+
+Early on (MQA/GQA/MLA), compression was an *architecture problem*: you had to decide how to compress at the moment you drew the Transformer blueprint. The cost was retraining.
+
+In the middle (Palu/CommonKV), compression was demoted to a *weight problem*: existing models could be compressed post-hoc, but the projection matrices had to be changed. The cost was losing reversibility.
+
+With EchoKV, compression retreats further to a *runtime problem*: neither the architecture nor the weights are modified; a lightweight "guesser" is simply inserted into the KV data stream. The cost is running a small network online.
+
+Each step down the stack lowers the barrier and increases flexibility. This is a deeply familiar pattern in systems design: *push hard decisions as late as possible*. Compiler → runtime → JIT follows this logic; database schema-on-read follows this logic; now KV-cache compression has arrived at the same point.
+
+What comes next? Pushing further in this direction, the most aggressive form would be *"decide per token how much to expand"* — dynamically determining, based on the current query, how much KV to reconstruct in each layer. EchoKV today still sets a per-layer budget; only a scheduler stands between the current design and that next step.
+
+A second thread: EchoKV's own planted seed — Keys and Values may need different compression mechanisms. This reveals that K and V are not the same thing, even though they have always been treated as a unit. Compressing them together is a historical artifact. The next wave of papers may well split them apart.
+
+* Takeaways
+
+For researchers:
+
+1. *Don't just read the paper — read who it is arguing against.* EchoKV's real breakthrough is not "we built a new network." It is "five generations of predecessors all modified model parameters, but that was never necessary." Papers that bypass an entire traditional assumption are almost always written after someone has spent a long time studying the limitations of a whole chain of prior work. The reverse-reading method is precisely about forcing yourself to find such openings.
+
+2. *List the constraints and ask, one by one, which ones can be relaxed.* The MQA-to-MLA lineage accepted the constraint "compression must be baked into the architecture." Palu relaxed one: "retraining is not required." EchoKV relaxed another: "modifying weights is not required." Each generation loosened exactly one constraint that the previous generation silently accepted. It is worth sweeping through your own field with this template: *What constraint am I currently taking for granted that could actually be relaxed?*
+
+3. *Irreversibility is an expensive price.* Palu and CommonKV look elegant on paper, but the moment you run mixed workloads, "no way back" is a permanent tax. EchoKV's value proposition is essentially *turning a one-way surgery into a removable earpiece*. The design philosophy of "add something that can always be taken off" is almost universally valid in systems engineering.
+
+Closing point: you can use this lineage as an engineering template. *The next time you design an optimization, ask yourself first: "Can it be turned off?" An optimization that can be turned off is worth ten times one that cannot.*

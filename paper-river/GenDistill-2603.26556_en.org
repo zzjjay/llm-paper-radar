@@ -1,0 +1,326 @@
+#+title:      When Perplexity Lies: Generation-Focused Distillation of Hybrid Sequence Models
+#+date:       [2026-05-28 Thu 19:48]
+#+filetags:   :paper:river:distillation:hybrid:ssm:linear_attention:en:
+#+identifier: 20260528T194840-en
+#+source:     https://arxiv.org/abs/2603.26556
+#+authors:    Juan Gabriel Kostelec, Xiang Wang, Axel Laborieux, Christos Sourmpis, Qinghai Guo (Huawei)
+#+venue:      arXiv preprint, 2026-03-27
+
+* The River of Problems
+
+A 7B model finishes distillation with a PPL (perplexity) gap of only 0.2 percentage points from the teacher — seemingly near-perfect. Ask it to actually generate answers, and the gap explodes to 20.8 percentage points. This is not an isolated accident in one paper; it is a systematic blind spot running through the entire line of research on "distilling Transformers into more efficient non-Transformers."
+
+The real conflict this whole river is trying to resolve looks like this:
+- Transformer self-attention is O(n²) in time and memory; long contexts are increasingly unmanageable — KV cache grows linearly, and time-to-first-token at 128K tokens explodes
+- Linear attention / SSMs can achieve O(1) per-step inference with no KV cache, but their expressiveness is capped by a fixed-size hidden state, causing them to fall apart on retrieval-style tasks
+- Training a high-quality linear architecture from scratch costs trillions of tokens — prohibitively expensive — so the field turns to *distillation*: take a ready-made Transformer teacher and pour its capabilities into an efficient student
+- How do you measure how well the pouring went? Everyone uses PPL (let the model score candidate answers), which is convenient, cheap, and aligned with the training objective — *but it fundamentally cannot test whether the model can generate correct answers on its own*
+
+GenDistill is the paper that stops everyone at this blind spot and says: you think your methods are improving, but actually your ruler is lying. It then hands over a concrete solution — a Hybrid-KDA architecture plus a three-stage distillation pipeline — that holds up under real generation evaluation.
+
+* Source Map
+
+This river has two main tributaries that only converge at GenDistill. One is the *architecture line* (how Transformers get replaced), and the other is the *distillation line* (how the teacher's abilities get transferred into the student).
+
+#+begin_example
+                    Architecture Line                   Distillation Line
+                    -----------------                   -----------------
+[2017] Transformer (Vaswani et al.)
+       Self-attention O(n^2), KV cache grows linearly
+                |
+                v
+[2020] Linear Attention (Katharopoulos et al.)
+       Remove softmax, rewrite attention as
+       matrix state S_t = S_{t-1} + k v^T
+       Problem: state only accumulates, information overwrites each other
+                |
+                v
+[2021/24] DeltaNet (Schlag; Yang et al.)
+       Reinterpret state update as "online gradient descent"
+       --> rank-1 corrective update
+           (I - beta k k^T) S + beta k v^T
+       Problem: still no true forgetting
+                |
+                v
+[2023/24] Mamba / Mamba2 (Gu & Dao)              [2024] MOHAWK (Bick et al.)
+       SSM route: bring selective state space      Three-stage distillation:
+       into LMs, efficient for long sequences        (1) Align attention matrix
+                |                                  (2) Align block hidden states
+                v                                  (3) End-to-end KD
+[2025] Gated DeltaNet (Yang et al.)               --> Uses Mamba2 as student
+       Add scalar forget gate alpha:               --> Evaluation is PPL-only
+       alpha (I - beta k k^T) S + beta k v^T              |
+       Problem: alpha applies the same decay                v
+       to all feature dimensions —                 [2024-25] Phi-Mamba / Llamba (Wang; Bick)
+       can't forget what should be forgotten,      Push MOHAWK to larger models / add DPO
+       can't retain what should be retained        --> 3B - 8B distillation tokens
+                |                                  --> Results still reported PPL-only
+                v                                         |
+[2025] Kimi Delta Attention (KDA, Team et al.)            v
+       Channel-wise forget gate Diag(alpha):       [2025] LoLCats (Zhang et al.)
+       each feature dimension decides              Linearize + 40M token LoRA fine-tuning
+       its own retention timescale                 Ultra-low cost but MMLU etc. drop noticeably
+                |                                         |
+                |                                         |
+                +------------------+-----------------------+
+                                   |
+                                   v
+                       [2026.03] GenDistill (this paper, Kostelec et al.)
+                                   |
+       Observed problem: the entire distillation line is self-deceiving with PPL —
+                  QRWKV6-7B differs from teacher by only 0.2pp on PPL,
+                  but 20.8pp on real generation
+       Solution: (a) Student uses Hybrid-KDA (7 attention layers out of 28,
+                     21 KDA layers); attention layers chosen via beam search
+                 (b) GenDistill three-stage pipeline; every design decision
+                     is validated with generation evaluation, not PPL
+                 (c) Systematic ablation of 6 design axes, producing a recipe:
+                     KD + completion-only mask + frozen attention layers +
+                     teacher-aligned data
+       Results: 86-90% of teacher accuracy / KV cache cut 75% /
+                TTFT 2-4× faster at 128K
+       Cost: 800M tokens (MOHAWK uses 3B, Llamba uses 8B)
+                                   |
+                                   v
+                            (Frontier extensions below)
+       [2025-26] M1, MiniCPM-SALA, Li et al. 2026
+                 Take "distillation + heavy SFT/RL post-training" route
+                 (MiniCPM-SALA burns 1T tokens)
+                 GenDistill argues the opposite: instead of patching with
+                 post-training volume, fix the distillation design itself —
+                 800M tokens is enough
+#+end_example
+
+Note: the architecture line and the distillation line run *in parallel* until KDA/MOHAWK. KDA is a component someone else built; MOHAWK is a pipeline someone else built. GenDistill's contribution is fitting these two pieces together correctly — and swapping out the ruler used to measure the result.
+
+* Evolutionary Narrative
+
+** 2017-2020 | Transformer → Linear Attention: Removing the Softmax
+
+*** The Problem Observed
+
+The strength of Transformers comes from the softmax(QK^T)V mechanism — "everyone looks at everyone else." But softmax couples all tokens into one dense block: step n of inference requires an n×n attention matrix, and the KV cache must store all previous K and V vectors. As sequence length grows, memory explodes.
+
+*** The Solution
+
+Linear Attention (Katharopoulos 2020) made an apparently destructive change: it replaced softmax with a dot-product of feature maps φ(Q)φ(K)^T. This change has an unexpected side effect — you can reassociate the matrix multiplications and convert "look at all K's first, then compute V" into "maintain a state matrix S_t = S_{t-1} + k_t v_t^T," updating only one matrix per step.
+
+This effectively rewrites attention from *"everyone looks at everyone"* to *"maintain a continuously updated associative memory"*: S acts like a dictionary where key k maps to value v, and each new pair is simply appended.
+
+*** What Pit Was Left Behind
+
+The dictionary only grows, never shrinks. When a new entry shares a key with an old one, the new value does not replace the old — it accumulates on top. Information interferes with itself, and as sequences lengthen, the memory blurs into noise.
+
+** 2021-2024 | DeltaNet: Reinterpreting the Update as "Online Gradient Descent"
+
+*** The Problem Observed
+
+Linear Attention's additive update is too naive — it has no mechanism for "correct yourself when you're wrong." If the same key k corresponds to different values v at different times, old values contaminate new ones.
+
+*** The Solution
+
+DeltaNet (Schlag 2021, reformulated into a hardware-efficient training form by Yang et al. 2024b) offered an elegant reinterpretation: treat the state update as minimizing a *per-token reconstruction loss* L_t(S) = ½‖S^T k_t − v_t‖². One step of online gradient descent on this loss yields a rank-1 corrective update:
+
+S_t = (I − β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T
+
+This is the *delta rule*. Intuitively: first use (I − β k k^T) to "erase" a portion of the old state in the direction of k, then write the new k v^T in. New values genuinely overwrite old ones.
+
+*** What Pit Was Left Behind
+
+Corrections only happen in the direction accessed by the new key. Old associations that haven't been accessed in a long time continue to sit in the state, occupying capacity, with no way to actively decay.
+
+** 2025 | Gated DeltaNet: Adding a "Forget Switch"
+
+*** The Problem Observed
+
+DeltaNet only updates what gets overwritten; it has no capacity for "active aging" — things that should no longer be remembered cannot be explicitly erased.
+
+*** The Solution
+
+Gated DeltaNet (Yang 2025c) multiplies a scalar forget gate α_t ∈ [0, 1] in front of the delta rule:
+
+S_t = α_t (I − β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T
+
+α_t is learned from the input and acts like a weight-decay coefficient: α close to 1 preserves long-term memory; α close to 0 causes rapid forgetting.
+
+*** What Pit Was Left Behind
+
+α_t is a *scalar* — it applies the same decay rate to every feature dimension of the state matrix S. But in practice, some feature dimensions carry syntactic information that needs short-term forgetting, while others carry subject-identity information that needs long-term retention. A one-size-fits-all scalar gate inevitably either forgets too aggressively where retention is needed, or retains too stubbornly where forgetting is needed.
+
+** 2025 | KDA: Making Each Dimension's Forget Gate Independent
+
+*** The Problem Observed
+
+Gated DeltaNet's scalar gate is too coarse-grained. For a model to simultaneously support "short-term forgetting of fine details" and "long-term retention of identity," each feature dimension needs its own independent forgetting rate.
+
+*** The Solution
+
+Kimi Delta Attention (KDA, Team et al. 2025) replaces the scalar α_t with a diagonal matrix Diag(α_t):
+
+S_t = (I − β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T
+
+Now every feature dimension has its own α and can independently decide "how long does this dimension remember." Intuitively: upgrading from a single "universal aging" switch to fine-grained control where "each cell has its own lifespan." Expressiveness jumps a tier. This is also why GenDistill chose KDA as the core linear layer for its student — it is the most expressive publicly available linear attention variant in 2025.
+
+*** What Pit Was Left Behind
+
+KDA's capabilities were measured in *training-from-scratch* settings. Whether you can *distill* a high-quality KDA student from a Transformer is another matter entirely. That kicks the ball to the distillation line.
+
+** 2024 | MOHAWK: Breaking Cross-Architecture Distillation into Three Stages
+
+*** The Problem Observed (Parallel Starting Point on the Distillation Line)
+
+If you want to convert a Transformer teacher trained on several trillion tokens into a Mamba student using end-to-end KL-divergence distillation, does that work? *No.* The architectures are too different — the teacher's hidden state lives in attention matrices, the student's lives in SSM recurrent states; they are misaligned from the very start. Direct end-to-end distillation produces chaotic gradients.
+
+*** The Solution
+
+MOHAWK (Bick et al. 2024) proposed a *three-stage* bottom-up distillation:
+
+1. *Stage 1: Align attention matrices* — make the student's "pseudo-attention" distribution approximate the teacher's softmax distribution
+2. *Stage 2: Align hidden states* — layer by layer, make each student block's output match the corresponding teacher block's output
+3. *Stage 3: End-to-end KD* — finally perform full-model distillation using logits-level KL divergence
+
+The logic is clear: first make the student resemble the teacher in "local behavior," then in "global output." This paradigm was subsequently adopted and extended by Phi-Mamba (Wang 2024), Llamba (Bick 2025a), and a series of other works (adding DPO, scaling to larger models).
+
+*** What Pits Were Left Behind
+
+Two — one minor, one fatal:
+
+- *Minor pit*: Stage 1 assumes the student has an explicit attention matrix to align. KDA does not — its state is a matrix S, not an N×N attention map. The pipeline cannot be transplanted directly
+- *Fatal pit*: The entire MOHAWK family (including Phi-Mamba, Llamba, QRWKV6, etc.) reports results using PPL evaluation. This *looks* fine, since the distillation objective is itself about matching probability distributions. But PPL evaluation and generation evaluation are *two fundamentally different capabilities* — and nobody formally called this out until GenDistill
+
+** 2026.03 | GenDistill (This Paper): Swap the Ruler, and the Whole Line's Answers Change
+
+*** The Problem Observed
+
+GenDistill's insight operates on two levels.
+
+The first is *strategic*: the entire cross-architecture distillation literature is self-deceiving with PPL evaluation. The paper makes this point sharply with a demonstration using QRWKV6-7B-Instruct (distilled from Qwen2.5-7B):
+
+| Evaluation Protocol | Average Gap: Teacher vs. Student |
+|--------------------+----------------------------------|
+| PPL                | 0.2 pp (looks nearly perfect)    |
+| Generation         | 20.8 pp (an order of magnitude worse) |
+
+Why such a large discrepancy? PPL evaluation means: "given four candidate answers A/B/C/D, have the model assign probabilities and check whether the correct answer ranks first." This tests only *discrimination ability*. Generation evaluation means: "the model autoregressively generates a passage, from which the answer is parsed." This tests the ability to "maintain coherence through an autoregressive process, generate the correct format, and complete a full reasoning chain without errors" — a completely different, and much harder, capability.
+
+This is not specific to QRWKV6. The paper systematically validates: design choices that look good under PPL may *reverse in order* under generation evaluation. In other words, a substantial portion of the "our method beats the baseline on PPL" conclusions drawn over the past several years may be reversed in real-world usage.
+
+The second level is *engineering*: under this stricter ruler, redo the architecture and distillation pipeline design from scratch.
+
+*** The Solution
+
+Fit KDA (the strongest branch of the architecture line) together with MOHAWK (the paradigm of the distillation line) correctly:
+
+- *Architecture (Hybrid-KDA)*: The Qwen3-0.6B teacher has 28 attention layers. The student retains 7 attention layers (frozen and transplanted directly from the teacher) plus 21 KDA layers. Which 7 layers to keep? Selected via *Beam Search (Add)*: starting from an all-KDA student, attention layers are incrementally added back; at each step, the combination with the lowest PPL on three complementary datasets (synthetic associative recall + C-EVAL + FineWeb-EDU) is selected.
+
+- *Distillation pipeline (GenDistill)*: Three stages, but Stage 1 is changed to *hidden state alignment* (since KDA cannot materialize an N×N attention matrix), and Stage 3 is split into 3a (distillation on pre-training data) and 3b (distillation on instruction data).
+
+- *Systematic ablation of six design axes* — every conclusion validated using generation evaluation:
+  1. Training objective: KD (knowledge distillation) vs. SFT (supervised fine-tuning) — KD wins
+  2. Loss mask: completion-only (compute loss only on answer tokens) vs. full sequence — completion-only wins
+  3. Training duration: longer is *not necessarily* better (prone to overfitting)
+  4. Dataset choice: teacher-aligned instruction data >> arbitrarily chosen instruction tuning data
+  5. Parameter freezing: freezing attention layers during post-training helps significantly
+  6. Architecture: Hybrid-KDA > Hybrid-Mamba2 > pure KDA
+
+*** Why This Works
+
+Three mechanisms stack together:
+1. *Evaluation-objective alignment*: using generation evaluation as the compass avoids getting trapped in PPL local optima
+2. *Hybrid covers KDA's blind spot*: retaining 7 attention layers provides a safety net for online retrieval-type tasks
+3. *Freezing teacher components*: MLPs, embeddings, and those 7 attention layers are all frozen and transplanted from the teacher, ensuring that "knowledge" the teacher already learned is not washed out by new data
+
+Results: 800M tokens (vs. MOHAWK's 3B and Llamba's 8B) achieves 86-90% of teacher accuracy, cuts KV cache by 75%, and delivers 2-4× faster time-to-first-token at 128K.
+
+*** What Pits Were Left Behind
+
+GenDistill flags several of its own:
+- The full ablation is only conducted on Qwen3-0.6B; whether conclusions hold at 0.6B → 7B remains to be verified
+- KDA is the state-of-the-art architecture in 2025, but by 2026 there will be RWKV7, new-generation SSMs, and others — the architecture selection itself is a rapidly moving target
+- The beam search for choosing attention layers still relies on PPL (on three small datasets) — a minor inconsistency with the "generation evaluation first" principle
+
+* Frontier Extensions
+
+GenDistill is from March 2026, but several adjacent works already existed at the time:
+
+- *M1* (Wang et al. 2025) and *MiniCPM-SALA* (Team et al. 2026): both recognized the problem with PPL evaluation, but their solution is *more post-training* (additional SFT + RL). MiniCPM-SALA burned 1T tokens to recover generation quality. GenDistill's counter-argument: rather than patching the hole with 1T tokens of post-training, fix the distillation design itself — 800M tokens is sufficient
+- *Li et al. 2026*: nearly concurrent with GenDistill; proposes *greedily adding attention layers back into a fully linear student*, selecting layers by KL divergence between teacher and student logits. Similar in spirit to GenDistill's Beam Search (Add), but with a simpler search strategy
+- *PostNAS* (Gu et al. 2025): trains a once-for-all supernet and uses beam search to find the optimal layer combination. Heavier than GenDistill — GenDistill trains no supernet, relying only on the teacher plus an already-distilled fully-linear student
+- *Hardware trends*: post-Blackwell, the pain of long-context inference (128K+) is growing sharper; "cut KV cache without hurting generation quality" is a production-level requirement in 2026. The path GenDistill takes — "use distillation to obtain a Hybrid architecture" — will become a standard first step for deploying Transformer models in long-context settings
+
+The likely trajectory for 2026-2027 is toward: (a) finer-grained attention/linear mixing and automated layer selection, (b) generation evaluation becoming the default reporting standard, and (c) joint optimization of distillation and post-training RL.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  Architecture Expressiveness             Distillation Pipeline
+                  -------------------------               ---------------------
+[2017] Transformer                                        (Train from scratch, trillions of tokens)
+       O(n^2) attention
+              |
+              v
+[2020] Linear Attention                                   (Train from scratch)
+       S_t = S_{t-1} + k v^T
+       Flaw: accumulate-only, no deletion
+              |
+              v
+[2021] DeltaNet                                           (Train from scratch)
+       (I - beta k k^T) S + beta k v^T
+       New values can overwrite old, no active forgetting
+              |
+              v
+[2025] Gated DeltaNet                                     (Train from scratch)
+       Add scalar alpha forget gate
+       Flaw: same rate applied to all dimensions
+              |
+              v
+[2025] KDA (Kimi)               -------- MOHAWK (Bick 2024) --------
+       Diag(alpha) channel-wise          Three stages: attn matrix align
+       forget gate, each dim             -> hidden align -> end-to-end KD
+       has its own retention             Evaluation: PPL-only
+                |                        Student: Mamba, 3B tokens
+                |                              |
+                |                              v
+                |                        Phi-Mamba / Llamba / QRWKV6
+                |                        Larger models + DPO added
+                |                        Evaluation: PPL-only
+                |                        ----> *PPL self-deception*: 0.2pp vs 20.8pp
+                |                              |
+                +------------+-----------------+
+                             |
+                             v
+                  [2026.03] GenDistill (this paper)
+                  ----------------------------------------------
+                  Ruler: switched to generation evaluation
+                  Architecture: Hybrid-KDA (7 attn + 21 KDA, layers chosen via beam search)
+                  Pipeline: MOHAWK three stages, Stage 1 changed to hidden state align
+                  Recipe: KD + completion-only mask + freeze attn + teacher-aligned data
+                  Cost: 800M tokens (4-10× cheaper)
+                  Gain: 86-90% accuracy / KV cache -75% / TTFT 2-4× faster @128K
+
+       Concurrent: M1, MiniCPM-SALA take "distill + heavy SFT/RL post-training" route
+                   GenDistill demonstrates the converse: get the distillation right
+                   and you don't need nearly as much post-training
+
+       Time ----------------------------------------------------->
+#+end_example
+
+* What This River Is Really Changing
+
+On the surface this looks like "architectures upgrading" (Linear → Delta → Gated → KDA) and "pipelines gaining stages" (end-to-end → three-stage). But stepping back, this river has undergone three deeper cognitive shifts:
+
+1. *From "replace attention" to "hybridize attention"* — pure linear architectures have a fundamental structural weakness on retrieval tasks (a fixed-size state cannot hold precise facts from large contexts). Hybrid is not a compromise; it is the reality this river had to accept after going full circle: the O(n²) cost of attention is the price paid for *exact* retrieval, and that capability cannot be fully substituted by linear memory. The question is no longer "do we need attention at all," but "how many layers to keep, and where."
+
+2. *From "seemingly optimizing capability, actually optimizing a proxy metric" to "aligning the evaluation protocol"* — PPL and generation look like the same thing (both are probability-based), but *discrimination vs. generation* are two fundamentally different capabilities. The entire distillation line went four or five years without anyone formally calling this out, because PPL is cheap, convenient, and aligned with the training objective — everyone tacitly trusted it. GenDistill's true contribution is not any particular design choice but this *return-to-first-principles methodological correction*. Such corrections are rarer than any architectural innovation, because they require acknowledging that part of a whole field's progress over recent years may have been illusory.
+
+3. *From "add more stages, more data, more compute" to "find the right design axes"* — M1 and MiniCPM-SALA take the "patch the hole with 1T tokens of post-training" approach. GenDistill achieves comparable results with roughly one-tenth that compute budget, by *pinning down the optimal combination of six design axes*. This echoes a broader pattern: when a research direction reaches diminishing marginal returns, the most valuable work is often not yet another trick, but *understanding how existing tricks interact*.
+
+Where is this likely to go next? First, *generation evaluation becoming the default* — a wave of papers will re-evaluate existing work and reshuffle the "actual capability rankings." Second, *the Hybrid ratio and layer selection* will be pushed toward full automation and task-awareness. Third, *joint design of distillation and post-training RL* — now that GenDistill has shown distillation itself can be done right, the next question is: "what additional gains can the compute saved during distillation buy when fed into RL?"
+
+* Honest Annotations
+
+- Citation relationships are drawn from the paper's Related Work and Background sections, cross-verified. The chain of iterative improvements through KDA / MOHAWK / DeltaNet / Linear Attention is explicitly stated in the paper
+- "PPL self-deception" is the central argument of GenDistill; the evidence is Table 1 of the paper using QRWKV6-7B-Instruct (Section 1.0). This narrative is built around that evidence
+- Descriptions of the three concurrent works — M1, MiniCPM-SALA, and Li et al. 2026 — are based on brief mentions in this paper's Related Work; the original papers have not been read
+- "2025" in the timeline refers to the public release year of KDA / Gated DeltaNet and similar works; specific months have not been rigorously verified
+- "Next-step predictions" are inferences drawn from the shape of this river, not assertions from the paper itself

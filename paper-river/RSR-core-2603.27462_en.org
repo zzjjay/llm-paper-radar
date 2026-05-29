@@ -1,0 +1,219 @@
+#+title:      RSR-core: A High-Performance Engine for Low-Bit Matrix-Vector Multiplication
+#+date:       [2026-05-28 Thu 19:56]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T195603-en
+#+source:     https://arxiv.org/abs/2603.27462
+#+authors:    Mohsen Dehghankar, Abolfazl Asudeh
+#+venue:      arXiv preprint, 2026-03-29 (cs.DS / cs.LG / cs.PF)
+
+* The Problem River
+
+The bottleneck of LLM inference is matrix-vector multiplication. Weight matrices contain hundreds of millions to tens of billions of numbers, and every generated token demands a full read-and-multiply pass over all of them. How do you make this both fast and lossless?
+
+The difficulty is that two pressures converge from opposite directions:
+- *Hardware direction*: compress weights from 16-bit down to 1-bit to save memory and bandwidth. But the harder you compress, the more accuracy you lose. How far can you push before the model breaks?
+- *Algorithm direction*: standard matrix multiplication is O(n^2), and decades of research have never broken through that wall. But what if the weights can only take values from {-1, 0, 1}? Is it still O(n^2)? Is there really no shortcut?
+
+The two paths ran in parallel, neither helping the other — until someone noticed that once hardware had compressed weights to ternary, the old foundation of algorithms cracked open, and a log factor could be excavated. Then someone else noticed that the gains excavated by the algorithm couldn't land inside a real hardware kernel — they were a paper victory. This river is the story of how two separate tracks collided.
+
+* Source Map
+
+#+begin_example
+[2023.10] BitNet (Wang et al., 2310.11453)
+  |
+  | Problem: FP16/INT8 weights are still too large and too energy-hungry
+  | Solution: Train a 1-bit Transformer from scratch (BitLinear)
+  v
+[2024.02] BitNet b1.58 (Ma et al., 2402.17764)
+  |
+  | Problem: Pure 1-bit is not expressive enough; noticeable accuracy drop
+  | Solution: Add a 0, making weights {-1, 0, 1} (ternary), log2(3) ≈ 1.58 bit
+  |           Starting from 3B parameters, begins to match FP16 LLaMA
+  v
+                +---------------------------------+
+                |                                 |
+                v                                 v
+[2024.10] bitnet.cpp           [2024.11] RSR (Dehghankar et al., 2411.06360)
+(2410.16144)                   ICML 2025
+  |                              |
+  | Direction: hardware          | Direction: algorithm
+  | Hand-write ternary multiply  | Ternary matrix columns contain many
+  | as a CPU kernel              | repeated patterns; compute each once,
+  | 2.4x–6x speedup             | complexity drops to O(n^2 / log n)
+  | But still O(n^2)             | But only NumPy/C++ lab code —
+  |                              | cannot plug into a real inference pipeline
+  +--------------+---------------+
+                 |
+                 | Problem: the log factor is consumed by the Python
+                 |          interpreter / memory access / generic sorting
+                 v
+[2026.03] RSR-core (this paper, 2603.27462)
+  |
+  | Solution: Rewrite RSR as a C kernel + CUDA kernel
+  |           Counting sort + compact metadata + warp-level parallelism
+  |           Integrated with HuggingFace; one line replaces nn.Linear
+  v
+  62x faster than ternary LLM inference on CPU, 1.9x faster on CUDA
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.10 | BitNet: Training a 1-Bit Transformer from Scratch
+
+*** What Problem It Saw
+
+LLM inference is slow, expensive, and hot. FP16 weights cost 2 bytes per number; a 70B model needs 140 GB for weights alone. Post-training quantization to INT8 saves half, but pushing further — to 4-bit or 1-bit — causes a cliff-edge accuracy collapse. The model was never trained for low precision; forcing it into a {-1, +1} world naturally leaves it confused.
+
+*** Its Solution
+
+Abandon post-training quantization — train with 1-bit from the very first step. Replace every ~nn.Linear~ in PyTorch with ~BitLinear~: during the forward pass, weights are binarized to ±1; during the backward pass, gradients still flow through and update a full-precision "latent" weight. This way the model learns from day one how to live in a 1-bit world.
+
+*** Why It Works (and What New Pit It Digs)
+
+Because the model adapts to low precision rather than being forced into it after the fact, it retains more capability and exhibits scaling laws similar to FP16. But pure 1-bit expressivity still has a ceiling: each weight can only "fire or not fire" — it cannot say "this connection is irrelevant." A noticeable capability gap remains on large models, motivating the next step.
+
+** 2024.02 | BitNet b1.58: Add a Zero, Ignite the Ternary Wave
+
+*** What Problem It Saw
+
+1-bit BitNet manages at small scale but struggles as you push into tens of billions of parameters. The problem is not the training framework — it is the vocabulary. A binary on/off switch cannot express "this edge is unimportant," which is an extremely common situation.
+
+*** Its Solution
+
+Add exactly one value: 0. The weight set grows from {-1, +1} to {-1, 0, +1}. Three values need log2(3) ≈ 1.58 bits to encode, hence the name b1.58.
+
+*** Why It Works (and What New Pit It Digs)
+
+That zero gives the model a built-in "pruning" button: unimportant connections can be zeroed out. Starting from 3B parameters, b1.58 matches same-size FP16 LLaMA; at 70B it is 4.1× faster and matrix-multiply energy is 71× lower.
+
+But b1.58 is only a *model architecture* — it says nothing about how to actually run those ternary matrices fast. cuBLAS/cuDNN on GPU is written for FP16/INT8; nobody has optimized for ternary. The result: the model weights are small, but inference is not much faster. Two engineering relay races begin: bitnet.cpp takes the hardware track; RSR takes the algorithm track.
+
+** 2024.10 | bitnet.cpp: The Hardware-Facing CPU Kernel
+
+*** What Problem It Saw
+
+b1.58 models are available, but running them with HuggingFace + PyTorch means doing bfloat16 multiplications on ternary matrices — none of the benefits of ternary are realized.
+
+*** Its Solution
+
+Hand-write SIMD kernels for x86 and ARM, compressing "ternary weight × float activation" down to a handful of instructions. Same-size models run 2.4×–6× faster on CPU.
+
+*** Why It Works (and What New Pit It Digs)
+
+Ternary multiplication does not need a real multiplier — table lookups and additions suffice. But the approach is fundamentally still O(n^2): every matrix element must be visited once. It never asks the question "could we visit fewer elements?"
+
+** 2024.11 | RSR: The Algorithm Track — First Break Through O(n^2)
+
+*** What Problem It Saw
+
+Everyone before — FP16, INT8, BitNet, bitnet.cpp — had silently assumed that matrix-vector multiplication must be O(n^2). This was decades of received wisdom. But with only three distinct weight values, that wisdom has a gap: *many columns are identical*.
+
+More precisely: slice the matrix into horizontal strips of k rows each. Within each strip, look at each column's k-element pattern. With k=8 and ternary, there are only 3^8 = 6561 possible patterns. If the matrix is n=10,000 columns wide, the pigeonhole principle guarantees that on average each pattern appears 1.5 times — heavy repetition.
+
+Old approach: compute the dot product of every column with the input vector v independently, repeating the work n times. RSR's insight: compute each *unique pattern* exactly once, then broadcast the result to all columns that share that pattern.
+
+*** Its Solution
+
+Two phases:
+- *Offline preprocessing*: slice the matrix into strips, apply counting sort within each strip to cluster columns with identical patterns, and record the column permutation and group boundaries.
+- *Online inference*: using the precomputed groupings, gather and sum the relevant elements of input v, compute one multiply-accumulate per *unique* pattern, then scatter the results back.
+
+Complexity drops from O(n^2) to O(n^2 / log n) — a log factor on paper.
+
+*** Why It Works (and What New Pit It Digs)
+
+It exploits the fact that "weights are fixed after training" — one preprocessing pass can be reused indefinitely. It exploits "low bit-width implies natural repetition" — the narrower the bit-width, the more repeated patterns.
+
+But the implementation is NumPy + C++ lab code: fine for benchmarking in isolation, but impossible to insert into a real LLM inference pipeline. The Python interpreter, generic sorting, variable-length scatter lists, and non-coalesced memory accesses all silently devour the log factor the algorithm had earned. Theoretical 29×, actual gain in HuggingFace: essentially zero. That is the starting point of RSR-core.
+
+** 2026.03 | RSR-core (This Paper): Making the Log Factor Land
+
+*** What Problem It Saw
+
+The RSR algorithm itself is not the problem — *RSR written in Python* is too slow, slow enough to erase every advantage it earns. The specific bottlenecks:
+
+- Interpreter dispatch: every matmul call detours through Python
+- Generic comparison sort O(n log n), even though the pattern space is a finite discrete set that does not need comparison sorting at all
+- Scatter implemented as a Python list of lists — memory jumps everywhere
+- Ternary requires scatter in both positive and negative directions; the original implementation uses two lists, causing dense branching
+- Multiple linear layers sharing the same input (Q/K/V) each invoke the kernel separately, wasting work
+
+*** Its Solution
+
+Rewrite the entire RSR pipeline as native kernels:
+
+1. *Replace generic sort with counting sort*: the pattern space has only 2^k or 4^k buckets; one pass in O(n + buckets) is enough.
+2. *Compact metadata*: column-permutation indices compressed to 16-bit; scatter represented with bitmasks instead of variable-length index lists; on CUDA, one group's full metadata fits in a single 64-bit word loaded in one instruction.
+3. *Fuse gather and aggregate on CPU*: a single scan over the input vector accumulates directly, avoiding any intermediate array. Scalar unrolled loads with software prefetch outperform hardware gather instructions for RSR's random-access pattern.
+4. *CUDA: row block → thread block, warp-level group parallelism*: each warp uses a shared-memory local buffer to avoid write conflicts; zero-contribution groups are dropped at preprocessing time.
+5. *Fuse activation quantization with matrix multiply; batch Q/K/V together*: eliminates one Python dispatch hop and exposes a larger parallel pool to multi-core execution.
+
+*** Why It Works (and What New Pit It Digs)
+
+This is not "algorithmic innovation" — it is *translating an existing algorithm from paper to silicon*, where every optimization corresponds to a hardware feature that the previous implementation had wasted. Result: 62× faster than ternary LLM inference with HuggingFace bf16 on CPU; 1.9× faster token generation on CUDA; zero accuracy loss.
+
+Remaining limitation: the CUDA speedup is only 1.9× because random-access scatter patterns are hostile to GPU memory hierarchies. The algorithmic next step likely requires redesigning pattern groupings to respect GPU memory coalescing — an open problem.
+
+* Frontier Extensions
+
+As of now (2026-05), RSR-core is the most recent engineering milestone combining algorithmic and hardware compression on this line. Visible next directions:
+- GPU-friendly RSR variants: the 1.9× on CUDA is far from exhausting the algorithm's potential; the bottleneck is random access. Pattern layout must be redesigned to match GPU coalesced memory access.
+- Cross-layer pattern sharing: currently each linear layer is preprocessed independently. If different layers share a common pattern dictionary, the preprocessing artifacts can be compressed further.
+- RSR-aware training: adding a loss term during training that encourages repeated column patterns could amplify the log factor further. BitNet and RSR have not yet formally converged on this idea.
+
+* One Diagram to Understand It All
+
+#+begin_example
+            Hardware track (compute each bit faster)   Algorithm track (compute fewer bits)
+            =========================================   ====================================
+
+2017-2022   FP16/INT8 matmul                           O(n^2) GEMM
+            cuBLAS, cuDNN                               (Strassen etc. don't apply at LLM scale)
+              |
+              |
+2023.10     BitNet (1-bit, train from scratch)
+              |
+              v
+2024.02     BitNet b1.58 (ternary)
+              |
+              +-----------------+--------------------+
+              |                                      |
+              v                                      v
+2024.10     bitnet.cpp                  2024.11   RSR (Dehghankar et al.)
+            CPU SIMD kernel                        O(n^2 / log n)
+            Still O(n^2);                          But only NumPy+C++;
+            measured 2–6x                          cannot plug into HF pipeline
+              |                                      |
+              +-------------------+------------------+
+                                  |
+                                  v
+2026.03                       RSR-core (this paper)
+                              Algorithm × hardware: translate RSR
+                              into C/CUDA kernels,
+                              integrate with HuggingFace
+                              CPU 62x, CUDA 1.9x
+
+       Core turning points:
+       (1) Adding 0 → ternary is the cost-efficiency inflection point
+       (2) Ternary matrix → many repeated columns → log factor available algorithmically
+       (3) Algorithm in paper ≠ algorithm in production; kernelization is the last mile
+#+end_example
+
+* Insights
+
+On the surface this river is "LLM inference optimization"; one layer deeper it is *two independent paths — hardware compression and algorithmic compression — that at a certain point each unlocked the other's door*.
+
+- When weights are FP16, nobody thinks "can the algorithm be faster?" because the matrix looks "dense" and "continuous" — structural redundancy is hidden by representational precision.
+- When weights are compressed to ternary, structural redundancy is exposed: columns have only 3^k possible patterns, so for large n they repeat heavily. For the first time in decades, the O(n^2) wall has a crack.
+- But an algorithmic victory in theory gets silently consumed by interpreters, general-purpose libraries, and memory access patterns in practice. The distance from "algorithm" to "kernel" is often longer than the invention of the algorithm itself — and far less celebrated in academia.
+
+A deeper thread: *compression creates new redundancy*. FP16 has no redundancy but is expensive. INT4 has some. Ternary has massive redundancy. Redundancy flips from "a problem" to "a resource the accelerator can exploit" — that is the core cognitive reversal in RSR.
+
+A prediction for what comes next: the next breakthrough may not be "shave off another bit," but rather "redesign the training objective so that redundancy emerges in a more structured shape that GPUs can digest." The bit count is approaching a floor (1.58 is very close to 1); the remaining space lies in *the shape of the redundancy*.
+
+* Takeaways
+
+1. *When reading a paper, start with who it criticizes*: RSR-core's single phrase "existing implementations operate at the application level" precisely locates the upstream RSR paper. Always read the "however" in the introduction first.
+2. *The gap between algorithm and engineering is larger than you think*: a theoretical 29× becoming 0× in production is the norm, not the exception. An algorithm with a log factor is not necessarily faster than an engineering implementation with a small constant factor. This means that "kernelizing someone else's algorithm" is a severely underrated, high-leverage opportunity.
+3. *Hardware trends change what algorithms are feasible*: ternary weights opened the first crack in the O(n^2) wall. The next hardware shift — in-memory compute, new memory hierarchies — will open new cracks. Watch the hardware roadmap to choose algorithmic problems.
+4. *Redundancy is defined by the representation*: switching representations can turn "an unstructured matrix" into "a highly repetitive matrix." When you are stuck on a problem, ask: "Is my current representation hiding structure that a different representation would reveal?"

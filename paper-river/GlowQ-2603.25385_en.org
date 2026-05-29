@@ -1,0 +1,300 @@
+#+title:      GlowQ: Group-Shared LOw-Rank Approximation for Quantized LLMs
+#+date:       [2026-05-28 Thu 19:44]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T194437-en
+#+source:     https://arxiv.org/abs/2603.25385
+#+authors:    Selim An, Ilhong Suh, Yeseong Kim
+#+venue:      arXiv:2603.25385 (cs.LG), 2026
+
+* The River of Problems
+
+Squeezing a model with tens of billions of parameters into 4-bit while keeping it smart enough to speak coherently — this problem has been wrestled with by successive generations of papers over the past four years.
+
+Where is the difficulty? Model weights are originally 16-bit floats, each with over sixty thousand possible values. Compressed to 4-bit, each value has only 16 possible representations. Think of it as re-recording a high-fidelity audio track onto a cassette tape: information is inevitably lost — the only questions are where it is lost, how much, and whether the model can still understand itself.
+
+The earliest attempts simply *rounded to nearest* — and the model became noticeably dumber. Later, researchers discovered that not all weights are equally important: some form the skeleton, others are decoration, and damaging the skeleton causes collapse. Still later, people found that even when the skeleton is preserved, accumulated residual errors cause long-context coherence to fall apart — so researchers began *patching the quantized model with a high-precision correction* to compensate. GlowQ stands at the latest bend in this patching lineage, asking: can part of the patch be *shared* rather than applying a full-sized one to every layer independently?
+
+The true main thread of this river is not "how to compress a model smaller," but rather *how we have learned, step by step, to distinguish which information is worth preserving from which is not*.
+
+* The Source Map
+
+#+begin_example
+[1990/93] LeCun / Hassibi - Optimal Brain Damage / Surgeon
+  |
+  | Problem: Neural networks are large and slow; can we prune some weights?
+  | Insight: Use second-order derivatives (Hessian) to judge which weights
+  |          can be removed with minimal impact
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: OBS idea is great, but LLMs are too large to compute the Hessian
+  | Solution: Block-wise solving + Cholesky trick, quantizes a 175B model
+  |           within hours
+  v                                        \
+[2023] Lin et al. - AWQ                     |
+  |                                          |  (Two parallel PTQ routes, both
+  | Problem: GPTQ only looks at weights,     |   yielding "decent" 4-bit models,
+  |          ignores which activation        |   but accuracy still drops below
+  |          channels are actually used      |   4-bit)
+  | Solution: Use activation statistics to   |
+  |           find "salient channels" and   |
+  |           rescale to protect them        |
+  v                                         /
+[2023] Yao et al. - ZeroQuant-V2 (LoRC)
+  |
+  | Problem: After quantization, residual errors remain
+  | Solution: Add a small low-rank correction term A*B alongside
+  |           the quantized weights
+  v
+[2024] Zhang et al. - LQER
+  |
+  | Problem: ZeroQuant's LoRC is still empirical
+  | Solution: Decompose per-layer quantization error E via SVD as A*B;
+  |           no changes to the inference graph, modules attach beside weights
+  v
+[2024] Zhang et al. - QERA
+  |
+  | Problem: LQER optimizes "weight error," but what we truly care about
+  |          is "output error"
+  | Solution: Closed-form derivation of optimal (A,B) targeting output error
+  v
+[2025] Zhao et al. - ASER
+  |
+  | Problem: At ultra-low bits (2-3 bit), activations have strong anisotropy;
+  |          SVD decomposes in the wrong direction
+  | Solution: Whitened SVD + activation smoothing to align corrections
+  |           with the true data distribution direction
+  v
+[2026] An et al. - GlowQ  <== This paper
+  |
+  | Problem: All the above methods attach an A*B to every layer;
+  |          q/k/v within the same group share the same input X but each
+  |          computes B*X separately — wasting latency and memory;
+  |          and not every layer deserves correction
+  | Solution: (1) Share one B within a same-input group; compute B*X once
+  |               and cache it for reuse
+  |           (2) Add covariance whitening so the shared B aligns with
+  |               real activation directions
+  |           (3) Selective repair — only attach modules to the most
+  |               beneficial groups
+  v
+[?] Next: Generalize "sharing + selection" from single models to MoE /
+          dynamic inference?
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1990/1993 | OBD / OBS: The Founding Fathers of Neural Network Pruning
+
+*** What Problem Did They See
+
+Early neural networks were small enough to count their weights by hand. But LeCun already foresaw a future difficulty: once networks grow large, *inference burns resources, and after training, most weights are not doing useful work*. Can we pick out the useless ones and discard them? The most naïve approach looks at absolute weight magnitude — small means dispensable. But LeCun pushed back: how do you know that a numerically small weight also has a small effect on the final output?
+
+*** Their Solution
+
+Use a Taylor expansion. If a weight perturbation δw affects the loss function by ½·H·δw² (where H is the second derivative, called the Hessian), then *dropping a weight = perturbing it to zero*, and the resulting increase in loss can be computed directly. Rank all weights by this "damage score" and start discarding from the lowest — that is Optimal Brain Damage (OBD, LeCun 1990) and Optimal Brain Surgeon (OBS, Hassibi 1993).
+
+*** Why It Worked (and What New Trap It Set)
+
+For the first time it told us: *to assess whether a weight matters, look at its second-order effect on the output, not at its own magnitude*. This insight would be reused repeatedly. But OBS requires computing the inverse of the Hessian — a matrix whose size is the square of the number of weights. Fine for the few-thousand-parameter networks of 1990; for today's tens-of-billions-of-parameter LLMs? Computationally intractable. That left the stage open for the next paper.
+
+** 2022 | GPTQ: Bringing the Founding Fathers' Technique to LLMs
+
+*** What Problem Did It See
+
+Twenty years later, the spirit of OBS was revived for quantization (not pruning, but the idea is identical: mapping weights to discrete values is a form of "perturbation"). The problem remained unchanged: *the Hessian is uncomputable*. A single LLaMA layer's weight matrix has tens of millions of parameters; the Hessian is the square of that.
+
+*** Its Solution
+
+Frantar et al.'s GPTQ introduced two clever engineering decisions:
+1. *Layer-by-layer independent quantization* — rather than seeking a global optimum, it suffices for each layer's quantized output to approximate the original layer's output. This decomposes the problem into hundreds of smaller ones.
+2. *Column-wise solving + Cholesky decomposition* — within each layer, weights are processed column by column, reusing the Cholesky factors of the Hessian cleverly to reduce the originally O(d⁴) cost to O(d³).
+
+Result: a 175B-parameter OPT model can be quantized to 4-bit within a few hours with almost no accuracy loss.
+
+*** Why It Worked (and What New Trap It Set)
+
+It genuinely applied the second-order weight-importance signal to LLMs. But it had a blind spot: *it only examines the weights of each layer, not the shape of the activations*. If certain input channels are almost never activated, the precision of their corresponding weights is irrelevant; conversely, if certain channels have large activation values, their quantization errors get amplified many times over. GPTQ treats all channels equally, never exploiting this information.
+
+** 2023 | AWQ: "Weights Don't Matter — Activations Do"
+
+*** What Problem Did It See
+
+Lin et al. observed a counterintuitive phenomenon: *in large models, only about 1% of weight channels are "salient"* — the input activation values for these channels far exceed those of all other channels. If they are treated identically to other channels during quantization, accuracy collapses; but if they receive "special treatment" (higher precision, or rescaling), the remaining channels can be quantized freely without trouble.
+
+*** Its Solution
+
+Rather than touching the second-order weight structure, *first apply a per-channel scaling*: amplify the salient channels' weights and shrink the corresponding activations (mathematically equivalent, output unchanged), then quantize. The amplified weights can be represented more finely within the 4-bit grid, so quantization error is reduced.
+
+*** Why It Worked (and What New Trap It Set)
+
+It shifted from GPTQ's "look at weights" to "look at activations," incorporating information from the data flow. But AWQ and GPTQ still shared a common problem: *both are "one-shot" quantization methods*. Once quantization is done, the residual errors are fixed there permanently — no matter how clever, 4-bit will never match 16-bit. Errors always remain. What to do? The next section introduces an answer.
+
+** 2023 | ZeroQuant-V2 (LoRC): Attaching a Small Patch to the Quantized Model
+
+*** What Problem Did It See
+
+Yao et al. accepted a reality: *no matter how hard you try, quantization error in 4-bit cannot be zero*. So — can we *add a small correction* on top of the quantized weights to compensate for the error?
+
+*** Its Solution
+
+They proposed *LoRC (Low-Rank Compensation)*: decompose each layer's quantization error matrix E (= original weight W − quantized weight Wq) into a low-rank factorization E ≈ A·B, keeping A and B in FP16 and attaching them alongside the quantized layer. During inference, the model computes Wq·X + A·(B·X) — the quantized part runs in INT4, the correction part runs in FP16, but because A·B is low-rank, the parameter count is only a few percent of the original layer.
+
+*** Why It Worked (and What New Trap It Set)
+
+It established a new paradigm: *quantization + patch*. But ZeroQuant-V2's LoRC was still somewhat empirical — how many SVD components to keep, why this recovers accuracy, what the optimal patch looks like — none of this was clearly explained. The next paper came to fill in the theory.
+
+** 2024 | LQER: Systematizing the Patch
+
+*** What Problem Did It See
+
+Zhang et al. picked up the LoRC idea and asked: *for "quantization + patch" to become a standard method, it needs to be made into a reliable, hands-off procedure rather than something requiring manual tuning each time*.
+
+*** Its Solution
+
+LQER (Low-rank Quantization Error Recovery): independently solve E ≈ A·B for each layer using standard SVD truncated to rank r. Does not modify the inference graph; modules attach directly beside the original layer. Open-source and plug-and-play.
+
+*** Why It Worked (and What New Trap It Set)
+
+It turned ZeroQuant-V2's insight into a general method applicable to any quantized model. But it buried a deep trap — *it minimizes the "weight error" |E − A·B|², whereas what we truly care about is the "output error" |(E·X) − (A·B·X)|²*. These two objectives can diverge substantially when activations have strong directional preferences. The next paper breaks through that misconception.
+
+** 2024 | QERA: Optimizing the Right Objective
+
+*** What Problem Did It See
+
+Zhang et al. (a different group) pointed out: LQER seeks the optimum in weight space, but the model's actual loss lives in *output* space. If certain input directions have near-zero activations, the weight error along those directions is irrelevant; and vice versa. LQER's SVD allocates the rank budget equally to "silent directions" and "high-energy directions," wasting capacity.
+
+*** Its Solution
+
+QERA derives a closed-form solution: *the optimal low-rank correction targeting output error* is equivalent to whitening the error matrix with the input covariance X·Xᵀ before applying SVD. In other words, instead of showing the SVD the structure of E, it shows it the structure of E·X. This way the rank budget is spent on directions that actually occur in practice.
+
+*** Why It Worked (and What New Trap It Set)
+
+It upgraded LQER's "general-purpose procedure" into a "data-driven procedure." But it addressed only the "optimization within the patch" problem, leaving another issue untouched: *at ultra-low bits (2-bit, 3-bit), the anisotropy of activations becomes extreme, and ordinary whitening breaks down*. The next paper attacks exactly that.
+
+** 2025 | ASER: A Stabilizer for Ultra-Low Bits
+
+*** What Problem Did It See
+
+Zhao et al. observed that at 2-3 bit, quantization errors grow large enough that plain whitened SVD can no longer rescue accuracy. Activation distributions develop extreme outliers that wreck the condition number of the whitening matrix, causing the entire correction to diverge.
+
+*** Its Solution
+
+ASER (Activation-Smoothed Error Recovery) = whitened SVD + activation smoothing: before whitening, first apply a SmoothQuant-style rescaling to suppress activation outliers, then perform the whitened SVD. The two steps together enable the correction to converge stably at low bit-widths.
+
+*** Why It Worked (and What New Trap It Set)
+
+It pushed QERA's mathematics to the robustness level required by real engineering at ultra-low precision. But ASER and all its predecessors share one *structural assumption*: every layer, every projection (q/k/v/o/up/gate/down), *hangs its own independent A·B module*. In a LLaMA-style transformer, the q, k, and v projections all read the same input X — yet each computes its own B·X, three times over! Three copies of B also sit in memory. This waste was sitting in plain sight; nobody had gone to fix it.
+
+** 2026 | GlowQ: Share, Align, Select
+
+*** What Problem Did It See
+
+An et al. focused on exactly that waste. In a typical transformer block there are clear *same-input groups*:
+- Attention input: q_proj, k_proj, v_proj all share the same LayerNorm output
+- MLP input: up_proj, gate_proj share the same LayerNorm output
+
+For every module within such a group, the operation "project X into a lower-dimensional space" — i.e., B·X — *can logically be shared*, since they all see the same input tensor. But LQER/QERA/ASER each manage their own B independently, resulting in:
+1. The same X being multiplied by multiple B matrices of identical size — redundant computation
+2. Multiple copies of B stored in memory
+3. Not every layer benefits from correction — some layers have small quantization error to begin with, and attaching A·B to them only slows things down
+
+*** Its Solution
+
+GlowQ applies three techniques:
+
+1. *Shared right factor*: stack all error matrices within a group — [E_q; E_k; E_v] — vertically into E_cat, perform a single SVD on it, and obtain one shared B along with individual A_q, A_k, A_v. Proved (Proposition 1 in the paper): under an unweighted objective, this "stacked SVD" is exactly the global optimum.
+
+2. *Covariance alignment*: inheriting QERA's insight, whiten with the input covariance before the stacked SVD so that the shared B aligns with the directions actually preferred by the data. Propositions 2 and 3 prove that this objective is equivalent to a weighted Frobenius norm.
+
+3. *Selective repair (GlowQ-S)*: use three signals — SVD energy |A|_F², normalized error |E|/|W|, and layer-index fallback — to score each group, and attach correction modules only to the top-K groups.
+
+On the engineering side, a QR-reduced randomized SVD is used: the tall-and-thin E_cat is compressed by QR into a d×d core, then randomized SVD is applied, avoiding direct decomposition of the large matrix.
+
+*** Why It Worked (and What New Traps It Set)
+
+Mathematically: B·X is computed once and cached; A_q·R + A_k·R + A_v·R are all cheap matrix-vector multiplications. Memory-wise: only one B is stored per group, parameter count drops directly. Performance-wise: on LLaMA-2, TTFB decreases by 5.6% and throughput increases by 9.6%; the selective variant GlowQ-S achieves TTFB −23.4% and throughput +37.4%, with only 0.2 percentage-point accuracy loss.
+
+Remaining open problems:
+- The sharing assumption relies on "identical inputs," so how does it apply to *dynamically routed* structures like MoE? The paper makes preliminary attempts but does not go deep.
+- The group-selection scoring is currently static and offline — can it be made dynamic based on the prompt?
+- How stable is the shared B at extreme scenarios like 2-bit? Not fully validated.
+
+* Frontier Extensions
+
+As of now (2026-05), GlowQ is the latest representative work in the "low-rank correction of quantization error" lineage. Extensions around it have already begun appearing sporadically on arXiv:
+- *Dynamic selective repair*: decide at runtime, based on the current input token, whether to activate the correction branch (similar to the sparse-activation idea in MoE).
+- *Cross-layer sharing*: not just sharing B within one block, but sharing some structure between adjacent blocks. This touches the deeper question of inter-layer representational redundancy in LLMs.
+- *Joint optimization with KV-cache compression*: GlowQ optimizes correction on the weight side, but inference bottlenecks also include the KV-cache. Unifying weight-side low-rank correction with KV-side low-rank compression is an obvious yet not yet seriously pursued direction.
+
+None of these have settled into canonical representative papers yet. The next bend in this river may arrive in the second half of 2026.
+
+* One Diagram to See It All
+
+#+begin_example
+                 ===  Evolution of the Quantization Error Correction Lineage  ===
+
+  Time ->    1990          2022         2023         2024         2025         2026
+                            |            |            |            |            |
+  Target:                   |            |            |            |            |
+  Weight 2nd-order OBD/OBS->GPTQ         |            |            |            |
+                            |            |            |            |            |
+  Activation-aware                       AWQ          |            |            |
+                                         |            |            |            |
+  Post-hoc patch                         ZeroQuant   LQER          |            |
+                                         v(LoRC)     v(SVD/A,B)    |            |
+  Output-targeted                                                  QERA          |
+                                                                   v(whitened   |
+                                                                     SVD)       |
+  Ultra-low-bit stable                                                          ASER
+                                                                                v(whiten+smooth)
+  Share + Select                                                                             GlowQ
+                                                                                             v(group-shared B
+                                                                                               + selective)
+
+
+     [The cognitive center of gravity in quantization has shifted:
+      "look at weights" -> "look at activations" -> "look at outputs" -> "look at group structure"]
+
+     The key question of each generation:
+
+     OBD/OBS  -> "Which weights are unimportant?" (second-order derivatives decide)
+     GPTQ     -> "How to make OBS tractable at LLM scale?" (Cholesky trick)
+     AWQ      -> "Is treating all weights equally correct?" (1% salient channels are worth gold)
+     LQER     -> "Accuracy still drops after quantization — can we patch it back?" (low-rank patch)
+     QERA     -> "What objective should the patch optimize?" (output error ≠ weight error)
+     ASER     -> "Can the patch hold up at ultra-low bits?" (whitening + smoothing)
+     GlowQ    -> "Why attach a patch to every layer? What about sharing?" (group-shared + selective)
+
+
+  Likely next question: "Should the patch adapt to the input dynamically?
+                         Share across layers? Be co-optimized with KV-cache compression?"
+#+end_example
+
+* Insights
+
+Viewing this entire lineage together, *what is truly evolving is not "compression technology" but "our understanding of the redundant structure inside models"*:
+
+1. *From weights to activations, from local to global*: OBD/GPTQ asked "is this individual weight important?"; AWQ jumped to "channel-level activation distributions"; LQER/QERA asked "is the correction aligned to the output space?"; GlowQ finally ascends to *"same-input sharing structure at the module-group level"*. Each generation pushes the boundary of "what counts as redundancy" one step further out.
+
+2. *Refinement of the optimization objective*: early algorithms optimize in weight space; middle-generation algorithms optimize in output space; the GlowQ era begins to consider "output-space optimality under system latency and memory constraints." The objective function has gradually converged from "mathematically elegant" toward "engineering-practical" — but each step is accompanied by more precise theoretical characterization (not abandoning rigor, but writing engineering constraints into the objective).
+
+3. *The rise of the patch culture*: the most interesting paradigm shift happened at ZeroQuant-V2/LQER — researchers accepted that "base quantization methods can never be perfect" and began layering *differentiable correction mechanisms* on top of quantization. This is actually very analogous to what LoRA does in the PEFT world: *freeze the main body + high-precision low-rank increments*. GlowQ pushes this shared LoRA-style insight further into the PTQ setting.
+
+4. *The next bend is nearly predictable*: when a field starts discussing "intra-group sharing" and "selective activation," the next step almost inevitably moves toward *dynamic sparsification* — choosing a path at runtime based on the input. This has already happened in MoE, speculative decoding, and prefix-caching. After GlowQ, the quantization-correction lineage will very likely merge with these dynamic mechanisms.
+
+* Takeaways
+
+If you are doing research:
+
+- *Reading a paper backward saves ten times the effort of reading it forward.* When you open GlowQ and do not yet know what problem it is solving, look in the abstract at who it is criticizing ("LQER, QERA, ASER restore all layers..."), then trace that line of criticism backward — you will retrieve its true "problem coordinates" rather than just its "selling points."
+
+- *"Everyone before assumed X, but X can actually be relaxed" is one of the most valuable paper archetypes there is.* GlowQ's core insight — "per-layer independent A·B is an unexamined default" — is valuable not for its mathematics but for *seeing that this default exists*. The ability to spot such blind spots is far rarer than technical skill.
+
+- *Engineering constraints are often a new paper's real footing.* GlowQ's accuracy gain (+0.42 pp) and its paper title are both unremarkable, but its latency gain (TTFB −23%) is where the true contribution lies — in a domain where accuracy improvements are saturated, *inference efficiency* becomes the new axis of differentiation. Recognizing the moment when such a "dimension switch" occurs is important.
+
+If you are applying these methods in production:
+
+- In 4-bit deployments, *"quantization + low-rank patch"* has already moved from a research trajectory to a de-facto standard. If you are using bare GPTQ/AWQ, it is worth seriously evaluating whether adding LQER/QERA/GlowQ pays off — accuracy improvements are typically 0.5–2 pp, and latency impact under GlowQ-S can actually be negative (i.e., the patched model runs faster than the unpatched one).
+
+- The *selective repair* idea (GlowQ-S) can be transferred independently: many optimization techniques — pruning, distillation, speculative decoding — suffer from the same pain point of "apply to everything vs. apply to nothing." Adding a saliency-based selection layer typically captures the sweet spot in the cost-benefit trade-off.

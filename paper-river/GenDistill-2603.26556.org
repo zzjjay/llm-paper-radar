@@ -1,0 +1,320 @@
+#+title:      When Perplexity Lies: Generation-Focused Distillation of Hybrid Sequence Models
+#+date:       [2026-05-28 Thu 19:48]
+#+filetags:   :paper:river:distillation:hybrid:ssm:linear_attention:
+#+identifier: 20260528T194840
+#+source:     https://arxiv.org/abs/2603.26556
+#+authors:    Juan Gabriel Kostelec, Xiang Wang, Axel Laborieux, Christos Sourmpis, Qinghai Guo (Huawei)
+#+venue:      arXiv preprint, 2026-03-27
+
+* 问题之河
+
+一个 7B 模型蒸馏完成，PPL（困惑度）和老师只差 0.2 个百分点——看起来近乎完美。让它真的开口生成答案，差距瞬间拉到 20.8 个百分点。这不是哪一篇论文的偶然事故，是整条"把 Transformer 蒸成更高效的非 Transformer"研究线的系统性盲区。
+
+整条河在解的真问题是这样一组冲突：
+- Transformer 的 self-attention 是 O(n²) 的时间/内存，长上下文越来越扛不住——KV cache 线性涨，128K token 推理时延爆炸
+- 线性注意力 / SSM 可以做到 O(1) 每步推理、无 KV cache，但表达力被固定大小的隐藏状态卡死，做检索类任务掉链子
+- 从头训一个高质量的线性架构要 trillions of tokens，烧不起——所以人们想"蒸馏"：拿现成的 Transformer 老师，把能力灌进一个高效学生
+- 怎么衡量灌得好不好？大家用 PPL（让模型给候选答案打分），方便、便宜、和训练目标对齐——*但根本测不出"模型能不能自己生成正确答案"这件事*
+
+GenDistill 这篇论文就是站在这个盲区上喊停的：你以为你的方法在进步，其实是你的尺子在撒谎。然后它顺手交出一套（Hybrid-KDA 架构 + 三阶段蒸馏 pipeline）能在真生成评测下也站得住的方案。
+
+* 溯源地图
+
+这条河有两条主干，到 GenDistill 才汇合。一条是 *架构线*（Transformer 怎么被替换掉），一条是 *蒸馏线*（怎么把老师的本事灌进学生）。
+
+#+begin_example
+                    架构线                              蒸馏线
+                    --------                            --------
+[2017] Transformer (Vaswani et al.)
+       自注意力 O(n^2), KV cache 线性增长
+                |
+                v
+[2020] Linear Attention (Katharopoulos et al.)
+       去掉 softmax, 把 attention 写成
+       矩阵状态 S_t = S_{t-1} + k v^T
+       问题: 状态只加不减, 信息互相覆盖
+                |
+                v
+[2021/24] DeltaNet (Schlag; Yang et al.)
+       把状态更新解读为"在线梯度下降"
+       --> rank-1 corrective update
+           (I - beta k k^T) S + beta k v^T
+       问题: 还是没有真正的遗忘
+                |
+                v
+[2023/24] Mamba / Mamba2 (Gu & Dao)              [2024] MOHAWK (Bick et al.)
+       SSM 路线: 把 selective state space         三阶段蒸馏:
+       搬进 LM, 长序列高效                          (1) 对齐 attention matrix
+                |                                  (2) 对齐 block hidden state
+                v                                  (3) 端到端 KD
+[2025] Gated DeltaNet (Yang et al.)               --> 用 Mamba2 当学生
+       加 scalar 遗忘门 alpha:                    --> 评测全用 PPL
+       alpha (I - beta k k^T) S + beta k v^T              |
+       问题: alpha 对所有维度一刀切,                       v
+       该忘的忘不掉、该留的留不住                  [2024-25] Phi-Mamba / Llamba (Wang; Bick)
+                |                                  把 MOHAWK 推到更大模型 / 加 DPO
+                v                                  --> 3B - 8B 蒸馏 tokens
+[2025] Kimi Delta Attention (KDA, Team et al.)    --> 报告依然 PPL-only
+       channel-wise 遗忘门 Diag(alpha):                   |
+       每个特征维度自己决定记多久                          v
+                |                                  [2025] LoLCats (Zhang et al.)
+                |                                   线性化 + 40M tokens LoRA 微调
+                |                                   超低成本但 MMLU 等掉得明显
+                |                                          |
+                +------------------+-----------------------+
+                                   |
+                                   v
+                       [2026.03] GenDistill (本文, Kostelec et al.)
+                                   |
+       看到的问题: 整条蒸馏线在用 PPL 自我欺骗——
+                  QRWKV6-7B 在 PPL 上只差老师 0.2pp, 真生成时差 20.8pp
+       解法: (a) 学生用 Hybrid-KDA (28 层里留 7 层 attention, 21 层 KDA),
+                attention 层用 beam search 挑出来
+            (b) GenDistill 三阶段, 每个设计决策都用"生成评测"拍板,
+                不再信 PPL
+            (c) 6 个设计轴系统消融, 总结出 recipe:
+                KD + completion-only mask + 冻结 attention 层 + 教师对齐数据
+       成果: 86-90% 老师精度 / KV cache 砍 75% / 128K 首 token 快 2-4x
+       代价: 800M tokens (MOHAWK 是 3B, Llamba 是 8B)
+                                   |
+                                   v
+                            (前沿延伸见后文)
+       [2025-26] M1, MiniCPM-SALA, Li et al. 2026
+                 走"蒸馏 + 加大量 SFT/RL 后训练"路线 (MiniCPM-SALA 烧 1T tokens)
+                 GenDistill 反其道而行: 不靠后训练量取胜, 靠蒸馏本身的设计
+#+end_example
+
+注：两条线在 KDA / MOHAWK 之间是 *并列* 关系——KDA 是别人造好的零件，MOHAWK 是别人造好的流水线，GenDistill 的贡献是把这两根东西插对了榫卯，并且换了一把尺子来量结果。
+
+* 演化叙事
+
+** 2017-2020 | Transformer → Linear Attention：把 softmax 拆掉
+
+*** 看到的问题
+
+Transformer 之所以强，靠的是 softmax(QK^T)V 这个"全互相看"的机制。但 softmax 把所有 token 强行连成一团：第 n 步推理要算 n×n 的 attention matrix，KV cache 还得把所有之前的 K、V 都存着。序列长一点，显存就爆。
+
+*** 解法
+
+Linear Attention（Katharopoulos 2020）做了一个看似破坏式的改动：把 softmax 拆成 φ(Q)φ(K)^T 的内积形式。这个改动有一个意外的副作用——你可以把矩阵乘法重新组合，把"先看所有 K、再算 V"变成"维护一个状态矩阵 S_t = S_{t-1} + k_t v_t^T"，每一步只更新一个矩阵。
+
+这相当于把 attention 从 *"全互看"* 改写成了 *"维护一个不断更新的关联记忆"*：S 就像一本字典，键 k 对应值 v，新来一对就往字典里加一条。
+
+*** 留下了什么坑
+
+字典只加不删。新条目和旧条目用同样的键值时，新值不会替换旧值，而是叠加上去——信息互相干扰，序列一长，记忆就糊成一片。
+
+** 2021-2024 | DeltaNet：把更新当作"在线梯度下降"来理解
+
+*** 看到的问题
+
+Linear Attention 的累加式更新太朴素了——它没有任何"错了就改"的机制。如果同一个键 k 在不同时间对应不同的值 v，旧值会污染新值。
+
+*** 解法
+
+DeltaNet（Schlag 2021，被 Yang et al. 2024b 改造成可高效训练的形式）做了一个漂亮的重新诠释：把状态更新看成是在最小化一个 *per-token 重建损失* L_t(S) = ½‖S^T k_t − v_t‖²。在这个视角下，一步在线梯度下降就推出来一个 rank-1 的修正式更新：
+
+S_t = (I − β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T
+
+这就是 *delta rule*。直观理解：先用 (I − β k k^T) 把旧状态在 k 方向上"擦掉一部分"，再把新的 k v^T 写进去。新值真的会覆盖旧值了。
+
+*** 留下了什么坑
+
+修正只在"被新键访问到的方向"上发生。如果某个旧关联很久没被访问，它依然躺在状态里占着名额，没法主动衰减。
+
+** 2025 | Gated DeltaNet：加一个"忘记开关"
+
+*** 看到的问题
+
+DeltaNet 只在被覆盖时才更新，没有"主动衰老"的能力——不该再记得的东西没办法被显式地擦掉。
+
+*** 解法
+
+Gated DeltaNet（Yang 2025c）在 delta rule 前面乘一个标量遗忘门 α_t ∈ [0, 1]：
+
+S_t = α_t (I − β_t k_t k_t^T) S_{t-1} + β_t k_t v_t^T
+
+α_t 是从输入学出来的，相当于一个"权重衰减"系数：α 接近 1 就长期保存，接近 0 就快速遗忘。
+
+*** 留下了什么坑
+
+α_t 是一个 *标量*——它对状态矩阵 S 的所有特征维度施加同样的衰减率。但现实里：有的特征维度承载着语法信息，需要短期遗忘；有的维度承载着主语身份，需要长期记忆。一刀切的标量门必然要么对该忘的不够狠，要么对该留的不够温柔。
+
+** 2025 | KDA：把遗忘门拆成"每个维度独立"
+
+*** 看到的问题
+
+Gated DeltaNet 的标量门粒度太粗。要让模型同时具备"短期细节遗忘"和"长期身份保留"，你需要让每个特征维度有自己独立的遗忘率。
+
+*** 解法
+
+Kimi Delta Attention（KDA, Team et al. 2025）把标量 α_t 换成对角矩阵 Diag(α_t)：
+
+S_t = (I − β_t k_t k_t^T) Diag(α_t) S_{t-1} + β_t k_t v_t^T
+
+现在每一个特征维度都有自己的 α，可以独立选择"这个维度留多久"。
+
+直观理解：从一个统一的"全员衰老"开关，升级成"每个细胞自己有寿命"的精细管理。表达力跳了一档。这也是为什么 GenDistill 选 KDA 作为学生的核心线性层——它是 2025 年公开可用的线性注意力变体里表达力最强的一支。
+
+*** 留下了什么坑
+
+KDA 的能力是 *从头训练* 时测出来的。能不能 *从 Transformer 蒸出来* 一个高质量的 KDA 学生？这是另一回事。这就把球踢到了蒸馏线。
+
+** 2024 | MOHAWK：把跨架构蒸馏拆成三阶段
+
+*** 看到的问题（蒸馏线的并行起点）
+
+如果你想把一个训了几 T tokens 的 Transformer 老师转成 Mamba 学生，直接端到端用 KL 散度蒸馏行不行？*不行*。架构差太多——老师的隐藏状态在 attention 矩阵里，学生的隐藏状态在 SSM 的递归状态里，从一开始就对不齐。直接端到端蒸，梯度一片混乱。
+
+*** 解法
+
+MOHAWK（Bick et al. 2024）提出 *三阶段* bottom-up 蒸馏：
+
+1. *Stage 1：对齐 attention matrix*——让学生的"伪 attention"分布去逼近老师的 softmax 分布
+2. *Stage 2：对齐 hidden states*——layer by layer 让学生每个 block 的输出去匹配老师对应 block 的输出
+3. *Stage 3：端到端 KD*——最后用 logits-level KL 散度做全模型蒸馏
+
+逻辑很清楚：先让学生在"局部行为"上像老师，再让它在"整体输出"上像老师。这套范式后来被 Phi-Mamba (Wang 2024)、Llamba (Bick 2025a) 等一系列工作沿用并扩展（加 DPO、加更大模型规模）。
+
+*** 留下了什么坑
+
+两个，一大一小：
+
+- *小坑*：Stage 1 假设学生有"显式的 attention matrix"可以对齐。KDA 没有——它的状态是矩阵 S，不是 N×N 的 attention map。这条 pipeline 直接搬过来不行
+- *大坑（致命）*：整条 MOHAWK 系（包括 Phi-Mamba、Llamba、QRWKV6 等）报告结果时都用 PPL 评测。这事 *看起来* 没问题，毕竟蒸馏目标本来就是匹配概率分布。但 PPL 评测和生成评测是 *两种根本不同的能力*——而这一点等到 GenDistill 才有人正式戳破
+
+** 2026.03 | GenDistill（本文）：把尺子换了，整条线的答案都变了
+
+*** 看到的问题
+
+GenDistill 的洞察分两层。
+
+第一层是 *战略层面* 的：整个跨架构蒸馏文献都在用 PPL 评测自我欺骗。论文用 QRWKV6-7B-Instruct（从 Qwen2.5-7B 蒸来）做了一个尖锐演示——
+
+| 评测协议 | 老师 vs 学生平均差距 |
+|---------+----------------------|
+| PPL     | 0.2 pp（看起来近乎完美）|
+| 生成    | 20.8 pp（差了一个数量级）|
+
+为什么差这么远？PPL 评测是"给四个候选答案 A/B/C/D，让模型给它们打概率，看正确答案是不是排第一"。这只测了"判别能力"。生成评测是"模型自己续写一段，从中解析出答案"。这测的是"在自回归过程里维持一致性、生成正确格式、不出错地走完整段推理"——一个完全不同（也更难）的能力。
+
+这不是 QRWKV6 的特例。论文系统验证：你在 PPL 下做的所有设计选择，在生成评测下可能 *反着排序*。也就是说，过去几年那些"我们的方法在 PPL 上比 baseline 好"的结论，相当一部分可能在真实使用场景里是反过来的。
+
+第二层是 *工程层面* 的：在这把更严的尺子下，重新做架构 + 蒸馏 pipeline 的设计。
+
+*** 解法
+
+把 KDA（架构线的最强支）+ MOHAWK（蒸馏线的范式）这两根东西插对：
+
+- *架构（Hybrid-KDA）*：Qwen3-0.6B 老师有 28 层 attention。学生保留 7 层 attention（从老师冻结直接搬过来）+ 21 层 KDA。哪 7 层保留？用 *Beam Search (Add)*：从全 KDA 的学生出发，逐步把 attention 层加回来，每一步在三个互补的数据集（合成 associative recall + C-EVAL + FineWeb-EDU）上挑 PPL 最低的组合。
+
+- *蒸馏 pipeline（GenDistill）*：三阶段，但 Stage 1 改为 *hidden state alignment*（因为 KDA 没法物化 N×N attention matrix），Stage 3 拆成 3a（预训练数据蒸）和 3b（指令数据蒸）。
+
+- *系统消融六个设计轴*——每一个轴的结论都用生成评测拍板：
+  1. 训练目标：KD（蒸馏）vs SFT（监督微调）——KD 赢
+  2. 损失 mask：completion-only（只在答案 token 上算 loss）vs full sequence——completion-only 赢
+  3. 训练时长：更长 *不一定* 更好（容易过拟合）
+  4. 数据集选择：教师对齐的指令数据 >> 随便找的 instruction tuning 数据
+  5. 参数冻结：post-training 时 *冻结 attention 层* 帮助显著
+  6. 架构：Hybrid-KDA > Hybrid-Mamba2 > 纯 KDA
+
+*** 为什么这招管用
+
+三个机制叠在一起：
+1. *评测对齐目标*：用生成评测当指针针，避免在 PPL 局部最优里打转
+2. *Hybrid 抓住 KDA 的短板*：保留 7 层 attention 给在线检索类任务兜底
+3. *冻结老师组件*：MLPs、embedding、那 7 层 attention 全部从老师冻结搬来，确保老师已经学到的"知识"不被新数据冲掉
+
+结果：800M tokens（MOHAWK 是 3B，Llamba 是 8B）就能拿到 86-90% 老师精度，KV cache 砍 75%，128K 首 token 时延快 2-4 倍。
+
+*** 留下了什么坑
+
+GenDistill 自己点了几个：
+- 只在 Qwen3-0.6B 上做完整消融，0.6B → 7B 的结论是否守恒待验证
+- KDA 是 2025 年的最新架构，2026 年还会有 RWKV7、新一代 SSM 等——架构选择本身在快速变
+- Beam search 选 attention 层依然依赖 PPL（在三个 small datasets 上）——这里和"生成评测优先"原则有一处小小的不一致
+
+* 前沿延伸
+
+GenDistill 是 2026 年 3 月的论文，但同期已经有一些工作走到了相邻的位置：
+
+- *M1*（Wang et al. 2025）和 *MiniCPM-SALA*（Team et al. 2026）：意识到了 PPL 评测的问题，但解法是 *加更多后训练*（额外 SFT + RL）。MiniCPM-SALA 烧了 1T tokens 才把生成质量补上来。GenDistill 的反向论点是：与其用 1T tokens 的后训练补窟窿，不如把蒸馏本身的设计修对，800M tokens 就够了
+- *Li et al. 2026*：和 GenDistill 几乎并发，提出 *贪心地把 attention 层加回到全线性学生*，用老师 vs 学生 logits 的 KL 散度选层。和 GenDistill 的 Beam Search (Add) 思路相近，但搜索策略更简单
+- *PostNAS*（Gu et al. 2025）：训一个 once-for-all supernet，用 beam search 找最佳层组合。比 GenDistill 重——GenDistill 不训 supernet，只用 teacher + 一个已经蒸好的全线性学生
+- *硬件趋势*：Blackwell 之后，长上下文推理（128K+）的痛点越来越尖锐，"砍 KV cache + 不掉生成质量"是 2026 年的产品级需求。GenDistill 这种"用蒸馏换 Hybrid 架构"的路径，会变成把 Transformer 模型落地到长上下文的标准前菜
+
+可以预期 2026-2027 这条线会继续往：（a）更细粒度的 attention/线性混合选择，（b）生成评测变成默认报告标准，（c）蒸馏 + 后训练 RL 的联合优化 这三个方向卷下去。
+
+* 一张图看懂
+
+#+begin_example
+                  架构表达力                        蒸馏 pipeline
+                  -----------                       ---------------
+[2017] Transformer                                   (从头训练, 几 T tokens)
+       O(n^2) attention
+              |
+              v
+[2020] Linear Attention                              (从头训练)
+       S_t = S_{t-1} + k v^T
+       缺陷: 只加不减
+              |
+              v
+[2021] DeltaNet                                      (从头训练)
+       (I - beta k k^T) S + beta k v^T
+       新值能覆盖旧值, 没主动遗忘
+              |
+              v
+[2025] Gated DeltaNet                                (从头训练)
+       加 scalar alpha 遗忘门
+       缺陷: 所有维度一刀切
+              |
+              v
+[2025] KDA (Kimi)               -------- MOHAWK (Bick 2024) --------
+       Diag(alpha) channel-wise          三阶段: attn matrix align
+       遗忘门, 每维独立寿命              -> hidden align -> end-to-end KD
+                |                        评测: 全 PPL
+                |                        Mamba 学生, 3B tokens
+                |                              |
+                |                              v
+                |                        Phi-Mamba / Llamba / QRWKV6
+                |                        扩大模型 + 加 DPO
+                |                        评测: 全 PPL
+                |                        ----> *PPL 自我欺骗*: 0.2pp vs 20.8pp
+                |                              |
+                +------------+-----------------+
+                             |
+                             v
+                  [2026.03] GenDistill (本文)
+                  ----------------------------------------------
+                  尺子: 换成生成评测
+                  架构: Hybrid-KDA (7 attn + 21 KDA, beam search 选层)
+                  Pipeline: MOHAWK 三阶段, Stage 1 改为 hidden align
+                  Recipe: KD + completion-only mask + 冻 attn + 老师对齐数据
+                  代价: 800M tokens (省 4-10x)
+                  收益: 86-90% 精度 / KV cache -75% / TTFT 快 2-4x @128K
+
+       后续 (并发): M1, MiniCPM-SALA 走"蒸 + 大量 SFT/RL 后训"
+                   GenDistill 反过来证明: 蒸馏本身做对了就不用那么多后训
+
+       时间 ----------------------------------------------------->
+#+end_example
+
+* 这条河真正在变的是什么
+
+表面上是"架构在升级"（Linear → Delta → Gated → KDA）和"流水线在加阶段"（端到端 → 三阶段）。但拉远一步，这条河真正经历的认知转变有三层：
+
+1. *从"替换 attention"到"混合 attention"*——纯线性架构在检索类任务上有天然的硬伤（固定大小状态装不下大上下文里的精确事实）。Hybrid 不是妥协，是这条河走了一圈后承认的现实：attention 的 O(n²) 是为了换 *精确* 检索的，这个能力没法完全用线性记忆替代。问题不是"要不要 attention"，而是"留几层、留在哪层"。
+
+2. *从"看似在优化能力，实则在优化代理指标"到"对齐评测协议"*——PPL 看起来和生成是一回事（毕竟都是概率），但 *判别 vs 生成* 是两种本质不同的能力。整条蒸馏线在四五年里都没人正式戳破这件事，因为 PPL 又便宜又方便又和训练目标对齐，所有人默认相信它。GenDistill 的真正贡献不是某个具体的设计选择，而是这个 *回到原点的方法论修正*——这种修正比任何架构创新都更稀缺，因为它要承认整个领域过去几年的部分进步可能是幻觉。
+
+3. *从"加阶段、加数据、加算力"到"找对设计轴"*——M1 和 MiniCPM-SALA 走的是"用 1T tokens 后训练补窟窿"的路。GenDistill 用同样的算力预算的 1/10 做到接近效果，靠的是 *把六个设计轴的最优组合定死*。这呼应一个更大的规律：当一个研究方向走到"边际收益递减"时，最有价值的工作往往不是再加一个 trick，而是 *把现有 trick 的相互作用搞清楚*。
+
+下一步最可能去哪？一是 *生成评测变默认*——会有一批回头复测既有工作的论文，把"实际能力排名"重新洗牌；二是 *Hybrid 比例和层选择* 会被推到自动化、任务感知的极致；三是 *蒸馏 + 后训练 RL 的联合设计*——既然 GenDistill 证明蒸馏本身能做对，下一步该问的是"蒸馏阶段省下来的算力，喂进 RL 能换到多少额外收益"。
+
+* 诚实标注
+
+- 引用关系来自论文 Related Work 与 Background 章节，已交叉验证。KDA / MOHAWK / DeltaNet / Linear Attention 的递归改进链是论文明确陈述的
+- "PPL 自我欺骗"是 GenDistill 论文的核心论点，证据是 QRWKV6-7B-Instruct 表 1（论文 1.0 节）。本河叙述以此为骨架
+- M1、MiniCPM-SALA、Li et al. 2026 三篇并发工作的描述基于本文 Related Work 中的简短提及，未读原文
+- 时间线里的"2025"指 KDA / Gated DeltaNet 等公开年份；具体月份未严格核对
+- "下一步预测"是基于这条河的推理，不是论文原文论断

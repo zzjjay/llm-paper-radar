@@ -1,0 +1,211 @@
+#+title:      TurboAngle: Near-Lossless KV Cache Compression via Uniform Angle Quantization
+#+date:       [2026-05-28 Thu 19:59]
+#+filetags:   :paper:river:
+#+identifier: 20260528T195905
+#+source:     https://arxiv.org/abs/2603.27467
+#+authors:    Dipkumar Patel
+#+venue:      arXiv preprint, 2026-03
+
+* 倒读 TurboAngle：KV cache 量化的"找对坐标系"史
+
+一句话先把这条线讲清楚：*KV cache 量化的演化，是研究者一步步从"在原始坐标系里跟离群点搏斗"，走到"先换个坐标系再说"，最后走到"换完坐标系发现量化目标本身就是均匀分布，可以直接套理论最优的均匀格子"的过程。* TurboAngle 是这条线目前的终点——它没有发明新东西，它只是把前人扔下的便宜没人捡的角度均匀性这个性质，一路捡了起来。
+
+* 溯源地图
+
+#+begin_src text
+
+  [2024]  KIVI / KVQuant
+          "raw activation, per-channel calibration"
+          看到的问题: outliers + channel-dependent scales
+          解法: 在原坐标系里精细处理 (per-channel asym, outlier handling)
+                    |
+                    | 留下的问题: 必须有 calibration data, 必须 per-model 调
+                    v
+  [2025-02] PolarQuant
+          "polar decomposition, but learned codebooks"
+          看到的问题: 与其在原空间斗, 不如换到 (radius, angle) 空间
+          解法: 随机预处理 + 极坐标分解 + 角度 k-means 量化
+                    |
+                    | 留下的问题: 旋转后角度分布是"集中的", 还得学 codebook
+                    v
+  [2025-04] TurboQuant                           [2025-AAAI] QJL (旁支)
+          "FWHT + random ±1 rotation +           "JL random projection
+           scalar quantization"                   + 1-bit sign"
+          看到的问题: 随机化坐标系能压离群点    spiritually similar:
+          解法: Hadamard 旋转后做标量量化       都是用随机投影换坐标系
+                    |
+                    | 留下的问题: 标量量化只是"差不多 Gaussian", 没用对
+                    v                            分布特性, 只是副作用
+  [2026-03] TurboAngle  <--- 这里
+          "FWHT + random ±1 rotation +
+           uniform ANGULAR quantization
+           + per-layer MixedKV early-boost"
+          看到的问题: TurboQuant 用错了量化目标 —— 旋转后的真正
+                    具有"已知分布"的量, 不是 Cartesian 坐标, 而是
+                    成对坐标的"角度", 而且这个角度严格 uniform on [0, 2π)
+          解法: 不量化坐标, 量化角度, 用均匀格子 (理论最优), 零 calibration
+
+#+end_src
+
+* 第一站 [2024]：KIVI 与 KVQuant —— 在原坐标系里硬刚离群点
+
+把时间拨回到 2024 年初。那时候大模型推理已经被 KV cache 占满显存了——上下文越长，KV cache 越大，远远超过模型权重本身。压缩 KV cache 成了刚需。
+
+最自然的想法当然是：直接把 KV 张量量化成 INT8、INT4、INT2。但一上手就发现一个老问题：KV 激活值里有 *离群点*，不同 channel 的 scale 还差几个数量级，分布也不是干净的 Gaussian。你拿一个统一的量化格子去切，要么浪费比特覆盖外层离群点，要么离群点被裁飞，要么 channel scale 不匹配把信息淹没。
+
+KIVI 的做法是 *精细化处理*：K cache 按 channel 做非对称量化（每个 channel 自己估范围），V cache 按 token 量化，所有这些都需要先跑一遍 calibration data 把统计量估出来。KVQuant 沿着同一条路走得更远，加上 per-vector 量化和显式的离群点处理，把上下文撑到 1000 万 token。
+
+*它们看到了什么问题*：KV 张量本身的分布很难处理，所以必须 per-channel、per-vector 地精细做参数估计。
+
+*它们留下了什么问题*：必须有 calibration data，必须 per-model 调参。换个模型就要重新跑一遍。在边缘部署、频繁迭代模型、serving 一堆 fine-tune 变种的场景下，calibration 是个负担。
+
+而且，所有这些精细化处理本质上是 *在原坐标系里跟数据的形状斗*。能不能换一个角度想：与其在原坐标系里斗，不如换个坐标系？
+
+* 第二站 [2025-02]：PolarQuant —— 第一次换坐标系，但只走了一半
+
+PolarQuant 是第一个认真问"能不能换坐标系"的工作。它做了两件事：
+
+1. 加一个 *随机预处理* (random preconditioning)——本质是给输入乘一个随机矩阵打散原始坐标的对齐结构
+2. 把每对连续坐标 (y_2i, y_2i+1) 做 *极坐标分解*，得到一个 radius 和一个 angle，然后分别量化
+
+为什么这个想法有意思？因为 radius 和 angle 是 *正交的两个自由度*——radius 表示"能量"，angle 表示"方向"。如果能各管各的，就能针对性地分配比特。
+
+但 PolarQuant 没把这条路走完。问题出在它的随机预处理上：经过它的旋转后，角度分布是 *集中的* (concentrated)，不是均匀的。集中的分布意味着你必须用一个非均匀的量化器——具体说，PolarQuant 用了 k-means 学一组 codebook。
+
+*它看到了什么问题*：原坐标系不好量化，应该换到 (radius, angle) 空间。
+
+*它留下了什么问题*：换完坐标系后角度还是不均匀，所以又要 calibration 来学 codebook。换坐标系这一步没换到位——它选的随机旋转不够"对"，没让角度变成均匀分布。
+
+后面会看到，TurboAngle 用一种更"对"的旋转，让角度直接变成 uniform，于是 codebook 就不用学了，直接均匀切就完了。但在 2025 年初，还没人意识到可以这样。
+
+* 第二站 旁支 [2025-AAAI]：QJL —— 用随机投影换坐标系的另一条路
+
+PolarQuant 在搞极坐标的同时，QJL（Johnson-Lindenstrauss 量化）走的是另一条更激进的路：用 JL 随机投影把原始向量打到一个新空间，然后只保留 *符号位*（1-bit sign quantization）。
+
+QJL 的精神跟 TurboAngle 是相通的——*都是用一个随机投影把原始坐标系打散，让量化变得容易*。区别在于 QJL 极致到只留 1 bit，损失大；TurboAngle 留下角度的几个 bit，损失小。
+
+把 PolarQuant 和 QJL 并排看：2025 年初，社区已经形成共识——"换个坐标系再量化"比"在原坐标系里硬刚"靠谱。剩下的问题是：*哪种旋转最好*？
+
+* 第三站 [2025-04]：TurboQuant —— 找到了"对的"旋转，但用错了量化目标
+
+TurboQuant 找到了关键的那个旋转：*FWHT (Fast Walsh-Hadamard Transform) + 随机 ±1 对角旋转*。
+
+具体说就是 y = H · D · x，其中 H 是归一化 Hadamard 矩阵（O(d log d) 算的快速变换），D 是一个对角线全是随机 ±1 的矩阵。把 KV 张量先这么变换一下，再做标量量化。
+
+这个组合有两个漂亮的性质：
+- *打散离群点*：随机 ±1 对角破坏 channel 之间的相关性，离群点被 Hadamard 蝴蝶变换"摊平"到所有输出 channel 上
+- *接近 Gaussian*：每个输出 y_j 是 d 个随机加权项之和，中心极限定理让它收敛到 Gaussian
+
+所以 TurboQuant 的故事是："旋转后数据接近 Gaussian，离群点没了，标量量化就好用了。"
+
+*它看到了什么问题*：PolarQuant 的随机预处理不够强，离群点压不下去，所以角度才会集中。换成 Hadamard + 随机 sign，离群点能被打得更平。
+
+*它留下了什么问题*——这是 TurboAngle 故事的关键——TurboQuant *没有意识到*，在做完这个旋转之后，它真正应该量化的不是 Cartesian 坐标，而是别的东西。
+
+它把"分布变得接近 Gaussian、kurtosis 降低"当成了主要收益，于是顺手套了个标量量化器。但这是 *副作用*，不是 *主效果*。
+
+* 第四站 [2026-03]：TurboAngle —— 同样的旋转，捡起被扔掉的均匀性
+
+TurboAngle 的核心洞察可以一句话说完：
+
+*在 FWHT + 随机 ±1 旋转之后，把每对连续输出 (y_2i, y_2i+1) 看成 2D 平面上的点，它们的极角 θ 不仅近似均匀，而且是严格的 Uniform([0, 2π))。*
+
+为什么？因为：
+- 旋转后每个 y_j 都是 d 个 ±1 随机加权项之和 → 中心极限定理 → 近 Gaussian
+- 随机 ±1 对角破坏 inter-coordinate 相关性 → 成对的 (y_2i, y_2i+1) 趋近于 *球对称* 2D Gaussian
+- 球对称 2D 分布的极角 = 严格的 Uniform([0, 2π))
+
+这是个干净的数学结果。球对称是关键——只要分布球对称，角度就一定均匀。Hadamard + 随机 sign 给你的，恰好就是球对称。
+
+那么对一个均匀分布，*信息论最优的量化器是什么*？是 *均匀格子*。把 [0, 2π) 切成 n 等份就完了，不需要学任何东西。
+
+*它看到了 TurboQuant 的什么问题*：TurboQuant 在同样的旋转之后，目光停留在"分布近 Gaussian"这个 *次要现象*，于是套了个标量量化器（对 Gaussian 已经够好，但对 *精确* 已知分布的角度，远远不够好）。真正能利用的 *精确已知* 的分布性质——角度严格均匀——TurboQuant 完全没用上。
+
+*它看到了 PolarQuant 的什么问题*：PolarQuant 也走了极坐标这条路，但选的旋转让角度集中，所以必须学 k-means。TurboAngle 用同一类随机旋转的不同实现（Hadamard + ±1，球对称），让角度直接均匀，于是 k-means 学不学都一样——直接用固定均匀格子，零 calibration。
+
+*它看到了 KIVI/KVQuant 的什么问题*：那些方法在原坐标系里 per-channel、per-vector 精修参数，全是在跟数据的脏分布斗。TurboAngle 直接换到一个 *分布是先验已知的* 坐标系里，根本不需要看任何数据。
+
+把三句话压一压：*TurboQuant 找对了旋转用错了量化目标；PolarQuant 找对了量化目标用错了旋转；TurboAngle 把两边各自正确的那一半合起来了。*
+
+** 第二个贡献：Per-layer MixedKV early-boost
+
+光是均匀角度量化还不够，因为 transformer 的层敏感度不一样——早期层编码广义特征，对量化误差敏感；后期层抗量化。TurboAngle 加了一招：*让每一层独立选 K 和 V 的 codebook 大小*，给最关键的前 n 层多分一点比特（"early boost"），其他层保持基线。
+
+这一招带出的发现也很有意思——七个模型上跑下来，*关键层、瓶颈类型 (K-dominated vs V-dominated)、甚至是否存在"负迁移层"（多给精度反而更差）都因模型而异*。也就是说没有 universal 的最佳配置，但有可发现的 per-model pattern。
+
+** 第三个贡献：norm 量化的非对称
+
+把 (radius, angle) 分开量化后，TurboAngle 又发现一个 *K 和 V 的 norm 敏感度差 10-20×* 的非对称：K 的 norm 必须 8-bit 线性，V 的 norm 给 4-bit log-space 就行。这平行于 angle 上的 K/V 非对称，反复指向同一件事——K 和 V 在 attention 里扮演本质不同的角色，应该非对称量化。
+
+* 压缩总览图
+
+#+begin_src text
+
+  问题轴: KV cache 太大, 必须量化, 但 KV 张量分布脏 (outliers, scale 差异)
+
+  +----------------+----------------------+----------------------+--------------------+
+  | 阶段           | 看到的问题            | 解法                  | 留下的新问题        |
+  +----------------+----------------------+----------------------+--------------------+
+  | KIVI/KVQuant   | 原坐标系下分布太脏    | per-channel calib +  | 必须 calibration,   |
+  | (2024)         |                      | outlier handling     | per-model 调参      |
+  +----------------+----------------------+----------------------+--------------------+
+  | PolarQuant     | 不如换到极坐标,       | 随机预处理 + 极坐标   | 旋转选错, 角度集中, |
+  | (2025-02)      | radius/angle 分开做  | + k-means 量化角度    | 还要学 codebook     |
+  +----------------+----------------------+----------------------+--------------------+
+  | QJL (2025)     | 用 JL 投影换坐标系    | JL + 1-bit sign      | 比特太少, 损失大    |
+  +----------------+----------------------+----------------------+--------------------+
+  | TurboQuant     | PolarQuant 旋转太弱   | FWHT + 随机 ±1 +     | 用错量化目标:       |
+  | (2025-04)      | 离群点没压住          | 标量量化              | 量了 Cartesian,     |
+  |                |                      |                      | 没看见角度的均匀性   |
+  +----------------+----------------------+----------------------+--------------------+
+  | TurboAngle     | TurboQuant 把"次要    | 同样的 FWHT + ±1,    | (本文止于此, 留下:  |
+  | (2026-03)      | 现象"当主效果, 错过   | 但量化的是角度,       | 跨模型自动配 layer  |
+  |                | 了角度严格均匀这个    | 用均匀格子 (理论最优) | budget, 端到端速度  |
+  |                | 精确已知性质          | + per-layer mixedKV  | 评估)              |
+  +----------------+----------------------+----------------------+--------------------+
+
+  深层认知转变 (从 KIVI 到 TurboAngle):
+  ----------------------------------------
+  "在原始坐标系里跟数据斗"  --->  "换坐标系, 让分布变好"
+                              --->  "换到分布是先验已知的坐标系, 直接套理论最优量化器"
+
+#+end_src
+
+* 洞见
+
+** 这条演化线背后真正在发生什么变化
+
+表面上看，这是 KV cache 量化的迭代——从 KIVI 的 2-bit 到 TurboAngle 的 3.28 bit 角度。但深层的变化不是"比特数"的变化，是 *量化范式* 的变化：
+
+1. *从"对抗数据分布"到"利用数据分布"*：KIVI/KVQuant 把数据分布当成敌人——分布脏，所以用 per-channel 参数去拟合它。TurboAngle 把数据分布当成朋友——只要我能把它变成 *已知的* 分布（均匀），就能用理论最优量化器。
+2. *从"启发式"到"信息论最优"*：均匀分布的 R-D 最优量化器是均匀格子，这是信息论的硬结论。TurboAngle 的"算法"其实没有自由参数——n 等分就完了。所有"聪明"都在选坐标系，不在量化器里。
+3. *从"calibration-driven"到"calibration-free"*：当你换到先验已知的坐标系，calibration data 就没用了。这对部署（serving 多个模型变种、边缘部署、频繁更新）是质变。
+
+更抽象一层：这是 *"把工程问题变成数学问题"* 的胜利。KIVI 这一脉是工程式的——见招拆招，对每个数据病理（outlier、scale 不齐、非对称）出一个针对性的工程招数。TurboAngle 这一脉是数学式的——找到一个把"脏数据"映射到"干净分布"的变换，然后让量化变成数学练习。
+
+** 下一步最可能往哪走
+
+1. *自动化 per-layer budget 分配*：TurboAngle 发现 layer-sensitivity pattern 是 model-specific，但配 budget 还是手动 grid-search。下一步必然是用某种轻量 calibration（或者更激进的 calibration-free 启发式）自动决定每层 K/V 的 codebook 大小。
+2. *把"已知分布"的思路扩展到 attention 之外*：FFN 激活、attention 输出、weight quantization——只要找到合适的随机变换让分布先验已知，同样的范式就能复用。可能会看到一个"Turbo-X"系列把这一招套到所有 LLM 量化场景。
+3. *端到端 latency 收益*：当前论文聚焦质量（perplexity），但 trig lookup + FWHT 的实际推理延迟还需要工程化验证。TurboAngle 在 fused attention kernel 里能不能跑得比 INT4 快，是它能不能真正落地的关键。
+4. *跟 sparse attention / KV eviction 结合*：量化和稀疏化是正交的两个压缩维度，TurboAngle 这种零 calibration 的量化方案特别适合跟动态 KV eviction（H2O、StreamingLLM 之流）拼接。
+
+* 诚实标注
+
+- *引用关系的确定性*：本文画出的 KIVI/KVQuant → PolarQuant → TurboQuant → TurboAngle 这条主线，是基于 TurboAngle 论文 §5 (Related Work) 中明确的对比和批判描述。这些引用关系是确定的。
+- *PolarQuant → TurboQuant 之间的承接* 是基于二者作者重叠（Zandieh, Han, Mirrokni 同时出现）和方法演进逻辑做的推断，论文本身没有明说 TurboQuant 是 PolarQuant 的直接后续。
+- *KIVI 之前的层* 没有继续往回挖。KIVI 引用的更早工作（GPTQ、AWQ、LLM.int8() 等）属于 weight quantization 主线，与 KV cache 量化的演化路径分叉。停在 KIVI 是因为它是 KV-cache-specific 这条线公认的现代起点。
+- *后续论文* 暂未找到明确批判/改进 TurboAngle 的工作——本论文发布于 2026-03，距今（2026-05）仅两个月，社区响应尚未沉淀。这部分留空是诚实，不是疏漏。
+
+* 关键论文一览
+
+| 简称        | 标题                                                              | arXiv / 会议             | 在这条线里的角色             |
+|-------------+-------------------------------------------------------------------+--------------------------+------------------------------|
+| KIVI        | KIVI: A tuning-free asymmetric 2bit quantization for KV cache     | ICML 2024 / [10]         | KV量化现代起点, 原坐标系     |
+| KVQuant     | KVQuant: Towards 10M context length LLM inference with KV quant   | NeurIPS 2024 / [7]       | 原坐标系 + 显式离群点处理     |
+| PolarQuant  | PolarQuant: Quantizing KV caches with polar transformation        | arXiv 2502.02617 / [5]   | 首次极坐标分解, codebook 学  |
+| QJL         | QJL: 1-bit quantized JL transform for KV cache                    | AAAI 2025 / [14]         | JL 投影 + 1-bit, 旁支        |
+| TurboQuant  | TurboQuant: Online vector quantization with near-optimal distortion | arXiv 2504.19874 / [13]  | 引入 FWHT + ±1 旋转, 但标量量化 |
+| TurboAngle  | TurboAngle: Near-Lossless KV Cache Compression via Uniform Angle Q | arXiv 2603.27467 (本文)  | 利用角度均匀性, 均匀格子 + 层分配 |
+| CQ          | KV Cache is 1 Bit Per Channel (Coupled Quantization)              | NeurIPS 2024 / [6]       | 同期 baseline, 1-bit/channel |
+| AQUA-KV     | AQUA-KV: Adaptive quantization for attention key-value cache      | ICML 2025 / [3]          | 同期 baseline, 自适应~3-bit  |

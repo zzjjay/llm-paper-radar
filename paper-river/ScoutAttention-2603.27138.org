@@ -1,0 +1,230 @@
+#+title:      ScoutAttention: Efficient KV Cache Offloading via Layer-Ahead CPU Pre-computation for LLM Inference
+#+date:       [2026-05-28 Thu 19:52]
+#+filetags:   :paper:river:
+#+identifier: 20260528T195224
+#+source:     https://arxiv.org/abs/2603.27138
+#+authors:    Qiuyang Zhang, Kai Zhou, Ding Tang, Kai Lu, Cheng Li, Zhenyu Yang, Peng Xu, Jiguang Wan
+#+venue:      DAC '26 (Design Automation Conference, 2026)
+
+* 问题之河
+
+长上下文 LLM 推理时，KV cache 比模型权重还要大——一个 32k token 的 Qwen3-32B 请求，光 KV cache 就要 8GB。GPU 的 HBM 装不下，怎么办？
+
+最直觉的答案：把 KV cache 放到 CPU 内存（DRAM）里。但是这个答案立刻撞上两堵墙：
+
+- *I/O 墙*：要算注意力时，得把 KV 从 CPU 搬回 GPU，PCIe 带宽（约 15 GB/s）比 HBM（1.9 TB/s）慢两个数量级
+- *算力墙*：那干脆让 CPU 自己算注意力？CPU 算力又比 GPU 慢 20 倍
+
+于是从 2017 年的原始 Transformer 一路走来，整条线在干一件事：*想办法让 GPU 在等 CPU/PCIe 的时候不要闲着*。每一代都解决了上一代的某个等待，但又制造出新的等待。ScoutAttention 是这条线上目前最新的一次尝试——它说，你不能让 GPU 等 CPU 算完，你得让 CPU 提前一层就开始算。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 问题: KV cache 随序列长度线性增长，长上下文吃光 HBM
+  | 观察: 但是注意力分布其实很稀疏，<20% 的 token 占 >80% 权重
+  v
+[2023] H2O - Heavy-Hitter Oracle (NIPS '23)
+  |
+  | 解法: 既然大部分 token 不重要，干脆把它们从 KV cache 里删掉
+  | 新坑: 一次删掉就回不来了，万一后面某个 query 真需要它呢？
+  v
+[2024] Quest - Query-Aware Sparsity (ICML '24)
+  |
+  | 解法: 不删，只是跳过——按 query 动态选 top-k block 来算注意力
+  | 新坑: KV cache 还是全部留在 GPU 上，HBM 没省下来
+  v
+[2024] InfiniGen (OSDI '24)
+  |
+  | 解法: 把不重要的 token 推到 DRAM，要用时再 recall 回 GPU
+  |        提前一层预测下一层要哪些 token，I/O 和计算重叠
+  | 新坑: PCIe 还是太慢，GPU 有 61% 时间在等 I/O
+  v
+[2025] HGCA - Hybrid GPU-CPU Attention (arXiv 2507.03153)
+  |
+  | 解法: 别 recall 了，离线的 token 就让 CPU 自己算 (co-attention)
+  |        GPU 算自己那部分，最后合并
+  | 新坑: CPU 比 GPU 慢 20 倍，GPU 现在 57% 时间在等 CPU
+  v
+[2026] ScoutAttention (DAC '26) <-- 本文
+        解法: 三件套同时上——
+              (1) GPU/CPU 都只算 top-k 稀疏 block (砍 CPU 工作量)
+              (2) CPU 提前一整层就启动 (拉长 CPU 的时间窗)
+              (3) 异步周期 recall (校正长时间漂移)
+
+旁支 (沿用而非批判):
+  [2025] NSA (DeepSeek) / MoBA  ----> 提供更强的 block-wise 稀疏化方案
+                                       ScoutAttention 声称兼容它们
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 注意力机制把 KV cache 这个负担引进了门
+
+*** 它看到了什么问题
+
+在 Transformer 之前，序列建模主要靠 RNN——一个一个 token 往后走，没法并行。Vaswani 等人受不了这种串行限制，他们想要一个能完全并行训练的架构。
+
+*** 它的解法
+
+干脆扔掉循环结构，让每个位置直接看序列里所有其它位置——这就是自注意力。每个 token 学一组 Q、K、V 向量，做完点积就知道该关注谁。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行起来了，长程依赖也好抓了，于是有了今天所有的大模型。但是埋下了两个雷：注意力的计算复杂度是 O(n²)，而且为了避免 decode 阶段重复计算 K、V，必须把它们缓存下来（KV cache）——这个 cache 随着序列长度线性增长。等到大家开始追求 32k、128k、1M 上下文，KV cache 就成了比模型权重更可怕的内存负担。
+
+** 2023 | H2O: 既然注意力是稀疏的，那就把不重要的删掉
+
+*** 它看到了什么问题
+
+KV cache 太大装不下，但 H2O 的作者发现一个有趣的现象——*注意力分布其实极其稀疏*。少于 20% 的 token 贡献了超过 80% 的注意力权重，而且某些 token（他们叫"heavy hitters"）会在很多 query 下反复被关注。
+
+*** 它的解法
+
+既然大部分 token 注意力权重小到可以忽略，那就别留着它们了。H2O 设计了一个策略，在线判断哪些是 heavy hitter，把其它的从 KV cache 里直接删掉。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+省内存的效果立竿见影。但是这一招是*不可逆*的——一旦删了，后面要是某个 query 突然需要那个被删的 token，就没救了。对于多轮对话、长篇推理这种"现在不重要不代表以后不重要"的场景，模型的精度会掉。所以方向对了，但姿势太粗暴。
+
+** 2024 | Quest: 别删，只是计算的时候跳过
+
+*** 它看到了什么问题
+
+H2O 把决策权交给了"写入端"——根据历史决定哪些 token 留下来。但每个 query 关心的 token 其实是不一样的。如果能在*读取端*按当前 query 动态选择，就既不丢信息又能省算力。
+
+*** 它的解法
+
+Quest 把 KV cache 按 token 顺序切成固定大小的 block（比如 32 token 一块），每个 block 算一个"digest"（用 channel-wise min/max 做摘要）。注意力计算时，先用 query 去和所有 digest 做点积，选出 top-k 个 block，只对这些 block 做完整注意力。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+block-wise 稀疏的两个好处：一是 query 自适应，每个 token 各算各的 top-k；二是粒度合适，digest 检索几乎免费，块内计算又能用 GPU 高效搬运。这种思路被后来一大批工作沿用（包括 MoBA、NSA，以及我们的主角 ScoutAttention）。
+
+但是 Quest 解决的是*计算稀疏*，没解决*存储稀疏*——KV cache 全部还在 GPU 上。HBM 还是不够用。下一步必须把 cache 真的搬出去。
+
+** 2024 | InfiniGen: 把 KV cache 推到 DRAM，要用的时候再拉回来
+
+*** 它看到了什么问题
+
+Quest 验证了"每个 query 真正需要的 token 不到 20%"。InfiniGen 的作者顺着这个观察往前推一步：既然 95% 的时间用不到，*那它根本不用待在 HBM 里*——挪到 DRAM，需要的时候临时拉回来就行。
+
+*** 它的解法
+
+prefill 结束后，把判断为"重要"的 token 留在 GPU，其余推到 DRAM。decode 时为了不让 PCIe 拖后腿，InfiniGen 设计了一个巧妙的预测器：*在算第 i 层的注意力时，提前预测第 i+1 层会需要哪些 token*，然后异步地把它们 recall 回来。理想情况下，i+1 层开算时数据正好到位，I/O 和计算重叠。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把"存储稀疏"和"计算稀疏"打通了，是第一个真正落地的 KV offloading 系统。
+
+但是它仍然撞上了 PCIe 带宽这堵墙——4 KB 一个 token 的 KV，PCIe 4x16 实际带宽算下来只有 800 MB/s（page 大一点也就 15 GB/s），远不如 HBM 的 1.9 TB/s。即使一层提前预取，*GPU 在等 I/O 的时间仍然占了端到端执行的 61%*。这意味着提前预测这条思路触到了天花板：你再怎么预测，I/O 本身就是不够快。
+
+** 2025 | HGCA: 让 CPU 自己算，别再 recall 了
+
+*** 它看到了什么问题
+
+HGCA 看着 InfiniGen 那 61% 的 GPU 空转，问了一个反向的问题：*我们为什么非要把数据搬回 GPU 才算？* PCIe 慢，但 CPU 不慢——一颗 36 核 CPU 做注意力的吞吐能到约 100 GB/s，比 PCIe 还快几倍。既然数据已经在 DRAM 里，*让 CPU 当场算*不就行了。
+
+*** 它的解法
+
+HGCA 提出 *co-attention*：GPU 上保留一个滑动窗口的 25% 重要 token，做完整注意力；剩余 75% 在 DRAM 里，由 CPU 用基于滑动平均权重的稀疏方法算注意力。两边算完后，把中间结果合并起来产生最终输出。整个过程零 I/O。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它绕开了 PCIe，I/O 瓶颈消失了。
+
+但是新瓶颈立刻冒出来——*GPU 算 attention 比 CPU 快 20 倍*。GPU 自己那部分算完之后，必须等 CPU 把剩下的算完才能合并。HGCA 还要求 CPU 做*完整*的注意力（虽然是稀疏方法，但是对所有 offload 的 token），于是在 batch size 40 的场景里，*GPU 有 57% 的时间在等 CPU*。原来等 I/O，现在等算力——天平翻了，但效率没救回来。
+
+** 2026 | ScoutAttention (本文): 让 CPU 提前一层就开始算，而且只算关键的一小撮
+
+*** 它看到了什么问题
+
+ScoutAttention 把前面两代的失败放在一起看：
+- InfiniGen 等 I/O —— 因为 *搬数据这件事本来就慢*
+- HGCA 等 CPU —— 因为 *CPU 不仅慢，还被迫干了所有 offload token 的活*
+
+两个问题的共同形式是："GPU 算完了，但 CPU/PCIe 还没完事"。要根治，必须做两件事：*减少 CPU 的工作量*，并且*把 CPU 启动的时间提前*。
+
+*** 它的解法
+
+三件套：
+
+1. *GPU-CPU 协同 block-wise 稀疏 co-attention*。继承 Quest 的 top-k block 选择，但是把工作分到两边——GPU 负责自己有的 top-k block（约 85%），CPU 只算剩下不在 GPU 上的那一小撮 top-k block（约 15%）。CPU 的活骤减。
+
+2. *Layer-ahead CPU pre-computation*。这是最关键的一招。算第 i 层时，他们用第 i 层的输入 X^i 乘以*第 i+1 层的* Q 投影矩阵 W_Q^{i+1}，得到一个"预测的下一层 query"——实验显示它和真实下一层 query 的余弦相似度高达 0.94-0.97（因为 Transformer 有 residual 连接，相邻层的输入很相似）。有了这个预测 query，CPU 就能在第 i 层开始时就启动第 i+1 层的注意力计算。CPU 拿到的时间窗从"一次注意力"扩到"整个 transformer layer"，足足 3 倍长。
+
+3. *异步周期 KV cache recall*。随 decode 推进，"重要 token 集合"会慢慢漂移，CPU 要算的 block 越来越多。每隔几步（实测平均 8.7 层一次），把 CPU 上的 hot block 真正 recall 回 GPU 一次，校正漂移。注意这个 recall 是在算完 attention *之后*异步做的——不上关键路径。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"减少 CPU 工作"和"拉长 CPU 时间窗"叠加，最终 GPU 等 CPU 的 idle 时间从 HGCA 的 57% / InfiniGen 的 61% 压到了 *6%*。在 Qwen3 14B 上，相对 FullKV 拿到 5.1x 解码吞吐提升、相对前代 offload 方法拿到 2.1x，精度只掉 2.1%。
+
+埋下的新坑（这条线还没走完）：
+- 预测 query 的相似度是模型架构（residual + LayerNorm 位置）的函数，换一类架构（如 Mamba/RWKV）还成立吗？
+- 异步 recall 的间隔是离线 profile 出来的常数，没法对突变 workload（比如 query 突然换主题）自适应
+- 整套设计绑定 Transformer 单层时间 ≈ CPU 处理 top-k 时间这个特定算力比，下一代 GPU 上来比例又变了
+
+* 前沿延伸
+
+ScoutAttention 是 2026 年 3 月的论文，是这条线上目前最新的工作。能看到的延伸方向有两条：
+
+- *更强的稀疏化基座*: NSA (DeepSeek, 2025) 提出"原生可训练稀疏注意力"——把稀疏机制做进训练里，而不是事后剪枝。MoBA (2025) 把稀疏 block 选择交给一个学习到的路由。ScoutAttention 在论文里明确说自己的框架与这些方法正交（它用的稀疏选择是 Quest，但可以无缝替换）。所以这条线下一步可能是 *ScoutAttention 风格的系统调度 + NSA/MoBA 风格的训练原生稀疏*。
+
+- *Prefill-Decode 解耦的协同设计*: DistServe (OSDI '24) 把 prefill 和 decode 部署到不同集群上，ScoutAttention 的设计只针对 decode。下一步很可能出现"prefill 集群预先把 digest + 重要 token 集合算好交付，decode 集群直接接管"的端到端协议。
+
+(没有找到引用了 ScoutAttention 的后续论文——发表才两个月。)
+
+* 一张图看懂
+
+#+begin_example
+
+时间  | 谁占主导  | 关键约束           | 该代的"GPU 等什么"
+-----+-----------+--------------------+---------------------
+2017 | 原始 attn | KV cache O(n)      | (问题尚未出现)
+2023 | H2O       | 砍 KV 不可逆       | 不等, 但牺牲精度
+2024 | Quest     | 全在 GPU, 稀疏算    | 不等, 但装不下
+2024 | InfiniGen | offload + 预取      | 等 I/O    (61% idle)
+2025 | HGCA      | CPU 当场算          | 等 CPU    (57% idle)
+2026 | ScoutAttn | CPU 提前一层 + 稀疏 | 几乎不等  ( 6% idle)
+
+                    +-------------------------------------+
+                    | 一个公式贯穿始终:                   |
+                    |                                     |
+                    |   T_iter = max(T_GPU, T_CPU+T_IO)   |
+                    |                                     |
+                    | 每一代都在改一项:                   |
+                    |   H2O    : 直接砍 T_CPU+T_IO 的输入 |
+                    |   Quest  : 砍 T_GPU (top-k)         |
+                    |   InfiniG: 让 T_IO 与下一个 T_GPU   |
+                    |            重叠                     |
+                    |   HGCA   : 干掉 T_IO, 增大 T_CPU    |
+                    |   Scout  : 砍 T_CPU + 让它与整层    |
+                    |            T_GPU 重叠               |
+                    +-------------------------------------+
+
+#+end_example
+
+* 洞见
+
+读完这条线，几件事浮出水面：
+
+*1. "把工作搬到便宜的资源上"是个永恒的诱惑，但便宜资源通常意味着"还有别的东西更慢"*。
+InfiniGen 把存储搬到便宜的 DRAM，发现 PCIe 慢；HGCA 把算力搬到便宜的 CPU，发现 CPU 慢。每次搬迁都打破一个瓶颈，但暴露另一个。ScoutAttention 的聪明在于*不再追求把工作整块搬走，而是承认 GPU 和 CPU 都得干活，只是要错开时间*。
+
+*2. 这条线的真正动力，从来不是"算法变聪明"，而是"硬件的相对算力/带宽比变化"*。
+H2O 和 Quest 没考虑 offload，是因为 2023 年 HBM 容量还没那么紧；InfiniGen 出现，是因为长上下文把 HBM 顶爆了；HGCA 翻盘，是因为 CPU 算力强到可以独立做 attention；ScoutAttention 的存在前提是 GPU/CPU 算力比恰好让"提前一整层"足够 CPU 算完它那份。所以*下一代 GPU 一旦把 HBM 容量做大（B200 已经 192GB），或者把 PCIe 6.0 做出来，这整条线的优化天平会再翻一次*。
+
+*3. 跨层利用 residual 相似性*是个被严重低估的工具。
+InfiniGen 已经在用相邻层输入相似来预测下一层重要 token，ScoutAttention 把它推到极致——直接用上一层的输入近似计算下一层的 query，余弦相似度 0.94+。这个性质是 Transformer 架构的"免费午餐"，但目前主要被用于推理加速。它在训练侧、对齐侧、可解释性侧可能还有大量未开发空间。
+
+*4. 这一系列工作其实在悄悄地把 attention 从"一个数学操作"重新定义成"一个跨设备/跨时间的协同调度问题"*。
+原始 attention 是一行公式；H2O 引入了 cache 管理；Quest 引入了 query-aware 计算调度；InfiniGen 引入了 I/O 调度；HGCA 引入了异构算力调度；ScoutAttention 引入了跨层时间调度。每加一层调度，attention 的"边界"就扩张一次。终极形态可能是一个完整的分布式 dataflow 编译器。
+
+* 启发
+
+- *找问题的方法*：盯紧"等待"。每一篇 paper 都是在解决前一篇里"某一方在等另一方"的具体瞬间。ScoutAttention 的工程价值，本质上就是把 GPU idle 从 61% 砍到 6%。*"什么资源在闲着"比"什么资源在加速"更能定位下一个研究问题。*
+
+- *做 system 工作的姿态*：硬件参数（HBM、PCIe、CPU/GPU 算力比、layer 时延）不是背景设定，是*第一性变量*。InfiniGen 的设计建立在 PCIe 4 上、HGCA 建立在 36 核 CPU 上、ScoutAttention 建立在 Qwen3 单层 ≈ 900μs 上——这些数字一变，结论就要重写。读这种 paper 时，先把硬件假设列出来，然后看作者的设计有多依赖这些假设。
+
+- *组合创新的可能性*：ScoutAttention 没有发明新的稀疏方法（用的是 Quest），没有发明新的 offload 思路（来自 InfiniGen），没有发明 CPU 协同（来自 HGCA），它做的是*把三个已有的好主意按正确的时序拼起来*。这意味着：在快速发展的领域里，*"重新调度已有组件"的研究价值不亚于"发明新组件"*——前提是你能看清楚每个组件被什么瓶颈卡住，并且找到一个新的总体框架让瓶颈互相抵消。
