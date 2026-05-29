@@ -1,0 +1,268 @@
+#+title:      Understanding Quantization of Optimizer States in LLM Pre-training: Dynamics of State Staleness and Effectiveness of State Resets
+#+date:       [2026-05-28 Thu 20:26]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T202652-en
+#+source:     https://arxiv.org/abs/2603.16731
+#+authors:    Kristi Topollai, Anna Choromanska
+#+venue:      arXiv preprint, March 2026, New York University
+
+* The Problem River
+
+Training a large model with tens of billions of parameters already strains GPU memory just from the weights themselves. But there is a second bill: each parameter carries its own "optimizer state" — Adam attaches two numbers per parameter (first-order momentum, second-order momentum), making the state heavier than the model itself.
+
+The most straightforward way to cut costs is to store these states in fewer bits. Instead of 32 bits per number, use 8 or 4. In principle everything should still work: decompress before each update, recompress afterward.
+
+But practitioners noticed something strange: once states are pushed to low precision, training starts to drift — loss curves develop spikes, convergence slows, and sometimes the only remedy is to "periodically reset the states to zero and restart" to keep things stable.
+
+Stranger still: this "reset and restart" trick produces dramatic improvements under low-precision formats like BF16, FP8, and FP4, yet is nearly useless at full FP32 precision.
+
+The question this river has returned to, decade after decade, is: *What is actually happening inside optimizer states once they are compressed?* Why does periodic resetting help? When is resetting most cost-effective?
+
+Each generation of researchers has answered in a different way: smarter block-wise quantization (to match value ranges), alternative rounding strategies (so that small updates are not silently discarded), or simply discarding the states periodically and restarting from scratch.
+
+* Map of Origins
+
+#+begin_example
+[2014]  Adam (Kingma & Ba)
+        |
+        | Problem: SGD learning rates are hard to tune;
+        |          different parameters need different step sizes
+        | Solution: maintain two EMAs — gradient mean + gradient-square mean
+        |           each parameter gets an adaptive step size
+        v
+[2022]  8-bit Adam (Dettmers et al.)
+        |
+        | Problem: Adam's two EMAs double memory usage;
+        |          goal is to compress them to 8 bits
+        | Solution: block-wise quantization + dynamic exponent mapping
+        |           appears lossless, but only goes down to 8 bits
+        v
+[2023]  4-bit Optimizers (Li et al.)
+        |
+        | Problem: pushing further to 4 bits breaks the second moment
+        | Solution: nonlinear quantization grid for the second moment
+        |           precision loss contained, but why the second moment
+        |           is so fragile remains unexplained
+        v
+[2025]  SPAM (Huang et al.) + Glentis et al.
+        |
+        | Problem: loss spikes appear during large-model pre-training;
+        |          stale gradients lingering in momentum are suspected
+        | Solution: periodically zero out momentum and continue training
+        |           effective, but framed only as "spike prevention,"
+        |           deep mechanism left unexplained
+        v
+[2026]  StaleEMA (Topollai & Choromanska)  <-- target paper
+        |
+        | Problem: why is reset especially effective at low precision?
+        |          how often should one reset? nobody had an answer
+        | Solution: model "low-precision updates swallowed by rounding"
+        |           as stalling; derive stalling probability formula
+        |           + theoretically optimal reset period;
+        |           explicitly connect quantization and reset as two
+        |           sides of the same phenomenon
+#+end_example
+
+* Evolutionary Narrative
+
+** 2014 | Adam: An Adaptive Step Size for Every Parameter
+
+*** What Problem It Saw
+
+Before Adam, the mainstream approach was SGD with momentum. Learning rates had to be tuned by hand — too large and training diverged, too small and it crawled. Worse, a single learning rate treated all parameters identically, even though embedding-layer gradients could be 1000× larger than attention-layer gradients; clearly a single step size made no sense.
+
+*** Its Solution
+
+Adam maintains two running averages per parameter:
+
+- ~m_t = β1 * m_{t-1} + (1-β1) * g_t~  — mean of gradients (first-order momentum)
+- ~v_t = β2 * v_{t-1} + (1-β2) * g_t^2~ — mean of squared gradients (second-order momentum)
+
+The update uses ~m_t / sqrt(v_t)~. The logic: parameters with large gradients are kept in check (dividing by the second moment automatically shrinks the step size), while parameters with persistently small gradients are not overlooked (the first moment accumulates their direction).
+
+The typical choice β2 = 0.999 means the second moment has a very long memory — it takes roughly 1000 steps to fully refresh the information it carries.
+
+*** Why It Worked (and Where It Buried New Problems)
+
+Adam automated the most painful part of training — learning rate tuning — letting each parameter find its own rhythm. This is exactly why Adam became the default optimizer for LLMs.
+
+But the cost was baked in from the start: *every single parameter* now carries two FP32 numbers. A 70B-parameter model has 70B × 4 bytes = 280 GB just for weights; optimizer states add another 280 GB × 2 = 560 GB. An 8-GPU H100 node has only 640 GB of VRAM total. Optimizer states alone nearly fill it.
+
+This is the starting point for every "compress the optimizer" paper that followed over the next decade.
+
+** 2022 | 8-bit Adam: Seriously Fitting EMA into 8 Bits
+
+*** What Problem It Saw
+
+Adam's two EMAs doubled memory. The simplest idea was to store them as INT8/FP8 — instantly cutting memory by 4×. But naive attempts (direct min-max quantization) caused training to collapse. The reason is that optimizer-state values span an enormous dynamic range — the second moment can span 12 orders of magnitude — so a single quantization grid maps small values entirely to zero.
+
+*** Its Solution
+
+Dettmers proposed *block-wise quantization*: partition the states into blocks of 2048 values, compute a separate min/max for each block, and scale independently. An abnormally large element then only damages the precision within its own small block; all other blocks retain theirs.
+
+Combined with a *dynamic exponent* mapping — a non-uniform grid dense at small values and coarse at large ones — this matches the shape of the second-moment distribution.
+
+In practice: 8-bit Adam is nearly indistinguishable from FP32 Adam on LLM pre-training. Optimizer states drop from 280 GB × 2 to 70 GB × 2.
+
+*** Why It Worked (and Where It Buried New Problems)
+
+Eight-bit grids are still fine enough. Precision loss within each block is effectively averaged away by the randomness of successive updates, and over time the result closely tracks uncompressed training.
+
+But two problems were left buried:
+
+1. *Nobody asked where the small updates swallowed by rounding actually went.* Everyone assumed they were just noise, unable to accumulate. 
+2. 8 bits looked fine, but the next generation would try 4 bits, 3 bits, 2 bits — and once the grid coarsens by another factor of two, the "swallowed small update" problem would explode.
+
+** 2023 | 4-bit Optimizers: Halving Again, but the Second Moment Starts Misbehaving
+
+*** What Problem It Saw
+
+Eight bits could be halved again. But Li et al. found that simply coarsening the 8-bit grid to 4 bits breaks the *second moment specifically* — loss curves degrade and final accuracy drops. The first moment, by contrast, is relatively robust.
+
+Why is the second moment so fragile? Nobody had a complete answer at the time. Li et al. offered a phenomenological explanation: "the second moment has a heavier-tailed distribution, making it more sensitive to quantization error."
+
+*** Its Solution
+
+They designed a *nonlinear quantization grid* specifically for the second moment — denser coverage in the small-value region plus dynamic range clipping. The essence is an engineering patch that rehabilitates the second moment at 4 bits.
+
+*** Why It Worked (and Where It Buried New Problems)
+
+It genuinely brought 4-bit training back into a usable regime. But the explanation stayed at the level of "quantization error" — it never clarified how that error *accumulates* over time.
+
+What was left buried: as precision keeps dropping (FP4, FP3), a new phenomenon becomes increasingly visible — *EMA updates are frequently swallowed entirely by rounding*, leaving the state unchanged for dozens of consecutive steps. This is not the same as "quantization error." Quantization error is a continuous small perturbation; being swallowed is discrete — "nothing happened at all." That distinction would matter greatly.
+
+** 2025 | SPAM and Glentis: Zero Out Momentum Periodically, and Training Stabilizes
+
+*** What Problem It Saw
+
+Running in parallel with optimizer-state quantization was a separate thread: large-model pre-training is plagued by loss spikes — a sudden violent jump in loss that either causes divergence or requires rollback.
+
+Empirically, these spikes seemed correlated with "stale gradient signals lingering in momentum." A large gradient from one batch gets absorbed into the momentum and continues pushing the parameters for hundreds of steps; if it eventually conflicts with the current gradient direction, the result can be an explosion.
+
+*** Its Solution
+
+SPAM (Huang et al.) and Glentis et al. independently proposed the same idea: *periodically zero out the momentum* (reset), letting it re-accumulate from scratch. A more aggressive variant resets the entire Adam state every N steps. The result: smoother loss curves and often better final accuracy.
+
+Topollai & Choromanska's own earlier 2026 work (cited in the paper) showed that an implicit reset — dynamically adjusting β — can produce a similar effect.
+
+*** Why It Worked (and Where It Buried New Problems)
+
+The story was coherent: old momentum is an "inertia trap," and clearing it periodically helps escape the trap.
+
+But an unsettling empirical finding remained: *reset is especially effective at low precision and nearly useless at full FP32 precision.* If reset were purely about preventing spikes, precision level should not matter so much.
+
+This asymmetry suggested that reset was tapping into a mechanism directly tied to *quantization* — one that SPAM and related work had not yet seen.
+
+** 2026 | StaleEMA: Connecting Quantization and Reset
+
+*** What Problem It Saw
+
+Topollai & Choromanska looked at both threads together:
+
+- *Thread A*: optimizer-state precision keeps dropping (8-bit → 4-bit); the second moment becomes increasingly fragile
+- *Thread B*: periodic reset is especially effective at low precision
+
+They asked: are these two phenomena the same phenomenon?
+
+Their specific diagnosis: at low precision, each step's EMA update increment is ~Δ_t = (1-β) * (g_t^2 - v_{t-1})~ — a very small number (β = 0.999 means coefficient 0.001). If this Δ is smaller than the quantization grid spacing at the current storage location, then after rounding the state does not move at all — storing it is equivalent to storing nothing.
+
+They named this phenomenon *state-update stalling*. It is distinct from traditional "quantization error" — quantization error means each step deviates a little; stalling means many consecutive steps produce "nothing happened at all."
+
+*** Its Solution
+
+Three contributions:
+
+1. *Model the stalling probability*: assuming gradients locally follow a Gaussian distribution (a reasonable short-window approximation), one can derive the per-step probability of stalling as a closed-form expression depending only on the precision grid spacing ε and the decay coefficient β2.
+
+2. *Prove that stalling accumulates*: starting from initialization, there is an early "burn-in window" during which the EMA still moves; after a critical time j*, stalling begins to dominate — the state becomes effectively frozen, almost unresponsive to new gradients.
+
+3. *Derive the optimal reset period*: since stalling accumulates until it overwhelms the system, the optimal time to reset is "before stalling becomes severe." They provide a closed-form formula that tells you, given a precision level (FP4/FP8/BF16) and β2, how frequently to reset.
+
+Empirically, low-precision Adam reset according to this formula recovers nearly all the training performance lost to precision reduction, while cutting optimizer-state memory by 4–8×.
+
+*** Why It Worked
+
+It provides a *mechanistic explanation* for why reset helps at low precision but not at high precision. At FP32 the grid is fine enough that stalling almost never occurs, so there is nothing for a reset to "restart"; at FP4 the grid is coarse enough that stalling is severe, and reset becomes a necessary operation to restore responsiveness.
+
+More importantly: it turns "when to reset" from a tuning art into an engineering calculation — theory supplies the period, experiments validate it.
+
+* Frontier Extensions
+
+This paper appeared in March 2026, so its citation network has not yet taken shape. But it already clearly identifies several directions that invite follow-up:
+
+- *Extending the stalling model to Muon, Shampoo, and SOAP*: these newer optimizers all use some form of EMA or preconditioner, and stalling may manifest differently in each. The paper's final section sketches a preliminary extension experiment without going deep.
+
+- *Adaptive reset*: the current reset period is a fixed value computed from a theoretical closed form. But the optimal period likely differs across training phases (early training vs. near convergence), so the natural next step is *online detection of stalling severity → dynamic reset scheduling*.
+
+- *Joint optimization with Stochastic Rounding*: stochastic rounding can mitigate but not eliminate stalling; the paper acknowledges this. A hybrid strategy — relying on SR early on and resorting to reset when stalling becomes severe — may outperform either approach alone.
+
+* One Diagram to See It All
+
+#+begin_example
+                  Optimizer state precision
+                      |
+   FP32  +--Adam(2014)--------------------------------+
+         |                                            |
+         | 2 FP32 numbers per parameter -> memory     |
+         | explosion                                  |
+         |                                            |
+   INT8  +--8-bit Adam(2022): block-wise quantization-+
+         |                                            |
+         | Compress states to 8 bits, appears lossless|
+         |                                            |
+   INT4  +--4-bit Opt(2023): nonlinear grid-----------+
+         |                                            |
+         | Push to 4 bits; second moment fragile      |
+         | but engineering patches work               |
+         |                                            |
+         | (reset work appears in parallel,           |
+         | explanation incomplete)                    |
+         |                                            |
+         | SPAM(2025): periodic reset framed as       |
+         | "spike prevention"                         |
+         |                                            |
+   FP4   +--StaleEMA(2026): stalling theory-----------+
+         |                                            |
+         | Reveals: quantization + EMA ->             |
+         | updates swallowed by rounding              |
+         | Derives: optimal reset period              |
+         |          = f(precision, β2)                |
+         | Unifies quantization and reset as two      |
+         | sides of the same phenomenon               |
+         v
+       Timeline: 2014 -> 2022 -> 2023 -> 2025 -> 2026
+
+       Two threads finally converge in 2026:
+
+         Quantization precision  ----\
+                                      >---> stalling is the shared root
+         Reset period           ----/
+#+end_example
+
+* Insights
+
+A pattern that recurs throughout this river is: *engineering experience arrives first, theoretical explanation comes later.*
+
+8-bit Adam ran for three years before anyone fully understood what was happening inside it. 4-bit optimizers were pushed into production before anyone could fully explain why the second moment was so fragile. SPAM's reset was proven effective long before StaleEMA explained the true reason it worked.
+
+Looking ahead, the next wave of "push to 2 bits" work will almost certainly appear first as engineering papers — some team using a collection of tricks to make 2 bits run — and the theory will follow one or two years later.
+
+But "theory-catching-up" papers like StaleEMA have a unique value: once they supply a mechanism, they narrow the subsequent design space from *"try every trick you can think of"* to *"let the formula tell you."* The question of how often to reset is now essentially a matter of plugging numbers into that formula.
+
+At a deeper level: *quantization does not merely degrade precision — quantization changes dynamics.*
+
+This is the genuine cognitive shift StaleEMA contributes. Previously, everyone thought of quantization as "adding noise," so the design philosophy was "make the noise small and random." StaleEMA reveals that in memory-bearing systems like EMA, quantization introduces an entirely new phenomenon — *stalling* — which is not noise but rather "nothing happened at all." Stalling can inflate the system's effective memory length from 1000 steps to tens of thousands, causing the system to lose responsiveness to new signals.
+
+All future work on low-precision training may need to design along two dimensions simultaneously — *quantization error* and *quantization stalling* — rather than the first dimension alone.
+
+* Implications
+
+If you work on model compression, quantization, or low-precision training, the concrete takeaways from this river are:
+
+1. *Do not focus only on "how large is the error after compression" — focus on "how do the dynamics change after compression."* At the same precision level, the effect of FP32 → FP8 on Adam is completely different from its effect on SGD, because EMA has memory.
+
+2. *An empirically effective trick may work for a different reason than its authors claimed.* SPAM originally explained reset as spike prevention; StaleEMA revealed that what actually matters is restoring the responsiveness of a quantized EMA. The implication: if you have built a method that works but whose explanation seems strained, do not close the book — a deeper explanation may still be waiting to be found.
+
+3. *"What to run at low precision" in mixed-precision training is a dynamics question.* The first and second moments differ substantially in their sensitivity to quantization; β2 = 0.999 is far more fragile at low precision than β2 = 0.9; different optimizers (Adam vs. Muon vs. Shampoo) are affected by stalling to different degrees. The next generation of low-precision training stacks may need to allocate precision budgets according to each component's stalling threshold, rather than applying a single global policy.
+
+4. *"Restart" as a general-purpose tool.* Resets have been used empirically in RL, continual learning, and non-stationary environments, but always heuristically. StaleEMA provides the first example of actually computing *when* to reset. This principle may transfer to many other stateful training systems — anywhere state can "accumulate staleness," theory-guided periodic resetting is worth considering.

@@ -1,0 +1,302 @@
+#+title:      Beyond Token Eviction: Mixed-Dimension Budget Allocation for Efficient KV Cache Compression
+#+date:       [2026-05-28 Thu 20:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T200000-en
+#+source:     https://arxiv.org/abs/2603.20616
+#+authors:    Ruijie Miao, Zhiming Wang, Wang Li, Shiwei Wu, Shufan Liu, Yanbing Jiang, Tong Yang
+#+venue:      ICML 2026 (arXiv preprint)
+
+* The River of Problems
+
+Once an LLM needs to read a long document spanning tens of thousands of tokens, the first thing to blow up GPU memory is not the model weights but the massive pile of K/V tensors that the attention mechanism caches to avoid recomputation — the KV cache. This pile grows *linearly with sequence length*: double the context, double the cache; after dozens of conversation turns, the cache can dwarf the model itself.
+
+A whole research thread has sprung up around one question: *Can we shrink this KV pile without breaking the model?*
+
+But "shrinking" is an art. Not every token, every head, or every dimension in the KV cache is equally important. Compressing uniformly is like throwing treasure and trash away together. Generation after generation of researchers on this river have been doing one thing — *progressively refining the granularity at which they ask "which slots deserve more budget and which deserve less."*
+
+* Source Map
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al., arXiv:2309.17453)
+  Efficient Streaming Language Models with Attention Sinks
+  |
+  | Problem: KV cache grows linearly with token count; long context is infeasible
+  | Solution: Fixed rule — keep the first 4 "attention sink" tokens + a recent
+  |           sliding window; evict everything in between
+  |           (granularity: hard positional rule)
+  v
+[2023.06 / NeurIPS'23] H2O (Zhang et al., arXiv:2306.14048)
+  Heavy-Hitter Oracle for Efficient Generative Inference
+  |
+  | Problem: StreamingLLM judges importance by position — too coarse;
+  |           tokens in the middle that are genuinely attended to get wrongly evicted
+  | Solution: Track cumulative attention scores to find "heavy hitters";
+  |           keep whoever is frequently attended to
+  |           (granularity: token-level dynamic scoring)
+  v
+[2024.04] SnapKV (Li et al., arXiv:2404.14469)
+  SnapKV: LLM Knows What You are Looking for Before Generation
+  |
+  | Problem: H2O's cumulative score carries noise from distant history;
+  |           slow to react to what the user is currently asking
+  | Solution: Use an "observation window" at the end of the prompt
+  |           (e.g., the last 32 tokens) to predict which tokens will be
+  |           needed during decoding
+  v
+[2024.06] PyramidKV (Cai et al., arXiv:2406.02069)
+  PyramidKV: Dynamic KV Cache Compression Based on Pyramidal Info
+  |
+  | Problem: All of the above give the same budget to every layer,
+  |           but different layers have very different token-dependency patterns
+  | Solution: More budget for lower layers, less for upper layers —
+  |           a pyramidal per-layer budget
+  |           (granularity: layer-level)
+  v
+[2024.10] HeadKV (Fu et al., arXiv:2410.19258)
+  Not All Heads Matter: A Head-Level KV Cache Compression
+  |
+  | Problem: PyramidKV still treats all heads within a layer equally,
+  |           but heads within the same layer play wildly different roles
+  | Solution: Score each head's importance individually;
+  |           give more budget to important heads
+  |           (granularity: head-level)
+  v
+[Parallel branch 2024.07] Palu (Chang et al., arXiv:2407.21118)
+  Palu: Compressing KV-Cache with Low-Rank Projection
+  |
+  | Perspective shift: stop asking "which token to keep" and instead ask
+  |                    "how many dimensions to keep per token" —
+  |                    KV matrices are inherently low-rank
+  | Solution: SVD on the projection matrices; compress all tokens uniformly
+  |           to r dimensions (but every token still gets the same count)
+  v
+[2026.03] MixedDimKV (this paper, arXiv:2603.20616)
+  Beyond Token Eviction: Mixed-Dimension Budget Allocation
+  |
+  | Key insight: weld the two lines together —
+  |   "evict a token"  = "compress it to 0 dimensions"
+  |   "keep a token"   = "compress it to the full d dimensions"
+  |   If so, why can't there be 0.25d or 0.5d in between?
+  | Solution: assign each token its own dimension count (granularity: per-token-dim)
+  |           use a deviation upper-bound on attention output as a "compression
+  |           loss score"; allocate total budget via Lagrangian + binary search
+  v
+[2026 frontier extensions]
+  MixedDimKV-H:  fold in head-level importance weights from HeadKV
+  Other concurrent KV-compression papers (EchoKV, CapKV, alpha-KV, …):
+    advancing in parallel from reconstruction, quantization, and
+    adaptive-budget angles
+#+end_example
+
+* The Evolutionary Narrative
+
+Along this river, the protagonist is not any single paper — it is *the granularity of KV cache compression*. Each generation has taken the same problem and cut it one level finer, asking "is this unit important, and how much budget does it deserve?"
+
+** 2023.09 | StreamingLLM: Hard Positional Rules
+
+*** The Problem It Saw
+
+After decoding 10,000 tokens, a naïve Transformer's KV cache has already consumed tens of gigabytes of GPU memory. The earliest researchers tried a simple fix: a sliding window — keep only the most recent N tokens. But the model immediately fell apart, producing gibberish.
+
+Xiao et al. traced the root cause and found a counterintuitive phenomenon: *the very first few tokens are disproportionately important*, regardless of whether they carry meaningful content. Attention scores at those positions are abnormally high — they act like "drain sinks" absorbing surplus attention weight. Remove them and the softmax distribution destabilizes, causing the whole model's output distribution to drift.
+
+*** Its Solution
+
+Codify a fixed rule: always keep the first 4 tokens (called attention sinks) plus a recent sliding window; evict everything in between.
+
+This is KV compression's earliest "granularity" — *positional granularity*. The rule is static, content-blind, and attention-blind; a token's fate is determined purely by its index in the sequence.
+
+*** The New Problem It Left Behind
+
+The large middle section is wiped out wholesale, yet obviously not all middle tokens are unimportant. If the user asks "what is the name of the character mentioned around token 3,000?" — that KV was already deleted. The model cannot answer not because it is unintelligent, but because the answer was preemptively erased.
+
+The next step had to look at content and attention.
+
+** 2023.06 | H2O: Picking Tokens by Attention Score
+
+*** The Problem It Saw
+
+StreamingLLM decided fate by position — too blunt. Zhang et al. stared at attention matrices for a long time and found a pattern: *only a tiny fraction of tokens (~5%) are repeatedly attended to*. Remove these "heavy hitters" and performance collapses; remove the tokens that nobody ever attends to, and the loss is nearly zero.
+
+In other words, the attention mechanism has already computed "who matters" — we just need to listen to it.
+
+*** Its Solution
+
+Maintain a *cumulative attention score* — each time a token is attended to, add the received attention weight to its running total. Each time a new token arrives, evict the lowest-scoring token from the cache.
+
+Granularity advances from "position" to *token-level dynamic scoring*.
+
+*** The New Problem It Left Behind
+
+The cumulative score keeps alive tokens that "were attended to long ago but nobody cares about now." What the current query needs, however, is what *will* be used going forward, not who had the highest historical total.
+
+Furthermore, updating cumulative scores across all tokens is computationally expensive.
+
+** 2024.04 | SnapKV: Picking Tokens Based on What the User Is Asking
+
+*** The Problem It Saw
+
+H2O scores using the entire history, but Li et al. ran a simple experiment: use the attention patterns of the last few prompt tokens to predict which earlier tokens will be attended to during decoding — *with remarkable accuracy*.
+
+This means the sentence the user writes at the end of the prompt already reveals what will be needed next. You do not need the full history; the prompt tail is enough.
+
+*** Its Solution
+
+Carve out an observation window at the end of the prompt (e.g., the last 32 tokens) and use their attention scores over the preceding context to rank earlier tokens. High-scoring tokens stay; low-scoring ones are evicted.
+
+This effectively replaces "global historical average" with *"what the user is currently focused on"* — more accurate and more efficient.
+
+*** The New Problem It Left Behind
+
+SnapKV applies the same strategy and the same budget to every layer. But a 32-layer model does very different things at each layer — why should they all get the same treatment?
+
+** 2024.06 | PyramidKV: Different Budgets for Different Layers
+
+*** The Problem It Saw
+
+Cai et al. examined per-layer attention distributions and found: lower layers attend broadly, covering many tokens; higher layers become increasingly focused, until the top layers fixate on just a handful of key tokens.
+
+This leads directly to a conclusion: *lower layers need more KV budget; upper layers need very little.* A uniform budget wastes capacity at the top while starving the bottom.
+
+*** Its Solution
+
+Allocate in a pyramid shape — large budget for lower layers, small budget for upper layers, with the total held constant. Granularity upgrades from "token-level" to *"token-level + layer-level."*
+
+*** The New Problem It Left Behind
+
+Within a single layer, all heads are still treated identically. But head-to-head variation is even larger than layer-to-layer variation — some heads specialize in retrieval, others in local syntax.
+
+** 2024.10 | HeadKV: Different Budgets for Different Heads
+
+*** The Problem It Saw
+
+Fu et al. did one thing: use a needle-in-a-haystack task to assign each head a "retrieval capability score." The results revealed enormous variance — some heads scored perfectly and removing them obliterated long-context capability; others barely contributed to retrieval at all and could be zeroed out without consequence.
+
+PyramidKV distributes budget across layers, but within a layer it is uniform — the same standard for high-scoring and low-scoring heads alike.
+
+*** Its Solution
+
+Compute head importance as weights, and refine budget allocation from layer-level down to *head-level*. Important heads receive more KV slots; unimportant heads receive fewer.
+
+*** The New Problem It Left Behind
+
+At this point, granularity has been refined all the way to token × layer × head. But what about one level finer? *Within the same token at the same head, different dimensions still differ in importance* — that cut has not yet been made.
+
+** Parallel Branch 2024.07 | Palu: A Different Perspective on Compression
+
+A brief detour is necessary here, because MixedDimKV's real elegance lies in welding two previously unrelated lines together.
+
+*** The Problem It Saw
+
+The entire chain above (StreamingLLM → HeadKV) does the same thing — *binary classification*: should this token (or head) stay or go? Chang et al. shifted the lens: instead of asking "keep or not," ask "how many dimensions to keep."
+
+Because the KV cache is fundamentally a matrix, and matrices have *low-rank structure* — you do not need all d dimensions; keeping the r principal components is sufficient.
+
+*** Its Solution
+
+SVD-decompose the K and V projection matrices, and compress all tokens uniformly to r dimensions. This branch (Palu / Eigen Attention / ShadowKV) cares about *dimension-level* granularity, but every token still gets the same dimension count.
+
+*** The Problem It Left Open — the Paper Wall That MixedDimKV Breaks Through
+
+The token-eviction branch only asks "keep or not." The dimension-reduction branch only asks "compress to how many dimensions, uniformly."
+
+But look again: *"evicting a token" is just "compressing it to 0 dimensions." "Keeping a token" is just "compressing it to the full d dimensions."*
+
+Then why can't there be 0.25d or 0.5d in between? Different tokens have different importance — important ones deserve more dimensions, unimportant ones fewer — *that is genuine fine granularity*.
+
+** 2026.03 | MixedDimKV: Unifying "Keep or Not" and "How Many Dimensions"
+
+*** Its Core Move
+
+If you view token eviction as "a special case of dimension allocation (either 0 or full)," then *allowing intermediate values* immediately yields a strictly richer framework:
+
+- StreamingLLM / H2O / SnapKV / HeadKV: binary allocation from {0, d}
+- Palu / Eigen Attention: uniform allocation [r, r, r, …, r]
+- MixedDimKV: arbitrary non-uniform allocation [r₁, r₂, r₃, …]
+
+Granularity drops in one step from token-level / head-level / layer-level all the way down to *the specific dimension count per (token, head) pair*.
+
+*** The Two Engineering Problems It Had to Solve
+
+1. *How to score the "compression loss" for each (token, head, candidate-dimension-count) triple?*
+
+   Old methods (H2O / SnapKV) score tokens using attention weights. But attention weights only reflect importance on the key side; they ignore value magnitudes and per-dimension compressibility.
+
+   MixedDimKV targets the *attention output* directly (not the attention weight) — because output deviation is what actually affects the model. It derives a *deviation upper bound*: a conservative loss score for each (token, dim) pair that captures the joint effect of three factors — attention saliency, value norm, and per-dimension compressibility.
+
+2. *Given a total budget, how to allocate a dimension count to each token?*
+
+   The candidate dimension set is discrete (e.g., {0, 32, 64, 128}), which looks like an integer program. But the authors prove a key fact: *under long-context conditions, the duality gap between the original problem and its Lagrangian dual is negligible.*
+
+   They therefore use *binary search* to find the Lagrangian multiplier, then monotonically assign each token a dimension count — solved in linear time.
+
+*** Its Two Variants
+
+- *MixedDimKV*: uses only its own loss score for allocation, with no head-level importance. Outperforms all baselines that do not use head information.
+- *MixedDimKV-H*: additionally incorporates HeadKV's head-level weights — consistently beats HeadKV when both have access to the same head information.
+
+*** What It Achieves
+
+- LongBench: *a KV cache of only 6.25% (KV size = 512) matches full attention.*
+- Needle-in-a-Haystack (50K context): *0.26% of cache (KV size = 128) still achieves 100% accuracy.*
+- Decoding latency: reduced to 55% of full attention.
+
+* Problem–Solution Summary
+
+#+begin_example
+Granularity evolution axis:
+  position --> token --> token+layer --> token+layer+head --> token+head+dim
+  (hard rule)  (attention)  (layer diff)    (head diff)       (dim allocation)
+
++-----------------+-----------------+----------------------------+
+|  Paper          |  Granularity    |  Source of "importance"    |
++-----------------+-----------------+----------------------------+
+|  StreamingLLM   |  position       |  none (fixed rule)         |
+|  H2O            |  token          |  cumulative attention wt   |
+|  SnapKV         |  token          |  observation-window attn   |
+|  PyramidKV      |  token x layer  |  + per-layer attn spread   |
+|  HeadKV         |  token x head   |  + head retrieval score    |
+|  Palu           |  dim (uniform)  |  low-rank principal comps  |
+|  MixedDimKV     |  token x dim    |  attn output deviation ub  |
+|  MixedDimKV-H   |  token x head x dim | + HeadKV head weights  |
++-----------------+-----------------+----------------------------+
+
+Key welding point (the paper's central contribution):
+  "Evict a token"  is a special case of "compress it to 0 dims"
+  "Keep a token"   is a special case of "compress it to full dims"
+  --> Binary allocation is just a degenerate form of continuous dim allocation
+  --> Once intermediate values are allowed, the granularity ceiling of the
+      entire KV-compression line is raised by one full order
+#+end_example
+
+* Insights and Next Steps
+
+** What Is Really Changing Along This River
+
+On the surface, granularity is being refined level by level: position → token → layer → head → dimension. But what is happening underneath is not mere subdivision — it is *the unification of all compression actions into a single framework*.
+
+StreamingLLM, H2O, Palu, and HeadKV were originally four unrelated stories — one group selects tokens, another computes attention, another distributes layer budgets, another does low-rank decomposition. MixedDimKV fits them all into one template with a single sentence:
+
+#+begin_quote
+*KV compression = an optimization problem that assigns a 0/1-bit budget to each (token, head, dim) triple*
+#+end_quote
+
+All prior methods are special cases of this template — StreamingLLM is the "hard positional constraint" special case; H2O is the "attention-ranked binary allocation" special case; Palu is the "uniform allocation across dimensions" special case.
+
+This is the river's greatest turning point: *not another new algorithm, but placing all prior algorithms inside a continuous optimization space* — predecessors are corner points of that space; this paper moves into the interior.
+
+** Where the River Most Likely Flows Next
+
+1. *Compression-aware training.* All existing methods (including MixedDimKV) are post-hoc; the model itself was never prepared to be compressed. If pre-training or post-training explicitly targets "low-dimensional KV should also work" (along the lines of DeepSeek MLA), the resulting loss will be far smaller.
+
+2. *Absorbing quantization into the same framework.* Quantization (KVQuant, PolarQuant) and dimension allocation are currently two orthogonal lines. The natural next step is to weld them — a token could be assigned "4 dims at 8-bit" or "8 dims at 4-bit," letting the optimizer choose. MixedDimKV has already made dimension count a free variable; making bit-width a free variable too is one more step.
+
+3. *Dynamic budgets.* Current budgets are fixed presets. But in real deployments, query difficulty varies enormously — a simple query may need only 1% of the cache, a hard one 20%. Making "how much cache to allocate per query" itself learnable is what true adaptivity would look like.
+
+* Honest Annotations
+
+- The progression StreamingLLM → H2O → SnapKV → PyramidKV → HeadKV is explicitly traced in the paper's Related Work section and can be taken as reliable.
+- Palu is cited and compared against (along with Eigen Attention and ShadowKV) as the representative "dimension-reduction" branch — this is also directly from the paper.
+- "MixedDimKV's core move = treating token eviction as a binary special case of dimension allocation" is explicitly stated in the paper's introduction, not an inference.
+- The "frontier extensions" section beyond MixedDimKV-H is based on parallel observation of concurrent KV-compression papers (EchoKV / CapKV / alpha-KV etc.) in this repository's paper-river directory — they are not cited by this paper, and this is lateral cross-referencing, not successor work.
+- Publication dates and arXiv IDs for prior papers come from the cited references in Related Work and have not been individually verified against page numbers.

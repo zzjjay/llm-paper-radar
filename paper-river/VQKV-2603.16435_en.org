@@ -1,0 +1,457 @@
+#+title:      VQKV: High-Fidelity and High-Ratio Cache Compression via Vector-Quantization
+#+date:       [2026-05-28 Thu 20:21]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T202115-en
+#+source:     https://arxiv.org/abs/2603.16435
+#+authors:    Yixuan Wang, Qingyu Shi, Jiayu Zhou, Dianbo Liu, Ziwei He, Zhouhan Lin
+#+venue:      arXiv 2603.16435 (2026-03)
+
+* The Problem River
+
+As LLM context windows grow longer, every additional token demands more KV cache
+in GPU memory. By the time the context reaches 100k tokens, the cache alone can
+exhaust an entire A100 — the model hasn't even started computing, yet memory is
+already gone.
+
+The problem is simple to state: can we compress this cache without making the
+model dumber?
+
+It sounds straightforward. But over three years of effort, researchers found:
+
+- Push for high compression ratios, and model quality drops.
+- Hold on to model quality, and you can't compress much.
+- Add calibration training, and you've broken the "plug-and-play" promise.
+
+Each generation watched its predecessors hit one wall, then threw itself against
+a different one. It took six generations before VQKV said: "You've all been
+pushing in the wrong direction — the question is not how much to drop or how
+many bits to use; it's that *you've always been treating each dimension
+independently*."
+
+* Source Map
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al.)
+  |
+  | Observation: the first token is an "attention sink"; drop it and the model collapses
+  | Solution:    keep head + keep tail, discard everything in between — the most naive eviction
+  v
+[2023.06] H2O (Zhang et al.)
+  |
+  | Problem:  a blanket cut in the middle is too coarse; some middle tokens matter
+  | Solution: score each token by cumulative attention received; keep high-scorers (heavy hitters)
+  v
+[2024.04] SnapKV (Li et al.)
+  |
+  | Problem:  H2O's scores must be maintained on-the-fly, adding overhead;
+  |           importance is only known after prefill completes
+  | Solution: use the last few prompt tokens as an observation window;
+  |           select which tokens to keep in a single pass
+  v
+[2024.02] KIVI (Liu et al.)
+  |
+  | Problem:  token eviction is "irreversible information loss" — once dropped, unrecoverable
+  | Solution: keep all tokens but quantize each float to 2-bit;
+  |           Keys quantized channel-wise, Values token-wise
+  v
+[2024.07] Palu (Chang et al.)
+  |
+  | Problem:  2-bit still processes each scalar independently, ignoring inter-dimension correlations
+  | Solution: apply low-rank decomposition along the feature dimension;
+  |           project KV into a low-dimensional subspace
+  v
+[2026.03] VQKV (Wang et al.)  <-- this paper
+  |
+  | Problem:  all prior methods treat each scalar (or linear subspace) independently;
+  |           high compression ratio and high fidelity cannot coexist
+  | Solution: compress entire vectors jointly via a codebook;
+  |           replace thousands of floats with a handful of integer indices
+  v
+[?]  Next generation — yet to be written
+#+end_example
+
+Note: arrows represent "saw the problem in the predecessor" relationships, not
+necessarily direct citations. KIVI and Palu are both explicitly named as
+baselines in the VQKV paper.
+
+* Evolutionary Narrative
+
+** 2023.09 | StreamingLLM: Discard the Middle, Keep Head and Tail
+
+*** What Problem It Saw
+
+The earliest response to KV cache overflow was sliding-window attention:
+keep only the most recent N tokens and throw away the rest.
+
+Intuitively appealing — humans only remember what was said recently, right?
+
+But the moment the model drops the very first token, performance collapses
+catastrophically. Perplexity shoots from 5 to 5000; the model babbles nonsense.
+
+Why? Nobody knew. Answering that question was StreamingLLM's contribution.
+
+*** Its Solution
+
+The authors made a very concrete observation: in the attention matrix, *the
+first token always receives disproportionately high attention*, regardless of
+its content. Even a meaningless "<bos>" attracts a large share of attention from
+every subsequent token.
+
+They named this the "attention sink." The mechanism: softmax forces scores to
+sum to 1, so the model must dump excess attention somewhere — the first token
+becomes that dumping ground.
+
+The fix is a single sentence: *never touch the first few tokens*; add a sliding
+window to retain the most recent ones; discard everything in between.
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because it uncovered an ignored invariant: the mathematical structure
+of the attention mechanism requires a "shock absorber." Preserving those few
+tokens keeps the model functional.
+
+But the trap is obvious: is the middle segment truly useless? Clearly not. If a
+critical fact is buried there (e.g., "the answer is 42"), a position-based cut
+destroys it.
+
+*That gap left room for the next paper: can we select by importance rather than
+position?*
+
+** 2023.06 | H2O: Find the "Heavy Hitter" Tokens
+
+*** What Problem It Saw
+
+StreamingLLM deletes by position — essentially admitting "we don't know what
+matters, so we'll bet on the beginning and the end."
+
+But attention maps give us an explicit signal: which tokens receive heavy
+attention and which are consistently ignored. Can that signal be used?
+
+*** Its Solution
+
+H2O stands for "Heavy Hitter Oracle." The idea is almost counterintuitively
+simple: *accumulate the attention score each token has received over its
+lifetime; keep the high-scorers, drop the rest.*
+
+Think of it as the inverse of LRU: not "keep what was accessed most recently"
+but "keep what has been referenced the most."
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because attention distributions are highly sparse — the vast majority
+of tokens receive negligible attention most of the time, so dropping them is
+essentially lossless; a small minority are referenced repeatedly and truly need
+to be kept.
+
+But H2O leaves two traps:
+
+1. The cumulative score must be maintained step-by-step during inference,
+   introducing extra computation and memory overhead.
+2. The score is a "backward-looking prediction" — historically important does
+   not guarantee future importance.
+
+*The next paper needed to be cheaper and more accurate — ideally selecting
+everything to keep in a single shot.*
+
+** 2024.04 | SnapKV: Use the Prompt's Tail to Predict What to Keep
+
+*** What Problem It Saw
+
+H2O makes eviction decisions at every step, spreading overhead across the entire
+decode phase. Its cumulative scores are also prone to early-context bias.
+
+SnapKV's authors noticed a pattern: *the attention pattern of the last few dozen
+prompt tokens already strongly indicates which positions the model will attend to
+during generation.*
+
+In other words, at the moment prefill ends, the model already "knows internally"
+which tokens are critical — we just need to read that signal out.
+
+*** Its Solution
+
+Take an "observation window" from the end of the prompt (e.g., the last 32
+tokens), look at where their attention flows, keep the KV entries at those
+positions, and discard everything else — all in one shot.
+
+Take a "snapshot" once prefill is done; make no further decisions throughout
+decode.
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because of a statistical regularity: the attention of the final few
+tokens is a *strong prior* for the attention pattern during generation.
+One-shot selection is both more accurate and has zero runtime overhead.
+
+But at its core, SnapKV is still *evicting tokens*. If a dropped token suddenly
+becomes relevant during generation, it is gone for good — this is precisely what
+VQKV later criticizes as "irreversible information loss."
+
+*The next paper needed to take a different road: don't delete, just compress.*
+
+** 2024.02 | KIVI: Stop Deleting — Chop Every Number Down to 2-bit
+
+*** What Problem It Saw
+
+The fundamental problem with the eviction path is irreversibility: once
+something is thrown away, it cannot be recovered.
+
+What if we kept all tokens but stopped storing each KV vector in 16-bit float,
+using 2-bit integers instead? No token is lost, and memory shrinks 8×.
+
+*** Its Solution
+
+KIVI applies *scalar quantization*: each floating-point number is quantized
+independently to a 2-bit integer.
+
+A notable finding from careful analysis: *Key cache quantizes better along the
+channel dimension* (each channel gets its own scale/zero-point), while *Value
+cache quantizes better along the token dimension.* This asymmetric design is
+KIVI's core contribution.
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because 2-bit resolution is sufficient to capture the dominant
+variation, and the approach is training-free and plug-and-play.
+
+But the trap is clear: *each float is processed independently.* A 128-dimensional
+vector's 128 values are correlated — they are not 128 independent scalars but a
+single geometric entity. Scalar quantization discards that correlation entirely.
+
+And 2-bit is a hard floor: push to 1-bit and the model collapses.
+
+*The next paper shifted axes: instead of cutting precision per scalar, compress
+along the feature dimension.*
+
+** 2024.07 | Palu: Low-Rank Decomposition Along the Feature Dimension
+
+*** What Problem It Saw
+
+KIVI compresses each number to 2-bit and stops there. Could the *dimension* axis
+offer further savings?
+
+Observation: a KV vector may be 128-dimensional, but its *distribution* might
+concentrate in a much lower-dimensional subspace. Like having 1,000 photos, each
+with one megapixel, but all photos are essentially "cats" — the intrinsic
+dimensionality is far below one million.
+
+*** Its Solution
+
+Palu applies low-rank decomposition: project KV into a low-dimensional space for
+storage and project back at compute time.
+
+This shifts focus from "compress the precision of individual numbers" to
+"compress the dimensionality of entire vectors."
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because KV vectors do exhibit low-rank structure, and the compressed
+representation stores fewer numbers — each of which can remain high-precision.
+
+But three traps remain:
+
+1. In training-free mode, the approximation error of low-rank projection is hard
+   to control — push compression hard and reconstruction quality collapses.
+2. Preserving quality requires auxiliary training (the path taken by MLA, CSKV,
+   etc.), sacrificing plug-and-play usability.
+3. Low-rank decomposition is fundamentally *linear* dimensionality reduction. If
+   the KV distribution lies on a curved manifold rather than a linear subspace,
+   linear methods cannot capture it.
+
+*The next paper said: you're all doing this linearly and independently. Try a
+codebook lookup instead.*
+
+** 2026.03 | VQKV: Compress Entire Vectors Jointly via a Codebook
+
+*** What Problem It Saw
+
+VQKV surveyed the five prior approaches laid out in a row:
+
+- StreamingLLM / H2O / SnapKV: token eviction — *irreversible information loss*
+- KIVI: per-channel scalar quantization — *ignores inter-dimension correlations*,
+  2-bit is the floor
+- Palu / ASVD: linear low-rank reduction — *requires training or sacrifices accuracy*
+
+Its diagnosis: all these methods treat dimensions independently. *Why not
+compress entire vectors jointly?*
+
+Vector Quantization (VQ) has long been proven in speech and image compression:
+train a codebook of 1,024 representative vectors; for any new vector, find the
+nearest entry and store only its index — *thousands of floats become a handful
+of integers.*
+
+*** Its Solution
+
+VQKV uses RSimVQ (Residual SimVQ):
+
+- *Residual structure* (Residual VQ): the first codebook finds the nearest
+  representative; the remaining "error" is fed to a second codebook for further
+  quantization, and so on — multiple small codebooks combine to express an
+  exponentially large set of possible values.
+- *SimVQ*: a projection matrix precedes each codebook to stabilize training and
+  prevent codebook "collapse" (many codewords never being used).
+
+The concrete procedure:
+
+1. Collect ~10 M KV vectors produced by LLaMA3.1-8B processing OpenWebText;
+   train codebooks offline (separate sets for Key and Value).
+2. At inference time, during prefill: map each KV vector to its codebook index;
+   store only the index and discard the original vector.
+3. During decode: look up the required entries from the codebook and reconstruct
+   them on the fly, integrated with a custom FlashAttention kernel.
+
+Special handling for RoPE: RoPE rotates Key vectors by position, causing the Key
+distribution to vary significantly across positions. The residual structure
+naturally absorbs these positional variations across successive codebook levels.
+
+*** Why It Works (and What New Trap It Laid)
+
+It works because it upgrades from "process each dimension independently" to
+"process each vector as a whole":
+
+- A 128-dimensional vector → 1 codebook index (log₂(1024) = 10 bits)
+- Effective bit-width per dimension: ~0.08 bit — far beyond KIVI's 2-bit floor
+- Those 10 bits are *jointly* allocated, preserving inter-dimension correlations
+
+Results on LLaMA3.1-8B: 82.8% cache compression, 98.6% performance retention,
+and the freed memory enables 4.3× longer generation.
+
+Traps laid:
+
+1. *Training the codebook requires ~10 M tokens and non-trivial compute* —
+   strictly speaking it is not "zero-cost," even though the base model itself is
+   untouched.
+2. *Codebook lookup and residual reconstruction add compute overhead*, even with
+   a custom FlashAttention kernel.
+3. *Offline-trained codebooks are model-specific* — switching from LLaMA3.1-8B
+   to LLaMA3.2-3B requires retraining.
+4. The RoPE handling is effective but justified empirically rather than by a
+   formal theoretical guarantee.
+
+* Frontier Extensions
+
+VQKV is a 2026-03 paper; as of today (2026-05) it is only two months old.
+No papers widely circulating that directly critique or improve upon VQKV have
+been identified yet.
+
+But the following directions are predictable targets:
+
+- *Online codebook learning*: the current codebook is trained offline and then
+  frozen. Could it be updated continuously during inference, like K-means? That
+  would make it truly zero-cost.
+- *Cross-model universal codebooks*: can a single set of codebooks work across
+  multiple models, eliminating per-model retraining?
+- *VQ + eviction hybrid*: drop entirely unimportant tokens; compress everything
+  else with VQ. The two historically separate paths converge for the first time.
+- *End-to-end distillation with VQ*: abandon the training-free constraint, fine-
+  tune the codebook together with the model, and push fidelity one step further.
+
+* One Diagram
+
+#+begin_example
+                                    Fi
+                                    de
+                                    li
+                                    ty
+              High ^
+                   |
+                   |  [VQKV]            <- high compression + high fidelity
+                   |  whole-vector compression
+                   |  joint codebook lookup
+                   |
+                   |  [Palu]  [MLA]
+                   |  linear low-rank  (requires training)
+                   |
+                   |  [KIVI]
+                   |  per-channel 2-bit
+                   |
+                   |  [SnapKV]
+                   |  snapshot eviction
+                   |
+                   |  [H2O]
+                   |  score-based eviction
+                   |
+               Low |  [StreamingLLM]
+                   |  position-based eviction
+                   +----------------------------> Compression
+                   Low                         High
+                                               Ratio
+
+  Timeline:
+  2023.06  H2O           score-based eviction
+  2023.09  StreamingLLM  position-based eviction (attention sink discovery)
+  2024.02  KIVI          scalar quantization (abandons eviction)
+  2024.04  SnapKV        snapshot eviction (last innovation on the eviction path)
+  2024.07  Palu          low-rank reduction (abandons per-feature processing)
+  2026.03  VQKV          vector quantization (abandons independent processing)
+
+  Paradigm shifts:
+  delete by position -> delete by importance -> compress by precision
+    -> compress by dimension -> compress by joint lookup
+  (coarse) ---------- (precise) ----------- (lossless tokens)
+    - (lossless precision) - (joint compression)
+#+end_example
+
+* Insight
+
+What is really changing across this lineage is the *gradual elevation of the
+"unit of processing"*:
+
+1. *Early 2023*: the unit is the *token*. Question: which tokens should be kept?
+2. *Early 2024*: the unit is the *scalar* (individual float). Question: how many
+   bits per number?
+3. *Late 2024*: the unit is the *low-rank subspace of a vector*. Question: which
+   direction to project onto?
+4. *2026*: the unit is the *vector itself*. Question: which codeword best
+   represents it?
+
+Each step up unlocks richer structure to exploit: relationships among tokens,
+relationships among scalars, relationships among dimensions, and finally the
+geometric structure of the entire vector distribution.
+
+Each generation discarded the last independence assumption that its predecessors
+had quietly held onto.
+
+At a deeper level, this is a journey *from discrete decisions (keep vs. drop) to
+continuous representation (lookup)*. Token eviction is a 0/1 decision — lost
+information never returns. Scalar quantization maps a continuous value into a
+discrete bucket — still lossy. Vector quantization asks "which prototype best
+resembles me?" and stores the answer as an index — the loss is absorbed into
+reconstruction error, and reconstruction error can be further reduced by
+residuals.
+
+Every step converts a hard decision into a soft query.
+
+Where will this go next? My bet: *making the codebook differentiable and
+updatable online.* VQKV's codebook is trained offline and then fixed — like a
+printed dictionary. The next generation will let the dictionary track the
+incoming distribution, or even adapt in real time to the specific task at hand.
+
+* Lessons
+
+Three takeaways from this river for the practice of finding research problems:
+
+1. *Watch for the independence assumption the previous paper quietly preserved.*
+   Every generation breaks a simplifying assumption its predecessors never
+   realized they were making. StreamingLLM assumed "position = importance." KIVI
+   assumed "each scalar is independent." Palu assumed "the distribution lives in
+   a linear subspace." VQKV broke the "independence" layer. *To find the next
+   paper, ask: what am I implicitly assuming right now?*
+
+2. *Borrowing tools across fields is the fastest path to new papers.* VQ has
+   been mature in speech and image processing for a decade. What VQKV did was
+   carry it over to LLM KV caches — the tool is old, the application is new, the
+   results are real. *Keep an eye on neighboring fields and look for tools your
+   own field hasn't adopted yet.*
+
+3. *Compression has no "final answer," only a "temporary upper bound."* Every
+   generation pushes the trade-off curve a bit further up and to the right, but
+   a new impossible triangle always surfaces. VQKV appears to have solved "high
+   compression + high fidelity + training-free," yet its codebook must be trained
+   offline and is not portable across models — *the new impossible triangle is
+   already waiting there.*
+
+This means you can:
+
+- When you see a "breakthrough," first ask what trade-off it pushed and how far;
+- Then ask what new trade-off it introduced;
+- That new trade-off is where the next paper lives.

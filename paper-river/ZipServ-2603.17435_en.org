@@ -1,0 +1,312 @@
+#+title:      ZipServ: Fast and Memory-Efficient LLM Inference with Hardware-Aware Lossless Compression
+#+date:       [2026-05-28 Thu 20:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T203341-en
+#+source:     https://arxiv.org/abs/2603.17435
+#+authors:    Ruibo Fan, Xiangrui Yu, Xinglin Pan, Zeyu Li, Weile Luo, Qiang Wang, Wei Wang, Xiaowen Chu
+#+venue:      ASPLOS 2026
+
+* The Problem River
+
+LLM weights fill up GPU VRAM. Is it possible to shrink those weights *without losing a single bit*, and to decompress them not slower but actually faster?
+
+That sounds like a free lunch. Intuitively, lossless compression is "trading CPU cycles for storage" — you store less, but you pay a decoding cost at read time. GPU inference is already throttled by HBM bandwidth; who would dare insert a decoder into the data path?
+
+This river of problems has been flowing for 70 years. The first 50 were spent fighting the battle of *compressing tighter* (the Shannon limit); the last 5 have suddenly demanded fighting a second battle: *the decoder must be shaped in a way the GPU likes*. The two goals are naturally in tension — entropy coding inherently produces variable-length bitstreams, while GPU SIMT inherently demands equal-length memory accesses. The entire river is the evolutionary history of this tug-of-war.
+
+* Source Map
+
+#+begin_example
+[1952] Huffman - A Method for the Construction of Minimum-Redundancy Codes
+  |
+  | Problem: Given symbol frequencies, how to store information with the fewest bits
+  | Solution: Optimal prefix code (high-frequency symbols get short codes, low-frequency get long)
+  | Side effect: Output is a variable-length bitstream; decoding must be serial
+  v
+[2009-2013] Duda - Asymmetric Numeral Systems (ANS / rANS / tANS)
+  |
+  | Problem: Huffman is still far from the Shannon entropy limit, but arithmetic coding is too slow
+  | Solution: Encode the entire message as one large integer, use a state machine for entropy coding
+  | Side effect: Tighter compression, Huffman-level speed, but still variable-length
+  v
+[2021] Johnson (Meta) - DietGPU
+  |
+  | Problem: ANS runs on the CPU and cannot keep up with gradient communication in GPU training
+  | Solution: Port the entire rANS pipeline onto the GPU; 250-410 GB/s throughput
+  | Side effect: Decompression target is a global memory buffer, not the compute units
+  v
+[2024-10] Hao - NeuZip   +   [2024-11] Hershcovitch - ZipNN
+  |
+  | Problem: The 8-bit exponent of BF16 weights has entropy of only ~2.6 bits — always wasted
+  | Solution: Compress only the exponent (Huffman); store sign and mantissa as-is; ~30% reduction
+  | NeuZip targets training memory; ZipNN targets checkpoint distribution
+  | Side effect: Neither solves how to use compression during inference — still "decompress then compute"
+  v
+[2025] Zhang et al. (Rice + xMAD) - DFloat11
+  |
+  | Problem: NeuZip/ZipNN only reduce storage; inference still restores full BF16, so compression is wasted
+  | Solution: Write a custom CUDA kernel; decompress on-GPU in tiles on demand
+  | Side effect: Huffman is still variable-length; full BF16 must land in a buffer before compute;
+  |             measured 1.56-3.44x decompression overhead — inference is actually slower
+  v
+[2026-03] Fan et al. (HKUST-GZ) - ZipServ  <-- this paper
+  |
+  | Problem: Variable-length entropy codes are SIMT's mortal enemy; decompressing into a buffer
+  |          is bandwidth's mortal enemy. These are two faces of the same hardware/algorithm mismatch.
+  | Solution: (1) Replace Huffman with fixed-length 3-bit codewords + triple bitmap
+  |           (2) Fuse decoding into GEMM; decompressed values land directly in Tensor Core registers
+  | Result: 30% compression, 2.21x kernel speedup, 1.22x end-to-end speedup
+  |
+  v
+[2026-04] Cloudflare - Unweight        (concurrent work, targeting Hopper WGMMA)
+[2026-05] SplitZip                     (extends this approach to the KV cache)
+#+end_example
+
+(Note: NeuZip and ZipNN appeared concurrently without citing each other. DietGPU is the engineering
+baseline cited by ZipServ, not a direct academic predecessor, but as the sole ancestor of the
+"GPU entropy coding" engineering lineage it belongs on the map.)
+
+* Evolutionary Narrative
+
+** 1952 | Huffman: Assign the shortest code to the most frequent symbol
+
+*** What problem did it see?
+
+This was the era when computers were just learning to process characters. Every character was encoded with the same number of bits (say, 8 bits), regardless of how frequently or rarely it appeared — the letter 'e' and the letter 'z' took the same storage. This was enormous waste, because common characters appear orders of magnitude more often than rare ones.
+
+Huffman was a PhD student at MIT when his advisor gave him the problem: given a set of symbol frequencies, can you find an *unambiguous* binary encoding that minimizes the average code length?
+
+*** Its solution
+
+Build a binary tree: low-frequency symbols go near the leaves (long path = long code), high-frequency symbols sit near the root (short path = short code). Every symbol is a leaf, so no code is a prefix of any other — given a bitstring of 0s and 1s, you walk the tree and uniquely parse out the symbols.
+
+The effect was immediate. If 'e' appears 100 times and 'z' appears once, encoding 'e' as 1 bit and 'z' as 8 bits dramatically shrinks total storage.
+
+*** Why it worked (and what pit it dug)
+
+It worked because it directly exploited *statistical redundancy* — as long as symbol frequencies are uneven, there is room to compress. Shannon's source coding theorem provides the theoretical lower bound (information entropy); Huffman is the integer-bit approximation of that bound.
+
+The pit it dug is variable-length encoding itself. Given a bitstring, you cannot know where the (N+1)-th symbol starts without decoding all N preceding symbols. Serial decoding is inherent — completely fine in 1952, when all computation was serial. Seventy years later, when a GPU warp needs 32 threads to march in lockstep, this became a fatal flaw.
+
+** 2009-2013 | ANS: Encode the entire message into one large integer
+
+*** What problem did it see?
+
+Huffman code lengths must be integers. But what if the optimal length for some symbol is 2.3 bits? Huffman can only assign 2 or 3, leaving a gap from the Shannon limit.
+
+The alternative was arithmetic coding — it can reach the Shannon limit, but it is computationally complex and slow and never displaced Huffman in practice.
+
+*** Its solution
+
+Jarosław Duda proposed ANS (Asymmetric Numeral Systems): encode the entire message as a *single large natural number* via lookup-table-driven state transitions. Each symbol encodes one state update; overall compression approaches the Shannon limit, while each operation is just a table lookup plus an addition or subtraction — as fast as Huffman.
+
+This exploded in the engineering world. Zstandard, Facebook's compression stack, JPEG XL, NVIDIA's nvCOMP, Meta's DietGPU — all of them are ANS variants (rANS or tANS).
+
+*** Why it worked (and what pit it dug)
+
+It worked because it simultaneously advanced two goals that had always been opposed: compression ratio and speed.
+
+But it did not touch the fundamental pit left by Huffman: *the output is still a variable-length bitstream*. Compressing a 100 MB message might yield 13.7 MB or 13.9 MB depending on the data; halfway through decoding you have no idea where the next token begins in the bitstream. On a CPU this is irrelevant (execution is sequential anyway); on a GPU it is a death sentence.
+
+** 2021 | DietGPU: Port the entire ANS pipeline onto the GPU
+
+*** What problem did it see?
+
+Meta was training distributed large models and needed to constantly transmit gradients between nodes. Bandwidth was the bottleneck, so compression was wanted — but ANS ran on the CPU. With 32 GPUs per node, funneling all gradients through the CPU encoder created a traffic jam before a single byte left the machine.
+
+Jeff Johnson (at FAIR) asked a blunt question: since the data already lives on the GPU, can the GPU do its own entropy coding?
+
+*** Its solution
+
+DietGPU is the first open-source rANS implementation that runs on the GPU, achieving 250-410 GB/s throughput on an A100. It also includes a floating-point extension specifically for compressing the exponent fields of FP data (since exponents in ML/HPC workloads are especially redundant).
+
+*** Why it worked (and what pit it dug)
+
+It worked because the ANS state machine can be split into many independent streams, each assigned to a warp, so aggregate throughput scales out.
+
+But it left two pits that ZipServ would later settle accounts with:
+
+1. *The decompression target is a global memory buffer.* DietGPU is a general-purpose compressor — it restores the full tensor into global memory, and downstream computation reads from there. Fine for "compress gradients then all-reduce"; but for LLM inference, *the bandwidth savings from compression are eaten back up by reading the buffer at full speed.*
+2. Variable-length bitstreams remain. The code segment each thread within a warp handles still depends on the data, causing control-flow divergence.
+
+** 2024 | NeuZip / ZipNN: Look at LLM weights — exponent entropy is only 2.6 bits
+
+*** What problem did it see?
+
+By this point entropy coding was mature and GPU entropy coding existed. But *no one had seriously applied it to LLM weights.* The research community was busy with lossy 4-bit quantization (GPTQ, AWQ) because the gains were more dramatic (16-bit → 4-bit) and the memory savings larger.
+
+But lossy quantization has a ceiling — accuracy really does drop. On LiveCodeBench, MXFP4 drops Llama accuracy from 56% to 36%. In scenarios requiring *bit-exact* reproduction (research, safety-critical systems, long-chain inference), lossy methods are forbidden.
+
+NeuZip and ZipNN appeared almost simultaneously (2024-10 and 2024-11) and both noticed the same fact: the 8-bit exponent of BFloat16, in a trained model, has *entropy of only about 2.6 bits*. In other words, more than 90% of the exponent slots use only about seven or eight distinct values.
+
+*** Its solution
+
+Split BF16 into [sign | exponent | mantissa] and *compress only the exponent with Huffman*, storing sign and mantissa as-is. This brings the average from 16 bits to about 11 bits — a 30% model size reduction, completely lossless, bit-for-bit identical.
+
+NeuZip takes the training-memory path: Llama-3 8B training memory drops from 31 GB to 16 GB with no change in training dynamics. ZipNN takes the checkpoint-distribution path: models on Hugging Face can save 30% in download traffic.
+
+*** Why it worked (and what pit it dug)
+
+It worked because *neural network weights are inherently low-entropy* — training pushes weights into a narrow range near zero, so the exponent distribution is naturally concentrated. Shannon gave you the lower bound in 1948; NeuZip/ZipNN simply applied it to the right object for the first time.
+
+But neither touched inference. NeuZip's inference mode still requires restoring the full BF16 tensor; ZipNN only handles storage and downloads — *on the GPU, inference still decompresses to full BF16 before computing.*
+
+This leads directly to the next paper's question: since weights are already compressed to 11 bits, can GPU inference *skip the restoration step* and operate directly on the compressed representation?
+
+** 2025 | DFloat11: The first attempt to bring lossless compression into GPU inference
+
+*** What problem did it see?
+
+NeuZip and ZipNN had done the compression, but *at inference time they both showed their cards*: decompress to a full BF16 tensor, then run standard GEMM. This negates the bandwidth benefit of compression — you compressed to 11 bits to save memory, but every inference still sends data through the 16-bit-wide channel.
+
+DFloat11 (Rice + xMAD, NeurIPS 2025) was the first to state explicitly: this is unacceptable — you must *decompress on demand, tile by tile on the GPU, computing as you go.*
+
+*** Its solution
+
+A custom CUDA kernel:
+- The Huffman lookup table is compacted into SRAM
+- Each transformer block decompresses its own weight slice, computes, then discards
+- A two-phase kernel plus auxiliary variables coordinate where each thread reads and writes
+
+Results: model shrinks from 16-bit to 11-bit (30% compression); larger models fit on one card (e.g., 405B on 8×80 GB); 2.3–46.2× faster than CPU offloading.
+
+*** Why it worked (and what pit it dug)
+
+It worked because it at least avoids restoring the full BF16 tensor to global memory — block-wise decompression reuses SRAM.
+
+But the pits were not solved, merely deferred:
+
+1. *Huffman is still variable-length.* In a warp of 32 threads, each thread handles a code segment of different length; fast threads must wait for slow ones, making SIMT control flow effectively worthless. On L40S, DFloat11 reaches only 76.5% of peak bandwidth; DietGPU (ANS) only 43.7% — both are 1.56–3.44× slower than cuBLAS.
+2. *Still "decompress then compute."* The kernel writes BF16 to SRAM or a global buffer; GEMM reads from there. There is one extra landing between decompression and computation.
+
+The ZipServ team draws a figure (Figure 1) that makes this explicit: on LLaMA-3.1-8B, *DFloat11's decompression time is 3.7× that of dense GEMM.* What was advertised as "lossless compression accelerating inference" is, in their measurements, the opposite — *you compressed, and you run slower.*
+
+That is ZipServ's starting point.
+
+** 2026 | ZipServ: Don't patch the decoder — replace the encoding scheme and fuse away the decode step
+
+*** What problem did it see?
+
+The ZipServ team's diagnosis is cold: prior work has been *patching* Huffman/ANS to be less bad on GPUs, but variable-length entropy codes and SIMT are *mathematically incompatible* — no amount of patching fixes it. Likewise, the "decompress to buffer then GEMM" decoupled pipeline incurs one gratuitous HBM round-trip no matter how fast the decompressor is.
+
+The two problems are not independent; they are two faces of the same hardware/algorithm mismatch: kernel-level mismatch (variable-length codes vs. fixed-length memory accesses) and system-level mismatch (decoupled decompress/compute vs. fusion).
+
+*** Its solution
+
+Two cuts: one at the encoding scheme, one at the pipeline.
+
+*First cut: TCA-TBE (Tensor-Core-Aware Triple Bitmap Encoding)*
+
+Stop chasing optimal entropy coding. Accept the fact: the top-7 most frequent exponent values cover 95%+ of weights in BF16, and those top-7 values are *contiguous* on the number line (99.6% of weight matrices exhibit this "exponent contiguity" property).
+
+So variable-length codes can be abandoned in favor of *fixed-length 3-bit codewords*: codewords 001–111 represent the top-7 exponents (as an offset from a base value); 000 is a fallback meaning "look up the full-precision buffer." Every weight is exactly 3 bits. To make memory accesses aligned, the 3 bits are split into a *triple bitmap*: three independent 1-bit bitmaps, each word-aligned to 64 bits. All threads in a warp access the same bitmap position and follow the same decoding path — *SIMT is perfectly aligned, zero control-flow divergence.*
+
+The cost: 11.3 bits/element vs. Huffman's 10.6 bits — slightly looser, a bit further from the information-theoretic bound — but the payoff is a shape the GPU loves.
+
+*Second cut: ZipGEMM (fused decompression-GEMM)*
+
+DFloat11 is "decompress → compute." ZipServ is *"decompress while computing"*: load compressed weights directly from DRAM into the register file, decode them to BF16 with a few bitwise operations, and feed the result immediately into mma.sync Tensor Core operations. The compressed form lives in memory; the decompressed form lives in registers for only a few clock cycles — *it never lands in a buffer, never gets written back.*
+
+Roofline analysis shows: standard GEMM compute intensity is 2MNK/(MK+KN+MN). DFloat11's decoupled pipeline, because it adds a buffer write and read, becomes 2MNK/(MK*(2/CR+4)+2(KN+MN)) — compute intensity actually drops 62% below uncompressed GEMM. ZipServ eliminates the 2/CR term from the denominator, giving compute intensity roughly 50% higher than uncompressed GEMM.
+
+*** Why it worked (and what new pits it dug)
+
+It worked because ZipServ is the first to place "information-theoretic goals" and "hardware goals" on the same scale and *deliberately sacrifice 0.7 bits/element of compression ratio in exchange for massively better parallelism.* This is "hardware-aware entropy coding" — a theoretical purist might wince, but the engineering result is: 30% compression, 2.21× kernel speedup, 1.22× end-to-end speedup. For the first time, lossless compression on a GPU genuinely saves both space and time simultaneously.
+
+New pits dug (hooks for future work):
+
+1. The 3-bit codeword covers only the top-7 exponents. The remaining ~5% of weights must take the full-precision fallback — more fallbacks mean thinner gains. Larger models or more extreme training may produce more dispersed exponent distributions.
+2. Only BF16 *weights* are addressed. Activations are untouched; the *KV cache is untouched* — in long-context scenarios the KV cache is the true memory monster.
+3. The TCA-TBE tile and bitmap layout is tailored for Ampere/Ada mma.sync. Hopper's WGMMA is a different interface (Unweight is already working on it), and Blackwell is yet another.
+4. The approach relies on statistical properties of *already-trained* models — the low entropy and contiguity of exponents are observations, not guarantees. A model trained to have a more dispersed exponent distribution would break this scheme.
+
+* Frontier Extensions
+
+ZipServ was posted in March 2026 and has not yet faced direct challenges. But two directions have already emerged:
+
+** 2026-04 | Unweight (Cloudflare)
+
+A concurrent work with nearly identical motivation — *fused decompression-GEMM* — but targeting Hopper H100/H200. It uses WGMMA instructions and shared memory to reconstruct weights (rather than the register-file reconstruction ZipServ uses), with a ThunderKittens-style producer/consumer warp-group architecture for asynchronous pipelining. 15–22% compression, bit-exact.
+
+Two teams, no cross-citations, almost the same answer at almost the same time. This kind of independent convergence typically means *the direction is right and the moment has arrived.*
+
+** 2026-05 | SplitZip
+
+Extends the lossless compression battlefield from *weights* to the *KV cache.* In disaggregated serving architectures (separate prefill and decode nodes), the KV cache must be moved across nodes under tight bandwidth and latency constraints — a new compression goldmine. SplitZip classifies ZipServ and Falcon together as the "multi-level fixed-length" school, in opposition to the Huffman school (DFloat11, ZipNN, ZipLLM).
+
+In other words, ZipServ's methodology has already been recognized as a *school of thought* — fixed-length, bitmap, fused into the operator — not merely a single paper.
+
+* One Figure to Understand It All
+
+#+begin_example
+                           What varies?                 Does it run on GPU?
+                           -----------------            ---------------------
+[1952] Huffman             Symbol freq -> variable-len  N/A (no GPUs then)
+                                       \
+                                        \  + Shannon limit unreachable
+                                         v
+[2009] ANS / rANS          Whole message -> big integer  Barely (variable-len still fatal)
+                                       \
+                                        \  + Speed finally competitive
+                                         v
+[2021] DietGPU             ANS on GPU                   Fast, but decompresses to buffer
+                                       \                   ^
+                                        \                  | "general-purpose compressor"
+                                         v                  mindset
+[2024] NeuZip + ZipNN      BF16 exponent entropy -> 30% smaller  Stores small, can't serve
+                                       \
+                                        \  + Applied entropy coding to the right target
+                                         v
+[2025] DFloat11            Huffman + block decompression  Finally on GPU, but 3.7x slower
+                                       \                   ^
+                                        \                  | "compute on compressed form"
+                                         v                  mindset appears for the first time
+[2026] ZipServ             3-bit fixed-len + bitmap      30% smaller + 1.22x faster
+                          + fused decode into GEMM        ^
+                                       \                  | First time both
+                                        \                   saving and speeding
+                                         v
+[2026] Unweight + SplitZip  Extended to Hopper / KV cache  Methodology becomes a school
+
+
+The tug-of-war along two axes:
+
+  Compression ratio (Shannon)  <-------- eternal tension -------->  Parallelism (SIMT)
+       |                                                                  |
+   Huffman (1952)                                                     cuBLAS (no compression)
+   ANS    (2009)                                                       DietGPU
+   NeuZip (2024) exploits LLM exponent entropy
+   DFloat11 (2025) tries for both -> fails
+   ZipServ  (2026) deliberately cedes a little compression, gains huge parallelism -> first balance
+#+end_example
+
+* Insights
+
+Reading the entire lineage, what is actually happening is not "compression algorithms getting smarter" — it is *the objective function of compression being rewritten.*
+
+For the first 50 years, the sole metric of entropy coding was *compression ratio* — approaching the Shannon limit. This goal assumed an infinitely powerful, zero-latency decoder. Huffman → arithmetic coding → ANS: three generations fighting that battle, each winning by shaving another sliver off the Shannon gap.
+
+Over the last 5 years, GPUs have pushed a second metric onto the table: *the decoder itself must be shaped in a way the hardware likes.* Variable-length bitstreams are close to Shannon but far from SIMT — compress as tightly as you want, but if you run slowly it is useless.
+
+ZipServ is the first work to *openly acknowledge this and act on it*: it deliberately gives up 0.7 bits/element of compression ratio to gain a SIMT-friendly fixed-length structure. This is "hardware-aware information theory" — compression ratio is no longer the terminal goal, but one term in a joint optimization of *compression ratio / decode parallelism.*
+
+Once this paradigm is established, several things follow:
+
+1. *Operator fusion will become the standard expectation in compression research.* Any compression scheme that cannot be fused into the operator it serves (GEMM, attention, convolution) is a half-finished product. Unweight is already pursuing the same idea on Hopper.
+2. *The KV cache is the next battlefield.* SplitZip has already moved — in long-context inference the KV cache is larger than the weights and is read and written every token. A ZipServ-level breakthrough there has not yet appeared.
+3. *Training-time design will need to be "compression-friendly."* If low-entropy, contiguous exponents are ZipServ's lifeblood, why not directly *constrain* the exponent distribution during training to be steeper and more contiguous? This is a direction no one has seriously pursued — moving compression from post-hoc to in-training.
+4. *The comparison with lossy quantization will be reshuffled.* The old debate — lossless camp vs. lossy camp — was won by the lossy camp because lossless was always slower. Now that ZipServ has moved lossless into the "smaller and faster" zone, any scenario where bit-exact reproduction matters (research reproducibility, compliance, long-chain inference) will see lossless come back to compete.
+
+* Implications
+
+In terms of choosing research directions, the biggest lesson from this lineage is: *when everyone in a field is competing on one metric, the real breakthrough usually comes from switching metrics.*
+
+The entropy coding world competed on "compression ratio" for 70 years. What ZipServ achieved came from "modestly conceding compression ratio in exchange for dramatically better decode parallelism." It did not require a mathematical breakthrough — fixed-length 3-bit codes are something a first-year undergraduate could conceive — it required *seeing clearly that the true bottleneck was not in that number, but in a dimension that everyone had tacitly ignored.*
+
+This suggests several practices:
+
+1. *Find fields where everyone is competing on one metric.* The longer the competition has gone on, the more likely it is that people have treated the objective function itself as sacred. Ask: "Under what constraints is this objective optimal? Can I change the constraints?"
+2. *Hardware evolution is a natural objective-function rewriter.* Each GPU generation reweights hardware objectives (SIMT width, Tensor Core shape, HBM bandwidth, shared memory size). Any algorithm *born under different hardware assumptions* is worth reexamining through today's hardware lens. Huffman was born in the CPU era and was reexamined by GPUs 70 years later; ANS was born in the CPU era and is being reexamined by GPUs now; attention was born in the Volta era and FlashAttention-3 is still reexamining it in the Hopper era. This pattern is productive, not an anomaly.
+3. *"Honestly accepting a small loss in one dimension" is often the key move.* ZipServ concedes 0.7 bits/element; FlashAttention concedes a tiny amount of numerical precision (by reordering reductions); MoE concedes balanced expert utilization. The optimal solution is rarely at the extreme — it is usually at the "nearly optimal" position — provided you can identify which dimension can be conceded, and by how much.
+
+(Note: The Huffman/ANS nodes reflect recognized algorithmic history. NeuZip and ZipNN are listed in parallel based on their concurrent publication without mutual citation. The critical relationship between DFloat11 and ZipServ is drawn directly from Figure 1 and §3 experimental comparisons in the ZipServ paper. The concurrent relationship between Unweight and ZipServ is based on retrieval — neither cites the other, and they appeared less than one month apart.)

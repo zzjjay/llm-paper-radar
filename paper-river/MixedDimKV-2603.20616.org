@@ -1,0 +1,294 @@
+#+title:      Beyond Token Eviction: Mixed-Dimension Budget Allocation for Efficient KV Cache Compression
+#+date:       [2026-05-28 Thu 20:00]
+#+filetags:   :paper:river:
+#+identifier: 20260528T200000
+#+source:     https://arxiv.org/abs/2603.20616
+#+authors:    Ruijie Miao, Zhiming Wang, Wang Li, Shiwei Wu, Shufan Liu, Yanbing Jiang, Tong Yang
+#+venue:      ICML 2026 (arXiv preprint)
+
+* 问题之河
+
+LLM 一旦要读几万 token 的长文档，最先撑爆显存的不是模型参数，而是注意力机制为了避免重算而缓存下来的那一大坨 K/V——KV cache。这一坨东西的大小，是 *和序列长度成正比* 的：上下文翻倍，cache 也翻倍；几十轮对话下来，cache 比模型本体还大。
+
+于是有一整条研究线，问题就一句：*能不能把这堆 KV 压小，同时让模型不掉链子？*
+
+但"压"是个艺术。KV cache 里每个 token 的每个 head 的每一维都不是均匀重要的。压得均匀，等于把宝贝和垃圾一起扔。这条河上一代一代人前赴后继，做的就是一件事——*把"哪些位置该多留、哪些位置该少留"这件事的颗粒度，一级一级做细*。
+
+* 溯源地图
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al., arXiv:2309.17453)
+  Efficient Streaming Language Models with Attention Sinks
+  |
+  | 问题: KV cache 随 token 数线性涨, 长上下文跑不动
+  | 解法: 固定保留——前 4 个 "attention sink" + 最近窗口,
+  |       中间的 token 全扔 (颗粒度: 位置硬规则)
+  v
+[2023.06 / NeurIPS'23] H2O (Zhang et al., arXiv:2306.14048)
+  Heavy-Hitter Oracle for Efficient Generative Inference
+  |
+  | 问题: StreamingLLM 凭"位置"判断重要性太粗糙,
+  |       中间真正被反复看到的 token 被冤杀
+  | 解法: 用累积注意力分数找 "heavy hitters",
+  |       谁被频繁关注就留谁 (颗粒度: token-级动态)
+  v
+[2024.04] SnapKV (Li et al., arXiv:2404.14469)
+  SnapKV: LLM Knows What You are Looking for Before Generation
+  |
+  | 问题: H2O 的累积分数包含遥远历史的噪声,
+  |       对"用户当前在问什么"反应迟钝
+  | 解法: 用 prompt 末端的一个 "observation window"
+  |       的注意力, 来预测哪些 token 在解码阶段会被用到
+  v
+[2024.06] PyramidKV (Cai et al., arXiv:2406.02069)
+  PyramidKV: Dynamic KV Cache Compression Based on Pyramidal Info
+  |
+  | 问题: 上面这些都是给每层分一样多的预算,
+  |       但不同层对 token 的依赖根本不一样
+  | 解法: 底层多留、顶层少留——分层金字塔预算
+  |       (颗粒度: layer-级)
+  v
+[2024.10] HeadKV (Fu et al., arXiv:2410.19258)
+  Not All Heads Matter: A Head-Level KV Cache Compression
+  |
+  | 问题: PyramidKV 还是把同一层里所有 head 一视同仁,
+  |       但同一层里不同 head 干的活差别巨大
+  | 解法: 给每个 head 单独评估重要性,
+  |       重要 head 多分预算 (颗粒度: head-级)
+  v
+[平行支线 2024.07] Palu (Chang et al., arXiv:2407.21118)
+  Palu: Compressing KV-Cache with Low-Rank Projection
+  |
+  | 视角切换: 不再问"哪个 token 该留", 而是问
+  |          "每个 token 该留几维"——KV 本来就低秩
+  | 解法: 对投影矩阵做 SVD, 所有 token 统一压到 r 维
+  |       (但每个 token 维度数还是一样)
+  v
+[2026.03] MixedDimKV (本篇, arXiv:2603.20616)
+  Beyond Token Eviction: Mixed-Dimension Budget Allocation
+  |
+  | 关键洞察: 把两条线焊在一起——
+  |   "扔 token" = "把这个 token 压到 0 维"
+  |   "留 token" = "把这个 token 压到满维"
+  |   既然如此, 中间为什么不能有 0.25 维、0.5 维?
+  | 解法: 每个 token 单独分配一个维度数 (颗粒度: per-token-dim)
+  |       用 attention 输出的偏差上界算 "压缩损失分数",
+  |       拉格朗日 + 二分搜索分配总预算
+  v
+[2026 前沿延伸]
+  MixedDimKV-H:  把 head-级重要性 (来自 HeadKV) 焊回来
+  其他同期 KV 压缩论文 (EchoKV, CapKV, alpha-KV 等):
+    各自从"重建"、"量化"、"自适应预算"角度并行推进
+#+end_example
+
+* 演化叙事
+
+下面这条线，主角不是任何一篇论文，主角是 *KV cache 压缩的"颗粒度"*。这条河上每一代人都在把同一个问题往下切一刀——切到更小的单位上，问"这个单位重不重要、该分多少预算"。
+
+** 2023.09 | StreamingLLM: 凭位置硬规则
+
+*** 它看到的问题
+
+朴素 Transformer 解码 1 万个 token 之后，KV cache 已经吃掉几十 GB 显存。最早的人想了个简单办法：滑动窗口——只留最近 N 个 token。但一跑发现：模型立刻崩了，输出胡言乱语。
+
+Xiao 他们追根溯源，发现一个反常识的现象：*最前面几个 token 异常重要*，无论它们是不是有意义的词。这几个位置上注意力分数畸高，像"汇水池"一样把多余的注意力都吸走。删了它们，softmax 失衡，整个模型分布就漂了。
+
+*** 它的解法
+
+干脆把规则定死：永远保留前 4 个 token (叫 attention sinks)，再保留最近一段窗口的 token，中间的全扔。
+
+这是 KV 压缩最早的"颗粒度"——*位置颗粒度*。规则是固定的、不看内容、不看注意力，纯靠 token 在序列里的下标决定生死。
+
+*** 它留下的新问题
+
+中间那一大段被一刀切掉，但显然不是所有中间 token 都不重要。比如用户问"第 3000 个 token 那段提到的人物叫什么"——那个位置上的 KV 你早就扔了。模型答不出来不是它笨，是你把答案先一步删了。
+
+下一步必须看内容、看注意力。
+
+** 2023.06 | H2O: 凭注意力分数挑 token
+
+*** 它看到的问题
+
+StreamingLLM 凭位置决定生死，太粗暴。Zhang 他们盯着注意力矩阵看了很久，发现一个规律：*真正被反复关注的 token 数量很少*，大概只占 5%。这些"重榨型选手"(heavy hitters) 一旦被删，性能立刻塌掉；删掉那些从来没人关注的，几乎无损。
+
+也就是说，"重要不重要"这件事注意力机制自己已经在算了，我们只要听它的就行。
+
+*** 它的解法
+
+维护一个 *累积注意力分数*——每个 token 被关注一次，就累加一次它收到的注意力权重。每次新来一个 token，从 cache 里挑分数最低的扔掉。
+
+颗粒度从"位置"细化到了 *token-级动态评分*。
+
+*** 它留下的新问题
+
+累积分数会把"曾经被关注但现在没人理"的老 token 持续保住。但用户当前 query 在意的是 *现在和未来* 会用到什么，不是历史总分高的那批。
+
+而且累积分数的更新涉及全 token 范围，效率也吃紧。
+
+** 2024.04 | SnapKV: 凭"用户在问什么"挑 token
+
+*** 它看到的问题
+
+H2O 算分用的是"整个历史"，但 Li 他们做了个简单实验：拿 prompt 最后几个 token 的注意力，去预测后面解码阶段会关注哪些 token——*极其准确*。
+
+这意味着：用户在 prompt 末尾问的那句话，本身就已经把"接下来要用什么"暴露出来了。不用看全历史，看 prompt 尾巴就够了。
+
+*** 它的解法
+
+在 prompt 末尾切一个 observation window (比如最后 32 个 token)，用它们对前文的注意力分数给每个老 token 打分。分数高的留，分数低的扔。
+
+这相当于把"重要性判定"从"全局历史平均"换成了 *"用户当前关注什么"*——更准、更省。
+
+*** 它留下的新问题
+
+SnapKV 给所有层都用一样的策略、一样的预算大小。但模型 32 层每层干的事不一样，凭什么待遇相同？
+
+** 2024.06 | PyramidKV: 给不同层不同预算
+
+*** 它看到的问题
+
+Cai 他们看每一层的注意力分布，发现：底层注意力很发散，关注的 token 多；越往上越聚焦，到顶层基本只盯着几个关键 token。
+
+那就有个直接结论：*底层需要更多 KV 预算，顶层只需要一点点*。统一预算等于让顶层浪费、底层挨饿。
+
+*** 它的解法
+
+按金字塔形状分配——底层预算大、顶层预算小，整体总量不变。颗粒度从"token-级"升级到 *"token-级 + layer-级"*。
+
+*** 它留下的新问题
+
+同一层里，所有 head 还是被一视同仁。但 head 的角色差异比 layer 还大——有些 head 专门盯检索任务、有些只看局部语法。
+
+** 2024.10 | HeadKV: 给不同 head 不同预算
+
+*** 它看到的问题
+
+Fu 他们做了一件事：用"大海捞针"任务给每个 head 单独打个"检索能力分"。结果发现 head 之间差异巨大——有的 head 检索能力满分，删了它整个长上下文能力就废；有的 head 几乎不参与检索，砍光也没事。
+
+PyramidKV 在 layer 间分预算，但层内是均匀的——这等于把高分 head 和低分 head 用同一个标准对待。
+
+*** 它的解法
+
+把 head 的重要性算出来作为权重，预算分配从 layer-级再细化到 *head-级*。重要 head 拿更多 KV，不重要 head 拿更少。
+
+*** 它留下的新问题
+
+到这里，颗粒度已经一路细到 token × layer × head。但再细一层呢？*同一个 token 在同一个 head 上的不同维度，重要性还是不一样*——这一刀还没切。
+
+** 平行支线 2024.07 | Palu: 换一个视角看压缩
+
+到这里要先岔开一下，因为 MixedDimKV 真正的精彩在于它把两条原本不相干的线焊到了一起。
+
+*** 它看到的问题
+
+上面整条线 (StreamingLLM → HeadKV) 都在做同一件事——*二分类*：这个 token (或这个 head) 该留还是该扔。Chang 他们换了个角度：与其问"留不留"，不如问"留多少维"。
+
+因为 KV cache 本质上是个矩阵，而矩阵有 *低秩性*——你不需要保留全部 d 维，只保留主成分对应的 r 维就够了。
+
+*** 它的解法
+
+对 K 和 V 的投影矩阵做 SVD 分解，所有 token 统一压到 r 维。这条线 (Palu / Eigen Attention / ShadowKV) 关心的是 *"维度"颗粒度*，但每个 token 维度数还是一样。
+
+*** 它留下的问题 —— 这正是 MixedDimKV 要捅破的窗户纸
+
+token-eviction 线只看"留不留"，dim-reduction 线只看"压几维但人人平等"。
+
+可你回头一想：*"扔掉一个 token"不就等于"把它压到 0 维"吗？"完整保留"不就等于"压到满维 d 吗？*
+
+那中间为什么不能有 0.25d、0.5d？不同 token 重要性不一样，重要的多分维度，不重要的少分维度——*这才是真正的细粒度*。
+
+** 2026.03 | MixedDimKV: 把"留不留"和"留几维"合一
+
+*** 它的核心移动
+
+如果你把 token eviction 看成"特殊的维度分配 (要么 0 要么满)"，那么 *允许中间值* 就立刻得到一个更细的框架：
+
+- StreamingLLM/H2O/SnapKV/HeadKV 是 [0, d] 二值分配
+- Palu/Eigen Attention 是 [r, r, r, ..., r] 均匀分配
+- MixedDimKV 是 [r_1, r_2, r_3, ...] 任意非均匀分配
+
+颗粒度一下子从 token-级 / head-级 / layer-级，下钻到 *per-token-per-head-的具体维度数*。
+
+*** 它要解决的两个工程难题
+
+1. *怎么给每个 (token, head, 候选维度) 打"压缩损失分"？*
+
+   旧办法 (H2O/SnapKV) 用 attention weight 给 token 打分。但 attention weight 只反映"key 这一侧的重要性"，没考虑 value 的大小，也没考虑这个 token 在不同维度下的可压缩性。
+
+   MixedDimKV 直接盯 *attention 输出* (而不是 attention weight)——因为输出的偏差才是真正影响模型的东西。他们推了个 *偏差上界*：对 (token, dim) 给一个保守估计的损失分数，包含三件事的联合作用——注意力显著性、value 范数、不同维度下的可压缩性。
+
+2. *给定总预算, 怎么分配每个 token 该几维？*
+
+   候选维度集合是离散的 (比如 {0, 32, 64, 128})，看似是个整数规划。但作者证明了一件关键事情：*长上下文下，原问题和它的拉格朗日对偶之间几乎没有间隙*。
+
+   于是用 *二分搜索* 找拉格朗日乘子，再单调地给每个 token 分一个维度——线性时间搞定。
+
+*** 它的两种形态
+
+- *MixedDimKV*：纯靠自己的损失分数分配，不依赖 head-级重要性。打败所有不用 head-info 的 baseline。
+- *MixedDimKV-H*：把 HeadKV 的 head-级权重也吃进来——在用同样 head info 的前提下，稳定超过 HeadKV。
+
+*** 它达到了什么程度
+
+- LongBench: *6.25% 的 KV cache (KV size=512) 就追上 full attention*。
+- 大海捞针 (50K 上下文): *0.26% 的 cache (KV size=128) 还能保持 100% 准确*。
+- 解码延迟: 降到 full attention 的 55%。
+
+* 问题-解法压缩总览
+
+#+begin_example
+颗粒度演化轴：
+  position --> token --> token+layer --> token+layer+head --> token+head+dim
+   (硬规则)   (看注意力)   (看层差异)      (看 head 差异)      (看维度分配)
+
++-----------------+-----------------+----------------------------+
+|  论文           |  颗粒度         |  "重要性"的来源            |
++-----------------+-----------------+----------------------------+
+|  StreamingLLM   |  position       |  无 (固定规则)             |
+|  H2O            |  token          |  累积 attention weight     |
+|  SnapKV         |  token          |  observation window 注意力 |
+|  PyramidKV      |  token x layer  |  + 层的注意力分散度        |
+|  HeadKV         |  token x head   |  + head 检索能力           |
+|  Palu           |  dim (统一)     |  KV 矩阵的低秩主成分       |
+|  MixedDimKV     |  token x dim    |  attention 输出偏差上界    |
+|  MixedDimKV-H   |  token x head x dim | + HeadKV 的 head 权重  |
++-----------------+-----------------+----------------------------+
+
+关键焊接点 (本文最大贡献)：
+  "扔 token" 是"压到 0 维"的特例
+  "留 token" 是"压到满维"的特例
+  --> 二值分配只是连续维度分配的退化形式
+  --> 一旦允许中间值, 整条 KV-压缩线的颗粒度极限就被推高了一阶
+#+end_example
+
+* 洞见与下一步
+
+** 这条河真正在发生什么变化
+
+表面上看，是颗粒度一级级变细：从位置 → token → 层 → head → 维度。但底层在发生的不是"细分"，而是 *"把所有压缩动作统一到同一个框架里"*。
+
+StreamingLLM、H2O、Palu、HeadKV，本来是四套互不相干的故事——有的人在选 token，有的人在算注意力，有的人在分层预算，有的人在做低秩分解。MixedDimKV 用一句话把它们全装进同一个模板：
+
+#+begin_quote
+*KV 压缩 = 给每个 (token, head, dim) 分配一个 0/1 比特预算的优化问题*
+#+end_quote
+
+旧方法都是这个模板的某个特例——StreamingLLM 是"位置硬约束"的特例、H2O 是"按 attention 排序的 0/1 分配"的特例、Palu 是"维度上均匀分配"的特例。
+
+这才是这条河最大的转折：*不是又造了一种新算法, 而是把前人所有算法装进了一个连续的优化空间*——前人都是这个空间里的角点，本文走进了空间内部。
+
+** 下一步最可能往哪走
+
+1. *训练时就考虑压缩*。目前所有方法 (包括 MixedDimKV) 都是 post-hoc，模型本身没准备好被压缩。如果在预训练或后训练阶段就把"低维 KV 也能 work"作为目标 (类似 DeepSeek MLA 的思路)，损失会更小。
+
+2. *把量化也吸进同一个框架*。现在量化 (KVQuant、PolarQuant) 和维度分配是正交的两条线。下一步自然是把它们焊接——一个 token 既可以"分配 4 维 8bit"，也可以"分配 8 维 4bit"，让优化器自己选。MixedDimKV 已经把"维度"做成了可变量，把"位宽"也变成可变量只是再走一步。
+
+3. *动态预算*。目前预算是预设的固定值。但实际部署时, 不同 query 难度差很多——简单 query 用 1% cache 就够, 难 query 需要 20%。把"每个 query 该分多少 cache"也变成可学的, 才是真正的自适应。
+
+* 诚实标注
+
+- StreamingLLM → H2O → SnapKV → PyramidKV → HeadKV 的递进关系是论文 Related Work 章节明确给出的，可信。
+- Palu 作为"维度分配"支线的代表，论文也明确引用并对比 (包括 Eigen Attention、ShadowKV)。
+- "MixedDimKV 的核心移动 = 把 token-eviction 视为维度分配的二值特例"是论文 introduction 明确陈述的洞察，不是推断。
+- "前沿延伸"部分 (MixedDimKV-H 之外) 是基于本仓库 paper-river 目录里同期 KV-压缩论文 (EchoKV/CapKV/alpha-KV 等) 的并行观察, 不是被本文引用——属于横向对照, 不是后继工作。
+- 各篇前驱论文的发表时间和 arXiv ID 来自其 Related Work 引用, 未逐一核实页码。

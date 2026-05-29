@@ -1,0 +1,314 @@
+#+title:      ZipServ: Fast and Memory-Efficient LLM Inference with Hardware-Aware Lossless Compression
+#+date:       [2026-05-28 Thu 20:33]
+#+filetags:   :paper:river:
+#+identifier: 20260528T203341
+#+source:     https://arxiv.org/abs/2603.17435
+#+authors:    Ruibo Fan, Xiangrui Yu, Xinglin Pan, Zeyu Li, Weile Luo, Qiang Wang, Wei Wang, Xiaowen Chu
+#+venue:      ASPLOS 2026
+
+* 问题之河
+
+大模型的权重占满了 GPU 的显存。能不能在 *一位都不丢* 的前提下把权重压小，并且解压不慢反而更快？
+
+听起来像免费午餐。直觉上无损压缩是 "用 CPU 算力换存储"——你存得小，但读的时候得花时间解开。GPU 推理本来已经被 HBM 带宽掐着脖子，谁敢在数据路径上再插一个解码器？
+
+这条问题之河流了 70 年，前 50 年在打 *压得更紧* 的仗 (Shannon 极限)，最近 5 年突然必须打另一场仗：*解码器要长成 GPU 喜欢的样子*。两个目标天然冲突——熵编码天生产出变长比特流，GPU 的 SIMT 天生要等长访存。整条河，就是这场拉锯的进化史。
+
+* 溯源地图
+
+#+begin_example
+[1952] Huffman - A Method for the Construction of Minimum-Redundancy Codes
+  |
+  | 问题: 给定符号频率, 怎么用最少的比特存信息
+  | 解法: 最优前缀码 (频率高的短, 频率低的长)
+  | 副作用: 输出是变长比特流, 解码必须串行
+  v
+[2009-2013] Duda - Asymmetric Numeral Systems (ANS / rANS / tANS)
+  |
+  | 问题: Huffman 离 Shannon 熵极限还有距离, 但算术编码太慢
+  | 解法: 把整条消息编成一个大整数, 用状态机做熵编码
+  | 副作用: 压得更紧, 速度像 Huffman, 但仍然是变长
+  v
+[2021] Johnson (Meta) - DietGPU
+  |
+  | 问题: ANS 都跑在 CPU 上, 跟不上 GPU 训练的梯度通信
+  | 解法: 把 rANS 整套搬上 GPU, 250-410 GB/s 吞吐
+  | 副作用: 解压目标是 global memory buffer, 不是计算单元
+  v
+[2024-10] Hao - NeuZip   +   [2024-11] Hershcovitch - ZipNN
+  |
+  | 问题: BF16 权重的 8-bit 指数熵只有 ~2.6 bit, 一直被浪费
+  | 解法: 只压指数 (Huffman), 符号和尾数原样存, 压 30% 左右
+  | NeuZip 走训练内存这条腿, ZipNN 走 checkpoint 分发这条腿
+  | 副作用: 都不解决推理时怎么用——还是 "先解开再算"
+  v
+[2025] Zhang et al. (Rice + xMAD) - DFloat11
+  |
+  | 问题: NeuZip/ZipNN 只是存得小, 推理时还得整张 BF16 复原, 等于白压
+  | 解法: 写定制 CUDA kernel, 在 GPU 上分块按需解压
+  | 副作用: Huffman 还是变长, 解压完整张 BF16 仍要落地到 buffer,
+  |        实测 1.56-3.44x 解压开销, 推理反而慢
+  v
+[2026-03] Fan et al. (HKUST-GZ) - ZipServ  <-- 本文
+  |
+  | 问题: 变长熵码就是 SIMT 的死敌, 解压到 buffer 就是带宽的死敌
+  |       这两件事是同一种错位的两个面
+  | 解法: (1) 把 Huffman 换成定长 3-bit codeword + triple bitmap
+  |       (2) 把解码融进 GEMM, 解压结果直接落进 Tensor Core 寄存器
+  | 结果: 30% 压缩, 2.21x 核 kernel 加速, 1.22x 端到端
+  |
+  v
+[2026-04] Cloudflare - Unweight        (并行工作, Hopper WGMMA 方向)
+[2026-05] SplitZip                     (把这套思路扩到 KV cache)
+#+end_example
+
+(注: NeuZip 与 ZipNN 同期出现, 互不相引; DietGPU 是 ZipServ 引用的工程基线
+而非学术前驱, 但它是 "GPU 熵编码" 这条工程线唯一可参照的祖先, 故纳入地图。)
+
+* 演化叙事
+
+** 1952 | Huffman: 给频率最高的符号最短的编码
+
+*** 它看到了什么问题
+
+那是计算机刚学会处理字符的年代。每个字符都用同样长度的位 (比如 8 位) 编码, 不管它出现的多频繁还是多稀少——字母 'e' 和字母 'z' 占同样的存储。这是巨大的浪费, 因为常用字符比罕用字符出现的次数多几个数量级。
+
+Huffman 在 MIT 念博士时被导师布置了这个问题: 给定一组符号的出现频率, 能不能找出一种 *不会混淆* 的二进制编码, 让平均存储长度最短?
+
+*** 它的解法
+
+构造一棵二叉树, 频率低的符号放在树底 (长路径 = 长编码), 频率高的符号放在树顶 (短路径 = 短编码)。每个符号都是叶子, 所以没有任何编码是另一个编码的前缀——你拿到一串 0/1, 顺着树走就能唯一切分出符号。
+
+效果立竿见影。如果 'e' 出现 100 次而 'z' 出现 1 次, 你把 'e' 编成 1 位、'z' 编成 8 位, 总存储就大幅缩水。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为它直接利用了 *统计冗余*——只要符号频率不均, 就有压缩空间。Shannon 的源编码定理给出了理论下界 (信息熵), Huffman 是这个下界的整数比特近似。
+
+埋下的坑是变长编码本身。你拿到一串比特, 不解码完前 N 个符号, 你根本不知道第 N+1 个符号从哪一位开始。串行解码是天然的——这在 1952 年完全没问题, 反正所有计算都是串行的。70 年后, GPU 一个 warp 32 个线程要齐步走的时候, 这件事变成了致命伤。
+
+** 2009-2013 | ANS: 用一个大整数把整条消息编进去
+
+*** 它看到了什么问题
+
+Huffman 给的码长必须是整数位。可如果某个符号的最优码长是 2.3 位呢？Huffman 只能给它 2 或 3, 离 Shannon 熵差着一截。
+
+另一个方向是算术编码——它可以达到 Shannon 极限, 但计算复杂、速度慢, 一直没法和 Huffman 抢市场。
+
+*** 它的解法
+
+Jarosław Duda 提出 ANS (Asymmetric Numeral Systems): 把整条消息编码成一个 *单一的大自然数*, 通过查表式的状态转移完成。每编一个符号, 状态就更新一次, 整体压缩率逼近 Shannon 熵, 而单次操作只是一次查表 + 一次加减——快得跟 Huffman 一个量级。
+
+这事在工程界炸了。Zstandard、Facebook 的压缩栈、JPEG XL、NVIDIA 的 nvCOMP、Meta 的 DietGPU——后续这一切都是 ANS 变种 (rANS 或 tANS)。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为它把 "压缩率" 和 "速度" 这两个一直对立的目标同时往前推了。
+
+但它没动 Huffman 留下的根本坑: *输出还是变长比特流*。你压一个 100MB 的消息出来可能是 13.7MB, 也可能是 13.9MB, 完全看数据分布; 你解码到一半, 也根本不知道下一个 token 从第几位开始。这件事在 CPU 上无所谓 (反正 CPU 是顺序执行的), 在 GPU 上就是死刑。
+
+** 2021 | DietGPU: 把 ANS 整套搬上 GPU
+
+*** 它看到了什么问题
+
+Meta 训练分布式大模型时, 节点间要不停传梯度。带宽是瓶颈, 所以想压缩——但 ANS 跑在 CPU 上, 一个节点 32 张卡, 整套梯度排队过 CPU 编码, 还没传出去就堵死了。
+
+Jeff Johnson (在 FAIR) 问了个直白的问题: 既然数据本来就在 GPU 上, 能不能让 GPU 自己做熵编码?
+
+*** 它的解法
+
+DietGPU 是第一个开源的 GPU 上 rANS 实现, 在 A100 上做到 250-410 GB/s 的吞吐。它还附了一个浮点扩展, 专门压 FP 数据的指数部分 (因为 ML/HPC 里浮点指数特别冗余)。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为 ANS 的状态机本身可以拆成大量独立的小流, 每条流分给一个 warp, 总吞吐就爆开了。
+
+埋下的坑有两个, 而且都是 ZipServ 后来要算总账的:
+
+1. *解压目标是 global memory buffer*。DietGPU 是个通用压缩器——解压完整张大 tensor 放到全局显存, 后续计算再去读。对于 "压完梯度再 all-reduce" 这种场景没问题; 但对于 LLM 推理, *你压缩省下的那点带宽, 又被读 buffer 的全速带宽吃回去了*。
+2. 变长比特流还在。每个 warp 内的线程负责的码段长度仍然依赖数据, 控制流就发散。
+
+** 2024 | NeuZip / ZipNN: 先看 LLM 权重——指数熵只有 2.6 bit
+
+*** 它看到了什么问题
+
+到这里, 熵编码已经成熟, GPU 熵编码也有了。但 *没人认真把它用到 LLM 权重上*。学术界忙着搞 GPTQ、AWQ 这种有损的 4-bit 量化, 因为它们更激进 (16-bit -> 4-bit), 内存收益更大。
+
+但有损量化有个天花板——精度真的会掉。LiveCodeBench 上 MXFP4 让 Llama 准确率从 56% 掉到 36%。在需要 *bit-exact* 的场景 (科研、安全关键、长链推理), 有损是禁忌。
+
+NeuZip 和 ZipNN 几乎同期 (2024-10 和 2024-11) 都注意到一个事实: BFloat16 的 8 位指数, 在训练完的模型里 *熵只有 2.6 bit 左右*。也就是说, 8 位的指数槽里, 90% 以上的位置只用了那么七八个值。
+
+*** 它的解法
+
+把 BF16 拆成 [符号 | 指数 | 尾数] 三段, *只对指数做 Huffman 编码*, 符号和尾数原样存。这一下就把 16 位压到平均 11 位左右, 模型尺寸缩 30%, 而且完全无损——比特级一模一样。
+
+NeuZip 走的是训练内存这条路: Llama-3 8B 的训练内存从 31GB 掉到 16GB, 而且训练动态完全不变。ZipNN 走的是 checkpoint 分发: Hugging Face 上的模型可以省 30% 的下载流量。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为 *神经网络的权重本身就是低熵的*——训练把权重往零附近的小范围内聚集, 指数分布天然集中。Shannon 在 1948 年就给了你下界, NeuZip/ZipNN 只是把这个下界第一次拿来用了。
+
+但他们都没碰推理。NeuZip 的推理模式还得整张 BF16 复原, ZipNN 干脆只管存储和下载——*GPU 上推的时候, 还是先解开成完整 BF16 再算*。
+
+这就引出了下一篇的问题: 既然权重已经被压成 11 bit, 那 GPU 推理的时候, 能不能 *不要先复原*, 直接在压缩态上跑?
+
+** 2025 | DFloat11: 第一次尝试把无损压缩搬进 GPU 推理
+
+*** 它看到了什么问题
+
+NeuZip 和 ZipNN 把压缩做出来了, 但 *推理时它们都摊牌了*: 解压成完整 BF16 张量, 然后走标准 GEMM。这等于压缩省下的带宽好处全没了——你压成 11-bit 是为了少占显存, 但每次推理还是按 16-bit 走数据通道。
+
+DFloat11 (Rice + xMAD, NeurIPS 2025) 第一次明确说: 不行, 必须 *按需解压, 在 GPU 上分块解, 解到哪里算到哪里*。
+
+*** 它的解法
+
+写了一个定制 CUDA kernel:
+- Huffman 编码表压成紧凑的 LUT 放在 SRAM
+- 每个 transformer block 解压自己那一段权重, 算完就丢
+- 用两阶段 kernel + 辅助变量协调线程的读写位置
+
+效果: 模型从 16-bit 缩到 11-bit (30% 压缩), 单卡能跑更大模型 (e.g. 405B on 8x80GB), 比 CPU offload 快 2.3-46.2x。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为它至少没把整张 BF16 复原到显存——按 block 解压, 复用 SRAM。
+
+但坑没解决, 只是被推迟:
+
+1. *Huffman 还是变长*。一个 warp 32 个线程, 每个线程负责的码段长度不同, 解码快的得等慢的, 控制流发散到 SIMT 形同虚设。L40S 上 DFloat11 只能跑到峰值带宽的 76.5%, DietGPU (ANS) 只有 43.7%——比 cuBLAS 慢 1.56-3.44x。
+2. *还是 "先解压再算"*。kernel 把 BF16 解到 SRAM 或者 global buffer, GEMM 再去读。解压和计算之间隔着一次落地。
+
+ZipServ 团队在论文里画了张图直接打脸 (Figure 1): DFloat11 在 LLaMA-3.1-8B 上的 *解压时间是密集 GEMM 的 3.7 倍*。所谓 "无损压缩加速推理" 在他们的实测里是反向的——*你压了, 但你跑得更慢*。
+
+这就是 ZipServ 的起点。
+
+** 2026 | ZipServ: 不是优化解码器, 是换掉编码方案 + 融掉解码步
+
+*** 它看到了什么问题
+
+ZipServ 团队的诊断很冷: 前人都在 *修补* Huffman/ANS 在 GPU 上的不适, 但变长熵码和 SIMT 是 *数学不兼容*, 修不好。同样, "解压到 buffer 再 GEMM" 这条 decoupled pipeline, 不管你解压有多快, 都白白多一次 HBM 往返。
+
+两个问题不是独立的, 是同一种 "算法/硬件错位" 的两个面: kernel 级别错位 (变长码 vs 等长访存) 和系统级别错位 (解压/计算解耦 vs 融合)。
+
+*** 它的解法
+
+两刀, 一刀砍编码方案, 一刀砍 pipeline。
+
+*第一刀: TCA-TBE (Tensor-Core-Aware Triple Bitmap Encoding)*
+
+不再追求最优熵编码。承认事实: BF16 指数里 top-7 个最频繁值覆盖了 95%+ 的权重, 而且这 top-7 在数轴上是 *连续* 的 (99.6% 的权重矩阵都有这个 "exponent contiguity" 性质)。
+
+所以可以放弃 Huffman 的可变长度, 改用 *定长 3-bit codeword*: 用 001-111 七个码字表示 top-7 指数 (相对 base 的 offset), 000 当 fallback 指 "去 full precision buffer 查"。每个权重就是定长 3 bit, *再加上为了让访存对齐的 triple bitmap 拆分*: 把 3 bit 拆成 3 个独立的 1-bit 位图, 每个位图是 64-bit 对齐的连续 word。这样一个 warp 里所有线程访同样的位图位置, 走同样的解码路径——*SIMT 完美对齐, 零控制流发散*。
+
+代价: 11.3 bits/element, 比 Huffman 的 10.6 bits 略松, 离信息论下界更远一点点——但换来的是 GPU 喜欢的形状。
+
+*第二刀: ZipGEMM (fused decompression-GEMM)*
+
+DFloat11 是 "解压 -> 算"。ZipServ 是 *"在算的过程中解压"*: 从 DRAM 直接 load 压缩权重进 register file, 用几条位运算解码到 BF16, 立刻送进 mma.sync 的 Tensor Core 计算。压缩态在显存里, 解压态只在寄存器里活几个时钟周期, *中间不落地, 不写 buffer*。
+
+Roofline 分析显示: 标准 GEMM compute intensity 是 2MNK/(MK+KN+MN), DFloat11 那种 decoupled pipeline 因为多了一次 buffer 写读变成 2MNK/(MK*(2/CR+4)+2(KN+MN))——CI 反而比不压还低 62%。ZipServ 把分母里那个 2/CR 拉下来, CI 比不压的 GEMM 还高约 50%。
+
+*** 为什么这招管用 (以及哪里埋了新坑)
+
+它管用是因为 ZipServ 第一次把 "信息论目标" 和 "硬件目标" 摆到天平两端, *主动牺牲 0.7 bit/element 的压缩率换大幅的并行度*。这是一种 "为硬件让路的熵编码"——理论纯粹主义者会皱眉, 但工程结果是: 30% 压缩、2.21x kernel 加速、1.22x 端到端。第一次, 无损压缩在 GPU 上真的同时省了空间和时间。
+
+埋下的新坑 (也是后续工作的钩子):
+
+1. 3-bit codeword 只能覆盖 top-7。剩下 5% 的权重必须走 full-precision fallback——fallback 越多, 收益越薄。模型越大、训练越极端, 指数分布可能越发散。
+2. 只针对 BF16 *权重*。Activation 没碰, *KV cache 也没碰*——长上下文场景里 KV cache 才是真正的内存怪兽。
+3. TCA-TBE 的 tile + bitmap 布局是为 Ampere/Ada 架构的 mma.sync 量身定做的。Hopper 的 WGMMA 是另一套 (Unweight 已经在做了), 未来还有 Blackwell。
+4. 只针对 *已经训练好的* 模型的统计性质——指数的低熵和连续性是观察, 不是保证。如果有人训出指数分布更散的模型, 这套就崩。
+
+* 前沿延伸
+
+ZipServ 是 2026 年 3 月才挂的, 还没人来正面挑战它。但已经有两个方向冒出来:
+
+** 2026-04 | Unweight (Cloudflare)
+
+并行工作, 思路高度一致——*fused decompression-GEMM*——但目标硬件是 Hopper H100/H200。用 WGMMA 指令 + 共享内存重建权重 (而非 ZipServ 在寄存器文件重建), 用 ThunderKittens 的 producer/consumer warp group 架构异步流水。15-22% 压缩, bit-exact。
+
+两个团队互不引用, 几乎同时给出了同一个答案。这种独立趋同往往意味着 *方向是对的, 时机也到了*。
+
+** 2026-05 | SplitZip
+
+把无损压缩的战场从 *权重* 推向 *KV cache*。在 disaggregated serving (prefill 节点和 decode 节点分离) 的架构下, KV cache 要跨节点搬, 带宽和时延都吃紧, 是新的压缩富矿。它把 ZipServ 和 Falcon 一起归为 "multi-level fixed-length" 流派, 与 Huffman 流派 (DFloat11, ZipNN, ZipLLM) 对立。
+
+也就是说, ZipServ 的方法论已经被识别成一个 *流派*——定长、bitmap、融进算子——而不仅仅是一篇论文。
+
+* 一张图看懂
+
+#+begin_example
+                           什么是变量?              GPU 上跑得动吗?
+                           -----------------       ---------------------
+[1952] Huffman             符号频率 -> 变长码     N/A (那时没 GPU)
+                                       \
+                                        \  + Shannon 极限不可达
+                                         v
+[2009] ANS / rANS          消息整体 -> 大整数      勉强 (变长仍是死结)
+                                       \
+                                        \  + 速度终于跟得上
+                                         v
+[2021] DietGPU             ANS on GPU              快了, 但解到 buffer
+                                       \              ^
+                                        \             | "压缩通用器"
+                                         v             思路
+[2024] NeuZip + ZipNN      BF16 指数熵 -> 30% 省  存得小, 但推不动
+                                       \
+                                        \  + 把熵编码用对了对象
+                                         v
+[2025] DFloat11            Huffman + 块解压        终于上 GPU, 但慢 3.7x
+                                       \              ^
+                                        \             | "在压缩态上算"
+                                         v             思路第一次出现
+[2026] ZipServ             3-bit 定长 + bitmap     压 30% + 快 1.22x
+                          + fused 解码进 GEMM       ^
+                                       \             | 第一次同时
+                                        \              省 + 快
+                                         v
+[2026] Unweight + SplitZip 扩展到 Hopper / KV cache  方法论形成流派
+
+
+拉锯的两个轴:
+
+  压缩率 (Shannon)      <-------- 永恒张力 -------->     并行度 (SIMT)
+       |                                                       |
+   Huffman (1952)                                           cuBLAS (无压缩)
+   ANS    (2009)                                            DietGPU
+   NeuZip (2024) 抓住 LLM 指数熵
+   DFloat11 (2025) 想要二者兼得 -> 失败
+   ZipServ  (2026) 主动让一点压缩率, 换巨大并行 -> 第一次平衡
+#+end_example
+
+* 洞见
+
+读完整条线, 真正在发生的不是 "压缩算法越来越聪明", 而是 *压缩这件事的目标函数被改写了*。
+
+前 50 年, 熵编码的唯一指标是 *压缩率*——逼近 Shannon 极限。这个目标假设了一个无限算力、无延迟的解码器。Huffman -> 算术编码 -> ANS, 三代人都在打这场仗, 谁能离香农下界更近一点谁就赢。
+
+最近 5 年, GPU 把另一个指标推到台面上: *解码器自己得长成硬件喜欢的形状*。变长比特流离 Shannon 近, 但离 SIMT 远——你压得再紧, 跑得慢就废了。
+
+ZipServ 是第一个 *公开承认这件事并按它行动的工作*: 它故意放弃 0.7 bit/element 的压缩率, 换 SIMT 友好的定长结构。这是一种 "硬件感知的信息论"——压缩率不再是终极目标, 而是 *压缩率 / 解码并行度* 的联合优化目标。
+
+这种范式一旦确立, 后面会发生几件事:
+
+1. *算子融合会成为压缩研究的常识*。任何压缩方案如果不能融进它服务的算子 (GEMM、attention、conv), 就是半成品。Unweight 已经在 Hopper 上跑同样思路。
+2. *KV cache 是下一个战场*。SplitZip 已经动手——长上下文里 KV cache 比权重更大, 而且每 token 都要读写。这里的 ZipServ-级别突破还没出现。
+3. *训练时间也要 "对压缩友好"*。如果指数低熵 + 连续性是 ZipServ 的命脉, 那为什么不在训练时直接 *约束* 指数分布更陡峭、更连续? 这是一个还没人正经做的方向——把压缩从 post-hoc 提前到 in-training。
+4. *与有损量化的对比会重新洗牌*。原本无损党 vs 有损党的争吵, 因为无损一直慢, 有损党赢。ZipServ 把无损也送进 "省+快" 区间后, 凡是 bit-exact 重要的场景 (科研复现、合规、长链推理), 无损会回来抢市场。
+
+* 启发
+
+研究方向选择上, 这条线给的最大启示是: *当一个领域所有人都在某个指标上卷的时候, 真正的突破往往来自换指标*。
+
+熵编码界卷 "压缩率" 卷了 70 年, ZipServ 拿到的反而是 "微弱让步压缩率, 大幅提升解码并行度"。它不靠数学突破——3-bit 定长码这种事一年级本科生都能想出来——它靠的是 *看清楚了真正的瓶颈不在哪个数字上, 而在另一个被默认忽视的维度上*。
+
+这意味着你可以:
+
+1. *找那些 "全员卷一个指标" 的领域*。卷得越久, 越说明大家把目标函数本身当成天条了。问 "这个目标函数是哪些约束下的最优? 我能改约束吗?"
+2. *硬件演化是天然的目标函数改写器*。每一代 GPU 都是一次硬件目标的重新加权 (SIMT 宽度、Tensor Core 形状、HBM 带宽、共享内存大小)。任何 *诞生在不同硬件假设下的算法*, 都值得用今天的硬件假设重审一遍。Huffman 诞生于 CPU 时代, 70 年后被 GPU 重审; ANS 诞生于 CPU 时代, 也在被 GPU 重审; 注意力机制诞生于 Volta 时代, 现在 Hopper 时代的 FlashAttention-3 还在重审。这条规律是有产能的, 不是个案。
+3. *"诚实地接受一点小损失" 往往是关键一招*。ZipServ 让步 0.7 bit/element, FlashAttention 让步一点点数值精度 (重排归约顺序), MoE 让步专家利用率均衡。最优解很少在端点, 通常在 "几乎最优" 的位置——前提是你能识别出哪个维度可以让步、让多少。
+
+(注: 本文 Huffman/ANS 节点是公认的算法史; NeuZip 与 ZipNN 并列是基于
+两篇论文同期发表且互不引用; DFloat11 与 ZipServ 的批判关系直接来自
+ZipServ 论文 Figure 1 和 §3 的实测对比; Unweight 与 ZipServ 的并行
+关系来自检索, 两者互不引用, 时间间隔 < 1 个月。)

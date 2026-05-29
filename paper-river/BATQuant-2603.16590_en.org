@@ -1,0 +1,219 @@
+#+title:      BATQuant: Outlier-resilient MXFP4 Quantization via Learnable Block-wise Optimization
+#+date:       [2026-05-28 Thu 10:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T100000-en
+#+source:     https://arxiv.org/abs/2603.16590
+#+authors:    Ji-Fu Li, Manyi Zhang, Xiaobo Xia, Han Bao, Haoli Bai, Zhenhua Dong, Xianzhi Yu
+#+venue:      arXiv 2603.16590 (2026, Huawei)
+
+* The River of the Problem
+
+Squeezing a model with tens of billions of parameters into a phone or edge device means compressing every weight from 16 bit down to 4 bit. Cutting 12 bits sounds straightforward; the hard part is that every model contains a small population of "outliers"—elements whose absolute values dwarf everything else—and once these are brutally flattened, the whole model collapses.
+
+This research thread is really one group of people doing the same thing over and over: figuring out how to handle outliers so that 4-bit still delivers 16-bit accuracy. Each generation of tricks is, at its core, answering the same question: *Where do outliers end up? Who has to absorb them?*
+
+The format has shifted—from old-style INT4 to MXFP4 supported by new hardware (32 numbers sharing a single floating-point scale)—and that shift invalidates every previous trick. BATQuant asks: in the MXFP4 era, where do outliers ultimately belong?
+
+* Source Map
+
+#+begin_example
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: direct rounding (RTN) causes accuracy collapse at low bit-widths
+  | Solution: use second-order Hessian information to calibrate the
+  |           rounding direction of weights layer by layer
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Problem: activations have outliers, weights do not;
+  |          activations are hard to quantize, weights are easy
+  | Solution: multiply a diagonal matrix to migrate the "hardness"
+  |           from activations to weights, making both quantizable
+  v
+[2024] Ashkboos et al. - QuaRot  /  Liu et al. - SpinQuant
+  |
+  | Problem: SmoothQuant can only migrate part of the difficulty;
+  |          extreme outliers still cannot be suppressed
+  | Solution: use global orthogonal (Hadamard) rotation to spread
+  |           outlier energy across entire rows/columns
+  v
+[2025] Shao et al. - BRQ  /  Egiazarian et al. - MR-GPTQ
+  |
+  | Problem: MXFP4 has 32 numbers sharing one scale; global rotation
+  |          spreads one block's outliers into every other block
+  | Solution: restrict rotation to within each block
+  |           (block-wise Hadamard)
+  v
+[2026] Li et al. - BATQuant  <-- target paper
+  |
+  | Problem: intra-block Hadamard still cannot suppress extreme outliers;
+  |          Hadamard's +/-1 entries cause a bimodal activation distribution,
+  |          wasting most of MXFP4's 7 representable values
+  | Solution: relax "rotation" to "affine"—a learnable intra-block transform,
+  |           compressed via Kronecker decomposition, plus learnable
+  |           intra-block clipping
+  v
+[?? Future]
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Making 4-bit Weight Quantization "Usable" for the First Time
+
+*** What Problem It Saw
+
+Before GPTQ, compressing weights to 4 bit basically meant RTN (Round-To-Nearest)—each value was snapped to the nearest 4-bit grid point. This was barely tolerable at 8 bit; at 4 bit, model accuracy simply collapsed. The reason is straightforward: adjacent weights are correlated, and the error introduced by rounding weight A can be partially compensated by nudging weight B in the opposite direction. RTN is completely unaware of this—every weight rounds independently, errors go unmanaged, and they all pile up in the output.
+
+*** Its Solution
+
+GPTQ borrowed an older idea: use the layer's input as calibration data to compute the second-order correlations among weights (the inverse of the Hessian matrix), then quantize column by column—after quantizing each column, immediately adjust the remaining unquantized columns in the opposite direction to "pass on" the error just introduced, so later columns can absorb it.
+
+An analogy: a relay of people passing a message, each one making a small error, while the next person intentionally errs in the opposite direction to cancel the previous mistake. By the time the message reaches the end, it roughly matches the original.
+
+*** Why It Worked (and What New Problem It Left Behind)
+
+It was the first method to make large-model 4-bit weight quantization practical. But GPTQ only handles weights, not activations. When researchers tried to also compress activations to 4 bit (W4A4), a new problem emerged: *activations have extreme outliers* concentrated in a fixed subset of channels, with absolute values tens of times larger than the rest. The weight-centric reasoning of GPTQ simply does not apply to activations.
+
+** 2023 | SmoothQuant: Migrating the "Hardness" of Activations to Weights
+
+*** What Problem It Saw
+
+After GPTQ, researchers noticed that certain channels in large-model activations would suddenly spike—values orders of magnitude larger than their neighbors. For example, in a 4096-dimensional activation, 95% of channels might lie in [-1, 1] while 5% lie in [-50, 50]. When you represent all 4096 values with 4 bits, the scale must accommodate the maximum value, so the 95% of small values get crushed to zero or a handful of adjacent grid points, losing all precision.
+
+Weights do not have this problem—their distribution is relatively uniform.
+
+*** Its Solution
+
+Since activations are hard to quantize and weights are easy, SmoothQuant introduces a diagonal scaling matrix $s$: dividing activations by $s$ smooths them out (small channels grow, large channels shrink), while multiplying the corresponding weight rows by $s$ makes them slightly less uniform. The remarkable thing is that the linear layer's output is completely unchanged, because $(\mathbf{X}/s)(s \cdot \mathbf{W}) = \mathbf{X}\mathbf{W}$.
+
+An analogy: two people carrying a table together, one end much heavier than the other. SmoothQuant changes their grip so both ends feel roughly equal—the total weight hasn't changed, but both ends are now manageable.
+
+*** Why It Worked (and What New Problem It Left Behind)
+
+Effective against typical outliers. But this is a per-channel *scalar* scaling, which can only balance things in "one direction." Against isolated, extreme outliers (say, a channel where 95% of values are 0.5 and 5% are 80), no choice of scale works—shrinking the peak also crushes all the normal values in that channel. The problem transforms into: *Can we stop outliers from being confined to specific channels and instead scatter them across all channels?*
+
+** 2024 | QuaRot / SpinQuant: Spreading Outliers Thin with Orthogonal Rotation
+
+*** What Problem It Saw
+
+SmoothQuant scales each channel independently, but outliers are always concentrated in the same fixed channels. What if the energy in those channels could be redistributed across all channels? Mathematics provides a ready-made tool: orthogonal matrices—they preserve a vector's length but can rotate a vector concentrated in one direction into one spread evenly across all directions.
+
+*** Its Solution
+
+QuaRot uses a *Hadamard matrix* (a special orthogonal matrix with only +1/−1 entries); SpinQuant uses a *learned orthogonal matrix*. Both do the same thing: insert a pair of mutually inverse orthogonal transforms $\mathbf{R}, \mathbf{R}^{-1}$ before and after a linear layer, so that $\mathbf{X}\mathbf{R}$ is "scattered" into a state where all channels are roughly uniform before quantization.
+
+An analogy: originally all the heavy items in a building are stacked in one corner, forcing the floor to be reinforced everywhere. Hadamard rotation distributes those items evenly across every floor and every room—now the floor only needs to be designed for the average load.
+
+*** Why It Worked (and What New Problem It Left Behind)
+
+Excellent results under INT4—it finally made 4-bit activation quantization viable. But when hardware moved toward MXFP4, the "benefit" of rotation turned into a "liability." MXFP4 does not share a single scale across the whole tensor; instead, *every 32 consecutive values share one scale*. Now the logic reverses: orthogonal rotation spreads the outliers from one block across all blocks—it *infects every block with one block's pollution*. What started as one or two "hard blocks" becomes every block being hard.
+
+** 2025 | BRQ / MR-GPTQ: Rotation Must Not Cross Block Boundaries
+
+*** What Problem It Saw
+
+QuaRot's orthogonal rotation is *global*—it treats the entire 4096-dimensional vector as one unit to scatter. But MXFP4 does not think in terms of the whole vector; it thinks in groups of 32. From the block's perspective, global rotation is an outsider barging into each block, shoving outliers from elsewhere in, and pushing local small values out. The result: every block's scaling factor is forced to accommodate outliers that landed there accidentally, while the ordinary values get crushed.
+
+*** Its Solution
+
+Simply restrict rotation to within each block: every 32 elements get their own small Hadamard matrix, completely independent of their neighbors. This is *block-wise rotation* (BRQ and MR-GPTQ proposed it nearly simultaneously). MR-GPTQ also fuses this scheme with GPTQ's column-wise calibration.
+
+An analogy: the previous trick shuffled furniture across the entire building; this trick acknowledges that 32 apartments form one wing, and each apartment tidies itself up internally without meddling with the others.
+
+*** Why It Worked (and What New Problem It Left Behind)
+
+Cross-block contamination is eliminated. But two new problems remain:
+
+1. *Extreme outliers still exist within a block* — In a block of 32 numbers, if one value is 100 and the other 31 are 0.5, after an intra-block Hadamard rotation all 32 values become on the order of $\pm \sqrt{100^2/32} \approx \pm 17$.
+2. *Hadamard's +1/−1 entries produce a bimodal distribution* — After rotation, activation values cluster into two symmetric peaks with a gap in between. MXFP4 has only 7 nonzero representable values ({0.5, 1, 1.5, 2, 3, 4, 6} and their negatives); a bimodal distribution occupies at most two of those slots, leaving the other 5 completely unused. Most of the representable range is squandered.
+
+** 2026 | BATQuant: Relaxing Rotation to Affine, and Saving Parameters
+
+*** What Problem It Saw
+
+BATQuant identifies two concrete defects in block-wise Hadamard: first, the *orthogonality* constraint is too rigid—it cannot actively reshape the distribution to fit MXFP4's 7 grid points; second, the +1/−1 Hadamard inevitably produces a bimodal distribution. Both defects share the same root cause: *you should not apply a fixed, orthogonal matrix to a block—you should let each block learn an invertible transform suited to itself.*
+
+*** Its Solution
+
+Three components assembled together:
+
+1. *Block-wise Affine Transformation (BAT)* — Replace the intra-block orthogonal rotation $\mathbf{R}_i$ with a learnable affine transform $\mathbf{P}_i$: invertibility is required, orthogonality is not. Each block learns its own 32×32 matrix, with the goal of making the transformed block both self-contained (no cross-block leakage) and capable of filling MXFP4's 7 grid points.
+2. *Global and Private Kronecker (GPK) decomposition* — A 4096-dimensional layer has 128 blocks; one 32×32 matrix per block means a parameter explosion. BATQuant writes each $\mathbf{P}_i$ as $\mathbf{A} \otimes \mathbf{B}_i$: $\mathbf{A}$ is a small "global" matrix shared by all blocks (e.g., 8×8), and $\mathbf{B}_i$ is each block's own small "private" matrix (e.g., 4×4). Their Kronecker product yields an effective 32×32 transform.
+3. *Block-wise Learnable Clipping* — Even after the affine transform, some blocks may still contain residual outliers. Each block independently learns a clipping threshold to clamp these stray extreme values.
+
+An analogy: the previous trick (BRQ) handed every apartment a standardized ruler (Hadamard) and told them to tidy up; BATQuant lets each apartment decide whether to use a ruler and what shape it should be (affine), while the whole building shares a "common toolkit" (global Kronecker), each apartment adds a few personal tools (private Kronecker), and finally everyone gets an "over-limit alarm" to clip any remaining oversized values.
+
+*** Why It Worked (and What New Problems It Left Behind)
+
+In terms of results: under W4A4KV16, BATQuant achieves 96.43% recovery on the Qwen3-VL-8B multimodal benchmark, lifting the previous block-rotation baseline (BRQ) from 88.32%; on LLM reasoning tasks it achieves 92.45%, more than 2 points above all baselines.
+
+Remaining open problems: (1) GPK constrains matrices to a "global + private" two-level Kronecker structure, limiting expressiveness—it may struggle with extreme cases where individual blocks are highly heterogeneous; (2) the affine matrices must be learned during calibration, making calibration more expensive than pure RTN or Hadamard; (3) although the weight-side transform can be fused into the linear layer at inference time, the activation-side affine transform still must be applied online, introducing an extra operator.
+
+* Frontier Extensions
+
+As of May 2026, BATQuant is one of the most recent public works on the MXFP4 quantization line. No direct follow-up papers are visible yet (the paper was posted 2026-03-17). Likely next steps include:
+
+- *Breaking GPK's structural constraint* — Replacing Kronecker with more flexible low-rank or sparse structures to find a better trade-off between accuracy and parameter count.
+- *Moving from PTQ to QAT* — Letting block-wise affine transforms participate directly during training rather than post-hoc calibration.
+- *Combining affine transforms with mixed precision* — Reserving high-precision channels for the small number of truly irrecoverable blocks while using more aggressive formats (e.g., MXFP3) for the rest.
+
+These are speculations, not claims from the paper.
+
+* One Diagram to Understand It All
+
+#+begin_example
+               Where do outliers end up? Who absorbs them?
+                              |
+        +---------------------+---------------------+
+        |                                           |
+   (Who absorbs them)                        (Where they go)
+        |                                           |
+  GPTQ 2022:  no one absorbs activations      INT4, one scale per tensor
+  weights compensate each other                     |
+        |                                           |
+  SmoothQuant 2023:  activations migrate       INT4, per-channel scale
+  "hardness" to weights via diagonal s,             |
+  X/s and s*W                                       |
+        |                                           |
+  QuaRot/SpinQuant 2024:  all channels share   INT4 + global orthogonal rotation
+  the load; Hadamard scatters outlier energy        |
+        |                                           |
+     ====Format shifts from INT4 to MXFP4 (32 values share one scale)====
+        |                                           |
+  BRQ/MR-GPTQ 2025:  each block absorbs       MXFP4 + intra-block orthogonal rotation
+  its own; small Hadamard per block,           (but +/-1 entries cause bimodal dist.)
+  no cross-block mixing                             |
+        |                                           |
+  BATQuant 2026:  each block learns its own    MXFP4 + intra-block learnable affine
+  transform; affine replaces rotation,        + GPK decomposition + learnable clipping
+  Kronecker saves parameters,
+  + residual outliers clipped per block
+        |
+        v
+  Future possibilities: intra-block nonlinear transform? mixed-precision blocks?
+#+end_example
+
+* Insight
+
+On the surface this thread is an iteration of "quantization algorithms"; at its core it is the continuous process of *aligning "what is shared" with "at what granularity the transform operates."*
+
+- GPTQ era: sharing is per-tensor, transforms are per-weight—granularity mismatch, patched by Hessian compensation.
+- SmoothQuant: sharing is per-channel, transform is also per-channel diagonal—aligned, but too weak in expressiveness.
+- QuaRot/SpinQuant: transform upgraded to global orthogonal rotation, sharing still per-tensor—expressive enough, granularity aligned, so INT4 takes off.
+- Shift to MXFP4: sharing suddenly becomes per-32-element blocks—global orthogonal rotation's granularity is too coarse, misaligned with blocks, and actively harmful.
+- BRQ/MR-GPTQ: shrink the transform to within each block, granularity aligned again, but the tool in use is still the old Hadamard, not expressive enough.
+- BATQuant: granularity aligned *and* the tool is upgraded from a "fixed orthogonal matrix" to a "learnable affine transform"—granularity match plus sufficient expressiveness, so it takes off again.
+
+The abstraction: *every time hardware or a format changes the boundary at which scales are shared, all higher-level transform methods must realign to that new boundary.* When the next generation of formats (NVFP4, MXFP3, mixed block sizes) arrives, this line will evolve once more—the same story, just with the boundary shifted again.
+
+The deeper shift is: *from "find one clever fixed transform" to "let each block learn a transform suited to itself."* The former relies on human priors (Hadamard, orthogonality, diagonal); the latter acknowledges that each block's distribution is heterogeneous and deserves individual treatment.
+
+* Takeaways
+
+A perspective for "finding problems" in research:
+
+- *New hardware = new constraints on old problems.* MXFP4 is not a new algorithm; it is a new constraint that hardware imposes on quantization research. Every time hardware introduces a new format, all upstream algorithms must be rethought from scratch—this is a reliable seam of new papers, and the key is being the first to recognize that "the constraint has changed."
+- *Failure modes are signposts.* Every leap forward in this thread happened because someone concretely visualized the failure mode of the previous generation ("look, after rotation block 295 has become bimodal"). Visualizing failure beats abstractly describing failure beats vaguely saying "there is room for improvement."
+- *Relaxing a constraint by one degree is often a new paper.* Hadamard is fixed ±1; BAT relaxes it to real-valued affine. Orthogonality relaxes to invertibility. Per-tensor relaxes to per-block. Each degree of relaxation accompanied a paper. The next degree of relaxation (invertibility relaxed to "approximately invertible"? affine relaxed to nonlinear?) is the next paper.
+
+This means you can: take any current SOTA quantization paper, ask "what constraint does it impose on the transform? What happens if you relax that constraint by one degree? Is the extra expressiveness worth the added overhead?"—and that is an actionable starting point for generating the next paper.

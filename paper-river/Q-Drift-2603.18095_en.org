@@ -1,0 +1,325 @@
+#+title:      Q-Drift: Quantization-Aware Drift Correction for Diffusion Model Sampling
+#+date:       [2026-05-28 Thu 20:41]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T204111-en
+#+source:     https://arxiv.org/abs/2603.18095
+#+authors:    Sooyoung Ryu, Mathieu Salzmann, Saqib Javed
+#+venue:      arXiv preprint, 2026-03
+
+* The Problem River
+
+To squeeze a large generative model into a small box (a phone, an edge GPU), the simplest approach is quantization — cutting weights and activations from FP16 down to 4-bit, 3-bit, or even 2-bit.
+The model instantly becomes ten times smaller and ten times faster. Sounds great.
+
+But here is the catch: a diffusion model does not produce an answer in a single forward pass. It must *iteratively denoise for 20–50 steps*, where the output of each step becomes the input of the next.
+The tiny errors introduced by quantization are barely visible at step one, but by step twenty they have warped the image beyond recognition — faces collapse, text blurs, style drifts.
+
+This whole research thread is obsessed with one question:
+
+*Without retraining, how do we make a quantized diffusion model generate images whose quality approaches full precision?*
+
+The difficulty is this: every generation of researchers thinks it has found the answer, and the next generation discovers, "You only saw half of it."
+
+* Source Map
+
+#+begin_example
+[2023.02] PTQ4DM / Q-Diffusion (Shang / Li)
+   |
+   | Sees: Naively applying PTQ to diffusion models collapses quality —
+   |       because activation distributions differ wildly across timesteps;
+   |       a single calibration set is like using one ruler for everything
+   | Fix:  Multi-timestep calibration sampling + split shortcut quantization
+   v
+[2023.05] PTQD (He et al., NeurIPS 2023)
+   |
+   | Sees: Even if each step's prediction is accurate,
+   |       errors still accumulate along the sampling trajectory
+   | Fix:  Decompose quantization noise into a "correlated part"
+   |       and a "residual part"; correct the former with a linear
+   |       offset, absorb the latter into the variance schedule
+   v
+[2024.07] TAC-Diffusion (Yao et al., ECCV 2024)
+   |
+   | Sees: Input error has two sources — the current step's prediction is
+   |       wrong AND the previous step left behind accumulated drift.
+   |       PTQD only corrects the current prediction, not the upstream drift.
+   | Fix:  NER corrects the prediction; IBC corrects the input;
+   |       weights are adjusted dynamically per timestep
+   v
+[2025.01] D2-DPM (Zeng et al., AAAI 2025)
+   |
+   | Sees: All the "fix the prediction" approaches above are still patching.
+   |       Quantization noise's real effect is to change the sampling equation
+   |       itself — the mean shift alters the drift, the variance inflation
+   |       alters the diffusion coefficient
+   | Fix:  Model quantization noise as Gaussian; denoise first, then iterate
+   |       (dual denoising)
+   v
+[2026.03] Q-Drift (Ryu et al., current paper)
+   |
+   | Sees: D2-DPM already touches the SDE boundary, but still operates
+   |       under the mindset of "first remove the noise, then step forward."
+   |       If quantization noise is treated directly as an implicit perturbation
+   |       injected into the SDE framework, it becomes not a bug but a feature —
+   |       the EDM marginal-preserving algebra can be used to derive a
+   |       correction term that keeps the sampler on the original marginal
+   | Fix:  Start from the Karras EDM generalized SDE; treat quantization
+   |       perturbation as an extra diffusion term; derive the matching
+   |       drift correction analytically
+   |       (5 calibration runs to estimate variance; plug-and-play with any sampler)
+   v
+[2025.05] D2-DPM v2 (Zeng et al., arXiv:2505.02242)
+   |
+   | Sees: High-order samplers (DPM-Solver++) have their direction estimates
+   |       also distorted by quantization noise
+   | Fix:  Extend the analysis to high-order discretization schemes
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.02 | PTQ4DM & Q-Diffusion: "You can't just transplant the classifier toolkit"
+
+*** What problem it saw
+
+PTQ (post-training quantization) was already mature for classification models — grab a few hundred images as a calibration set, run one pass to collect activation statistics, then cut weights and activations from FP32 to INT8/INT4 with almost no accuracy loss.
+
+The first researchers who tried to port this to diffusion models quickly discovered: apply it directly and FID shoots from 5 to 188.
+Why? Because a diffusion model is not "one inference pass." At t=999 the network sees near-pure noise; at t=10 it sees an almost-finished image — the activation distributions at the two extremes are on completely different scales.
+Calibrating the entire network with statistics from t=500 is like using a single ruler to measure everything from an ant to an elephant.
+
+Even worse, Q-Diffusion found that the shortcut connections in DDIM exhibit *bimodal distributions*: activations from deep feature channels versus shallow feature channels differ in magnitude by a factor of 200, and forcing both into the same quantization range is a guaranteed catastrophe.
+
+*** Its fix
+
+PTQ4DM proposed sampling calibration data across multiple timesteps (rather than from a single moment).
+Q-Diffusion added one more trick: "split shortcut quantization" — quantize the two branches of a shortcut separately to avoid the bimodal distribution being flattened.
+
+*** Why this works (and where the new hole is buried)
+
+It works because it acknowledges the *time-varying nature* of diffusion models — activations at different timesteps have their own statistical character and should be treated separately. This move pulled W4A8 FID from astronomical numbers back to single digits.
+
+Where is the hole? *This fix assumes: as long as local reconstruction error at each step is small, overall generation will be fine.*
+In other words, it treats quantization noise as "small, i.i.d. perturbations, viewed independently at each step."
+The next paper would slap this assumption in the face.
+
+** 2023.05 | PTQD: "Errors are not independent — they snowball along the trajectory"
+
+*** What problem it saw
+
+He et al. at NeurIPS 2023 made an uncomfortable observation: even if per-step prediction error is minimized, image quality still degrades noticeably after 20 steps of sampling.
+Quantization error does not "strike and vanish" — it is *fed back into the next step repeatedly*.
+A small deviation at step t enters step t-1's input, gets amplified a little by the network, then passes to step t-2...
+By the final steps, the SNR (signal-to-noise ratio) has been quietly consumed.
+
+PTQD also did something crucial: it used a statistical hypothesis test (D'Agostino-Pearson) to demonstrate that *quantization noise at each step is approximately Gaussian*. This elevated all subsequent work — treating quantization noise as part of the SDE — from intuition to a derivable foundation.
+
+*** Its fix
+
+Decompose the quantization noise ε_q into two components:
+- *Correlated part*: linearly correlated with the full-precision output; can be subtracted using a scalar correction coefficient
+- *Uncorrelated (residual) part*: near-Gaussian remainder; absorbed into the variance schedule of DDPM
+
+In practice: apply a bias correction to the denoised result at each step, and adjust the corresponding entry in the variance table.
+They also added a mixed-precision strategy — use low-bit at early timesteps (where only coarse structure is being shaped) and high-bit at late timesteps.
+
+*** Why this works (and where the new hole is buried)
+
+This was the first work to reframe "quantization error" from "the model predicted wrong" to "random noise injected into the sampling process."
+It is a genuine shift in perspective — from a *function-approximation* view to a *dynamics* view.
+W4A8 FID gap was compressed to 0.06.
+
+The new hole: *PTQD corrects the "current step's prediction" but does not correct the input drift inherited from the previous step.*
+Moreover, the correction coefficients are estimated globally from data, without accounting for how the error structure varies across timesteps.
+
+** 2024.07 | TAC-Diffusion: "The upstream is leaking too — fixing only the current step isn't enough"
+
+*** What problem it saw
+
+PTQD treats each step as an independent Gaussian perturbation and then debiases it. But Yao et al. pointed out: when you stand at step t, the *input itself* has already been contaminated by all the accumulated errors from preceding steps.
+Fixing the current step's prediction correctly does nothing — you produced a "correct prediction" on a corrupted input, which is like running a precision calibration algorithm on dirty data.
+
+The error actually comes from *two sources superimposed*:
+1. The noise prediction at the current step is distorted by quantization (network output error)
+2. The previous step fed in a corrupted x_{t-1} (input bias from the previous step)
+
+*** Its fix
+
+Two complementary modules:
+- *NER* (Noise Estimation Reconstruction): corrects the current step's prediction, similar to PTQD but dynamically per timestep
+- *IBC* (Input Bias Correction): estimates the input bias propagated from upstream and cleans the input before processing
+
+The key insight is "timestep-awareness" — correction strength varies dynamically with t, because the error structure at early and late timesteps is completely different.
+
+*** Why this works (and where the new hole is buried)
+
+Extended PTQ to extreme low-bit regimes like W2A8 that were previously considered impossible — FID remains usable.
+TAC-Diffusion was the first to acknowledge that "error has state, and that state travels across timesteps."
+
+The new hole: *It is still "correcting the prediction output."* Both NER and IBC patch the original sampling equations from the outside, without asking from first principles: "If quantization noise truly is a random perturbation, how should it be expressed within the SDE framework?"
+
+** 2025.01 | D2-DPM: "Quantization noise changes the coefficients of the sampling equation, not just the output"
+
+*** What problem it saw
+
+Zeng et al. at AAAI 2025 stepped back one more level: diffusion sampling is fundamentally the numerical solution of an SDE: dx = drift·dt + diffusion·dW.
+When quantization noise enters the prediction, it is equivalent to:
+- *Modifying the drift coefficient* (because the mean shifts) → the sampling trajectory heads in the wrong direction
+- *Modifying the diffusion coefficient* (because the variance inflates) → the trajectory's convergence is broken
+
+In other words, every prior method adjusted "the output value," but what actually changed were *the two coefficients of the differential equation itself*.
+Correcting the output does not fix the trajectory, because the trajectory was never walking along the original SDE to begin with.
+
+*** Its fix
+
+"Dual Denoising" (D²):
+1. First denoising: at each step, *remove the quantization noise first* using a Gaussian model (based on channel-wise or tensor-wise statistics)
+2. Second denoising: then run the standard reverse diffusion iteration
+
+Several variants (S-D² / D-D²) were introduced to choose between single-shot and dynamic correction.
+
+*** Why this works (and where the new hole is buried)
+
+For the first time, "how quantization noise affects the sampling equation" was *written down as coefficient-level equalities*.
+No longer "we patch the output" — instead "we identified a drift shift and a diffusion inflation."
+
+The new hole: *The core idea is still "first remove the quantization noise, then run the original sampling."*
+Quantization noise is still treated as a contaminant to be cleaned away.
+But if quantization noise is inherently a random perturbation — why not treat it directly as part of the SDE?
+EDM (Karras 2022) already proved: within a family of generalized SDEs, you can inject an additional diffusion term and, as long as you adjust the drift to match, the marginal distribution is preserved. This observation is the starting point of Q-Drift.
+
+** 2026.03 | Q-Drift: "Don't treat quantization noise as a bug — fold it directly into the SDE"
+
+*** What problem it saw
+
+D2-DPM had already articulated how "quantization changes the sampling equation," but its solution was still "remove the noise and then step forward" — meaning each step requires a denoising estimate, and that estimate may itself be inaccurate.
+
+The deeper observation: within the Karras 2022 EDM framework there exists a family of SDEs parameterized by β(t), ranging from 0 (pure ODE, deterministic sampling) all the way to large values (strong Langevin diffusion). The entire family *shares the same marginal distribution*.
+That is: "injecting additional noise" is not inherently a problem — as long as you *adjust the drift to compensate*, the final probability distribution is completely unchanged.
+
+So what about quantization noise? It is exactly that "additional injected noise." The original sampler simply does not know it exists, so no one adjusts the drift to match. The result: the sampling trajectory deviates from the correct marginal distribution.
+
+*** Its fix
+
+Model the quantization error ε_q as an implicit Gaussian perturbation, equivalent to an increment in the effective diffusion strength within the EDM framework.
+Then, from EDM's marginal-preserving formula, derive algebraically: the drift must include a first-order correction term, proportional to score × (equivalent variance of quantization noise).
+
+Concretely in engineering:
+- Calibration phase: run *5 pairs* of full-precision vs. quantized sampling (truly only 5 runs), estimate per-timestep variance statistics
+- Inference phase: add a constant × existing score estimate to the sampler's update formula — essentially zero overhead
+- Compatibility: because the derivation is based on the general SDE, it extends to Euler / Flow-matching / DPM-Solver++
+  (the paper's appendix provides closed-form versions for each sampler)
+
+*** Why this works (and where the new hole is buried)
+
+It is the *first method in this line that requires neither "correcting predictions" nor "denoising"* — quantization noise is not eliminated; it is *acknowledged and algebraically compensated*. This means:
+1. Nothing needs to be learned (D2-DPM requires training a Gaussian model)
+2. No dependence on model architecture (works for U-Net and DiT alike)
+3. It does not compete with PTQ methods (SVDQuant, MixDQ fix noise at the model layer; Q-Drift fixes noise at the sampler layer)
+
+On PixArt-Sigma + SVDQuant W3A4 — an extremely aggressive setting — FID drops by 4.59 outright.
+
+Honest assessment of remaining holes:
+- The entire mathematical framework assumes quantization noise is "approximately Gaussian and jointly Gaussian with the output." The paper provides empirical validation, but the boundary of this assumption under extreme low-bit quantization has not been fully mapped
+- The "5 calibration runs" is an empirical number; whether it is sufficient for very large models at high resolution requires broader evaluation
+- First-order correction — which means it may be insufficient for large step sizes (few-step sampling), and a higher-order version is needed
+
+* Frontier Extensions
+
+** 2025.05 | D2-DPM v2 / "Sampling-Aware Quantization" (Zeng et al., arXiv:2505.02242)
+
+Follow-up work by the same authors. They observed that D2-DPM was validated on first-order samplers, but high-order solvers such as DPM-Solver++ perform "direction estimation" (midpoint method, second-order predictor) in ways where quantization noise further distorts the direction estimate itself.
+
+Fix: extend the analysis from "noise entering a single step" to "noise entering the discretization scheme," and derive the corresponding corrections for high-order solvers. This line of work converges in spirit with Q-Drift — both threads recognize that *the sampler's discretization scheme itself needs to be quantization-aware*.
+
+As of 2026-05, Q-Drift remains the most concise method in this line for sampler-level correction, and the one most grounded in the first principles of SDEs.
+Future work will likely proceed along three paths:
+1. Extending the first-order Euler correction to second-order predictor-corrector schemes
+2. Replacing the Gaussian assumption with more general heavy-tailed distributions (to handle outliers)
+3. Combining with distillation-based few-step samplers (4-step, 2-step models)
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  The shift in perspective: from "fix the prediction" to "fix the equation"
+
+   Time ─────────────────────────────────────────────────────►
+
+   2023.02       2023.05         2024.07           2025.01            2026.03
+   ─────────     ─────────       ─────────         ──────────         ──────────
+   PTQ4DM /      PTQD            TAC-Diff          D2-DPM             Q-Drift
+   Q-Diff
+
+   Level of intervention:
+   |     |        ^                ^                  ^                  ^
+   |  Model       |                |                  |                  |
+   |  layer       |                |                  |                  |
+   |  (calibra-   |                |                  |                  |
+   |   tion /     |                |                  |                  |
+   |   bitwidth)  |                |                  |                  |
+   |              |                |                  |                  |
+   |           Prediction       Prediction +       Sampling           SDE drift
+   |           layer            input layer        equation           layer
+   |           (mean/var        (NER+IBC,          layer              (EDM marginal
+   |            correction)      timestep-aware)   (drift/diffusion   preserving
+   |                                                coefficient        drift correction)
+   |                                                shift identified)
+
+   Core action:
+   "I quantize      "I admit noise    "I admit the        "I admit the       "I admit noise
+    each step        accumulates;      previous step       sampling           is part of the
+    more             I correct the     leaks too, so       equation itself    SDE; adjust
+    precisely"       mean and          I correct both      was changed;       the drift to
+                     variance of       ends"               denoise first,     match and
+                     the current                           then iterate"      we're done"
+                     prediction"
+
+   In one line:
+   Function approx ──► Noise compensation ──► State correction ──► Coefficient ID ──► Dynamics fusion
+
+                  The identity of quantization noise evolves:
+                  bug → Gaussian perturbation → state contamination → coefficient shift → one term of the SDE
+#+end_example
+
+* Insight
+
+Reading through this entire line, the surface story is "PTQ for diffusion keeps getting better." But what is *truly evolving is the researchers' ontology of quantization error*:
+
+| Era        | What quantization error is              | Response strategy              |
+|------------+-----------------------------------------+--------------------------------|
+| Early      | An approximation error to be minimized  | Better calibration             |
+| PTQD       | An injected Gaussian noise              | Compensate mean and variance   |
+| TAC        | A contagious state contamination        | Correct both ends              |
+| D2-DPM     | A perturbation that shifts eq. coeff.   | Denoise first, then iterate    |
+| Q-Drift    | An intrinsic term of the SDE            | Adjust drift to match          |
+
+Each generation of researchers did not invalidate the previous generation's observations — they simply *stepped back one more level* and saw a larger structure that the previous generation had missed.
+
+What is really happening underneath this line is:
+*The community is slowly, painfully conceding: diffusion model inference is not a function-computation problem — it is an SDE numerical-solving problem.*
+Every engineering optimization you apply (quantization, distillation, caching) must be re-examined inside the SDE framework, or you are merely doing surface patching.
+
+This is isomorphic to several other "return to dynamics" moments in deep learning history:
+- Neural ODEs reframed residual networks as ODE solvers
+- Score-based modeling reframed generative modeling as SDE
+- Now Q-Drift reframes quantization acceleration as perturbation analysis on an SDE
+
+Each time, "an engineering problem gets swallowed by a mathematical structure." The next such moment will most likely be: low-rank adaptation (LoRA), KV cache compression, and speculative decoding errors will ultimately be unified under the same SDE/ODE lens.
+
+* Takeaways
+
+If you are doing engineering optimization — any work where "approximations are introduced for the sake of speed" — this line offers three transferable methodological lessons:
+
+1. *First identify the mathematical object your system is, then decide how to compensate for error.*
+   PTQ4DM treated diffusion as a function; PTQD treated it as a stochastic process; Q-Drift treated it as a family of SDEs.
+   Each step back costs less effort, because you are borrowing the mathematical properties of the object itself.
+
+2. *Do not compete with existing components — find the orthogonal direction.*
+   Q-Drift does not replace SVDQuant; it adds a layer on top of SVDQuant.
+   This means your work does not need to defeat any SOTA — it only needs to *stack on top of SOTA and still gain points*.
+   The hit rate of this kind of work is an order of magnitude higher than head-to-head competition.
+
+3. *First derive the closed form for the simple case, then handle complexity.*
+   Q-Drift's first-order Euler derivation takes only a few lines of algebra; the appendix extends it to DPM-Solver++.
+   "Derive the cleanest version first" is more valuable than "start with full generality" — because reviewers cannot follow the latter, but they remember the former.
+
+The bottom line: *Pick any "engineering problem that has been patched multiple times," find the mathematical object underneath it, and restate all the patches inside that object's algebraic framework — odds are good you will produce another Q-Drift.*

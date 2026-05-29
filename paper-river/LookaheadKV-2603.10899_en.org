@@ -1,0 +1,275 @@
+#+title:      LookaheadKV: Fast and Accurate KV Cache Eviction by Glimpsing into the Future without Generation
+#+date:       [2026-05-28 Thu 20:15]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T201538-en
+#+source:     https://arxiv.org/abs/2603.10899
+#+authors:    Jinwoo Ahn, Ingyu Seong, Akhil Kedia, Junhan Kim, Hyemi Jang, Kangwook Lee, Yongkweon Jeon (Samsung Research)
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+An LLM wants to read a million-word novel and then answer your question. The problem: for every single token it must hold a "key and value" (KV cache) in GPU memory. One million tokens takes roughly 320 GB. A consumer-grade GPU cannot hold that.
+
+So people ask: can we discard the "unimportant" tokens and keep only the "important" ones?
+
+Simple enough in principle. But there is a fundamental paradox: *which tokens matter can only be known after the model has finished answering*. The tokens the response repeatedly attends to are the important ones — but the response hasn't been generated yet. You are still compressing the cache, preparing to begin.
+
+Every paper on this river is answering the same question: *before answering, how do you guess "which tokens I will need later"?*
+
+Each generation guesses more accurately, but also wants to guess faster. Accuracy and speed — two ropes pulled ever tighter. Until LookaheadKV twisted them into one.
+
+* A Map of Origins
+
+#+begin_example
+[2023] H2O (Zhang et al.)
+  |
+  | Observed problem: attention matrices are actually very sparse;
+  |                   the vast majority of tokens are never attended to
+  | Solution: during generation, track which tokens are attended to repeatedly
+  |           -> keep the "heavy hitters"
+  | Remaining gap: you must start generating before you know who matters;
+  |                no way to compress during prefill
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Observed problem: H2O only compresses during decode; the large KV blob
+  |                   built during prefill goes unmanaged
+  | Solution: use the last few dozen tokens of the prompt as an "observation
+  |           window," treating them as a surrogate for the future response;
+  |           keep whichever prompt tokens they attend to
+  | Remaining gap: prompt suffix ≠ actual model response; the proxy is weak
+  v
+[2026] SpecKV (Galim et al.)
+  |
+  | Observed problem: SnapKV's prompt-suffix proxy is too crude
+  | Solution: use a smaller model to draft a response first; use that draft
+  |           as the observation window
+  | Remaining gap: running an extra small model is slow; prefill latency
+  |                takes a significant hit
+  v
+[2025] LAQ / Lookahead Q-Cache (Wang et al.)
+  |
+  | Observed problem: small model and target model have different preferences;
+  |                   the draft's "representativeness" is discounted
+  | Solution: skip the small model — let the target model draft a short
+  |           response using SnapKV first, then re-evaluate importance
+  |           with its own draft
+  | Remaining gap: self-drafting is more accurate but slower; even reducing
+  |                sequence length doesn't save enough
+  v
+[2026] LookaheadKV (this paper)
+  |
+  | Observed problem: the whole line has been chasing "a proxy that looks
+  |                   more like the future response," but the proxy itself
+  |                   is a luxury — do you really need to generate that many
+  |                   tokens just to guess which tokens matter?
+  | Solution: train a few dozen "lookahead tokens" + lightweight LoRA to let
+  |           the model directly predict importance scores — no draft
+  |           generation at all; one shot
+  | Status: near-zero prefill overhead; accuracy surpasses the most expensive
+  |         draft-based methods
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2023 | H2O: Attention Is Sparse — Just Keep the Heavy Hitters
+
+*** What Problem It Saw
+
+Long-context LLMs were just getting started. A strange fact emerged: when GPT processed documents tens of thousands of tokens long, *99% of the entries in the attention matrix were nearly zero*. The model was repeatedly attending to a handful of tokens; everything else was along for the ride.
+
+So why store the KV entries for those free-rider tokens in GPU memory at all? Pure waste.
+
+*** Its Solution
+
+H2O proposed the "Heavy Hitter Oracle": during generation, accumulate how many times each token has been attended to; keep the batch with the highest cumulative scores and evict the rest. Like a marathon — at kilometer 1000 you look back and notice a few runners have been in your field of vision the whole time; everyone else has been left far behind.
+
+*** Why It Worked (and What Gap It Left)
+
+"Important tokens tend to stay important" — subsequent work (Liu et al. 2023) validated this property. Once the model attends to a token at step 100, it will very likely attend to it again at step 1000. So evicting tokens that have never been attended to at all is safe.
+
+But H2O has a congenital limitation: *it must wait until decode begins before it can compress*. Because it needs to count "how often each token was attended to," and attention is produced one step at a time during generation.
+
+In practice, the biggest KV cache is the one built during the *prefill phase* — when you feed in a million-token document, the KV pile fills GPU memory before the model has spoken a single word. H2O is powerless there.
+
+The next paper would tackle exactly this: *how do you compress during prefill?*
+
+** 2024 | SnapKV: Peek at the Prompt Suffix and Pretend It's the Future
+
+*** What Problem It Saw
+
+When prefill finishes, the KV cache is full but the model has generated zero tokens, so "times attended to" is zero for everything. H2O has no data to work with.
+
+Yet if you don't compress right after prefill, GPU memory overflows. What do you do?
+
+*** Its Solution
+
+SnapKV's insight is simple and bold: *the last few dozen tokens of the prompt already contain a signal about what is about to be answered*.
+
+If the prompt ends with "...here is the full document. Please answer: what is the author's view on quantum computing?" — that closing question itself tells the model where to look. SnapKV takes an "observation window" at the prompt suffix (say, the last 32 tokens), checks which earlier tokens they attended to during prefill, and retains the most-attended ones.
+
+Crucially, this "checking" was already computed during prefill — *no extra computation is needed at all*. Free lunch.
+
+*** Why It Worked (and What Gap It Left)
+
+The prompt suffix is the question itself, and the question is a preview of the answer. The logic holds. SnapKV costs almost nothing extra, outperforms H2O by a wide margin for prefill-phase compression, and quickly became the de facto standard for prefill eviction.
+
+But the ceiling is obvious. The question (prompt suffix) ≠ the answer. The tokens the model actually attends to while generating a response may be quite different from those the question attends to. When the budget is cut to the bone — say, retaining only 5% — SnapKV starts dropping accuracy sharply.
+
+To be more accurate, you need to know the more genuine "future." The next step: well, why not generate a piece of the future?
+
+** 2026 | SpecKV: Hire a Smaller Model to Draft a Response First
+
+*** What Problem It Saw
+
+SnapKV uses "the question" as a proxy for the future — too coarse. The real future is "the answer." But the answer hasn't been produced yet.
+
+Could you use a cheap method to quickly construct an "approximate answer" ahead of time?
+
+*** Its Solution
+
+SpecKV borrows the idea of speculative decoding: use a smaller LLM (say, a 7B model as a surrogate for a 70B model) to quickly draft a response. The draft doesn't need to be exact — it just needs to be "roughly what the target model would say."
+
+Then use this draft as the observation window: check which prompt tokens it attends to; those are the ones that should genuinely be retained.
+
+This is a significant improvement over SnapKV, because the proxy has been upgraded from "the question" to "an approximate answer."
+
+*** Why It Worked (and What Gap It Left)
+
+If the tokens the future response repeatedly uses are the tokens the response repeatedly attends to — and if that condition holds — then the draft is closer to the truth than the prompt suffix. Experiments confirm: at low budgets, SpecKV's accuracy is noticeably higher than SnapKV.
+
+But the cost is real: you must actually run a small model and generate dozens to hundreds of tokens. That generation process itself slows down the prefill. In scenarios where *Time-To-First-Token (TTFT)* matters (mobile devices, conversational applications), what the user experiences is "I finished typing — why is nothing happening?"
+
+Moreover, small and large models don't necessarily share the same preferences — what the 7B model finds important, the 70B model may not. The next paper would tackle both issues.
+
+** 2025 | LAQ / Lookahead Q-Cache: Let the Target Model Draft Itself — but Still Generates
+
+*** What Problem It Saw
+
+SpecKV's surrogate model has a "taste mismatch." Given the same prompt, a 7B model and a 70B model may focus on different things. Using the 7B draft to decide which tokens the 70B model should keep introduces hidden distortion.
+
+*** Its Solution
+
+LAQ's idea: the draft must come from the target model itself. How do you get the target model to quickly produce a short output without a fully compressed cache?
+
+The approach has two stages:
+1. Use SnapKV (the cheap method) to do a rough first pass of compression
+2. Use the compressed cache to let *the target model* generate a short draft
+3. Use that draft to re-evaluate true importance scores, then compress a second time
+
+It's as if SnapKV holds the seat temporarily, then the target model "probes" the future itself, and only then is the final eviction decision made.
+
+*** Why It Worked (and What Gap It Left)
+
+Because the draft comes from the target model itself, the taste-mismatch problem vanishes. LAQ pulls ahead of SnapKV and SpecKV on long-context benchmarks such as LongBench and RULER.
+
+But the fundamental cost remains — *you still have to generate tokens*. And because you're using the target model, each token is expensive. On an 8B model with 4K context, LAQ's prefill latency can be several times that of SnapKV.
+
+At this point the entire river faces what looks like an inescapable dilemma: *to be accurate you need a sample of the "future," and to get a sample of the "future" you have to spend time generating it*. Accuracy and speed are inversely related.
+
+LookaheadKV cuts that knot.
+
+** 2026 | LookaheadKV: Train a Small Prophetic Module — No Generation Required
+
+*** What Problem It Saw
+
+Connecting the four preceding papers, the whole line has been climbing the same mountain: *how to obtain a proxy that looks more like the future response*. The more it resembles the future, the more accurate the importance estimate.
+
+But the authors of LookaheadKV ask a different question: *do you actually need the future response itself, or only the score of "which tokens the future response would attend to"?*
+
+If you only need the score, why generate tokens at all? A score is a vector, and a vector can be learned.
+
+*** Its Solution
+
+The specific approach is elegant:
+
+1. Append a few dozen "lookahead tokens" at the end of the prompt — learnable embeddings that correspond to no real vocabulary items; their sole job is to stand there and "prophesy the future"
+2. Attach a set of *lookahead LoRA* weights to the model — low-rank adapters that activate only for these lookahead tokens
+3. Training objective: make the attention distribution these lookahead tokens produce during prefill approximate the distribution that would arise "if the full response had actually been generated" (aligned via KL divergence)
+
+Where does training data come from? Run the target model offline on a batch of long-context samples with full generation; record the true importance scores as ground truth.
+
+At inference time: prompt arrives → append the lookahead tokens → one prefill pass → the attention distribution of those tokens predicts "who the future response will attend to" → compress the cache accordingly.
+
+The entire process *generates zero output tokens*.
+
+*** Why It Worked (and What Gap It Left)
+
+In essence, this *distills* the "expensive, runtime proxy generation" into a "lightweight, parameterized predictor." The cost of generating 50 draft tokens is replaced by a single forward pass over a few dozen static tokens plus LoRA.
+
+The experimental numbers are concrete: on 32K context, prefill overhead increases by only 2.16%; it is 14.5× cheaper than LAQ; accuracy actually exceeds LAQ (the most accurate draft-based method).
+
+There are new gaps:
+- *Pretraining is required* — every target model needs its own lookahead module trained. It does not work out of the box the way SnapKV does
+- Training data requires running full offline generation to obtain ground-truth scores; the offline cost is non-trivial
+- Only prefill eviction is covered; the decode stage remains unaddressed
+
+But in real-world on-device LLM deployment, paying once offline to get near-zero online cost is a trade-off that makes sense.
+
+* Frontier Extensions
+
+As of May 2026, LookaheadKV was published just two months ago (2026-03-11), and no clear "critical follow-up work" has yet appeared. Related work does mention several contemporaneous parallel ideas (Greenewald 2025, Peng 2025, Samragh 2025) — all exploring "LoRA selectively activated for a subset of tokens." These are similar intuitions that different labs arrived at independently around the same time on adjacent problems; they do not constitute strict successors.
+
+Potential directions worth watching (limitations the authors themselves point out):
+- *Decode-stage eviction*: this paper only handles prefill; can a similar "train a predictor" approach replace the cumulative-statistics family (H2O and its descendants) for the decode stage?
+- *Training-free versions*: can some existing internal signal in the model (e.g., the attention pattern at a certain layer) serve as a lookahead surrogate, eliminating the training step?
+- *Cross-model transfer*: can a lookahead module trained on one model size be shared across other sizes in the same model family?
+
+* The Whole Picture at a Glance
+
+#+begin_example
+              "How to guess which KV entries to keep before answering"
+
+Timeline ->  2023      2024         2026          2025          2026
+Proxy quality
+^
+| True response .................................[ground truth, unreachable]
+|
+| Learned                                                      LookaheadKV
+| predicted distribution                                  (lookahead tok+LoRA)
+|                                                             zero overhead
+|
+| Target model                                       LAQ
+| self-drafted response                           (self-draft)
+|                                                   expensive
+|
+| Small model            SpecKV
+| drafted response    (smaller model)
+|                        moderate cost
+|
+| Prompt suffix     SnapKV
+|                  (suffix window)
+|                  zero overhead
+|
+| Cumulative      H2O
+| attention      (only usable at decode time)
+|
++-------------------------------------------------------------> Time
+
+Horizontal = time;  vertical = proxy increasingly resembles the "true future"
+LookaheadKV is the first to be: both "close to the true future" AND "zero overhead"
+#+end_example
+
+* The Core Insight
+
+This river looks like it is chasing "a more accurate proxy," but at its core it is chasing *moving expensive runtime computation into cheap offline training*.
+
+Every generation accepted the premise that "accuracy costs money" and only argued about how to trade a little more speed for accuracy. What LookaheadKV does is dismantle the game entirely — *it distills the act of "generating a proxy at runtime" into "a predictive capability learned into the model's parameters."*
+
+This pattern recurs throughout ML:
+- Speculative decoding (small model drafts for the large model) → Medusa / EAGLE (draft capability learned into extra heads of the large model itself)
+- Knowledge distillation (large model inference is too slow) → capability learned into a small model
+- Chain-of-thought (generate a reasoning chain at inference time) → RL post-training (reasoning capability learned into weights)
+
+The pattern is always: *temporary runtime computation → parameterized capability baked in offline*.
+
+The implication for "how to find research problems": when a field is stuck in an accuracy-vs-speed dilemma, first ask — *do I actually need the output of that expensive operation, or just some statistic it produces?* If it's just a statistic, it can almost certainly be replaced by a small learned predictor.
+
+The most likely next step is to take this "train a small module to predict the future" approach and extend it from KV eviction to the decode stage, and beyond speculative decoding to every other "runtime approximation" step.
+
+* Takeaways
+
+- *Compression is fundamentally prediction*. Any "keep the important, discard the unimportant" problem is at its core a prediction problem. Once you accept that, distillation / training a small predictor becomes the default option.
+- *When designing a proxy, always ask: "Do I need the proxy itself, or only the final vector/score the proxy produces?"* If you only need the score, you can usually train something an order of magnitude smaller to emit that score directly.
+- *Training data can be distilled from "expensive offline runs"* — this is widely overlooked: you don't need human labels; just let the expensive oracle run once and record the intermediate products.
+- For engineering deployment: *on-device / mobile LLM is the natural habitat for techniques like LookaheadKV*. Cloud deployments can afford LAQ-style expensive-but-accurate methods; phones can only afford SnapKV-style fast-but-crude ones — LookaheadKV is the tool that breaks the wall between "expensive and accurate" and "cheap and fast."
