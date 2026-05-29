@@ -1,0 +1,329 @@
+#+title:      Adaptive Layer-Wise Transformations for Post-Training Quantization of Large Language Models
+#+date:       [2026-05-29 Fri 11:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T114641-en
+#+source:     https://arxiv.org/abs/2511.17809
+#+authors:    Cuong Pham, Hoang Anh Dung, Cuong C. Nguyen, Trung Le, Gustavo Carneiro, Jianfei Cai, Thanh-Toan Do
+#+venue:      arXiv preprint, 2025-11-21
+
+* The River of the Problem
+
+A 70-billion-parameter model storing weights natively in 16-bit floating point needs several H100s for a single inference pass. If every number can be compressed to 4-bit or even 3-bit integers, memory footprint drops fourfold, throughput doubles, and the model becomes runnable on ordinary GPUs. That is precisely what quantization is trying to accomplish.
+
+But there is one nearly impassable barrier: *outliers*.
+
+The vast majority of weights and activations in a model live quietly between −1 and 1. Yet a handful of channels will suddenly spike to values in the hundreds — 10 to 100 standard deviations above the mean. The moment you try to represent everything as integers, the total range must cover the largest outlier, and the remaining 99% of "normal" values get squeezed into two or three integer slots — precision vanishes and the model collapses.
+
+This is the river every paper in this lineage is chasing: *how to neutralize those outliers so that low-bit quantization does not destroy accuracy*. Over roughly three years, five distinct strategies emerged. Each one solved its predecessor's pain point and buried a new one of its own. This paper (2025-11) stands at the top of that chain and identifies the blind spot shared by all prior work — *treating every layer identically*.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar)
+  |
+  | Pain point: weights only; activations stay at 16-bit
+  |             downstream INT8 GEMM acceleration completely unreachable
+  v
+[2023] SmoothQuant (Xiao)
+  |
+  | Solution: "migrate" activation outliers proportionally onto the weights
+  |           both sides become quantization-friendly -> W8A8 works
+  | New trap: migration ratio is hand-tuned; breaks down completely at W4A4
+  v
+[2023] OmniQuant (Shao)
+  |
+  | Solution: make the migration ratio a learnable parameter, find optimum via gradient descent
+  | New trap: still per-channel scaling; occasional giant activation points survive at 4-bit
+  v
+[2024] QuaRot (Ashkboos)
+  |
+  | Solution: apply Hadamard rotation matrices to "scatter" outliers across all dimensions
+  |           end-to-end W4A4 all-4-bit inference achieved for the first time
+  | New trap: rotation spreads the distribution but does not flatten it;
+  |           Hadamard operator adds inference overhead
+  v
+[2024] FlatQuant (Sun)
+  |
+  | Solution: drop the rotation constraint; learn a full affine transformation
+  |           whose goal is to flatten the distribution
+  |           Kronecker decomposition + fused kernel reduces overhead to 0.07x
+  | New trap: all layers share the same *type* of transformation (all affine)
+  v
+[2025-11] ALT (Pham et al., this paper)
+  |
+  | Pain point: statistical properties differ dramatically across layers
+  |             some layers suit rotation, others suit affine; one-size fits none
+  | Solution: measure each layer's weight kurtosis and adaptively select the transform type
+  v
+[2025+] (concurrent work)
+  KurTail / ButterflyQuant / OSP
+  each approaching "per-layer heterogeneity" and "prevention at the source" from different angles
+#+end_example
+
+* Evolutionary Narrative
+
+No paper in this river appeared out of thin air. Each one was answering the same difficulty left behind by its predecessor — outliers — but attacking it from a new angle.
+
+** 2022 | GPTQ: Quantization as a Reconstruction-Error Minimization Problem
+
+*** What Problem It Saw
+
+After GPT-3 burst onto the scene, everyone wanted to fit these 175-billion-parameter behemoths onto consumer GPUs. The most naïve approach at the time was round-to-nearest — map each 16-bit float to the nearest integer tick. At 8-bit the results were tolerable; at 4-bit accuracy fell off a cliff.
+
+Why? Because this naïve method looks only at what the weight values *are*, without caring how much a change in a weight will corrupt that layer's *output*. A rounding error of 0.1 on a weight paired with an input of 100 produces an output error of 10; the same rounding error paired with an input of 0.01 has almost no effect. The naïve method treats both weights identically.
+
+The field already had a theoretically superior algorithm called OBQ — it quantized weights one at a time, updating the remaining weights after each step to compensate for the introduced error, achieving much better results. But it ran in *cubic complexity*, making it astronomically slow for 175-billion-parameter models.
+
+*** Its Solution
+
+GPTQ did three things that let the spirit of OBQ survive on large models:
+
+1. *Fixed ordering*: OBQ greedily picks the weight with the smallest current error first, but the authors found that on large models this greedy choice and a fixed left-to-right column order produce nearly identical results. Once the order is fixed, all rows can share a single Hessian — computation drops by a factor of 1/n.
+2. *Hessian-inverse compensation*: The error e introduced by quantizing column i, multiplied by the inverse of H, tells you in which direction to nudge the remaining columns to best cancel that error. Here H is simply X·X^T, the input covariance matrix — it encodes which input directions matter most.
+3. *Blocking + Cholesky*: The matrix is split into blocks of 128 columns; within each block, fine-grained column-by-column quantization and compensation proceeds; across blocks, updates are lazy. A single Cholesky decomposition pre-computes all information needed for inverting H.
+
+Result: OPT-175B quantized on 4 GPUs in 4 hours, with negligible accuracy loss at 4-bit.
+
+*** Why It Worked (and Where the New Trap Was Buried)
+
+The key insight was upgrading quantization from "approximate by value" to "approximate by output" — the yardstick shifted from "how wrong is the weight" to "how wrong is this layer's output."
+
+But there was a fundamental limitation: *GPTQ only dared to touch weights, not activations*. Activation outliers were too extreme; the column-wise error-compensation strategy simply did not apply to them. This meant weights could be stored in 4-bit, but at runtime they had to be cast back to FP16 for the actual multiply — hardware INT8/INT4 matrix-multiply units were out of reach. The approach helped only small-batch decode scenarios; prefill got no speedup whatsoever.
+
+The question for the next generation became: *how do you quantize the activations too?*
+
+** 2023 | SmoothQuant: Migrating Outliers from Activations to Weights
+
+*** What Problem It Saw
+
+Look closely: weight distributions are well-behaved and smooth; a few activation channels routinely reach values 100× larger than the rest. When quantization uses a single scale per tensor (one table, one scale factor), the scale for the 99% normal channels is hijacked by the 1% outlier channels — the normal channels end up with only 2–3 effective integer ticks.
+
+GPTQ could not address this because it never touched activations.
+
+*** Its Solution
+
+A beautifully physical intuition: *if weights are easy to quantize and activations are hard, migrate some of the "difficulty" from activations onto weights until both sides are equally hard*.
+
+The math is simple: multiply each activation channel by s_i (shrinking large channels) and divide the corresponding weight row by s_i (making the weights proportionally larger). The matrix-multiply result is unchanged, but the activation outliers are flattened; the weights become slightly harder to quantize, but remain within a bearable range.
+
+Better still, the division can be pre-fused into the preceding layer's weights, adding zero runtime overhead.
+
+*** Why It Worked (and Where the New Trap Was Buried)
+
+This was the first time *equivalent transformation* was explicitly brought onto the PTQ stage — the mathematical behavior of the model is unchanged, but the numerical distribution is reshaped into something more quantization-friendly. This paradigm seeded the entire river that followed.
+
+Two new traps remained:
+
+1. The migration ratio α was a *manually tuned hyperparameter* — different models and different layers each required separate tuning.
+2. W8A8 held up; *W4A4 collapsed* — 4-bit precision is simply too tight. Merely "compressing" activations was not enough; outlier points persisted, and the weights, having been burdened with the migrated difficulty, also buckled.
+
+The next generation's relay: *can the ratio be learned automatically? And can we learn not just a scalar ratio but the entire shape of the transformation?*
+
+** 2023 | OmniQuant: Making the Equivalent Transformation Learnable
+
+*** What Problem It Saw
+
+SmoothQuant's α is fundamentally a knob turned by human intuition. But the optimal α differs for every block and every layer, and its relationship to the final output error is highly nonlinear — manual tuning cannot get it right. In the 4-bit setting, an α off by 0.01 could mean a 5-point perplexity gap.
+
+*** Its Solution
+
+Upgrade SmoothQuant's scalar s to learnable *scale and shift vectors*, and add *Learnable Weight Clipping (LWC)* — letting the model learn where to clip excessively large weights. The entire apparatus is supervised by a block-level end-to-end error signal and trained with backpropagation.
+
+*** Why It Worked (and Where the New Trap Was Buried)
+
+This pushed PTQ from "heuristic tuning" to "small-scale differentiable optimization." On W4A4 it gained 5–12 points over SmoothQuant.
+
+But it was still fundamentally *per-channel scaling* — every transformation it could express amounted to "multiply each channel by a number." That is the full expressiveness of a diagonal matrix. LLM outliers, however, do not always fall neatly into a few channels; they can have more complex multi-dimensional structure. The diagonal transformation has a low ceiling.
+
+The next generation's relay: *can we use a stronger transformation to genuinely scatter outliers across all dimensions?*
+
+** 2024 | QuaRot: Smashing Outliers Apart with Hadamard Rotation
+
+*** What Problem It Saw
+
+OmniQuant's diagonal scaling still struggled at W4A4 — a few activation channels remained as isolated giant spikes that per-channel scaling could not suppress. Earlier work (Atom, QUIK) responded by keeping those unfortunate channels in 8-bit, but that required a complicated mixed-precision kernel ecosystem, which was a significant engineering burden.
+
+*** Its Solution
+
+Observation: if you insert an *orthogonal rotation matrix* R and its inverse R^T between weights and activations, the matrix-multiply output is completely unchanged (because R·R^T = I). But after rotation, outlier energy that was concentrated in a few channels is spread across all dimensions.
+
+The specific choice was *Hadamard rotation* — a special class of orthogonal matrices whose entries are all ±1/√n, enabling fast block-structured computation analogous to FFT.
+
+R is pre-fused into the weights; on the activation side only an online Hadamard operation (low overhead) is needed. Result: no channel has outliers anymore; pure 4-bit end-to-end inference runs fully, including 4-bit KV-cache.
+
+*** Why It Worked (and Where the New Trap Was Buried)
+
+The core insight was turning outliers from "exceptional spikes" into "uniform small fluctuations" — once every channel has a similar range, a single scale can govern all channels and quantization error drops.
+
+But several traps remained:
+
+1. Hadamard is *fixed*, not data-adaptive — it may not be the optimal rotation for a given data distribution.
+2. To fuse the rotation into layers preceding LayerNorm, LayerNorm must be replaced with RMSNorm, and because of residual connections, *all Transformer blocks are forced to share the same rotation*. Expressiveness is constrained.
+3. After rotation the distribution is more "spread," but within each channel there is still some heavy-tailed behavior — not yet truly flat.
+
+The next generation's relay: *why restrict to rotation? Why force a global shared transform? Can we learn a stronger, per-layer transformation?*
+
+** 2024 | FlatQuant: Learning an Affine Transformation That Truly Flattens the Distribution
+
+*** What Problem It Saw
+
+QuaRot used Hadamard; SpinQuant upgraded Hadamard to a learnable orthogonal matrix — but both remained inside the "orthogonal" cage. The authors of FlatQuant plotted activation distributions after QuaRot/SpinQuant processing and saw: *still steep, still heavy-tailed*. Rotation had spread energy around, but had not flattened the distribution.
+
+What actually determines quantization accuracy is how flat the distribution is. A perfectly uniform distribution loses almost nothing at 4-bit; a Gaussian is acceptable; but a peaked distribution with heavy tails causes 4-bit quantization to collapse.
+
+Moreover, because of the RMSNorm residual structure, all blocks had to share one transformation — yet each layer's distributional characteristics are quite different, and forcing a shared transform wastes expressiveness.
+
+*** Its Solution
+
+Drop the "orthogonal" constraint entirely and let the transformation matrix be a *full learnable affine transformation* — with complete freedom to sculpt the distribution into the flattest possible shape. Optimization target: minimize the discrepancy between the transformed distribution and an ideal uniform distribution.
+
+A full affine matrix is too large to be practical. The authors applied *Kronecker product decomposition*: write a d×d matrix as the Kronecker product of two smaller matrices, reducing parameters from d² to 2d; then write a CUDA kernel that fuses the affine transformation and quantization together, cutting runtime overhead from QuaRot's 0.26x down to 0.07x.
+
+LayerNorm is left untouched; each block learns its own transformation — maximum expressiveness.
+
+Result: LLaMA-3-70B at W4A4 incurs less than 1% accuracy loss and gains 7.5 points over SpinQuant.
+
+*** Why It Worked (and Where the New Trap Was Buried)
+
+The objective shifted from "scatter" to "flatten" explicitly. The constraint relaxed from "must be orthogonal" to "any affine." "Shared globally" was broken up into "each layer has its own." All three changes together produced a decisive improvement.
+
+But there is a *detail almost no one noticed* — although FlatQuant gives each layer its own transformation *parameters*, every layer still uses the same *type* of transformation (affine). This was an unquestioned default assumption running through the entire river: all layers should use the same class of transformation, differing only in parameters.
+
+The next generation would puncture this assumption.
+
+** 2025-11 | ALT (This Paper): Different Layers Deserve Different Types of Transformations
+
+*** What Problem It Saw
+
+Using FlatQuant's codebase, the authors ran an observational experiment: they plotted the weights of all Transformer layers and found that the statistical characteristics *differed dramatically* — some layers had tall-peaked, heavy-tailed weight distributions (high kurtosis); others were flat and nearly uniform (low kurtosis).
+
+The critical observation:
+
+- High-kurtosis layers (heavy tails, occasional extreme values) are best served by *rotation* — rotation scatters those extreme values across all dimensions.
+- Low-kurtosis layers (already relatively flat) work better with *affine transformation* — rotation can actually *disrupt* a distribution that was already close to uniform.
+
+FlatQuant uniformly applied affine to every layer; QuaRot uniformly applied rotation to every layer — *both methods made a suboptimal choice for whichever half of layers did not suit their fixed strategy*.
+
+*** Its Solution
+
+A two-step approach:
+
+1. *Differentiable search*: For each layer, model the choice "affine or rotation" as a continuous differentiable mixture weight α_l ∈ [0,1], and use a straight-through estimator during training to find the optimum. But this search must be run once per model, making it expensive.
+2. *Kurtosis-guided fast selection*: Since kurtosis correlates with the optimal transformation type, simply *use kurtosis to decide directly* — compute the *robust z-score* of each layer's weights (using MAD instead of standard deviation, which is insensitive to extreme values); layers exceeding the threshold are high-kurtosis and receive rotation; layers below threshold are low-kurtosis and receive affine.
+
+The second method matches the differentiable search in quality at negligible cost.
+
+Result: On LLaMA-3-8B under the aggressively extreme W3A3K2V2 setting, perplexity is 4.58 points lower than FlatQuant, and average accuracy across 6 zero-shot tasks improves by 2.11%.
+
+*** Why It Worked (and What Open Questions Remain)
+
+This is the first paper in the river to state explicitly: "*the type of transformation is itself a variable that should be chosen, not a constant that should be assumed.*"
+
+Open questions left behind:
+
+1. Only "affine vs. rotation" is considered. If the search space were expanded to include per-channel scaling, Hadamard, Butterfly, and others, would results improve further?
+2. Kurtosis is *static* (computed from the offline weight distribution); actual activation distributions shift with input. Could there be a *dynamic*, per-batch layer-wise transformation selection?
+3. Will these findings generalize to vision and speech models, or are they particular to LLMs?
+
+* Frontier Extensions
+
+The river has not stopped. Roughly concurrent with ALT, at least three forces are converging on the same problem from different directions.
+
+** KurTail (2025-03)
+
+Also uses kurtosis as a signal, but on *activation kurtosis* rather than weight kurtosis, and optimizes only *within the rotation family* (learning the optimal rotation matrix that minimizes post-rotation activation kurtosis). Complementary to ALT: KurTail optimizes "the best parameters for one type of transformation"; ALT chooses "which type of transformation."
+
+** ButterflyQuant (2025-09)
+
+Rather than choosing between affine and rotation, this work introduces an entirely new family of transformations — *Butterfly matrices* (the structure used in FFT). Parameterized via Givens rotations, they are structurally orthogonal yet possess learnable degrees of freedom. At 2-bit, perplexity on the QuaRot baseline drops from 22.1 to 15.4. This line of work questions the choice of the transformation family itself.
+
+** Outlier-Safe Pre-Training (OSP, 2025)
+
+The most radical direction: rather than dealing with outliers *after* training, prevent them from appearing *during* training. Switching to the Muon optimizer, modifying RMSNorm, and adding a learnable embedding projection produces models whose weights and activations have near-zero kurtosis. 4-bit quantization becomes almost lossless; training overhead is only 2% higher.
+
+This line asks a more fundamental question: *are outliers an inevitable property of the model, or are they a side effect of wrong optimizer and normalization choices?*
+
+* A Single Diagram
+
+#+begin_example
+                 The "Outlier" River in LLM Quantization
+                              |
+                              |  Core problem: a tiny number of large values
+                              |  hijack the quantization range
+                              |
+   Year   Method          What It Did                    Cost / Limitation
+   ----   --------------  ----------------------------   ----------------------------
+   2022   GPTQ            Minimize output error          Activations untouched ->
+                          per layer (Hessian            INT GEMM unreachable
+                          compensation)
+                              |
+                              v
+   2023   SmoothQuant     Migrate activation             Hand-tuned hyperparameter;
+                          difficulty onto weights        W4A4 collapses
+                          (per-channel scale)
+                              |
+                              v
+   2023   OmniQuant       Make migration ratio           Still diagonal transform;
+                          learnable (LET + LWC)          low expressiveness
+                              |
+                              v
+   2024   QuaRot          Hadamard rotation              Fixed rotation; globally
+                          scatters outliers              shared; not flat enough
+                          (computational invariance)
+                              |
+                              v
+   2024   FlatQuant       Learn full affine +            All layers share the
+                          Kronecker decomposition        *same type* of transform
+                          Goal: flatten distribution     (assumption no one questioned)
+                              |
+                              v
+   2025   ALT (this)      *Pick transform type           Only covers "rotation vs.
+                          per layer* using weight        affine"; static; only
+                          kurtosis as signal             validated on LLMs
+                              |
+            +-----------------+-----------------+
+            |                 |                 |
+            v                 v                 v
+        KurTail           ButterflyQuant      OSP (Pre-Train)
+     (optimize rotation  (introduce new       (prevent outliers
+      parameters)         transform family)    at the source)
+
+
+   Conceptual axis (left to right):
+   "Weights only"      "Weights and activations"    "Reshape distribution"    "Choose the reshaping tool"
+   GPTQ                SmoothQuant / OmniQuant      QuaRot / FlatQuant        ALT / KurTail / Butterfly
+#+end_example
+
+* Insight
+
+Tracing the entire river, the surface story is "quantization bit-width pushed from 8-bit to 4-bit to 3-bit," but what is actually changing underneath is *the attitude toward the model's numerical distribution*:
+
+1. *Stage 1 (GPTQ)*: The distribution is given. The only option is to find the best integer approximation *without touching the distribution*.
+2. *Stage 2 (SmoothQuant, OmniQuant)*: The distribution can be "mildly adjusted" — per-channel scaling is the gentlest possible adjustment.
+3. *Stage 3 (QuaRot, FlatQuant)*: The distribution can be "substantially reshaped" — matrix transformations actively recast the distribution into a quantization-friendly form.
+4. *Stage 4 (ALT, KurTail, OSP)*: The reshaping tools themselves need to be chosen, designed, and potentially made unnecessary from the start.
+
+Each generation brought one more degree of *agency*: from passively accepting the distribution, to gently adjusting it, to actively reshaping it, to intelligently selecting the reshaping tool.
+
+Looking forward, the next most likely directions are:
+
+- *Dynamic adaptation*: Current choices are all static (computed from offline weight statistics). But activation distributions drift with input. Could the transformation type switch dynamically at runtime based on observed activations?
+- *Unified search space*: Place affine, rotation, Butterfly, and scaling together in one unified transformation family, and let each layer select from a continuous space — rather than choosing from a discrete menu of "a few transform types."
+- *Joint training–quantization design*: OSP has already broken ground. If training treats "ease of quantization" as an auxiliary objective from the start, the quantization stage can approach a no-op.
+
+At a deeper level: this river illustrates *the power of default assumptions*. From SmoothQuant through FlatQuant, every paper quietly accepted the assumption that "all layers should use the same type of transformation" — until ALT pulled that assumption out and questioned it. Progress in research is often not "inventing a new method" but "noticing which universally accepted premise is wrong."
+
+* Takeaways
+
+1. *Find the default assumption nobody is questioning.* From 2022 to 2024, every paper in this river improved "the parameters of the transformation" without anyone considering that "the type of transformation" could also vary. To find research opportunities, rather than chasing SOTA and tweaking the third decimal place, list all the SOTA methods and ask: "what premise do they all share?" — that shared premise is often the entry point for the next paper.
+
+2. *Statistical properties are the most faithful guide.* The most impactful leaps in this river all came from carefully observing data distributions first: SmoothQuant noticed "activations have outliers; weights don't"; FlatQuant noticed "the distribution is still not flat after rotation"; ALT noticed "kurtosis varies dramatically across layers." Intuition often misleads; distribution plots do not.
+
+3. *Replace expensive search with a cheap proxy signal.* ALT's differentiable search works but is too costly — its genuinely clever contribution is *finding kurtosis as a cheap proxy*. This is a general research pattern: use an expensive but accurate method to produce an oracle, analyze which simple metric correlates tightly with the oracle, then use that metric as a substitute.
+
+4. *Read papers in reverse.* Reading only ALT, it feels like little more than "added an if-else to choose the transformation" — not very exciting. But reading backwards to GPTQ in 2022 and then forward again reveals this as the moment a decade of consensus was broken — its significance looks completely different. That felt sense of intellectual weight is something you cannot get from reading only the latest paper.
+
+Practically, this means:
+- When you pick up any recent paper in your field, resist reading it immediately. Dig back three to five generations first, until you can see clearly what consensus it is challenging.
+- When designing PTQ experiments, start by plotting the per-layer kurtosis histogram of your target model — you may immediately see which layers want rotation and which want affine.
+- In your own field, find an assumption of the form "everyone uses the same type of X" and ask "should different situations use different types of X?" — in the quantization domain, that simple question is worth an arXiv paper.

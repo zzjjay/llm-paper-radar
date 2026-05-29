@@ -1,0 +1,260 @@
+#+title:      Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+#+date:       [2026-05-29 Fri 11:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T115033-en
+#+source:     https://arxiv.org/abs/2511.18643
+#+authors:    Haojun Xia, Xiaoxia Wu, Jisen Li, Robert Wu, Junxiong Wang, Jue Wang, Chenxi Li, Aman Singhal, Alay Dilipbhai Shah, Alpay Ariyak, Donglin Zhuang, Zhongzhu Zhou, Ben Athiwaratkun, Zhen Zheng, Shuaiwen Leon Song
+#+venue:      Preprint, Nov 2025 (arXiv:2511.18643)
+
+* The Problem River
+
+When you deploy a large model on GPU for long-context inference, the thing that actually fills up VRAM is not the model weights — it is the stack of intermediate states the model uses to "take notes": the KV cache. LLaMA3-70B running 128K context with 32 concurrent requests needs 1.2 TB of KV cache, an order of magnitude larger than the model itself. A single B200 has 192 GB and costs thirty thousand dollars.
+
+So can we compress the KV cache the same way we compress weights — from 16-bit down to 4-bit or 2-bit?
+
+Sounds obvious; turns out it is a minefield. 4-bit holds precision well enough, but 2-bit falls apart — especially on tasks that require long chains of reasoning like math and coding benchmarks, where accuracy can drop by more than ten points. This river has been flowing for three years, and every generation asks the same question: why does compression to 2-bit break things? Which numbers are "untouchable"? And if they are untouchable, can we give them a private room while the rest share a bunkhouse?
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Finding: 0.1% of "outlier channels" have values 50-100x larger than the rest;
+  |          a single outlier can destroy the quantization accuracy of an entire tensor
+  | Solution: pull outlier channels out and run them in FP16; run everything else in INT8
+  v
+[2024-01] Hooper et al. - KVQuant
+  |
+  | Problem: how do we bring the outlier idea to KV cache?
+  |          KV cache has its own quirks — K outliers run along the channel dimension,
+  |          V outliers run along the token dimension
+  | Solution: quantize K per-channel, V per-token;
+  |           pull outliers out and store them as a sparse matrix
+  | New trap: sparse matrix multiplication is slow on GPU; hardware-unfriendly
+  v
+[2024-02] Liu et al. - KIVI
+  |
+  | Problem: KVQuant preserves accuracy via sparse matrices, but sparse kernels drag speed
+  |          Can we ditch the outlier rescue path and survive on pure 2-bit?
+  | Solution: K per-channel, V per-token, no outlier list;
+  |           keep the most recent N tokens in FP16 as a "sliding window" to cover local context
+  | New trap: holds up on GSM8K, drops 10+ points on long-reasoning tasks like MATH/AIME
+  v
+[2025-11] Xia et al. - Kitty  <-- target paper
+  |
+  | Problem: KIVI on Qwen3-8B/MATH drops from 88.26 to 47.29
+  |          Root cause: a few "critical channels" in K cache carry most of the
+  |          attention signal and get destroyed by 2-bit quantization error
+  | Solution: Dynamic Channel-wise Precision Boost — pick ~25% critical channels
+  |           by average magnitude and store them in INT4; store the rest in INT2;
+  |           split each page into two uniform 2-bit tensors so the dequant kernel
+  |           needs no if-else branches
+  v
+[2025-02/03] KVTuner & BitDecoding  <-- concurrent/follow-up work
+  | Push the same core idea along two other axes: per-layer precision, Tensor Core dequant
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Large Models Harbor a Few "Assassin Channels"
+
+*** What Problem It Saw
+
+Before 2022, the prevailing view was that quantization was a uniform-scaling engineering problem — find the right scale factor and compress all numbers proportionally. But once model size crossed 6.7B parameters, this approach suddenly stopped working: accuracy fell off a cliff.
+
+Dettmers pulled out the activation values for every layer and found something strange: *0.1% of hidden dimensions had values 50 to 100 times larger than the others*. And these "giants" were not occasional — they appeared in almost every transformer layer and activated on roughly 75% of tokens.
+
+This is a fundamental problem. Quantization is essentially "allocating 256 bins over a fixed range." If 99.9% of values in a tensor lie in [-1, 1] but 0.1% lie in [-100, 100], you either let the outliers overflow, or you spread all 256 bins across [-100, 100] — which means most small values get collapsed into the same bin and all their information is lost.
+
+*** Its Solution
+
+Since the outlier channels are always the same few, just pull them out and handle them separately. LLM.int8() splits the matrix multiplication into two parts: 99.9% of "ordinary channels" run in INT8, and 0.1% of "assassin channels" stay in FP16. Both parts compute independently and are summed at the end.
+
+*** Why It Works (and What New Trap It Left)
+
+It works because it acknowledges a fact: *quantization failure is not uniform failure — it is death by a handful of channels*. Isolate those channels and the rest becomes manageable.
+
+But it left a tail: the FP16 sparse path runs poorly on hardware, because GPUs love regular matrix multiplication and dislike mixed-precision paths that vary in shape. It also only touched weights and activations — no one had yet looked to see whether the same story played out in the KV cache.
+
+** 2024-01 | KVQuant: Bringing the Outlier Idea into KV Cache, at the Cost of Sparse Kernels
+
+*** What Problem It Saw
+
+As LLM inference moved toward long contexts (128K, 1M tokens), the KV cache became the new bottleneck — larger than the model weights themselves. But naively porting LLM.int8() did not work, because the KV cache has its own structural character.
+
+The KVQuant team looked carefully at the numerical distributions of K and V and found two things:
+1. *K outliers run along the channel dimension*: certain channels consistently have larger values
+2. *V outliers run along the token dimension*: certain tokens have entire vectors that are larger
+
+So the previous approach of "uniformly quantize by token" or "uniformly quantize by channel" was wrong — K should be quantized per-channel, and V should be quantized per-token.
+
+*** Its Solution
+
+KVQuant gives the outlier idea a five-layer makeover:
+1. Quantize K per-channel (following the direction of the anomaly)
+2. Quantize K before RoPE (avoiding the distortion that rotary position encoding introduces)
+3. Use non-uniform quantization per layer (different quantization points for different layers)
+4. Set an outlier threshold per vector (isolate on demand)
+5. Normalize the quantization center point (correcting distribution drift at 2-bit)
+
+The outlier portion is stored separately as a sparse matrix; the 1% of outliers are pulled out and excluded from the main computation.
+
+*** Why It Works (and What New Trap It Left)
+
+It works because it lands LLM.int8()'s "per-channel isolation" in the KV cache domain, achieving <0.1 perplexity loss at 3-bit and supporting LLaMA-7B up to 10M-token context.
+
+The new trap is that sparse matrix multiplication on GPU is a long-standing headache — sparse SpMM throughput is far below dense GEMM. Later evaluations of KVQuant often noted: "great accuracy, but with a slow path attached." The next generation would either need to optimize the sparse path or eliminate it entirely.
+
+** 2024-02 | KIVI: Drop the Outlier List, Fall Back on the "Recent Window"
+
+*** What Problem It Saw
+
+Concurrently with KVQuant, the KIVI team made the same observation about K-per-channel and V-per-token quantization (the two papers were independent discoveries; KVQuant appeared a week or two earlier). But KIVI took a more radical position: *can we simply avoid maintaining an outlier sparse path at all?*
+
+They noticed that inference is streaming — new tokens arrive one by one. If you always keep the most recent N tokens in FP16 and only quantize older tokens to 2-bit, then local context precision is preserved — and the attention mechanism is inherently most sensitive to recent tokens anyway.
+
+*** Its Solution
+
+KIVI's design is minimal:
+- Quantize K per-channel to INT2 (no outlier list)
+- Quantize V per-token to INT2
+- Maintain a sliding window: the most recent 128 tokens stay in FP16
+- A plug-and-play algorithm requiring no retraining or fine-tuning
+
+*** Why It Works (and What New Trap It Left)
+
+It works because it abandons the complex outlier-isolation path and bets on "recent tokens matter most" — and the bet pays off on LLaMA-2 and Mistral, where 2-bit barely loses accuracy while achieving 4× larger batch sizes and 2.35–3.47× throughput.
+
+But Kitty's experiments expose the trap that was buried: *2-bit KIVI cannot hold up on long-chain reasoning tasks*. Concrete numbers:
+- Qwen3-8B + MATH-Algebra: FP16 88.26 → KIVI-4bit 88.46 → *KIVI-2bit 47.29*
+- Qwen3-8B + AIME24: FP16 71.67 → KIVI-4bit 77.67 → *KIVI-2bit 57.00*
+
+4-bit is fine; 2-bit drops 40 points outright. The "recent window" cannot cover math reasoning tasks that require tracing back to the original problem — because the critical information the model needs may sit thousands of tokens back, where everything has already been compressed to 2-bit.
+
+** 2025-11 | Kitty: Not All Channels Are Created Equal
+
+*** What Problem It Saw
+
+The Kitty team was not willing to accept "2-bit losing points on math is just normal." They ran a seemingly simple but highly revealing experiment:
+
+*Compress exactly one channel of the K cache to INT2 while keeping all other channels in FP16, and measure how much the attention scores degrade.*
+
+They did this for every channel, one at a time. The results (Figure 2b of the paper) showed: *the vast majority of channels can be safely compressed to 2-bit, but a small number of particularly sensitive channels cause immediate accuracy collapse when compressed.* This echoes the outlier observation in LLM.int8() — *criticality is also sparsely distributed*.
+
+More specifically: the MSE error curve has several sharp spikes, each corresponding to a "critical channel." These channels turn out to be exactly the ones with larger average magnitudes (Figure 2a of the paper).
+
+This explains the root cause of KIVI's collapse on long reasoning: KIVI treats all channels equally and compresses everything to 2-bit, but in reality a small number of channels carry the bulk of the attention computation. Once these channels are contaminated by 2-bit quantization error, the entire attention score is distorted.
+
+*** Its Solution
+
+Kitty proposes *Dynamic Channel-wise Precision Boost (DCPB)*, in a single sentence: *keep critical channels in INT4, compress the rest to INT2*.
+
+How are critical channels selected? The most straightforward heuristic — sort channels by average magnitude and take the top-K (default 25%, i.e., 32 out of 128 dimensions). The intuition is that channels with large magnitudes are both more susceptible to quantization perturbation and more influential on the attention score.
+
+This is easy to state at the algorithm level; the hard part is making it fast on GPU. If a page contains both INT2 and INT4 channels, the dequant kernel must use if-else branches, triggering warp divergence and scattering memory accesses.
+
+Kitty's system-level solution is clever: *split a mixed-precision K page into two uniform 2-bit tensors* — the INT4 channels are split into two INT2 halves and stored separately. This makes the page layout regular and the dequant kernel a uniform 2-bit path with no branches, preserving coalesced memory access.
+
+The full design recipe also includes:
+- The first 32 tokens (attention sink) kept in FP16
+- The most recent 128 tokens (local window) kept in FP16
+- Older intermediate tokens stored in mixed-precision pages
+- A Q-Buffer that temporarily holds FP16 KV until a full group is ready for quantization
+
+*** Why It Works (and What New Trap It Left)
+
+The intuition is solid: you are not trying to give everyone equal treatment — you are making sure that the small number of "critical voters" are not drowned out by noise. Give them a slightly better microphone (INT4) while ordinary votes remain INT2; overall storage barely changes, but the attention scores are no longer poisoned by critical-channel error.
+
+On Qwen3-8B/MATH-Algebra, KIVI-2bit 47.29 → Kitty (KIVI-K4V2*) 87.92, nearly matching FP16's 88.26. On GPQA-Diamond, 32.24 → 40.51 (close to FP16's 40.71). At the system level end-to-end: KV memory reduced 8×, throughput 2.1–4.1×.
+
+Remaining traps:
+- Channel selection currently uses the simplest "average magnitude" heuristic; the authors themselves acknowledge that smarter heuristics (or adaptive methods) would do better
+- The current top-25% K-channel boost ratio is fixed, with no consideration of layer-wise variation
+- V cache precision allocation is untouched — does V also have "critical tokens" worth boosting?
+
+* Frontier Extensions
+
+** 2025-02 | KVTuner: Pushing "Where to Use Higher Precision" from Channel to Layer
+
+KVTuner (ICML 2025) asks: *different layers may vary greatly in their sensitivity to KV quantization — can we allocate bit-widths per layer?*
+
+It runs an offline search — using multi-objective optimization to find the Pareto-optimal precision pairing per layer (e.g., K8V4 for one layer, K4V2 for another) — then at inference time simply reads from this table with zero runtime overhead. The result on LLaMA-3.1-8B-Instruct is near-lossless mixed precision at 3.25 bits, with 21.25% higher throughput than KIVI-KV8.
+
+It is complementary to Kitty: KVTuner operates across layers, Kitty operates across channels within a layer. In principle, the two can be stacked.
+
+** 2025-03 | BitDecoding: Pushing Low-bit Dequant onto Tensor Cores
+
+BitDecoding solves another long-standing problem in the KV quantization line: dequant kernels have historically run on CUDA cores, leaving Tensor Cores idle — even though Tensor Cores deliver tens of times more compute throughput.
+
+Through query transformation, warp-level parallel dequant, and software pipelining, BitDecoding packs mixed-precision execution into a Tensor Core-friendly layout, achieving 8.6× speedup on Blackwell + NVFP4.
+
+This is also orthogonal to Kitty — Kitty asks "which channels deserve more bits," while BitDecoding asks "whatever bit allocation you choose, can we run the dequant on Tensor Cores."
+
+As of early 2026, these two lines plus Kitty's channel-wise precision boosting define the current state of the 2-bit KV cache river.
+
+* One Diagram
+
+#+begin_example
+                   Evolution of 2-bit KV Cache Quantization
+              "Which numbers are untouchable? How do we protect them?"
+
+Time      Key Finding / Solution          "Untouchable" Granularity   System Cost
+----      ----------------------          -------------------------   -----------
+2022      outlier channels                  channel (activation)      FP16 sparse path
+LLM.int8  0.1% of channels 50-100x         |                         |
+          --> pull them out into FP16       |                         v
+                                            |                      slow (sparse path)
+                                            v
+2024-01   K along channel / V along token   channel + token          sparse matrix + GPU-unfriendly
+KVQuant   1% outliers stored as sparse      |                        |
+          matrix; 5-layer refinement        |                        v
+                                            v                     slow (sparse SpMM)
+                                            |
+2024-02   K-channel / V-token + slide win   most recent 128 tokens   regular dense (fast)
+KIVI      no outlier list                   |                        |
+          bet on "recent tokens matter"     |                        v
+                                            v                     fast, but 2-bit collapses
+                                            |                     on long reasoning
+2025-02   per-layer bit allocation          layer granularity        zero runtime overhead
+KVTuner   offline Pareto search             (orthogonal to Kitty)    (offline search)
+                                            |
+2025-03   low-bit dequant on Tensor Cores   system level             hardware co-design
+BitDecode (orthogonal to Kitty)
+                                            |
+2025-11   critical channels INT4,           channel granularity (K)  split INT4 into two INT2;
+Kitty     rest INT2                         + sink + local FP16      keep uniform 2-bit page
+          select top-25% by avg magnitude                            layout (regular dense, fast)
+          echoes LLM.int8() insight
+          applied to KV cache channels
+
+
+Core pattern in one sentence: three years of evolution answer the same question —
+    how to express "sparsely distributed critical information" via "regular hardware paths."
+#+end_example
+
+* Insight
+
+Reading the whole line, what is really evolving is not "how many bits to compress to," but *how to translate "critical information is sparsely distributed" into "GPU runs fast."*
+
+LLM.int8() was the first to see clearly: precision loss is not uniform — it is dragged down by a handful of outliers. Its isolation solution was accurate, but the sparse path made GPUs unhappy. KVQuant carried that idea into the KV cache and pushed the outlier approach to its limit, then tripped over slow sparse kernels. KIVI simply abandoned outlier isolation and fell back on the recent window — simple, fast, but long reasoning tasks exposed the truth: "there is critical information far back too," because the model may need something from thousands of tokens ago that has already been crushed to 2-bit.
+
+Kitty's elegance lies in *returning to LLM.int8()'s original insight* — acknowledging the sparsity of criticality — but using an engineeringly smarter translation: represent a mixed-precision INT4+INT2 page as two uniform INT2 tensors. The algorithm layer enjoys the precision boost; the system layer sees a clean, regular 2-bit world.
+
+The real cognitive shift underlying this whole line: *"inconsistent algorithmic semantics" and "consistent hardware paths" are not in contradiction — they can be decoupled through data layout.* Early on, people thought the choice was binary: either flatten everything algorithmically to make hardware happy (KIVI), or tolerate irregular hardware paths to get algorithmic precision (KVQuant). Kitty proves there is a third way.
+
+The most likely next directions:
+1. *Make channel selection adaptive rather than heuristic* — a thread the Kitty authors themselves left open, selecting K dynamically per prompt or per layer
+2. *Apply the same decomposition to V cache* — the per-channel criticality analysis found precision heterogeneity in K; does V have the same story along the token dimension?
+3. *Compose with KVTuner and BitDecoding* — cross-layer (KVTuner) + within-layer channel (Kitty) + Tensor Core dequant (BitDecoding) is theoretically a complete end-to-end stack
+
+* Takeaways
+
+The lessons this river offers for doing research are really about *acknowledging heterogeneity*:
+
+1. *"Treat everything uniformly" is the cheapest approach and the easiest one to get wrong.* KIVI bet that all tokens and all channels matter equally — elegantly engineered but precision collapses. Kitty bet that a small number of critical channels deserve special care — and transferred a three-year-old insight (outliers) from activations into the channel dimension of the KV cache.
+
+2. *Algorithmic heterogeneity can be "disguised" as system homogeneity through data layout.* Splitting INT4 channels into two INT2 halves is the single most valuable trick in the Kitty paper. Its transferability is broad: any scenario where "the algorithm is mixed, but the hardware wants regularity" is worth trying this pattern.
+
+3. *"Why did the predecessor fail" is worth more than "what did the predecessor achieve."* KIVI did not provide an endpoint — it pointed Kitty to where the next cut should land. Kitty's experiments begin by reproducing KIVI's collapse on MATH; that table is the engine of the entire paper.
+
+The practical takeaway: if you are doing any kind of quantization, compression, or pruning, *start with a "criticality heat map"* — perturb each unit at some granularity (channel, layer, token, head) independently, and measure which perturbations significantly hurt the downstream metric. Where the spikes are, that is where the next paper's topic lives.

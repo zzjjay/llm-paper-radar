@@ -1,0 +1,399 @@
+#+title:      Layer-Wise High-Impact Parameter Ratio Optimization in Post-Training Quantization for Large Language Models
+#+date:       [2026-05-29 Fri 11:42]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T114200-en
+#+source:     https://arxiv.org/abs/2511.17801
+#+authors:    Cuong Pham, Hoang Anh Dung, Cuong C. Nguyen, Trung Le, Gustavo Carneiro, Thanh-Toan Do
+#+venue:      arXiv preprint, 2025-11-21 (Monash University & University of Surrey)
+
+* The Problem River
+
+The most direct way to fit a 7-billion-parameter language model onto a consumer GPU is to compress each weight from 16 bits down to 2 bits — memory drops by 8×, immediately. But the moment you push to 2 bits, the model is essentially broken: it babbles incoherently and can't answer elementary questions.
+
+Why? Because buried inside the model is a tiny cluster of "critical parameters" — disturb them and the whole model collapses. The entire evolution of this field circles around that cluster: How do you find them? How many do you keep? At what precision? Is it the same for every layer? A decade of researchers drilling into this question ultimately arrives at what this paper asks: "What is the optimal number of high-impact parameters to retain, per layer?"
+
+* The Source Map
+
+#+begin_example
+[2020] Nagel et al. - AdaRound
+  |
+  | Problem seen: nearest-neighbor rounding is done independently per weight,
+  |               ignoring interactions among weights
+  | Solution: make "round up or round down" learnable, optimized against task loss
+  v
+[2021] Li et al. - BRECQ  +  [2021/2023] Chen/Deng - Quadratic Mixed-Precision
+  |
+  | Problem seen: AdaRound can't learn on large models; joint optimization
+  |               across the whole network is too slow
+  | Solution: joint optimization within blocks (block-wise);
+  |           cross-layer sensitivity approximated with quadratic Hessian
+  v
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem seen: LLM activations have extreme outliers;
+  |               quantizing to INT8 causes collapse
+  | Solution: outlier channels stay in FP16, everything else uses INT8 —
+  |           first explicit "treat them differently" approach
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem seen: LLM.int8() only fixes activations; 4-bit weights are still wanted
+  | Solution: use second-order information (Hessian) to correct remaining weights
+  |           column by column — 4-bit weights with negligible loss
+  v
+[2023] Lin et al. - AWQ  +  Xiao et al. - SmoothQuant
+  |
+  | Problem seen: GPTQ treats all weights equally, but ~1% of weights
+  |               actually determine performance
+  | Solution: use activation magnitudes to locate "salient weights";
+  |           give them larger scaling protection
+  v
+[2023] Kim et al. - SqueezeLLM
+  |
+  | Problem seen: AWQ's fixed ratio and scaling protection are insufficient;
+  |               2-bit still collapses
+  | Solution: non-uniform (clustering) quantization + salient weights
+  |           stored as sparse FP16
+  v
+[2024] Shao et al. - OmniQuant
+  |
+  | Problem seen: AWQ's scaling is searched manually; SqueezeLLM's
+  |               non-uniform approach is hardware-unfriendly
+  | Solution: make the "equivalent-transformation" parameters
+  |           (scaling, shifting) learnable
+  v
+[2024] Cui & Wang - CherryQ
+  |
+  | Problem seen: using one ratio for everyone is wrong,
+  |               but the ratio is still hard-coded
+  | Solution: pick "cherry parameters" element-wise and keep them in FP16;
+  |           fine-tune the rest with QAT
+  v
+[2025] Ding et al. - CBQ + LoRA-Rounding
+  |
+  | Problem seen: AdaRound is desirable for LLMs but untrainable
+  |               (too many parameters)
+  | Solution: compress the learnable "rounding matrix" into LoRA
+  |           via low-rank decomposition
+  v
+[2025] LHPRO (this paper)
+  |
+  | Problem seen: every prior "identify important parameters" method uses
+  |               the same fixed ratio across all layers
+  | Solution: quadratic optimization to find "how many high-impact parameters
+  |           to keep per layer," decided per channel rather than per element
+  v
+[Future] ?
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2020 | AdaRound: Rounding Is Not Obvious
+
+*** What Problem It Saw
+
+Before AdaRound, everyone quantizing weights defaulted to a naive operation: round 3.7 to 4, round 3.4 to 3 — nearest-neighbor rounding. Intuitively this seems optimal, because for any single weight it minimizes that weight's quantization error.
+
+The trouble is: the network's output is not determined by any single weight — it is the collective product of all of them. When millions of weights each round "locally optimally" and independently, their accumulated errors do not point toward "globally optimal network output." In other words, local optimality weight-by-weight ≠ global optimality.
+
+*** Its Solution
+
+Turn "round up or round down" into a binary switch, one per weight. Each switch's state is parameterized by a learnable continuous variable (softened via a sigmoid-like function), then trained with a small calibration dataset using backpropagation, minimizing a reconstruction loss.
+
+In plain terms: before, every weight decided on its own which way to round. Now, they negotiate together to make the whole network's output resemble the original model as closely as possible.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It was the first time "weight rounding" was transformed from a seemingly non-differentiable arithmetic operation into an optimizable objective. This step opened the entire "learned quantization" path.
+
+But the pit is obvious: every weight needs its own learnable switch, and that switch lives in FP16. For a network like ResNet with tens of millions of parameters that's manageable; for LLaMA-7B with billions of parameters, the switches alone consume 14 GB — completely untrainable.
+
+** 2021 | BRECQ + Quadratic Mixed-Precision: Hessian Shows You Where It Hurts
+
+*** What Problem It Saw
+
+One reason AdaRound can't learn on large models is that it optimizes all weights together by default. But networks have structure — weights within a Transformer block are highly correlated, while weights across blocks are nearly independent. Forcing all blocks into one optimization problem is both slow and unnecessary.
+
+At a deeper level: when you need to make "mixed-precision" decisions (which layers get 8 bits, which get 4 bits), how do you know which layers deserve higher precision? Exhaustive search over combinations is exponential.
+
+*** Its Solution
+
+Two parallel insights combined:
+1. BRECQ cuts the network into blocks, optimizes within each block jointly, and treats blocks as independent of each other. Complexity drops from O(full network) to O(block size).
+2. A series of works (Chen 2021, Deng 2023) proved that the second-order expansion of loss with respect to quantization error is approximately Δᵀ H Δ, where H is the Hessian. So "what precision to use per layer" can be formulated as a quadratic program: minimize Δᵀ H Δ subject to a memory budget constraint.
+
+In plain terms: the intuition "which layer is sensitive" becomes a computable number — layers where the Hessian diagonal is large are sensitive. A linear-programming solver then allocates precision according to the budget.
+
+*** Why It Worked (and What New Pit It Dug)
+
+This is the mathematical starting point for all subsequent "layer-level sensitivity optimization" work. The core mathematics of LHPRO (this paper) is directly inherited from here.
+
+The pit left behind: this methodology was developed for CNNs. When LLMs appeared, nobody immediately ported it over — because LLMs first had to confront a far more glaring problem: outliers in the activations.
+
+** 2022 | LLM.int8(): The First Admission That "Some Parameters Simply Cannot Be Compressed"
+
+*** What Problem It Saw
+
+After OPT-175B appeared, researchers discovered a strange phenomenon: the larger the model, the more extreme outliers appeared in its activations. Within a single layer, 99.9% of activation values fell within ±2, yet a handful of channels routinely hit ±60.
+
+If you applied symmetric INT8 quantization — mapping the whole layer to [−127, 127] — the outliers would stretch the quantization range so wide that the normal channels were almost all crushed to zero. The model collapsed immediately.
+
+*** Its Solution
+
+Bluntly simple: identify channels with outliers (via a threshold), pull those channels out and compute them in FP16; run all remaining channels in INT8. Sum the two contributions at the end.
+
+In plain terms: the first explicit modeling of the "99%/1%" distribution — the vast majority of parameters can be aggressively compressed, but that 1% you cannot touch.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It proved the feasibility of the "treat them differently" paradigm. AWQ, SqueezeLLM, CherryQ, and this paper all build on that paradigm, each with a different strategy for "finding the important parameters" and "how to protect them."
+
+The pit: it only solved the 8-bit activation problem and didn't touch weight compression to 4 bits or lower. Furthermore, the FP16 mixed-precision kernel is hardware-unfriendly — you need two separate compute paths.
+
+** 2022–2023 | GPTQ: Second-Order Information Rescues Weight Quantization
+
+*** What Problem It Saw
+
+LLM.int8() made 8-bit workable, but appetites grew — could you do 4 bits? Simple nearest-neighbor rounding to 4 bits caused OPT and LLaMA to lose 10+ perplexity points.
+
+*** Its Solution
+
+Drawing on the OBS (Optimal Brain Surgeon) idea: when you quantize one weight, the remaining unquantized weights should compensate for the induced error. Proceed column by column — quantize one column, then use the inverse Hessian to update all remaining columns.
+
+In plain terms: before, every weight rounded independently. GPTQ says: "I compressed the first weight and introduced +0.3 error, so the remaining weights collectively compensate by −0.3."
+
+*** Why It Worked (and What New Pit It Dug)
+
+It was the first time 4-bit weight quantization of an LLM was nearly lossless. GPTQ remains the standard 4-bit baseline to this day.
+
+The pit: GPTQ treats all weights equally in its "compensation" mechanism. It didn't realize that a small subset of weights shouldn't be asked to absorb compensation error at all — they're too sensitive. That gave AWQ its opening.
+
+** 2023 | AWQ + SmoothQuant: Where Is the Real 1%?
+
+*** What Problem It Saw
+
+GPTQ assumed all weights are equal. But the AWQ team ran an experiment: keeping 1% of weights in FP16 selected by weight magnitude improved things only modestly; selecting by corresponding activation magnitude produced a dramatically larger improvement.
+
+That is, a weight's "importance" doesn't depend on its own size — it depends on how large the input it multiplies is. A small weight multiplied by a huge activation still carries enormous influence.
+
+*** Its Solution
+
+Rather than actually retaining FP16 (which is hardware-unfriendly), apply an "equivalent transformation": before quantization, multiply the channels corresponding to these "salient weights" by a scaling factor s; after quantization, divide back out. Mathematically this is equivalent to quantizing that channel on a finer grid.
+
+SmoothQuant applies the same idea to activations — "migrating" activation outliers to the weight side via a scaling factor.
+
+In plain terms: instead of "special protection for important parameters," think of it as "disguise them as unimportant first (scale them down), quantize, then restore."
+
+*** Why It Worked (and What New Pit It Dug)
+
+Switching the importance criterion from "look at the weight" to "look at activation × weight" — this criterion has been used ever since.
+
+The pit: the scaling factor s is searched manually, trying each channel one by one. And at 4 bits this works reasonably well, but at 2 bits, no amount of scaling rescues the model — because the 2-bit grid itself is simply too coarse.
+
+** 2023 | SqueezeLLM: Actually Pulling the Salient Weights Out
+
+*** What Problem It Saw
+
+AWQ's scaling protection collapses at 2 bits. SqueezeLLM's judgment was: scaling merely shuffles the error around without truly reducing it. To survive at 2 bits, the critical 0.45% of weights must be physically removed from the quantization grid.
+
+*** Its Solution
+
+Two things done together:
+1. Use Hessian-based sensitivity to identify the critical 0.45% of weights; store them as a sparse FP16 matrix, kept alongside as a bypass.
+2. For the remaining 99.55% of weights, abandon uniform quantization — cluster them into 16 groups (4 bits) with k-means and use cluster centroids as representative values: non-uniform quantization.
+
+In plain terms: AWQ says "disguise the important ones as ordinary." SqueezeLLM says "yank the important ones out entirely, and for the ordinary ones, don't spread them uniformly either — cluster them by their actual distribution."
+
+*** Why It Worked (and What New Pit It Dug)
+
+First method to approach lossless quality at 3 bits. It introduced "Hessian-based importance" as a criterion, which all subsequent work (including this paper) adopts.
+
+Two pits: (1) Non-uniform quantization is extremely hardware-unfriendly — GPU matrix multiplication is designed for uniform quantization; every multiply requires a table lookup. (2) The 0.45% ratio is a single global value applied to the entire network. The first and last layers get the same ratio — which is obviously wrong.
+
+** 2024 | OmniQuant: Make the Scaling Learnable Too
+
+*** What Problem It Saw
+
+AWQ's scaling is searched manually — slow and not necessarily optimal. SmoothQuant suffers the same issue. If the scaling factors could learn themselves, results should improve.
+
+*** Its Solution
+
+Unify AWQ's per-channel scaling and SmoothQuant's activation-weight migration into "learnable equivalent transformations." Use block-level reconstruction loss and backpropagation to learn the parameters of these transformations.
+
+In plain terms: hand all the manually-tuned knobs over to gradient descent.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It became the new SOTA for 4-bit and 3-bit quantization in 2024. This paper uses it as the quantizer for "ordinary parameters."
+
+The same pit remained: all "salient weights" share one ratio. OmniQuant learns the values of the scaling factors, but does not learn "which weights are salient, or what fraction should be."
+
+** 2024 | CherryQ: Finally Willing to Admit "One Ratio for All Is Wrong"
+
+*** What Problem It Saw
+
+CherryQ made explicit what everyone had been avoiding: applying a single global ratio (say, 1%) to divide the whole network into salient/ordinary is a simplification inherited from prior work purely for convenience. In practice, sensitivity varies enormously from layer to layer.
+
+*** Its Solution
+
+Pick "cherry parameters" element-wise — each layer selects its own proportion independently. The selected ones are kept in FP16; the rest are fine-tuned with QAT (Quantization-Aware Training).
+
+In plain terms: for the first time, "the ratio" became a variable — determined per layer, per element, however many cherries each layer has.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Confirmed the hypothesis that "the per-layer ratio should differ."
+
+Three pits: (1) Element-wise sparse FP16 is extremely hardware-unfriendly — you must maintain a boolean mask or index array, and use gather/scatter during matrix multiplication. (2) It depends on QAT, requiring training data and substantial compute — it is not a pure PTQ method. (3) "How many to pick per layer" is still determined after the fact by statistics, not by explicit optimization.
+
+** 2025 | CBQ + LoRA-Rounding: AdaRound Finally Fits Inside an LLM
+
+*** What Problem It Saw
+
+Back to AdaRound's old problem: every weight needs its own learnable switch, which is completely untrainable at LLaMA scale. Yet AdaRound's accuracy advantage is genuinely attractive — jointly learned rounding within a block is far better than heuristics.
+
+*** Its Solution
+
+Borrow LoRA's idea: the [out, in]-shaped "learnable rounding matrix" can be factored into two low-rank matrices [out, r] × [r, in], where r is much smaller than out and in. The number of learned parameters drops from out×in to (out + r×in).
+
+In plain terms: AdaRound gives every weight its own key. LoRA-Rounding discovers that these keys are highly correlated, so you only need to forge a small number of "master keys" and combine them to reconstruct all the rest.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Enabled AdaRound to run on LLMs for the first time, establishing a new accuracy SOTA in 2025.
+
+The pit: low-rank approximation inherently loses information. If r is too small, the model lacks expressive capacity; if r is large, you're back to the untrainable regime. This paper's authors argue that LoRA-Rounding's compressed search space may miss the optimal solution that AdaRound would find in its full space.
+
+** 2025 | LHPRO (This Paper): Finally Asking the Right Question
+
+*** What Problem It Saw
+
+Connecting all the threads above, this paper's team identified a question that everyone had been sidestepping:
+
+- LLM.int8(), AWQ, SqueezeLLM, CherryQ all acknowledge that "some parameters are special"
+- All use some "ratio" to define how many parameters are special
+- All treat this ratio as a fixed value shared across the whole network (or determined post-hoc by statistics)
+- Nobody explicitly asked: "Given a memory budget, how many high-impact parameters should be retained per layer to minimize total loss?"
+
+This is a perfectly well-posed constrained optimization problem, yet for a decade everyone had patched it over with heuristics.
+
+A second overlooked insight: storing high-impact parameters in FP16 is wasteful — given the same memory budget, storing them at 4 bits instead of FP16 allows keeping 4× as many. And 4-bit quantization is nearly lossless for LLMs.
+
+*** Its Solution
+
+The complete method:
+1. *Criterion*: Use Fisher information (a diagonal approximation of the Hessian) to score each weight, serving as the "high-impact" indicator.
+2. *Per channel, not per element*: CherryQ selects element-wise, which is hardware-unfriendly. This paper selects along the hidden dimension (per channel) — picking entire columns together, which is GPU-friendly.
+3. *Core innovation*: Formulate a quadratic optimization problem (inheriting the mathematics of BRECQ/Chen-Deng). The decision variable δ is a one-hot vector encoding "which ratio to use per layer." The objective is Δᵀ H Δ (the second-order contribution of quantization error to loss), subject to a total memory budget constraint. The Hessian is simplified using a block-diagonal approximation (non-zero within a block, zero across blocks).
+4. *Mixed strategy*: High-impact parameters use the expensive AdaRound (few parameters, trainable); the rest use the cheap OmniQuant.
+5. *Key cleverness*: High-impact parameters are stored at a medium bit-width (4 bits), not FP16 — so the same budget retains far more of them.
+
+In plain terms: before, you "pick the top 1% and store them in FP16." This paper says "solve for an optimal ratio independently per layer — maybe 5%, maybe 0.5% — and store all of them at 4 bits."
+
+*** Why It Worked (and What New Pit It Dug)
+
+At the 2-bit setting, LLaMA-2-7B perplexity drops from OmniQuant's 37.37 all the way to 9.40 — approaching the full-precision baseline of 5.47. This validates the synergy of three ideas: per-layer optimized ratios + medium-bit storage for high-impact parameters + channel-wise selection.
+
+Pits left behind:
+- The quadratic program itself is NP-hard (though tractable at small scale); scaling to many layers with many candidate ratios becomes slow
+- The candidate ratio set B is hand-specified as discrete values — no truly continuous optimization
+- Still depends on calibration data to estimate Fisher information, which may not generalize to new tasks
+- The Fisher diagonal importance criterion still simplifies away cross-parameter correlations
+
+* Frontier Extensions
+
+As of early 2026, the SOTA for 2-bit PTQ is still evolving rapidly. Trends visible after LHPRO:
+- *Hardware co-design*: MX-Format (microscaling format) and similar new hardware natively support "different precisions within a group," making mixed-precision quantization actually realizable on chip for the first time
+- *Continuous ratio search*: using gradients rather than discrete quadratic-program solving to determine δ, and making the candidate set B itself learnable
+- *Joint KV-cache quantization*: this paper only handles weights, but the inference bottleneck is shifting from weights to the KV cache; GPTQ-style second-order analysis is being ported to KV quantization
+
+That said, the core idea of LHPRO — "explicitly optimize layer-wise sensitivity" — should be absorbed into next-generation frameworks rather than replaced outright, because it solves an optimization problem that nobody had properly addressed for a decade.
+
+* One Diagram
+
+#+begin_example
+                  This quantization-compression line solves one problem:
+                  Which weights must be protected? How many? At what precision?
+
+  +-------------------------------------------------------------+
+  | Timeline ---->                                               |
+  +-------------------------------------------------------------+
+
+  [Rounding problem]                  [Mixed-precision problem]
+  AdaRound -----+                     +-- LLM.int8()
+  (learnable    |                     |   (treat the 1% differently)
+   rounding)    |                     |
+                v                     v
+              BRECQ +-----------+   AWQ/SmoothQuant
+              (block + quadratic)|   (use activations to find salient weights)
+                |               |     |
+                |               |     v
+                |               |   SqueezeLLM
+                |               |   (FP16 bypass + non-uniform)
+                |               |     |
+                |               |     v
+                |               |   OmniQuant
+                |               |   (learnable scaling)
+                |               |     |
+                |               |     v
+                |               |   CherryQ
+                |               |   (element-wise + QAT)
+                |               |     |
+                v               v     v
+              CBQ ----+      [problem exposed but never directly solved]
+              (LoRA-Rounding) |
+                              v
+              +-------------------------------+
+              | LHPRO (this paper)            |
+              | = BRECQ's quadratic program   |
+              | + AWQ's "find salient"        |
+              | + "ratio" as per-layer        |
+              |   decision variable           |
+              | + high-impact → AdaRound,     |
+              |   rest → OmniQuant            |
+              +-------------------------------+
+
+  Core evolutionary direction:
+  +----------------+------------------+--------------------+
+  | Early          | Middle           | Now (LHPRO)        |
+  +----------------+------------------+--------------------+
+  | One cut for    | 1% outliers get  | Solve optimal      |
+  | the whole net  | special handling | ratio per layer    |
+  | Heuristic      | Heuristic        | Quadratic          |
+  | rounding       | scaling          | programming        |
+  | FP16 protection| FP16 protection  | Medium-bit (4-bit) |
+  | Element-wise   | Element / channel| Channel-wise       |
+  | mask           | selection        | (hardware-friendly)|
+  +----------------+------------------+--------------------+
+#+end_example
+
+* Insights
+
+The true through-line of this decade is not "compression technology became more sophisticated." It is that *the set of design variables allowed to be explicitly modeled kept expanding*.
+
+- Before AdaRound, even "rounding direction" was fixed (nearest neighbor)
+- AdaRound made "rounding" a variable
+- AWQ made "scaling" a variable
+- OmniQuant made "the values of the scaling" learnable variables
+- CherryQ made "which parameters count as salient" a variable
+- LHPRO made "how large a fraction is salient, per layer" a variable
+
+What each generation of researchers did, in essence, was discover that "the thing the previous generation treated as a constant is actually a variable" — and then put it into an optimization problem.
+
+This tells us something actionable: to judge whether a field still has research opportunities, look at what its practitioners default to treating as "non-negotiable." The places that are assumed to be constants are typically where the next variable is hiding.
+
+After LHPRO, what is still being treated as a constant:
+- The candidate ratio set B is hand-specified (it should be learnable)
+- The high-impact criterion is Fisher information (it should be tied directly to final task loss)
+- The block-diagonal Hessian approximation (cross-block dependencies are simplified to zero)
+- The quantization grid is uniform (except SqueezeLLM, everyone assumes uniform grids)
+
+The next generation of papers will pick one of these "things treated as constants" and turn it into a variable.
+
+* Takeaways
+
+*For research*: Don't look for problems by asking "what new algorithm can I invent?" Look instead at "what did prior methods assume without questioning?" LHPRO invented no new criterion, no new quantizer, no new loss function. What it did was reopen the "one fixed ratio shared across all layers" — a setting everyone had tacitly accepted — and make it an optimizable quantity. Papers that "expose a hidden variable" like this are often more durable than papers that "invent a new component."
+
+*For engineering practice*: If you are tuning a global hyperparameter in your own project (learning-rate decay, batch size, sparsity ratio), stop and ask — why is this hyperparameter a single global value? If you allowed it to vary by group, by layer, or by module and optimized each independently, would you get an order-of-magnitude improvement? The answer is usually "yes" — it's just that nobody wanted to build the optimization framework to do it.
+
+*The takeaway*: This means the "per-layer explicit optimization" mindset can be transplanted broadly — LoRA rank should differ per layer, KV cache precision should differ per layer, dropout should differ per layer. Behind every design choice that "seems like it can only be one value," there is a lurking question: "Why not optimize it independently per layer?" Ask that question, and you will find your next paper.

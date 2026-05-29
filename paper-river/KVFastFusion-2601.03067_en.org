@@ -1,0 +1,324 @@
+#+title:      Joint Encoding of KV-Cache Blocks for Scalable LLM Serving
+#+date:       [2026-05-29 Fri 11:41]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T114119-en
+#+source:     https://arxiv.org/abs/2601.03067
+#+authors:    Joseph Kampeas, Emir Haleva
+#+venue:      arXiv preprint, 2026-01-06
+
+* The River of Problems
+
+An LLM server handles 1,000 concurrent users. Every user asks "what does this document say," each attaching nearly identical RAG retrieval results. GPU memory holds 1,000 nearly identical KV caches. Can they all *share a single copy*?
+
+The problem is hard because the KV cache wears three sets of shackles:
+
+- *Memory* grows faster than the model itself — a 70B model's weights are only 140 GB, but serving 256 requests each with an 8K context can easily consume 200 GB in KV cache alone.
+- *Shape* must conform to the attention kernel — once you alter the [seq, head, dim] layout, you must rewrite CUDA kernels and spend forever chasing hardware upgrades.
+- *Content* looks different but is semantically highly repetitive — "please translate this passage" and "translate the following" are completely different at the token level, yet the model's internal KV representations nearly overlap.
+
+Generation after generation of researchers has hit a wall on this road: first finding ways to *manage* cache placement (paging), then finding ways to *discard* the unimportant (heuristic eviction), then finding ways to *compress* each token (quantization, low-rank), and only finally realizing — the real waste is not within a single request, but *between* requests.
+
+* The Source Map
+
+#+begin_example
+[2023.06] PagedAttention / vLLM
+  |
+  | Observed: KV cache fragmentation wastes 60–80% of reserved memory
+  | Solution: OS-style paging with block-table indirection
+  | Gap left: can only share blocks with *exactly matching prefixes*
+  v
+[2023.06] H2O - Heavy Hitter Oracle
+  |
+  | Observed: cache is still too large; attention scores follow a power law
+  | Solution: dynamic eviction, keeping only "important tokens"
+  | Gap left: heuristic judgment + irreversible information loss
+  v
+[2023.09] StreamingLLM - Attention Sinks
+  |
+  | Observed: H2O is too expensive; sliding window crashes without initial tokens
+  | Solution: permanently keep the first 4 sink tokens + sliding window
+  | Gap left: static policy, what is dropped is gone, no reuse
+  v
+[2024.02] KIVI - 2-bit KV Quantization
+  |
+  | Observed: eviction loses information; better to keep all at lower precision
+  | Solution: K quantized per-channel, V quantized per-token, asymmetrically
+  | Gap left: breaks standard tensor layouts, requires custom kernels
+  v
+[2024.05] MiniCache - Cross-Layer Merging
+  |
+  | Observed: all compression is done within a single layer
+  | Solution: merge adjacent-layer KV via SLERP interpolation
+  | Gap left: still operates within a single request
+  v
+[2024.05] DeepSeek-V2 MLA - Architecture-Level Compression
+  |
+  | Observed: post-hoc compression has a ceiling
+  | Solution: during training, project KV into a low-rank latent at training time
+  | Gap left: requires training from scratch; cannot rescue already-deployed models
+  v
+[2024.05] CacheBlend - Cross-Request Block Reuse
+  |
+  | Observed: prefix caching is limited to exact-prefix reuse
+  | Solution: reuse at arbitrary positions, but selectively recompute 10–20% of drifted tokens
+  | Gap left: token sequences must still match exactly before any reuse is possible
+  v
+[2026.01] KV Fast Fusion (BFF/CFF)  <-- target paper
+  |
+  | Observed: 94% of block pairs have cosine similarity > 0.8
+  | Solution: "fuse" semantically similar blocks into one shared representation
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2023.06 | PagedAttention / vLLM: Giving the KV Cache an Operating System
+
+*** What Problem Did It See?
+
+Before vLLM, every incoming request caused the system to reserve a contiguous block of GPU memory sized for the worst case. A user who generated only 50 tokens was allocated space for 2,048. The result: *60–80% of memory sat idle* — fragmented like an undefragmented hard drive, blocking new requests and leaving GPU compute spinning in neutral.
+
+*** Its Solution
+
+Slice the KV cache into fixed-size *blocks* (default: 16 tokens per block) and give each request a *block table* mapping logical block numbers to arbitrary physical block numbers. Blocks can be scattered anywhere in memory without needing to be contiguous. Two requests sharing the same prefix — say, both starting with "You are a helpful assistant" — can have their early blocks point to the same physical copy (copy-on-write).
+
+The idea is borrowed directly from the virtual memory techniques operating systems solved decades ago.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Throughput jumped 2–4×. But this only solved the *layout* problem, not the *redundancy* problem. Sharing only happened when prefixes were byte-for-byte identical. "Please translate this passage" and "translate the following" — immediately recognizable as the same task to any human — look to PagedAttention like two completely unrelated byte strings, with zero sharing.
+
+Cache still grows as O(total tokens). This planted the seed for every compression effort that followed.
+
+** 2023.06 | H2O: Not Every Token Is Worth Remembering
+
+*** What Problem Did It See?
+
+vLLM solved *where* to put things, but not *having too much* to put. One observation: attention scores are highly concentrated — a handful of tokens absorb the bulk of attention weight while the rest are nearly ignored. If a token is never attended to, why keep it?
+
+*** Its Solution
+
+At each inference step, accumulate the total attention score each token has received over its history. High-scoring tokens are called *Heavy Hitters* and are kept; low-scoring ones, combined with a recent-token window, are *evicted*. Compressing the cache to 20% of its original size while preserving accuracy.
+
+*** Why It Worked (and What New Pit It Dug)
+
+This became the most important cautionary tale for everything that followed. It has three fatal problems:
+
+1. *Heuristics are unreliable* — using historical attention scores to predict future importance breaks on out-of-distribution inputs, long generations, and reasoning tasks.
+2. *Eviction is irreversible* — once a token is dropped, it cannot be recovered even if the model genuinely needs it later.
+3. *It invades the kernel* — every step requires secretly bookkeeping inside the attention kernel, breaking the standard compute path.
+
+The "rigid heuristics" that Fast Fusion later criticizes trace their prototype directly to H2O.
+
+** 2023.09 | StreamingLLM: Don't Touch Those First 4 Tokens
+
+*** What Problem Did It See?
+
+H2O is too expensive — every step requires computing and sorting scores. The most direct fix: a sliding window, keeping only the most recent N tokens. But when tried in practice, the model immediately collapses. Why?
+
+A counterintuitive phenomenon was discovered: the model dumps all the attention probability it "cannot use" onto the very first few tokens in the sequence, regardless of what those tokens actually contain. These tokens act as *attention sinks* — garbage cans for surplus attention weight. Remove them, and the attention distribution collapses, sending the whole model into disarray.
+
+*** Its Solution
+
+Unconditionally keep the first 4 tokens plus a sliding window. No dynamic scoring, no ranking. Handles long streams of 4M tokens stably, 22× faster than sliding-window-with-recompute.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It degraded H2O's "dynamic heuristic" into a "static heuristic." But static means treating all content, all tasks, all attention heads identically — long-range dependencies beyond the window are permanently lost.
+
+The deeper issue: like H2O, it *discards* rather than *compresses*. Two requests with overlapping content? It has no idea, and no interest.
+
+** 2024.02 | KIVI: Rather Than Discard, Compress to Lower Precision
+
+*** What Problem Did It See?
+
+Eviction-based methods (H2O, StreamingLLM) inflict hard information loss. A new idea: keep all tokens but represent each one with fewer bits. But naïve 2-bit quantization collapses accuracy — why?
+
+The *outlier distribution patterns differ* between K and V caches: outliers in the K cache concentrate on specific channels, while outliers in the V cache show no clear pattern. A one-size-fits-all quantization scheme gets thrown off by K's per-channel outliers.
+
+*** Its Solution
+
+Asymmetric quantization:
+- K is quantized *per-channel* — each channel gets its own scale factor, "catching" outlier channels individually.
+- V is quantized *per-token* — each token gets its own scale, localizing error.
+
+A small full-precision sliding window (the most recent few tokens remain unquantized) protects reasoning tasks. Custom CUDA/Triton kernels fuse dequantization with matrix multiplication. Result: 2.6× memory compression, 2.35–3.47× throughput improvement.
+
+*** Why It Worked (and What New Pit It Dug)
+
+This is the precise target of Fast Fusion's later criticism about "disrupts tensor layouts" and "requires specialized compute." Per-channel K quantization means the standard [seq, head, dim] layout is broken, and the attention kernel must be rewritten. Every GPU generation upgrade, every attention variant (FlashAttention v1, v2, v3), requires another rewrite.
+
+And KIVI compresses *within a single block*. It cannot address the waste where "block A from request 1 and block B from request 2 are nearly identical."
+
+** 2024.05 | MiniCache: Adjacent Layers' KV Look Very Similar
+
+*** What Problem Did It See?
+
+All compression so far operates within a single layer. MiniCache's authors noticed something nobody had paid attention to: in the middle-to-late portion of a Transformer, cosine similarity between KV representations in adjacent layers is very high. In other words — *there is waste along the depth dimension*.
+
+*** Its Solution
+
+Decompose adjacent layers' KV into magnitude and direction; merge directions using SLERP (spherical linear interpolation) while preserving each layer's individual magnitude. A small number of "outlier tokens" that genuinely cannot be merged are kept separately. No training required, and it stacks on top of quantization: combined with INT4 on LLaMA-3-70B it achieves 5× compression.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It uncovered a new dimension of redundancy: depth. But it still operates *within a single request*. Depth redundancy is just one axis; *cross-request redundancy* is the real dominant term — the same RAG document retrieved by 100 users, and MiniCache is completely blind to it.
+
+** 2024.05 | DeepSeek-V2 MLA: Fix It at the Source
+
+*** What Problem Did It See?
+
+All post-hoc compression has a ceiling, because the model itself encodes each token as a fat vector. GQA and MQA reduce the cache by sharing K/V heads, but both pay a perplexity cost (GQA ~0.5, MQA ~1.5). Can the model learn a more compact representation at training time?
+
+*** Its Solution
+
+*Multi-head Latent Attention*: at training time, jointly project K and V into a low-rank latent vector c_kv whose dimension is far smaller than n_heads × d_head. At inference, only this small vector is cached, along with a decoupled RoPE positional component. Mathematically, the up-projection matrices are absorbed into W_Q and W_O, so the "decompression" cost is zero. Result: 93.3% reduction in KV cache, 5.76× generation throughput, and perplexity that is actually *better* than MHA.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The first time compression reaches the *architecture level*. But the cost is clear — the model must be trained from scratch. Already-deployed LLaMA, Mistral, and Qwen cannot benefit at all. This is a "future models" solution, not a "current models" solution.
+
+And MLA still compresses *per token*: the same token appearing across 1,000 requests produces 1,000 separate latent vectors. Cross-request waste remains everyone's problem to ignore.
+
+** 2024.05 | CacheBlend: Finally Looking Across Requests
+
+*** What Problem Did It See?
+
+PagedAttention and SGLang's prefix caching can only reuse blocks that appear as a *prefix*. But in RAG scenarios, retrieved document chunks appear at different positions each time, with different content prepended. Simply transplanting cached KV blocks to a new position hurts accuracy — the block's KV was computed under a different context, and now that context has changed, so the attention pattern has shifted too.
+
+*** Its Solution
+
+Reuse cached KV at *any position*, but *selectively recompute* the 10–20% of tokens with the largest deviation — called HKVD (high KV deviation). Pipeline the recomputation with fetching KV from slow storage (SSD). TTFT drops 2.2–3.3×, throughput rises 2.8–5×. EuroSys 2025 Best Paper.
+
+*** Why It Worked (and What New Pit It Dug)
+
+For the first time, the work crosses the single-request boundary and sees reuse across multiple requests. But reuse still requires *exact text block matching* — two blocks that are *nearly but not exactly identical* share nothing. The paradigm remains "hash lookup + patch."
+
+And the "10–20%" selective-recompute threshold is yet another heuristic dial to tune.
+
+* The Frontier
+
+** 2026.01 | KV Fast Fusion (BFF / CFF): Don't Find Identical Blocks — Fuse Similar Ones
+
+*** What Problem Did It See?
+
+CacheBlend pushed "reuse" from exact prefixes to exact blocks. But Fast Fusion, running Llama-3.1-8B on OpenMathInstruct-2, found a number that stops you in your tracks: *94% of KV block pairs have cosine similarity > 0.8*. That is, across requests, nearly every block is an *approximate duplicate* of others — yet every prior method, from PagedAttention to CacheBlend, was blind to this because the hashes never matched.
+
+*** Its Solution
+
+Instead of finding "identical" blocks, find clusters of "similar" blocks and *fuse them into a single shared representation*. Two variants:
+
+- *BFF (Batch Fast-Fusion)*: before the decode phase, fuse similar blocks across requests.
+- *CFF (Chunks Fast-Fusion)*: during the prefill phase, fuse across input chunks.
+
+An O(B log B) tree-structured pairwise fusion strategy clusters blocks by cosine similarity threshold. The key design decision: *preserve the standard tensor layout* — the fused "representative block" is still a [seq, head, dim] tensor that any standard attention kernel can consume directly, with no custom CUDA required.
+
+A theoretical analysis is also included: deriving the rate-distortion tradeoff under a Poisson arrival model.
+
+*** Why It Worked (and What New Pits It Left)
+
+It addresses three pain points that run through the entire lineage at once:
+
+1. Not heuristic eviction — it retains a fused representation rather than discarding.
+2. Does not break tensor layout — standard attention kernels run directly.
+3. Requires no custom hardware — pure PyTorch implementation.
+
+Result: 4.38× KV cache compression, negligible accuracy loss, ~40% throughput improvement in single-machine vLLM benchmarks. It also incidentally closes the timing side-channel exposed by prefix caching.
+
+New pits left behind:
+- The threshold is hand-tuned; different models and tasks may require re-tuning.
+- Fused blocks are inherently lossy; their impact on tasks with extreme long-range dependencies needs further validation.
+- It is orthogonal to MiniCache (cross-layer), KIVI (quantization), and CacheBlend (selective recompute) — but whether they can be stably stacked has not been systematically verified.
+
+** Mid-2026 and Beyond
+
+As of May 2026, no paper has directly cited and improved upon Fast Fusion's joint encoding. In adjacent directions:
+
+- *CommonKV*: continues the MiniCache cross-layer merging line, arguing that direct cosine merging degrades accuracy at high compression ratios, replacing it with subspace merging.
+- *KVShare / FusionRAG / SAM-KV / EPIC / A³*: branches from CacheBlend, continuing to explore "exact block reuse + selective recompute."
+
+None of these have crossed the paradigm jump that Fast Fusion represents — similarity-cluster-based joint encoding. The next obvious paper on this line should mathematically unify BFF/CFF with MLA, quantization, and cross-layer merging, delivering a *joint compression theory for multi-dimensional redundancy*.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                     Where is the KV cache waste? Eight years of research in one diagram
+  =======================================================================================
+  Waste Dimension     | Within a Single Request  | Cross-Layer, Single Req  | Cross-Request
+  --------------------|--------------------------|--------------------------|---------------
+  Placement/Frag.     | vLLM (2023)              |                          |
+                      | "OS-style paging"        |                          |
+  --------------------|--------------------------|--------------------------|---------------
+  Token Importance    | H2O (2023)               |                          |
+                      | "evict non-heavy-hitters"|                          |
+                      | StreamingLLM (2023)      |                          |
+                      | "keep sinks + window"    |                          |
+  --------------------|--------------------------|--------------------------|---------------
+  Precision / Bits    | KIVI (2024)              |                          |
+                      | "K per-ch, V per-tok"    |                          |
+  --------------------|--------------------------|--------------------------|---------------
+  Depth Redundancy    |                          | MiniCache (2024)         |
+                      |                          | "SLERP merge adj. layers"|
+  --------------------|--------------------------|--------------------------|---------------
+  Architecture Ceiling| DeepSeek MLA (2024)      |                          |
+                      | "low-rank latent at      |                          |
+                      |  training time"          |                          |
+  --------------------|--------------------------|--------------------------|---------------
+  Exact Block Reuse   |                          |                          | CacheBlend
+                      |                          |                          | (2024) reuse +
+                      |                          |                          | selective recomp.
+  --------------------|--------------------------|--------------------------|---------------
+  Approx. Block Fusion|                          |                          | <<< KV Fast
+                      |                          |                          |     Fusion 2026
+                      |                          |                          |     94% blocks
+                      |                          |                          |     cos > 0.8
+                      |                          |                          |     -> fuse
+
+
+  Three layers of abstraction in capability evolution:
+       Manage (vLLM)
+         |
+         v
+       Discard (H2O, Streaming)
+         |
+         v
+       Compress (KIVI, MiniCache, MLA)
+         |
+         v
+       Reuse (CacheBlend)
+         |
+         v
+       Fuse (Fast Fusion)      <-- from "find identical" to "find similar"
+#+end_example
+
+* Insight
+
+On the surface, this lineage is a sequence of KV cache compression techniques. Underneath, what is truly changing is that *the researchers' definition of "waste" keeps expanding*.
+
+- First generation (vLLM) saw only *spatial waste* — space was reserved and unused.
+- Second generation (H2O, StreamingLLM) saw *temporal waste* — some tokens would never be attended to again.
+- Third generation (KIVI) saw *bit waste* — precision was excessive.
+- Fourth generation (MiniCache, MLA) saw *structural waste* — correlations between layers, within tokens.
+- Fifth generation (CacheBlend) crossed the request boundary for the first time, seeing *instance waste* — but only its "identical" face.
+- Sixth generation (Fast Fusion) pushed this to the limit: *similarity is a form of repetition*.
+
+Each generation's advance is not primarily technical — it is a matter of *seeing*. Prior generations were not incapable of doing what came next; they simply *never recognized that as waste*.
+
+This is a recurring pattern in systems research: physical resource bottlenecks gradually shift researchers' attention from "algorithms" to "data," from "single points" to "distributions," from "exact" to "approximate." The LLM serving field — in six years — has retraced thirty years of the storage systems story.
+
+Where does the next step lead? Three most probable directions:
+
+1. *Unified multi-dimensional redundancy framework* — mathematically unify the five kinds of waste (spatial, temporal, bit, structural, instance) and automatically decide which compression to apply to which block.
+2. *Learning the fusion strategy* — the cosine threshold is hand-tuned; let the model learn which blocks should be fused.
+3. *From inference back to training* — since so many blocks are nearly identical at inference time, can training encourage the model to generate more "fusible" KV representations in the first place?
+
+* Takeaways
+
+For researchers: *develop sensitivity to "waste" before reaching for solutions*.
+
+If what you learned from the vLLM paper is "paging," that is a technique. If what you learned is "first study where real workloads actually waste resources, then optimize precisely for that" — that is a methodology. Fast Fusion achieved 4.38× compression not because the algorithm is particularly clever, but because the authors measured something no one had measured before: the cosine similarity distribution between blocks. Once that number — 94% > 0.8 — appeared, the method itself was nearly inevitable.
+
+What this means you can do:
+- On any systems problem, *quantify the redundancy first*, then design the algorithm. Without measurement, you are guessing.
+- Cross the single-instance boundary — much waste only becomes visible after aggregating across multiple instances.
+- Be wary of "exact match" thinking — in most real-world scenarios, "approximate" is the norm and "exact" is the exception.
+- Heuristics are not wrong, but every heuristic contains, hidden inside it, the entry point for the next paper.

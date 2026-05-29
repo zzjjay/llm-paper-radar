@@ -1,0 +1,364 @@
+#+title:      Which Quantization Should I Use? A Unified Evaluation of llama.cpp Quantization on Llama-3.1-8B-Instruct
+#+date:       [2026-05-29 Fri 11:56]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T115622-en
+#+source:     https://arxiv.org/abs/2601.14277
+#+authors:    Uygar Kurt
+#+venue:      arXiv preprint, 2026-01
+
+* The River of the Problem
+
+In one sentence: *I have an ordinary laptop and I want to run a large model. How small can I compress it before it breaks down — and with so many compression methods available, which one should I pick?*
+
+This looks like a hyperparameter choice, but it is actually the outermost tip of a decade of compression history. The difficulty is not "can we compress at all?" but rather three things tangled together:
+
+1. *Model capability* collapses past a certain threshold — before that point differences are invisible, but beyond it the model suddenly can't do arithmetic.
+2. *Hardware implementation* determines which numeric formats actually run fast — theoretical 4-bit does not automatically halve memory usage in practice.
+3. *Evaluation standards* are all over the map — one paper says Q4 is fine, another says Q5 is the minimum, and there is no way to tell who is right.
+
+When llama.cpp converts a model into the GGUF format it presents you with over a dozen options (Q3_K_S, Q4_0, Q4_K_M, Q5_K_S, Q6_K, Q8_0, …), each representing a different trade-off. Reddit threads have argued about this for three years and no one has ever compared them systematically. This river flows from "how do we compress a neural network" all the way down to "should I use Q4_K_S or Q5_0?"
+
+* The Source Map
+
+#+begin_example
+[2015] Han et al. - Deep Compression
+  |
+  | Observed: 90% of the 32-bit FP weights in neural networks are redundant
+  | Solution: Pruning + Quantization + Huffman coding, applied in sequence
+  v
+[2022.08] Dettmers et al. - LLM.int8()
+  |
+  | Observed: The above approach collapses completely on 6B+ models —
+  |           because large models develop "outlier features" in their activations
+  | Solution: Most weights in INT8; the outlier columns kept in FP16 as a safety net
+  v
+[2022.10] Frantar et al. - GPTQ
+  |
+  | Observed: LLM.int8 still needs an FP16 safety net, so savings are incomplete;
+  |           and INT4 amplifies errors severely
+  | Solution: Use a small calibration dataset + Hessian information to
+  |           quantize weights to 4-bit in one pass, compensating errors by importance
+  v
+[2023] ggerganov - llama.cpp K-quants + imatrix
+  |
+  | Observed: GPTQ is elegant in theory, but during CPU inference
+  |           per-element scale lookups are slow and memory layout is chaotic
+  | Solution: Partition weights into super-blocks, each sharing one set of
+  |           scale/zero-point values; assign extra bits to critical layers
+  |           guided by an "importance matrix"
+  v
+[2023-2025] LLMC, Huang, Zheng, Jin, and other empirical studies
+  |
+  | Observed: Users choose quantization formats by Reddit folklore
+  | Solution: Run batched benchmarks — but they either switch models and hardware,
+  |           only measure perplexity, or emulate GGUF in PyTorch
+  |           instead of testing the real GGUF implementation
+  v
+[2026.01] Kurt - This paper (WhichQuant)
+  |
+  | Observed: All of the above studies never answered the most basic question:
+  |           "On the same machine, with the same model,
+  |            how much do 13 GGUF formats from Q3 to Q8 actually differ?"
+  | Solution: Lock the model (Llama-3.1-8B-Instruct),
+  |           lock the hardware, run 5 downstream tasks + perplexity + throughput
+  v
+[Future] Multi-model families / multi-hardware / long context / mechanistic interpretability
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2015 | Deep Compression: Neural Networks Can Slim Down 35×
+
+*** What Problem It Saw
+
+This was the era of AlexNet and VGG. A VGG-16 weight file weighed 552 MB — too large even to install on a phone. At the time everyone implicitly assumed that neural-network weights had to be 32-bit floats; no one questioned it.
+
+Han et al. stared at weight histograms for a while and noticed something absurd: *most weights are either close to zero or very similar to one another.* The precision of 32-bit floats was being wasted entirely.
+
+*** Its Solution
+
+Three techniques applied in sequence, like lossless file compression:
+
+1. *Pruning* — weights whose absolute value is near zero are removed outright.
+2. *Quantization* — the remaining weights share a small "palette"; each weight stores only an index into it.
+3. *Huffman coding* — more frequent indices receive shorter code words.
+
+VGG-16 shrank from 552 MB to 11.3 MB with almost no accuracy loss.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+It worked because CNN weights are genuinely redundant. But the approach carries a hidden assumption: *the weight distribution is broadly uniform, with no layers that must be handled with special care.*
+
+That holds for CNNs. But as models grew from 100 M parameters to 7 B and 70 B, the assumption began to break — and *when it broke, it did not break uniformly; it broke at a few specific locations.*
+
+The next paper is the one that got cut by that blade.
+
+** 2022.08 | LLM.int8(): Large Models Have "Assassin Layers" — You Can't Treat Them Uniformly
+
+*** What Problem It Saw
+
+Dettmers applied the Deep Compression recipe to 6 B+ language models and was stunned — *INT8 quantization caused model performance to cliff-drop*, a completely different phenomenon from what happened on ResNet.
+
+He dug into the cause with microscopic analysis and found: in Transformers with 6 B+ parameters, the activation values in certain hidden dimensions would suddenly spike to 10× or 100× the normal magnitude. He called these *outlier features*.
+
+Outlier features occupying just 0.1% of dimensions carry 99% of the effective signal. If you quantize the entire matrix uniformly to INT8, the outliers get clipped and the model instantly loses its memory.
+
+*** Its Solution
+
+Instead of treating everything the same, use *mixed precision*:
+
+- Split every matrix multiplication into two parts.
+- *Non-outlier columns* — run in INT8, saving memory and compute.
+- *The handful of outlier columns* — keep in FP16 and compute as-is.
+- Combine the two results at the end.
+
+This was the first time anyone formally established that LLMs require weights and activations to be treated differently.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+It worked because outlier features, though devastating, are sparse. The cost of the FP16 safety net is manageable.
+
+But the pitfalls are obvious:
+
+1. *Insufficient compression* — most weights are INT8 (half the size), plus the FP16 safety net, for an overall saving of only ~40%.
+2. *Slow inference* — mixed precision means constantly switching between INT8 and FP16 kernels, which is hardware-unfriendly.
+3. *Cannot compress to 4-bit* — once outliers are present, a 4-bit grid simply cannot hold the signal.
+
+Getting one tier smaller and one tier faster required a new idea.
+
+** 2022.10 | GPTQ: Use Calibration Data to Tell the Model "Where It Should Hurt"
+
+*** What Problem It Saw
+
+LLM.int8 merely quarantines outliers; *it does not compensate for the error introduced by quantization.* Quantization is lossy — at 8-bit it is tolerable, but at 4-bit the loss amplifies until the model produces nonsense.
+
+Frantar et al. asked: can we, while quantizing each weight, *know in advance which weights are dangerous to touch*, and then spread the resulting error to less sensitive weights?
+
+*** Its Solution
+
+They adapted an old technique called OBS (Optimal Brain Surgeon) — originally used for pruning small neural networks in the 1990s — whose principle is to use the *Hessian matrix* to compute the sensitivity of every weight.
+
+GPTQ modernizes and scales it up:
+
+1. *Calibration* — run 128 sentences through the model and record the covariance of each layer's activations (an approximation of the Hessian).
+2. *Column-by-column quantization* — compress one column of weights at a time down to 4-bit.
+3. *Error compensation* — after each column is quantized, use the Hessian to spread the "just-committed error" across the remaining unquantized columns.
+4. *Single-pass* — no fine-tuning required; a 175 B model finishes in a few hours.
+
+Result: *OPT-175B compressed to 4-bit with almost no perplexity change.* This was the first time 4-bit LLMs became practical.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+Hessian information turns "importance" from a feeling into a number, and allocating precision resources according to that number is optimal.
+
+But GPTQ is an *academic algorithm* — it produces a set of numbers and does not care how they are stored or computed. When it came time to deploy, a raft of problems surfaced:
+
+1. *Chaotic storage layout* — each column has its own scale, so CPU memory access jumps all over the place.
+2. *Non-portable kernels* — each target hardware needs a custom matrix-multiplication kernel.
+3. *No cross-layer discrimination* — all layers are treated equally, yet some (e.g., attention output projections) are demonstrably more sensitive.
+
+Most importantly: *there was no "format" that an ordinary user could simply download and run.* Running a large model on a laptop required someone to wrap both the algorithm and all the engineering concerns in a single package.
+
+The next baton was picked up by a Bulgarian programmer.
+
+** 2023 | llama.cpp K-quants + imatrix: Turning Quantization into a File Format
+
+*** What Problem It Saw
+
+ggerganov's situation when writing llama.cpp:
+- The GPTQ paper is beautiful, but the code requires a GPU.
+- LLM.int8 code runs on CPU, but saves only half the memory.
+- Users have a 16 GB MacBook and want to run Llama-70B.
+
+Academic algorithms did not address the specific battlefield of *CPU inference under extreme memory constraints.* Academia measured perplexity; users measured "will it even fit in RAM?"
+
+*** Its Solution
+
+No paper. Just define a file format. The core idea has two layers:
+
+**** Layer One: Blocks + Super-blocks
+
+Group every 256 weights into a super-block, then subdivide it into 16 sub-blocks:
+- Each sub-block has its own *6-bit scale*.
+- The super-block has one overall *FP16 scale*.
+- The weights themselves are stored at *3/4/5/6/8 bits*.
+
+This means the CPU reads weights in contiguous chunks — cache-friendly, SIMD-friendly. Yet each sub-block's own scale retains sufficient local precision. This is the Q3_K / Q4_K / Q5_K / Q6_K family.
+
+**** Layer Two: imatrix (Importance Matrix)
+
+Borrows GPTQ's idea but simplifies it. Run calibration text once, recording the mean squared activation for each layer — *columns with larger activations correspond to more important weights.* This signal then drives a per-layer decision:
+
+- Some layers use Q4_K_*M* (mostly Q4, with critical layers promoted to Q5).
+- Others use Q4_K_*S* (small — Q4 throughout).
+
+The suffixes _S / _M / _L indicate "how many extra bits were added to the important layers."
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+It worked because ggerganov solved three things that academia never addresses:
+- Memory layout → actually runnable on CPU.
+- File format → directly downloadable by anyone.
+- Mixed precision → resources tilted toward critical layers.
+
+But *new pitfalls appeared immediately*:
+
+1. *Format explosion* — Q3_K_S / Q3_K_M / Q3_K_L / Q4_0 / Q4_1 / Q4_K_S / Q4_K_M / Q5_0 / Q5_1 / Q5_K_S / Q5_K_M / Q6_K / Q8_0 …
+2. *Choice paralysis* — both are "5-bit," but what is the difference between Q5_0 and Q5_K_M? No one could say clearly.
+3. *No systematic comparison* — Reddit advice amounted to "I ran it and Q4_K_M felt fine."
+
+Academia noticed the problem and started producing systematic evaluations — but fell into a new set of pitfalls.
+
+** 2023–2025 | The Wave of Empirical Studies (LLMC, Huang, Zheng, et al.): Trying to Systematize, but Getting It Wrong
+
+*** What Problem It Saw
+
+The community was choosing formats by folklore, and academia grew impatient. A string of "empirical study of LLM quantization" papers appeared:
+- LLMC (Gong 2024) compared a large batch of quantization algorithms.
+- Huang 2024 / Zheng 2025 / Jin 2024 all attempted systematic perplexity comparisons.
+
+The intent was good, but Kurt calls them out by name in this paper.
+
+*** Their Solution
+
+The solution was essentially: take many models × many quantization methods × run perplexity → produce a ranking.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+These empirical studies looked systematic but *all missed the actual needs of real users*:
+
+1. *Wrong framework* — most replicated GPTQ/AWQ in PyTorch rather than testing the GGUF format itself. It is like evaluating an H.265 encoder's quality by running a simulator.
+2. *Too coarse-grained* — comparisons were "4-bit vs. 8-bit," not "Q4_0 vs. Q4_K_S vs. Q4_K_M." Users can download the latter; the former is an abstraction.
+3. *Only perplexity* — that metric does not correlate strongly with *can it do arithmetic? can it follow instructions?*
+4. *No model lock* — one study uses Llama-2-7B, another uses Mistral-7B; conclusions cannot be compared across tables.
+
+The most basic question went unanswered: *If I download Q4_K_M versus Q5_0, how much difference does it actually make?*
+
+** 2026.01 | WhichQuant (This Paper): Answering "the Most Basic Question" Properly
+
+*** What Problem It Saw
+
+By this point in the river, what was missing was *the least glamorous kind of research*: no new algorithm, no new format — just *honestly running the same model on the same machine and recording what happens.*
+
+But it enforces a strict set of controls:
+- Model locked to Llama-3.1-8B-Instruct.
+- llama.cpp version locked to b7600.
+- Hardware documented (CPU, memory).
+- Tasks covering *reasoning (GSM8K), commonsense (HellaSwag), instruction-following (IFEval), knowledge (MMLU), truthfulness (TruthfulQA), and perplexity (WikiText)*.
+- 13 GGUF formats + FP16 baseline, all produced from the same weights.
+- Throughput (prefill + decode), compression ratio, and quantization time all reported.
+
+*** Its Solution
+
+There is no algorithmic solution. *The "solution" is simply producing one carefully constructed table.*
+
+From that table, a few conclusions emerge that no one could previously confirm:
+
+1. *5-bit is the sweet spot* — Q5_0 compresses by 65% while sometimes scoring slightly above FP16 on downstream averages.
+2. *Format matters more than bit count* — variants that share the same 5-bit depth and the same perplexity of 7.43 can differ by several points on GSM8K.
+3. *Stay away from 3-bit for math* — Q3_K_S collapses most severely on GSM8K.
+4. *Q4_K_S is the default recommendation* — 71% compression with light quality loss.
+5. *Tasks differ in sensitivity to quantization* — GSM8K and IFEval are most sensitive; HellaSwag is nearly insensitive.
+6. *Q6_K / Q8_0 are Pareto-dominated* — if you can tolerate a tiny loss, Q5_0 dominates them on every axis.
+
+*** Why It Worked (and What New Pitfall It Buried)
+
+The value of this paper lies not in novelty but in *locking all variables down.* Having one paper you can point to and say "use Q5_0" is worth more than 1,000 Reddit replies.
+
+But it honestly acknowledges its own limits — these are the open pits for future work:
+
+1. *Only one model family tested* — conclusions from Llama-3.1-8B cannot be directly transferred elsewhere.
+2. *Only one model size tested* — a 70B model may behave completely differently at low bit counts.
+3. *Only CPU inference tested* — throughput distribution will shift on GPUs, NPUs, and Apple ANE.
+4. *Only short context tested* — in long-context settings, KV cache quantization and weight quantization interact.
+5. *No explanation of why Q5_0 is so strong* — the phenomenon is observed but the mechanism is not explained.
+
+* Extensions to the Frontier
+
+At the time this paper was published (2026-01), it sits at the very leading edge of this river — a "benchmark-type" paper that has just been surfaced, with no formal follow-up work yet.
+
+Several forces can be expected to push it forward:
+
+1. *Horizontal expansion* — other researchers run the same protocol on Qwen-3, Mistral, and Gemma, comparing against Kurt's table.
+2. *Vertical pressure* — the same protocol applied to 70B and 1B models, observing how the curves behave at both extremes.
+3. *Hardware dimension* — adding throughput and accuracy numbers for GPU / Apple Silicon / edge NPU.
+4. *Mechanistic explanation* — the next wave of theoretical work needs to answer "why does Q5_0 beat Q5_1 / Q5_K_M?"
+5. *Long context* — KV caches are also quantized in GGUF, and the combinatorial space of weight × KV quantization has not been systematically studied.
+
+This river's downstream course should grow from "evaluation" into "mechanistic understanding." Once we can explain why Q5_0 is strong, we can design a format like Q4.5 that is theoretically optimal from the start.
+
+* One Diagram to Understand It All
+
+#+begin_example
+              "How to Compress Neural Networks" --- A Decade of Evolution
+
+     Precision axis
+       FP32 |---o
+            |    \
+            |     \  [2015 Deep Compression]
+       INT8 |      o-------o
+            |              |\   [2022 LLM.int8 discovers outliers]
+            |              | \--o
+            |              |     \
+       INT4 |              |      o  [2022 GPTQ compensates with Hessian]
+            |              |       \
+            |              |        \--o  [2023 K-quants: give quantization a format]
+       3-6  |              |            \   _S/_M/_L
+       bit  |              |             \  imatrix
+       mix  |              |              \--o
+            |              |                  \  [2024-25 empirical studies]
+            |              |                   \  miss the target
+            |              |                    \--o
+            |              |                        \
+            |              |                         \  [2026 WhichQuant]
+            |              |                          \--o  lock all variables,
+            |              |                              answer "use Q5_0"
+            |              |
+            +--------------+----------------------------+------> Time
+                CNN era       LLM quantization           LLM quantization
+            (compress CNN    algorithms (tackling        "productized"
+             weights)        LLM-specific challenges)    (can run + can choose)
+
+     Key turning points:
+       [a] From "weights uniformly redundant" to "activations have assassins" (Han -> Dettmers)
+       [b] From "quarantine outliers" to "compensate mathematically" (Dettmers -> Frantar)
+       [c] From "elegant algorithm" to "deployable file format" (Frantar -> ggerganov)
+       [d] From "folklore format selection" to "systematic evaluation" (community -> Kurt)
+#+end_example
+
+* Insights
+
+Reading through this entire line of work, what is really happening is:
+
+*The center of gravity in quantization research has drifted from "algorithms" to "interfaces."*
+
+- Early work (Han, Dettmers, Frantar) was algorithmic innovation — "I have better mathematics."
+- Middle-stage work (ggerganov) was productization — "I packaged the mathematics into a file you can download."
+- Late-stage work (Kurt) was evaluation standardization — "I help you decide which file to download."
+
+The bottleneck at each stage was different:
+- Algorithm bottleneck: *insufficient precision.*
+- Productization bottleneck: *users cannot run it.*
+- Evaluation bottleneck: *users do not know what to choose.*
+
+This is a textbook "research → engineering → standards" maturation cycle. Once such a cycle completes, *the next wave of innovation starts from a higher level of abstraction* — automatic format selection, adaptive quantization, runtime precision switching.
+
+Another fact that many people overlook: *ggerganov, who is not an academic, has had the greatest impact of anyone in this river.* He publishes no papers and holds no tenure, yet the K-quants format is now *the de facto standard.* Every academic evaluation eventually has to confront the question "how do those GGUF files actually perform?" Research influence is ultimately determined by *whose interface gets adopted*, not by *whose citation count is highest.*
+
+* Takeaways
+
+If you are looking for research topics, this river offers three concrete lessons:
+
+1. *"Nobody has ever systematically compared this" is a severely underrated type of research topic.* Kurt's paper introduces no new method, yet it *crystallizes a fog of uncertainty into a single table.* Similar opportunities exist everywhere — you just need to find a tool that everyone uses daily but chooses by guesswork.
+
+2. *Engineering is the bridge between research and reality, not a second-class activity.* ggerganov's K-quants have no paper, yet they define the entire framework of Kurt's evaluation. *Without the GGUF interface, there would be no demand for "evaluating GGUF."* If you can build that kind of interface, you matter far more than the person writing the 100th GPTQ improvement paper.
+
+3. *The moat of an evaluation paper lies in locking the variables.* The key to an evaluation worth citing is not running more benchmarks — it is *pinning down every variable that others keep swapping out*:
+   - Same model.
+   - Same machine.
+   - Same tool version.
+   - Same task suite.
+   
+   That makes replication require reconstructing an entire environment, *raising the bar high enough* that your conclusions become the anchor everyone else references.
+
+Landing point: you can use Kurt's paper as a template right now. Find a tool you use regularly (LangChain? vLLM? some option in Ollama?), and write a "*Which X should I use? A Unified Evaluation of Y on Z.*" The evaluation paper template is already there — waiting for you to fill it in.

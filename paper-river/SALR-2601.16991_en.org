@@ -1,0 +1,310 @@
+#+title:      Sparsity-Aware Low-Rank Representation for Efficient Fine-Tuning of Large Language Models
+#+date:       [2026-05-29 Fri 12:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T120004-en
+#+source:     https://arxiv.org/abs/2601.16991
+#+authors:    Longteng Zhang, Sen Wu, Shuai Hou, Zhengyu Qing, Zhuo Zheng, Danning Ke, Qihong Lin, Qiang Wang, Shaohuai Shi, Xiaowen Chu
+#+venue:      arXiv preprint, 2026
+
+* The River of Problems
+
+Large models are too large to run or fine-tune affordably. This line of work asks exactly one question: *Can we make a model smaller while still teaching it new things — and smaller in a way that is real, not just on paper?*
+
+The question is hard because "compression" and "learning" pull in opposite directions. Compression means discarding the redundant parts of the weights; fine-tuning means growing new capabilities on top of those same weights. The more aggressively you prune, the less room is left to learn; the more room you want for learning, the less you dare to prune. For a decade, researchers have swung back and forth — some prune first then fine-tune (performance collapses), some fine-tune first then prune (the fine-tuning is wasted), some try to do both simultaneously (and can't do either well).
+
+There is a subtler trap: many papers that report "50% sparsity" are fooling themselves, because the weights still store fp16 zeros, and not a single byte of memory is saved. True "smallness" must show up at the byte level, at the kernel level, and at inference latency. Reaching the end of this line requires chewing through three bones at once — theory, algorithm, and systems.
+
+* The Source Map
+
+#+begin_example
+[2015] Han et al. - Deep Compression
+  |
+  | Observed: Neural-network weights are massively redundant;
+  |           dropping half loses almost no accuracy.
+  | Approach:  Pruning + quantization + Huffman coding; 35× compression.
+  | Left open: Post-prune retraining costs as much as original training;
+  |            the whole pipeline must be repeated for every new task.
+  v
+[2019] Houlsby et al. - Adapter Tuning
+  |
+  | Observed: Full fine-tuning for every task means storing N full model copies.
+  | Approach:  Freeze the backbone; insert a small bottleneck module per layer.
+  | Left open: Bottleneck is in series with the backbone — one extra
+  |            sequential matmul at inference, adding latency.
+  v
+[2022] Hu et al. - LoRA
+  |
+  | Observed: Adapter changes the compute graph and slows inference.
+  | Approach:  Restrict the update to low-rank W += A*B; A and B are a
+  |            bypass alongside W and can be merged back at deployment —
+  |            zero latency overhead.
+  | Left open: The backbone W remains dense fp16; no memory or compute
+  |            savings at inference. LoRA only reduces "how many parameters
+  |            to update during training."
+  v
+[2023] Frantar & Alistarh - SparseGPT
+[2024] Sun et al.         - Wanda
+  |
+  | Observed: LLMs are too large for even one gradient pass;
+  |           traditional pruning pipelines are infeasible.
+  | Approach:  One-shot post-training pruning with no gradients;
+  |            prune LLaMA to 50% sparsity in a few hours.
+  | Left open: The result is a sparse mask, but the actual weights
+  |            are still stored in dense fp16 format.
+  |            Who compensates for the discarded information? Nobody.
+  v
+[2025] Huang et al. - LoSA
+  |
+  | Observed: SparseGPT prunes and walks away; LoRA fine-tunes without pruning.
+  | Approach:  Prune and fine-tune jointly; dynamically sparsify W, A, and B
+  |            all together.
+  | Left open: Pruning all three blocks accumulates the largest error;
+  |            two dense GEMMs make training and inference heavier;
+  |            GSM8K drops from 79.5 to 71.4.
+  v
+[2026] SALR  (this paper)
+  |
+  | Observed: LoSA prunes too much; only the frozen W should be pruned;
+  |           the pruned residual should be recovered via SVD;
+  |           sparse structure must translate into real memory and speed gains.
+  | Approach:  Static pruning of W → SVD patch on the residual →
+  |            bitmap encoding + two-stage pipelined GEMM kernel.
+  | Result:    50% sparsity, performance matches LoRA, model 2× smaller,
+  |            inference 1.7× faster.
+  v
+[Future] Quantization–Sparsity–Low-Rank trinity
+         QSALR already demo'd: NF4 + 20% sparsity = 5× compression
+#+end_example
+
+* Evolutionary Narrative
+
+** 2015 | Deep Compression: Neural Networks Are Obese — and Can Lose 35×
+
+*** What Problem Did It See?
+
+By 2015, AlexNet and VGG-style vision networks were already hundreds of megabytes; deploying them to phones was simply impossible. The prevailing belief was that deep learning meant "more parameters, better results," so models could only grow. The Han team ran a counterintuitive experiment: pick any fully-connected layer, zero out the 90% of weights with the smallest absolute values, fine-tune the remaining 10% — and accuracy barely moves.
+
+In other words, *the vast majority of weights in a neural network are not doing any real work.* This was genuinely counterintuitive at the time: if SGD had spent so long optimizing every number, why would most of them be useless?
+
+*** Their Solution
+
+Three steps, each squeezing the model further:
+
+1. *Pruning*: Discard small weights, leaving a sparse matrix.
+2. *Quantization sharing*: Cluster the remaining weights into 256 centroids; store only an 8-bit index per weight.
+3. *Huffman coding*: Assign shorter codewords to more-frequent indices.
+
+Stacked together, VGG-16 shrinks from 552 MB to 11.3 MB — 35×.
+
+*** Why It Worked (and What New Holes It Dug)
+
+It worked because neural-network training is an over-parameterized search: SGD needs redundant dimensions to escape bad local optima, but once it has converged, those dimensions are expendable. A deep observation.
+
+But it planted two landmines. First, *post-prune retraining* takes as many steps as the original training — feasible for small models, completely out of reach for later GPT-scale networks. Second, *the whole pipeline must be repeated for every downstream task.* When BERT arrived in 2018–2019, a single BERT had to serve a hundred tasks; storing a 400 MB fine-tuned copy per task was untenable — and that passed the ball to Adapter.
+
+** 2019 | Adapter: Don't Touch the Backbone — Set Up a Small Side Table for New Tasks
+
+*** What Problem Did It See?
+
+Once BERT appeared, the standard NLP recipe became "pretrain a large model, then fine-tune downstream." The catch: each downstream task (sentiment analysis, QA, NER, …) required storing a full copy of BERT-large. Ten tasks meant ten 4 GB checkpoints — storage and distribution were unsustainable.
+
+Han's compression approach couldn't help here: it compressed a single model, but the problem was the *number of model copies*.
+
+*** Their Solution
+
+Houlsby devised an elegant fix: *keep the backbone frozen; insert a small bottleneck — two fully-connected layers with a hidden dimension of a few dozen — inside each Transformer layer.* Only these bottlenecks are updated during fine-tuning; the backbone is completely locked.
+
+At deployment, one large shared backbone serves all tasks, and each task carries only a few MB of adapter weights. Ten tasks drop from 40 GB to 4 GB + 40 MB.
+
+*** Why It Worked (and What New Holes It Dug)
+
+It worked because the pretrained model already encodes general linguistic capability; downstream tasks require only small "nudges" in representation space, and a bottleneck of a few dozen dimensions is large enough to hold those nudges. A sharp inductive bias.
+
+The trap was in the *compute graph*: adapters are inserted *in series* with the backbone. Each forward pass must finish the backbone computation, pause and wait for the adapter, then continue. What could have been a single matrix multiply now has an extra stop in the middle. Measured inference latency increased by 20–30%. In production, that is unacceptable.
+
+** 2022 | LoRA: Flatten the Adapter Until It Disappears Into the Backbone
+
+*** What Problem Did It See?
+
+Hu et al. stared at that 30% latency overhead and asked the incisive question: *how complex is what the adapter actually learns?*
+
+They took the weight difference ΔW between pre- and post-fine-tuning, ran SVD, and found that the top 8 singular values captured the overwhelming majority of the energy. In other words, *fine-tuning is intrinsically a low-rank update* — the model appears to learn many complex things but is really just shifting within a very thin subspace.
+
+If the update is low-rank, why use a full bottleneck inserted in series with the backbone?
+
+*** Their Solution
+
+LoRA writes the update directly as ΔW = A·B, where A is d×r and B is r×k, with r set to 4 or 8. The forward pass computes W·x + A·(B·x), with A and B placed *in parallel alongside* the backbone — no longer blocking the backbone's matrix multiply.
+
+Even better at deployment: compute A·B and add it to W, yielding a matrix of exactly the same shape as the original. At inference, no one can tell LoRA was used — zero latency overhead.
+
+*** Why It Worked (and What New Holes It Dug)
+
+It worked by satisfying three requirements simultaneously: fewer trainable parameters (only A and B, tens of MB), no extra compute at deployment (merged back into W), and preserved multi-task switching (A and B can be hot-swapped when not merged). LoRA became the de facto standard for fine-tuning large models.
+
+But it has a fundamental limitation: *W itself is still dense fp16.* A 70 B model still occupies 140 GB of memory; inference still requires the same amount of floating-point arithmetic. LoRA solves "how many parameters to update during training" — it does not solve "how large the model is at inference or how fast it runs."
+
+The deep observation Han made in 2015 — that weights are massively redundant — had been set aside in the large-model era, because pruning LLMs requires gradients, and gradients are computationally unaffordable.
+
+** 2023–2024 | SparseGPT, Wanda: Pruning LLMs Without Gradients
+
+*** What Problem Did It See?
+
+There was a canyon between the LoRA camp and the compression camp: traditional pruning requires iterating "prune → retrain → prune again," but training LLaMA-70B costs millions of dollars — who would dare retrain?
+
+As a result, LoRA fine-tuning proliferated while pruning of LLMs was nearly a blank slate.
+
+*** Their Solution
+
+SparseGPT used a Hessian approximation with layer-wise reconstruction; Wanda went further — it scores weights by |weight| × ||input||, computing no gradients at all. Both are *one-shot post-training pruning* methods: feed a small calibration dataset, and in a few hours LLaMA-70B reaches 50% sparsity with accuracy dropping only one or two points.
+
+The barrier to LLM pruning had collapsed.
+
+*** Why It Worked (and What New Holes It Dug)
+
+It worked because LLMs are even more over-parameterized than older networks — LLaMA has far more redundancy than VGG, so a single-shot cut is surprisingly tolerable.
+
+But two truly large holes remained:
+
+1. *Nothing compensates for what was pruned.* SparseGPT zeros out weights and moves on; all the information in those "small but nonzero" entries is simply lost. Once accuracy drops, it keeps dropping.
+2. *Sparsity lives only at the mask level, not the byte level.* A 50%-sparse weight matrix is still stored in dense fp16 — claim to have saved memory, measure actual memory usage: not a single byte saved. This gap was enormous, and authors quietly looked the other way. GPU kernels on 50%-sparse matrices are no faster either.
+
+So you end up with a "model that looks compressed" but not a "model that is actually small." The entire LLM inference optimization community knew it privately: sparse methods consistently lost to quantization in production precisely because of this.
+
+** 2025 | LoSA: Prune While Training — Move All Three Blocks at Once
+
+*** What Problem Did It See?
+
+Huang et al. saw that SparseGPT pruned and walked away, while LoRA fine-tuned without pruning. Could the two be done *together* — make the model sparse while simultaneously fine-tuning it?
+
+Their idea: not only prune the backbone W but also dynamically adjust the sparsity of LoRA's A and B. Let the sparse structure and the low-rank adaptation converge simultaneously.
+
+*** Their Solution
+
+LoSA = dynamic sparse masks (recomputed every few steps) + low-rank adaptation + all three blocks pruned together. Two dense GEMMs are required during computation: first ΔW = A·B, then ΔY = X·ΔW.
+
+*** Why It Worked (and What New Holes It Dug)
+
+The part that worked: coupling training and compression allows more information flow than SparseGPT's "prune and abandon" approach.
+
+But the holes were glaring:
+
+1. *It prunes too much.* SALR later proves via MSE theory that pruning all three of W, A, and B yields the largest error bound (E3 > E2 > E1). The intuition: you have already compressed once with low rank; a second cut exponentially raises the probability of destroying useful information. LoSA's GSM8K score falls from 79.5 to 71.4 — an 8-point penalty.
+2. *Higher compute cost.* Two dense GEMMs are far heavier than LoRA's two small-matrix GEMMs; training is slower and so is inference.
+3. *Dynamic sparsity is hard to deploy.* Recomputing masks every few steps means no fixed sparsity pattern at deployment, making hardware acceleration extremely difficult.
+4. *Still no byte-level sparsity* — the gap between mask sparsity and real memory savings remains unaddressed.
+
+LoSA moved the ball forward, but with the wrong technique. When SALR picked it up, the authors saw a pile of messes that needed rebuilding from scratch.
+
+** 2026 | SALR: Getting Theory, Algorithm, and Systems Right All at Once
+
+*** What Problem Did It See?
+
+The team led by Longteng Zhang, standing on a decade of accumulated failures, saw one thing clearly: *the reason this line never reached its destination is that each generation only solved one face of the problem.*
+
+- Han solved "compression is possible" — but for small models.
+- Adapter solved "multi-task sharing" — but inference was slow.
+- LoRA solved "training with fewer parameters + zero inference latency" — but never touched the backbone.
+- SparseGPT/Wanda solved "LLMs can be pruned" — but accuracy dropped and bytes were not saved.
+- LoSA solved "prune while training" — but with the wrong technique: too much pruned, too much compute, no deployment path.
+
+SALR's question: *Can we get all three things — theoretical guidance, algorithmic choices, and systems-level deployment — right at the same time?*
+
+*** Their Solution
+
+Three stacked layers, each aimed at a predecessor's wound:
+
+1. *Theory layer*: Derive an MSE error-bound framework that proves *pruning only the frozen W while leaving A and B untouched* yields the lowest error bound (E1). This is the theoretical death sentence for LoSA.
+2. *Algorithm layer*: Don't discard the pruning residual E = W − Ŵ — apply truncated SVD to obtain a rank-r low-rank patch and attach it alongside the LoRA adapter. The per-element MSE is thereby reduced by a factor of (1 − r/min(d,k)) — a theoretically guaranteed information recovery. Multiple low-rank adapters (LoRA's A·B and the SVD patch) are fused by column-concatenation into a single GEMM with no additional runtime overhead.
+3. *Systems layer*: Encode the sparse weights with a bitmap (one bit per position to mark nonzeros); write a two-stage pipelined kernel — stage one decompresses in parallel, stage two runs the GEMM in parallel. Now 50% sparsity genuinely yields half the memory and twice the arithmetic throughput.
+
+Going further: stack with NF4 quantization → QSALR → 5× model compression.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it took *every layer of prior failure* seriously:
+
+- LoSA was wrong to prune A and B? Prove that pruning only W is optimal — establish the theory first.
+- SparseGPT was wrong not to compensate? Apply SVD to recover the residual; per-element MSE is now bounded.
+- The entire sparse camp was wrong to ignore byte-level savings? Write a bitmap kernel; fix it at the hardware level.
+- LoRA was wrong not to touch W? Touch W — but only with a single static prune pass, producing a fixed pattern at deployment.
+
+Result: at 50% sparsity, GSM8K and MMLU both match or exceed LoRA; model is 2× smaller; inference is 1.7× faster. This is the first time in this line that "all of the above" was claimed — and actually delivered.
+
+New holes left behind (which are the starting point for the next generation):
+
+- 50% is the sweet spot on this line; can 70% or 80% sparsity maintain the same gains? SALR itself does not fully demonstrate this.
+- A static mask means the mask selection must be right on the first try — sensitivity to the calibration dataset is amplified.
+- How should the SVD patch rank r be chosen adaptively? Currently it is hand-tuned.
+- Can this be combined with sparse attention (the KV-cache branch)? No one has done this yet.
+
+* Frontier Extensions
+
+SALR is a January 2026 paper — the most recent advance on this line. The directions for extension are already taking shape:
+
+- *QSALR* (demonstrated in the same paper) shows the feasibility of a "quantization + sparsity + low-rank" trinity. The next milestone is likely a unified MSE framework covering all three sources of error, giving users a single knob to trade "how much compression" against "how much accuracy loss."
+- *Hardware co-design*: The bitmap kernel is SALR's early implementation. The FlashAttention story tells us that once the theory is settled, hardware primitives catch up quickly. NVIDIA/AMD's next-generation Tensor Cores in 2026–2027 are expected to natively support bitmap-sparse GEMM.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                    The History of Liberation Along Three Dimensions
+                    =================================================
+
+  Year      Training Efficiency      Inference Size            Inference Speed
+  ----      -------------------      --------------            ---------------
+  2015      X Full training          Han  35× compression      X Not measured
+            (retraining required)    (small models)
+
+  2019      Adapter                  X Multiple large copies   X +30% latency
+            Only update bottleneck   (adapter itself is small)
+
+  2022      LoRA                     X Backbone unchanged      Merge back into W
+            Only update A, B         (still fp16)              Zero latency
+
+  2023      X Still needs gradients  SparseGPT/Wanda           X Bytes not saved
+            (SparseGPT doesn't)      50% mask                  Kernel not faster
+
+  2025      LoSA                     X Bytes not saved         X Two dense GEMMs
+            Prune while training     Mask level only           Even slower
+
+  2026      SALR                     SALR                      SALR
+            Prune only W +           Bitmap encoding           Pipelined kernel
+            SVD patch residual       Truly halved              1.7× speedup
+
+  ------------------------------------------------------------------
+   Han's 2015 observation —                  Eleven years later:
+   "weights are massively redundant"         "memory and time actually saved"
+#+end_example
+
+* Insight
+
+The biggest takeaway from reading this line: *"pruning" and "low-rank" are not two different things — they are two faces of the same thing.*
+
+- Pruning says: most elements of a weight matrix are noise; remove them without losing accuracy.
+- Low-rank says: the useful part of a weight matrix is concentrated in a small subspace.
+
+Mathematically these are almost the same statement: *the effective information content of a weight matrix is far smaller than its nominal dimension.* For a decade the two camps pursued separate paths; LoSA was the first to attempt a merger (but merged incorrectly); SALR was the first to use an MSE framework to clearly articulate "what should be pruned and what should be recovered."
+
+The deeper implication: *we used to measure models by parameter count — we should now measure them by effective information content.* A 70 B model may contain only 7 B worth of "effective information"; the rest is redundant dimensions (handled by pruning) and low-rank fluctuations (handled by LoRA/SVD). SALR's MSE framework is essentially *a metric for effective information.*
+
+The most likely next step: extend this framework to *attention.* SALR currently targets only FFN and projection weights; it does not touch the K and V caches in attention — yet those dominate memory at inference time. Once the bitmap-sparse + low-rank residual recovery paradigm is ported to attention, LLM inference costs could drop by another order of magnitude.
+
+* Lessons
+
+For how to do research, the biggest lesson this line offers is: *don't route around the truly hard problems.*
+
+Every generation of papers used a clever compromise to avoid the core issue:
+- Adapter didn't touch the backbone, so the series connection caused latency.
+- LoRA didn't touch the backbone's density, so memory was not saved.
+- SparseGPT didn't compensate for lost information, so accuracy dropped.
+- LoSA ignored the error bound, so it pruned destructively.
+
+The reason SALR could take a large step forward is that it *directly tackled several problems everyone else had been routing around simultaneously*: it required a theoretical bound, a way to recover lost information, and byte-level sparsity in deployment. This "have it all" stance looks greedy, but the problems are inherently coupled — solve only half and the other half bites back.
+
+Practically speaking:
+
+- If you are doing model compression research, *start by deriving an error bound.* Trial-and-error pruning without theoretical guidance will be dominated by opponents who have one.
+- If you are doing systems optimization, *sparse GEMM kernels are the next FlashAttention-scale opportunity* — SALR has only opened the door.
+- If you are choosing an LLM deployment strategy, *you can now seriously add "sparse + low-rank" methods like SALR to your evaluation list* — it is no longer a binary "quantize or don't."
+- More generally: *when you notice that every solution in a field only solves half the problem, the "have it all" position that everyone is routing around is almost certainly where the next major paper needs to stand.*

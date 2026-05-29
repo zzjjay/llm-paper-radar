@@ -1,0 +1,316 @@
+#+title:      E$^3$-Pruner: Towards Efficient, Economical, and Effective Layer Pruning for Large Language Models
+#+date:       [2026-05-29 Fri 11:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T113824-en
+#+source:     https://arxiv.org/abs/2511.17205
+#+authors:    Tao Yuan, Haoli Bai, Yinfei Pan, Xuyang Cao, Tianyu Zhang, Lu Hou, Ting Hu, Xianzhi Yu
+#+venue:      arXiv preprint, 2025-11
+
+* The River of the Problem
+
+A question that is simple to state yet hard to solve: given a large model with billions or tens of billions of parameters, can you drop a few layers to make it run faster without losing its ability to answer questions?
+
+The difficulty lies in three things knotted together:
+1. *You cannot guess which layers to drop* — layers are mutually dependent, and deleting the wrong one can wreck the whole model. Yet every search algorithm for "which layers matter least" is expensive.
+2. *After dropping, you must rescue* — removing layers inevitably hurts accuracy, so you need KD or SFT to "train it back." The training cost alone can run into billions of tokens, more expensive than the pruning itself.
+3. *You must actually account for speedup* — pruning looks great on paper, but whether it is truly fast on real hardware is another matter. Structured sparsity often promises much and delivers little.
+
+Every generation working on this river has been pulled between these three corners: save on search, or save on training, or chase real speedup — almost no one has managed all three at once. The reason E³-Pruner calls itself "three E's" (Effective / Economical / Efficient) is that it tries to lift all three corners simultaneously.
+
+* Source Map
+
+#+begin_example
+[2023] LLM-Pruner (Ma et al.)
+   |    Problem: LLM pruning from scratch — no one knew how to do it
+   |    Solution: Identify "coupled structural groups" and prune them together (width direction)
+   |    Residue: Width-pruned sparse structures are not always hardware-friendly
+   v
+[2024] Sheared-LLaMA (Xia et al.)
+   |    Problem: LLM-Pruner prunes in one shot, cannot precisely control the ratio
+   |    Solution: Gumbel-Softmax + sparsity regularization, end-to-end differentiable pruning
+   |    Residue: Training is 5x slower; ratio can only be "approached," not pinned exactly
+   v
+[2024] ShortGPT (Men et al.)
+   |    Problem: Width pruning + retraining costs too much
+   |    Solution: Switch to pruning whole layers (depth direction), use cosine BI score,
+   |              drop layers with no training at all
+   |    Residue: No retraining means large accuracy drops; math/reasoning tasks collapse
+   v
+[2024] Minitron (Muralidharan et al.)
+   |    Problem: ShortGPT drops layers with no recovery — too blunt
+   |    Solution: BI score for layer selection + large-scale KD for recovery
+   |    Residue: KD requires tens of B tokens; training is expensive;
+   |              importance scores and "the model after pruning" are two different things
+   v
+[2025] DarwinLM (Tang et al.)
+   |    Problem: Static BI score for layer selection ignores post-pruning global behavior
+   |    Solution: Evolutionary search over architectures, evaluating candidate models each generation
+   |    Residue: Evolutionary process requires ~1B token training evaluations — still expensive
+   v
+[2025-11] E3-Pruner  <-- this paper
+   |    Problem: None of the above paths simultaneously achieve cheap + accurate + fast
+   |    Solution: Gumbel-TopK differentiable search (cheaper search) +
+   |              entropy-aware adaptive KD (cheaper training) +
+   |              strict whole-layer pruning (hardware-friendly, real speedup)
+   |    Results: Qwen3-32B pruned 25% of layers, MATH-500 96.0%
+   |             (original model 96.8%, previous SOTA Minitron 95.0%)
+   |             Training uses only 0.5B tokens, inference 1.33x speedup
+   v
+[?] How will the next generation critique it?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | LLM-Pruner: To Prune a Large Model, First Figure Out "Which Parameters Belong Together"
+
+*** What Problem It Saw
+
+Before the era of large models, pruning was a toy for small models. Researchers dealt with hundreds of millions of parameters — prune once and fine-tune, done.
+
+With LLMs, that approach broke down. For a 7B model, if you want to trim it to 5B, you cannot arbitrarily delete weights — many parameters in a transformer are "tied together": the query, key, and value projections of an attention head; the up-projection dimension in an FFN paired with the corresponding down-projection. Delete one without the other and matrix dimensions no longer align.
+
+*Even worse*: no one had the compute to prune and fully retrain an LLM the way BERT-era models were handled.
+
+*** Its Solution
+
+LLM-Pruner first did something laborious but necessary: identify all "coupled parameter groups" in the model and treat each group as the smallest pruning unit. Pruning one group means cutting the entire dependency chain together, without breaking dimensions.
+
+It then uses first- and second-order gradient information to score each group by importance, discards the least important ones, and finally applies a small amount of LoRA fine-tuning to recover accuracy.
+
+*** Why It Worked (and What New Problems It Created)
+
+It turned "pruning an LLM" from impossible to possible. But the pitfalls were obvious:
+1. The result is oddly shaped matrices that are narrower in the width direction — GPU kernels cannot always fully utilize them, and the measured speedup is far smaller than the theoretical FLOPs reduction.
+2. Pruning is done in one shot; if you want to hit exactly "25% pruned," you basically cannot — you check the ratio after the fact.
+
+The next generation zeroed in on these two pitfalls.
+
+** 2024 | Sheared-LLaMA: Don't Prune All at Once — Let the Model Learn to Prune Itself
+
+*** What Problem It Saw
+
+LLM-Pruner follows a discrete pipeline: "score → cut → patch." The problem: importance scores are local and instantaneous, but "whether the whole model still works after pruning" is global and dynamic. The two are misaligned.
+
+It also cannot precisely control the pruning ratio — ask for "30% pruned" and you get 28% or 31%, depending on the run.
+
+*** Its Solution
+
+Sheared-LLaMA reformulates pruning as *end-to-end differentiable*: each prunable unit gets a mask variable, and Gumbel-Softmax relaxes the discrete "prune / keep" choice into a continuous distribution. A sparsity regularization term then drives the masks toward the target sparsity rate.
+
+The whole thing runs interleaved with normal training — the model is simultaneously being pruned and adapting to its pruned state.
+
+*** Why It Worked (and What New Problems It Created)
+
+The benefits of differentiability are clear: gradients directly tell you "how much will the loss rise if I prune a little more here?" That is more reliable than hand-crafted scoring.
+
+But the pitfalls are equally clear:
+1. Training is *5× slower* than normal SFT, because every step must compute gradients through the masks and the regularization term.
+2. Sparsity regularization can only "push" — it cannot "pin" — so the final ratio still drifts; hitting exactly 25% requires repeated coefficient tuning.
+3. It still prunes width, so the hardware acceleration problem remains unsolved.
+
+At this point, people began to realize that width pruning was an overly complicated path. Someone started asking: why not prune entire layers?
+
+** 2024 | ShortGPT: Drop Whole Layers — the Most Blunt Approach, Yet the Most Natural
+
+*** What Problem It Saw
+
+All the headaches of width pruning — coupled groups, oddly shaped matrices, kernel unfriendliness — stem from "operating inside a layer."
+
+But what if you delete an entire layer? A transformer block, once removed, is gone; the remaining layers connect normally, matrix dimensions are completely unchanged, and any inference framework ingests the result as-is. The speedup ratio equals the ratio of layer counts, with no hidden discounts.
+
+*** Its Solution
+
+ShortGPT proposes the BI (Block Importance) score: run a calibration dataset through the model and measure the cosine similarity between the input and output of each layer. Higher similarity means the layer "did almost nothing" and is a better candidate for removal.
+
+Sort layers by BI score from low to high and remove the target number of layers. *No training whatsoever.*
+
+*** Why It Worked (and What New Problems It Created)
+
+It cleanly demonstrated one fact: LLMs genuinely contain quite a few redundant layers, at least by the cosine similarity measure.
+
+But the cost is accuracy. On commonsense tasks, ShortGPT still holds up; on hard tasks — math, code, reasoning — performance collapses. The reason is intuitive: high cosine similarity does not mean the layer is useless; it may simply be applying a small correction. Remove all those "small corrections" together and the entire reasoning chain breaks.
+
+From this moment, the field converged on a consensus: pruning whole layers is the right direction, but you cannot skip recovery.
+
+** 2024 | Minitron: Choosing Layers Is the Easy Part; Recovering Them Is the Real Work
+
+*** What Problem It Saw
+
+ShortGPT's problem, at its root, is *no retraining*. It makes layer selection very cheap and skips recovery entirely.
+
+But once you accept that retraining is necessary, the precision requirement on layer selection drops — as long as selection is not too bad, subsequent KD can compensate for a large portion. The focus should shift to how to reduce training cost.
+
+*** Its Solution
+
+Minitron's approach: use an importance score similar to ShortGPT's for coarse layer selection, then apply large-scale knowledge distillation (KD) so that the pruned model's outputs approximate those of the original.
+
+The advantage of distillation: it learns a distribution, not just answers — information density is far higher than SFT. With the same token budget, KD recovers much more accuracy than SFT.
+
+*** Why It Worked (and What New Problems It Created)
+
+Minitron brought "post-pruning recovery" to a high standard. In the setting of pruning 25% of layers from Qwen3-32B, its MATH-500 score reaches 95.0%, less than 2 points below the original model's 96.8%. This was the SOTA before E³-Pruner appeared.
+
+But the pitfalls are clear:
+1. KD requires a substantial number of training tokens — tens of billions to start — so the training bill remains high.
+2. *Layer selection and recovery are two disconnected steps.* The BI score tells you "which layers are inactive now," but which layers are inactive after recovery is a different question. There is no gradient connecting the two steps.
+
+The next person would ask: why not let "layer selection" also be driven by the loss?
+
+** 2025 | DarwinLM: Then Use Evolution — Search the Entire Architecture Directly
+
+*** What Problem It Saw
+
+Minitron uses a static, one-shot importance score. Its implicit assumption is: "the importance the pre-pruning model reports will still hold after pruning." This assumption breaks down under aggressive pruning.
+
+DarwinLM surfaces this problem: since single-point importance scores are inaccurate, why score at all? *Search the entire architecture directly* — which layers to keep, which heads to keep, which MLP channels to keep — and let the search algorithm figure it out by trial.
+
+*** Its Solution
+
+Use an evolutionary algorithm: maintain a population of candidate architectures, score each generation with a short training run followed by a short evaluation, keep the good ones, and produce the next generation through mutation and crossover.
+
+It can even perform mixed pruning across layers, widths, and heads — not limited to whole-layer pruning.
+
+*** Why It Worked (and What New Problems It Created)
+
+It prescribed the right medicine for the "inaccurate scoring" disease — you look directly at actual performance rather than relying on proxy metrics.
+
+But the cost is painful: the evolutionary process alone burns ~1B tokens of training just to evaluate each offspring. The search phase is as expensive as the actual fine-tuning that follows — or more so.
+
+At this point, an interesting pattern emerges in the river: the field keeps toggling between "save on search" and "save on training." ShortGPT saves on training but picks layers crudely; Minitron retrains to compensate but training is expensive; Sheared-LLaMA and DarwinLM refine the search but the search itself becomes more expensive.
+
+*No one has pressed all three down at once.* That is E³-Pruner's entry point.
+
+** 2025 | E³-Pruner: Press All Three at Once
+
+*** What Problem It Saw
+
+Abstracting the river above, E³-Pruner identifies three mutually antagonistic pain points:
+
+| Pain point | Who is stuck here |
+|------------+-------------------|
+| Inaccurate layer selection | ShortGPT (static cosine), Minitron (static BI) |
+| Expensive training | Minitron (tens of B tokens), DarwinLM (~1B search + fine-tune) |
+| Illusory speedup | LLM-Pruner, Sheared-LLaMA (width pruning, hardware-unfriendly) |
+
+Previous work solved 1–2 of these, but fixing A caused B to resurface. Solving all three simultaneously requires redesigning both the search and training phases from the ground up.
+
+*** Its Solution
+
+Two phases:
+
+*Phase 1: Gumbel-TopK Differentiable Search* (cheaper search + more accurate layer selection)
+
+Rather than using Gumbel-Softmax plus sparsity regularization to "approach" a target ratio as in Sheared-LLaMA, E³-Pruner uses *Gumbel-TopK*: directly select the Top-K layers to retain from N candidates. The ratio is *pinned*, not approximated.
+
+Top-K is itself a discrete operation and cannot be differentiated; Gumbel noise makes it differentiable. KL divergence serves as the loss — the output of the model with certain layers removed must approximate the output of the original model. Gradients directly tell you "whether keeping this layer or that layer causes less damage to the final behavior."
+
+This step resolves the old problem of "layer selection being decoupled from model behavior": the objective function for layer selection is precisely "model behavior after pruning."
+
+*Phase 2: Entropy-Aware Adaptive KD* (cheaper training + effective recovery)
+
+Standard KD treats every token equally, but most tokens are simple (syntactic fillers, stop words) — learning them barely matters. The tokens that truly need the teacher's guidance are *high-entropy tokens* — positions where the model is uncertain and prone to going wrong.
+
+E³-Pruner weights each token by its entropy, concentrating training compute on these positions. The result: only 0.5B tokens of training, yet it matches or surpasses Minitron trained on tens of billions of tokens.
+
+*Whole-layer pruning* (hardware-friendly, real speedup)
+
+The entire method prunes only whole layers, never widths. Inference frameworks ingest the result directly, and the 1.33× speedup is measured on actual hardware — not derived from FLOPs arithmetic.
+
+*** Why It Worked (and What New Problems It Created)
+
+Its core reason for working is *connecting "layer selection" and "layer recovery" through a single gradient* — the loss for layer selection is exactly the behavioral gap of the pruned model. Minitron's two-step "score first, then KD" loses information at the boundary; E³-Pruner fuses those two steps into one, so no information is discarded.
+
+Entropy-aware KD is a more elementary insight: training compute should be spent where learning is hard. Applied correctly, 0.5B tokens does the work of tens of billions.
+
+Pitfalls it leaves behind:
+1. Gumbel-TopK search still requires full-model gradient computation — not cheap — and may still be a bottleneck for models in the hundreds of billions of parameters.
+2. Whole-layer pruning has a hard ceiling — some layers genuinely cannot be removed. 25% is the sweet spot; whether 50% can look this good is doubtful, and the 16-layer variant in the paper already shows accelerating accuracy degradation.
+3. KL plus entropy weighting is hand-crafted. Why entropy rather than another uncertainty measure is not fully justified.
+
+* Frontier Extensions
+
+As of now (2026-05), no work explicitly critiquing E³-Pruner has surfaced — the paper was posted in 2025-11. But following the evolutionary logic, the next moves are almost predictable:
+
+*Direction A: Breaking the ceiling of whole-layer pruning*
+
+E³-Pruner holds up at 25%; higher pruning rates degrade. Someone will likely propose a hybrid strategy of "whole-layer pruning + fine-grained width pruning," using E³'s differentiable framework to search both granularities jointly. The challenge is preserving hardware friendliness — which loops back to the old problem that ShortGPT sidestepped.
+
+*Direction B: Even cheaper search*
+
+Gumbel-TopK still requires full-model gradient passes. Work will likely propose proxy-model-based, partial-forward, or neural-predictor-based search to compress this step further, down to GPU-hours.
+
+* One Diagram to Understand It All
+
+#+begin_example
+
+  Pruning granularity    Search strategy         Recovery strategy       Cost / bottleneck
+  ------------------     ---------------         -----------------       -----------------
+  Width coupled groups - gradient + one-shot - - LoRA light fix     <-- LLM-Pruner 2023
+                                                                         ratio imprecise / illusory speedup
+                                                                              |
+                                                                              v
+  Width + mask        - Gumbel-Softmax        - end-to-end joint   <-- Sheared-LLaMA 2024
+                        + sparsity reg          training                 training 5x slower
+                                                                              |
+                                                                              v
+  Whole layer (depth) - static cosine BI      - no retraining      <-- ShortGPT 2024
+                                                                         math tasks collapse
+                                                                              |
+                                                                              v
+  Whole layer         - static BI             - large-scale KD     <-- Minitron 2024
+                                                                         KD training ~tens of B tokens
+                                                                              |
+                                                                              v
+  Whole layer + width - evolutionary search   - per-gen training   <-- DarwinLM 2025
+  mixed                                                                  search ~1B tokens
+                                                                              |
+                                                                              v
+  Whole layer         - Gumbel-TopK           - entropy-aware KD   <-- E3-Pruner 2025
+                        (diff. + pinned ratio)  (0.5B tokens)           real hardware speedup
+                                                                         25%@MATH 96.0
+                                                                              |
+                                                                              v
+                                                                         Next wave?
+                                                                     mixed granularity /
+                                                                     small proxy search
+
+  Timeline: 2023 ------------ 2024 ------------ 2025 ---------> future
+
+  Core tension:
+      [Accurate selection]  <--pull-->  [Cheap training]  <--pull-->  [Real speedup]
+      Whoever presses all three down at once becomes the new SOTA
+
+#+end_example
+
+* Insights
+
+Looking at this river from beginning to end, the surface story is "pruning techniques iterating," but underneath lies *a tension that recurs throughout machine learning*:
+
+*Static heuristics vs. dynamic search vs. recovery training — how to allocate budget among the three*
+
+- Early phase (LLM-Pruner): trust heuristic scores + light fine-tuning
+- Middle phase (Sheared-LLaMA): distrust heuristics, force search into training, training becomes expensive
+- Reversal (ShortGPT): retreat to static heuristics but eliminate training entirely, accept accuracy loss
+- Counter-reversal (Minitron): heuristic selection + heavy investment in training, bill charged to KD
+- Escalation (DarwinLM): distrust heuristics, use evolutionary search, but search itself becomes expensive
+- *Synthesis* (E³-Pruner): differentiable search (accurate and cheap) + token-weighted training (accurate and cheap)
+
+Real progress is never "add another trick." It is *merging two previously separate budgets into one gradient*. Sheared-LLaMA merged search and training but made training expensive; E³-Pruner refines search while making training tokens more valuable through entropy-awareness — both sides saved simultaneously.
+
+There is a larger metaphor here: any "two-stage" system will eventually have someone fuse it into one stage. Scoring + pruning, pruning + distillation, distillation + quantization — all will be merged. E³-Pruner is a waypoint in this fusion trend within the pruning domain, not the endpoint.
+
+*The most likely next direction*: pruning, quantization, and KV cache compression are currently developed independently. Expect a paper that places them inside a single differentiable framework and searches them jointly — at which layer a token is processed, at what precision, and with how much KV history all become differentiable variables.
+
+* Takeaways
+
+Lessons for doing research:
+
+1. *Find the tension, not the blank space* — E³-Pruner did not discover a brand-new direction; it observed that "accurate selection / cheap training / real speedup" had been undermining each other all along and deliberately designed to bind them together. In technical fields, *the combination of known pain points is often the most fertile entry point*, more productive than digging entirely new holes.
+2. *Merging two steps is a classic move* — Any pipeline split into "first A, then B" is worth asking: "Can A and B be tied together by a single loss?" Gumbel-TopK dissolves the boundary between "scoring" and "pruning," and this operation generalizes to many two-stage pipelines.
+3. *Spend the budget where things are hard* — Entropy-aware KD is an insight you can explain in one sentence, but its power comes from the observation that "distributing training compute uniformly is wasteful." For any training pipeline, ask: "Which parts are hard to learn, which are easy — can I upweight accordingly?"
+
+Practical implications:
+
+- If you are doing model compression, do not look only at accuracy — simultaneously track *search cost / training cost / measured speedup*. Losing ground on any one of these is not a win.
+- If you are building any "two-stage" system (retrieve + generate, plan + execute, select + evaluate), consider whether the discrete decision in stage one can be made differentiable so that stage two's loss can flow back.
+- If you are doing distillation or fine-tuning, try weighting tokens (by entropy, by loss, by gradient magnitude) — it will very likely match the effect of uniform training with far fewer tokens.

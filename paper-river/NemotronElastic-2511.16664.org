@@ -1,0 +1,336 @@
+#+title:      Nemotron Elastic: Towards Efficient Many-in-One Reasoning LLMs
+#+date:       [2026-05-29 Fri 11:34]
+#+filetags:   :paper:river:
+#+identifier: 20260529T113408
+#+source:     https://arxiv.org/abs/2511.16664
+#+authors:    Ali Taghibakhshi, Sharath Turuvekere Sreenivas, Saurav Muralidharan, Ruisi Cai, et al. (NVIDIA)
+#+venue:      arXiv 2025-11
+
+* 问题之河
+
+一个公司发布一款大模型，往往要发整整一家子：12B、9B、6B、4B……为什么？因为云上跑大的，手机里得跑小的。
+
+但训练一家子的代价吓人——每个 size 都要从零训一遍，几百亿 token 一次，电费烧成天文数字。
+
+退一步：能不能训一个大的，剪一刀变小？能。但每剪一刀，又要重训几百亿 token 把它救回来。这叫 Minitron 这条路线。
+
+再退一步：能不能"一次训练，多种尺寸"？训一个 12B，里面已经天然嵌套了一个 9B、一个 6B，部署时按需要取一份就行，不需要再训？
+
+这就是这条河要解决的问题。它一路从 2022 年的一个嵌入学习小论文开始，淌过 Transformer，淌过 Mamba，淌到 2025 年底的推理大模型——每一步都在回答同一个问题：*怎么让一个模型里同时住下多个模型？*
+
+* 溯源地图
+
+#+begin_example
+[2022] Kusupati - Matryoshka Representation Learning (MRL)
+  |
+  | 问题: 一个 embedding 只能定一个粒度，要多粒度就得训多份
+  | 解法: 让前 k 维自己就是一个能用的小 embedding (套娃)
+  v
+[2023-10] Devvrit/Kudugunta - MatFormer
+  |
+  | 问题: MRL 只玩 embedding，整个 Transformer 不也能套娃吗？
+  | 解法: 把套娃结构塞进 FFN，训一个大模型抽出 g 个嵌套子模型
+  v
+[2024-06] Cai - Flextron
+  |
+  | 问题: MatFormer 抽出的子模型尺寸固定，路由也死板
+  | 解法: 加一个 router，按输入/预算动态选子模型；扩到 attention head
+  v
+[2024-10] Shukla - MatMamba
+  |
+  | 问题: 上面这些都是 Transformer，新的 Mamba 怎么办？
+  | 解法: 把套娃结构搬进 Mamba2 block
+  v
+[2025-11] Taghibakhshi - Nemotron Elastic  <--- 目标论文
+  |
+  | 问题: 真正能用的 SOTA 模型是 hybrid Mamba+Attention 的推理模型，
+  |       前面这些都不支持；而且推理模型要长上下文，更不能简单套用
+  | 解法: 把套娃推到 hybrid 架构 + 推理训练 + 端到端 router + 异构层选择
+  v
+[2026 ICML] Taghibakhshi - Star Elastic (后续)
+  | 把同样的思路再推到 MoE 架构 (30B-A3B 三个尺寸)
+
+(并行线，作对比)
+[2024-07] Muralidharan - Minitron / Minitron-SSM
+  | 不走套娃路: 训大的，剪出小的，再蒸馏救活；每个 size 单独救活
+  | 这是 Nemotron Elastic 主要要打的对手 (省 7x token)
+#+end_example
+
+* 演化叙事
+
+** 2022 | MRL: 让一个向量装下多个粒度
+
+*** 它看到了什么问题
+
+那个年代你训一个 embedding 模型，512 维就是 512 维。如果有一天你说"我手机内存只够放 64 维"，对不起，请你重训一个 64 维的。每个尺寸一份模型——不雅观，更不省事。
+
+更刺痛的是：这个 512 维向量里其实早就埋着信息密度的不均匀，前面几十维通常已经能把大类区分开了，后面几百维只是在补细节。但你没办法只取前面几十维当一个小模型用，因为训练时没有人逼它"前 k 维也得自己能用"。
+
+*** 它的解法
+
+简单粗暴：训练时把同一个 embedding 切成几段，每一段都加一个独立的分类头，每一段都算 loss，全部加起来一起反传。
+
+这样一来，前 8 维被逼着自己能分类，前 16 维也得能，前 32 维也得能……训完之后，你想要哪个粒度，就截到哪一维。一个向量，几十个尺寸，免费。
+
+像俄罗斯套娃——大的拆开里面有小的，小的拆开里面还有更小的，每一个都是完整的玩偶。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为损失函数本身把"前 k 维要自给自足"刻进了梯度里。模型没有选择，只能把最判别的信息往前堆。
+
+但这只解决了 embedding 一个层。整个深度网络呢？每一层每一块也想套娃，怎么办？
+
+—— 这个新坑被下一篇论文挖。
+
+** 2023-10 | MatFormer: 把套娃塞进 Transformer
+
+*** 它看到了什么问题
+
+MRL 只动了输出向量。可一个 Transformer 里 60% 的参数都在 FFN（前馈层）的中间维度上。如果整个模型不能套娃，只让最后一层 embedding 套娃，省下的算力九牛一毛。
+
+更现实的问题：要部署到云、桌面、手机三种场景，传统做法是训三个不同尺寸的模型。但只要尺寸不一样，蒸馏、对齐、推理代码全都得重写。能不能让一个模型自带三种尺寸？
+
+*** 它的解法
+
+把 MRL 的套娃逻辑搬进 Transformer 的 FFN 中间维度。
+
+具体地：FFN 的中间维度 d_ff，划成 g 个嵌套区间，比如 [d_ff/8, d_ff/4, d_ff/2, d_ff]。训练时每一步随机抽一个粒度，只跑那个粒度的前向反向。因为权重都共享，更新小的等于更新大的。
+
+训完之后，每一层都自带 g 个可抽取的子 FFN。再玩一招 "Mix'n'Match"——每层独立选粒度，组合数爆炸，几百个子模型免费送。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+套娃逻辑天然适合权重共享：你训大的，等于在训小的；训小的，等于在 fine-tune 大的中最关键的那部分参数。两边互不矛盾。
+
+但坑也明显：
+
+一，*只动了 FFN*。Attention head 数没动，每层也都用同一个粒度。粒度的灵活度不够。
+
+二，*抽出来的子模型尺寸死板*。训练时设了 g=4，部署时本质就这四种（Mix'n'Match 是手动拼），没有一个智能的机制根据输入或预算动态决定。
+
+三，*训练计算量翻倍*。论文自己说每个 token 的 FLOPs 比普通 Transformer 高 2.58 倍——套娃的代价。
+
+下一步：能不能加一个学出来的路由器，让模型自己决定每层用多大？
+
+** 2024-06 | Flextron: 给套娃配一个路由器
+
+*** 它看到了什么问题
+
+MatFormer 抽子模型时，你得手动指定每层的粒度。这有两个不爽：
+
+一，*尺寸不灵活*。手动选 g=4 套，想要中间尺寸只能凭手感插值。
+
+二，*没考虑输入差异*。一个简单问题和一个难问题，用同样大的子模型——明显浪费。
+
+三，*只动 FFN，不动 attention*。Attention head 在长上下文里能吃掉 70% 显存，一动不动等于把最大的肉留在桌上。
+
+*** 它的解法
+
+加 router。两种模式：
+
+- *Static router*：给一个延迟/显存预算，输出一个最优的层粒度配置。
+- *Adaptive router*：每个 token 进来时，router 自己决定走哪个子网络。
+
+而且这次 *MLP 和 attention head 都能 elastic*。Attention head 按重要性排序，从小到大嵌套，router 选 top-k。
+
+训练上，因为路由不可微，他们用一个 surrogate model 预测最终 loss，然后让 router 在 surrogate 上做梯度下降——绕开梯度断裂的问题。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把"选哪个子模型"从人变成模型自己学。这是从手工切换到自适应的关键一跃。
+
+但还是有问题：
+
+一，*router 训练分两阶段*——先训 elastic 网络，再训 router，主干和 router 不能真正端到端共训。
+
+二，*Surrogate model 是替身*——你优化的是 surrogate 的 loss，不是真正的 loss，总有偏差。
+
+三，*只玩 Transformer*。2024 年下半年，Mamba 异军突起，state space model 比 Transformer 快几倍，整个 elastic 套路对它失效。
+
+下一步：把套娃推到 Mamba 上。
+
+** 2024-10 | MatMamba: 套娃跨到 Mamba 这边
+
+*** 它看到了什么问题
+
+Mamba2 出来了，比 Transformer 长上下文快几倍。但 Mamba 的 block 结构完全不是 attention + FFN，前面 MatFormer/Flextron 那套嵌套 FFN 中间维度的玩法直接套不上来——Mamba 里没有那个中间维度。
+
+而且 Mamba 有自己的硬约束：state space 的 channel 数、head 数、group 数都不是随便切的，切错了模型直接崩。
+
+*** 它的解法
+
+把 Matryoshka 思路硬塞进 Mamba2 block。具体把模型主维度 d_model 做嵌套划分（典型是 [d/8, d/4, d/2, d]），训练时每一步随机抽一个粒度，跑前向反向。
+
+跟 MatFormer 一样，训完一个大模型，抽出 g 个嵌套小模型。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它证明了套娃这套范式不依赖 attention——任何带 channel 维度的层都能玩。
+
+但留下的坑越来越具体：
+
+一，*纯 Mamba 模型在生产里很少*。真正 SOTA 是 hybrid Mamba+Attention（比如 Jamba、Zamba、Nemotron-H），attention 那几层 MatMamba 不管。
+
+二，*没有 router*。还是手动选粒度。
+
+三，*没考虑推理模型*。推理模型要长 CoT、长上下文，训练 curriculum 完全不同，MatMamba 没碰过这块。
+
+四，*没用蒸馏*。光靠 multi-granularity loss 把小模型救活，比有蒸馏老师指点的差一截。
+
+—— 这堆坑全部留给 Nemotron Elastic 去填。
+
+** 2024-07 (并行线) | Minitron: 不套娃，走剪枝蒸馏
+
+在套娃这条线快速演化的同时，NVIDIA 自家另一条路也在跑：直接训一个大模型，按重要性剪一刀变小，然后用大模型当老师蒸馏几百亿 token 救活小模型。这就是 Minitron。
+
+Minitron 的优点：小模型本身不带任何套娃约束的"代价"，是干净的独立模型。缺点：每个 size 都要单独剪、单独蒸馏几百亿 token；想要 3 个 size 就要重训 3 次。
+
+Minitron 不是 Nemotron Elastic 的祖宗，但是它的*主要对手*——Nemotron Elastic 全程在跟 Minitron 算账："我用 110B token 训出 12B+9B+6B 三个，你 Minitron-SSM 训一个 9B 要 750B，我快你 7 倍。"
+
+记住这条对照线，下一节就要用。
+
+** 2025-11 | Nemotron Elastic: 把套娃推到推理大模型
+
+*** 它看到了什么问题
+
+到 2025 年，真正能打的模型长这样：
+
+- 架构是 *hybrid*——大部分层是 Mamba（吃长上下文），少数关键层是 Attention（保推理质量）。代表是 Nemotron-H、Jamba。
+- 用途是 *推理*——要做长链 CoT，输出几万 token 思考再答题。
+- 必须有 *多个尺寸*——服务器跑 12B，边端跑 6B。
+
+把前面四篇拉过来看，全部对不上：
+
+| 论文       | 支持 hybrid? | 支持推理训练? | 有 router? | 异构层选择? |
+|-----------+-------------+-------------+-----------+-----------|
+| MatFormer | 否(纯 Trans) | 否           | 否         | 部分(Mix'n'Match) |
+| Flextron  | 否(纯 Trans) | 否           | 是         | 是         |
+| MatMamba  | 否(纯 Mamba) | 否           | 否         | 否         |
+
+而且 Minitron 这条对照线虽然管用，但每个 size 都要单独烧几百亿 token，太贵。
+
+*** 它的解法
+
+四件事同时做，缺一不可：
+
+1. *Group-aware SSM elastification*——Mamba 的 head/group 不能随便切，他们在嵌套时严格保持 group 结构，让任何抽出来的子模型仍然是合法的 Mamba。
+2. *Heterogeneous MLP elastification*——不再是每层用同一粒度，而是每层独立选自己最合适的中间维度，由 router 学。
+3. *Normalized MSE 选深度*——不只是宽度变化，深度也能剪（直接砍层）。哪些层可砍？用 normalized MSE 衡量每层对输出的贡献，小的先砍。
+4. *端到端 router + 知识蒸馏*——给一个预算（6B、9B、12B），router 输出一组可微 mask，决定哪些 channel/head/layer 留下；同时大模型当老师，把所有 budget 的子模型一起蒸馏。
+
+训练 curriculum 分两段：先 8K 上下文打底，再 49K 上下文专门练长 CoT 推理——这是前面所有 elastic 论文都没碰过的。
+
+总成本：110B token，一次训练同时产出 6B/9B/12B 三个嵌套模型。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用的关键是把四条独立的研究线 *拧到一起*——elastic 范式、Mamba 约束、推理训练、router 蒸馏，过去都是各自孤岛。Nemotron Elastic 第一次把它们全接上。
+
+省钱的关键有两层：
+
+- 比 Minitron 路线：训一次出三个，对比 Minitron-SSM 训一个 9B 要 750B，他用 110B 出三个，省 7 倍。
+- 比 from-scratch 路线：省 360 倍。
+
+效果上 Nemotron-Elastic-12B 在 7 个推理 benchmark 平均 77.41 分，跟原版 Nemotron Nano V2-12B 的 77.38 几乎打平——也就是 *免费送一个 9B 和一个 6B*。
+
+新坑：
+
+- *单 checkpoint，多个尺寸*——好处是部署时显存固定，但训练时要兼顾所有 budget，每个 budget 都得"够好"，互相之间永远在抢梯度。
+- *目前只到 12B*——是不是能 scale 到 70B、100B？
+- *只支持 dense 架构*——MoE 架构里专家也想 elastic 怎么办？
+
+最后一个坑被同一批人下一篇论文填了。
+
+* 前沿延伸
+
+** 2026 ICML | Star Elastic: 把套娃推到 MoE
+
+Nemotron Elastic 出来 4 个月，NVIDIA 同一批作者就发了 Star Elastic（ICML 2026 接收）。
+
+它在 Nemotron 3 Nano 30B-A3B（一个 MoE 模型，激活 3B）上做了同样的事：embedding 维度、attention head、Mamba head、*MoE expert 数*——全部 elastic。
+
+一个 30B 父模型，嵌套出 12B、23B、30B 三个子模型，160B token 训完——只用了父模型预训练预算（25T）的 0.6%。
+
+技术上的延伸是把"哪些 expert 在小预算下被抽出来"也作为 router 的决策对象，让 MoE 的 sparsity 维度也加入套娃。
+
+截至 2026 年 5 月，这是 elastic LLM 这条线的最新进展。
+
+* 一张图看懂
+
+#+begin_example
+
+时间    架构维度      解法演化                             代价
+====    ========     ====================                ====
+
+2022    embedding    MRL: 前k维强制能用 (套娃起源)         一份向量多粒度
+                              |
+                              v
+2023.10 Transformer  MatFormer: FFN 套娃                   2.58x FLOPs/token
+        (FFN only)            |
+                              v
+2024.06 Transformer  Flextron: + router (静态&动态)         router 还是后训
+        (FFN+attn)            |        + attn head elastic
+                              v
+2024.07 Transformer  [并行线] Minitron: 不套娃，剪枝蒸馏    每 size 都要重训
+        (剪枝路线)             每个尺寸单独 750B token
+                              |
+                              v
+2024.10 Mamba2       MatMamba: 套娃跨到 SSM                没 router, 没 hybrid
+        (纯 Mamba)            |                            没推理训练
+                              v
+2025.11 hybrid       Nemotron Elastic:                     一次 110B 出 3 个
+        Mamba+Attn   - group-aware SSM elastic              7x 省于 Minitron
+        + 推理       - 异构层粒度 (router)                  360x 省于 from-scratch
+                     - 深度也 elastic (normalized MSE)
+                     - 端到端 router + KD
+                     - 两段课程 (8K + 49K)
+                              |
+                              v
+2026.05 hybrid+MoE   Star Elastic: + MoE expert elastic    30B → 12B/23B/30B
+                                                            160B token (0.6%)
+
+
+问题维度演化:
+  套娃范围:     embedding -> FFN -> +attn -> Mamba -> +hybrid -> +MoE
+  路由智能度:   无 -> 无 -> 静态+动态 -> 无 -> 端到端 -> 端到端
+  训练目标:     表征 -> 通用 LM -> 通用 LM -> 通用 LM -> 推理 -> 推理
+  代价节省:     一份向量 -> 1 套权重 -> 1 套权重 + adaptive -> 同 -> 1 ckpt N size
+
+#+end_example
+
+* 洞见
+
+读完整条线，*真正在演化的不是"怎么压缩模型"，而是"训练范式与部署范式怎么解耦"*。
+
+传统范式里，一个尺寸的模型对应一个训练 run，对应一个 deployment artifact——三者绑死。这条河每往前走一步，都在松开一根绳：
+
+1. *MRL* 松开了"一个向量对应一个粒度"。
+2. *MatFormer* 松开了"一个模型对应一个尺寸"。
+3. *Flextron* 松开了"每次推理用同一个子模型"。
+4. *MatMamba* 松开了"套娃只能在 attention 上玩"。
+5. *Nemotron Elastic* 松开了"推理模型不能套娃" + "异构架构不能套娃" + "深度不能 elastic"。
+6. *Star Elastic* 松开了"sparsity 不能 elastic"。
+
+每松一根绳，部署侧就多一份自由。最终方向很清晰：*一个 checkpoint 装下整条产品线*——云端、桌面、手机、IoT 都从这一个 checkpoint 抽。
+
+下一步可能往哪走？三个猜测：
+
+- *Modality elastic*——一个 checkpoint 既能做纯文本，也能加一个视觉子模型抽出来。
+- *Context-length elastic*——根据输入长度动态选粒度（短句用小子模型，长 CoT 用大）。
+- *训练动态 elastic*——训练初期主要训小子模型省算力，后期再训大的。
+
+而 Minitron 这条剪枝路线很可能被逐步淘汰——除非它能找到 elastic 做不到的优势（比如目标尺寸的极致干净度）。
+
+* 启发
+
+这条河最值得抄走的一招：*把"训练时优化什么"和"部署时使用什么"分开设计*。
+
+传统思路是：训什么，就用什么。MRL 把这两件事第一次劈开——*训练时优化"任何前缀都能用"，部署时取你想要的前缀*。后面所有 elastic 工作都是这个思路的不同维度版本。
+
+这意味着你可以：
+
+- *研究上*——当你看到一个"训练一份等于训练 N 份"的研究问题时，去想"能不能把 N 个目标的 loss 同时塞进训练？"通常前提是这 N 个东西之间存在自然的嵌套或包含关系。
+- *工程上*——当你要交付多种尺寸/多种配置的模型时，第一反应不该是"训多份"，而是"能不能找到嵌套结构让它们共享权重？"
+- *选论文上*——盯住"训练范式与部署范式解耦"这条主线，它在 SSM、MoE、多模态、推理模型每个方向都还有空间可挖。
+
+落点在「能用」：这意味着你下次面对"要做 family of models"这种需求时，至少要先问一句——"能不能套娃？" 不能再想都不想就训三遍。

@@ -1,0 +1,257 @@
+#+title:      Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost
+#+date:       [2026-05-29 Fri 11:50]
+#+filetags:   :paper:river:
+#+identifier: 20260529T115033
+#+source:     https://arxiv.org/abs/2511.18643
+#+authors:    Haojun Xia, Xiaoxia Wu, Jisen Li, Robert Wu, Junxiong Wang, Jue Wang, Chenxi Li, Aman Singhal, Alay Dilipbhai Shah, Alpay Ariyak, Donglin Zhuang, Zhongzhu Zhou, Ben Athiwaratkun, Zhen Zheng, Shuaiwen Leon Song
+#+venue:      Preprint, Nov 2025 (arXiv:2511.18643)
+
+* 问题之河
+
+把一个大模型放进 GPU 里跑长文本，真正撑爆显存的不是模型权重，是它"记笔记"的那一摞中间状态——KV cache。LLaMA3-70B 跑 128K 上下文、32 个并发请求，KV cache 要 1.2 TB，比模型本身还大一个数量级。一张 B200 才 192 GB，三万美元一张。
+
+那能不能像压缩权重一样，把 KV cache 也从 16-bit 压到 4-bit、2-bit？
+
+听起来理所当然，做起来一路踩坑。4-bit 还能撑住精度，2-bit 就崩——尤其在数学题、代码题这些需要长链条推理的场景，精度直接掉十几个点。这条河淌了三年，每一代人都在追问同一个事：为什么压到 2-bit 就崩？是哪些数字"碰不得"？碰不得的话能不能让它们单独住高级病房，其他人挤大通铺？
+
+* 溯源地图
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | 发现: 0.1% 的"异常通道"数值是其他人的 50-100 倍
+  |       一个 outlier 能毁掉整个 tensor 的量化精度
+  | 解法: 把 outlier 通道拎出来单独走 FP16，其他走 INT8
+  v
+[2024-01] Hooper et al. - KVQuant
+  |
+  | 问题: outlier 思路怎么搬到 KV cache 上？
+  |       KV 还有自己的脾气——K 的异常沿"通道"方向走，V 沿"token"方向
+  | 解法: K 按 channel 量化、V 按 token 量化；
+  |       outlier 拎出来存稀疏矩阵
+  | 新坑: 稀疏矩阵乘法在 GPU 上慢，硬件不友好
+  v
+[2024-02] Liu et al. - KIVI
+  |
+  | 问题: KVQuant 靠稀疏矩阵保精度，但稀疏 kernel 拖速度
+  |       能不能不要 outlier 救济、纯 2-bit 就够？
+  | 解法: K 按 channel、V 按 token，无 outlier 名单；
+  |       最近一小段 token 留 FP16 当"滑动窗口"兜底局部上下文
+  | 新坑: 在 GSM8K 还行，在 MATH/AIME 这类长推理上掉 10+ 个点
+  v
+[2025-11] Xia et al. - Kitty  <-- 目标论文
+  |
+  | 问题: KIVI 在 Qwen3-8B/MATH 上从 88.26 掉到 47.29
+  |       根因: K cache 里有几根"关键通道"承担了大半注意力，
+  |             被 2-bit 量化误差炸了
+  | 解法: 通道级精度提拔——按平均幅值挑出 ~25% 关键通道存 INT4，
+  |       其余 75% 存 INT2；page 拆成两个统一 2-bit tensor，
+  |       让 dequant kernel 不用 if-else 分支
+  v
+[2025-02/03] KVTuner & BitDecoding  <-- 同期/后续
+  | 把同一根思路推到另两个维度: 按层调精度、用 Tensor Core 算 dequant
+#+end_example
+
+* 演化叙事
+
+** 2022 | LLM.int8(): 大模型里藏着几个"刺客通道"
+
+*** 它看到了什么问题
+
+2022 年之前，大家以为量化是个"统一缩放"的工程问题——找个合适的 scale，所有数字一起按比例压。可一旦模型规模过了 6.7B，这套办法忽然不灵了：精度断崖式下跌。
+
+Dettmers 把每一层的激活值拉出来看，发现了一件诡异的事：*0.1% 的隐藏维度，数值是其他维度的 50 到 100 倍*。而且这些"巨人"不是偶尔冒出来——它们在几乎所有 transformer 层里都存在，在大约 75% 的 token 上都激活。
+
+这就麻烦了。量化的本质是"在固定范围内分配 256 个格子"。如果一个 tensor 里有 99.9% 的数字在 [-1, 1]，但有 0.1% 在 [-100, 100]，你要么牺牲 outlier 让它溢出，要么把 256 格平摊到 [-100, 100] 里——那大多数小数字会被压成同一个格子，信息全没了。
+
+*** 它的解法
+
+既然 outlier 通道是固定那几根，那就把它们拎出来单独处理。LLM.int8() 把矩阵乘法拆成两份：99.9% 的"普通通道"走 INT8，0.1% 的"刺客通道"留 FP16。两份各自算完再相加。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它承认了一个事实：*量化失败不是平均的失败，是被几根通道拖死的*。把这几根隔离开，剩下的就好办。
+
+但它留下了一条尾巴——FP16 的稀疏路径在硬件上跑得不顺，因为 GPU 喜欢规整的矩阵乘法，不喜欢"有时大有时小"的混合精度。同时它只动了权重和激活，还没人去看 KV cache 里是不是也有同样的故事。
+
+** 2024-01 | KVQuant: 把 outlier 思路搬进 KV cache，但代价是稀疏 kernel
+
+*** 它看到了什么问题
+
+LLM 推理走向长上下文（128K、1M tokens）之后，KV cache 成了新瓶颈——比模型权重还大。但简单粗暴地把 LLM.int8() 那套搬过来不行，因为 KV cache 有自己的结构特点。
+
+Hooper 团队仔细看了 K 和 V 的数值分布，发现两件事：
+1. *K 的异常沿通道方向走*：某几根 channel 的数值持续偏大
+2. *V 的异常沿 token 方向走*：某些 token 的整个向量都偏大
+
+所以以前那种"统一按 token 算 scale"或"统一按 channel 算 scale"都不对——K 该按 channel 量化，V 该按 token 量化。
+
+*** 它的解法
+
+KVQuant 把 outlier 思路做了五层精装修：
+1. K 按 channel 量化（顺着异常的方向走）
+2. K 在 RoPE 之前量化（避开旋转位置编码把分布搅乱）
+3. 按层做"非均匀"量化（不同层用不同的量化点）
+4. 每个 vector 单独定 outlier 阈值（按需隔离）
+5. 量化中心点归一化（修正 2-bit 下的分布漂移）
+
+outlier 那部分单独存成一个稀疏矩阵，1% 的离群点拎出来不参与主算。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它把 LLM.int8() 的"逐通道隔离"在 KV cache 上落了地，3-bit 精度损失 <0.1 perplexity，能撑到 LLaMA-7B 跑 10M 上下文。
+
+新坑是稀疏矩阵乘法在 GPU 上是个老大难——稀疏 SpMM 的吞吐量远不如稠密 GEMM。后人评价 KVQuant 时常说："准度漂亮，但加了一条慢路径"。下一代要么把稀疏路径优化掉，要么干脆不要这条路径。
+
+** 2024-02 | KIVI: 不要 outlier 名单了，靠"最近一窗"兜底
+
+*** 它看到了什么问题
+
+KVQuant 同期，KIVI 团队也做了 K-按-channel、V-按-token 的观察（这两篇是并行独立发现，KVQuant 早一两周）。但 KIVI 想得更彻底：*能不能干脆不维护 outlier 稀疏路径？*
+
+他们注意到：推理是流式的，新 token 一个个进来。如果你能让"最近 N 个 token"始终留在 FP16，老 token 才量化到 2-bit，那局部上下文的精度就保住了——而注意力机制本来就对最近 token 最敏感。
+
+*** 它的解法
+
+KIVI 的设计极简：
+- K 按 channel 量化到 INT2（无 outlier 名单）
+- V 按 token 量化到 INT2
+- 维护一个滑动窗口：最近的 128 个 token 留 FP16
+- 一个 plug-and-play 算法，不需要重新训练或微调
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用是因为它放弃了 outlier 隔离这条复杂的路，靠"反正最近的 token 最重要"赌一把——结果在 LLaMA-2、Mistral 上 2-bit 精度几乎不掉，4× 更大 batch size，2.35-3.47× 吞吐量。
+
+但 Kitty 的实验暴露了埋的坑：*在长链条推理任务上 2-bit KIVI 撑不住*。看具体数字：
+- Qwen3-8B + MATH-Algebra：FP16 88.26 -> KIVI-4bit 88.46 -> *KIVI-2bit 47.29*
+- Qwen3-8B + AIME24：FP16 71.67 -> KIVI-4bit 77.67 -> *KIVI-2bit 57.00*
+
+4-bit 还好，2-bit 直接掉 40 个点。"最近一窗"在数学推理这种需要回溯到题目本身的场景兜不住——因为模型需要的关键信息可能在几千 token 之外，而那部分已经被压成 2-bit 了。
+
+** 2025-11 | Kitty: 不是所有通道都生而平等
+
+*** 它看到了什么问题
+
+Kitty 团队没有满足于"2-bit 在数学题上掉点是正常的"。他们做了一个看似简单但很关键的实验：
+
+*把 K cache 的某一根通道单独压成 INT2，其他通道保持 FP16，看注意力分数会变多差。*
+
+每次只动一根，对每根通道分别测一遍。结果（论文 Figure 2b）显示：*绝大多数通道压到 2-bit 没事，但有那么几根特别敏感的通道，一压精度就崩*。这跟 LLM.int8() 里的 outlier 观察很像——*关键性也是稀疏分布的*。
+
+更具体地：MSE 误差曲线上有几个尖刺，对应几根"关键通道"。这些通道恰好就是平均幅值偏大的那几根（论文 Figure 2a）。
+
+这就解释了 KIVI 在长推理上崩的根因：KIVI 对所有通道一视同仁压 2-bit，但其实少数几根通道承担了大半的注意力计算。这几根被 2-bit 误差污染后，整个 attention score 就走样了。
+
+*** 它的解法
+
+Kitty 提出 *Dynamic Channel-wise Precision Boost (DCPB)*，一句话：*关键通道留 INT4，其他通道压 INT2*。
+
+具体怎么选关键通道？最朴素的启发式——按通道的平均幅值排序，取 top-K（默认 25%，即 128 维里挑 32 维）。直觉是：幅值大的通道既容易被量化误差扰动，又对 attention score 的贡献更大。
+
+光是算法层这样讲很简单，难的是怎么让 GPU 跑得快。如果你 page 里既有 INT2 通道又有 INT4 通道，dequant kernel 就要写 if-else 分支，会触发 warp divergence、内存访问也散乱。
+
+Kitty 的系统层解法很巧：*把一个混合精度的 K page 拆成两个统一 2-bit 的 tensor*——INT4 通道拆成两个 INT2 拼起来。这样 page 布局是规整的，dequant kernel 也是统一的 2-bit 路径，没有分支，内存合并访问保住。
+
+设计配方还包括：
+- 头 32 个 token（attention sink）保 FP16
+- 最近 128 个 token（local window）保 FP16
+- 中间的老 token 走 mixed-precision page
+- Q-Buffer 暂存 FP16 KV 直到攒够一个 group 再量化
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉很硬：你不是要全民共富，你是要让那少数几个"关键投票人"声音不被噪声盖住。给他们 INT4 这个稍微高级一点的麦克风，普通票仍然是 INT2，整体存储几乎不变，但 attention score 不再被关键通道的误差污染。
+
+在 Qwen3-8B/MATH-Algebra 上，KIVI-2bit 47.29 -> Kitty (KIVI-K4V2*) 87.92，几乎追平 FP16 的 88.26。GPQA-Diamond 上 32.24 -> 40.51（接近 FP16 的 40.71）。系统层端到端：KV memory 缩 8×，throughput 2.1-4.1×。
+
+留下的新坑：
+- 关键通道的选择目前用最简单的"平均幅值"启发式，作者自己承认更聪明的启发式（或自适应方法）会更好
+- 当前是 top-25% K-channels boost，这个比例固定，没考虑层间差异
+- 没有动 V cache 的精度分配——V 是不是也有"关键 token"值得 boost？
+
+* 前沿延伸
+
+** 2025-02 | KVTuner: 把"哪里该高精度"从通道维度推到层维度
+
+KVTuner（ICML 2025）问的问题是：*不同层对 KV 量化的敏感度可能差很多，能不能按层分配比特数？*
+
+它做的事是离线搜索——用多目标优化在每层之间找 Pareto 最优的精度配对（比如某层 K8V4、另一层 K4V2），然后推理时直接读这张表，没有运行时开销。结果是 LLaMA-3.1-8B-Instruct 上 3.25-bit 混合精度近无损，比 KIVI-KV8 吞吐量再提 21.25%。
+
+跟 Kitty 是互补的：KVTuner 是层间，Kitty 是层内通道。两者理论上可以叠。
+
+** 2025-03 | BitDecoding: 把低比特 dequant 推上 Tensor Core
+
+BitDecoding 解决的是 KV 量化这一线的另一个老问题：dequant kernel 长期用 CUDA core 算，Tensor Core 闲着——而 Tensor Core 的算力是 CUDA core 的几十倍。
+
+它通过 query 变换、warp 级并行 dequant、软件流水线，把 mixed-precision 执行装进 Tensor Core 友好的布局，在 Blackwell + NVFP4 上拿到 8.6× 加速。
+
+跟 Kitty 也是正交的——Kitty 关心"哪根通道值得多分一点比特"，BitDecoding 关心"无论你怎么分比特，能不能让 dequant 跑在 Tensor Core 上"。
+
+截至 2026 年初，这两条线 + Kitty 的通道精度提拔，构成了 2-bit KV cache 这条河的最新岸边。
+
+* 一张图看懂
+
+#+begin_example
+                       KV cache 2-bit 量化的演化
+                      "哪些数字碰不得？怎么单独照顾？"
+
+时间      关键发现/解法              "碰不得"的粒度       系统代价
+----      --------------              -----------          --------
+2022      outlier 通道                  通道 (激活)         FP16 稀疏路径
+LLM.int8  0.1% 通道幅值 50-100x        |                   |
+          --> 拎出来走 FP16             |                   v
+                                        |                慢 (稀疏路径)
+                                        v
+2024-01   K 沿 channel / V 沿 token     通道+token         稀疏矩阵 + GPU 不友好
+KVQuant   1% outlier 存稀疏矩阵         |                   |
+          5 件精装修                    |                   v
+                                        v                慢 (sparse SpMM)
+                                        |
+2024-02   K-channel / V-token + 滑窗    最近 128 token      规整稠密 (快)
+KIVI      不要 outlier 名单             |                   |
+          赌"最近最重要"                |                   v
+                                        v                快, 但 2-bit 长推理崩
+                                        |
+2025-02   按层调比特                    层粒度              零运行时开销
+KVTuner   离线 Pareto 搜索              (与 Kitty 正交)     (离线搜索)
+                                        |
+2025-03   低比特 dequant 上 Tensor Core 系统层             硬件协同设计
+BitDecode (与 Kitty 正交)
+                                        |
+2025-11   关键通道 INT4, 其余 INT2      通道粒度 (K)        把 INT4 拆成两个
+Kitty     按平均幅值挑 top-25%          + sink + local      INT2, 保持统一
+          回应 LLM.int8 的洞见在        FP16                2-bit page 布局
+          KV cache 上的对应版本                            (规整稠密, 快)
+
+
+核心规律一句话: 三年的演化都在回答同一个问题 ——
+              "稀疏分布的关键信息" 怎么用 "规整的硬件路径" 来表达。
+#+end_example
+
+* 洞见
+
+读完整条线，真正在演化的不是"压到几 bit"，而是 *怎么把"关键信息稀疏分布"这件事翻译成"GPU 跑得快"这件事*。
+
+LLM.int8() 第一次看清楚：精度损失不是平均的，是被少数 outlier 拖死的。它的隔离方案虽然准，但稀疏路径让 GPU 不爽。KVQuant 把这套搬到 KV cache，把 outlier 思路推到极致，结果还是栽在稀疏 kernel 慢。KIVI 干脆放弃 outlier 隔离，靠"最近窗口"兜底——简单粗暴跑得快，但在长推理任务上暴露了"远处也有关键信息"的真相。
+
+Kitty 的优雅在于它*回到了 LLM.int8() 的初心*——承认关键性的稀疏分布——但用了一个工程上更聪明的转译：把混合精度的 INT4+INT2 page，拆成两个统一的 INT2 tensor 来存。这样算法层享受到精度提拔的好处，系统层却看到一个规整的 2-bit 世界。
+
+这条线背后真正的认知转变：*"不一致的算法语义"和"一致的硬件路径"不是矛盾的，可以通过数据布局解耦*。早期大家以为，要么算法上一刀切让硬件高兴（KIVI），要么硬件上忍受不规整让算法精准（KVQuant）。Kitty 证明了第三条路。
+
+下一步最可能的方向：
+1. *把通道选择从启发式变成自适应*——Kitty 作者自己留的伏笔，按 prompt 或层动态选 K
+2. *V cache 也来一次同样的解构*——目前 K-channel 维度找到了精度异质性，V 是不是也有同样的故事？
+3. *和 KVTuner、BitDecoding 的合体*——层间 (KVTuner) + 层内通道 (Kitty) + Tensor Core dequant (BitDecoding)，理论上是端到端 stack
+
+* 启发
+
+这条河给做研究的启发，其实是关于*"承认异质性"*这件事：
+
+1. *"统一处理"是最便宜也最容易错的姿势*。KIVI 押注"所有 token、所有通道一样重要"，工程优雅但精度崩。Kitty 押注"少数关键通道值得特殊照顾"，把已知三年的洞见（outlier）从激活层搬到了 KV cache 的通道层。
+
+2. *算法的异质性可以靠数据布局"伪装"成系统的同质性*。INT4 通道拆成两个 INT2，是 Kitty 整篇论文最值钱的一招。这一招的可迁移性很强：任何"算法层混合、硬件层想规整"的场景都值得想这个套路。
+
+3. *"前人为什么失败"比"前人取得了什么"更值钱*。KIVI 给的不是终点，是给 Kitty 指了下一刀该切哪里——Kitty 的实验从复现 KIVI 在 MATH 上的崩塌开始，那张表就是整篇论文的发动机。
+
+落点在"能用"：如果你在做任何"量化、压缩、剪枝"，*先做一次"关键性热力图"*——按某个粒度（通道、层、token、head）单独扰动，看哪些扰动会显著影响下游指标。哪里有尖刺，哪里就是下一篇论文的题目。
