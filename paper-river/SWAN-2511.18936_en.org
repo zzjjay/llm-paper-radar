@@ -1,0 +1,276 @@
+#+title:      SWAN: Sparse Winnowed Attention for Reduced Inference Memory via Decompression-Free KV-Cache Compression
+#+date:       [2026-05-29 Fri 12:01]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T120141-en
+#+source:     https://arxiv.org/abs/2511.18936
+#+authors:    Santhosh G S, Saurav Prakash, Balaraman Ravindran
+#+venue:      arXiv preprint (2025-11)
+
+* The River of the Problem
+
+When a large model generates a long passage of text, why does GPU memory blow up so fast? The real culprit is not the model itself but a "ledger" — the KV cache. Every new token adds one more row to the ledger; by the time you reach tens of thousands of tokens, the ledger outweighs the model itself.
+
+The hardest part of this problem is that every row in the ledger could, in principle, be needed later. You cannot tear out pages at random — delete the wrong row and the output goes wrong. You cannot compress too aggressively either — too much distortion and the output goes off the rails. And to make matters worse, even if you do manage to compress, you have to decompress before each use — you save memory but pay in time.
+
+Over four years, generation after generation of researchers has wrestled with this ledger. First they noticed that most rows are never consulted, and simply deleted a portion. Then, feeling that deletion was too brutal, they started writing each row in smaller handwriting. Next, realising the limits of smaller handwriting, they found "redundancy between entries" and pursued low-rank compression — which in turn introduced decompression overhead. SWAN is the latest stop on this line, asking: can the compressed ledger be used directly, without ever being decompressed?
+
+* The Provenance Map
+
+#+begin_example
+[2017] Vaswani et al. - Transformer
+  |
+  | Problem: RNNs are inherently sequential
+  | Solution: attention mechanism — each token attends to all past tokens
+  |       --> but inference must cache all historical K and V (KV cache)
+  v
+[2023] Zhang et al. - H2O (NeurIPS'23)
+  |
+  | Observation: 95% of the attention matrix is sparse; a few tokens are
+  |              repeatedly attended to
+  | Solution: simply evict unimportant tokens (token eviction)
+  |
+  | Residual problem: eviction is irreversible — long-range tasks lose
+  |                   critical information
+  v
+[2024] Singhania et al. - Loki (NeurIPS'24)
+  |
+  | Observation: K vectors live in a low-rank subspace
+  | Solution: don't evict tokens, evict dimensions — use PCA to project K
+  |           to low dimensions for attention scoring
+  |
+  | Residual problem: only saves compute; the KV cache itself is still
+  |                   stored at full size
+  v
+[2024] Saxena et al. - Eigen Attention (EMNLP'24 Findings)
+  |
+  | Observation: Loki's direction is right, but what is stored in the
+  |              cache should already be the low-dimensional K
+  | Solution: eigen-decompose weights offline; cache stores only low-rank K/V
+  |
+  | Residual problem: compression ratio is baked into the weights —
+  |                   switching from 50% to 80% requires re-decomposing
+  v
+[2024] Kim et al. - Lexico (ICML'25)
+  |
+  | Observation: K/V are not only low-rank but can also be sparsely coded
+  |              with a shared dictionary
+  | Solution: learn a shared dictionary; store sparse coefficients + indices
+  |
+  | Residual problem: OMP decoding is required every decoding step —
+  |                   an extra pass at every single generation step
+  v
+[2025] Santhosh et al. - SWAN  <-- target paper
+  |
+  | Observed gap: low-rank methods either fix the compression ratio (Eigen)
+  |               or require per-step decompression (Lexico)
+  | Solution: rotate K with an orthogonal matrix, drop low-energy dimensions,
+  |           then use the result directly in attention — no reconstruction,
+  |           no decompression, compression ratio tunable at runtime
+
+[2025+] Follow-up: as of this writing (2026-05), SWAN was submitted only
+        six months ago; no direct critiques or follow-up improvements
+        have been observed yet.
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: attention broke the sequential shackles of RNNs — and quietly planted the KV-cache time bomb
+
+*** What problem it saw
+
+RNNs must process one token at a time; the next token cannot move until the previous one is done. The larger the model, the longer the wait.
+
+*** Its solution
+
+Every position attends directly to all past positions' Keys and Values, then takes a weighted sum. Positions have no sequential dependency on each other — they can be computed in parallel.
+
+*** Why it worked (and what new trap it set)
+
+Parallelism is the lifeblood of training efficiency. But inference is a different story. To generate token N, you need to see the K and V of all preceding N-1 tokens. Either you recompute all past K/V from scratch for every new token (wasteful), or you cache them (this is the KV cache). Caching is fast, but it consumes memory. The longer the sequence and the larger the batch, the fatter the ledger — eventually fatter than the model itself. The next six years of research revolve entirely around this ledger.
+
+** 2023 | H2O: most rows are never consulted — just tear them out
+
+*** What problem it saw
+
+Every row of the KV cache must be retained, yet when attention is actually computed, the probability of any given row being consulted varies enormously. The authors ran experiments: 95% of attention matrix entries are near zero; a handful of "heavy-hitter tokens" are attended to repeatedly. If so, why keep the cold tokens around?
+
+*** Its solution
+
+At each generation step, identify which tokens have the highest cumulative attention scores (heavy hitters), retain those plus the most recent few tokens, and evict the rest from the cache. The paper proved this is a dynamic submodular problem and provided theoretical guarantees.
+
+*** Why it worked (and what new trap it set)
+
+It worked because attention really is sparse. On OPT/LLaMA, inference throughput improved by up to 29×.
+
+But the trap is equally clear — "once gone, never recovered." Short-context dialogue is fine, but as soon as the task requires reaching back to a specific detail from long ago (long-document QA, code comprehension), the token you casually evicted may be exactly what the answer depends on. It is an irreversible gamble.
+
+The next generation asked: instead of evicting tokens, can we make each token occupy less space?
+
+** 2024 | Loki: don't evict tokens, evict dimensions — K is not as "wide" as it looks
+
+*** What problem it saw
+
+H2O's reduction along the token dimension is too blunt. Loki's authors extracted the K matrix and ran principal component analysis, finding a counterintuitive fact: although K's nominal dimension is D (e.g., 128), the first 16–32 dimensions carry almost all the information; the remainder is mostly noise.
+
+In other words, K vectors live in a subspace far lower-dimensional than their nominal size.
+
+*** Its solution
+
+Compute a PCA projection matrix P from K on a calibration dataset, offline. At inference time, project both the query and K into the low-dimensional space, compute attention scores there to select the top-k important tokens, then return to the full dimension for the actual value aggregation.
+
+*** Why it worked (and what new trap it set)
+
+Coarse scoring in low dimensions, fine computation in high dimensions — both precision and speed are served. Attention time on LLaMA dropped by 45%.
+
+But the critical gap SWAN later called out: Loki saves *compute*, not *memory*. What is stored in the KV cache is still the full-dimensional K — the projection only happens during computation. The original problem of memory explosion is untouched.
+
+The next person asked: what if what gets stored in the cache is already the low-dimensional K?
+
+** 2024 | Eigen Attention: take low-rank compression all the way — store the low-dimensional form directly
+
+*** What problem it saw
+
+Loki treats low-rank as "an optimisation applied at compute time," but the real bottleneck is memory. If the K/V stored in the cache are themselves low-dimensional, that is where memory is actually saved.
+
+*** Its solution
+
+Eigen-decompose the weight matrices for K and V offline, rewriting them as W_K = U_K · V_K (where V_K is low-rank). At inference time, only the low-rank portion enters the cache. Handling RoPE requires care — rotary positional encoding is tied to the original dimensionality — so the authors keep queries at full dimension and upsample low-rank keys back to full size before applying RoPE.
+
+*** Why it worked (and what new trap it set)
+
+The cache shrinks by 40%; attention latency drops by 60%. This is the observation that "K is low-rank" actually landing on the memory dimension.
+
+But the fatal flaw SWAN identified: the compression ratio is welded to the weights. To run two scenarios — one memory-constrained at 80% compression, one memory-relaxed at 50% compression for accuracy — you must re-decompose the weights offline for each case. There is no runtime switch.
+
+The next person asked: can the compression ratio be made flexible?
+
+** 2024 | Lexico: a universal dictionary plus sparse coding — tune the compression ratio as you like
+
+*** What problem it saw
+
+Eigen Attention hardcodes the compression ratio. Lexico wants "on-demand compression" — 4× today, 8× tomorrow, no retraining.
+
+*** Its solution
+
+It borrows a classic signal-processing trick — dictionary learning. A shared dictionary (roughly 4096 atom vectors) is learned offline on WikiText. At inference time, OMP (Orthogonal Matching Pursuit) expresses each K/V as "a sparse combination of s atoms from the dictionary." The cache stores only those s atom indices plus s coefficients. The smaller s is, the more aggressive the compression.
+
+*** Why it worked (and what new trap it set)
+
+It preserves 90–95% of performance at 15–25% cache occupancy; it even functions in extreme low-memory scenarios where 2-bit quantisation fails. The compression ratio genuinely becomes a tunable knob.
+
+But the pain point SWAN identified: decoding is required before use. Every decoding step, you must reconstruct the original K/V by multiplying sparse coefficients by dictionary atoms and summing — before you can feed the result into attention. Across tens of thousands of decoding steps in a single generation, that means tens of thousands of reconstructions. Latency climbs steadily.
+
+The next person asked: after compressing, can we feed the compressed representation directly into attention — with zero reconstruction?
+
+** 2025 | SWAN: rotate + prune, then use the result directly
+
+*** What problem it saw
+
+Looking back along the line: H2O loses information, Loki doesn't save memory, Eigen can't be tuned at runtime, Lexico requires decompression. SWAN sets out to satisfy all four simultaneously — *genuinely saves memory* + *runtime-tunable* + *no reconstruction* + *near-lossless*.
+
+*** Its solution
+
+Three steps, each precisely addressing one gap left by predecessors.
+
+Step 1: compute an orthogonal matrix R offline on calibration data. Rotate K through R (note: R is orthogonal, so no information is lost) to get RK. The beauty of an orthogonal rotation is that it redistributes "energy" — most dimensions become low-energy "noise dimensions," while a few concentrate almost all the signal.
+
+Step 2: drop the low-energy dimensions of RK and store only the top-k energy dimensions. This is the cache. Crucially, k is a runtime parameter: want 50% compression today? Set k = 64. Want 75% tomorrow? Set k = 32.
+
+Step 3 — SWAN's real coup: multiply the query by the same R, then retain only the corresponding k dimensions. Compute the dot-product attention *directly* in this k-dimensional space. No need to reconstruct K to its original dimensionality. Because R is orthogonal, the low-dimensional dot product is a faithful approximation of the full-dimensional dot product.
+
+A small dense buffer (keeping the most recent few tokens uncompressed) handles RoPE boundary conditions.
+
+*** Why it worked (and what new trap it set)
+
+Every move precisely patches a predecessor's wound:
+
+| Predecessor   | Residual gap                       | SWAN's fix                                  |
+|---------------+------------------------------------+---------------------------------------------|
+| H2O           | Information lost, unrecoverable    | Orthogonal rotation is lossless; prune low-energy dims |
+| Loki          | Cache still large                  | What is stored is already the pruned low-dim form |
+| Eigen         | Compression ratio hardcoded        | How many dims to prune is a runtime parameter |
+| Lexico        | Decompression required every step  | Low-dim representation feeds directly into attention |
+
+Reports 50–60% per-token cache savings with performance close to the uncompressed baseline.
+
+Where are the open questions? Two emerge: (1) robustness of the choice of orthogonal matrix R — does it hold across different models and data distributions? (2) Is the dense buffer design sufficient for extreme long-context settings (million-token scale)? These are the threads the next generation can pick up.
+
+* Frontier Extensions
+
+SWAN was submitted to arXiv on 24 November 2025. As of this writing (May 2026) no direct critiques or follow-up improvements have been observed. SWAN is the current frontier of this line.
+
+Likely subsequent directions (speculative, not yet published):
+
+- *Learned R*: the current rotation matrix is computed offline from calibration data; could R itself become learnable (or even input-adaptive)?
+- *Cross-layer shared R*: computing independent rotations for every layer is costly; exploring shared or low-rank R across layers.
+- *Stacking with quantisation*: SWAN is a low-rank method and KIVI is a quantisation method — the two are theoretically orthogonal. Applying 4-bit quantisation to SWAN's already-reduced-dimension cache could halve memory again.
+
+* One Diagram to Understand It All
+
+#+begin_example
+The KV-cache compression river
+
+Time    Method         Core move                     Residual gap
+------  -------------  ----------------------------  ------------------------------
+2023    H2O            Evict unimportant tokens      Irreversible; long-range tasks fail
+                       (token eviction)
+
+2024    Loki           Project K to low-dim          Only saves compute; cache unchanged
+                       for attention scoring
+                       (low-rank compute)
+
+2024    Eigen Attn     Eigen-decompose weights;      Compression ratio baked into weights
+                       store low-rank K/V
+                       (low-rank storage)
+
+2024    Lexico         Dictionary + sparse coding    Decompression required every
+                       (sparse coding)               decoding step
+
+2025    SWAN           Orthogonal rotation + prune;  (none observed yet)
+        <-- you are   attend directly in low-dim
+        here          (rotated low-rank,
+                       decompression-free,
+                       runtime-tunable)
+
+Progress along four dimensions
+                  H2O   Loki   Eigen   Lexico   SWAN
+Genuine memory    ✓     X      ✓       ✓        ✓
+  savings
+Runtime-tunable   ✓     ✓      X       ✓        ✓
+No decompression  ✓     ✓      ✓       X        ✓
+Near-lossless     X     ✓      ✓       ✓        ✓
+                  ^ SWAN is the only method that checks all four boxes
+#+end_example
+
+* Insight
+
+Reading this line from start to finish, the surface story is "how to compress the KV cache," but the deeper story is *the incremental tightening of the constraint set*.
+
+In the H2O era, researchers cared about one constraint: save memory. Evict tokens and call it done. In the Loki era, a second constraint was added: preserve information. The blunt deletion became a careful projection. In the Eigen era, a third constraint arrived: *the compression must land on the cache itself*. In the Lexico era, a fourth: *the compression ratio must be tunable*. In the SWAN era, the final constraint: *no decompression*.
+
+Each paper did not simply "solve the same problem better" — it *added another clause to the problem statement*. Research progress is not about making the answer more accurate; it is about making the question harder. When all the constraints are stacked — save memory, lossless, tunable, no decompression — the remaining solution space narrows to exactly one path: "perform attention directly in a low-dimensional invariant subspace." That is the narrow path SWAN walks.
+
+One layer deeper: the low-rank idea was already present in Loki, yet it took two years (2024 → 2025) to be fully exploited. The reason was not insufficient technology — it was that *people never stated all the constraints at once*. Loki only cared about saving compute; Eigen only cared about saving memory; Lexico only cared about tunability. Each solved a local problem, but because "no decompression" was never written into the problem statement, every solution still required decompression. SWAN's contribution is less a new technique than a *new problem statement* — it wrote out all the constraints first, then forced itself to find a solution satisfying every one.
+
+Where is the line most likely to go next? Following the logic of this progression, the next constraint to be added to the set is probably *no calibration data* (every low-rank method today still requires offline calibration) or *input-adaptive R* (the rotation matrix varies with the input).
+
+* Takeaways
+
+*In research, subtract first, then add.*
+
+Subtracting means: from a predecessor's solution, remove one hidden assumption. H2O assumed "once evicted, gone for good." Loki assumed "low-rank is only for acceleration." Eigen assumed "the compression ratio must be decided in advance." Lexico assumed "after compression you must decompress before use." Every next-generation paper removes one load-bearing pillar from the predecessor.
+
+Adding means: take the pillar you just removed, write it as a new constraint in your own problem statement, and force yourself to find a new solution.
+
+The practical takeaway: the next time you read a paper you admire, do not only ask "what new technique did it invent?" Ask instead *which hidden assumption it removed, and which new constraint it added*. The former teaches you a method; the latter teaches you the judgment to choose which problems to pursue.
+
+Concretely for KV-cache engineering: if you are making architecture decisions for long-context inference today, SWAN is currently the only option that simultaneously satisfies "save memory + no decompression + tunable + near-lossless" — it deserves to be your first candidate for evaluation. But watch the offline orthogonal matrix R carefully: whether your calibration data covers your deployment distribution is exactly where SWAN is most likely to stumble.
+
+* References
+
+- SWAN (target paper): https://arxiv.org/abs/2511.18936
+- Lexico: https://arxiv.org/abs/2412.08890 / https://proceedings.mlr.press/v267/kim25ae.html
+- Eigen Attention: https://arxiv.org/abs/2408.05646 / https://aclanthology.org/2024.findings-emnlp.899/
+- Loki: https://arxiv.org/abs/2406.02542 / NeurIPS 2024
+- H2O: https://arxiv.org/abs/2306.14048 / NeurIPS 2023
+- Transformer (Vaswani et al.): Attention Is All You Need, NeurIPS 2017

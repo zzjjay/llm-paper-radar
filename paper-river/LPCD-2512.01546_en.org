@@ -1,0 +1,294 @@
+#+title:      LPCD: Unified Framework from Layer-Wise to Submodule Quantization
+#+date:       [2026-05-29 Fri 18:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T180000-en
+#+source:     https://arxiv.org/abs/2512.01546
+#+authors:    Yuma Ichikawa, Yudai Fujimoto, Akira Sakai
+#+venue:      arXiv preprint, December 2025
+
+* The River of Problems
+
+The most direct way to squeeze a 70-billion-parameter model onto a consumer GPU is quantization — compressing each weight from 16-bit floating point down to 4-bit or even 2-bit integers. The trouble is: change one weight, and the model's output shakes. Change all of them one by one, and the shaking amplifies layer by layer, until the model may not even manage a coherent greeting.
+
+So the core question is one sentence: *How do you replace all the floating-point weights while keeping the model's final output as unchanged as possible?*
+
+The hard part is "as unchanged as possible." Intuitively, you should optimize the whole model end-to-end, but a model with hundreds of layers and tens of billions of parameters is simply intractable for end-to-end second-order optimization. So for thirty years, the field has been doing the same thing — *breaking the end-to-end objective into small pieces, solving them one piece at a time, and then somehow preventing the accumulated error from exploding*. Each generation of papers redefines how large "a piece" is.
+
+* Source Map
+
+#+begin_example
+[1993] Hassibi & Stork - Optimal Brain Surgeon (OBS)
+  |
+  | Problem: How to remove one weight with minimal loss change?
+  | Solution: Use second-order Hessian information to score each weight's
+  |           "should it be removed?" — and after removal, use H^-1 to
+  |           simultaneously adjust the remaining weights to compensate.
+  |
+  | Buried pitfall: Computing the Hessian is infeasible at GPT-175B scale.
+  v
+[2022] Frantar et al. - OBQ -> GPTQ
+  |
+  | Problem: OBS idea is right, but can't run on billion-parameter models.
+  | Solution: Fixed column scan order + Cholesky reuse of Hessian blocks.
+  |           Swap "remove weight" for "quantize weight" — after quantizing
+  |           one, use the Hessian to adjust the remaining unquantized ones.
+  |           Done independently, layer by layer.
+  |
+  | Buried pitfall: "Layer-independent" means layer k assumes it receives
+  |          clean floating-point input, but in reality layer k-1 is already
+  |          quantized — its output carries error. The error amplifies
+  |          layer by layer.
+  v
+[2025] Li et al. - GPTAQ / Zhang et al. - Qronos
+  |
+  | Problem: The upstream is already quantized; layer k receives dirty input.
+  | Solution: Add an "input mismatch compensation" term to GPTQ's objective,
+  |           so that weight adjustments can absorb some of the accumulated
+  |           upstream error.
+  |
+  | Buried pitfall: This is just patching — a heuristic blending of weights.
+  |          No guarantee that "local patching" actually reduces "global error."
+  v
+[2025-04] Arai & Ichikawa - QEP
+  |
+  | Problem: GPTAQ's blending weight is chosen by feel, with no theoretical
+  |          guarantee.
+  | Solution: Rewrite the quantization objective to directly align "output
+  |           computed with the true (already-quantized) input" vs. "output
+  |           computed with the quantized-weight + same input."
+  |           An extra α_l knob allows per-layer disabling of compensation
+  |           to prevent overfitting, and provides a provable global error bound.
+  |
+  | Buried pitfall: Attention is still locked on one Linear layer — unable
+  |          to see residual connections and RMSNorm, the "glue" in between.
+  v
+[2025-09] Lin et al. - LoaQ
+  |
+  | Problem: Between Linear layers in a Transformer there are residuals and
+  |          RMSNorm — these determine what the next layer actually receives.
+  |          Aligning only the Linear output means optimizing the wrong target.
+  | Solution: Lift the alignment target from the Linear output up to
+  |           "sub-block output + after RMSNorm."
+  |           LLOA -> SOA -> NOA: three levels progressively approaching
+  |           the model-level output.
+  |
+  | Buried pitfall: This hand-picks "sub-block + RMSNorm" as the submodule.
+  |          Switch to a different submodule (QK block, VO block,
+  |          MLP up-down, KV cache, rotation matrix) and you have to
+  |          re-derive everything. Every new scenario needs a new paper.
+  v
+[2025-12] Ichikawa et al. - LPCD  <-- this paper
+  |
+  | Problem: QEP, LoaQ, GPTAQ… each is a bespoke suit tailored by hand
+  |          for one particular submodule. Can we explain all submodule
+  |          quantization in one shot?
+  | Solution: Define output mismatch for any submodule as a unified objective.
+  |           Use coordinate descent in the submodule's output space; at each
+  |           step, project the solution back to the discrete quantized domain
+  |           using existing layer quantizers.
+  |           GPTQ, QEP, LoaQ all become special cases.
+  v
+[? 2026+] Follow-on work
+   No papers citing LPCD observed yet (as of 2026-05).
+#+end_example
+
+* Evolutionary Narrative
+
+** 1993 | OBS: Whether to Remove a Weight Should Be Decided by Curvature, Not Magnitude
+
+*** What Problem It Saw
+
+In the 1990s, neural networks were small but expensive. Pruning aimed to cut away useless weights. The dominant approach was magnitude pruning — "this weight is small, removing it shouldn't hurt." Hassibi saw through the flaw immediately: how sensitive the loss is to a weight depends not just on the weight's size, but on the curvature of the loss at that point. A small weight sitting on a steep slope can cause a collapse when removed.
+
+*** Its Solution
+
+Do a second-order Taylor expansion of the loss around the optimal point; the coefficient of that term is the Hessian matrix $H$. Removing the $q$-th weight is equivalent to forcing $w_q = 0$, and the resulting "loss cost" can be computed in closed form — and not only can you compute "how much does removing this cost," you can simultaneously compute "how should the remaining weights be adjusted to recover the loss." Both formulas use $H^{-1}$.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it pairs the "remove" action with a "compensate" step. No retraining needed after removal — $H^{-1}$ is used to fine-tune all remaining weights in one shot, absorbing the error.
+
+The buried pitfall is obvious: you must store $H^{-1}$. For a layer with $n$ weights, the Hessian is $n \times n$. Just one layer of GPT-175B would require hundreds of gigabytes for the Hessian. OBS is elegant on small networks; at large-model scale it simply cannot run.
+
+** 2022 | GPTQ: Dragging OBS to the Billion-Parameter Scale
+
+*** What Problem It Saw
+
+OBS's idea is correct, but it re-selects "the next weight to remove" at every step (dynamic order), meaning the Hessian must be maintained separately for every row/column. For a 175B model, this overhead amounts to *half a year of GPU time*.
+
+*** Its Solution
+
+Three small moves cut the complexity down:
+
+1. *Fixed order*: Stop selecting the cheapest weight to quantize each time; just scan columns in order 1, 2, 3, … This means the Hessian evolution trajectory is identical for every row in the same layer and can be reused.
+2. *Cholesky decomposition*: Compute all necessary information from $H^{-1}$ once upfront, avoiding repeated matrix inversion inside the loop — with better numerical stability too.
+3. *Block processing*: Slice the weights into blocks and process each block together; IO-friendly.
+
+Note that the task shifts from "pruning" to "quantization" — instead of zeroing a weight, align it to the nearest point on a discrete quantization grid. But the trick of "adjust the remaining weights after quantizing one" is inherited directly from OBS.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it abandons the theoretically optimal "dynamic best selection" in exchange for a more-than-hundredfold speedup. A 175B model finishes in 4 GPU hours with almost no accuracy loss.
+
+The buried pitfall is the *layer-independence* assumption. When GPTQ processes layer $k$, it treats that layer as an island — assuming the input it receives is the original clean floating-point input. But at actual inference time, it receives the already-quantized output of layer $k-1$, which carries error. This error amplifies layer by layer, and especially explodes at low bit-widths (3-bit, 2-bit).
+
+** 2025 | GPTAQ / Qronos: Attaching an "Upstream Dirty-Input Compensator" to GPTQ
+
+*** What Problem It Saw
+
+GPTQ minimizes "how much does the output change between pre- and post-quantization, given floating-point input." But at inference time the input is already corrupted. So you are optimizing the wrong objective, and all your effort goes in the wrong direction. This is *activation mismatch* — the pre-quantization input and the post-quantization input do not match.
+
+*** Its Solution
+
+Change the objective to: "given *quantized input*, align the quantized output to the *floating-point output computed with floating-point input*." This introduces a cross term, effectively making the current layer's weights absorb some of the error propagated from upstream. Qronos pushes even harder: at the beginning of each Transformer block it resets accumulated error and focuses on correcting only the newly introduced error within that block.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it finally acknowledges that "upstream has error" and makes the current layer actively compensate. At 3-bit and 2-bit it clearly outperforms GPTQ.
+
+The buried pitfall: the mixing weight between the original objective and the compensation objective is chosen empirically. There is no theory saying "this blend will definitely reduce the final error," and for certain layers it can actually make things worse. The open-source implementation of GPTAQ requires searching different mixing coefficients per layer.
+
+** 2025-04 | QEP: Turning "Per-Layer Compensation" into a Principled Framework
+
+*** What Problem It Saw
+
+GPTAQ's intuition is right, but its formulation is messy — the objective looks like two things bolted together, and nobody can explain why the mixing coefficient should take that value. Moreover, overly strong compensation causes the model to "overfit" the calibration set, hurting performance on real data.
+
+*** Its Solution
+
+Rewrite from scratch: the objective for layer $l$ is no longer an output difference, but rather aligning *"the output computed with the input that should actually arrive (the already-quantized upstream output)"* to *"the output computed with quantized weights + the same input."* The compensation term becomes a correction added *on top of the pretrained weights*, and can be plugged into any existing PTQ algorithm as a drop-in.
+
+More critically: each layer gets a knob $\alpha_l$. At $\alpha_l = 1$ compensation is full; at $\alpha_l = 0$ there is none. Compensation can be selectively disabled layer by layer — this not only saves one-third to one-half of compute, but also acts as regularization, actually improving generalization.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it provides a *provable global error bound* — something GPTAQ never delivered. Llama-2-70B with QEP+QuIP at 2-bit actually matches RTN/GPTQ at 3-bit.
+
+The buried pitfall: attention is still locked on a single Linear layer. A Transformer block contains *residual connections* and *RMSNorm* — non-learnable "glue" components that ultimately determine what the next block actually sees. QEP cannot see this glue.
+
+** 2025-09 | LoaQ: Lifting the View from Linear to "After the Sub-Block"
+
+*** What Problem It Saw
+
+The sub-block output in a Transformer is $h_{k+1} = h_k + X_{\text{out}} W_{\text{out}}$ — where $h_k$ is the residual and the second term is the attention/MLP contribution. This then passes through RMSNorm *before* entering the next block.
+
+So "what the next block actually sees" is not the output of $W_{\text{out}}$, but rather *the residual plus its output, all normalized together*. Aligning at the $W_{\text{out}}$ step as QEP/GPTAQ do is futile — the RMSNorm washes the alignment away immediately.
+
+LoaQ also observes an interesting fact: residual connections allow quantization errors to accumulate layer by layer, so why doesn't the model collapse? Because RMSNorm "rescales" the accumulated error back into a bounded range. This implies: *it is the normalized output that truly influences downstream computation*.
+
+*** Its Solution
+
+Three levels progressively approach the true target:
+
+1. *LLOA* (Linear-Layer Output Approximation) — align the $W_{\text{out}}$ output; equivalent to GPTQ.
+2. *SOA* (Sub-layer Output Approximation) — align $h_k + X_{\text{out}} W_{\text{out}}$, incorporating the residual.
+3. *NOA* (Normalized Output Approximation) — align $\text{RMSNorm}(h_k + X_{\text{out}} W_{\text{out}})$.
+
+Each level can be rewritten in an activation-aware form analogous to GPTQ, so the solver does not need to be rewritten.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it finally optimizes the *correct objective*. Under 2-bit channel-wise quantization, LoaQ outperforms GPTQ, GPTAQ, and Qronos.
+
+The buried pitfall: it *hand-picks* the specific submodule structure of "sub-block + residual + RMSNorm" and derives everything for that one structure. Transformers contain other "naturally coupled" submodules — QK projection pairs (Q and K are co-dependent), VO projection pairs, MLP up-down pairs, KV caches, and rotation matrices of the SpinQuant/QuaRot variety. Each new one requires a new derivation. One scenario, one paper.
+
+** 2025-12 | LPCD: Turning "Submodule Quantization" into a Unified Optimization Framework (This Paper)
+
+*** What Problem It Saw
+
+Looking back at the lineage: OBS optimizes "one weight," GPTQ optimizes "one Linear layer," QEP optimizes "a Linear layer with upstream correction," LoaQ optimizes "Linear + residual + RMSNorm, one specific sub-block."
+
+Each generation raises the granularity of optimization by one level, but each time does so by hand-crafting a new granule to order. The authors of LPCD (note that Ichikawa is also a QEP author) asked a question that sounds simple but cuts deep:
+
+*Can we write a framework where "granularity" is a variable — you plug in whatever submodule you want to optimize?*
+
+*** Its Solution
+
+Split the entire problem into two alternating steps — *Coordinate Descent*:
+
+1. *Relaxed optimization in output space*: In the submodule's "continuous output space," solve an alignment problem that matches the submodule's output (without requiring weights to be discrete). This step is convex and tractable because the quantization constraint is temporarily relaxed.
+2. *Layer projection*: Take this relaxed solution and use an existing layer quantizer (GPTQ, QEP, etc.) as a "projection operator" to project it back into the discrete quantized domain.
+
+Repeat 1-2-1-2. Hence the name: *Layer-Projected Coordinate Descent*.
+
+Key insight: *all previous methods are single-iteration special cases of this framework*. GPTQ = submodule is a single Linear, no CD, just one pass; QEP = submodule is a single Linear, relaxed output space includes upstream error; LoaQ = submodule is the sub-block + residual + RMSNorm.
+
+From this, extensions arise naturally: want to quantize grouped-query KV? Set the submodule to the KV block. Want joint VO quantization? Set the submodule to V+O. Want LoRA error compensation? Stuff a LoRA into the submodule. Want to insert a rotation matrix (SpinQuant-style)? Stuff a rotation into the submodule. All handled by one framework.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it finds the correct level of abstraction: it turns "the submodule" from a formula hard-coded in a paper into a parameter of the framework. Coordinate descent provides a clean convergence guarantee, and layer projection ensures the result can be fed back into a standard PTQ pipeline — without breaking existing toolchains.
+
+Buried pitfalls (inferred; the paper does not make these explicit):
+- There is a trade-off between the number of CD iterations and the choice of submodule; larger submodules are more expensive to solve per step.
+- The paper's experiments only instantiate three cases — KV, VO, and MLP up-down; the potential of other submodules has not been verified.
+- This is still post-training; whether the gap relative to end-to-end QAT schemes can be fully closed remains to be seen.
+
+* Frontier Extensions
+
+As of May 2026, LPCD is a December 2025 preprint, and no follow-on papers explicitly advancing this "unified submodule quantization" direction have been observed. Anticipated directions include:
+
+- *Automatic submodule selection*: Currently QK/VO/MLP groupings are chosen by hand; a natural next step is to let the framework discover which submodule combinations are most worth quantizing jointly.
+- *Deep fusion with rotation/Hadamard methods*: QuaRot and SpinQuant rotation matrices can already be plugged into LPCD as submodules, but the reward of jointly optimizing them has not been fully explored.
+- *Extension to on-device training*: The LPCD framework is not in principle limited to post-training; could it serve as an inner solver for QAT?
+
+* One Diagram
+
+#+begin_example
+
+         Granularity ^                                LPCD Framework
+                     |                             /  (submodule = anything)
+                     |                          /
+                     |                       /
+                     |  Hand-crafted---LoaQ      Submodule becomes
+                     |  submodule               a variable
+                     |  (sub-block +
+                     |   RMSNorm)
+                     |       |
+                     |       |
+                     |  --- QEP (principled per-layer compensation) ---
+                     |       |
+                     |  --- GPTAQ/Qronos (heuristic per-layer compensation) ---
+                     |       |
+                     |  Single Linear (layer-independent)----GPTQ
+                     |       |
+                     |  Single weight (single point + global compensation)----OBS
+                     +-----------------------------------------> Time
+                       1993       2022       2025 spring  2025 fall  2025 winter
+
+
+      Horizontal axis: time                Vertical axis: optimization granularity
+
+      Each generation raises the granularity
+      OBS  -> GPTQ:   Can it even run?
+      GPTQ -> QEP:    Should we look upstream?
+      QEP  -> LoaQ:   Should we look at the glue (residual + Norm)?
+      LoaQ -> LPCD:   Can granularity itself become a tunable parameter?
+
+#+end_example
+
+* Insights
+
+On the surface, this thirty-year evolutionary line looks like "quantization algorithms getting more and more accurate." But what is really happening underneath is: *the granularity of optimization is approaching "end-to-end" one level at a time, while new algebraic techniques keep the computational cost from exploding*.
+
+- OBS wanted global vision (Hessian), and couldn't afford it.
+- GPTQ retreated to a single layer but cleaned up the algebra (Cholesky + fixed order) — suddenly tractable.
+- GPTAQ/QEP expanded the view from a single layer to "single layer + upstream."
+- LoaQ expanded the view to "sub-block + glue."
+- LPCD turned the "size of the view" itself from a hard-coded constant into a tunable parameter.
+
+Every generation is resolving the same tension: *the distance between the target we want to optimize (final model output) and the target we can afford to compute (the output of some small piece)*. Progress means finding ways to shrink that distance without letting compute blow up.
+
+Where next? Two directions are worth betting on:
+1. *Automatic granularity*: Let the algorithm decide which submodules should be quantized together.
+2. *Fusion with distributed training / QAT*: The boundary between post-training and training-time methods is blurring.
+
+* Takeaways
+
+This lineage offers a hard-nosed lesson about how to do research:
+
+*Don't just read one paper. First ask: what is it criticizing?* Read LPCD in isolation, and you'll think it's a nice unified framework. Thread together OBS → GPTQ → QEP → LoaQ, and you immediately see it isn't some isolated algorithm — it is the natural endpoint (one of them) of a thirty-year problem evolution: *turning hard-coded submodules into parameters of the framework*. This kind of "unifies all previous special cases" paper almost inevitably appears after a field accumulates three or four hand-crafted solutions.
+
+*Elevation of abstraction level often happens by parametrizing something previously fixed.* GPTQ parametrizes continuous weight values into a discrete grid; QEP parametrizes the compensation strength $\alpha$ per layer; LPCD parametrizes the submodule itself. If you see a field full of "write a new paper for each X" work, ask: *can X become a parameter of the framework?* That is likely the next unifying contribution.
+
+*You can apply this lens in reverse to your own field — scan for the "bespoke suits" that are being hand-tailored one by one. The next LPCD moment might be yours to write.*

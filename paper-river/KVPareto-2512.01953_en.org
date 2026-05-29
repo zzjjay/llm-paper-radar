@@ -1,0 +1,256 @@
+#+title:      KV Pareto: Systems-Level Optimization of KV Cache and Model Compression for Long Context Inference
+#+date:       [2026-05-29 Fri 12:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T123820-en
+#+source:     https://arxiv.org/abs/2512.01953
+#+authors:    Sai Gokhale, Devleena Das, Rajeev Patwari, Ashish Sirasao, Elliott Delaye
+#+venue:      arXiv 2512.01953 (2025)
+
+* The Problem River
+
+Long-context inference no longer fits in GPU memory. To let a 7B model read a 128k-token book on an edge device, the KV cache alone can dwarf the model itself. Why is this so hard? Because every additional token requires storing another key–value pair — double the sequence length, double the cache. There is no escaping the linear scaling.
+
+Over the past few years, three communities have attacked the problem from three directions: one group compressed KV-cache precision (KIVI, KVQuant, KVTuner), another restructured scheduling so that prefill and decode stop crowding each other out (Sarathi, vLLM), and a third compressed model weights (AWQ, GPTQ). All three paths made real progress in isolation, but nobody stopped to ask: what happens when you do all three at once? Is it 1+1+1=3, or do some techniques cancel each other out, or is there one specific combination that is the true sweet spot?
+
+KV Pareto does exactly that — it pulls three mutually isolated optimization techniques onto a single canvas and traces the memory-accuracy Pareto frontier they jointly define.
+
+* Source Map
+
+#+begin_example
+[2023 Sep] Kwon et al. - vLLM / PagedAttention            (SOSP'23)
+  |
+  | Observed: contiguous KV-cache allocation causes fragmentation, batch sizes suffer
+  | Solution: treat the KV cache like OS virtual memory — use paging
+  v
+[2023 Aug] Agrawal et al. - Sarathi                       (chunked prefill)
+  |
+  | Observed: prefill monopolizes the GPU; in-flight decode requests stall
+  | Solution: slice prefill into chunks and co-schedule them with decode
+  v
+[2024 Feb] Liu et al. - KIVI                              (ICML'24)
+  |
+  | Observed: nobody had carefully studied what KV element distributions actually look like
+  | Solution: inspect the distributions — key and value must be quantized differently
+  |           (per-channel vs. per-token)
+  v
+[2024 Jan] Hooper et al. - KVQuant                        (NeurIPS'24)
+  |
+  | Observed: KIVI strains at 2-bit; target is 3-bit and below without quality loss
+  | Solution: pre-RoPE quantization + non-uniform data types + sparse outlier handling
+  v
+[2025 Feb] Li et al. - KVTuner                            (ICML'25)
+  |
+  | Observed: uniform precision across all layers is too coarse;
+  |           sensitivity varies enormously by layer
+  | Solution: offline search for per-layer K/V bit-width assignments (mixed precision)
+  v
+[2025 Dec] Gokhale et al. - KV Pareto                     (this paper)
+  |
+  | Observed: three threads (KV quantization, chunked prefill, weight quantization)
+  |           operate in isolation; their joint effect has never been mapped
+  | Solution: sweep all combinations on a shared evaluation bench;
+  |           trace the memory-accuracy Pareto frontier
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | vLLM / PagedAttention: Managing the KV Cache Like Virtual Memory
+
+*** What problem did it see?
+
+Serving an LLM profitably means batching as many requests as possible. But each request's KV cache grows dynamically with generation length — you never know whether a user will ask for 10 tokens or 1000. The standard approach was to pre-allocate a large contiguous block of GPU memory per request, just in case. The result was memory sliced into islands, with enormous gaps that could never be filled. Kwon et al. named this phenomenon: fragmentation.
+
+A useful analogy: every request is a traveler with an unknown amount of luggage, and the airport insists that all bags occupy consecutive lockers. A few heavy travelers lock up entire rows; neighboring lockers sit half-empty, but because they are not contiguous, new travelers cannot be admitted.
+
+*** Its solution
+
+Borrow the operating system's virtual-memory abstraction. Divide the KV cache into fixed-size pages; allow a single request's cache to scatter across non-contiguous physical locations, indexed through a mapping table. The attack target is fragmentation: no more contiguous allocation, no more worst-case reservation.
+
+*** Why it worked (and what new problem it left behind)
+
+Memory utilization went from heavily discounted to nearly full, and batch sizes roughly doubled. But it solved *where to put* the cache, not *how much cache to store* — total KV volume still scales linearly with sequence length. Feed in a 128k-context request and even the cleverest paging cannot save you. The next bottleneck is not the memory manager; it is the sheer volume.
+
+** 2023 | Sarathi: Prefill, Stop Monopolizing the GPU
+
+*** What problem did it see?
+
+vLLM let you pack in more requests, but inside those requests there are two kinds of work: prefill (consuming the entire prompt in one pass) and decode (emitting one token at a time). When a prefill arrives it saturates GPU compute, forcing any in-flight decode requests to wait. Conversely, a pure-decode batch is a compute desert — each request contributes only one token, leaving matrix-multiply hardware largely idle.
+
+A vivid picture: prefill is a bulk buyer who rolls up with a cart full of goods and blocks the checkout lane; decode is a stream of customers buying a single bottle of water, standing in a queue while the cashier idles.
+
+*** Its solution
+
+Slice prefill into chunks and process only one chunk per step. Then, within the same step, let a prefill chunk ride alongside a batch of decode requests — decode *piggybacks* on prefill. The chunk size is tuned to saturate GPU compute, and decode comes along essentially for free.
+
+*** Why it worked (and what new problem it left behind)
+
+It smoothed out the imbalance between the two workload types: every step has a similar compute shape, so neither blocks the other. The idea was later absorbed into vLLM and became mainstream. But chunked prefill introduces a new free variable: how large should the chunk be? Does it interact with quantization strategy? Nobody had given a systematic answer — filling that gap is one of KV Pareto's contributions.
+
+** 2024 | KIVI: Understand What KV Cache Distributions Look Like Before Deciding How to Compress Them
+
+*** What problem did it see?
+
+By early 2024, KV quantization was an active area, but Liu et al. noticed something odd: nobody had seriously studied the numerical distributions inside the KV cache. Everyone defaulted to uniform, symmetric, low-bit quantization applied per-token, and it fell apart at 2-bit. Where exactly did it fall apart? Nobody could say precisely.
+
+*** Its solution
+
+Do the most elementary thing — plot histograms. The discovery: key and value distributions are two entirely different animals.
+
+- Keys have large outliers concentrated in specific channels; viewed along the channel dimension the distribution is relatively tight.
+- Values have outliers scattered broadly; viewed along the token dimension the distribution is more uniform.
+
+KIVI therefore proposed *asymmetric quantization*:
+
+- Keys quantized *per-channel* (one scale shared per channel)
+- Values quantized *per-token* (one scale shared per token)
+
+Aligning quantization granularity with the shape of the distribution. What looks like a one-line configuration change made 2-bit KV quantization work out of the box for the first time.
+
+*** Why it worked (and what new problem it left behind)
+
+Granularity aligned to distribution shape. But KIVI is still *uniform* — every layer and every head uses the same bit-width — and 2-bit is its floor. Going further requires either richer data types or accepting that some positions simply need more bits than others.
+
+** 2024 | KVQuant: Targeting 3-bit Without Letting RoPE Scramble the Distributions
+
+*** What problem did it see?
+
+KIVI established the feasibility of 2-bit KV quantization, but Hooper et al. were aiming at million-token-scale context — 10M-token inference. At that scale even 2-bit feels large. They also noticed a detail KIVI left unaddressed: RoPE (rotary position encoding) rotates key vectors and in doing so distorts the clean per-channel outlier structure, amplifying quantization error.
+
+*** Its solution
+
+Four techniques layered on top of each other:
+
+1. *Pre-RoPE quantization*: quantize keys *before* the RoPE rotation is applied, avoiding the distortion.
+2. *Non-uniform data types*: learn a custom non-linear quantization function per layer rather than a uniform grid.
+3. *Sparse-dense separation*: per vector, isolate outliers and store them in FP16; quantize the dense remainder aggressively.
+4. *Per-channel key quantization*: inherited directly from KIVI.
+
+Together, these four ingredients keep perplexity degradation below 0.1 at 3-bit, and enable 1M-token context on a single A100.
+
+*** Why it worked (and what new problem it left behind)
+
+The approach decomposes "push to the limit" into multiple independent axes, each contributing headroom. The cost is complexity — all four techniques must land correctly. And the scheme is still *uniformly applied across all layers*. Some layers are not sensitive and could get away with fewer bits; others are fragile and collapse at low precision. A one-size-fits-all policy inevitably leaves bits on the table in some places and falls short in others.
+
+** 2025 | KVTuner: Different Layers Deserve Different Bit-widths
+
+*** What problem did it see?
+
+Both KIVI and KVQuant assumed a single precision configuration shared across all transformer layers. Li et al. analyzed the attention mechanism theoretically and found two things:
+
+- Different layers tolerate KV quantization error very differently (early layers are more sensitive; many middle and late layers are robust).
+- Within a single layer, keys are almost always worth more bits than values.
+
+So why assign the same bit-width to every layer and every K/V pair?
+
+*** Its solution
+
+Reframe "how many bits should each layer get" as an *offline search* problem:
+
+- Enumerate multiple (key_bits, value_bits) combinations per layer.
+- Use sensitivity analysis to prune obviously poor combinations.
+- Cluster layers to compress the search space further.
+- Apply multi-objective optimization (accuracy vs. memory) to extract a set of Pareto-optimal configurations.
+
+Run the search once offline (a few hours), obtain a per-layer bit-width table, and follow the table at inference time. On Llama-3.1-8B this yields "near-lossless 3.25-bit mixed precision."
+
+*** Why it worked (and what new problem it left behind)
+
+It accepted a basic truth: uniform precision is a lazy assumption, and the world is inherently non-uniform. But KVTuner only pulled one lever — per-layer bit-width of the KV cache. It left untouched:
+
+- KV quantization *granularity* (per-token / per-tensor / per-block are another set of knobs)
+- *Chunked prefill* and its interaction with KV precision (what happens when chunk size and KV bit-width are co-tuned?)
+- *Weight quantization* (does AWQ remain stable under varying KV precision?)
+
+No one had mapped all three simultaneously.
+
+** 2025 | KV Pareto: Pulling All Three Threads onto a Single Pareto Plot
+
+*** What problem did it see?
+
+By this point, three forces had each traveled far on their own:
+
+| Direction        | Representative work          | What it controls                    |
+|------------------+------------------------------+-------------------------------------|
+| KV quantization  | KIVI / KVQuant / KVTuner     | Precision of cache elements         |
+| Chunked prefill  | Sarathi / vLLM               | Scheduling of prefill and decode    |
+| Weight quantization | AWQ / GPTQ                | Precision of model parameters       |
+
+Each line reported success: used in isolation, each saves memory while preserving accuracy. But Gokhale et al. pointed out that no *joint sweep* had ever been done. Does chunk size = 512 with KV 4-bit beat chunk size = 2048 with KV 8-bit? After AWQ quantizes weights to 4-bit, how far can you still push KV quantization? Does the optimal combination shift completely when you switch models (Qwen vs. Llama vs. Mistral)?
+
+An engineer deploying on an edge device needs a single chart saying "your memory budget is X GB; the optimal configuration is Y."
+
+*** Its solution
+
+KV Pareto does not invent a new algorithm. It builds a *systems-level evaluation framework*:
+
+- **Axes**: three groups of knobs — KV quantization precision and granularity; chunk size; whether AWQ is enabled.
+- **Coverage**: multiple models (Qwen, Llama, Mistral) × multiple benchmarks (GSM8K, MMLU, Needle-in-a-Haystack up to 128k).
+- **Output**: for each (model, task, memory_budget) triple, the *Pareto-optimal configuration*.
+
+The headline finding: under a 1–3% accuracy budget, joint optimization saves 68–78% of total memory — more than any single technique alone.
+
+*** Why it worked (and what new problem it left behind)
+
+The fundamental reason it works is an admission that *interaction effects cannot be extrapolated from single-variable experiments*. The best KV quantization precision depends on whether weights are also quantized; the best chunk size depends on the remaining KV memory budget. These second- and third-order interactions are invisible when each technique is studied alone.
+
+The gaps it leaves are equally clear:
+
+- The Pareto frontier is derived from *empirical sweeps*; there is no theory that predicts the optimal configuration for an unseen model.
+- Evaluation is capped at 128k context; the million-scale regime that KVQuant targeted has not been explored.
+- Rotation-based quantization (QuaRot, SpinQuant) is explicitly listed as future work.
+
+* Frontier Extensions
+
+As of the time this paper-river was written (2026-05), KV Pareto has been public for only about six months and direct follow-ups are still sparse. Two extension directions are visible:
+
+1. *Predictive joint configuration* — instead of running a Pareto sweep every time, predict the optimal configuration directly from model architecture, task type, and hardware parameters. This is the most immediate next step that KV Pareto itself identifies.
+
+2. *Folding rotation-based quantization into the knob set* — QuaRot / SpinQuant use learned rotation matrices to "rotate away" activation outliers, making 4-bit inference work without reserving outlier slots. Once added to KV Pareto's axis set, the entire Pareto frontier may shift uniformly toward lower memory and higher accuracy.
+
+Both directions are still in progress. KV Pareto is currently the latest landmark on this joint-optimization narrative thread.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  Time ->
+                  2023        2024          2025          2025-Dec
+  ----------------+-----------+-------------+-------------+----------
+  Scheduling /    | vLLM       Sarathi                       \
+  memory mgmt     | (paging)   (chunked PF)                   \
+                  |                                            \
+  KV cache        |            KIVI 2-bit                       >  KV Pareto
+  precision       |            (asym K/V)   KVQuant 3-bit      /   (three-axis
+                  |                         (pre-RoPE)        /    joint Pareto
+                  |                         KVTuner 3.25-bit /     sweep)
+                  |                         (per-layer mix) /
+                  |                                        /
+  Weight          |            AWQ 4-bit                  /
+  precision       |            (Lin et al.)              /
+
+  Problem evolution:  "where to store" -> "how to schedule" -> "how to compress each element"
+                   -> "how to tune precision per layer" -> "how to do all of this at once"
+
+  Cognitive arc:  optimize separately  --------------------->  optimize jointly
+                  (easy to publish)                           (hard, but what deployment needs)
+#+end_example
+
+* Insight
+
+What truly happened at each step on this timeline was not "yet another better compression algorithm." It was *a progressive refinement of the granularity at which optimization is applied, ultimately demanding integration*:
+
+- **Phase 1** (vLLM, Sarathi): stop wasting global resources.
+- **Phase 2** (KIVI, KVQuant): store each numerical value at the most appropriate precision.
+- **Phase 3** (KVTuner): acknowledge that different positions (layers) need different treatment.
+- **Phase 4** (KV Pareto): acknowledge that different optimization techniques interact and must be tuned jointly.
+
+Each phase is the result of the previous phase's own assumption breaking down. vLLM assumed "uniform per-request management is enough" — Sarathi broke that, because prefill and decode inside a request are different. KIVI assumed "keys and values are alike" — it broke that itself, because their distributions differ. KVTuner assumed "all layers are alike" — it broke that itself, because per-layer sensitivity varies enormously. KV Pareto assumed "each technique can be tuned independently" — and is now breaking that itself, because the interactions are strong.
+
+The next likely transition is *from empirical sweeping to learned prediction*: replace "sweep everything to find the optimum" with "glance at the model architecture and hardware and predict the optimum." Beyond that, *hardware co-design* may follow — once we know what the optimal configuration looks like, we can build chips specifically for it.
+
+* Takeaways
+
+For researchers: when a field has three forces each advancing independently, each presenting clean single-variable experiments, *their interactions are usually where the next good paper lives*. Such work need not invent a new algorithm, but it requires building infrastructure capable of holding three things in motion simultaneously, and the resolve to run the "combination experiment left as future work" that everyone else deferred.
+
+For practitioners: never again trust "our method saves X% in isolated testing." Sweep the Pareto frontier on your own model, task, and hardware — the budget allocation you arrive at will very likely differ completely from the best point reported in any individual paper.
+
+The bottom line: you can take any sub-field that seems to have been squeezed to its limit and squeeze it one layer further — combine it with another optimization technique considered orthogonal, sweep their joint Pareto plot, and the odds are good that nobody has drawn that chart before.

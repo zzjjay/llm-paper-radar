@@ -1,0 +1,297 @@
+#+title:      OptRot: Mitigating Weight Outliers via Data-Free Rotations for Post-Training Quantization
+#+date:       [2026-05-29 Fri 12:35]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T123510-en
+#+source:     https://arxiv.org/abs/2512.24124
+#+authors:    Advait Gadhikar, Riccardo Grazzi, James Hensman
+#+venue:      arXiv 2025/12 (preprint)
+
+* The River of the Problem
+
+To squeeze a model with tens of billions of parameters into a phone or a single GPU, the most direct approach is to compress each weight from 16-bit floating point down to 4-bit integer — four times smaller on disk, and faster to compute. But the moment you do, the model starts talking nonsense.
+
+Why? Because hiding inside the weights are a handful of "giants." The vast majority of weights cluster between -0.1 and 0.1, yet a few will suddenly spike to 5, 10, or even higher. When you quantize, you have only 16 slots (4 bits) to work with. To accommodate those giants, each slot must span a wide range — and the result is that 99% of the "ordinary weights" get crushed into the same value.
+
+This entire line of research is asking the same question over and over: *How do we push those giants down so that all weights look roughly the same size?* The answers grow increasingly elegant, but each generation emerges because the previous one didn't push hard enough.
+
+* Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar)
+  |
+  | Problem seen: quantizing an entire matrix at once is too crude; errors accumulate
+  | Fix: quantize column by column, immediately compensating remaining columns for the error
+  | Gap left: algorithm depends on input data (Hessian); completely helpless against "giants"
+  v
+[2022/23] SmoothQuant (Xiao) + LLM.int8 (Dettmers)
+  |
+  | Problem seen: giants in activations cause immediate blowup when quantizing activations
+  | Fix: SmoothQuant "moves" activation giants into the weights; LLM.int8 keeps giants in FP16
+  | Gap left: SmoothQuant just relocates the problem, doesn't solve it;
+  |           LLM.int8 needs mixed precision, which hardware dislikes
+  v
+[2023] QuIP (Chee)
+  |
+  | Problem seen: the root cause of giants is that "weight distribution is concentrated on certain axes"
+  | Fix: use a random orthogonal matrix to "rotate" the weights, spreading the distribution (incoherence theory)
+  | Gap left: the rotation matrix sits inside the network — an extra multiply at inference → slow
+  v
+[2024] QuaRot (Ashkboos)
+  |
+  | Problem seen: QuIP's rotation must be computed at inference, hurting latency
+  | Fix: exploit LLMs' "rotation invariance" to pre-fuse rotations into weights — zero runtime overhead
+  | Gap left: uses a fixed Hadamard matrix, not the optimal rotation angle
+  v
+[2024] SpinQuant (Liu)
+  |
+  | Problem seen: QuaRot's rotation angle is fixed, leaving performance on the table
+  | Fix: learn the best rotation on the Stiefel manifold with Cayley-SGD
+  | Gap left: training uses RTN to simulate the forward pass + requires calibration data;
+  |           slow and misaligned with GPTQ
+  v
+[2025/12] OptRot (Gadhikar, Grazzi, Hensman)  <-- this paper
+  |
+  | Problem seen: SpinQuant's objective is misaligned with GPTQ, and it depends on data
+  | Fix: derive a new objective from QuIP theory — "sum of fourth powers of rotated weights" — no data needed
+  v
+[Parallel] DartQuant, FlatQuant, OSTQuant, ButterflyQuant, Kurtail
+  (contemporaneous attempts using different objective functions or different rotation parameterizations)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Turning Quantization into "Column-by-Column Firefighting"
+
+*** What Problem It Saw
+
+Before GPTQ, quantizing a layer meant straightforward rounding: each weight was independently snapped to the nearest integer grid point. The consequence was that errors snowballed — the first column is off by a little, the second column off by a little more, and by the thousandth column the entire matrix's output has drifted wildly.
+
+Earlier work (OBQ) attempted to compute an optimal rounding scheme using second-order information, but its complexity was cubic — infeasible even for a few hundred million parameters, let alone tens of billions.
+
+*** Its Fix
+
+In a single sentence: *quantize one column, then immediately compensate*. Each pass compresses only one column of weights, immediately computes how much error that column introduced, and then slightly adjusts the remaining unquantized columns to cancel it out. Errors therefore never accumulate.
+
+Underneath, a Hessian matrix (essentially the covariance of input activations) tells the algorithm "which directions of error are most damaging," so compensation is prioritized in those directions.
+
+*** Why It Works (and Where the New Hole Is)
+
+Error compensation means each column's quantization "knows what happened before it," leaving capacity in the remaining columns for the most important directions. For the first time, a model like 175B could be compressed to 4 bits in a matter of hours.
+
+But it is entirely powerless against giants. If a weight is already 50, and 4 bits can represent at most −8 to 7 (signed), no amount of compensation can recover it. The problem was passed to the next generation: someone had to make the giants smaller first.
+
+** 2022/23 | SmoothQuant & LLM.int8: Dealing with Giants First
+
+*** What Problem It Saw
+
+GPTQ assumes you can quantize weights cleanly, but in real large-model deployment, activations also harbor giants — certain channels are tens of times larger than others. When these channels are multiplied by weights and then quantized, they overflow and the model collapses.
+
+*** Its Fix
+
+Two approaches:
+- *LLM.int8* (Dettmers): identify the giant channels and keep them in FP16 while the rest use INT8. Mixed precision.
+- *SmoothQuant* (Xiao): observe that "activations have giants but weights are relatively flat," then deliberately divide activations channel-wise by a scale s and multiply the corresponding weights by s — mathematically equivalent, but activations become flatter and easier to quantize.
+
+*** Why It Works (and Where the New Hole Is)
+
+Both methods acknowledged something important: *quantization is no longer post-processing; it requires actively reshaping the distributions of weights and activations.* This is the conceptual seed from which the entire rotation lineage grew.
+
+But neither truly "eliminates" the giants: LLM.int8 protects them, requiring hardware support for mixed precision; SmoothQuant merely moves the giants from activations into weights — someone still has to pay the bill. A more powerful tool was needed to truly eliminate giants.
+
+** 2023 | QuIP: Translating the "Giant" Problem into a Geometry Problem
+
+*** What Problem It Saw
+
+SmoothQuant uses per-channel scaling — it can only adjust along coordinate axes. But giants don't necessarily align neatly with any coordinate axis; they may lie along a diagonal direction. Axis-aligned scaling cannot handle diagonal giants.
+
+*** Its Fix
+
+Introduce a mathematical concept called *incoherence*. Intuitively: a matrix is incoherent if its elements are uniformly sized with no single value standing out, and its important directions (the eigenvectors of the Hessian) don't align with the coordinate axes.
+
+The approach: apply a *random orthogonal matrix* R to rotate the weights (W → R^T W), moving them from the original coordinate system to a random orientation. Random rotation has a near-magical property — it "scatters" any distribution, making values on each coordinate roughly equal in size. Giants are spread evenly across all coordinates, and the matrix becomes incoherent.
+
+And because rotation is orthogonal, a pair (R, R^T) can be inserted between two layers of the network with mathematically equivalent outputs — the model's output is unchanged.
+
+QuIP also proved a theorem: the better the incoherence, the tighter the theoretical upper bound on quantization error. For the first time, quantization had a framework with theoretical guarantees.
+
+*** Why It Works (and Where the New Hole Is)
+
+It transformed "eliminating giants" from an empirical operation into a geometrically grounded one with mathematical guarantees. Every subsequent rotation method walks this same path.
+
+But two new holes opened up:
+1. At inference, that pair (R, R^T) actually has to be computed — an extra matrix multiply, which is slow.
+2. The rotation is *random*. Random is good on average, but not necessarily optimal.
+
+** 2024 | QuaRot: Absorbing Rotations into Weights for Zero Inference Overhead
+
+*** What Problem It Saw
+
+QuIP's rotations are useful but expensive. A 7B model has dozens of layers; every layer requires multiplying by a rotation matrix on both sides, dragging down inference speed. Academically beautiful, engineeringly hesitant.
+
+*** Its Fix
+
+Notice an overlooked fact: *an LLM's residual stream is rotation-invariant* — if you multiply the residual stream by a rotation matrix and then rotate it back after the downstream LayerNorm, the output is completely unchanged. This means rotation R can be pre-merged with the weights of the layers on either side:
+
+#+begin_example
+Before:  x -> Linear(W1) -> R -> R^T -> Linear(W2) -> y
+After:   x -> Linear(W1 * R) -> Linear(R^T * W2) -> y
+                  ^^^^^^^                ^^^^^^^^
+                 new weights, computed offline    new weights, computed offline
+#+end_example
+
+After merging, *no rotation computation is needed at inference* — it is already baked into the weights. This is called a *fusible rotation*.
+
+Two other rotations (R3 before the KV cache, R4 before the down projection) cannot be fused, but using a Hadamard matrix allows the fast Hadamard transform, with very little overhead — these are called *online rotations*.
+
+This was the first scheme to achieve W4A4KV4 full 4-bit with genuinely fast inference.
+
+*** Why It Works (and Where the New Hole Is)
+
+It turned "rotation" into an engineering-ready tool. From this point on, "four rotations R1/R2/R3/R4 + GPTQ weight quantization" became the industry template.
+
+But R1 and R2 still use a fixed random Hadamard matrix — why is this angle better than others? Unknown. SpinQuant had already found that different random seeds could cause a 13-point accuracy gap downstream. A fixed Hadamard is clearly not optimal. The natural next step was obvious: *learn* the rotation.
+
+** 2024 | SpinQuant: Learning the Best Rotation on a Manifold
+
+*** What Problem It Saw
+
+Rotation matrix R must be orthogonal (R^T R = I); otherwise it is no longer a rotation, and QuaRot's fusion breaks. But the set of all orthogonal matrices is not an ordinary Euclidean space — it is a curved *Stiefel manifold*. Ordinary gradient descent walks off the manifold.
+
+*** Its Fix
+
+Use *Cayley-SGD*: at each step, apply the Cayley transform to constrain the update to the Stiefel manifold, ensuring R remains orthogonal throughout. The optimization objective is the discrepancy between quantized and original output (KL divergence or cross-entropy).
+
+To enable backpropagation, the forward pass uses *RTN* (round-to-nearest) for weight quantization (GPTQ is sequential and cannot support end-to-end gradients). After learning R, GPTQ is used to quantize the weights for actual deployment.
+
+The learned rotation outperforms the random Hadamard, especially under the 4-bit activation setting.
+
+*** Why It Works (and Where the New Hole Is)
+
+It acknowledged that "the optimal rotation is worth learning" and provided an engineering solution for learning on the manifold.
+
+But three intertwined problems remain:
+1. *Optimization objective misaligned with actual deployment*: training uses RTN, deployment uses GPTQ; the learned rotation optimizes only for activation quantization error, blind to weight quantization error.
+2. *Depends on calibration data*: a batch of real data must be fed through the forward pass to compute the loss.
+3. *Slow*: each step requires a full model forward pass; hundreds of steps translate directly into real GPU-hours.
+
+Why not embed GPTQ into the training loop? Because GPTQ is sequential (column by column), a single run is painfully slow; wrapping it in hundreds of optimization steps is simply infeasible.
+
+** 2026 | OptRot: Turning the Rotation Objective into Pure Math — No Data Required
+
+*** What Problem It Saw
+
+Summarizing the chain above, what OptRot sees is actually quite simple:
+- SpinQuant's learned objective is misaligned with actual deployment (GPTQ) — it is optimizing for RTN, not GPTQ.
+- The learning process requires calibration data, forward passes, and hundreds of iterative steps: slow and expensive.
+- The entire industry uses GPTQ to quantize weights, yet no one had specifically derived a rotation objective tailored to GPTQ.
+
+*** Its Fix
+
+Return to QuIP's theoretical framework. QuIP gives an error upper bound for *random* rotations. OptRot tightens that theorem one notch, deriving a probabilistic upper bound on GPTQ quantization error for a *given* rotation R:
+
+#+begin_example
+GPTQ error <= (w_max^2 / quantized bit count) * tr(H * L^T L) * calibration term
+              ^^^^^^
+              maximum absolute value of the rotated weights
+#+end_example
+
+The elegant part: *in this bound, the only term influenced by rotation R is w_max* — the largest element in the rotated weight matrix. All other terms are either data-dependent (H) or constants.
+
+The maximum is not easy to optimize (non-differentiable). OptRot uses a smooth surrogate: the *sum of fourth powers of the rotated weights*.
+
+#+begin_example
+Objective:  min_R   sum over all weights |  (R^T W)_{i,j}  |^4
+                                            ^^^^^^^^^^^^^^
+                                            rotated weights
+#+end_example
+
+The fourth power is the L_p norm with p=4, a smooth approximation of L_infinity (the maximum); it is also the core of *kurtosis* — a statistic that captures "whether giants exist." Two perspectives, one destination.
+
+Computing this objective *requires only the weights themselves — no data, no forward pass*. Optimization then proceeds with Cayley-SGD on the Stiefel manifold as before.
+
+*** Why It Works (and Where the New Hole Is)
+
+Three things are resolved at once:
+1. *Aligned with GPTQ*: the objective is derived directly from the GPTQ error upper bound, making it a natural fit for GPTQ deployment.
+2. *Data-free*: no calibration set, no calibration drift, no dependence on whose data you use.
+3. *Fast*: each objective evaluation is just a few matrix multiplications. One can also select the 50 weight matrices with the largest errors and optimize only those, without loading the entire model into GPU memory.
+
+In W4 weight-quantization settings, OptRot surpasses both the Hadamard baseline (QuaRot) and data-driven methods SpinQuant and OSTQuant.
+
+Remaining limitation: in W4A4 settings where activations are also compressed to 4 bits, OptRot falls slightly behind some data-driven methods — because its objective only looks at weights and ignores activation distributions. The paper itself acknowledges this as a "weight vs. activation" trade-off.
+
+* Frontier Extensions
+
+OptRot itself is a December 2025 preprint and has not yet faced formal critics. But a cohort of contemporaneous papers probe different directions, and can be viewed as parallel competition:
+
+- *DartQuant* (Shao 2025) uses a "Whip loss" — a heuristic for activation uniformity, lacking the rigorous derivation from an error upper bound that OptRot provides. OptRot's paper ran experiments: applying Whip loss to weights yields worse incoherence than OptRot.
+- *FlatQuant* (Sun 2024) learns a more general *invertible linear map* (not just rotation), with greater expressiveness, but *cannot be fused into weights*, requiring computation at inference — falling back into the same pit as QuIP.
+- *ButterflyQuant* (Xu 2025) replaces full orthogonal matrices with Givens rotations / butterfly parameterizations, reducing the number of optimization variables.
+- *OSTQuant* (Hu 2025) uses KL divergence as its objective but, like SpinQuant, requires data and forward passes.
+- *Kurtail* (Akhondzadeh 2025) directly minimizes kurtosis — conceptually aligned with OptRot's fourth-power idea, but not derived from the GPTQ error upper bound.
+
+The foreseeable next step: extending OptRot's data-free property to the activation side. OptRot currently underperforms data-driven methods in W4A4 precisely because it does not model activations; if a smooth surrogate could be derived from an activation-side incoherence bound (analogous to QuIP's treatment of activations), it might win in W4A4 as well.
+
+* One Diagram
+
+#+begin_example
+
+Timeline    Quantization Method         Strategy for "Giants"               Data Needed?
+---------- ----------------------- ------------------------------------ -------------------
+
+2022       GPTQ                   (none, quantize directly)            Yes (Hessian)
+  |        column-wise error compensation
+  |
+  v
+2022/23    SmoothQuant            per-channel scaling (axis-aligned)   Yes
+           LLM.int8               keep giants in FP16                  Yes
+  |
+  v        --- Rotations enter: scatter "giants" across all dimensions ---
+  |
+2023       QuIP                   random orthogonal matrix             Yes
+           + quantization         rotation computed at inference        (incoherence theory)
+  |
+  v        --- Engineering: make rotations zero-overhead ---
+  |
+2024       QuaRot                 fixed Hadamard, fused into weights   Yes (for GPTQ)
+           + GPTQ                 R1/R2 fusible, R3/R4 online
+  |
+  v        --- Learning: find the best rotation angle ---
+  |
+2024       SpinQuant              learn R, Cayley-SGD                  Yes (calibration data + forward)
+           + RTN (training)       objective: model output KL
+           + GPTQ (deployment)    <-- training objective ≠ deployment objective
+  |
+  v        --- Theory: optimize directly on the GPTQ error upper bound ---
+  |
+2025/12    OptRot                 learn R, Cayley-SGD                  No (weights only)
+           + GPTQ                 objective: ||R^T W||_4^4
+                                  <-- 4th power = smooth proxy for "maximum"
+
+#+end_example
+
+Reading across a row shows "what tools this generation had." Reading down a column shows how a single dimension (e.g., "does it need data?") was simplified step by step.
+
+The core moves in the entire chain are really just three: *use rotation to scatter giants → make rotation zero-overhead → align the rotation objective with the real quantizer*. OptRot pushes the third step to its limit — not even data is required.
+
+* Insights
+
+On the surface this is a chain of technical iterations, but underneath a deeper shift is happening: *the central difficulty of quantization moved from "how to round" to "how to reshape the representation space."*
+
+In the GPTQ era, everyone studied "given the weights, how do we round cleverly." After QuIP, the question became "can I first transform weights and activations into a space more friendly to quantization, then apply the simplest possible rounding." OptRot is this shift taken to its extreme — the quantizer itself is plain GPTQ; all the cleverness is concentrated in that rotation matrix.
+
+A second underlying pattern is *alignment between the objective function and the deployment pipeline*. The fundamental reason SpinQuant is overtaken by OptRot is that its training objective (KL + RTN) is one step removed from its deployment objective (accuracy after GPTQ). OptRot derives its objective directly by inverting the GPTQ error bound, achieving alignment. Whenever a method uses proxy A during training but switches to B at deployment, it is almost certain that a successor will align the proxy directly to B.
+
+Where is the next step most likely to go? Two directions:
+1. *Activation-side OptRot* — extend the fourth-power objective idea to activation distributions, making W4A4 also data-free.
+2. *Automating the search for surrogates* — OptRot's objective was derived by hand. If meta-learning or symbolic regression could automatically find tighter surrogates from the error upper bound, the entire research chain would be advanced by a different mode of discovery.
+
+* Takeaways
+
+Three takeaways this river offers to researchers:
+
+First: *the most expensive optimization is often unnecessary.* SpinQuant looks like it must have forward passes, data, and hundreds of steps — but returning to the theory reveals that the loss is essentially a proxy for an upper bound, and the data-dependent terms in that bound can be dropped. Many "seemingly indispensable" costs exist because no one went back to derive which parts are actually necessary. This means: *when you encounter an expensive pipeline, first trace back to what it is actually optimizing — you will often find a version that is ten times cheaper.*
+
+Second: *theoretical bounds guide engineering even when they are loose.* QuIP's bound is loose for random rotations, but it tells you "make incoherence smaller" — OptRot extends that message from random to learned rotations, and performance breaks through. The value of theory is not accurate prediction but *pointing at what to optimize*. This means: *don't wait for the theory to be tight before using it; treat it as a steering wheel first.*
+
+Third: *methods that look identical on the surface can have completely different skeletons.* SpinQuant and OptRot both "learn a rotation on the Stiefel manifold with Cayley-SGD" — identical optimization framework, identical output form. But change the objective function, and one requires data and forward passes while the other needs neither. This means: *when two methods look alike, the difference almost always lives in the one line that is the objective function — and that one line is where the real research is.*

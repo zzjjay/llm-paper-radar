@@ -1,0 +1,238 @@
+#+title:      More Than Bits: Multi-Envelope Double Binary Factorization for Extreme Quantization
+#+date:       [2026-05-29 Fri 12:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T123833-en
+#+source:     https://arxiv.org/abs/2512.24545
+#+authors:    Yuma Ichikawa, Yoshihiko Fujisawa, Yudai Fujimoto, Akira Sakai, Katsuki Fujisawa
+#+venue:      arXiv preprint, 2025-12-31 (cs.LG)
+
+* The River of the Problem
+
+A 70B-parameter model stored in FP16 needs 140 GB. Can we compress each weight down to just one or two bits and still have a model that makes sense?
+
+Where is the difficulty? A weight is originally a continuous real number. Compress it to 1 bit and only two values remain — +1 and −1 — stripping away all "how important am I" information. During inference, every weight's contribution is determined by its *numerical magnitude*; flatten that magnitude to a bare sign and the model immediately "loses its voice."
+
+What if we could keep the sign (hardware computes this blazingly fast — integer multiply costs 1/16 of FP16) while feeding back some "how large am I" information? The past three years of research on this line have been wrestling with exactly that: how to use as few real numbers as possible to smuggle magnitude information back into a sea of ±1s. Each generation thinks: the previous wave was too stingy about magnitude — can we afford a little more? But not too much, or we lose the speed of 1-bit.
+
+This line of work is the story from OneBit all the way to MDBF.
+
+* The Source Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  | Problem: 4-bit holds up, but 2-bit/1-bit collapse immediately
+  | Solution: use Hessian to calibrate per-layer quantization error
+  | Legacy: still element-wise quantization; no rescue at 1-bit
+  v
+[2024-Feb] OneBit (Xu et al.)
+  | Problem: direct 1-bit compression causes catastrophic degradation
+  | Solution: W = sign(W) * (a * b^T) -- one ±1 matrix + two 1-D scaling vectors
+  | Legacy: a single pair of 1-D scalings has too little expressive power
+  v
+[2025] DBF (Boza & Macko)
+  | Problem: OneBit has only one pair of scalings; too little headroom near 1-bit
+  | Solution: dual sign matrices + internal diagonal scaling
+  |       W = D_a * S_a * D_m * S_b^T * D_b
+  | Legacy: after demodulation all rank components share the same magnitude profile
+  v
+[2025] LittleBit (Lee et al.)
+  | Problem: one DBF term is not accurate enough
+  | Solution: stack a second DBF term on the residual (P=2)
+  |       gains precision by adding sign diversity
+  | Legacy: adding signs补"direction", not "magnitude"; poor cost-efficiency
+  v
+[2025-Dec] MDBF (Ichikawa et al.) <-- target paper
+  | Insight: the real bottleneck is the single-envelope constraint (magnitude locked at rank-1)
+  | Solution: keep shared signs intact; upgrade the single envelope to a rank-l envelope
+  |       magnitude information goes through size, not through sign diversity
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Everything Is Fine Down to 4-bit
+
+*** What Problem It Saw
+
+Before GPTQ, large-model quantization was essentially "round each weight independently to the nearest integer grid point." This works perfectly at 8-bit, barely holds at 4-bit, but at 3-bit or 2-bit the model immediately starts babbling — because rounding errors accumulate independently across all weights and, at low bit-widths, drown the signal entirely.
+
+*** Its Solution
+
+Instead of treating each weight's rounding error in isolation, GPTQ uses a Hessian matrix (think of it as a relational graph of "which weights, varied together, most affect the model output") to distribute error. Round one weight first, propagate the error it introduces onto the remaining unquantized weights, and let subsequent rounding steps actively compensate for what came before.
+
+*** Why It Works (and What New Problem It Buries)
+
+It acknowledges a plain truth: weights are not independent, and quantization should not treat them as such. With this calibration, 4-bit quantization achieved near-lossless quality for the first time.
+
+However, GPTQ is still element-wise — each weight is stored independently as 4 bits or 3 bits. At 1-bit, each weight is reduced to ±1; no matter how clever the error redistribution, there is no saving "information that was never stored." To reach 1-bit one must take a different road: stop storing element-wise and instead change the *structure* — decompose the entire weight matrix into a product of 1-bit matrices and a small number of real-valued factors.
+
+** 2024-Feb | OneBit: The First 1-bit LLM That Does Not Collapse
+
+*** What Problem It Saw
+
+Replacing the weight matrix W entirely with sign(W) breaks the model — all magnitude information is erased in one stroke. But what if you attach one scaling factor per row and one per column, and multiply the outer product of these two vectors elementwise onto the ±1 matrix as "the amplification at each position"? Might that recover something?
+
+*** Its Solution
+
+OneBit decomposes the weight matrix as:
+
+#+begin_example
+W ~ sign(W) (*) (a * b^T)
+#+end_example
+
+`sign(W)` is a ±1 matrix (1 bit/element); `a` and `b` are two 1-D FP16 vectors whose outer product gives a rank-1 real-valued envelope that is applied elementwise to the sign matrix.
+
+Intuitively: the sign determines direction; the outer product determines how loud each position should be.
+
+*** Why It Works (and What New Problem It Buries)
+
+OneBit establishes a paradigm — *sign + low-rank envelope*. This paradigm matters because it maps directly to a hardware fast path: 1-bit GEMM (bit-packed, run through a dedicated kernel) plus a few cheap diagonal rescalings, eliminating FP16 matrix multiplication from the entire inference path.
+
+But OneBit's envelope is very weak: the magnitude information for an N × M matrix is compressed into just N + M numbers. When you try to squeeze more precision near 1-bit, this headroom is simply not enough.
+
+** 2025 | DBF: Upgrading from One Sign Layer to Two Sign Layers + Internal Scaling
+
+*** What Problem It Saw
+
+OneBit exhausted its expressive power with a single (a, b) pair. Can the sign pathway carry more structure systematically? The key observation is that OneBit's `sign(W) * (a b^T)` can be rewritten as "two matrix multiplications plus several diagonal rescalings." Why not make the inner segment binary as well and add another set of diagonal scalings?
+
+*** Its Solution
+
+DBF (Double Binary Factorization) decomposes the weight as:
+
+#+begin_example
+W ~ D_a * S_a * D_m * S_b^T * D_b
+#+end_example
+
+where `S_a` and `S_b` are two 1-bit sign matrices (shapes N × R and M × R, R being the internal rank), and `D_a`, `D_m`, `D_b` are three sets of diagonal scalings (i.e., three 1-D vectors a, m, b).
+
+At inference time, the FP16 GEMM is replaced by *two binary GEMMs plus a few diagonal rescalings* — still the 1-bit path, but now with an extra sign matrix and an extra set of scalings in the middle.
+
+*** Why It Works (and What New Problem It Buries)
+
+DBF's strength lies in expanding OneBit's single (a/b) pair into three scaling groups (a, m, b) plus two sign matrices (S_a, S_b), enriching the structure while barely changing the parameter count (signs are 1-bit). Its accuracy near 2-bit is substantially better than OneBit's.
+
+But here lies a trap that MDBF will later expose: DBF is mathematically equivalent to `W ~ U V^T`, where `U = D_a S_a D_{sqrt(m)}` and `V = D_b S_b D_{sqrt(m)}`. Look at the columns of U — every column is the *same* vector a, flipped in sign by ±1 and rescaled by sqrt(m). In other words, once you strip away the ±1 perturbations, all columns of U share the same "amplitude profile" — namely a. MDBF later names this the *single-envelope constraint*: all rank components share the same rank-1 envelope.
+
+DBF did not realize this was the bottleneck.
+
+** 2025 | LittleBit: Stack Another Term on the Residual
+
+*** What Problem It Saw
+
+One DBF term `D_a S_a D_m S_b^T D_b` is not a close enough fit to the weight. Why not follow a boosting-style approach and fit the residual a second time?
+
+*** Its Solution
+
+LittleBit simply sums two DBF terms:
+
+#+begin_example
+W ~ D_{a^(1)} S_a^(1) D_{m^(1)} S_b^(1)T D_{b^(1)}
+  + D_{a^(2)} S_a^(2) D_{m^(2)} S_b^(2)T D_{b^(2)}
+#+end_example
+
+The second term specifically targets the residual of the first. Combined with QAT (quantization-aware training) and multi-GPU optimization, LittleBit set a new accuracy record in the 1.5-bit regime.
+
+*** Why It Works (and What New Problem It Buries)
+
+LittleBit confirms something important: DBF's capacity is genuinely insufficient, and adding more helps. But what exactly does it add? *An extra set of sign matrices (S_a^(2), S_b^(2))* — that is, more "directional diversity."
+
+MDBF later argues: you're adding to the wrong place. Extra sign terms do recover precision, but they recover *sign expressiveness* — whereas the real scarcity is *magnitude expressiveness*.
+
+How can we tell? Look at MDBF's ablations: under the same bits-per-weight budget, *increasing the envelope rank l (adding real-valued magnitude degrees of freedom)* monotonically reduces reconstruction error; *increasing the number of DBF terms P (adding more signs)* often makes reconstruction error worse. LittleBit chose the second path, hence its poor cost-efficiency.
+
+** 2025-Dec | MDBF: Don't Add Signs — Increase the Envelope's Rank
+
+*** What Problem It Saw
+
+Stack up the previous three generations:
+
+- OneBit: sign + rank-1 envelope (one (a, b) pair)
+- DBF: dual signs + rank-1 envelope (all R columns share the same profile a)
+- LittleBit: DBF + DBF on residual (adds signs, not envelope rank)
+
+MDBF identifies the common root cause: after demodulation, the envelope in all of these methods has *rank 1*. This means the weight matrix's diversity in the "magnitude" dimension is locked — all R rank components must share a single amplitude pattern.
+
+The authors ran an empirical check: they computed the entropy-based effective rank of the demodulated envelope for weight matrices in LLaMA2-13B. The result: the effective rank of the demodulated envelope consistently sits in the mid-range of R (much greater than 1), showing that *the magnitude of a weight matrix is itself multi-modal* and a rank-1 envelope simply cannot contain it.
+
+*** Its Solution
+
+Upgrade DBF's rank-1 envelope to a rank-l envelope, leaving the sign basis untouched:
+
+#+begin_example
+W ~ S_a * (A Q^T) * (transpose stuff) * S_b
+#+end_example
+
+Concretely, the demodulated envelope of each factor is no longer the rank-1 form `a m^(1/2) (...)` but the rank-l form `A Q^T` (A is N × l, Q is R × l). The same sign pair S_a / S_b is shared, but each column is now allowed its own envelope mode.
+
+*** Why It Works (and What New Problems Remain)
+
+Three key points:
+
+1. *The hardware path is unchanged.* MDBF still runs as two binary GEMMs plus diagonal rescalings at inference time, because the sign matrices are shared. It does not break the deployment-friendliness of DBF/LittleBit — a prerequisite for production use.
+
+2. *The saved bits are spent where it counts.* Under a fixed bits-per-weight budget, increasing envelope rank l is more cost-effective than increasing the number of DBF terms P. The sweep in Figure 1 of the paper shows the optimal configuration is (l*, P*) = (16, 1) — that is, push the envelope to 16 dimensions and use just one DBF term; never stack a second DBF term. This single finding directly refutes LittleBit's direction of scaling.
+
+3. *Closed-form initialization + ADMM refinement.* When the sign masks are fixed, the optimal envelope fit is exactly the low-rank SVD given by the classical Eckart–Young theorem — so MDBF has a clean closed-form warm start, followed by ADMM alternating optimization.
+
+Remaining open issues: (a) the choice of envelope rank l still relies on grid search; (b) full integration with QAT is not yet done (LittleBit used QAT, while MDBF focuses on PTQ); (c) solving for the sign masks remains a non-convex discrete problem and initialization quality significantly affects final accuracy.
+
+* Extensions at the Frontier
+
+This paper appeared on arXiv on 2025-12-31; as of May 2026, no direct public follow-ups have yet emerged. Foreseeable directions:
+
+1. *MDBF + QAT*: LittleBit already demonstrated that QAT delivers large accuracy gains in the 1-bit regime. Bringing MDBF's multi-envelope structure into a QAT framework should push accuracy further.
+
+2. *Per-layer adaptive l*: MDBF currently uses the same l for all layers, but effective ranks can vary substantially across layers (Figure 2 of the paper hints at this). Per-layer adaptive l should squeeze out more efficiency.
+
+3. *Cross-layer sign sharing*: MDBF already shares S_a / S_b along the rank dimension. The natural next question is: can some sign structure also be shared across layers?
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  | Sign pathway         | Envelope (magnitude)
+------------------+---------------------+-------------------------------
+2022 GPTQ         | element-wise 4-bit, | (N/A — element-wise quant.)
+                  |   no sign structure |
+                  |                     |
+2024 OneBit       | sign(W)             | rank-1 (one (a, b) pair)
+                  |                     |
+2025 DBF          | S_a * (...) * S_b   | rank-1 (vectors a, m, b;
+                  | two sign matrices   |   but all R columns share
+                  |                     |   the same profile a)
+                  |                     |    <-- single-envelope hidden bottleneck
+                  |                     |
+2025 LittleBit    | DBF + DBF           | rank-1 (adds signs, not envelope)
+                  | stacks on residual  |    <-- fixing the wrong place
+                  |                     |
+2025-12 MDBF      | S_a * (...) * S_b   | rank-l envelope (l = 16)
+                  | same as DBF,        |    <-- bits spent on magnitude,
+                  |   signs unchanged   |        not on signs
+                  |                     |
+
+       Problem: 1-bit inference is fast, but accuracy collapses
+              |
+              v
+       Consensus evolution: cut magnitude -> add one scaling pair -> add two sign groups -> add more sign terms -> increase envelope rank
+                  GPTQ          OneBit              DBF                  LittleBit               MDBF
+                  fails         foundation          richer structure     wrong direction          right bottleneck
+#+end_example
+
+* Insights
+
+This line of work reveals three things to me.
+
+First, *the true scarce resource in binary quantization is not sign diversity but magnitude expressiveness*. The first three generations (OneBit → DBF → LittleBit) all scaled by "adding more sign matrices," because signs are cheap (1 bit/element) and don't consume the budget. But that is precisely the problem — you are adding the cheap thing and saving the expensive thing. MDBF inverts this: keep fewer signs, spend all the bits on the real-valued degrees of freedom in the envelope. This is a cognitive shift in *budget allocation*.
+
+Second, *"theoretically equivalent" and "practically exploited" are two different things*. The single-envelope constraint in DBF was never hidden — once you write out `W = D_a S_a D_m S_b^T D_b`, the fact that "all columns of U share the profile a" is mathematically obvious. But nobody measured the effective rank of the demodulated envelope, and nobody recognized it as the bottleneck. Half of MDBF's contribution is the new structure; the other half is *the diagnosis* — naming the bottleneck, drawing the evidence, turning something "plainly visible but unexamined" into something "clearly too important to ignore."
+
+Third, *"preserving the hardware fast path" is a hard constraint*. Every paper on this line stands only because it does not break the 1-bit GEMM inference path. LittleBit preserved this (two stacked DBF terms are still binary GEMMs); MDBF preserved it (shared signs keep binary GEMMs unchanged). The moment anyone introduces a full FP16 matrix multiply for the sake of accuracy, the entire line loses its purpose. This draws a red line for future work: any scheme that "breaks the sign-shared binary kernel" must first prove it beats 4-bit GPTQ; otherwise, just use 4-bit.
+
+Where should the field go next? The two nearest gaps — *per-layer adaptive l* and *MDBF + QAT* — should appear soon. Farther out, I expect someone will combine the rank-l envelope structure with mixture-of-experts-style sparse gating, letting different input routes activate different envelope modes. But this requires resolving a prior question: the current bottleneck of the 1-bit path is magnitude capacity, not compute; once that capacity is opened up, what becomes the next bottleneck? That is the most worthwhile question to track on this line after MDBF.
+
+* Takeaways
+
+The methodological lessons for doing research concentrate on two points.
+
+*The right to name a bottleneck.* Three generations of researchers all felt the accuracy ceiling of the DBF family, but only MDBF attributed that ceiling to the "single-envelope constraint." Naming a bottleneck is itself a contribution — it turns a vague discomfort scattered across many researchers' heads into an object that can be attacked and measured. To find a research problem, *look for phenomena that are "plainly obvious but never formally stated."* They are often the next bottleneck.
+
+*The direction of improvement vs. the location of improvement.* LittleBit's direction was correct (DBF is not accurate enough; add something), but the location was wrong (add signs instead of envelope). The cost of that mistake was one paper. Judging "where to add" is much harder than judging "what to add" — the former requires quantitative intuition about the marginal cost/benefit of each component. This suggests a concrete practice: *before making any improvement, run a sweep experiment* — plot the scaling curve for each component individually, and see which curve has the steepest slope and which saturates earliest. MDBF's Figure 1 is exactly this sweep — increasing l monotonically reduces error; increasing P actually raises it — and that single figure set the direction for the entire paper.

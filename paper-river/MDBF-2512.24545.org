@@ -1,0 +1,235 @@
+#+title:      More Than Bits: Multi-Envelope Double Binary Factorization for Extreme Quantization
+#+date:       [2026-05-29 Fri 12:38]
+#+filetags:   :paper:river:
+#+identifier: 20260529T123833
+#+source:     https://arxiv.org/abs/2512.24545
+#+authors:    Yuma Ichikawa, Yoshihiko Fujisawa, Yudai Fujimoto, Akira Sakai, Katsuki Fujisawa
+#+venue:      arXiv preprint, 2025-12-31 (cs.LG)
+
+* 问题之河
+
+一个 70B 参数的大模型，存成 FP16 要 140GB。能不能把每个权重压到只用一两个比特，但模型还能说人话？
+
+这事儿难在哪？一个权重原本是个连续的实数，你给它压到 1 bit，就只剩 +1 和 -1 两种取值——所有的"我有多重要"的信息都没了。模型推理的时候，每个权重该贡献多少，是靠它的*数值大小*说话的；你把大小抹平，只留正负号，模型立刻"失语"。
+
+那能不能既保留正负号（这部分硬件算得飞快，整数乘法的代价是 FP16 的 1/16），又给每个权重补一点"我有多大"的信息回来？过去三年这条线一直在折腾这个：怎么用尽量少的实数，把"大小"信息塞回到一堆 ±1 里头去。每一代人都在想：上一波的"大小"塞得太抠门，能不能多塞一点；又不能塞太多，否则就失去了 1-bit 的快。
+
+这条线，就是从 OneBit 一路走到 MDBF 的故事。
+
+* 溯源地图
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  | 问题: 4-bit 还能撑住，但 2-bit/1-bit 直接崩
+  | 解法: 用 Hessian 校准逐层量化误差
+  | 留下: 还是逐元素量化，到 1-bit 没救
+  v
+[2024-Feb] OneBit (Xu et al.)
+  | 问题: 1-bit 直接压会塌方
+  | 解法: W = sign(W) * (a * b^T) -- 一个 ±1 矩阵 + 两个一维 scaling 向量
+  | 留下: 一对一维 scaling 表达力太弱
+  v
+[2025] DBF (Boza & Macko)
+  | 问题: OneBit 只有一对 scaling, 接近 1-bit 时余量太少
+  | 解法: 双 sign 矩阵 + 内部 diagonal scaling
+  |       W = D_a * S_a * D_m * S_b^T * D_b
+  | 留下: demodulation 之后所有 rank 分量共享同一个 magnitude profile
+  v
+[2025] LittleBit (Lee et al.)
+  | 问题: DBF 一项不够准
+  | 解法: 在残差上再叠一项 DBF (P=2)
+  |       靠加 sign 多样性补精度
+  | 留下: 加 sign 是补"方向", 不是补"大小"; 性价比不高
+  v
+[2025-Dec] MDBF (Ichikawa et al.) <-- 目标论文
+  | 看穿: 真正瓶颈是 single-envelope 约束 (大小被锁死在 rank-1)
+  | 解法: 共享 sign 不动, 把单个 envelope 升级到 rank-l envelope
+  |       磁信息走大小, 不走 sign 多样性
+#+end_example
+
+* 演化叙事
+
+** 2022 | GPTQ: 4-bit 之前一切好说
+
+*** 它看到了什么问题
+
+在 GPTQ 之前，大模型量化基本就是"挨个权重四舍五入到最近的整数刻度"。这招在 8-bit 完全够用，4-bit 也勉强能撑，但到了 3-bit、2-bit，模型直接说胡话——因为每个权重的舍入误差独立累加，到了低位宽就盖过了信号本身。
+
+*** 它的解法
+
+不要孤立地看每个权重的舍入误差，而是用一个"Hessian 矩阵"（你可以理解为"哪些权重一起变会让模型输出受影响最大"的关系网）来分配误差。先把一个权重舍入，把它制造的误差摊到剩下还没量化的权重头上，让后续的舍入主动补偿前面的伤。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它承认了一个朴素的事实：权重不是独立的，量化也不该独立做。靠这套校准，4-bit 量化第一次做到了几乎无损。
+
+但是，GPTQ 还是逐元素量化——每个权重独立存储成 4 个比特、3 个比特。到了 1-bit，每个权重只剩 ±1，再聪明的误差摊派也救不了"信息从根上没了"。要走到 1-bit，必须换路：不再逐元素存，而是改变*结构*——把权重矩阵整个拆成若干个 1-bit 矩阵和少量实数因子的乘积。
+
+** 2024-Feb | OneBit: 第一次让 1-bit LLM 不塌方
+
+*** 它看到了什么问题
+
+直接把权重矩阵 W 全部替换成 sign(W)，模型就废了。原因前面说了——所有"我有多大"的信息被一刀切掉。但反过来，如果你给每行配一个 scaling factor、每列配一个 scaling factor，把这两个一维向量乘出来当作"每个位置的放大倍数"，是不是能恢复一部分？
+
+*** 它的解法
+
+OneBit 把权重矩阵分解成：
+
+#+begin_example
+W ~ sign(W) (*) (a * b^T)
+#+end_example
+
+`sign(W)` 是一个 ±1 矩阵（占 1-bit/元素），`a` 和 `b` 是两个一维向量（FP16），它们的外积给出一个秩 1 的实数 envelope，逐元素相乘到 ±1 矩阵上。
+
+直观地说：sign 决定方向，外积决定每个位置该有多响。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它确立了一个范式——*sign + low-rank envelope*。这个范式之所以重要，是因为它直接对应一条硬件 fast path：1-bit GEMM（位打包后用专用 kernel 算）+ 几次便宜的对角缩放，整个推理流程不再有 FP16 矩阵乘。
+
+但 OneBit 的 envelope 表达力很弱：整个 N x M 矩阵的"大小"信息被压缩到 N+M 个数里。当你想在 1-bit 附近继续挤精度时，这点余量不够用。
+
+** 2025 | DBF: 把"一层 sign"升级到"两层 sign + 内部 scaling"
+
+*** 它看到了什么问题
+
+OneBit 用了一对 (a, b) 一维 scaling，表达力到顶。能不能更系统地让"sign 路径"承载更多结构？关键观察是：OneBit 那个 `sign(W) * (a b^T)` 其实可以重写成"两个矩阵乘 + 几个对角缩放"的结构，那为什么不让中间那一段也是 binary 的、再加一组对角缩放呢？
+
+*** 它的解法
+
+DBF（Double Binary Factorization）把权重分解成：
+
+#+begin_example
+W ~ D_a * S_a * D_m * S_b^T * D_b
+#+end_example
+
+其中 `S_a`、`S_b` 是两个 1-bit sign 矩阵（形状 N x R 和 M x R，R 是内部秩），`D_a`、`D_m`、`D_b` 是三组对角缩放（也就是 a、m、b 三个一维向量）。
+
+推理时，FP16 GEMM 被替换成 *两次 binary GEMM 加几次对角缩放*——还是 1-bit 路径，但中间多了一道 sign 矩阵和一组 scaling。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+DBF 的厉害在于它把 OneBit 的"一对 a/b"扩展到了"a、m、b 三组 + 两个 sign 矩阵 S_a/S_b"，结构上更丰富，参数量却几乎不变（sign 都是 1-bit）。它在 2-bit 附近的精度比 OneBit 好得多。
+
+但这里埋了一个 MDBF 后来要拆穿的坑：DBF 数学上等价于 `W ~ U V^T`，其中 `U = D_a S_a D_{sqrt(m)}`、`V = D_b S_b D_{sqrt(m)}`。注意 U 的每一列长什么样？*每一列都是 a 这同一个向量*，再被 sign 翻一下符号、被 sqrt(m) 缩放一下。换句话说，去掉 ±1 的扰动之后，U 的所有列共享同一个"幅度轮廓"，即 a。MDBF 后来给这个现象起了个名字叫 *single-envelope constraint*——所有 rank 分量共享同一个 rank-1 envelope。
+
+DBF 当时没意识到这是瓶颈。
+
+** 2025 | LittleBit: 在残差上再叠一项
+
+*** 它看到了什么问题
+
+DBF 一项 `D_a S_a D_m S_b^T D_b` 拟合权重，残差还是不小。能不能像 boosting 那样，再拟合一次残差？
+
+*** 它的解法
+
+LittleBit 干脆做了两项 DBF 相加：
+
+#+begin_example
+W ~ D_{a^(1)} S_a^(1) D_{m^(1)} S_b^(1)T D_{b^(1)}
+  + D_{a^(2)} S_a^(2) D_{m^(2)} S_b^(2)T D_{b^(2)}
+#+end_example
+
+第二项专门去拟合第一项的残差。配合 QAT（量化感知训练）和多 GPU 优化，LittleBit 在 1.5-bit 这一档刷新了精度。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+LittleBit 验证了一件事：DBF 的容量确实不够，加东西能补回来。但它加的是什么？*多加了一组 sign 矩阵 (S_a^(2), S_b^(2))*，也就是多加了一组"方向多样性"。
+
+MDBF 后来站出来说：你加错地方了。多 sign 项确实补了精度，但补的是"sign 表达力"——而真正稀缺的是"magnitude 表达力"。
+
+怎么看出来的？看后面 MDBF 的实验：在同样的 bits-per-weight 预算下，*增加 envelope 秩 l（多塞实数 magnitude）* 单调降低重构误差；*增加 DBF 项数 P（多塞 sign）* 反而经常让重构误差变大。LittleBit 走的是后一条路，所以性价比不高。
+
+** 2025-Dec | MDBF: 不加 sign，加 envelope 的秩
+
+*** 它看到了什么问题
+
+把前面三层叠起来看：
+
+- OneBit：sign + rank-1 envelope（一对 a, b）
+- DBF：双 sign + rank-1 envelope（每列都是 a 这同一个轮廓）
+- LittleBit：DBF + 残差上再叠 DBF（多加 sign，envelope 还是 rank-1）
+
+MDBF 抓出了共同的病根：所有这些方法 demodulation 之后的 envelope *秩都是 1*。这意味着权重矩阵在"幅度"维度上的多样性被锁死了——所有 R 个 rank 分量必须共享同一个幅度模式。
+
+他们做了个实证：算 LLaMA2 13B 权重矩阵的 entropy-based effective rank。结果发现，去掉 sign 后的 demodulated envelope 的 effective rank 稳定在 R 列的中段（>>1），这说明：*权重的幅度本身就是多模态的*，rank-1 envelope 根本装不下。
+
+*** 它的解法
+
+把 DBF 的 rank-1 envelope 升级成 rank-l envelope，sign 基不动：
+
+#+begin_example
+W ~ S_a * (A Q^T) * (transpose stuff) * S_b
+#+end_example
+
+具体地，每个因子的 demodulated envelope 不再是 `a m^(1/2) (...)` 这种 rank-1 形式，而是 `A Q^T` 这种 rank-l 形式（A 是 N x l，Q 是 R x l）。共享同一对 sign mask S_a/S_b，但允许每列有不同的 envelope mode。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+三个关键的事：
+
+1. *硬件路径没动*。MDBF 推理时还是两次 binary GEMM 加对角缩放，因为 sign 矩阵共享。它没破坏 DBF/LittleBit 的部署友好性，这是它能进生产线的前提。
+
+2. *省下来的 bits 花在了刀刃上*。在固定 bits-per-weight 预算下，增加 envelope 秩 l 比增加 DBF 项数 P 更划算。论文 Figure 1 的扫描结果是：最优配置 (l*, P*) = (16, 1)——也就是说，envelope 升到 16 维，DBF 只用 1 项；千万别再叠第二项 DBF。这一刀直接否定了 LittleBit 的扩展方向。
+
+3. *闭式初始化 + ADMM 精细化*。利用 sign mask 固定时，envelope 的最优拟合就是经典 Eckart-Young 定理给的低秩 SVD——所以 MDBF 有个干净的闭式 warm start，再用 ADMM 交替优化。
+
+新坑？目前看：(a) envelope 秩 l 的选择还是 grid search；(b) 没和 QAT 完整结合（LittleBit 用了 QAT，MDBF 主打 PTQ）；(c) sign mask 的求解依然是个非凸离散问题，初始化对最终质量影响很大。
+
+* 前沿延伸
+
+这篇论文 2025 年 12 月 31 日才挂到 arXiv，截至 2026 年 5 月，公开的直接 follow-up 还没出现。可以预期的延伸方向：
+
+1. *MDBF + QAT*：LittleBit 已经验证 QAT 对 1-bit 区间的精度提升很大；把 MDBF 的多 envelope 结构搬到 QAT 框架里，预期会进一步刷分。
+
+2. *envelope 秩 l 的自适应*：MDBF 现在对所有 layer 用同一个 l，但不同层的有效秩差别可能很大（论文 Figure 2 也暗示了这点）。逐层自适应 l 应该能榨出更多。
+
+3. *跨层共享 sign*：MDBF 共享了 S_a/S_b 在 rank 维度上，下一步可以问：能不能在 layer 维度上也共享一些 sign 结构？
+
+* 一张图看懂
+
+#+begin_example
+                  | sign 路径          | envelope (大小)
+------------------+-------------------+----------------------
+2022 GPTQ         | 逐元素 4-bit, 无  | (不适用, 逐元素量化)
+                  |                   |
+2024 OneBit       | sign(W)           | rank-1 (a, b 一对向量)
+                  |                   |
+2025 DBF          | S_a * (...) * S_b | rank-1 (a, m, b 三向量,
+                  | 两个 sign 矩阵    |   但所有 R 列共享一个轮廓 a)
+                  |                   |    <-- single-envelope 隐藏瓶颈
+                  |                   |
+2025 LittleBit    | DBF + DBF         | rank-1 (加 sign 不加 envelope)
+                  | 残差上再叠一项     |    <-- 补错了地方
+                  |                   |
+2025-12 MDBF      | S_a * (...) * S_b | rank-l envelope (l = 16)
+                  | 同 DBF, sign 不动 |    <-- 把 bits 花在大小上, 不花在 sign 上
+                  |                   |
+
+       问题: 1-bit 推理快, 但精度塌
+              |
+              v
+       共识演化: 砍大小 -> 加一对 scaling -> 加两组 sign -> 加更多 sign 项 -> 加 envelope 秩
+                  GPTQ      OneBit          DBF            LittleBit         MDBF
+                  失败      奠基            扩结构         走偏              抓对瓶颈
+#+end_example
+
+* 洞见
+
+这条线让我看到三件事。
+
+第一，*二进制量化的真正稀缺资源不是 sign 的多样性，而是 magnitude 的表达力*。前三代人（OneBit→DBF→LittleBit）的扩展思路都是"加更多 sign 矩阵"，因为 sign 便宜（1-bit/元素）、加起来不占预算。但这正是问题——你在加便宜的东西，省的是真正贵的东西。MDBF 反过来：保留少量 sign，把 bits 全部花在 envelope 的实数自由度上。这是一种"预算分配"上的认知转变。
+
+第二，*"理论上等价"和"实际拿来用"是两件事*。DBF 的 single-envelope 约束在论文里不是没暴露——`W = D_a S_a D_m S_b^T D_b` 这个分解写出来后，"U 的所有列共享 a"是数学上显然的事。但没人专门去测 demodulated envelope 的 effective rank，没人意识到这是瓶颈。MDBF 的贡献一半是新结构，一半是*这个诊断*——给瓶颈起名字、给证据画图、把它从"显然可见但没人看"变成"显然不该忽视"。
+
+第三，*"保留硬件 fast path"是个硬约束*。这条线上每一篇能立得住，前提都是不破坏 1-bit GEMM 的推理路径。LittleBit 也守住了这点（叠两项 DBF 还是 binary GEMM），MDBF 也守住了（共享 sign 让 binary GEMM 不变）。一旦谁为了精度引入 FP16 的全连接矩阵乘，整条线的意义就没了。这给后续研究划了红线：任何"破坏 sign-shared binary kernel"的方案，先证明你比 4-bit GPTQ 强；否则不如直接 4-bit。
+
+下一步往哪走？最近的两个洞——*per-layer 自适应 l* 和 *MDBF+QAT*——应该会很快出来。再远一点，我猜会有人把 envelope 的 rank-l 结构和 mixture-of-experts 式的稀疏门控结合：让不同的输入路径激活不同的 envelope mode。但这需要先解决一个问题：当前 1-bit 路径的瓶颈是磁信息容量，不是计算；如果把容量打开了，下一个瓶颈会变成什么？这是 MDBF 之后这条线最值得跟的问题。
+
+* 启发
+
+对做研究的方法论启发，集中在两点。
+
+*瓶颈的命名权*。三代人都看到了 DBF 系列的精度天花板，但只有 MDBF 把这个天花板归因到 "single-envelope constraint"。命名瓶颈本身就是一种贡献——它让原本散在不同人脑子里的模糊感觉变成一个可被攻击、可被衡量的对象。要找研究问题，*去看那些"显而易见但没人正式说"的现象*。它们往往就是下一个瓶颈。
+
+*改进的方向 vs 改进的位置*。LittleBit 的改进方向是对的（DBF 不够准，应该加东西），但加的位置错了（加 sign 而不是加 envelope）。这个失误的代价是一篇论文。判断"加在哪"比判断"加什么"难得多——前者需要对各个组件的边际成本/收益有定量直觉。这意味着你可以这样做：*在动手改进之前，先做一组扫描实验*，把每个组件的扩展曲线画出来，看哪条曲线斜率最陡、哪条最早饱和。MDBF 的 Figure 1 就是这种扫描——增加 l 单调降误差，增加 P 反而升误差——这一张图，给整篇论文定了方向。

@@ -1,0 +1,238 @@
+#+title:      Outlier Smoothing with Closed-Form Rotations for W4A4 Large Language Model Quantization
+#+date:       [2026-05-29 Fri 12:21]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T122135-en
+#+source:     https://arxiv.org/abs/2511.22316
+#+authors:    Jinying Xiao, Bin Ji, Shasha Li, Xiaodong Liu, Ma Jun, Chao Wang, Wei Li, Ye Zhong, Xuan Xie, Nyima Tashi, Jie Yu
+#+venue:      arXiv preprint, Nov 2025 (v1) / May 2026 (v2)
+
+* The Problem River
+
+Cramming a 70-billion-parameter model onto a consumer GPU means representing every weight and activation in just 4 bits — each number can only land on one of 16 steps. The trouble is that a small handful of "unusually large" numbers (outliers) inevitably appear, and the moment they do, they stretch the 16-step range so wide that all the ordinary numbers get squeezed into just a few steps, destroying precision.
+
+This river is the story of seven years spent circling a single question: *How do you tame the outliers that break quantization?* Early on, people dodged them — pulling them aside for separate treatment. Then people squashed them — spreading their magnitude through channel-wise scaling. Then people rotated them — scattering their energy via geometric rotation. The last step was to learn the rotation — letting the model optimize its own best rotation. That turned out to be slow, unstable, and not necessarily better than a hand-crafted one. This paper (SingleQuant) loops back to the start: instead of learning the rotation, compute it in closed form in a single step.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Discovery: Large models have a few "super-large" activations; quantizing them collapses quality
+  | Fix: Keep those outlier columns in FP16, quantize the rest to INT8 (mixed precision)
+  v
+[2023] Xiao et al. - SmoothQuant
+  |
+  | Problem: Mixed precision is ugly; GPU kernels are hard to write
+  | Fix: Stop dodging — shift some of the outlier "difficulty" per-channel onto the weights (scaling equivalence transform)
+  v
+[2024.4] Ashkboos et al. - QuaRot
+  |
+  | Problem: Scaling only flattens along the channel dimension; within-token outliers stay in place
+  | Fix: Use Hadamard rotation to spread outlier energy uniformly across the entire hidden dimension
+  v
+[2024.6] Liu et al. - SpinQuant
+  |
+  | Problem: QuaRot's random rotation is not necessarily optimal
+  | Fix: Learn the rotation matrix on the Stiefel manifold via gradient descent (Cayley SGD + STE)
+  v
+[2025.11] Xiao et al. - SingleQuant  <<< target paper
+  |
+  | Problem: Gradient-based rotation learning is slow and unstable (14 h / LLaMA-2-13B);
+  |          STE makes the loss non-smooth
+  | Fix: Skip learning altogether — use closed-form Givens rotation + Hadamard, done in 37 seconds
+  v
+[Future] ???
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering "Systematic Outliers" Inside Large Models
+
+*** What Problem It Saw
+
+Before LLM.int8(), quantization was largely a computer-vision trick — CNN activations are well-behaved enough to handle INT8 directly. When the Dettmers team applied the same approach to language models of 6.7B parameters and above, it fell apart: even dropping activations from FP16 to INT8 caused perplexity to explode. Digging deeper revealed a surprising phenomenon: in certain hidden dimensions, large models consistently produce activation values whose absolute magnitude is orders of magnitude larger than everything else. These are not noise — they are functionally load-bearing parts of the model, and squashing them kills it.
+
+*** Its Fix
+
+Since these outliers can't be suppressed, don't try. LLM.int8() splits the activation matrix by column into two parts: the handful of outlier columns are computed in FP16, and everything else is computed in INT8. The two results are then summed. This is the classic "mixed-precision decomposition."
+
+*** Why It Worked (and What Pit It Dug)
+
+It worked because outliers cluster in a fixed set of dimensions that can be identified in advance and isolated. But the drawbacks are obvious: mixed-precision GPU kernels are painful to write, and the speed-up largely evaporates — you wanted INT8 acceleration but now have to run a parallel FP16 path. Worse, for more aggressive bit-widths like W4A4, the approach simply cannot hold — 4 bits don't even have room to represent those outlier values without burning the entire range.
+
+The question for the next paper became: *Can we tame the outliers directly, without splitting the computation into two paths?*
+
+** 2023 | SmoothQuant: Migrate the Outlier Difficulty onto the Weights
+
+*** What Problem It Saw
+
+LLM.int8() sidestepped outliers via mixed precision, but at the cost of hardware friendliness. Xiao et al. approached the issue from a different angle: outliers are difficult not because they exist, but because they share a tensor with much smaller activations — the quantizer must use a single scale, and one large value pulls that scale so high that ordinary values collapse into two or three bins. All the quantization difficulty is concentrated on the activation side.
+
+*** Its Fix
+
+They noticed a mathematical equivalence: =Y = (X * diag(s)) * (diag(1/s) * W)=. Multiply a column of the input X by a large value s, then divide the corresponding row of the weight W by s, and the result is unchanged. This lets you migrate some of the activation "difficulty" channel-by-channel onto the weights:
+
+#+begin_example
+Before:   activations [outlier ★, normal, normal]   weights [normal, normal, normal]
+              ★ is huge; quantizer range blown wide open
+
+After:    activations [normal, normal, normal]        weights [scaled, scaled, scaled]
+              Both sides are moderate; each quantizes well
+#+end_example
+
+Weights are naturally smoother and easier to quantize, so letting them absorb some of the outlier difficulty actually lowers overall quantization error.
+
+*** Why It Worked (and What Pit It Dug)
+
+Intuitively: before, 100% of the difficulty was concentrated in a single column on the activation side; after, it is redistributed across a full row on the weight side, and neither side is extreme anymore. This was the first time outlier handling moved from "classify and separate" to "equivalence transform."
+
+But SmoothQuant's transform only operates along the *channel* dimension — it can reduce the height of an outlier in a column, but it cannot move that outlier to a different position within the column. If a token has an outlier in a particular channel, that outlier is still there after scaling, just not quite as sharp. When bit-width is pushed further to W4A4, "not quite as sharp" is not enough. What is needed is a way to disperse outlier energy *across the entire hidden dimension*.
+
+** 2024.4 | QuaRot: Use Rotation to Spread Outliers Across All Dimensions
+
+*** What Problem It Saw
+
+SmoothQuant's equivalence transform is a diagonal scaling — it can change the magnitude of each channel but cannot change the fact that outliers are concentrated in a few channels. The insight in Ashkboos et al. was: a different equivalence transform — *orthogonal rotation* — can do both. It changes scale and redistributes energy across dimensions. A vector [100, 0, 0, 0] passed through a 4×4 Hadamard rotation becomes [50, 50, 50, 50]: the same total energy, but the peak is cut in half.
+
+*** Its Fix
+
+Inject the Hadamard rotation H into the key computational path of an LLM: multiply by H before a given layer and by H^T after it. The forward pass is mathematically equivalent (since H H^T = I), but activations are rotated before being quantized, so outliers are "spread out" into ordinary-sized values and the quantizer scale is no longer spiked by a single needle.
+
+#+begin_example
+Before rotation:  ★ . . . . . . .   <- outlier stands alone
+After rotation:   ~ ~ ~ ~ ~ ~ ~ ~   <- same energy, spread across all dimensions
+#+end_example
+
+The entire process requires no training — it is a pure geometric transform computed offline once.
+
+*** Why It Worked (and What Pit It Dug)
+
+Hadamard is a "universal" random rotation that statistically disperses energy for any distribution to some degree. But "universal" also means "non-targeted" — it uses no information about the actual activation distribution of the model at hand. Intuitively: if a model's outliers are concentrated in specific dimensions, there must exist a rotation *tailored to that model* that works better than a generic Hadamard.
+
+The question for the next paper: *Can we learn an optimal rotation?*
+
+** 2024.6 | SpinQuant: Let the Rotation Matrix Learn
+
+*** What Problem It Saw
+
+QuaRot hardcodes the rotation as Hadamard, which amounts to baking in the prior that activation distributions are uniform. But each model and each layer has its own distribution, and a one-size-fits-all rotation is inevitably suboptimal.
+
+*** Its Fix
+
+Make the rotation matrix R a learnable parameter, define a loss based on the discrepancy between the quantized output and the original output, and optimize R via back-propagation. R must remain orthogonal throughout (otherwise the forward pass is no longer equivalent), so training must stay on the *Stiefel manifold* — the surface of all orthogonal matrices. This is done with Cayley SGD: at each step, an anti-symmetric matrix generates an orthogonal update that keeps R on the manifold. Because the loss passes through the rounding operator (which has zero gradient almost everywhere), STE (Straight-Through Estimator) is used to treat it as the identity during the backward pass.
+
+#+begin_example
+Random initialization R_0
+   |
+   | Forward: rotate activations with R, quantize, compute loss
+   | Backward: STE through round, Cayley SGD update on the manifold
+   v
+... hundreds to thousands of iterations ...
+   v
+Optimal rotation R*
+#+end_example
+
+*** Why It Worked (and What Pit It Dug)
+
+In principle, the learned R should strictly outperform a random Hadamard — and in most cases it does. But the cost is steep: SpinQuant takes *14 hours* on LLaMA-2-13B, and runs out of memory on 70B models. Worse, the SingleQuant authors find empirically that STE makes the loss landscape non-smooth, causing Cayley SGD to bounce around the Stiefel manifold: both the objective and the gradient norm oscillate continuously and do not converge even when the iteration count is multiplied by ten.
+
+Slow to learn, unstable in convergence, and not necessarily better than a closed-form solution — the problem now clearly points to the next step: *Can we skip learning entirely and directly compute the right rotation in closed form?*
+
+** 2025.11 | SingleQuant (Target Paper): Closed-Form Rotation, One Shot
+
+*** What Problem It Saw
+
+SpinQuant's gradient-based rotation learning has two fundamental flaws. First, the combination of the Stiefel manifold and STE is inherently non-smooth, violating the Lipschitz condition that SGD convergence requires — oscillation is the natural result. Second, iterative optimization is simply unaffordable at 70B scale. Concurrent works — OSTQuant, FlatQuant, DuQuant, and others — were all feeling their way along the same "learn the rotation" path. SingleQuant's judgment is that the path itself is wrong: *rotation should not be framed as a learning problem.*
+
+*** Its Fix
+
+The outliers in LLM activations are split into two types, each addressed by its own closed-form rotation:
+
+- *MO (Massive Outlier)*: extreme values concentrated in a small number of token-dimension positions. Countered by *ART (Alignment Rotation Transformation)* — find the two-dimensional subspace where the outlier lives and apply a 2D Givens rotation that "aligns" it toward the direction of most dispersed energy. This rotation has a closed-form optimal solution (the angle given by SVD) and requires no iteration.
+
+- *NO (Normal Outlier)*: a generally heavy-tailed distribution. Countered by *URT (Uniformity Rotation Transformation)* — a Hadamard rotation that pushes the distribution toward uniformity. Also closed-form, no training.
+
+The two are combined via a Kronecker decomposition, reducing the overall rotation complexity from O(n^2) to O(n^(3/2)).
+
+#+begin_example
+SpinQuant's path:                        SingleQuant's path:
+
+  Random R_0                               Inspect the activation covariance
+     |                                              |
+     | Thousands of gradient steps                 | One SVD, compute the angle
+     | Struggling on the Stiefel manifold          |
+     v                                              v
+  R* (14 hours, still oscillating)         R* (37 seconds, analytically optimal)
+#+end_example
+
+*** Why It Worked (and What Pit It Dug)
+
+The intuition is plain: if you can *directly see* which rotation will spread outliers most evenly, why let SGD grope in the dark? SpinQuant's detour essentially forces a problem with a closed-form solution into the mold of an optimization problem. On LLaMA-2-13B the speedup is 1400×, from 14 hours to 37 seconds, while average task accuracy also improves by 0.57%; on 70B models SingleQuant beats the strongest baseline by 3.33 percentage points — clear evidence that the closed-form solution is both faster and more accurate.
+
+The pit it digs: the closed-form rotation is optimal *with respect to a specific objective function* (e.g., minimizing some second-order moment). If the true quantization error diverges from that objective — for instance, because a downstream task is especially sensitive to particular tokens — the closed-form solution is no longer truly optimal. SpinQuant's approach of "learn using task loss" has a higher theoretical ceiling; its current implementation (Stiefel + STE) is simply too broken to reach it. The next generation of methods will likely find its answer on the hybrid path: *closed-form initialization followed by a small number of fine-tuning steps.*
+
+* Frontier Extensions
+
+As of May 2026, SingleQuant represents the latest advance along this "how to handle LLM W4A4 outliers" evolutionary line. Two directions beyond it are worth watching:
+
+- *MoE Models*: SingleQuant already includes experiments on Mixtral 8x7B, but activation distributions vary enormously across experts in a MoE architecture. Whether a single closed-form rotation can handle that heterogeneity is still an open question.
+- *Closed-Form + Lightweight Learning Hybrids*: Closed-form solutions are fast but bound to their objective function; learning is targeted but unstable. A natural next step is to use the closed-form solution as initialization and then fine-tune for a very small number of steps on task loss, capturing the benefits of both.
+
+Note: the "frontier" directions above are logical extrapolations from the discussion in the SingleQuant paper and from the trajectory of the field, not citations to existing work.
+
+* The Big Picture in One Diagram
+
+#+begin_example
+              Problem: W4A4 quantization of large models — outliers blow up the dynamic range
+              ==============================================================================
+
+   Action on outliers                     Representative paper    Cost / limitation
+   -----------------                      ----------------        -----------------
+[1] Dodge them (two-path computation)   LLM.int8()              Mixed precision; hard to write kernels
+              |
+              | "Can we avoid splitting paths and suppress outliers directly?"
+              v
+[2] Flatten them (channel-wise scaling  SmoothQuant             Can only redistribute along channel dim
+    equivalence transform)
+              |
+              | "Can we scatter the energy within a dimension?"
+              v
+[3] Rotate them (Hadamard geometric     QuaRot                  Random rotation; not tailored to the model
+    transform)
+              |
+              | "Can we learn a targeted rotation?"
+              v
+[4] Learn the rotation (Cayley SGD +    SpinQuant               14 hours; still oscillating
+    STE)
+              |
+              | "Why learn it at all? Can we just compute it?"
+              v
+[5] Closed-form rotation (ART + URT)    SingleQuant             37 seconds; 1400× speedup
+
+Timeline:  2022 -------- 2023 -------- 2024.4 -------- 2024.6 -------- 2025.11
+Insight:   outliers exist -> equiv. transform -> geometric scatter -> data-specific -> closed-form data-specific
+#+end_example
+
+* Insights
+
+On the surface this line is a technical progression from INT8 to INT4, but underneath it represents *three successive leaps in how outliers are understood*:
+
+1. *Outliers as foreign objects* (LLM.int8): they are lesions in the model that must be quarantined and handled separately.
+2. *Outliers as difficulty* (SmoothQuant): they are a quantization-difficulty distribution problem that can be redistributed under an equivalence transform.
+3. *Outliers as geometry* (QuaRot / SpinQuant / SingleQuant): they are energy concentrations along certain directions of the activation distribution — fundamentally a geometric problem that can be "eliminated" by rotating the coordinate system.
+
+And SingleQuant takes one more step within that third understanding: since this is a geometric problem, and geometric problems inherently have closed-form solutions, *forcing it into an optimization framework is a regression*. That judgment is sharp — it points toward a more general methodology: when a problem is repeatedly attacked by "learning" with poor results, first look back and ask what coordinate system gives it a closed-form solution.
+
+Where is the field most likely to go next? Two directions: (a) a hybrid paradigm of closed-form initialization plus a handful of fine-tuning steps, combining speed with task-specificity; (b) deriving more refined closed-form rotation families from statistical priors on activation distributions — SingleQuant uses Givens + Hadamard, but future work may produce analytic rotations that are more "aware" of layer-specific structure.
+
+* Takeaways
+
+Reading this river offers a few things that are useful for finding research problems:
+
+1. *Don't treat every problem as a learning problem.* A decade of deep learning has built the muscle memory that "if it has parameters, let gradients learn it." SingleQuant is a reminder: when a learning problem keeps refusing to converge, first ask — "does this have a closed-form solution?" You may be running a supercomputer to calculate 2+3.
+
+2. *Following the critiques leads to gold.* The strongest part of every paper in this line is its critique of its predecessor — QuaRot directly notes that SmoothQuant only operates along channels; SpinQuant notes that QuaRot's rotation is not model-specific; SingleQuant notes that SpinQuant's optimization doesn't converge. If you read papers only for the method sections, you miss the most valuable signal. Read the pointed judgments in the related-work sections — those are the real engine driving problem evolution.
+
+3. *Hardware friendliness is the quiet deciding factor.* LLM.int8() lost ground because mixed-precision kernels are painful to write. QuaRot gained traction because Hadamard can be computed efficiently. SpinQuant was overtaken because 14 hours and OOM on 70B models is untenable. The success or failure of a research direction often has less to do with the accuracy numbers headlined in the paper and more to do with an engineering metric nobody emphasized — and the next winner in this line may well be whichever method runs efficiently on some new piece of hardware.
+
+The takeaway to carry forward: use "is this actually a geometric problem that has been incorrectly packaged as a learning problem?" as a blade to scrape over your own model components that are slow to train, unstable, and require endless manual tuning. Quantization is only the beginning.

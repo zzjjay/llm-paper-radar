@@ -1,0 +1,278 @@
+#+title:      Hold Onto That Thought: Assessing KV Cache Compression On Reasoning
+#+date:       [2026-05-29 Fri 13:09]
+#+filetags:   :paper:river:
+#+identifier: 20260529T130929
+#+source:     https://arxiv.org/abs/2512.12008
+#+authors:    Minghui Liu, Aadi Palnitkar, Tahseen Rabbani, Hyunwoo Jae, Kyle Rui Sang, Dixi Yao, Shayan Shabihi, Fuheng Zhao, Tian Li, Ce Zhang, Furong Huang, Kunpeng Zhang
+#+venue:      arXiv preprint, 2025-12 (cs.CL)
+
+* 问题之河
+
+一个大模型一边"想"一边写答案的时候，它的记忆会膨胀到撑爆显卡——你能不能让它一边想一边*扔掉*一些记忆，又不让它把题目忘了？
+
+这个问题难在三层：
+
+第一层，*记忆增长是线性的*。Transformer 每生成一个新 token，就要拿这个 token 去看*所有之前*的 token，所以它必须把之前每个 token 的 key 和 value 都存下来——这就是 KV cache。一个 8B 模型在 32K 上下文下，cache 能轻松吃掉 8GB 显存，比模型参数本身还重。
+
+第二层，*哪些 token 重要无法事先知道*。你想丢掉的当然是"没用的" token，但 attention 是动态的——这一步没人看的 token，下一步可能突然变成焦点。事先选错，模型就开始胡言乱语。
+
+第三层（这篇论文真正切入的地方），*推理模型把整个游戏规则改了*。以前的压缩方法都假设"输入长、输出短"——你给它一篇长文档，它给你一句摘要。所以大家都优化怎么把 prompt 压小（这叫 prefill 阶段）。但 o1、DeepSeek-R1 这些推理模型反过来——*prompt 很短，但它自己边想边写出几万字的思考链*。这时候 cache 是在 decoding 阶段一点点撑大的，没人专门为这个场景设计过压缩。
+
+一代一代人前赴后继，就在围绕这一个问题打转：*怎么定义"这个 token 还有用"？*
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 问题: 算 attention 必须看所有 token, 每一步都要重算
+  | 解法: 缓存历史 token 的 key/value (KV cache)
+  | 留坑: cache 随上下文线性膨胀, 显存爆炸
+  v
+[2023-09] Xiao et al. - StreamingLLM
+  |
+  | 问题: 长序列下 cache 撑不住, 一个朴素的滑窗会让模型崩溃
+  | 解法: 发现"注意力沉默井"——保留最前面几个 token + 最近窗口
+  | 留坑: 只看位置, 不看内容, 中间段被一刀切
+  v
+[2023-10] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | 问题: 中间段也有重要 token, 不能只看位置
+  | 解法: 用累计 attention score 找"重击者"(heavy hitters)动态保留
+  | 留坑: 每步都要追踪全局 attention, 计算开销大; 还是边生成边算
+  v
+[2024-04] Li et al. - SnapKV
+  |
+  | 问题: H2O 每步重新选, 开销重复; 其实压缩可以一次定终身
+  | 解法: 用 prompt 末尾一个"观察窗"投票出重要的 prefix 位置, 压完就锁定
+  | 留坑: 只压 prompt (prefill), 完全不管 decoding 阶段长出来的 token
+  v
+[2025-06] Cai et al. - R-KV
+  |
+  | 问题: 推理模型的思考链全在 decoding 里, SnapKV 这条路堵死了
+  | 解法: 专为推理设计, 用 attention + key 向量余弦相似度联合压缩
+  | 留坑: 计算开销最大; 在很多任务上其实输给更朴素的 heavy-hitter
+  v
+[2025-12] Liu et al. - HOTT (本文)
+  |
+  | 问题: 推理压缩方法到底谁强谁弱, 没人系统比过; SnapKV 这种好方法在 decoding 上根本没人实现
+  | 解法: 大规模 benchmark + 把 SnapKV 改造成 decoding 版 (SnapKV-D)
+  | 发现: heavy-hitter 类 (H2O, SnapKV-D) 是赢家; 压得太狠反而让模型想得更长
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 为速度埋下了内存的坑
+
+*** 它看到了什么问题
+
+在 Transformer 之前，主流的语言模型是 RNN——一个 token 接一个 token 地算，第 t 步必须等第 t-1 步算完。这件事不能并行，训练慢得要死。Vaswani 他们想要一个能在 GPU 上全部并行展开的架构。
+
+*** 它的解法
+
+扔掉 RNN，用 attention：每个 token 直接看*所有*其他 token，权重由相似度决定。训练时所有 token 一起喂进去，所有 attention 一次算出来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行起来了，模型越做越大也跟得上。但*推理*的时候藏着一颗定时炸弹：生成第 t 个 token 要用到前面 t-1 个 token 的 key 和 value，要是每步都重算，开销是 O(t²)。所以大家发明了 *KV cache*——把每个 token 算过的 key/value 存下来，下次直接读。
+
+代价是：cache 大小随上下文长度线性增长。8K token 还撑得住，128K 就吃光显存。这颗坑一埋就是七年，直到下面这群人开始挖。
+
+** 2023-09 | StreamingLLM: 发现"注意力沉默井"
+
+*** 它看到了什么问题
+
+最朴素的想法是：cache 太大了，那就只保留最近 N 个 token 嘛——一个滑窗。Xiao 他们试了，结果模型在窗口滑过初始 token 的那一瞬间*直接崩溃*——困惑度从个位数飙到几千，输出变成乱码。
+
+为什么？他们做了个怪异的发现：在每一层、每一个 head，*前几个 token 的 attention 权重都异常地高*，哪怕这些 token 本身是 "the" 这种没语义的东西。
+
+*** 它的解法
+
+他们管这叫 *attention sink*（注意力沉默井）——softmax 必须把权重分到某个地方，模型学到的策略就是"没事就丢到开头那几个 token 上"。所以方案极简：保留最前面 4 个 token（沉默井），再加一个滑动窗口。
+
+#+begin_example
+[sink][sink][sink][sink] ......丢掉...... [recent recent recent recent]
+       永远保留                                  滑动窗口
+#+end_example
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它揭示了一个反直觉的事实——*token 的重要性和位置强相关*，但只对开头和末尾管用。中间那一大段被一刀切了。要是题目的关键信息在中间（"Alice 把书放在了厨房"——题干在中段，问"书在哪"），StreamingLLM 直接抓瞎。
+
+下一篇论文盯着这个洞：*能不能根据内容选保留谁？*
+
+** 2023-10 | H2O: 让"重击者"自己冒出来
+
+*** 它看到了什么问题
+
+StreamingLLM 只看位置，不看 token 实际有没有用。Zhang 他们做了个统计：在真实任务里，attention 矩阵确实是稀疏的——但*稀疏的位置不固定*。少数 token 在很多 query 下都被反复关注，他们管这种 token 叫 *heavy hitter*。
+
+只要能动态识别这些 heavy hitter 并保留下来，性能不会塌。
+
+*** 它的解法
+
+每一步生成时，给每个 token 维护一个累计 attention score（它历史上被关注了多少次的总和）。cache 满了就把分数最低的踢出去，保留"重击者"和最近的 token。
+
+#+begin_example
+StreamingLLM:  [固定 sink][......扔......][滑窗 recent]
+H2O:           [heavy heavy ... heavy 散落在各处][滑窗 recent]
+                 由 attention 分数动态选出
+#+end_example
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+H2O 第一次让 cache 压缩跟着*内容*走，不再是位置启发式。但代价是：*每生成一个新 token，都要更新所有历史 token 的累计分数*，再做一次 top-k 排序。计算开销 O(N·B·d) 加进了热路径。
+
+更深的问题是：H2O 的所有决策都在 *decoding 时一步步做*。如果你的场景是"超长 prompt + 短输出"（当年最流行的长文档问答），prefill 阶段一次性输入几万 token，H2O 反而帮不上忙——它要边生成边选，prefill 那一大坨 KV 已经存进显存了。
+
+下一篇论文盯着这个洞：*能不能在 prompt 还没生成回答之前，就把 prefix 一次性压完？*
+
+** 2024-04 | SnapKV: 用末尾几个 token 给前面投票
+
+*** 它看到了什么问题
+
+H2O 假设你边生成边压。但 2024 年最贵的场景是 long-context QA——你塞一本书给模型，问一个问题，输出可能就一两百字。这时候，*99% 的 cache 占用都是 prompt 本身*，decoding 阶段产生的那点 KV 根本不是大头。
+
+Li 他们做了个关键观察：把 prompt 想成"前缀 + 问题"。问题部分（末尾几十个 token）的 attention 已经告诉你*它最关心 prefix 的哪些位置*。既然如此，何必边生成边选？直接拿问题去给 prefix 投票，一次定终身。
+
+*** 它的解法
+
+prompt 末尾切出一个 "observation window"（观察窗，比如最后 32 个 token）。把这个窗口里所有 query 对前面 prefix 的 attention 加起来，挑分数最高的若干个 prefix 位置保留下来，其他扔掉。压缩完成，decoding 阶段直接在压缩后的 cache 上跑，不再重选。
+
+#+begin_example
+prompt: [........long prefix........][problem question? <-obs window]
+                  |                              |
+                  |  <----用观察窗的 attention 给前面投票
+                  v
+压缩后: [稀疏保留的 prefix 位置] + [完整 obs window]
+        然后开始 decoding, 不再做任何选择
+#+end_example
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+SnapKV 把"选择"从热路径里挪走了——压缩一次，跑无限步。在 long-context QA 上它一举成为新王。
+
+但它有个隐含假设：*生成阶段不会太长*。如果模型只输出 200 字，那 decoding 增加的 cache 量小到可以忽略。
+
+这个假设在 2024 年下半年崩了。OpenAI o1 出来了，DeepSeek-R1 出来了——推理模型生成几万 token 是常态。SnapKV 那套"压完 prefix 就完事"的逻辑直接失效：*它根本没设计 decoding 阶段的压缩*。一个 32K 的思考链照样能撑爆显存。
+
+下一篇论文盯着这个洞：*推理模型的思考链怎么压？*
+
+** 2025-06 | R-KV: 第一个专门为"想"设计的压缩
+
+*** 它看到了什么问题
+
+推理模型的输出结构和普通生成不一样——它会自言自语、自我修正、复盘 ("Wait, let me reconsider..."), 留下大量重复或近似的中间步骤。Cai 他们认为这些重复 token 占了 cache 的大头，但又没办法用 attention score 区分（重复内容自身也会互相关注，分数不低）。
+
+*光看 attention 不够，还得看 token 本身像不像*。
+
+*** 它的解法
+
+R-KV 把两种信号合起来：
+1. *累计 attention*（继承自 H2O 思路）
+2. *key 向量之间的余弦相似度*——如果两个 key 高度相似，它们对应的 token 在内容上重复，留一个就够
+
+每隔 w 步做一次联合打分，淘汰分数低的 token。这是第一个明确说"为推理 trace 优化"的压缩方法。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+理论上很合理。实践上有两个问题：
+
+第一，*计算开销是这一系列里最大的*——O(N/w · B²·d) 来自两两余弦相似度，B 是 cache 大小。压缩这件事本身就花掉了它省下的时间。
+
+第二，更尴尬的是 HOTT 测出来的结果：*R-KV 在推理任务上其实输给更朴素的 heavy-hitter 方法（H2O 和 SnapKV-D）*。它的复杂启发式没有兑现成性能。
+
+下一篇论文盯着这个洞：*这么多方法到底哪个真行？没人系统比过。*
+
+** 2025-12 | HOTT: 把推理压缩这条线第一次摸清楚
+
+*** 它看到了什么问题
+
+到 2025 年底，这条研究线已经有十几个方法在打架，但所有 benchmark 都在用 LongBench/RULER 这种 *长 prompt + 短输出* 的设定。推理模型的 *短 prompt + 超长输出* 场景下，没人系统比过谁强谁弱。
+
+更具体的两个洞：
+- *SnapKV 的好思路被锁在 prefill 里*——没人把它扩展到 decoding 阶段。
+- *没人量化"压缩 vs 推理质量"的 tradeoff*——压得太狠时模型到底会怎么垮？
+
+*** 它的解法
+
+两步走：
+
+第一，*工程贡献*——把 SnapKV 的观察窗机制搬到 decoding 阶段，每隔 N 步用最近的 N 个 token 当观察窗，给前面投票。这叫 *SnapKV-D*（D 代表 decoding）。本质上是用 SnapKV 的"一次定多步"思想分摊 H2O 的逐步开销。
+
+第二，*系统 benchmark*——在 10 个推理 benchmark（GSM8K, MATH500, ReClor, FOLIO 等）上把 StreamingLLM、H2O、SnapKV-D、KNorm、PyramidKV、R-KV 全部跑一遍，覆盖普通模型 (Llama-3.1-8B) 和推理模型 (DeepSeek-R1-distill)。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+三个核心发现，每个都反直觉：
+
+1. *简单的 heavy-hitter 胜出*。对推理模型，H2O 和 SnapKV-D 全面领先，包括 R-KV 这种专门为推理设计的方法。复杂启发式没用，attention 信号本身已经够强。
+
+2. *压缩会让推理"想得更长"*。这是个隐藏成本——cache 越小，模型生成的 trace 越长，有时候压根停不下来 (KNorm 经常生成"循环呓语")。你以为省了内存，结果总推理时间反而变长。
+
+3. *没有通用最优*。对非推理模型，最佳方法因数据集而异，StreamingLLM 在 GSM8K 上奇好但在别处都差。
+
+埋下的新坑：HOTT 本身只是 benchmark，没解决"怎么在不增加 trace 长度的前提下压"的根本矛盾。这是下一代论文的起点。
+
+* 前沿延伸
+
+截至 2026 年 5 月，HOTT 是这条线上*最新的系统评估*。它指出的两个未解问题——"压缩诱发的 trace 膨胀"和"decoding 阶段的最优压缩策略"——大概率会催生两类后续工作：
+
+1. *推理-感知的压缩*：在压缩决策里加入"输出长度"作为目标，而不是只看下游任务准确率。
+2. *动态 budget*：根据当前生成阶段（早期探索 vs 后期收束）动态调整 cache 大小，而不是全程一个固定预算。
+
+如果你看到 2026 年新出的 KV 压缩论文，去 intro 里搜 "decoding-phase" 或 "reasoning trace length"——它们大概率会引用 HOTT 作为问题定义来源。
+
+* 一张图看懂
+
+#+begin_example
+                              KV cache 该保留谁?
+                                     |
+            +------------------------+------------------------+
+            |                        |                        |
+        看位置                    看内容                    看结构
+            |                        |                        |
+   [2023] StreamingLLM       [2023] H2O                  [2025] R-KV
+   sink + 滑窗              累计 attention              attention + key 相似
+   "开头永远重要"           "重击者动态显现"             "重复 token 该去重"
+            |                        |                        |
+            |                        v                        |
+            |               [2024] SnapKV                    |
+            |               观察窗投票 (prefill only)         |
+            |               "末尾告诉你前面要留谁"             |
+            |                        |                        |
+            +------------------------+------------------------+
+                                     |
+                                     v
+                            场景变了: 推理模型
+                            (短 prompt + 长 decoding)
+                                     |
+                                     v
+                          [2025-12] HOTT (本文)
+                          1) SnapKV-D: 把观察窗搬到 decoding
+                          2) Benchmark: heavy-hitter 类胜出
+                          3) 警告: 压得太狠 -> 想得更长
+
+  时间轴: 2017 ----------> 2023 -----> 2024 -----> 2025 -----> 2025.12
+          KV cache 诞生   位置    内容    一次定全   推理   系统评估 + 新基线
+#+end_example
+
+* 洞见
+
+读完这条线，三个比"具体方法"更深的东西在动：
+
+*1. 从位置启发到内容启发，再到"评估即贡献"。* 最早 StreamingLLM 拍脑袋说"开头重要"。然后 H2O 说"让数据告诉你哪个重要"。然后 SnapKV 说"压缩可以一次定终身"。到 HOTT 这里，*没有提出新方法，只是认真比了一遍*——这本身就是贡献。这说明这个子领域到了"方法太多、不知道谁有用"的阶段，做一份诚实的横评比再发一篇新方法更有价值。这是任何快速膨胀的子方向必然出现的拐点。
+
+*2. 推理模型把所有"长 prompt 假设"打碎了。* 2023-2024 年所有压缩论文都默认"prompt 长输出短"，这个假设被 o1/R1 系列直接颠覆。一个 benchmark 假设的转变能让一整代方法重新洗牌——SnapKV 不是变差了，是被换了赛道。下次再做评估，要先问：*我的 benchmark 反映的是哪一年的工作负载？*
+
+*3. 压缩可能"省了内存、亏了时间"。* HOTT 最反直觉的发现：cache 越小，模型生成越长。这是个隐藏的负反馈循环——你以为在优化资源，实际可能在恶化总成本。任何"只优化一个维度"的研究都该警惕：*你压缩的那部分，是不是把代价转嫁到了另一个你没在看的维度？*
+
+* 启发
+
+这条线对怎么做研究有三层启发：
+
+*第一，紧盯"假设崩了"的时刻。* StreamingLLM、H2O、SnapKV 都是好工作，但 o1 一发布，它们的隐含前提全失效。这意味着你可以*主动去找前提崩塌的场景*——找到一个"大家都默认 X，但 X 其实变了"的洞，往里写论文。HOTT 就是这么找到的。
+
+*第二，benchmark 也是一种研究。* 不是只有提新方法才算贡献。当一个子领域方法泛滥但谁也说不清谁更好时，*认真做评估本身就是 SOTA 工作*。HOTT 没提新理论，但它把整条线第一次摸清楚了——这种"清理战场"的价值，往往被低估。
+
+*第三，多看一个维度。* HOTT 发现"压缩诱发 trace 膨胀"，是因为它*同时记录了内存和输出长度*。如果只看准确率，这个 tradeoff 永远看不到。落点在"能用"：下次你做优化研究，*强制自己额外记录一个看似不相关的指标*——很可能你的方法在那个维度上正在悄悄亏钱。
