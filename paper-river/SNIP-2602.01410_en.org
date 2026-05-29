@@ -1,0 +1,204 @@
+#+title:      SNIP: An Adaptive Mixed Precision Framework for Subbyte Large Language Model Training
+#+date:       [2026-05-29 Fri 08:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T085428-en
+#+source:     https://arxiv.org/abs/2602.01410
+#+authors:    Yunjie Pan, Yongyi Yang, Hanmei Yang, Scott Mahlke (U. Michigan)
+#+venue:      ASPLOS 2026
+
+* What This River Is About
+
+LLM training keeps getting more expensive. Over the eight years from 2018 to 2026, the entire field has been doing one thing: *pushing the numeric precision of training lower*. From 32 bits down to 16, then to 8, and now attempting 4.
+
+Every step down sharpens the same tension: *save money, but don't let the model collapse*. Every landmark paper on this line answers a different variant of the same question — "at this precision level, how do we keep the model alive?"
+
+Reading the line in reverse, you find a beautiful pattern: solutions have steadily moved from "one global setting fits all" toward "careful per-component accounting." SNIP is the current end of this evolutionary arc; it turns the question of "which layer should use which precision" into a solvable math problem.
+
+* The Source Map
+
+#+begin_src
+                  [2018]
+                Mixed Precision (Micikevicius)
+                FP16 + FP32 master weights + loss scaling
+                "Drop from 32 bits to 16 bits without model collapse"
+                          |
+                          | 16 bits is still expensive; hardware now supports 8 bits
+                          v
+                  [2022-2023]
+                FP8 formats (Micikevicius) / FP8-LM (Peng)
+                "Full FP8 training pipeline: gradients, optimizer, comms all at 8 bits"
+                          |
+                          | 8 bits can go lower; the hardware roadmap points to 4 bits
+                          v
+                  [2025]
+                FP4 Training (Wang et al.)
+                Differentiable quantization estimator + outlier compensation
+                "All GEMMs in FP4, suppress error with careful tricks"
+                          |
+                          | Are all layers really suited to FP4?
+                          | Early and late layers have wildly different sensitivity
+                          v
+                  [2026] ★ SNIP (this paper)
+                Per-layer precision selection solved globally with ILP
+                "Forward loss sensitivity + backward weight sensitivity -> integer programming"
+                          |
+                          v
+                         Future: dynamic precision? Hardware co-design?
+
+  A parallel line (borrowed by SNIP but not directly inherited):
+  -------------------------------------------------------------
+  [2019] HAQ (Wang)     RL-based per-layer bit selection (inference)
+  [2022] OBC (Frantar)  Hessian-based sensitivity (inference)
+  [2024] BBS (Chen)     KL-divergence-based (inference)
+
+  SNIP's critique of this line: you only measure local quantization error,
+  ignoring training dynamics — gradients accumulate and the optimizer amplifies them.
+#+end_src
+
+* Section 1: From 32 Bits to 16 Bits (2018)
+
+The story begins with Micikevicius's 2018 paper, *Mixed Precision Training*.
+
+Before that, neural network training defaulted to 32-bit floating point (FP32). One number occupies 4 bytes; at GPT-3 scale, weights and activations alone would blow out GPU memory. The natural question: *can we halve the bit width and use FP16?*
+
+A direct swap doesn't work. FP16 has a much narrower representable range; once gradients get small they underflow to zero and learning stops.
+
+Micikevicius introduced three patches:
+
+1. *FP32 master-weight copy*: keep a 32-bit "original" of each parameter, compute gradients in FP16, but write updates back to the FP32 copy
+2. *Loss scaling*: multiply the loss by a large constant (e.g., 1024) before the backward pass so gradients are amplified into FP16's representable range, then scale back before the update
+3. *Operator-level precision selection*: matrix multiplications use FP16, but accumulation uses FP32
+
+This approach established an implicit paradigm — *"mixed precision" is not a uniform reduction but a targeted one: keep critical spots high, compress the rest*. That is the seed of everything that follows.
+
+But Micikevicius left two gaps open. First, the FP32 master-weight copy still consumes memory, discounting the claimed "2× savings." Second, he said nothing about lower precisions (8-bit, 4-bit) — he only solved the 16-bit tier.
+
+* Section 2: From 16 Bits to 8 Bits (2022–2023)
+
+Four years later, hardware caught up. The NVIDIA H100 natively supports FP8. A new question emerged: *can 16 bits be pushed further down to 8?*
+
+Again, a direct swap fails. FP8 has an even narrower range than FP16; the old "FP32 master weights + loss scaling" patches are no longer sufficient — gradients blow up more easily under FP8.
+
+Two key papers define this period. Micikevicius's 2022 *FP8 Formats for Deep Learning* first defined *two FP8 variants*: E4M3 (higher precision, suited for the forward pass) and E5M2 (wider range, suited for backward gradients). The implicit message: "8 bits is too narrow to be one-size-fits-all; we need two flavors."
+
+Then Peng's 2023 FP8-LM landed that idea in full LLM training. They did something aggressive — *extending FP8 from forward matrix multiplications to gradients, optimizer states, and cross-device communication*. The result is a tiered framework:
+
+- O1: compress only gradient all-reduce communication to FP8
+- O2: also compress optimizer states to FP8 (Adam's m and v)
+- O3: also compress distributed weight broadcasts to FP8
+
+Measured on GPT-175B: memory reduced 39%, speed increased 75%. This was effectively a proclamation: "FP8 is no longer just a GEMM precision — it is the precision of the entire training pipeline."
+
+DeepSeek-V3 (2024) carried this to production-scale trillion-parameter models, proving the approach holds at the largest real-world scale.
+
+Yet the FP8-LM family left one conspicuous gap — *it assumes all GEMMs run at FP8*. This is a "compress everything uniformly" strategy: every layer, every matrix multiplication, treated at the same precision tier.
+
+* Section 3: Attempting 4 Bits (2025)
+
+The hardware roadmap kept descending. The Blackwell architecture began supporting FP4. The problem repeated itself: *can 8 bits be compressed to 4?*
+
+The difficulty jumped by an order of magnitude. FP4 has only 16 representable values (2^4 = 16); the moment an outlier arrives it warps the entire quantization grid. The "add a bit of loss scaling, be careful about range" fixes from the FP8 era are nowhere near sufficient.
+
+Wang et al.'s 2025 paper *Optimizing LLM Training Using FP4 Quantization* is the first serious FP4 training work. Its two core ideas:
+
+1. *Differentiable quantization estimator*: the quantization function is not differentiable, so back-propagated gradients are wrong. They designed a smooth approximation so weight update directions are not misled by quantization noise
+2. *Outlier clamping and compensation*: detect extreme activation values, handle them separately, and prevent them from blowing up the entire quantization grid
+
+This approach held quality loss to "nearly negligible" on 13B models. But the cost is visible — *gradient computation becomes more complex, and outliers need a separate sparse GEMM pass*.
+
+More importantly, Wang et al. still followed the "compress everything" philosophy: all layers use FP4, and carefully engineered numerical tricks absorb the error.
+
+At this point, a central contradiction was fully exposed:
+
+#+begin_src
+  Reality: different layers vary enormously in sensitivity to precision loss
+  - Attention projection layers: small precision drops are tolerable
+  - Layers adjacent to LayerNorm: even a small perturbation can cause collapse
+  - First and last layers: typically more sensitive than middle layers
+  - Early vs. late training: the sensitivity distribution shifts over time
+
+  Practice: uniform treatment — either all FP4 or all FP8
+
+  This wastes budget. We can do better.
+#+end_src
+
+* Section 4: Per-Layer Precision Selection (2026, This Paper: SNIP)
+
+SNIP sees this contradiction and asks a new question: *can we independently select the precision for each layer — leaving sensitive layers at FP8 and compressing insensitive ones to FP4?*
+
+The idea itself is not original to SNIP — *the inference community has been doing it for years*. HAQ (2019) uses reinforcement learning to pick bit widths per layer; OBC (2022) uses the Hessian to measure sensitivity; BBS (2024) uses KL divergence. But SNIP's critique of these methods is sharp:
+
+#+begin_quote
+"They only measure local quantization error, without accounting for training dynamics."
+#+end_quote
+
+What does that mean? At inference time you only care about "how much does this layer's output differ from the full-precision version." Training is different — *quantization error flows through gradients into the optimizer, is amplified by AdamW's momentum, and ultimately deflects the weight update trajectory*. A scheme with small local error can send the entire model off course after 1000 training steps.
+
+SNIP therefore designs two new metrics:
+
+** Metric 1: Loss Divergence (Forward Path)
+
+If layer i is quantized, *by how much does the training loss rise?* Computing this exactly requires a fresh forward pass — too expensive. SNIP uses Theorem 4.1 for approximation: treat quantization as adding a small perturbation δ to the input, so the change in loss is approximately *gradient · perturbation magnitude*. The gradient is already computed during back-propagation, so this estimate is essentially free.
+
+** Metric 2: Weight Divergence (Backward Path)
+
+Looking at the forward loss alone is insufficient because the optimizer has memory. SNIP also asks: *if layer i is quantized and one optimizer step is taken, how much do the weights diverge from the full-precision version?* This involves second-order cross-derivatives (of the loss with respect to both weights and inputs), which are never computed during training. The solution is clever: *inject a small Gaussian noise into the input, run one extra forward–backward pass, and observe how the gradients change*. This probes the otherwise uncomputed second-order terms at the cost of two extra passes every few steps — far cheaper than evaluating each layer independently.
+
+** Connecting Both Metrics to an Integer Program
+
+With *(loss divergence + weight divergence) = cost of choosing precision j for layer i*, the rest is a math problem:
+
+#+begin_src
+  Minimize   sum( q_{i,j} * x_{i,j} )       // minimize total quality loss
+  Subject to sum( e_{i,j} * x_{i,j} ) >= E_t // total speedup meets target
+             sum_j x_{i,j} = 1               // exactly one precision per layer
+             constraint 1 satisfied within each pipeline stage  // keep pipeline balanced
+#+end_src
+
+This is a classic *knapsack variant*, solved with scipy's milp solver (HiGHS backend) in about 30 seconds. The output is a globally optimal assignment — a list specifying "FP8 here, FP4 there" for every layer.
+
+Measured on Llama at scales of 1B / 3B / 7B / 70B, SNIP saves up to 80% of FLOPs with negligible quality degradation.
+
+* Problem–Solution Summary
+
+#+begin_src
+  Year    Precision      Core tension                     Solution paradigm              Remaining gap
+  ----    ---------      ------------                     -----------------              -------------
+  2018    FP32->16       Narrow range, gradient underflow FP32 master weights + scaling  16 bits still costly
+  2022    FP16->8        Even narrower range              E4M3/E5M2 dual formats         Formats only, no training recipe
+  2023    8-bit end-to-end Optimizer/comms still at 16   O1/O2/O3 three-tier framework  All layers uniform
+  2025    8->4           Outliers blow up 16-value grid   Differentiable estimator+comp  All layers still uniform
+  2026    Selective 4-bit Sensitivity varies across layers Per-layer ILP assignment      Future: dynamic?
+
+  The evolutionary direction running through the whole line:
+  ---------------------------------------------------------
+  "Global uniform setting" --> "Careful per-component accounting"
+  "Numerical tricks"        --> "Search + optimization"
+  "Rule of thumb"           --> "Data-driven + math-driven"
+#+end_src
+
+* What Is Really Happening Beneath This Line
+
+On the surface, bit widths are falling — 32, 16, 8, 4. But the deeper cognitive shift is something else entirely.
+
+*First shift: from "precision is a numerical problem" to "precision is an allocation problem."* Early work asked "how do we keep FP16 from blowing up" — a question of numerical technique. In SNIP's era the question becomes "given a fixed precision budget, how do we allocate it optimally" — a *resource scheduling problem*.
+
+*Second shift: from "precision strategy is model-agnostic" to "precision strategy is coupled to the model itself."* FP8-LM's strategy is identical for every LLM; SNIP's strategy differs per model and per training phase. Mixed precision has evolved from a "framework feature" into a "model-specific hyperparameter."
+
+*Third shift: from "use whatever the hardware supports" to "hardware / algorithm / compiler co-optimization."* SNIP explicitly encodes pipeline-parallelism constraints into the ILP — you cannot concentrate FP4 in certain pipeline stages without unbalancing the pipeline. Precision selection is no longer an isolated decision; it is coupled to the distributed execution strategy.
+
+* Where This Might Go Next
+
+Following the evolutionary trajectory:
+
+1. *Dynamic precision*: SNIP currently re-solves periodically (gather statistics, then solve once). But training dynamics change. The next step is *reallocating precision at every training step*, which will require even cheaper sensitivity estimates.
+2. *Hardware co-design*: once per-layer precision is algorithmically determined, can the most frequently ILP-selected precision combinations inform chip design? "Which combinations does the ILP pick most often" is exactly the data chip architects want.
+3. *Cross-task transfer*: the same model architecture may have a different sensitivity distribution under different training regimes (pre-training / SFT / RLHF). Can we learn a *"meta-model of sensitivity"* rather than re-profiling from scratch each time?
+4. *Down to 1–2 bits*: beyond FP4, 1.58-bit quantization (BitNet) is already underway — but that is a different line: *redesigning the architecture to suit low precision*, rather than *allocating precision within a fixed architecture*. The two lines may eventually converge.
+
+* Honest Disclosure
+
+- The main lineage traced here (Mixed Precision → FP8-LM → FP4 Training → SNIP) reflects relationships *explicitly cited* by SNIP in its abstract and related work
+- The HAQ / OBC / BBS branch is a line that SNIP *explicitly critiques but does not directly inherit*; those methods target inference, not training
+- The forward-looking extensions (dynamic precision, hardware co-design, cross-task transfer) are *inferences* based on evolutionary trends, not published papers
+- Because the arxiv PDF binary could not be decoded directly, paper details were obtained from the ar5iv HTML version; the original paper takes precedence in case of discrepancy

@@ -1,0 +1,223 @@
+#+title:      Is Finer Better? The Limits of Microscaling Formats in Large Language Models
+#+date:       [2026-05-29 Fri 08:17]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T081719-en
+#+source:     https://arxiv.org/abs/2601.19026
+#+authors:    Fasoli, Kar, Liu, Venkataramani, Srinivasan, Chang, Wang (IBM Research)
+#+venue:      ICLR 2026
+
+* The River of the Problem
+
+How do you stuff a 70-billion-parameter model into a single GPU without making it dumb?
+
+The entire low-precision quantization field has been doing the same thing for the past decade: represent every weight with fewer and fewer bits. Chop from FP16 to FP8, then to FP4. Each cut halves memory, doubles throughput — but model quality starts to wobble.
+
+The wobble has a simple cause: you only have 16 numbers to work with (FP4), yet the true distribution of weights can span hundreds of times in magnitude. The fix everyone landed on was clever — *block-shared scaling factors*: partition weights into small tiles, pick the tile's maximum to compute a scale, divide all elements by that scale before quantizing. The smaller the tile, the more tightly the scale tracks the local distribution, and in theory the smaller the error.
+
+So for a decade the direction was singular: *keep cutting blocks finer*. From one scale per entire tensor, to per-channel, to per-128 elements, to per-32 elements (the MX microscaling format) — and the industry roadmap was clearly heading toward 16, then 8.
+
+What this paper does is tap the brakes while everyone else is flooring it toward "finer": it finds that *beyond a certain granularity, cutting blocks even smaller actually increases error*. And the culprit is not the elements — it is the small thing everyone ignored: the scale values themselves are also quantized.
+
+* The Source Map
+
+#+begin_example
+[~2020] Per-tensor quantization (Lin, Dettmers)
+  |
+  | Problem: one scale covers the entire tensor; outliers ruin everyone
+  | Fix: give each channel / each token its own independent scale
+  v
+[2021-22] Per-channel / Per-token (Dai, Yao ZeroQuant)
+  |
+  | Problem: still too few scales; intra-block distribution can vary wildly
+  | Fix: group every 128 elements together under one shared scale
+  v
+[2020-23] Per-group / GPTQ / SmoothQuant (Shen, Frantar, Xiao)
+  |
+  | Problem: 128 still coarse; going finer is eaten alive by storage & bandwidth
+  | Fix: hardware-friendly microscaling format MX, block size 32, PoT scales
+  v
+[2023] OCP Microscaling MX (Rouhani et al.)
+  |
+  | Problem: FP4 elements + PoT scales = insufficient precision, quality drops
+  | Fix: replace scale with FP8 E4M3, introduce NVFP4 (block 16)
+  v
+[2024-25] NVFP4 / E4M3 scales (Lee, NVIDIA)
+  |
+  | Problem: pushing further to block=8 causes perplexity to get *worse*???
+  | Diagnosis: not the elements' fault — the scale's dynamic range is too narrow
+  v
+[2026] *Is Finer Better? UE5M3* (Fasoli et al., this paper)
+  |
+  | Borrow the idle sign bit and use it as an exponent bit;
+  | scale range expands from 2^-9 to 2^-17
+  v
+[2025+] BitMoD / BlockDialect / Nanoscale / per-channel attention scales
+  (not "expand scale range" — instead "switch format families" or "intra-block coding")
+#+end_example
+
+* The Evolutionary Narrative
+
+** ~2020 | Per-Tensor Quantization: One Scale to Rule Them All
+
+*** What problem did it see?
+
+When researchers first tried to cut precision, they took the easy path: compute the maximum of the entire weight tensor, derive one scale, and divide every element by it before quantizing. This held up reasonably in the INT8 era — 8 bits give 256 slots, leaving enough headroom. The moment you drop to 4 bits, only 16 slots remain, and a single outlier blows the scale wide open — the other 99% of small values get squeezed near zero and are effectively discarded. Lin et al. and Dettmers repeatedly confirmed this on the LLM.int8 line: large models simply contain a handful of very large activation values (outliers) that dominate the scale and ruin everyone else.
+
+*** Its solution
+
+There was no solution — just the acknowledgment that this path was a dead end and that the scale had to be cut finer.
+
+*** Why it worked (and what new trap it set)
+
+It did not work, which is why everything that follows was necessary. But it left behind one crucial insight: *the real killer of quantization quality is distributional spread, not average precision*. Everyone who came after dug down through that same hole.
+
+** 2021–2022 | Per-Channel / ZeroQuant: An Independent Scale per Channel
+
+*** What problem did it see?
+
+If the numbers inside one tensor vary too wildly to share a scale, stop making them share. Dai et al. and Yao et al. (ZeroQuant) noticed that the distribution of each column (each output channel) in a weight tensor is fairly stable across columns — some channels are inherently large, others inherently small. Giving each column its own scale isolates the outlier to that column, preventing it from contaminating its neighbors.
+
+*** Its solution
+
+One scale per output channel for weights; correspondingly, one scale per token for activations.
+
+*** Why it worked (and what new trap it set)
+
+It did suppress most outlier contamination. But more scales meant more storage overhead, and *within a column the spread could still be enormous* — a column might contain a few values at 3.0 alongside masses of 0.01; the scale is set by 3.0, and the 0.01 values still get crushed toward zero. The problem did not disappear; it was only postponed.
+
+** 2020–2023 | GPTQ / SmoothQuant / Q-BERT: Groups of 128
+
+*** What problem did it see?
+
+Shen et al. (Q-BERT), Frantar et al. (GPTQ), and Xiao et al. (SmoothQuant) found per-channel granularity still insufficient, so they sliced further: every 128 consecutive elements share one scale. This was an engineering sweet spot — small enough to track local distribution, large enough that the storage cost of scales themselves did not become a burden. GPTQ also folded in second-order information to minimize error column by column.
+
+*** Its solution
+
+Per-group quantization (group size = 128), combined with PTQ-level algorithmic refinements (error compensation, activation smoothing).
+
+*** Why it worked (and what new trap it set)
+
+The effect was substantial: INT4 became genuinely usable for LLMs for the first time. But the software stack had now reached its ceiling — *cutting further (to 32, 16, 8) starts to backfire*: each 4-bit element occupies half a byte, and a 16-bit scale shared across 32 elements already adds 6% overhead; shared across 8 elements it adds 25%. Software alone cannot paper over that. The next step required hardware to enter the picture.
+
+** 2023 | OCP MX Microscaling: Hardware Joins In — Block=32, PoT Scale
+
+*** What problem did it see?
+
+Rouhani et al. (OCP Microscaling spec) shifted attention from algorithms to formats: making block size = 32 truly cheap required hardware-level fusion of scale and element processing, with the scale itself encoded as cheaply as possible. Their answer was *E8M0* — powers of two (PoT), dynamic range 2⁻¹²⁷ to 2¹²⁸, but with only 1 bit of representational precision. Multiply and divide become shifts in hardware, nearly free.
+
+*** Its solution
+
+Defined the MXFP4/MXFP6/MXFP8 standards: every 32 elements share one 8-bit PoT scale. Block 32 + PoT scale + hardware-level matrix-multiply support. NVIDIA and AMD subsequently added native support.
+
+*** Why it worked (and what new trap it set)
+
+It turned microscaling from a research artifact into a commodity. But *PoT scales are not precise enough for FP4 elements* — the OCP document itself acknowledged this. FP4 representation is already coarse; apply a scale that is equally coarse on top, and two layers of roughness stack to produce a quality drop. The next entry had to fix the scale's own precision.
+
+** 2024–2025 | NVFP4: Block=16, Scale Upgraded to FP8 E4M3
+
+*** What problem did it see?
+
+Lee et al. and NVIDIA saw that PoT scales failed on FP4: a scale can only be chosen from 2⁰, 2¹, 2², … — if the true block maximum is 5.7, the scale must round up to 8 (wasting dynamic range) or down to 4 (clipping). FP4 elements already have only 16 slots; with scale precision wasted on top of that, two consecutive layers of precision loss become unacceptable.
+
+*** Its solution
+
+NVFP4 halved the block size (32 → 16) and replaced the scale with *FP8 unsigned E4M3* (4-bit exponent + 3-bit mantissa, UE4M3), giving the scale a real mantissa so it can precisely match the block maximum. NVIDIA Compute Capability 10.0+ provides native hardware support.
+
+*** Why it worked (and what new trap it set)
+
+Block 16 + precise scales: quality recovered substantially. But the hardware roadmap was already set: the next step is *block 8*, then *block 4*. Everyone assumed finer was better, because every step of the preceding years had confirmed exactly that.
+
+And here is where this paper enters.
+
+** 2026 | This Paper — UE5M3: The First Brake, "Finer Is Not Better"
+
+*** What problem did it see?
+
+The authors swept block sizes across several models — Llama, Granite, Mixtral — and found that *block 8 gives worse perplexity than block 16*. This violates every intuition. Granite-3.3-8B starts to invert at block 16; Llama-3.1-8B and Mixtral invert at block 8; only a minority of models, such as Llama-2-7B, decrease monotonically all the way. They named this phenomenon *perplexity inversion*.
+
+Even more striking: they ruled out the usual suspect of outlier clipping (Granite weights never exceed 1.0 in magnitude), which forced them to search for the true cause.
+
+*** Its solution
+
+First, a clean diagnostic: the quantization precision of the scale itself is insufficient. The smallest nonzero value representable by FP8 UE4M3 is 2⁻⁹. Once a block's true standard deviation σ falls below roughly 2·10⁻², its scale lands in the lowest few bins of UE4M3 and the relative error explodes; narrower still, the entire block gets rounded to zero. The smaller the block, the more likely it is to have an extremely narrow distribution — so finer blocks actually make things worse.
+
+The theoretical framework is elegant: decompose the error into three components — quantization error of the non-maximum elements, quantization error of the maximum element itself (zero when the scale is nonzero, nonzero otherwise), and the probability that the entire block is rounded to zero. The relative weight of these three terms varies with σ; the third term blows up for narrow distributions.
+
+The fix is to change the scale format. Since scales are unsigned (the sign bit of UE4M3 sits idle), borrow that bit and turn it into an exponent bit: the new format *UE5M3* (5-bit exponent + 3-bit mantissa). Dynamic range expands from [2⁻⁹, 448] to [2⁻¹⁷, ~57344]; mantissa precision is unchanged. The smallest representable scale shrinks by a factor of 256, so narrow-distribution blocks are never forced to round to zero again.
+
+*** Why it worked (and what new trap it set)
+
+It attacks the most lethal of the three error sources (blocks rounded to zero) without disturbing the other two. The cost is merely reinterpreting the scale encoding in hardware — *no additional bits required* — making it essentially free.
+
+The remaining open problem: UE5M3 rescues narrow-distribution blocks, but it does not address a different need — applying FP4 to attention tensors that genuinely contain outliers. Zhang et al. 2025 are already working on per-channel attention scales to fill that gap.
+
+* Frontier Extensions
+
+Several parallel lines advancing at the same time as this paper (all cited in §2.2):
+
+- *Chen et al. 2025 BitMoD*: repurposes the redundant "+0/−0" encoding in FP4 as an extra quantization level, squeezing more precision out of the element side.
+- *Jang & Tambe 2025 BlockDialect*: allows the two largest elements in each block to be matched against one of 16 tunable pairs — effectively a small intra-block codebook.
+- *Lo et al. 2024 Nanoscale*: adapts both scale format and element format to the per-block distribution — a "format-family" approach rather than a "range-expansion" approach.
+- *Zhang et al. 2025*: uses per-channel scales on the attention side to combat outliers — the direction §5.1 of this paper explicitly names as the target to replace with per-tensor scales.
+
+Together these lines form a map: *the next step for microscaling is not simply cutting blocks finer, but finding the most cost-effective combination among scale encoding, intra-block codebooks, and adaptive format families.* This paper is the cleanest instance of the "expand scale range" branch on that map.
+
+* One Diagram to Understand It All
+
+#+begin_example
+        Scale precision      Block granularity    Representative
+        --------------       -----------------    --------------
+2020    1/tensor             1                    LLM.int8 (Dettmers)
+                                                   |
+                             one scale per tensor; outliers ruin everyone
+                                                   v
+2022    1/channel or         thousands            ZeroQuant
+        1/token
+                             within-channel spread can still be large
+                                                   v
+2023    1/128 elements       128                  GPTQ, SmoothQuant
+                                                   |
+                             software optimization maxed out; hardware must step in
+                                                   v
+2023    PoT E8M0             32                   OCP MXFP4
+                                                   |
+                             scale too coarse; FP4 can't hold up
+                                                   v
+2024    UE4M3 FP8 scale      16                   NVFP4
+                                                   |
+                             cutting to 8 makes things *worse* — inversion!
+                                                   v
+2026    UE5M3 FP8 scale      8 (or even smaller)  << This Paper >>
+                             \_borrow the idle sign bit to extend the exponent_/
+
+       Horizontal axis: time
+       Upper vertical: scales become progressively finer
+       Lower vertical: blocks become progressively smaller
+       Key inflection: at 2026, the trajectory "smaller block = better" is falsified for the first time
+#+end_example
+
+* Insights
+
+Reading the entire arc, what is truly happening is not "low-precision quantization becoming ever more refined." It is:
+
+*Each generation of solutions assumes that "the previous generation's problems automatically vanish at finer granularity" — until one generation discovers that they did not vanish, but were actually amplified.*
+
+The earlier generations all held: per-tensor → per-channel → per-128 → block 32, each step finer than the last genuinely solved the outlier problem of the previous step. But at the block 16 → block 8 transition, for the first time "cutting finer makes things worse." The reason:
+
+- *Earlier generations were cutting along the "element" dimension.* Finer cuts → higher intra-block homogeneity → tighter scale fit → smaller error.
+- *This generation hit the "scale" dimension.* Once blocks are cut fine enough, the dynamic range of the scale itself becomes the new bottleneck — narrow blocks have tiny scales that fall below UE4M3's representable floor and get rounded to zero, wiping out the whole block.
+- The real conceptual shift is: *a quantization system is a two-level coupled object (elements + scales); optimizing one level to its extreme exposes the shortfall of the other.*
+
+Where is the most likely next step? Two directions:
+
+1. *Squeeze every last drop out of the scale layer.* UE5M3 is the first move on this line. Expect UE6M2, logarithmic scales, and perhaps even two-level scales (scale of scales) to follow.
+2. *Step outside "block size" as a variable altogether.* What BitMoD, BlockDialect, and Nanoscale are doing — intra-block elements no longer coded uniformly, each block gets an adaptive format tailored to it. If this line matures, "block size" as a hyperparameter may disappear entirely.
+
+Ordering the bets: short-term, direction (1) wins on hardware compatibility (only the scale encoding changes); long-term, direction (2) wins because it opens a much larger design space.
+
+* Takeaways
+
+- *Be wary of extrapolating the previous generation's success.* This field's trend line for eight years was "finer scale = better," and the industry roadmap was built on it. But trend lines bend at critical points. The biggest research opportunities tend to come from carrying the spirit of "what happens if we keep pushing in this direction?" into experiment — and *finding the bend* — rather than taking one more step along the trend.
+- *Watch the coupling layers.* The true bottleneck is rarely in the heavily optimized component (the elements) but in the long-neglected "small accessory" (the scale). This pattern recurs throughout systems engineering: memory bandwidth bottlenecks the CPU, communication cost bottlenecks distributed scaling, scale precision bottlenecks element precision.
+- *Zero-cost solutions are the most beautiful.* UE5M3 is impressive not because it is clever, but because *it adds zero bits* — it simply reinterprets an idle sign bit that was already there. Almost every hardware improvement that actually ships is a story of "finding unused degrees of freedom within existing constraints."
+- *When engineering, look for your "bit you can borrow without missing."* It may be hiding in a field no one reads, a standard no one has questioned, or a default configuration no one has challenged.

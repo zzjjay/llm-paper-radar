@@ -1,0 +1,221 @@
+#+title:      MixQuant: Pushing the Limits of Block Rotations in Post-Training Quantization
+#+date:       [2026-05-29 Fri 12:00]
+#+filetags:   :paper:river:quantization:rotation:en:
+#+identifier: 20260529T120000-en
+#+source:     https://arxiv.org/abs/2601.22347
+#+authors:    Sai Sanjeet, Ian Colbert, Pablo Monteagudo-Lago, Giuseppe Franco, Yaman Umuroglu, Nicholas J. Fraser
+#+venue:      arXiv 2026
+
+* One-liner
+
+To scatter the "giants" in activations into "dwarfs" before compressing to INT4, the cleanest approach is a full-vector rotation. But full rotations are too expensive in practice, so the vector is split into small blocks that are each rotated independently — and the moment you cut into blocks, the giants reappear. PeRQ is the first work to explain precisely *why* they reappear, and then offers a zero-cost fix: reorder the channels so that the total L1 energy in every block is roughly equal, and *then* rotate.
+
+* Lineage Map
+
+#+begin_src
+                  outlier problem in LLM quantization
+                              |
+                              v
+  [2022] LLM.int8 -- "Hey, a few channels in activations are enormously large"
+                              |
+                              | (scale locally to work around them)
+                              v
+  [2023] SmoothQuant -- migrate half the activation giants onto the weights
+                              |
+                              | (but now the weights are harder to quantize too)
+                              v
+  [2023] GPTQ -- use the Hessian to guide column-wise rounding
+                              |
+                              | (still symptomatic; giants stay put)
+                              v
+  [2023] QuIP -- key insight: multiply by an orthogonal matrix and
+                 the giants get scattered uniformly
+                              |
+                              | (Kronecker rotation is still slow)
+                              v
+  [2024] QuaRot -- use Hadamard rotation, and fold it into the weights
+                              |
+                              | (some positions still require online rotation)
+                              v
+  [2025] SpinQuant -- if we must rotate, learn the optimal rotation
+                              |
+                              | (online rotation O(d log d) is still costly)
+                              v
+  [2025] BRQ / MR-GPTQ -- split into blocks, rotate each block O(d log b)
+                              |
+                              | (saves compute, but giants reappear)
+                              v
+  [2024] DuQuant -- tried rotation + permutation, but dense blocks need O(b^2) memory
+                              |
+                              v
+  [2026] *PeRQ* (this paper) -- proves: whether block rotation can suppress giants
+                          depends on whether per-block L1 energy is balanced.
+                          Sort channels first to equalize energy, then apply
+                          Hadamard; the permutation folds into the weights -> zero overhead
+                              |
+                              v
+  [2026+] PolarQuant / QAM-W / ButterflyQuant -- each pushes this line further
+#+end_src
+
+* The Story from the Beginning
+
+** Stop 1 — LLM.int8 (2022): The Giants Are Real
+
+Early on, people assumed large-model quantization failed because the distribution was "poorly shaped" — the scale factor was chosen poorly. Then Dettmers printed the actual activation values and discovered that certain transformer channels spike to values dozens or even hundreds of times larger than the average for certain tokens. Stuffing these into an INT8 box either clips them (losing all information) or stretches the scale so coarsely that every other small value collapses to zero.
+
+What he found: *a small number of "giant" channels in activations hold the entire dynamic range hostage.*
+
+His fix: identify those channels, keep them in FP16, use INT8 for the rest.
+
+What remained: this is a "detect and exempt" scheme. As giants grew more numerous (e.g. after LLaMA-65B), the exemptions multiplied until the scheme broke down.
+
+** Stop 2 — SmoothQuant (2023): Move the Giants to the Weight Side
+
+Xiao saw the flaw in LLM.int8 — you can't keep treating giants as exceptions forever. His observation: activations have giants, weights are relatively flat; why not average the difficulty across both?
+
+Concretely: in the matrix product X @ W, silently insert a pair of inverse scale factors — X @ diag(s) @ diag(1/s) @ W. Dividing activations by s shrinks the giants; multiplying weights by s inflates them slightly, but they can absorb it.
+
+What he found: *once the activation giants are moved to the weight side, both tensors become quantizable.*
+
+What remained: this is a relocation trick. If the activation giants are extreme enough, the weight side will grow its own giants. Moreover the scaling can only act along the channel dimension — it never truly "scatters" a giant; that giant is still there in its channel, just somewhat smaller.
+
+** Stop 3 — GPTQ (2023): Rounding Can Be Smarter
+
+Frantar took a different route: rather than reshaping the distribution, reshape the rounding procedure. He noted that when weights are rounded column-by-column to INT4, the error introduced in each column propagates differently to the final output — later columns can compensate for earlier ones.
+
+Concretely: use the Hessian to quantify how each column's error propagates, then adjust subsequent columns' rounding accordingly.
+
+What he found: *rounding is not neutral; it has direction, and errors can be strategically redirected.*
+
+What remained: this is symptomatic treatment. Giants are still giants. GPTQ makes weight quantization more accurate, but it is powerless against activation giants.
+
+** Stop 4 — QuIP (2023): Just Rotate
+
+Chee was the first to directly attack the shape of the distribution. His idea is counterintuitive: if a vector contains a few huge values and many tiny ones, what happens when you multiply it by a random orthogonal matrix?
+
+Something remarkable: the giant's "energy" gets spread uniformly across all dimensions. The vector [100, 0.1, 0.1, …, 0.1] becomes [3.2, 3.1, 3.3, 2.9, …] after rotation. No giants, no dwarfs, all medium-sized. This property is called *incoherence*.
+
+What he found: *a giant is not a physical entity — it is an artifact of a poorly chosen coordinate system. Switch the basis and it vanishes.*
+
+His fix: use a random orthogonal matrix constructed via Kronecker products to rotate the weights and the Hessian.
+
+What remained: Kronecker rotation is still slow, and it only touched the weights, not the activations.
+
+** Stop 5 — QuaRot (2024): Hadamard Rotation + Fold into Weights
+
+Ashkboos took QuIP's insight and swapped two components: (1) replaced the Kronecker construction with Hadamard matrices — faster, O(d log d); (2) exploited the "computational invariance" of transformer blocks to fold many rotations directly into the weight matrices at no inference cost.
+
+What he found: *QuIP's rotation is a preprocessing step on weights, but the transformer residual stream is continuous — the rotation can be threaded through the entire network.*
+
+His fix: insert Hadamard rotations into the residual stream, Q/K/V projections, and FFN layers. Those that can be folded into weights incur zero cost; those that cannot are applied online.
+
+What remained: even though each online Hadamard is O(d log d), it must be performed at every attention and FFN layer, and the cumulative cost is substantial.
+
+** Stop 6 — SpinQuant (2025): If We Must Rotate, Learn the Best One
+
+Liu noticed that QuaRot uses a random Hadamard — why should random be optimal? Using a small calibration dataset, he learns a rotation matrix tailored to the specific model.
+
+What he found: *a random orthogonal matrix is good in expectation, but not necessarily optimal for any given model.*
+
+His fix: parameterize the rotation matrix as a learnable variable and fine-tune it with a small auxiliary loss.
+
+What remained: the cost of online rotation was still not resolved.
+
+** Stop 7 — BRQ / MR-GPTQ (2025): Split into Blocks, Giants Return
+
+Shao and Egiazarian nearly simultaneously hit the same engineering inflection point: online Hadamard is too expensive — can the vector be split into small blocks, each rotated independently?
+
+With block size b, the per-layer rotation cost drops from O(d log d) to O(d log b). Shao reported that on Llama2 7B with MXFP4, block size 32 reduces online rotation overhead by 1.5×. Sounds great.
+
+What they found: *full online rotation is too costly; block-wise rotation is cheap.*
+
+What remained: the smaller the block, the weaker the rotation's ability to scatter giants. In the extreme case — block size 1 — there is no rotation at all. Figure 1 in the paper makes it clear: on Llama3 1B, small-block rotation lets the giants resurface.
+
+Why does this happen? Nobody had worked it out. People empirically observed "small blocks stop working" but could not explain it, let alone fix it.
+
+** Stop 8 — DuQuant (2024): Try Adding a Permutation
+
+Lin attempted a rescue. His reasoning: since a random Hadamard is not optimal, let me manually design a rotation that encourages giants to scatter into neighboring channels, and add a zigzag permutation to spread giants evenly across blocks.
+
+What he found: *a permutation can assist the rotation by distributing giants more evenly among blocks.*
+
+His fix: manually construct a dense block-diagonal rotation matrix plus a zigzag permutation.
+
+What remained: a dense block rotation requires O(b²) memory, versus O(b log b) for Hadamard — an order-of-magnitude engineering difference. Moreover the scheme is heuristic, with no theoretical guarantee that it actually solves the problem.
+
+** Stop 9 — PeRQ (2026, This Paper): Finally a Clear Answer
+
+Sanjeet et al. realized that everyone before them had been trial-and-erroring — splitting into blocks, adding permutations, learning rotations — without answering the fundamental question: *when does block rotation work, and when does it fail?*
+
+Their first move: set engineering aside and prove a mathematical fact.
+
+#+begin_quote
+For a Hadamard rotation with block size b, the worst-case post-rotation maximum
+(outlier) is determined by the *distribution of per-block L1 total energy*.
+When the L1 energy is perfectly uniform across all blocks, the worst-case outlier
+is minimized. Any imbalance causes the worst-case outlier to grow.
+#+end_quote
+
+This immediately clarifies the entire lineage. Why did BRQ's block splitting fail? Because the giant channels in transformer activations concentrate in a few blocks, and those blocks carry far more L1 energy than the rest — by the theorem, the worst-case outlier explodes. Why does DuQuant help? Because its zigzag permutation happens (by coincidence) to equalize per-block energy.
+
+Once the true root cause is identified — *unequal per-block L1 energy* — the remedy is obvious:
+
+1. *Permute*: reorder channels so that every block has roughly equal L1 energy. A greedy algorithm (MassDiff) computes this permutation on calibration data.
+2. *Rotate*: apply the standard block Hadamard rotation. The theorem now guarantees that the worst-case outlier approaches that of a full-vector rotation.
+3. *Quantize*: quantize as usual.
+
+The elegant bonus is zero overhead: certain positions in a transformer are *permutation-equivariant*, meaning inserting a permutation on one side and its inverse on the other leaves the output unchanged. PeRQ exploits this to fold the permutation into the weight matrices — just as QuaRot folds rotations into weights — so at inference time the permutation step does not exist.
+
+Empirically: on Llama3 1B quantized to INT4 with block size 16, PeRQ recovers *90% of the perplexity gap* relative to full-vector rotation; without the permutation only 46% is recovered.
+
+* Where the Line Goes Next
+
+Several related works appearing around the same time or shortly after PeRQ continue the theme of "understand + repair block structure":
+
+- *PolarQuant* (2026): applies Hadamard only inside each weight tensor without touching the computation graph. The angle is different — since a block rotation is effective precisely because it pushes the distribution toward Gaussian, make "Gaussianization" the explicit objective and design the codebook as an optimal Gaussian quantizer.
+- *QAM-W* (2026): block Hadamard rotation + 2D joint codebook + activation-aware scaling, pushing aggressively toward lower bit-widths.
+- *ButterflyQuant* (2025): replaces the fixed Hadamard with learnable butterfly factorizations (compositions of Givens rotations), learning a per-layer "block-structured orthogonal" transform.
+
+* Problem–Solution Summary
+
+#+begin_src
+            Problem                                 Solution                  Cost
+  -----------------------------------------------------------------------
+  LLM.int8     giant channels in activations        FP16 exceptions          ever-growing exceptions
+  SmoothQuant  giants overwhelm the scale           shift scale to weights   weights become harder
+  GPTQ         column-wise rounding errors accumulate  Hessian-guided compensation  symptomatic
+  QuIP         giants are a coordinate artifact     orthogonal rotation scatters them  rotation is slow
+  QuaRot       QuIP not threaded through network    Hadamard + fold to weights  online rotation costly
+  SpinQuant    random rotation is suboptimal        learn the rotation        online still costly
+  BRQ/MR-GPTQ  online rotation too expensive        block-wise b rotation     giants reappear
+  DuQuant      unclear why block splitting fails    dense block + zigzag      O(b^2) memory
+  *PeRQ*       no theory for when block rotation fails  *prove L1-uniformity + permutation folded into weights*  zero overhead
+#+end_src
+
+* The Core Thread
+
+The deepest evolution running through this entire line is *the de-physicalization of the "giant" concept*.
+
+- LLM.int8 treats giants as physical entities and handles them by detection + isolation.
+- SmoothQuant treats giants as a physical burden and handles them by redistribution.
+- QuIP is the first to say: a giant is a coordinate-system artifact, not a physical entity.
+- QuaRot and SpinQuant engineer and optimize that insight.
+- Once block rotation is introduced, "giants are not physical entities" temporarily breaks down inside each small block — the block's coordinate system is too small to scatter them, and they reconstitute.
+- PeRQ gives a more precise answer: within a finite coordinate system (a block), whether giants are physical entities depends on the *distances between giants* — that is, how they are distributed across blocks. Spread them into separate blocks and each block's interior returns to a "no giants" regime, restoring the effectiveness of rotation.
+
+The next steps along this line are most likely: (1) jointly learning permutation and rotation end-to-end rather than in two separate stages; (2) replacing the "L1-uniformity" criterion with a finer objective (e.g. using the worst-case outlier directly as the loss); (3) stress-testing the theory at lower bit-widths (INT2, binary) and larger models.
+
+* Uncertainty Notes
+
+- BRQ (Shao 2025) and MR-GPTQ (Egiazarian 2026) appear only as citations in PeRQ; I have not read the originals. The specific "1.5× overhead reduction" figure is quoted via PeRQ's account.
+- The exact locations of "permutation-equivariant regions" (which layers qualify) are not spelled out in the abstract; I infer they include positions inside attention heads and FFN down_proj layers — the same spots exploited by QuaRot.
+- Whether DuQuant's zigzag permutation "accidentally" satisfies L1 uniformity is not verified; it is a reasonable inference from PeRQ's theorem.
+- The "where the line goes next" section reflects my own judgment, not claims made in the paper.
+
+* Sources
+
+- Target paper: https://arxiv.org/abs/2601.22347 (PeRQ, Sanjeet et al., 2026)
+- QuaRot: https://arxiv.org/abs/2404.00456 (Ashkboos et al., 2024)
+- QuIP / QuIP#: https://arxiv.org/abs/2402.04396 (Tseng et al., ICML 2024; citing Chee 2023)
+- DuQuant: https://arxiv.org/abs/2406.01721 (Lin et al., 2024)
+- SmoothQuant, GPTQ, LLM.int8 are public knowledge; not individually sourced

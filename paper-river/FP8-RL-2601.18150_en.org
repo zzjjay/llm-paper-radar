@@ -1,0 +1,242 @@
+#+title:      FP8-RL: A Practical and Stable Low-Precision Stack for LLM Reinforcement Learning
+#+date:       [2026-05-29 Fri 08:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T080954-en
+#+source:     https://arxiv.org/abs/2601.18150
+#+authors:    Zhaopeng Qiu, Shuang Yu, Jingqi Zhang, Shuai Zhang, Xue Huang, Jingyi Yang, Junjie Lai (NVIDIA)
+#+venue:      arXiv preprint, 2026 (Under review)
+
+* The River of Questions
+
+A simple question: when training a reasoning-capable large model (the RL phase), can you use lower-precision compute to make it faster — without letting it collapse in the process?
+
+That sounds like two separate problems — "faster" is engineering, "not collapsing" is algorithms. But researchers working along this line discovered they are really one problem. Every time you squeeze out more speed, the model becomes more prone to collapse. Every time you clamp down on collapse, you give the speed back. Across a dozen papers, the field has been tugging at both ends, inch by inch finding a balance.
+
+Why is it hard? Because RL training has an awkward structure: the model is simultaneously "generating answers" (rollout) and "updating itself based on how those answers are scored" (training). The generation side must be fast — so it uses an inference engine and low precision. The update side must be accurate — so it uses high precision. The same model therefore looks different on each side: "the me I think I'm updating, and the me that actually produced the answers, are no longer the same entity." This misalignment (train-inference mismatch) causes minor accuracy loss at best, and complete training collapse at worst.
+
+* Provenance Map
+
+#+begin_example
+[2023] DeepSpeed-Chat
+  |
+  | Problem: Training and generation crammed into one process, GPU utilization poor
+  | Solution: Productionize RLHF, but still synchronous execution
+  v
+[2024] HybridFlow / verl (Sheng et al.)
+  |
+  | Problem: Synchronous architecture can't use the best training backend
+  |          AND the best inference engine simultaneously
+  | Solution: Decouple — training uses FSDP/Megatron, generation uses vLLM/SGLang
+  | Side effect: After decoupling, numerics/kernels differ on each side
+  |              → mismatch is planted as a time bomb
+  v
+[2025] When Speed Kills Stability (Liu et al.)
+  |
+  | Problem: Everyone uses the decoupled architecture, but training occasionally
+  |          collapses for no apparent reason
+  | Solution: No new method — this paper is a diagnostic report, proving collapse
+  |           comes from train-inference mismatch, and prescribing token-level
+  |           Truncated Importance Sampling (TIS) as the remedy
+  v
+[2025] FlashRL (Liu et al.)
+  |
+  | Problem: If TIS can suppress mismatch, can we aggressively push rollout to INT8?
+  | Solution: INT8 rollout + TIS, validating that 8-bit is genuinely viable
+  | Side effect: INT8 is just a starting point; FP8 is the native format on
+  |              Hopper/Blackwell, with a higher speed ceiling
+  v
+[2026] FP8-RL (this paper, NVIDIA)         <<< Target paper
+  |
+  | Problem: FP8 is better hardware-matched than INT8, but RL introduces two
+  |          unique pitfalls FP8 inference never faced:
+  |          (1) Weights change every step — repeated quantization and sync required
+  |          (2) FP8 error is more subtle than INT8; mismatch is harder to suppress
+  | Solution: Engineering — dynamic weight sync + blockwise FP8 + KV cache quant;
+  |           Algorithm — retain TIS, and explore end-to-end FP8 to further
+  |           narrow the gap
+  v
+[2025-11] vLLM Bitwise-Consistent  +  [2025] Qi et al. FP16
+  |
+  | Two paths in the opposite direction:
+  | Path A (vLLM): Achieve bitwise consistency at the operator level — mismatch = 0
+  | Path B (FP16): Stop wrestling with BF16/FP8; just use FP16 and eliminate
+  |                rounding drift at the source
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | DeepSpeed-Chat: Productionizing RLHF
+
+*** What Problem It Saw
+
+After InstructGPT was published, everyone knew RLHF was the key to ChatGPT's success — but no one had the code. A researcher wanting to train an RLHF model had to assemble everything from PPO upward, by hand.
+
+*** Its Solution
+
+Microsoft packaged the entire three-phase RLHF pipeline (SFT, reward model, PPO) into an out-of-the-box library, running all four models — Actor, Critic, Reward, Reference — synchronously inside a single process.
+
+*** Why It Worked (and What New Trap It Set)
+
+It did get RLHF running. But packing everything together meant two things: first, you couldn't give the "generation" step its own best-in-class inference engine; second, during rollout, the training GPUs simply idled and waited. The larger the cluster, the worse the waste. That became the problem the next generation of frameworks had to solve.
+
+** 2024 | HybridFlow / verl: Decoupling Training and Inference
+
+*** What Problem It Saw
+
+DeepSpeed-Chat bound everything together, but in the LLM world, training frameworks (FSDP, Megatron-LM) and inference frameworks (vLLM, SGLang) were each evolving at breakneck speed. You could have the best training or the best inference — not both.
+
+*** Its Solution
+
+ByteDance's verl used Ray to completely separate training from inference: the training side could pick any backend it liked; the generation side could pick any engine it liked; a scheduling layer synchronized weights between the two. OpenRLHF and NeMo-RL followed similar designs.
+
+*** Why It Worked (and What New Trap It Set)
+
+Speed improved immediately, because generation could now exploit state-of-the-art techniques like vLLM's PagedAttention. But something new surfaced: the FSDP forward pass on the training side and the vLLM forward pass on the inference side, though sharing identical weights, used different kernels, different parallelism partitioning, and different accumulation orderings. Feed the same prompt to both sides — the logits they compute are not exactly equal. The gap is invisible in the short term, but it accumulates over long sequences and becomes the protagonist of the next story.
+
+** 2025 | When Speed Kills Stability: A Diagnostic Report on "Mysterious Collapse"
+
+*** What Problem It Saw
+
+Many teams trained RL with verl and watched their models collapse mid-run — loss spiking, accuracy dropping to zero — with no clear explanation. People piled on heuristic tricks from experience; nobody tracked down the root cause.
+
+*** Its Solution
+
+This paper nailed the root cause: training assumed it was doing on-policy RL (updating the current policy using samples from that policy), but because the rollout policy and the training policy differ numerically in the decoupled architecture, updates were actually off-policy. Without correction, the amplified likelihood ratios that PPO encounters on long sequences drive the optimization to blow up. The remedy is classical importance sampling with truncation (Truncated IS / TIS): clip excessively large importance weights at an upper bound to control variance.
+
+*** Why It Worked (and What New Trap It Set)
+
+Diagnosis plus prescription let the field understand: "Oh — it's not that RL algorithms are broken; it's numerical drift in the engineering stack." But TIS handles only the small discrepancy of "both sides are BF16 but kernels differ." What if someone deliberately made rollout coarser — say, by using genuinely low precision? Would TIS still hold?
+
+** 2025 | FlashRL: Pushing Rollout Down to INT8
+
+*** What Problem It Saw
+
+If mismatch can be patched with TIS, why does rollout still have to stay in BF16? Low-precision rollout saves memory and raises throughput — in theory, it should significantly speed up RL training. But nobody had dared to try, fearing collapse.
+
+*** Its Solution
+
+FlashRL quantized rollout directly to INT8 and paired it with TIS correction, demonstrating that the "aggressively lower precision + soft correction" approach is viable in RL. 8-bit rollout, full-power RL.
+
+*** Why It Worked (and What New Trap It Set)
+
+It opened a door — rollout precision can be cut independently. But INT8 was the optimization target of the previous hardware generation. The new Hopper and Blackwell GPUs natively support FP8, which is theoretically even faster than INT8. And the quantization error profile of FP8 differs from INT8: FP8 has exponent bits, giving it a large dynamic range but uneven precision distribution. What does that mean for RL's "long-sequence accumulated error" regime? Nobody had studied it systematically.
+
+** 2026 | FP8-RL: Bringing FP8 to the RL Battleground (Target Paper)
+
+*** What Problem It Saw
+
+FP8 has already matured in inference (vLLM, TensorRT-LLM) and pre-training (DeepSeek-V3), yet almost nobody uses it in RL. That's because RL introduces two pitfalls that static inference never encounters:
+
+First, *weights change every step*. Static inference quantizes the model once and is done. In RL, after every training step, the latest weights must be re-quantized and re-pushed to the inference engine. This repeated synchronization is an engineering nightmare in a decoupled architecture.
+
+Second, *FP8 error is subtler than INT8*. INT8 is uniform quantization — error is predictable. FP8 has exponent bits: high precision for small values, low precision for large values. In autoregressive generation over long sequences (20K tokens), the error accumulation profile is completely different. Can TIS still hold it? Does correction need to be more aggressive?
+
+*** Its Solution
+
+The full stack is wired together inside the verl framework:
+
+1. *Linear layers: W8A8 blockwise FP8 quantization* — weights quantized statically, activations quantized dynamically, each block gets its own scale. Fine block granularity means small precision loss.
+2. *KV cache FP8 quantization* — this is the real bottleneck. In long contexts (20K tokens), KV cache dominates memory. Cutting it from BF16 to FP8 doubles effective cache capacity, raises concurrency, and sends throughput soaring. The challenge is that K/V distributions shift at every step, so QKV scales must be recalibrated each step.
+3. *Retain token-level TIS (C=2) for mismatch correction* — the FlashRL recipe is carried forward and validated under FP8.
+4. *Explore end-to-end FP8* — not just rollout in FP8, but training in FP8 as well (following DeepSeek-V3's hybrid recipe: forward in E4M3, backward in E5M2). When both sides are low precision, the mismatch actually shrinks.
+
+Results: 10–20% rollout speedup for dense models, 30–50% for MoE models, up to 44% combined speedup with KV cache quantization, with accuracy nearly identical to the BF16 baseline.
+
+*** Why It Worked (and What New Traps It Left)
+
+The key is not FP8 per se, but walking on two legs — engineering and algorithms together. On the engineering side: nail dynamic quantization and weight synchronization. On the algorithm side: accept that mismatch will always exist and apply TIS as a soft correction. Neither side pursues perfection, but together they're stable enough.
+
+Several open problems remain:
+- For MoE models in certain configurations, TIS alone is insufficient; techniques like Rollout Router Replay (R3) or Masked IS (MIS) that specifically correct routing discrepancies are needed.
+- More aggressive precision (NVFP4) was explored and found to destabilize training due to accumulated quantization error.
+- The fundamental issue is unsolved: mismatch still exists, merely suppressed. Can it be eliminated at the root?
+
+* Frontier Extensions
+
+** 2025-11 | vLLM Bitwise-Consistent: Eliminating Mismatch at the Operator Level
+
+The exact opposite philosophy from FP8-RL. FP8-RL says "accept that mismatch necessarily exists and soft-patch it with TIS"; the vLLM and TorchTitan teams say "achieve bitwise consistency at the engineering level — every bit computed by training and inference must be identical." The approach unifies kernels, enforces determinism, and aligns parallelism partitioning. The cost is forgoing some inference optimizations, so raw throughput may not be as dramatic as FP8-RL. But if achieved, corrections like TIS become unnecessary.
+
+** 2025 | Qi et al. — Defeating the Mismatch via FP16
+
+A more radical diagnosis. This paper argues: "You're all wrestling with mismatch in BF16, but the root cause may be BF16 itself — BF16's rounding errors accumulate during autoregressive decoding and cause the rollout and training policies to drift apart." The fix: switch everything to FP16 (not BF16). Rounding behavior becomes consistent, and mismatch immediately narrows.
+
+This path is in direct opposition to FP8-RL: FP8-RL is "lower precision plus correction," while the FP16 camp is "switch precision formats and eliminate the problem at the source." Which path wins may ultimately depend on where hardware goes next.
+
+** Directions the Paper Itself Identifies as Future Work
+
+- NVFP4 (4-bit floating point) — more aggressive, but currently unstable
+- Validation on larger models
+- Multi-turn dialogue and Agentic RL settings, where sequences are longer and the rollout bottleneck is even more pronounced
+
+* A Single Diagram
+
+#+begin_example
+              The "Speed vs. Stability" Tug-of-War in RL (2023 -> 2026)
+              ===========================================================
+
+  Precision   |
+  (high→low)  |
+              |  [BF16, synchronous execution]
+   BF16       |  DeepSpeed-Chat (2023)
+              |  - Slow but stable; nobody discusses mismatch
+              |        |
+              |        v  Decoupled architecture appears
+              |
+   BF16       |  HybridFlow/verl (2024)  --[side effect]-->  mismatch surfaces for the first time
+              |  - Training/inference split; throughput takes off
+              |        |
+              |        v  Training starts collapsing for no apparent reason
+              |
+   BF16       |  When Speed Kills (2025)
+              |  - Diagnosis: mismatch is the culprit
+              |  - Prescription: TIS (soft correction)
+              |        |
+              |        v  "Soft correction" opens a door
+              |
+   INT8       |  FlashRL (2025)
+              |  - If we can correct it, push rollout to INT8
+              |        |
+              |        v  But INT8 isn't hardware-native on new GPUs
+              |
+   FP8        |  >>> FP8-RL (2026, this paper) <<<
+              |  - Engineering: dynamic quant + KV cache + weight sync
+              |  - Algorithm: TIS retained + E2E FP8 explored
+              |  - 44% speedup, accuracy intact
+              |       /  \
+              |      /    \
+              |     v      v
+   FP16/      | vLLM Bitwise   Qi et al. FP16
+   Bitwise    | (2025-11)      (2025)
+   Consistent | "0 mismatch"   "Switch to FP16, eliminate at root"
+              |
+              |
+   Future: NVFP4? Multi-turn Agentic RL?
+#+end_example
+
+* Insights
+
+Reading through this line of work, what emerges is not "FP8 finally arrives in RL" but a pattern that repeats itself:
+
+*Every engineering optimization (decoupling, lower precision, parallel acceleration) breaks some implicit assumption the algorithm relied on.* Decoupling broke the assumption that "training and inference run the same policy." Low precision broke the assumption of "numerical exactness." Then the algorithms side steps in to patch it — relaxing the assumption from "fully on-policy" to "near on-policy plus correction" via importance sampling.
+
+But patching has a ceiling. The more patches, the higher the variance, the worse the stability. So starting in 2025 you see the field fork into two paths:
+
+- *The patching path (FP8-RL camp)*: Keep pushing toward lower precision on the engineering side, relying on ever-more-refined corrections like TIS/MIS/R3 to hold things together. Advantage: throughput keeps climbing. Disadvantage: corrections have their own side effects and are sensitive to hyperparameters.
+- *The elimination path (vLLM bitwise / FP16 camp)*: Acknowledge that patching is a dead end, and step back to eliminate mismatch at the root. Advantage: clean. Disadvantage: surrenders some engineering flexibility.
+
+Which path wins depends fundamentally on one judgment: *Is mismatch an intrinsic property of RL, or a human-made artifact of engineering implementation?* If the former, patching is destiny. If the latter, elimination is the endgame.
+
+Where does the next step most likely go? My bet is *both paths run in parallel, and MoE models will be the proving ground* — because MoE routing gives mismatch a new dimension (experts selected may differ too), where IS alone is insufficient, and the R3 "replay" mechanism signals that the field is already shifting from "correct" toward "align." Once the "align" idea matures, a hybrid will emerge on the FP8 path too: "FP8 but bitwise consistent."
+
+* Takeaways
+
+The deepest lesson from this line of work is not technical — it's about research taste:
+
+1. *Diagnosis before prescription.* "When Speed Kills Stability" proposed no new method whatsoever, but it put a finger on something everyone vaguely sensed and made it rigorous. The whole field could then move forward. Doing research doesn't always mean inventing something new; clearly articulating someone else's headache is a core contribution in its own right.
+
+2. *Don't only look at the problem you solved; look at what new assumption you introduced in solving it.* HybridFlow solved the "framework flexibility" problem but silently broke the "on-policy" assumption. FP8-RL solved the "rollout speed" problem but silently amplified mismatch. Every contribution should prompt the question: what new problem am I handing to the next person?
+
+3. *Engineering and algorithms are two faces of the same problem.* Along this entire line, the engineering camp (NVIDIA, vLLM team) and the algorithms camp (importance sampling, FP16 approach) interlock — neither can do without the other. People who can look clearly at both sides can see where the next opportunity lies.
+
+This means you can — in your own work — cultivate the habit of "looking for the diagnostic report first": before every decision, ask what is actually blocking progress here. Get that clear, and the solution tends to surface on its own.

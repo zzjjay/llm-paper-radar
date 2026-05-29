@@ -1,0 +1,294 @@
+#+title:      RAP: KV-Cache Compression via RoPE-Aligned Pruning
+#+date:       [2026-05-29 Fri 09:04]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T090450-en
+#+source:     https://arxiv.org/abs/2602.02599
+#+authors:    Jihao Xin, Tian Lyu, David Keyes, Hatem Ltaief, Marco Canini
+#+venue:      arXiv preprint, Feb 2026 (KAUST)
+
+* The Problem River
+
+Why does keeping a long conversation in memory burn through GPU memory so voraciously? Because every new token forces the model to permanently store the "key" and "value" (Key/Value) representations for every preceding token — nothing is ever discarded. This storage depot is called the KV-Cache. A 30B-parameter model running a 100K-token context needs 22.8 GB for this cache alone.
+
+The entire river traced here pursues a single question: how do you shrink that depot without damaging the model's reasoning?
+
+The difficulty is that every compression idea conceived over the past seven or eight years has been blocked by a clever trick from 2021 — Rotary Position Embedding (RoPE). RoPE tells the Transformer which word comes before which, and nearly every modern LLM uses it. But the moment you try to compress K/V representations, RoPE objects: "No — once you've flattened me, I can no longer rotate." Compression schemes are therefore forced either to abandon RoPE and retrain from scratch (the DeepSeek path), or to reconstruct the full-dimensional data at every inference step after compressing it (the Palu path) — wasted effort either way.
+
+What RAP sets out to resolve is precisely this three-year-old impasse: is it possible, *without retraining*, to *genuinely* reduce KV-Cache size, parameter count, and compute all at once — and to do so *without being bitten by RoPE*?
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need (MHA)
+  |
+  | Problem: RNNs are slow — sequences must be processed one step at a time
+  | Solution: Multi-head attention + KV cache
+  | Buried seed: KV cache grows linearly with context length
+  v
+[2021] Su et al. - RoFormer (RoPE)
+  |
+  | Problem: Absolute positional encodings cannot gracefully extrapolate to longer sequences
+  | Solution: Apply paired rotations to Q/K, encoding "position" as an angle
+  | Buried seed: Rotations must act on the original paired dimensions (j, j');
+  |              any "compression" step shatters this 2×2 structure
+  v
+[2023] Ainslie et al. - GQA / MQA
+  |
+  | Problem: Every head stores its own K/V — too expensive
+  | Solution: Multiple query heads share one set of K/V heads
+  | Buried seed: Fewer heads = expressiveness explicitly sacrificed; this is lossy
+  v
+[2024] DeepSeek-V2 - MLA (Multi-head Latent Attention)
+  |
+  | Problem: GQA's head-reduction is too blunt
+  | Solution: Compress K/V along the hidden dimension into a low-rank latent;
+  |           to work around RoPE, keep a small separate "decoupled RoPE" segment
+  | Buried seed: Requires training from scratch; existing models cannot adopt it
+  v
+[2024] Wang et al. - SVD-LLM
+  |
+  | Problem: Small singular values ≠ small loss contribution when SVD-compressing weights
+  | Solution: Data whitening + truncation-aware SVD
+  | Buried seed: General weight compression — not tailored to the KV-cache + RoPE combination
+  v
+[2025] Chang et al. - Palu
+  |
+  | Problem: MLA requires retraining; vanilla SVD ignores KV specifics
+  | Solution: Post-training W ≈ AB; cache only X·A (low-dim latent);
+  |           B can theoretically be "absorbed" into downstream weights, eliminating reconstruction
+  | Buried seed: RoPE's rotation is applied after the Q/K projection, so B cannot be absorbed;
+  |              every inference step must expand the latent back to full dimension — compression wasted
+  v
+[2026] Xin et al. - RAP (this paper)
+  |
+  | Problem: How to make "absorbing B" work in the presence of RoPE
+  | Solution: Instead of arbitrary linear decomposition, prune column pairs aligned with RoPE;
+  |           preserving 2×2 rotation blocks → B is naturally absorbable → zero reconstruction
+  v
+[2025-->] MHA2MLA, RAP+ follow-ons
+  |
+  | Problem: Migrate existing MHA models to the MLA paradigm
+  | Solution: Partial RoPE + low-rank approximation, reusing pretrained weights
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | MHA: Multi-Head Attention + KV Cache — where the "memory monster" was born
+
+*** What problem it saw
+
+RNNs process sequences one time step at a time; parallelism is impossible.
+
+*** Its solution
+
+Discard the RNN; rely entirely on attention: each token uses its Query to compute similarity against every other token's Key, then takes a weighted sum of all Values. The multi-head variant (MHA) lets the model look from multiple perspectives simultaneously.
+
+To avoid recomputing during inference, K and V are cached — this is the origin of the KV-Cache.
+
+*** Why it worked (and what new pit it dug)
+
+Parallelism plus caching made both training and inference fast. The pit: the cache *grows linearly with sequence length*. On a 30B model with a 100K context, that cache consumes 22.8 GB — more than the model weights themselves. This pit sat unnoticed for a decade; every compression paper that followed has been digging at it.
+
+** 2021 | RoPE: Rotary Position Embedding — encoding position as angle
+
+*** What problem it saw
+
+Classical positional encodings (absolute, added to embeddings) had two flaws: the model could not extrapolate beyond the longest sequence seen during training, and position was "added on" rather than emerging naturally from the attention computation.
+
+*** Its solution
+
+Don't add — *rotate*. Partition the dimensions of Q and K into pairs (j, j'); apply a 2×2 rotation matrix R(i, θ_j) to each pair, where the rotation angle is determined by position i. The affinity between two tokens depends only on the rotation angle corresponding to their positional *difference*.
+
+*** Why it worked (and what new pit it dug)
+
+Clean, good extrapolation properties, near-zero overhead. By 2023, virtually every mainstream LLM (LLaMA, Mistral, Qwen, DeepSeek, GPT-OSS, GLM-4.7) had adopted RoPE.
+
+The pit it left behind is lethal: RoPE's semantics *must* act on the original (j, j') paired dimensions. Any operation that scrambles those pairs — such as SVD projecting K onto a new basis — destroys RoPE's rotational meaning. The entire KV-compression lineage that follows is blocked by this single property.
+
+** 2023 | GQA/MQA: Too much KV? Let multiple Q heads share one K/V
+
+*** What problem it saw
+
+In MHA, every head independently maintains K/V; storage cost grows linearly with head count. Training observations revealed that many heads learn nearly identical representations — storing so many copies is wasteful.
+
+*** Its solution
+
+MQA: all Q heads share *one* set of K/V heads. GQA: groups of Q heads each share one set of K/V heads — a middle ground between MHA and MQA.
+
+*** Why it worked (and what new pit it dug)
+
+KV cache is slashed by several fold outright. In LLaMA-2-70B, GQA became nearly standard.
+
+But it is *lossy* — head count is explicitly reduced, and model expressiveness is sacrificed. GQA is an engineering compromise, not a structural breakthrough. It shifted the problem from "cache too large" to "can we compress more cleverly?"
+
+** 2024 | MLA: Instead of reducing head count, compress each head's K/V along the hidden dimension
+
+*** What problem it saw
+
+GQA compresses KV by *reducing the number of heads* — coarse-grained and harmful to the model. Could we instead compress the *dimensionality within each head* directly?
+
+*** Its solution
+
+DeepSeek-V2's MLA: a matrix W^DKV compresses the token embedding into a low-dimensional latent C^KV (the only thing actually stored in the cache); two other matrices W^UK and W^UV "decompress" C^KV into K and V on demand.
+
+On DeepSeek-V3 this achieves 32× compression — a 93% reduction in KV cache, and 5.76× throughput improvement.
+
+But *it runs straight into the RoPE wall*: once K has been compressed into the low-dimensional C^KV, its original dimensions no longer exist, and RoPE has nowhere to rotate. DeepSeek's fix is *decoupled RoPE* — a small dedicated segment of dimensions carries RoPE information, sidestepping the conflict.
+
+*** Why it worked (and what new pit it dug)
+
+MLA was the first systematic compression of KV along the hidden dimension, with stunning results. But it *requires training from scratch* — decoupled RoPE changes the attention structure, so pretrained weights are incompatible.
+
+For already-trained LLaMA, Mistral, and Qwen models, MLA is a dead end.
+
+** 2024 | SVD-LLM: General post-training SVD compression — laying the mathematical groundwork
+
+*** What problem it saw
+
+SVD is the most classic low-rank compression tool; in theory you should be able to apply it directly to LLM weights. In practice, *naive SVD performs very poorly*: small singular values do not imply small loss contribution — a failure mode of the Eckart-Young theorem in data-driven settings.
+
+*** Its solution
+
+Truncation-aware data whitening: use calibration data to whiten the input distribution, absorbing its effect so that truncating small singular values directly corresponds to small loss increases. Followed by fine-tuning of the compressed weights.
+
+*** Why it worked (and what new pit it dug)
+
+The first method to make *post-training* SVD compression genuinely viable for LLMs. It laid the mathematical foundation for all subsequent "post-training KV compression" work.
+
+But it is a general weight-compression technique, not designed *specifically for KV cache + RoPE*. Applying it directly to K/V projection matrices still hits the RoPE wall.
+
+** 2025 | Palu: Targeting SVD-LLM's idea squarely at the KV cache
+
+*** What problem it saw
+
+MLA is too costly (requires retraining); SVD-LLM is too generic (doesn't address KV specifically). Can we, *post-training*, decompose the K/V projection matrices as W ≈ A·B, cache only the low-dimensional X·A, and "absorb" the B half into downstream weights (inside W_q) — so that reconstruction is never needed at inference?
+
+*** Its solution
+
+Palu lays out the complete pipeline: W_k ≈ A_k · B_k, fold B_k^⊤ into W_q once and for all — theoretically permanent. The KV cache stores only X·A_k, immediately halving the attack surface.
+
+*** Why it worked (and what new pit it dug)
+
+Mathematically elegant. But it is pierced by *RoPE's non-commutativity*:
+
+  RoPE(X·A_k·B_k)  ≠  RoPE(X·A_k) · B_k
+
+because the A_k and B_k produced by SVD do not respect RoPE's 2×2 pairing structure — B_k scrambles the dimensions, and RoPE cannot rotate correctly in the new basis.
+
+So at inference Palu is *forced* to multiply the cached X·A_k back by B_k, reconstructing full dimensionality before applying RoPE. Compression happens, but the reconstruction overhead consumes all savings — FLOPs do not decrease, and attention latency during decoding actually rises to 196% (paper Table 3).
+
+** 2026 | RAP: If SVD breaks RoPE's pairs, don't do SVD — prune along the pairs
+
+*** What problem it saw
+
+RAP distills Palu's failure into a single sentence: B cannot be absorbed into W_q because SVD's B *shatters RoPE's (j, j') pairing*.
+
+Invert the question: what if B *happened not to shatter those pairs*?
+
+*** Its solution
+
+Abandon arbitrary linear decomposition. Instead, apply *structured pruning*: partition the D dimensions of K/V into D/2 groups of 2, aligned with RoPE pairs; each group is either kept entirely or dropped entirely.
+
+The resulting A_k is simply "a chosen subset of RoPE pairs"; the corresponding B is a 0/1 expansion matrix — a sparse matrix that places low-dimensional entries back into their original positions, padded with zeros. This B *commutes with RoPE by construction*:
+
+  RoPE(X·A_k) · B  =  RoPE(X·W_k)
+
+B can therefore genuinely be absorbed into W_q. At inference, the cache stores RoPE(X·A_k) directly — no reconstruction whatsoever.
+
+The remaining engineering: Fisher-information scoring (which RoPE pairs matter, which to keep); layer-adaptive budget allocation (K is less sensitive than V and can be pruned more aggressively); LoRA + knowledge distillation for fast accuracy recovery; a custom Triton kernel for non-contiguous cos/sin indexing.
+
+*** Why it worked (and what new pit it dug)
+
+The key insight: RoPE is not an "impassable wall" but a *constraint* — as long as your compression respects that constraint (preserving 2×2 pairs), all the benefits of low-rank decomposition materialize naturally.
+
+Results: on LLaMA-3-8B and Mistral-7B, 30% KV compression simultaneously delivers a genuine 30% reduction in attention parameters and FLOPs; prefill latency drops to 83%, decode latency drops to 77% — *Palu's decode latency was 196%*.
+
+Remaining pits: pruning granularity is still coarse (2 dimensions per group); joint compression with ultra-low-bit quantization for very long sequences is not fully worked out; non-standard RoPE variants (YaRN, Circle-RoPE) are compatible in principle, but RAP does not provide optimal pruning strategies tailored to them.
+
+* Frontier Extensions
+
+** 2025-> | MHA2MLA: Migrating existing MHA models to the MLA paradigm
+
+Alongside RAP, a parallel evolutionary direction has emerged: since MLA is so powerful but requires training from scratch, can existing LLaMA and Mistral models be *converted to MLA structure at low cost*?
+
+MHA2MLA (2025) does exactly that: partial RoPE (some dimensions use RoPE, others use the latent path) plus low-rank approximation that reuses pretrained weights, followed by small-scale fine-tuning. It reports achieving ~97% cache savings when combined with KV quantization.
+
+RAP's path is "stay within the MHA paradigm and squeeze via pruning." MHA2MLA's path is "accept that MLA is the ultimate form, and find a way to migrate there." The premises differ — RAP requires no architectural changes and no large-scale retraining; MHA2MLA accepts architectural changes in exchange for a higher compression ratio.
+
+As of February 2026, RAP is the most complete solution on the strictest path: *no architecture changes, no large-scale retraining, RoPE semantics fully preserved*.
+
+* One Diagram
+
+#+begin_example
+              KV-Cache Compression History: How RoPE went from useful tool to stumbling block — and was finally worked around
+
+  Compression  2017          2021         2023         2024              2025          2026
+  Dimension    -----------   ----------   ----------   ---------------   -----------   ----------
+
+  Store all    MHA           RoPE         GQA/MQA      MLA               Palu          RAP
+               Per-head KV   Rotary pos.  Shared K/V   Compress hidden   Post-train    RoPE-pair
+                             encoding     heads        dim; retrain +    AB SVD        pruning;
+                                                        decoupled RoPE   decomp.       prune in pairs
+
+  KV size      100%          100%         ~25%         ~7%               70% (nominal) 70%
+
+  Params       100%          100%         ~80%         ~95%              98%–130%      70%
+                                                                         (actually up)
+
+  FLOPs        100%          100%         ~25%         ~7%               82%–112%      70%
+                                                                         (actually up)
+
+  Decode lat.  100%          100%         faster       faster            196% !!       77%
+
+  Cost         Memory        Position     Expressiv.   Must retrain      Hit RoPE      +small distill.
+               explosion     correct      drops        (old models dead) wall; forced
+                                          (lossy)                        reconstruct
+
+  RoPE rel.    Unused        Creates      Sidesteps    Decoupled:        Wall          Work with it:
+                             problem      problem      redesign RoPE     (forced       prune along
+                             (unwittingly)(not yet     for training      reconstruct)  pairs
+                                          visible)
+
+  ===================================== Main Problem Thread =====================================
+  "KV cache too large" --> "how to compress" --> "RoPE won't cooperate after compression"
+                                                 --> "how to make peace with RoPE"
+                                                                       |
+                                                              RAP's answer:
+                                                              never break the 2×2 pairs
+#+end_example
+
+* Insight
+
+Reading the entire river, what is really happening is not "compression technology iterating" — it is *the process of an implicit constraint being gradually seen*.
+
+When the KV cache was born in 2017, nobody imagined that compressing it would be a problem. When RoPE was proposed in 2021, it was solving "positional extrapolation" and had no idea it would become an obstacle to compression. When GQA appeared in 2023, the field believed "reduce head count" was the answer. When MLA appeared in 2024, DeepSeek *explicitly acknowledged for the first time* that RoPE is a nuisance — their fix was to "redesign RoPE" (decoupled RoPE), at the cost of retraining from scratch.
+
+When Palu appeared in 2025, the problem had crystallized into a clear mathematical proposition: *under the RoPE constraint, can you find a decomposition that lets B be absorbed into W_q?* Their answer was "no (with arbitrary SVD)," forcing them into reconstruction.
+
+RAP's 2026 answer is: "You were asking the wrong question. Don't look for a *decomposition* — look for a *pruning*." Structured pruning transforms "low-rank approximation" from a linear-algebra problem into a combinatorial selection problem, and combinatorial selection can naturally respect RoPE's pairing constraint.
+
+The essence of this leap: *reframing a constraint from 'an obstacle to overcome' to 'a structure to work with'*. RAP does not defeat RoPE; it accepts RoPE — every operation stays within RoPE's semantic boundaries.
+
+Where is the field most likely to go next? Three directions:
+1. *Combining with quantization*: once RAP has reduced the dimensionality, applying low-bit quantization to each latent could yield another 4–8× saving. RAP has already validated orthogonality between the two.
+2. *Combining with sparse attention*: RAP handles compression in the *dimension* direction; sparse attention (SnapKV, H2O) handles compression in the *token* direction. Nobody has systematically combined both.
+3. *Extending to non-RoPE modules*: linear attention and SSM-Transformer hybrids (such as Mamba-Transformer) are gaining traction; they carry different positional-encoding constraints. The same pattern — "identify the implicit constraint, design compression that respects it" — should transfer.
+
+* What This Suggests
+
+The single lesson this river offers researchers is: *when a problem has been attempted repeatedly and keeps failing, step back and examine the constraint.*
+
+Palu was extraordinarily clever work — elegant mathematics, top-tier institution — and it failed badly in engineering, with latency rising 96%. The root cause was not a flawed decomposition; it was *failing to recognize that RoPE was the true protagonist*.
+
+RAP's contribution is not algorithmic complexity — "prune in pairs" looks almost trivially obvious in hindsight. Its contribution is that *it was the first work to explicitly formalize RoPE-commutativity as a mathematical condition* (Definition 1.1 in the paper). Once you can write down the equation:
+
+  RoPE(X·A)·B = RoPE(X·A·B)
+
+every decomposition satisfying it constitutes the feasible solution space. SVD lies outside that space. Structured pair-wise pruning lies inside it.
+
+This suggests:
+- When you are stuck in engineering for a long time, stop and *formalize* whatever is blocking you. It is usually not a bug — it is an implicit constraint.
+- Once you have written down the constraint mathematically, ask "what class of solutions *naturally* satisfies this constraint?" rather than "how do I patch my existing solution to approximate it?"
+- When a field accumulates many patch-style contributions (Palu+KD, decoupled RoPE, various reconstruction tricks), that is usually a signal that the underlying constraint has not been articulated clearly — which is precisely where a paper-level contribution becomes possible.
+
+More broadly: in AI systems work, *expressing a constraint* is often scarcer than *optimizing an objective*. Everyone chases metrics, but few people can write down "what class of solutions is simply not in the feasible set." This river shows you that those are the people who ultimately win.

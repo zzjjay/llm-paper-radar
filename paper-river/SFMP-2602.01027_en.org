@@ -1,0 +1,293 @@
+#+title:      SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision Quantization for Large Language Models
+#+date:       [2026-05-29 Fri 00:00]
+#+filetags:   :paper:river:quantization:en:
+#+identifier: 20260529T000000-en
+#+source:     https://arxiv.org/abs/2602.01027
+#+authors:    Xin Nie, Haicheng Zhang, Liang Dong, Beining Feng, Jinhong Weng, Guiling Sun
+#+venue:      arXiv 2026.02
+
+* Target Paper
+
+*SFMP: Fine-Grained, Hardware-Friendly and Search-Free Mixed-Precision
+Quantization for Large Language Models* (Nie et al., 2026)
+
+In one sentence: turn "how many bits per layer" from a discrete search into a
+continuously tunable knob, then use intra-block reordering + a unified GEMM
+kernel to capture both flexibility and hardware efficiency at once.
+
+* Lineage Map
+
+#+begin_src text
+
+  [1992]              [2022]              [2022]
+  OBS / OBQ  ----->  LLM.int8()  ----->  GPTQ
+  (what to keep)     (outliers can't     (4-bit for large models)
+       \              be dropped)              |
+        \                  \                  v
+         \                  \             [2023]
+          \                  \------>    AWQ
+           \                              (salient weights need high bits)
+            \                              |
+             \                             v
+              \                         [2024]
+               \                       SliM-LLM
+                \                       (mixed precision within groups)
+                 \                       |
+                  \                      v
+                   \                  [2025]
+                    \---------->     AMQ
+                                      (automated search via AutoML)
+                                       |
+                                       v
+                                    [2026.02]
+                                  >> SFMP <<     <-- target paper
+                                  (fractional bits + intra-block reordering
+                                   + unified kernel)
+                                       |
+                                       v
+                                    [2026.02+]
+                                    ScaleBITS
+                                    (scalable bit-width search)
+#+end_src
+
+* First Anchor: Discovering "Weight Inequality"
+
+The story traces back to LeCun's 1992 *Optimal Brain Surgeon* (OBS): when
+pruning, which weights can be discarded and which must be kept can be computed
+using the Hessian matrix. This is the origin of the idea that "weights differ
+in significance." The seed it planted is: *not all numbers in a neural network
+are equally important*.
+
+Thirty years later, in 2022, that seed bloomed in large language models.
+Dettmers' *LLM.int8()* found, during 8-bit quantization, that large-model
+activations contain a small number of massive outliers — and these outliers are
+precisely what sustains the model's capability. Quantize them along with
+everything else and accuracy collapses. His solution was straightforward: pull
+the outliers out and keep them in FP16, let the rest run in int8.
+
+This told everyone: *to compress a large model to low bit-widths, you must
+confront the reality of "a critical minority of values."* But LLM.int8() only
+targets 8 bits, and its handling of outliers is a workaround rather than a
+systematic treatment.
+
+* Second Step: GPTQ Pushes PTQ to 4 Bits
+
+Right after, Frantar 2022 proposed *GPTQ*. The challenge: to achieve near
+lossless compression at 4 bits or below, each weight matrix must be optimized
+individually — a second-order problem that naive methods cannot handle for
+175B-parameter models.
+
+GPTQ revived the mathematics of OBS: using a Hessian approximation, it
+*quantizes weights column by column, and after each column is quantized it
+compensates the error into the remaining unquantized columns*. This
+"quantize-then-compensate" loop compresses a 175B OPT model to 3–4 bits in a
+few hours with only a tiny accuracy drop.
+
+GPTQ was the first "practical" paper on this line. But it carries an inherent
+flaw: *all weights are treated equally and given the same bit-width*. That
+amounts to assuming every weight matters equally — a direct contradiction of
+what OBS and LLM.int8() established.
+
+* Third Step: AWQ Gives High Bits to Salient Weights
+
+Lin 2023's *AWQ* targeted exactly that contradiction: if roughly 1% of weights
+are "especially important" (identifiable via activation magnitudes), why
+allocate bits uniformly?
+
+But AWQ does not actually "mix precisions" — keeping high-precision outliers
+is cumbersome and hardware-unfriendly. Instead it uses a clever compromise:
+*scale the important weights up before uniform quantization*. The scaling is
+equivalent to giving them effectively higher precision without breaking the
+clean integer format.
+
+AWQ works well at 4 bits, but it exposes the next problem: when the total
+budget is pushed to extremes like 2 bits or 2.5 bits, the scaling trick can no
+longer save accuracy. The paper's own numbers show LLaMA3.1-8B perplexity
+exploding to ~1.86e6 at BPW=2.25. *The ceiling of uniform bit-width has been
+reached.*
+
+* Fourth Step: SliM-LLM Introduces Genuine Mixed Precision
+
+Huang 2024's *SliM-LLM* drops the pretense: if weight importance is uneven,
+then *actually assign different bit-widths to different parts*. Its key
+observation: salient weights are not randomly scattered — they *cluster along
+the channel dimension*.
+
+So SliM-LLM computes salience per group (a small segment within a row),
+assigns 4 bits to groups that are collectively important and 2 bits to the
+rest, averaging to around 3 bits overall. It calls this "Salience-Determined
+Bit Allocation."
+
+This step genuinely opens the door to mixed precision. But it exposes two new
+problems:
+- *Throughput collapse*: unequal bit-widths within groups force the GPU to
+  handle each width separately during GEMM; SFMP reports that SliM-LLM's
+  throughput is 30–50% lower than GPTQ's at the same average bit-width.
+- *Per-matrix average bit-width is fixed*: you cannot let an overall-important
+  layer receive a higher average; the entire model must conform to one global
+  average.
+
+SliM-LLM made mixed precision usable, but *it turned "how to allocate
+precision" into a combinatorial optimization problem*.
+
+* Fifth Step: AMQ Uses AutoML to Tame the Combinatorial Explosion
+
+Lee 2025's *AMQ* externalizes the problem: since choosing how many bits each
+layer gets (2, 3, or 4) is a search problem, just search — but the search space
+is on the order of 3^560 for LLaMA3.1-70B, so brute force is out.
+
+AMQ's four tricks:
+1. *Prune the space*: use a small calibration set to measure sensitivity; lock
+   clearly sensitive layers at 4 bits immediately.
+2. *Use a proxy*: during search, use HQQ (an activation-free quantization
+   method) as a cheap stand-in, then convert to GPTQ/AWQ at the end.
+3. *Quality predictor*: avoid running full evaluation on every candidate.
+4. *NSGA-II genetic algorithm*: multi-objective search.
+
+The results are solid — LLaMA-2-7B finishes in 5 hours, and 70B models are
+feasible. But SFMP's counterexample is: *AMQ still requires 44 hours to search
+LLaMA3.1-70B*. Moreover, this is layer-granularity mixed precision, coarser
+than SliM-LLM's group granularity, leaving less room for accuracy gain.
+
+The deeper problem: *bit-widths can only be integers*. If you want an average
+of 3.7 bits, you must make some layers 4-bit and the rest 3-bit — but you
+cannot say "this layer is 3.7-bit." This hard-locks the search space in the
+discrete domain and keeps it NP-hard forever.
+
+* Sixth Step: SFMP Steps Outside the Discrete Domain
+
+By this point the accumulated pain along the entire line is clear:
+
+- *Salient weights must be treated differently* (shared consensus across
+  LLM.int8 / AWQ / SliM-LLM)
+- *Group granularity is more accurate than layer granularity but is
+  hardware-unfriendly* (lesson from SliM-LLM)
+- *Search is NP-hard; no matter how clever, it is slow* (lesson from AMQ)
+- *Uniform bit-width collapses at 2 bits* (lesson from AWQ)
+
+Nie 2026's *SFMP* answers by reframing the problem:
+
+** Replace Integer Bit-Widths with "Fractional Bits"
+
+This is the core move. A block is no longer "all 3-bit" or "all 4-bit" but
+"3.7-bit" — *implemented by having some weights in the block at 3 bits and
+others at 4 bits, with the ratio continuously adjustable*.
+
+Effect: *discrete search becomes continuous optimization*. The per-layer
+average bit-width can now be set by gradient descent or simple allocation —
+no NSGA-II needed. AMQ's 44-hour search simply disappears.
+
+** Intra-Block Reordering to Cluster Salient Weights
+
+SliM-LLM assumes salient weights cluster along rows/columns, but SFMP shows
+that within a row or column they are actually *scattered*. Cutting naively into
+blocks mixes salient and non-salient weights together, making fractional-bit
+allocation within the block imprecise.
+
+SFMP performs a row-column reordering that consolidates weights by importance
+within each block. This is done only on the weight side; activations need only
+one lightweight reordering, so throughput loss is minimal.
+
+** Unified GEMM Kernel
+
+The final barrier: mixed-precision implementations have historically been slow
+because different block bit-widths require the GPU kernel to branch across
+paths. SFMP implements a "unified GEMM kernel for arbitrary average bit-width"
+that fetches 3-bit and 4-bit weights within the same block in a single memory
+access and computes them jointly.
+
+** Closing the Loop
+
+SFMP's essence is not inventing new "quantization ideas" — salience, mixed
+precision, and automatic allocation all appeared earlier. What it does is
+*change the problem domain*: from "searching in a discrete bit-width space" to
+"adjusting in a continuous ratio space." Once the domain changes, "search" as
+an operation becomes unnecessary (hence "search-free" in the paper's title),
+and hardware-friendly integer arithmetic is preserved.
+
+* Problem–Solution Summary
+
+#+begin_src text
+
+  +--------------------+--------------------------+--------------------+
+  | Stage              | Problem identified       | Solution           |
+  +--------------------+--------------------------+--------------------+
+  | OBS (1992)         | Not all weights equal    | Hessian salience   |
+  | LLM.int8 (2022)    | Outliers destroy 8-bit   | Keep outliers FP16 |
+  | GPTQ (2022)        | Large-model 4-bit PTQ    | Column-wise error  |
+  |                    | too expensive            | compensation       |
+  | AWQ (2023)         | Uniform bits waste quota | Scale up salient   |
+  |                    |                          | weights            |
+  | SliM-LLM (2024)    | Uniform bits collapse    | Group-granularity  |
+  |                    | at very low bits         | true mixed prec.   |
+  | AMQ (2025)         | Layer-level search space | AutoML multi-obj.  |
+  |                    | explosion                | search             |
+  | >> SFMP (2026) <<  | Discrete search is       | Fractional bits +  |
+  |                    | inherently slow & coarse | intra-block reord. |
+  |                    |                          | + unified GEMM     |
+  +--------------------+--------------------------+--------------------+
+
+  Thread: from "find outliers" → "treat salient weights differently"
+          → "automatically allocate bit-widths"
+          → "make the allocation itself continuous rather than discrete"
+#+end_src
+
+* Postscript: ScaleBITS
+
+Shortly after SFMP was posted, *ScaleBITS* (arXiv 2602.17698) appeared,
+focusing on "scalable bit-width search." It stays within the search paradigm,
+effectively continuing AMQ's line and acknowledging that search still has room
+to improve. This suggests that SFMP's "continuization," however elegant, has
+not been universally adopted — fractional bits require new kernel support,
+while the search route is plug-and-play. The two paths are evolving in
+parallel.
+
+* Insights
+
+** What Is Really Changing Along This Line
+
+On the surface it is "bit-widths being carved ever more finely" — layer, group,
+block, and finally fractional bits. But the deeper shift is in *the mathematical
+character of the quantization problem*:
+
+- Early era (OBS–GPTQ): quantization as a *reconstruction problem* — given a
+  bit-width, minimize output error.
+- Middle era (AWQ–SliM-LLM): quantization as an *allocation problem* — given a
+  budget, assign bits to the weights that need them most.
+- Present era (AMQ–SFMP): quantization as an *optimization problem* — the
+  allocation itself must be automated.
+
+And SFMP takes the furthest step: *turning combinatorial optimization into
+continuous optimization*. This is a leap from "engineering heuristics" to an
+"analytically tractable problem."
+
+This echoes an old pattern in deep learning history: whenever a problem is
+stuck in the discrete domain, the eventual breakthrough almost always comes from
+someone finding the right relaxation to move it into the continuous domain (the
+neural network itself is, after all, a continuous relaxation of a discrete
+decision machine).
+
+** Where the Next Steps Might Go
+
+- *End-to-end differentiable bit-widths*: SFMP's fractional bits are still
+  post-training (PTQ). Injecting fractional bits into the training loop so that
+  bit-widths and weights are adjusted together by gradients could be the next
+  step for QAT.
+- *Fractional bits for activations too*: everything so far targets weights only.
+  Mixed precision for activations is harder (dynamic range changes in real time)
+  but the potential gain is larger.
+- *Better characterizations of salience*: from Hessians to activation
+  magnitudes to continuous importance under fractional bits, the next step may
+  be task-conditional salience — a weight that matters for reasoning tasks but
+  not for generation tasks.
+
+* Honest Annotations
+
+- *Confirmed citation relationships*: SFMP → AMQ / SliM-LLM / AWQ / GPTQ /
+  BitStack / SqueezeLLM — all are explicitly cited and critiqued in the paper.
+- *Inferred lineage*: OBS → GPTQ is a methodological origin acknowledged by
+  GPTQ's own authors; the "salient weights" thread LLM.int8 → AWQ → SliM-LLM
+  is a community-recognized evolution.
+- *Relationship between ScaleBITS and SFMP*: both appeared in the same month;
+  no confirmed cross-citation; in the lineage they represent "different routes
+  to the same problem," not a strict critique relationship.

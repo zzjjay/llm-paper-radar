@@ -1,0 +1,258 @@
+#+title:      MELINOE: Fine-Tuning Enables Memory-Efficient Inference for Mixture-of-Experts Models
+#+date:       [2026-05-29 Fri 09:13]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T091320-en
+#+source:     https://arxiv.org/abs/2602.11192
+#+authors:    Arian Raje, Anupam Nayak, Gauri Joshi (CMU)
+#+venue:      arXiv 2026
+
+* The River of the Problem
+
+A 47B-parameter MoE model activates only a small fraction of its experts per token — by rights it should be light enough to fit on a consumer GPU. But reality disagrees: you must keep all 47B resident in GPU memory, because the next token might knock on any expert's door.
+
+The contradiction is deeply awkward. You buy sparse activation to save compute, but sparse activation does not save memory. An entire generation of research has been circling this problem — can you keep only *a handful* of experts on GPU and stash the rest in CPU memory, pulling them over on demand?
+
+That sounds reasonable. But the devil lives in the word *pulling*. A PCIe transfer takes a few milliseconds; 64 tokens trigger tens of thousands of such transfers — and generation throughput ends up an order of magnitude slower than intuition would suggest. Every paper in this river is, at its core, fighting that PCIe bus: how do we transfer less? Transfer more cleverly? Or skip the transfer altogether?
+
+MELINOE takes a fork that nobody had walked before — instead of optimizing the transfer, it transforms the thing that needed transferring in the first place.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Outrageously Large Neural Networks
+  |
+  | Proposes: pack N experts in one layer, router activates K of them
+  |           -- compute stays fixed, capacity grows
+  v
+[2021] Lepikhin et al. - GShard / [2024] Jiang - Mixtral / OLMoE / DeepSeekMoE
+  |
+  | Brings MoE to industrial scale; models grow to tens of B parameters
+  | Tension surfaces: activation is sparse, yet all parameters must
+  |                   reside in GPU memory
+  v
+                  ==============================
+                  || Modern MoE Offloading Domain ||
+                  ==============================
+                               |
+        +----------------------+----------------------+
+        |                      |                      |
+        v                      v                      v
+[2023] Mixtral-           [2025] MoE-Infinity /  [2025] Fiddler
+       Offloading                FLoE                (Kamahori)
+       (Eliseev)                                      |
+       |                   |                     | Execute some experts
+       | Keep most experts | Use a predictor to  | on CPU directly --
+       | on CPU; aggressive| prefetch the next   | move activations,
+       | quantization lets | experts to be       | not weights
+       | small cache hold  | activated, hiding   |
+       | more experts      | I/O latency         |
+       | Issue: I/O still  | Issue: routing too  | Issue: CPU too slow;
+       | slow; quant hurts | scattered, hit rate | collapses under
+       | accuracy          | is low              | large batches
+        \                      |                      /
+         \                     |                     /
+          +--------------------+--------------------+
+                               |
+                               | Everyone treats "routing" as an
+                               | immutable constant and works around it
+                               v
+[2026] MELINOE (Raje, Nayak, Joshi)
+  |
+  | Flips the lens: routing is malleable! Fine-tune the model to
+  | "show preference" -- repeatedly using a few experts per sequence
+  | so cache hit rate rises naturally
+  v
+[2025+] Concurrent work: BuddyMoE / FasterMoE / Harmoeny / OracleMoE ...
+        each finding its own angle on the offloading problem
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al. "Outrageously Large Neural Networks": MoE's Original Sin
+
+*** What problem did it see?
+
+Neural networks get more capable as they grow, but also proportionally more expensive. Shazeer wanted a way to keep scaling up *without* scaling compute.
+
+*** Its solution
+
+Split one FFN layer into N independent "experts" and place a small router in front. Each token activates only K experts (typically K=2, N=64). Compute tracks K; total parameter count can grow to N times larger.
+
+*** Why it worked — and what trap it set
+
+The compute-saving logic is sound. But there is a side effect that only became painful years later: the weights of all N experts must *all* be ready, because you do not know which one the router will select until it selects it. The compute ledger was won; the *memory ledger* was lost. That buried mine sat there for seven years.
+
+** 2024 | Mixtral / OLMoE / DeepSeekMoE: The Mine Goes Off
+
+*** What problem did it see?
+
+MoE had been theoretically valid for years, but it was not until Mixtral and this wave of open-source MoE models hit deployment that practitioners felt the pain directly: Mixtral-8x7B has 47B parameters total, activates only 13B — *you assume* the GPU needs to hold 13B, *in practice* it must hold 47B. A single H100 80GB barely manages; a 4090 24GB cannot at all.
+
+*** Its solution
+
+There was no solution — these papers simply put the problem in front of everyone. In a single sentence: 96% of an MoE model's parameters are expert weights, and only a small fraction is ever activated — the *mismatch between activation and storage* is too large to ignore.
+
+*** Why it worked — and what trap it set
+
+Industrial-scale MoE was validated as a worthwhile direction. But the deployment threshold landed in an awkward spot: without offloading you simply cannot run these models on ordinary GPUs. Someone had to open that door.
+
+** 2023 | Mixtral-Offloading (Eliseev): The First to Push the Door
+
+*** What problem did it see?
+
+47B doesn't fit in 24GB, but 96% of the parameters are experts and each token uses only two of them. This means most experts are idle most of the time — *why should idle parameters occupy GPU memory*?
+
+*** Its solution
+
+Keep only a small "expert cache" on GPU (enough for a few experts), and store everything else in CPU RAM. If the router selects an expert not in cache, fetch it from CPU over PCIe. Simultaneously, use aggressive mixed-precision quantization so the tiny GPU cache can hold more experts.
+
+*** Why it worked — and what trap it set
+
+Running Mixtral on a consumer GPU for the first time was a landmark achievement. But the trap is obvious:
+
+A single PCIe transfer costs a few milliseconds; generating 64 tokens triggers tens of thousands of transfers (Figure 1a's baseline column in the paper shows OLMoE in the thousands-of-transfers range) — total latency becomes dominated by I/O. Quantization also begins to erode accuracy.
+
+#+begin_example
+Time_decode ≈ Time_compute + N_miss × Time_transfer
+                              ^^^^^^^^^^^^^^^^^^^^^
+                              this term dominates everything
+#+end_example
+
+The next generation must find a way to reduce N_miss or hide Time_transfer.
+
+** 2025 | MoE-Infinity / FLoE: Predict Where It's Going Next
+
+*** What problem did it see?
+
+Mixtral-Offloading fetches an expert only after the router asks for it. But by the time the router asks, it is already too late — those PCIe milliseconds have already stalled generation. Could we *know in advance* which experts the router will select, and secretly pull them over while the GPU is computing something else?
+
+*** Its solution
+
+Train a predictor that takes the input and infers which experts will be activated next. Prefetch them into the GPU cache so that by the time the router actually arrives, they are already there. I/O time is *hidden* behind compute time.
+
+*** Why it worked — and what trap it set
+
+Perfect in theory. But it rests on an unguaranteed precondition — *prediction accuracy*.
+
+Accuracy depends on "routing locality": whether consecutive tokens tend to visit the same set of experts. In vanilla MoE models this locality is *weak* — the load-balancing loss during pre-training is specifically designed to *scatter* expert usage so that every expert gets trained. The result: activation is spread thinly across the sequence, and the top-8 experts cover only 31% of activations (Figure 1b in the paper). No predictor, however clever, can recover from that level of scatter.
+
+** 2025 | Fiddler (Kamahori): Skip the Transfer Entirely, Compute in Place
+
+*** What problem did it see?
+
+If moving experts is so expensive, why not *not move them*? Just compute the experts that live on CPU directly on the CPU, then send back the result — the result is a few floating-point activations, far cheaper to transfer than hundreds of millions of weight parameters.
+
+*** Its solution
+
+When the router selects a CPU-resident expert, let the CPU compute that portion and send the activation vector back to the GPU for aggregation. This sidesteps the PCIe weight-transfer bottleneck entirely.
+
+*** Why it worked — and what trap it set
+
+It works well for single sequences and small batches. But CPU compute is orders of magnitude slower than GPU compute — as soon as more tokens need to pass through each expert (larger batches, longer sequences), the CPU becomes the new bottleneck. For large models with coarse-grained experts (like Mixtral's, where each expert is very large), CPU computation time overtakes weight-transfer time.
+
+At this point the entire lineage is stuck: everyone is *optimizing the transfer* — prefetching, quantizing, rerouting — but *nobody has touched the routing itself*. Routing is assumed to be a factory setting, untouchable.
+
+** 2026 | MELINOE: Don't Optimize the Transfer — Transform the Thing Being Transferred
+
+*** What problem did it see?
+
+MELINOE stands on the shoulders of the four prior works and asks a question everyone had skipped:
+
+"Why do we treat routing as an immutable fact? Routing was *learned* by the model — and if it was learned, it can be *learned again*."
+
+The sharper insight: vanilla MoE already exhibits a faint expert preference within a sequence (top-8 covering 31%, versus the uniform-distribution baseline of 12.5%). But that preference is too weak to support a cache.
+
+So amplify it through fine-tuning.
+
+*** Its solution
+
+Two fine-tuning objectives are designed, updating only the router and a small set of LoRA parameters:
+
+1. *Cache Simulation Loss* — Simulate the state of a GPU cache (using exponential decay over history to approximate recently loaded experts). Every time the router selects an expert *not in cache*, the model is penalized. The model naturally learns to favor experts already resident in cache.
+
+2. *Rank Matching Loss* — Prevents the model from collapsing to a handful of experts (which would destroy expressiveness). Rather than matching absolute probabilities, it requires only that the fine-tuned model preserve the *relative ranking* of the original model's expert preferences. This grants freedom to reshape routing while preserving a safety floor.
+
+After fine-tuning, a lightweight MLP predictor is trained: given a prompt, predict which experts will be used across the entire sequence. At deployment, this prediction is used to pre-populate the cache.
+
+*** Why it worked — and what trap it remains
+
+The essence of this approach is *baking compressibility into the model weights*. The original model's routing was too scattered for prefetching or caching to help — MELINOE's fine-tuning makes the model *naturally biased* within a sequence, and cache hit rate rises accordingly. Figure 1a shows that after fine-tuning, the number of transfers drops by 3.03×.
+
+And critically: accuracy does not drop. ROUGE-L on Dolly15K rises from 0.1851 to 0.2486; GSM8K accuracy rises from 79.21% to 80.20%. In other words, *forcing the model to focus actually makes it better at the task* — suggesting that a substantial portion of the entropy in the original MoE routing was redundant noise.
+
+Remaining traps: fine-tuning still requires access to the original model weights, making MELINOE more suitable for model providers than for downstream-only users. And as batch size grows, different sequences favor different experts, diluting the cache advantage — maintaining locality under multi-request serving is the next open problem.
+
+* Frontier Extensions
+
+Concurrent MoE offloading papers (late 2025–2026) are proliferating rapidly, confirming that "routing as a malleable object" is beginning to diffuse as an idea:
+
+- *BuddyMoE* (Wang 2025) — Exploits redundancy between experts, using similar experts as substitutes for one another to reduce transfers.
+- *FasterMoE* / *OracleMoE* (2025) — Optimize at the scheduling and dispatch level.
+- *Harmoeny* (Doucet 2025) — Efficient MoE inference across multiple GPUs.
+- *Taming Latency-Memory Tradeoff* (Yu 2025) — Systematically characterizes the latency-memory trade-off in offloading.
+
+As of now, MELINOE is the first to successfully run down the *fine-tune-the-routing* fork — everyone before it circled at the level of offloading and scheduling; MELINOE is the first to reach into the model itself.
+
+* One Diagram
+
+#+begin_example
+         Optimize "the transfer"                  |     Transform "what is transferred"
+================================================================================
+                                                  |
+[2017] Shazeer                                    |
+  MoE born: compute saved, memory explodes        |
+                                                  |
+[2024] Mixtral / OLMoE                            |
+  Problem detonates: 47B won't fit on             |
+  a consumer GPU                                  |
+                                                  |
+[2023] Mixtral-Offloading                         |
+  Strategy: offload to CPU + aggressive quant     |
+  Pain point: I/O is the bottleneck              |
+                                                  |
+[2025] MoE-Infinity / FLoE                        |
+  Strategy: predict and prefetch                  |
+  Pain point: routing too scattered,              |
+              predictions inaccurate              |
+                                                  |
+[2025] Fiddler                                    |
+  Strategy: compute directly on CPU               |
+  Pain point: CPU too slow                        |
+                                                  |
+                                                  |   [2026] MELINOE
+                                                  |     Strategy: fine-tune to
+                                                  |       make routing "show preference"
+     Routing = constant, work around it  ----->  |     + cache-sim loss
+                                                  |     + rank-matching loss
+                                                  |     + predictor pre-fills cache
+                                                  |     Result: 3× fewer transfers
+                                                  |             1.2–14.7× speedup
+                                                  |             downstream accuracy *improves*
+#+end_example
+
+* Insight
+
+Reading the full river, the real underlying shift is not "iteration on offloading techniques" but a *change in how "routing" is conceived as an object*:
+
+- In the first four papers, routing is a *physical constant* — shipped with the model, as immutable as a hardware spec. All engineering effort *works around it*.
+- In MELINOE, routing is a *software interface* — a behavior of the model that can be retrained into whatever shape you need.
+
+This shift is very engineering-flavored but deeply consequential: when you reclassify something from "cannot be changed" to "can be changed," the entire optimization map is redrawn. The optimization ceiling of the first four papers was *capped* by the scatteredness of routing; MELINOE raises that ceiling directly.
+
+Even more thought-provoking is MELINOE's side effect: accuracy *improves* after fine-tuning. This suggests that the original MoE routing was *already doing wasted work* — some of its routing entropy was noise injected by the pre-training load-balancing loss. Strip that noise away, and the model is actually more focused. This points to a larger conversation: there has always been a mismatch between MoE's *training objectives* and its *inference needs*. MELINOE patches this at inference time; in the future someone may address it at training time from the start.
+
+The most likely next steps:
+
+1. *Build routing locality into pre-training* — add the cache simulation loss during pre-training rather than as a post-hoc fine-tune.
+2. *Routing alignment under multi-request serving* — different sequences prefer different experts; can they be made to cluster naturally within a single batch?
+3. *Plasticity of the expert structure itself* — MELINOE changes *who is selected*; the next generation may change *what an expert is*: dynamic merging, dynamic splitting.
+
+* Takeaway
+
+The meta-lesson of this river is: *when everyone is busy optimizing an object, ask whether the object itself can be changed*.
+
+Four generations of papers treated routing as given, and competed to optimize the periphery (transfers, prefetching, CPU compute). MELINOE stepped back and asked "could routing also be a variable?" — and that single step back doubled the optimization space.
+
+The direct implication for one's own research: when a field seems to have been ground down to marginal improvements, look for its untouched *default assumptions*. That is usually where the next order-of-magnitude gain begins.
+
+The direct deployment value: if you are working on edge deployment of MoE models (consumer GPUs, edge devices), MELINOE's paradigm — fine-tune + predictor + quantized cache — is now the new baseline you can adopt today. And this fine-tuning approach is *orthogonal* to other offloading techniques; it can be stacked on top of Fiddler or MoE-Infinity to extract yet another round of gains.

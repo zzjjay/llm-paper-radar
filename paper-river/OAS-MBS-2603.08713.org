@@ -1,0 +1,198 @@
+#+title:      Unveiling the Potential of Quantization with MXFP4: Strategies for Quantization Error Reduction
+#+date:       [2026-05-29 Fri 09:19]
+#+filetags:   :paper:river:quantization:mxfp4:
+#+identifier: 20260529T091920
+#+source:     https://arxiv.org/abs/2603.08713
+#+authors:    Jatin Chhugani, Geonhwa Jeong, Bor-Yiing Su, Yunjie Pan, Hanmei Yang, Aayush Ankit, Jiecao Yu, Summer Deng, Yunqing Chen, Nadathur Satish, Changkyu Kim
+#+venue:      arXiv preprint, 2026 (cs.AR)
+
+* 目标论文
+
+"Unveiling the Potential of Quantization with MXFP4: Strategies for Quantization Error Reduction" (Chhugani et al., 2026, arXiv:2603.08713)。
+
+一句话：MXFP4 这个 4 比特格式硬件上很省，但精度比 NVIDIA 的 NVFP4 差 10% 左右。这篇用两招纯软件改造（OAS + MBS），把差距压到 1% 以内，同时保留 MXFP4 的硬件优势。
+
+* 一句话主线
+
+LLM 推理要省钱，就得把权重塞进更少的比特里——但比特一少，离群值就会把整个张量的精度毁掉。十年里大家一直在赛跑：怎么让一个共享的"刻度尺"既能照顾大多数普通值，又不被少数极端值搞坏。这条线从"一个张量一把尺子"开始，一步步缩小尺子覆盖的范围，缩到极致就是 MX 标准的 32 元素一把尺子；然后又被迫在尺子精度和硬件代价之间二选一——NVFP4 选了精度，MXFP4 选了硬件，而这篇论文做的事是：让 MXFP4 不用换硬件也能追上 NVFP4 的精度。
+
+* 溯源地图
+
+#+begin_example
+
+  [FP32/BF16 baseline]                          ~2017
+        |
+        | "一个张量一把尺子太粗了, 离群值毁掉精度"
+        v
+  [LLM.int8() Dettmers'22]                      离群值检测 + 混合精度
+        |
+        | "为啥不把离群值搬走?"
+        v
+  [SmoothQuant Xiao'23]                         把激活的尖刺挪到权重
+        |
+        | "搬完还有误差, 一层一层补回来"
+        v
+  [GPTQ Frantar'23]                             误差补偿式权重量化
+        |
+        | "尺子还可以做得更细 -- 每 N 个元素一把"
+        v
+  [Shared Microexponents Rouhani'23]            块级浮点的现代形态
+        |
+        | "把这个标准化, 给整个工业界用"
+        v
+  [OCP MX 标准 / MXFP4]   <----+                32 元素 / 块, E8M0 (2 的幂) 缩放
+        |                      |
+        | "MX 精度不够"        | "MX 硬件友好但精度差"
+        v                      |
+  [NVFP4 NVIDIA'24-'25]        |                16 元素 / 块, E4M3 (FP8) 缩放
+        |                      |
+        +-----> 精度 vs 硬件   |
+                的两难          |
+                               |
+        +----------------------+
+        |
+        v
+  [本文 OAS + MBS'26]  <---- 不动硬件, 不动块大小, 只改"尺子怎么选 + 再加一层粗尺子"
+        |
+        | (并行工作)
+        v
+  [MXPlus Lee'25, MicroScopiQ ...]              其它压差距方案
+
+#+end_example
+
+注：引用关系基本可确认（论文 bibkey 列出了 NVFP4、OCP MX、Rouhani shared microexponents、GPTQ、SmoothQuant、LLM.int8、Atom、SpQR、MXPlus、MicroScopiQ）。Nervana 块浮点和 STC 2019 是更早的硬件先例，论文也列了，但叙事中可以省略。
+
+* 倒读：这篇在批判谁
+
+直接靶子是 *NVFP4*：MXFP4 已经标准化、硬件已经在做（甚至更省 ~12% tensor core 面积），但精度被 NVFP4 压着打 ~10%，"被吊打的标准没人愿意用"。
+
+间接靶子是 *vanilla MXFP4 / OCP MX 标准本身*：标准里把 block scale 定成 E8M0（只允许 2 的幂），是为了硬件简单。这个选择没错，但配套的"怎么挑这个 2 的幂"——直接拿块内最大值往 FP4 满刻度对齐——会让大量值溢出截断，是精度差距的根源之一。
+
+* 正向叙事：问题怎么演化成今天这样
+
+** 起点：一个张量一把尺子，被几个数毁了一锅汤
+
+最早做 LLM 量化时，做法朴素：拿到一个张量（比如 4096x4096 的权重矩阵），找最大绝对值，按这个值把所有数压到 INT8 的 [-127, 127] 区间里。一个张量配一个 scale 因子。
+
+问题很快暴露——Dettmers 2022 (LLM.int8()) 发现：到了 6.7B 参数以上的模型，激活里会出现 *系统性的离群特征*，某几个维度的数比平均水平大 20 倍以上。如果你按"最大值"定标，那 99% 的普通值就被挤到 INT8 最低几档，精度全没了；如果你按"中位数"定标，那几个大值直接饱和爆掉。任你怎么选，单尺子救不了。
+
+LLM.int8() 的解法是"混合精度"：识别出离群通道，单独用 FP16 算，其余的走 INT8。能用，但工程上很丑——多了一条数据通路。
+
+** 第二步：与其分两条路，不如把离群值"搬家"
+
+SmoothQuant (Xiao 2023) 想得更巧：离群值之所以麻烦，是因为它出现在 *激活* 里——激活是动态的，没法预先校准。但权重是静态的，量化它容易。那能不能把激活里的尖刺"挪"到权重上？
+
+数学上很简单：Y = (X / s) * (W * s)。给激活除以一个 per-channel 的缩放因子 s，把这个 s 乘回权重。激活变平了，权重多了一点动态范围——但权重你慢慢挑就行。这就是"smoothing"。
+
+这一步看起来漂亮，但精度还是有损。于是 GPTQ (Frantar 2023) 接上：与其一锤子定音地量化整个权重矩阵，不如 *一列一列地量化，每量化完一列就把误差补偿到剩下还没量化的列里*。本质上是把量化当成一次有损压缩，然后用近似牛顿法把损失一层层吃掉。这个范式后来变成所有 PTQ（post-training quantization）方法的祖宗。
+
+到这里，INT8 已经基本可用。问题切换战场——大家要 *INT4*、要 *FP4*。比特更少，单尺子的问题以指数级恶化。
+
+** 第三步：把尺子做细——块浮点的复兴
+
+如果一把尺子管整个张量太粗，那 *一把尺子管 32 个数* 行不行？
+
+这就是块浮点（Block Floating Point）的思路，老想法了——Nervana、MICRO 2019 的 STC 都做过硬件。但在 LLM 时代复活它的是 Darvish Rouhani 等人 2023 年的 "Shared Microexponents"：每 32 个连续元素共享一个指数（scale），数据本身只存极低比特（4 或 8）。这样小范围内的动态范围足够覆盖块内的所有值，离群值最多影响它所在的那一个块，不会污染整个张量。
+
+Microsoft 拉上 AMD、NVIDIA、Intel、Meta 把这个做成了 *OCP MX 标准*：定义了 MXFP4、MXFP6、MXFP8、MXINT8 几种格式，每种都是"32 元素一块，每块一个 8 比特的 power-of-two scale（E8M0）"。这个 power-of-two 的选择很关键——硬件实现 scale 应用只需要一次位移，不需要乘法器，省面积省功耗。
+
+** 第四步：NVIDIA 不同意，自己搞了 NVFP4
+
+NVIDIA 在 Blackwell 之后推 NVFP4：同样是块格式，但 *块大小缩到 16，scale 用 FP8 (E4M3)*。
+
+注意这两个变化的代价：
+- 块从 32 缩到 16 → metadata 翻倍，存储和带宽更贵
+- scale 从 E8M0 升到 E4M3 → 应用 scale 需要一个真正的 FP8 乘法，不再是位移
+
+但好处是 *精度*：scale 不再被 2 的幂限制，可以精细对准块内最大值；块更小，块内动态范围更紧。结果是 NVFP4 在 LLM 基准上比 MXFP4 平均高 ~10%。
+
+于是格式战开打：MXFP4 硬件友好但精度差，NVFP4 精度好但硬件吃亏 (~12% 更多面积)。芯片厂商纠结：选哪边？
+
+** 第五步：本文的提问——能不能不二选一
+
+Chhugani 等人盯着这个 10% 的差距，问了一个反方向的问题：*差距真的是硬件能力造成的吗？还是 MXFP4 的软件用法没用好？*
+
+他们做了误差分解，发现两个具体痛点：
+
+*痛点 A：缩放因子的"贪心"选法浪费了动态范围。* 标准做法是：找块内最大绝对值 amax，挑一个最小的 2^k 使得 amax / 2^k 不超过 FP4 的最大可表示值（6.0）。这样不会有任何溢出，但代价是——因为强制不溢出，所有小值都被挤到 FP4 的低几档，量化噪声很大。
+
+*OAS (Overflow-Aware Scaling) 的反向操作*：故意挑一个 *更小* 的 2^k，允许最大的几个值溢出截断（被 clip 到 ±6）。代价是几个离群值损失精度，收益是 *绝大多数普通值获得更多有效比特*。在均方误差意义下，这是个数学上能解析求解的最优化问题：找到那个让 "截断损失 + 量化损失" 总和最小的 k。
+
+直觉打个比方：你只有 16 把尺子的刻度，块内有 32 个数。一个传统做法是"让最长那根棍子刚好对准 16 号刻度"——但如果那根棍子是个异常值，其它 31 根棍子全挤在 1-2 号刻度里，误差很大。OAS 说："让最长那根棍子超出刻度被砍掉一点，把刻度重心挪到大多数棍子身上，整体误差反而更小。"
+
+*痛点 B：离群值还是会被 power-of-two scale 伤到。* 即使 OAS 优化了"挑哪个 2^k"，2^k 这个集合本身还是稀疏的。某些块里离群值和中位值的比例正好落在两档 2^k 之间，OAS 也救不了。
+
+*MBS (Macro Block Scaling) 的解法*：在 32 元素的 micro block 之上，再加一层 *macro block* (例如 4-16 个 micro block 合一)，每个 macro block 配一个 *FP32 的高精度 scale*。整个流程变成：FP4 数据 x E8M0 micro scale x FP32 macro scale。两层 scale，前者负责硬件友好的位移，后者负责"补一刀精细缩放"。
+
+关键是 macro 这一层的开销很小——粒度粗，metadata 占比可忽略；FP32 乘法只在 macro block 边界发生一次，每 macro block 内部的 GEMM 还是走原 MXFP4 路径。最终 GEMM 整体开销 ~6%，硬件面积优势 (~12%) 还在。
+
+合起来：OAS 把"挑 scale"这一步做到最优，MBS 在偶尔失败的块上补一层粗尺子。精度差距从 ~10% 压到 <1%。
+
+** 当下与后续
+
+并行工作里：
+- *MXPlus* (Lee 2025) — 也在攻 MXFP4 精度，做法是改块内数据排列
+- *MicroScopiQ* — 用学习的方式选 scale，比 OAS 的解析解更激进
+
+本文相对它们的优势是"零硬件改动 + 解析可求解"，更容易被工业界直接采用。
+
+* 问题-解法压缩总览
+
+#+begin_example
+
+  问题                        解法                        留下的问题
+  ----                        ----                        ------------
+  一张量一尺子, 离群值毁精度  LLM.int8: 离群通道走FP16    数据通路丑, 工程难
+                              |
+                              v
+  数据通路丑                  SmoothQuant: 离群值搬到权重  搬完还有误差
+                              |
+                              v
+  搬完还有误差                GPTQ: 误差逐层补偿          INT4/FP4 还是不够
+                              |
+                              v
+  低比特单尺子救不回来        块浮点: 每 32 个数一尺子    标准化怎么定
+                              |
+                              v
+  缺统一标准                  OCP MX: 32 元素, E8M0 scale 精度差 NVFP4 ~10%
+                              |
+                              v
+  MX 精度差                   NVFP4: 16 元素, FP8 scale    硬件代价大 ~12%
+                              |
+                              v
+  二选一不爽                  OAS + MBS: 优化 scale 选法  -- 现在的 frontier
+                              + 加一层粗尺子               GEMM ~6% 开销, 精度差 <1%
+
+#+end_example
+
+* 演化背后真正的认知转变
+
+表面看是"块越分越细 + 尺子越分越精"。深层看是三步认知：
+
+1. *承认离群值不是噪声，是信号。* 早期把离群值当噪声处理（裁剪、过滤）会损失模型能力。从 LLM.int8() 开始，整个领域承认离群值是 LLM 的本质特征，必须 *为它专门设计表示*。
+
+2. *用层次化粒度对抗动态范围爆炸。* 单一粒度（全张量、单元素）都失败。胜出的是"细块 + 粗块"的层次结构——每一层 scale 解决一个尺度的问题。本文的 MBS 把这个思路推到极致：micro × macro 两层 scale 协同。
+
+3. *硬件约束反向倒逼软件创新。* MXFP4 vs NVFP4 之争的本质是"硬件简单"vs"软件懒惰"的张力。本文的姿态是：接受硬件约束（power-of-two scale 不动），把所有创新挤压到软件层。这其实是个更健康的范式——硬件十年一变，软件半年一变。
+
+* 下一步最可能往哪走
+
+短期（一年内）：
+- OAS 思想被引入 INT4 / FP6 等其它低比特格式
+- MBS 的粒度选择从启发式走向学习式（每层模型不同 macro block 大小）
+- 训练期感知（quantization-aware training）+ OAS 联合
+
+中长期：
+- 真正的"动态 scale 选择"硬件支持——把 OAS 的逻辑做进 tensor core
+- 跨注意力头/跨层共享 macro scale，进一步降低 metadata
+- 与 KV cache 量化合流——目前 KV 量化和权重量化各做各的
+
+更远一点的方向：如果"层次化尺子"这条路走到头，下一步可能是 *learned formats*——不再让人类定义 E8M0/E4M3，而是让模型自己学一个最优的位分布。Quartet FP4 已经有这个味道。
+
+* 验收
+
+- *问题是主角*：通篇围绕"低比特怎么不毁精度"这一个问题往下追，论文是切片
+- *因果不断*：每一步都从前一步的痛点自然生长出来（"搬完还有误差"→GPTQ；"低比特救不回来"→块浮点）
+- *差异清晰*：NVFP4 vs MXFP4 的 trade-off 一句话讲清；本文 vs vanilla MXFP4 的差别就是 OAS+MBS 两招
+- *外行能跟*：用"尺子和棍子"的比方贯穿，没有 GEMM/张量等术语先于直觉出现
+- *诚实标注*：引用关系（NVFP4、OCP MX、Rouhani'23、GPTQ、SmoothQuant、LLM.int8、MXPlus、MicroScopiQ）从论文 bibkey 可确认；"后续走向"标明是推测

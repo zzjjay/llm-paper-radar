@@ -1,0 +1,224 @@
+#+title:      Breaking the Blocks: Continuous Low-Rank Decomposed Scaling for Unified LLM Quantization and Adaptation
+#+date:       [2026-05-29 Fri 08:35]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T083522-en
+#+source:     https://arxiv.org/abs/2601.22716
+#+authors:    Pingzhi Tang, Ruijie Zhou, Fanxu Meng, Wenjie Pei, Muhan Zhang
+#+venue:      arXiv preprint, Jan 2026
+
+* The River of the Problem
+
+Squeezing an 8-billion-parameter model onto a consumer GPU means compressing every weight from 16 bits down to 3–4 bits. But you cannot save a separate scaling factor for each individual weight — that defeats the whole point of compression — and you cannot share a single factor across the entire model either, because precision collapses. The real question is: where exactly do you draw the line? This is the same problem that LLM quantization has been wrestling with for a decade.
+
+The difficulty lies in non-uniform weight distributions and "outliers" — a handful of extremely large values that blow up the scale factor and crush 99% of the remaining weights to zero. The early answer was to cut weights into "blocks" (every 64 or 128 weights share one scale), a blunt compromise. But block boundaries are hard cuts: uniform within a block, discontinuous between blocks — completely misaligned with the smooth, continuous distribution of the actual weights. Generation after generation of papers has asked the same question: can we make this less rigid?
+
+* A Map of the Origins
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem: a single per-tensor scale cannot hold; outliers collapse most weights to 0
+  | Solution: detect outlier columns, keep them in FP16; quantize the rest per-channel
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: per-channel is still too coarse; direct 4-bit quantization tanks accuracy
+  | Solution: cut into groups (B=128); use second-order Hessian info to compensate quantization error
+  v
+[2023] Dettmers et al. - QLoRA / NF4
+  |
+  | Problem: 4-bit models also need to be fine-tunable, otherwise they are unusable
+  | Solution: freeze the block-quantized weights; attach a FP16 LoRA additive adapter on top
+  |
+  | Residual flaw: the adapter is a high-precision addition; it cannot be merged back into
+  |   the low-precision weights → inference always carries an extra layer of overhead
+  v
+[2023] Li et al. - LoftQ
+  |
+  | Problem: QLoRA separates quantization and adapter into two steps; all quantization loss
+  |   is dumped onto the adapter at initialization
+  | Solution: alternating SVD — let quantization residual and LoRA jointly minimize
+  |   initial reconstruction error
+  |
+  | Residual flaw: architecture unchanged — still "block quantization + additive adapter"
+  v
+[2025] Lee et al. - LRQ
+  |
+  | Problem: the hard block cut itself is the root disease; scales should be continuous
+  | Solution: model the scale as a low-rank exponential map: S = exp(B*A)
+  |
+  | Residual flaw: the exponential map cannot be initialized from existing block statistics;
+  |   only PTQ — no QAT or PEFT support
+  v
+[2026] Tang et al. - LoRDS  (this paper)
+  |
+  | Problem: PTQ, QAT, and PEFT toolchains each operate in isolation, reinventing the wheel
+  | Solution: write the scale directly as a linear low-rank form S = B*A;
+  |   one mechanism simultaneously handles PTQ initialization, QAT joint training, and PEFT fine-tuning
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): Quantization's First Acknowledgment that Outliers Exist
+
+*** What Problem It Saw
+
+Before LLM.int8(), 8-bit quantization of large models worked like this: compute the maximum absolute value of the entire weight matrix, use it as the scale, share it across the whole matrix. Simple — but it fell apart on models above 6B parameters, with accuracy dropping off a cliff. Dettmers investigated and found the culprit: at GPT-3 scale, "activation outliers" emerge — a small number of channels whose values are hundreds of times larger than the rest. Once those outliers enter the max-scale calculation, the effective precision of the entire matrix is consumed.
+
+*** Its Solution
+
+Bluntly pragmatic: pull the outlier channels out and keep them in FP16; for the rest, compute a per-channel scale and quantize to INT8. This amounts to conceding that "weight distributions are not uniform — forcing one scale to cover everyone simply does not work."
+
+*** Why It Worked (and What New Hole It Left)
+
+It was the first time quantization granularity was pushed down from the full matrix to the channel level. But a channel is still a hard cut — the 4096 weights inside a single channel still share one scale. The granularity had not been pushed fine enough, and at 8 bits the headroom was generous; when people actually wanted to compress to 4 or 3 bits, this approach could not hold.
+
+** 2022 | GPTQ: Cut the Blocks Smaller, Then Rescue Accuracy with Second-Order Information
+
+*** What Problem It Saw
+
+If you want to halve the bit-width again from 8 to 4, per-channel granularity is completely insufficient. Quantizing each channel to INT4 scrambles the model's outputs. The LLM.int8() strategy cannot save 4-bit quantization.
+
+*** Its Solution
+
+Two changes stacked together. First, push granularity finer: every 128 consecutive weights form a "group," each with its own scale. This became the standard definition of "block quantization" or "group-wise quantization." Second, quantization is no longer a simple round-to-nearest — second-order Hessian information is used: whenever one weight is quantized, its error is "spread" to the remaining unquantized weights in the same row, which adjust to cancel it out.
+
+*** Why It Worked (and What New Hole It Left)
+
+Second-order compensation made 4-bit PTQ useful for the first time. But the block structure itself is a temporary compromise — it implicitly assumes that "neighboring 128 weights share similar statistical properties," which has no theoretical guarantee whatsoever. The staircase-shaped scale — forced uniform within a block, hard-cut between blocks — is misaligned with the genuinely continuous distribution of the weights. This misalignment was never directly addressed in any subsequent paper, until LoRDS.
+
+** 2023 | QLoRA: Since Quantization Loses Precision, Paste an Adapter on Top to Win It Back
+
+*** What Problem It Saw
+
+GPTQ made 4-bit inference practical, but only solved "deployment." What about fine-tuning on downstream tasks? You cannot run gradient descent directly on 4-bit weights — discrete integers have no gradient.
+
+*** Its Solution
+
+Freeze the 4-bit block-quantized weights (NF4 — a 4-bit format better suited to normal distributions — was invented here), then attach a LoRA to each linear layer: two low-rank FP16 matrices B and A. During the forward pass, compute ~W_quant @ x + B @ A @ x~. Only B and A are updated; gradients travel the FP16 path. Memory pressure dropped from 200 GB to 48 GB, making single-GPU fine-tuning of 65B models a reality.
+
+*** Why It Worked (and What New Hole It Left)
+
+Mathematically, LoRA is an additive residual that should be mergeable back into the main weights. But here the main weights are NF4 4-bit integers and the additive adapter is FP16 — the precisions are incompatible, so no merge is possible. As a result, B @ A must be computed separately at inference time forever, and the FP16 parameters must be carried forever. The classic LoRA advantage of "disappearing after training" is gone; inference is always slower than a purely quantized model. The deeper problem: to compensate for precision loss introduced by block quantization, a completely independent parameter system was piled on top — quantization and the adapter are two separate things, each unaware of the other.
+
+** 2023 | LoftQ: Let Quantization and the Adapter Shake Hands at Initialization
+
+*** What Problem It Saw
+
+QLoRA's two-step procedure is wasteful: first quantize W to W_q, then hand all the quantization residual (W − W_q) to a zero-initialized LoRA to recover. But LoRA is low-rank, and at zero initialization it has no idea what the residual looks like — it needs many training steps just to begin approximating it.
+
+*** Its Solution
+
+Alternating optimization: first, use SVD to decompose the principal components of W and hand them to LoRA; then quantize what remains; then use the updated quantization residual for another round of SVD… repeated for several iterations, so that W_q + B @ A already closely approximates W before training even begins.
+
+*** Why It Worked (and What New Hole It Left)
+
+LoftQ got the initialization right, but the architecture is identical to QLoRA — block-quantized body plus additive adapter. The hard block boundaries remain; the fundamental problem that the adapter cannot be merged remains. LoftQ is a "tuning" of QLoRA, not a "reconstruction" of it. Every paper in this line was circling the same combination of "blocks + adapter" without anyone questioning the combination itself.
+
+** 2025 | LRQ: The First to Ask — Can the Scale Itself Be Continuous?
+
+*** What Problem It Saw
+
+LRQ is the first paper to stare directly at the block structure. It asks: why must the scale be a staircase? Weight statistical distributions vary smoothly, yet scales are artificially cut into discrete blocks. Forced uniformity within a block, hard discontinuities between blocks — this is the true source of quantization error.
+
+*** Its Solution
+
+Write the scale as the exponential map of a low-rank matrix: ~S = exp(B @ A)~. The scale is no longer a staircase but a smooth, continuous surface; the low-rank constraint keeps the parameter count comparable to block quantization.
+
+*** Why It Worked (and What New Hole It Left)
+
+This is the pivotal turn in this lineage — the first acknowledgment that "the problem is not the adapter, it is the geometry of the scale." But LRQ itself is blocked by two engineering problems: (1) the exponential map cannot be initialized from existing block statistics; it must be trained from scratch at high reconstruction cost; (2) this formulation only supports PTQ. There is no natural interface for QAT or PEFT. LRQ is a conceptual breakthrough, but an engineering half-product.
+
+** 2026 | LoRDS: Make the Scale Linear Low-Rank, and Three Toolchains Converge
+
+*** What Problem It Saw
+
+LRQ's direction was right, but the wrong function was chosen. The exponential keeps scales strictly positive and avoids numerical instability — reassuring in principle, but it severs the direct path from "block statistics → low-rank scale" and forecloses the possibility of "nudge the scale a little and call it PEFT."
+
+The deeper layer: QLoRA / LoftQ / LRQ each solved one piece — one solved PEFT, one solved initialization, one solved PTQ — but all three use different mathematical objects that cannot be transferred to one another. The entire field was being dragged along by "toolchain fragmentation," with three separate mechanisms each iterating in isolation.
+
+*** Its Solution
+
+Write the scale directly as a linear low-rank form: ~S = B @ A~, without exp.
+
+This seemingly small change opens three doors in a chain:
+
+- *PTQ*: The traditional block-scale matrix ~S_block~ is already low-rank (every block shares one value, so ~rank ≤ m/B~). Apply truncated SVD to it and you directly obtain the initialization for B and A — block statistics transfer over seamlessly, and refining an 8B model on an A100 takes about 30 minutes.
+- *QAT*: S = B @ A is continuously differentiable, so weights and scales can be jointly trained with STE.
+- *PEFT*: Want to fine-tune? Stop attaching external adapters — just update B and A directly. Task knowledge is "absorbed" into the quantization scale. At inference time the scale is still just a scale; the model architecture is entirely unchanged, with zero additional overhead.
+
+Moreover, because W ⊙ (B @ A) is an element-wise multiplication, the effective rank of the induced update is not bounded by the rank of B and A — it can be far higher than the parameter budget r. This is the origin of the "high-rank within low-rank budget" claim in the paper title.
+
+*** Why It Worked (and What New Holes Remain)
+
+The elegance of the linear low-rank form is that it accommodates three things simultaneously: compatibility with existing block statistics (SVD initialization), compatibility with backpropagation (continuous differentiability), and compatibility with deployment (merging into the dequantization pipeline). LRQ asked the right question but chose the wrong function; LoRDS reverts to the most elementary linear form, and paradoxically that allows three previously adversarial toolchains to merge into one.
+
+Remaining holes: (1) Under the iso-parameter constraint ~r = nm/(B(n+m))~, the rank is typically very small (around r = 2 for an 8B model) — can it truly replace block statistics in all cases? The paper's experiments show a 27-point gain over NF4 at 3-bit, but more aggressive 2-bit compression still breaks down. (2) The "high-rank effective update" is achieved mathematically through element-wise coupling with W, which is less interpretable than a plain additive LoRA. (3) The Triton kernel speedup is hardware-specific; porting to non-NVIDIA platforms may erode the performance gains.
+
+* Frontier Extensions
+
+As of May 2026, the paper is three months old and no clear follow-up work has appeared yet. Anticipated directions:
+
+- *Removing the remaining assumptions of the block structure*: LoRDS still imposes an iso-parameter-budget constraint; a natural next step is to relax this and let rank adapt layer by layer.
+- *Extending the multiplicative adapter to other positions*: LoRDS currently only acts on the weight-side scale, but the activation side (the SmoothQuant family) has the same "block" problem. Can the same low-rank idea handle it?
+- *Integration with MoE / inference-time sparse activation*: The "high effective rank" property of multiplicative updates may be particularly well suited to per-expert local adaptation in mixture-of-experts models.
+
+(The above are speculations, not published work.)
+
+* One Figure to Understand It All
+
+#+begin_example
+                   The river of "how to assign scales to weights"
+
+  Granularity    per-tensor    per-channel    per-block      per-element
+  ===========    ==========    ===========    ==========     ============
+  2020-2021          o          .  .  .  .    .  .  .  .     .  .  .  .   <- naive INT8 (collapses)
+                     |
+                     v
+  2022           (LLM.int8)     o             .  .  .  .    .  .  .  .   <- outlier columns kept in FP16
+                                              |
+                                              v
+  2022           .              .            (GPTQ B=128)   .  .  .  .   <- block quant + Hessian compensation
+                                              |
+                                              v
+  2023           .              .            (QLoRA NF4)    .            <- block quant + additive LoRA
+                                                            (FP16 adapter floating outside)
+                                              |
+                                              v
+  2023           .              .            (LoftQ)        .            <- same architecture, better init
+                                              |
+                                              v
+  2025           .              .             ~~~smooth~~~  .            <- LRQ: exp(BA) continuous scale
+                                              (PTQ only)
+                                              |
+                                              v
+  2026           .              .             ============>              <- LoRDS: S=BA linear low-rank
+                                              (block stats initializable; PTQ/QAT/PEFT unified)
+
+  ----------------------------------------------------------------------
+  Vertical axis: who bears the responsibility for compensating quantization error
+  ----------------------------------------------------------------------
+   External adapter (FP16, cannot merge)         QLoRA, LoftQ
+                v
+   Internal scale (low-rank, can merge)           LoRDS
+#+end_example
+
+* Insight
+
+Tracing this river to its end, what is truly evolving is not "quantization accuracy" — it is *where the compensation mechanism lives*:
+
+- Before 2022: compensation lived in "which channels are exempt from quantization" (the outlier columns of LLM.int8())
+- 2022–2024: compensation lived in "an adapter bolted on outside the block" (the QLoRA family)
+- 2025–2026: compensation is *absorbed into the scale itself* (LRQ → LoRDS)
+
+Each generation moves the compensation mechanism one step closer to the weights. What started as an external module became a more sophisticated external module, and finally the external module was redesigned as an intrinsic degree of freedom of the weight itself. There is a general principle here: when two components of a system persistently compensate for each other, they tend to be eventually refactored into a single component — because the interface cost of keeping them separate exceeds any clarity gained from modularity.
+
+QLoRA remained dominant for three years because it solved the memory problem so well that no one in engineering wanted to touch the architecture. The price was that the entire field became locked into the "block quantization + additive adapter" pattern, with all subsequent work patching it (LoftQ fixed initialization, QA-LoRA fixed inference, DoRA fixed directionality). LoRDS's true value is not that some metric went up by a few points — it is that it demonstrates *patching ends where refactoring begins*: by rewriting the adapter from an external module into an intrinsic degree of freedom of the scale, three formerly fragmented research directions unify automatically.
+
+Where is the most likely next step? Pushing this thinking into activation quantization (the SmoothQuant family) and inference-time KV caches — clearing the temporary 2022 compromise called "blocks" from every corner of the model.
+
+* Takeaway
+
+Observing where a field has *split* is often exactly where the next good paper will come from. When the PTQ, QAT, and PEFT communities each iterated in isolation for three years, each running separate workshops without knowing what the others were doing — that is a structural problem. Behind it lies an assumption that everyone accepted but should not have (here: "the block"). Pull it out, and three lines of research merge automatically.
+
+The landing point: *fragmentation = opportunity*. Next time you survey a field, ask first: which toolchains are operating separately? What underlying structure do they share? Is that structure a genuine physical constraint, or a historical path dependency? If it is the latter, refactor it — and you have a paper that unifies three research lines into one.

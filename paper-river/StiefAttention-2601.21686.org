@@ -1,0 +1,281 @@
+#+title:      Don't be so Stief! Learning KV Cache low-rank approximation over the Stiefel manifold
+#+date:       [2026-05-29 Fri 08:28]
+#+filetags:   :paper:river:
+#+identifier: 20260529T082849
+#+source:     https://arxiv.org/abs/2601.21686
+#+authors:    Luca Benfenati, Matteo Risso, Andrea Vannozzi, Ahmet Caner Yüzügüler, Lukas Cavigelli, Enrico Macii, Daniele Jahier Pagliari, Alessio Burrello
+#+venue:      arXiv preprint, 2026-01-29
+
+* 问题之河
+
+长上下文推理时，模型把每个 token 的 key 和 value 都存在显存里——这就是 KV cache。问题是它会胀。Llama3-8B 跑 32K 上下文、批大小 4，光 KV cache 就要 16GB，跟模型本身的权重一样大。显存装不下，带宽喂不饱，整个推理就被它卡住。
+
+人们想了很多招：扔掉不重要的 token、把数值压成低精度、改注意力架构。还有一条路是: 既然每个 head 的 key/value 向量维度 d_h 很高（通常 128），那把它投影到一个更小的子空间，只存投影系数就好。这就是"低秩压缩"路线。
+
+难点不在投影本身——SVD 一发就能拿到最优低秩近似。难点在 *投影到底要最小化什么*。SVD 最小化的是 key 本身的重建误差；但 key 不是最终输出，它要过 softmax、乘 value、过 FFN、过 LayerNorm、加残差，一路传到下一层。前面 key 重建得很准，不等于最后一层输出还像原来的样子。这条河，五年都在啃这个错位。
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani - Attention Is All You Need
+  |
+  | KV cache 作为推理加速的副产品诞生，但还没人意识到它会成为瓶颈
+  v
+[2023] Pope et al. - Efficiently Scaling Transformer Inference
+  |
+  | 把问题量化: KV cache 随 (seq_len * batch * layers) 线性增长，长上下文下吃光 HBM
+  v
+[2023] Ainslie - GQA (Grouped-Query Attention)
+  |
+  | 让多个 query head 共用一组 KV head, 直接砍 KV head 数量
+  | 但: 需要重训，且压缩比有限（只能砍 head 维度，不能砍 head 内部）
+  v
+[2024] DeepSeek-V2 - MLA (Multi-Head Latent Attention)
+  |
+  | 架构层面把 K/V 投到低维 latent, 从源头压
+  | 但: 必须从头训练或大量微调，已有模型用不上
+  v
+[2023] Yuan et al. - ASVD / K-SVD (post-training 起点)
+  |
+  | 直接对训练好的模型做 SVD: 投影矩阵 = K 矩阵的 top-r 右奇异向量
+  | 不用重训，立等可取
+  | 但: 只重建 K 本身，没考虑 query 怎么打分
+  v
+[2024] Saxena - EigenAttention
+  |
+  | 注意到投 K 也隐式投了 Q (因为 QK^T 共享投影空间)
+  | 解法: 把 [K; Q] 竖着拼起来，对联合矩阵做 SVD
+  | 但: 谁的方差大谁说了算，K 和 Q 互相挤压
+  v
+[2025] Lesens - KQ-SVD
+  |
+  | 干脆别重建 K 或 Q，直接重建它们的乘积 QK^T (注意力分数本身)
+  | 但: QK^T 还要过 softmax 和 value mixing，依然是 proxy
+  v
+[2026] StiefAttention (本文)
+  |
+  | 不再 proxy: 直接最小化整个 decoder layer 的输出误差
+  | 用 MLP 从激活统计量学投影基, QR 分解保正交, 落在 Stiefel manifold 上
+#+end_example
+
+* 演化叙事
+
+** 2017 | Transformer: 注意力机制带来了 KV cache 这个"副作用"
+
+*** 它看到了什么问题
+
+RNN 必须一个 token 接一个 token 算，没法并行，训练慢、长序列吃不消。
+
+*** 它的解法
+
+扔掉时序递归，全部用注意力——每个 token 直接看全局所有 token。训练时所有位置并行计算。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行性解锁了 GPU 全部算力，模型可以做大。但推理时不一样: 生成第 N 个 token 要看前面 N-1 个 token 的 key 和 value。如果每次都重算，计算量是 O(N^2)。于是人们把前面算过的 K 和 V 缓存起来——KV cache 应运而生。
+
+这时没人觉得这是问题。直到模型大了、上下文长了，cache 的存储和带宽吃光了 HBM。
+
+** 2023 | Pope et al.: 把"KV cache 太大"量化成了一道墙
+
+*** 它看到了什么问题
+
+模型越大、上下文越长、批越大，KV cache 占的显存就越线性增长。当时人们还在死磕权重量化，没意识到 cache 才是长上下文场景的真瓶颈。
+
+*** 它的解法
+
+不是新算法，是把账算清楚: 一个公式告诉你，PaLM-540B 跑 2K 上下文、批 512，KV cache 就要几百 GB。从此 "KV cache 优化" 成了一个独立的研究方向。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把问题命名出来，整个社区开始往这条路上跑。但具体怎么压？三条岔路同时长出来:
+- 扔掉不重要的 token (eviction: StreamingLLM, H2O)
+- 把数值压成 4-bit/2-bit (quantization: KVQuant)
+- 把维度压低 (low-rank: 接下来这条线)
+
+本文走的是第三条。
+
+** 2023 | GQA: 同一组 query 共用一份 KV，砍掉"重复 head"
+
+*** 它看到了什么问题
+
+标准 multi-head attention 每个 query head 配一个独立的 K head 和 V head。Llama-2-70B 有 64 个 head，KV cache 就要存 64 份。但很多 head 其实学到的东西高度相关，存这么多是浪费。
+
+*** 它的解法
+
+让多个 query head 共享同一个 K/V head——比如 8 个 query head 共用 1 个 KV head，KV cache 直接砍 8 倍。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+简单粗暴，效果显著，Llama-3 全系列都用了。但它只能砍 "head 这一维"——head 内部那 128 维特征还是原封不动地存着。要想再压，得动 head 内部。而且 GQA 是架构改动，需要重训。
+
+** 2024 | MLA (DeepSeek-V2): 直接在架构里塞一层潜空间
+
+*** 它看到了什么问题
+
+GQA 是个"组合优化"——只能整组砍。如果想更细粒度地压 head 内部的 128 维，GQA 帮不上忙。
+
+*** 它的解法
+
+把每个 head 的 K 和 V 都投到一个共享的低维潜空间 (比如 512 维)，只缓存潜变量。要用 K/V 时再投回来。DeepSeek-V2/V3/R1 全靠这个把 cache 压到原来的 1/10 还能保性能。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它从架构层面就承认 "K 和 V 本来就有低秩结构"。但有个硬伤: 现有的 Llama、Qwen、Mistral 没有这个潜空间——要用 MLA，要么从头训，要么大改后大量微调。TransMLA (Meng et al., 2025) 想做 post-training 转换，仍然离不开微调。
+
+那有没有办法 *不动权重、不微调*，对已经训好的模型做这种压缩？这就是 SVD 路线的起点。
+
+** 2023 | K-SVD / ASVD: 第一次用 post-training 的方式压 head 维度
+
+*** 它看到了什么问题
+
+MLA 太重——已经部署在线的 Llama 模型不能说改就改。需要一个 *拿来就用* 的方法: 不重训、不微调，只看几百条校准数据就能压。
+
+*** 它的解法
+
+最朴素的想法: 对每个 head 的 K 矩阵做 SVD，取前 r 个右奇异向量当投影矩阵。压缩时 K_compressed = K @ P，用的时候 K_reconstructed = K_compressed @ P^T。SVD 保证了 "K 自己" 的重建误差最小。V 同理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+SVD 是 "对 K 这个矩阵" 最优的低秩近似。但 K 不是终点——它要和 Q 做内积，过 softmax 算注意力分数。
+
+举个例子: 假设 K 矩阵有一维方差很大但对 Q 几乎正交。SVD 会优先保留这一维（因为方差大），但这一维对注意力分数没贡献。真正重要的方向被丢了。"K 自己重建得好" 和 "注意力算得对" 不是一回事。
+
+精度掉得不能忍。下一个人就盯上了这个点。
+
+** 2024 | EigenAttention: "投 K 也是在投 Q，那不如一起投"
+
+*** 它看到了什么问题
+
+K-SVD 只对着 K 优化，没意识到 Q 和 K 共享同一个投影空间——你在压 K 的时候，等于也在隐式地约束 Q 能看到 K 的哪些维度。Q 重要、但 K 那一维方差小的方向，会被 K-SVD 无情砍掉。
+
+*** 它的解法
+
+把 K 和 Q 竖着拼成一个矩阵 [K; Q]，对这个 *联合矩阵* 做 SVD。这样选出来的投影方向，既照顾 K 的方差，也照顾 Q 的方差。代价就是投影矩阵保留了对双方都有利的方向。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+比 K-SVD 强了一档。但问题来了: 拼起来做 SVD 的时候，*谁的数值大谁说了算*。如果 K 的 magnitude 是 Q 的 10 倍，SVD 主要在保 K——Q 又被忽略了。EigenAttention 是个"靠运气" 的方案，前提是 K 和 Q 的尺度差不多。
+
+** 2025 | KQ-SVD: 别投 K 也别投 Q，直接重建它们的乘积
+
+*** 它看到了什么问题
+
+K 和 Q 拼起来做 SVD 只是一个 hack。真正决定注意力的是它们的乘积 QK^T——这才是 softmax 之前的注意力分数。直接最小化 QK^T 的重建误差，不才是真的对症？
+
+*** 它的解法
+
+把 QK^T 写成 (Q @ P_Q)(K @ P_K)^T，对原始的 QK^T 做截断 SVD，闭式求出最优的 P_Q 和 P_K。Q 走 P_Q 这条路压缩，K 走 P_K 这条路压缩，最终的注意力分数矩阵在低秩约束下是最优重建。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+终于把目标对准了 "注意力分数" 而不是 "K 自己"。但 QK^T 也还不是终点啊——它要过 softmax，然后乘 V，再过 output projection，过残差、LayerNorm、FFN，传到下一层。
+
+softmax 是非线性的。前面 QK^T 重建得再好，softmax 之后误差怎么放大，谁也说不准。这个 proxy 比前两个更近，但还是 proxy。
+
+要彻底，就得一路对到底——直接对 *decoder layer 的输出* 优化。
+
+** 2026 | StiefAttention: 把目标拉到 decoder layer 出口
+
+*** 它看到了什么问题
+
+K-SVD 优化 K，EigenAttention 优化 [K;Q]，KQ-SVD 优化 QK^T——这是一条逐步"往下游靠"的链，每一步都更接近真实评估的指标，但都没到。一个层 layer 的输出 = norm(softmax(QK^T/√d) @ V @ W_O + residual) 全过完，再 + FFN(...) 才是这一层的最终输出。前面所有 proxy 都还在中间某一站。
+
+而且这些 proxy 之间的好坏关系也不直观: 论文实测发现 SVD 类方法 *在重建注意力输出上更准* (29.6% lower attention error)，但 *最终 layer 输出反而更糟*——因为 softmax 后的微小偏差被 V mixing、output projection 和 FFN 放大了。
+
+*** 它的解法
+
+直接以 *layer 输出的重建误差* 为目标。但难点是: 投影矩阵必须正交（不正交就不是 valid 的子空间投影，会破坏 K/V 的几何结构）。这种 "在约束流形上做梯度下降" 的问题，就是 Stiefel manifold 优化。
+
+怎么做:
+1. 对每层 layer，统计 K 和 V 的逐维均值和方差 (μ, σ^2)——这就是 4·d_h 维的简单特征。
+2. 用一个小 MLP 把这些统计量映射成一个 d_h × d_h 矩阵 A。
+3. 对 A 做 QR 分解，取 Q 部分——保证正交。
+4. 截断前 r 列，得到投影矩阵 P。
+5. 用这个 P 重建 K/V，跑完整层 forward，算和原始 layer 输出的相对误差。
+6. 梯度回传到 MLP 参数。每层独立训。
+
+KV head 之间共享 K 的投影基（因为 K 在 GQA 里本来就是组内复用的），但每个 KV head 单独学 V 的投影基（因为 V 直接对接 head-specific output projection，差异大）。
+
+预先把每层在不同 (r_K, r_V) 下的误差曲面存起来。部署时给一个误差预算 ε，按层去查表分配秩——不用重训，就是个加权 Pareto 选择。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+把目标从 proxy 拉到了真目标。Llama3-8B 同压缩比下，比 EigenAttention 在 C4 perplexity 上低 11.9 分，MMLU 上高 5.4%。
+
+留下的坑:
+- 投影基本身没参数共享之外的结构——每层每 head 都要单独学。
+- MLP 预测器虽然只在 offline 用，但训练时要对每层每 rank 跑一次 forward，校准开销不小。
+- 误差曲面是预存的，运行时仍然 *离线决定* 秩。如果不同输入分布差异大（比如代码 vs 自然语言），同一套基可能不是各自最优。
+
+* 前沿延伸
+
+StiefAttention 是 2026-01 发的预印本，是这条线目前最新的一步。可以预见的下一步:
+
+- *输入自适应的秩分配*: 当前是离线决定每层用多少秩；自然延伸是按输入动态调，比如简单 prompt 用低秩，复杂 prompt 用高秩。
+- *和 quantization 正交叠加*: 低秩压缩管 "维度"，量化管 "每维的位宽"。两条路理论上可以乘起来用 (低秩 + 4-bit 量化)，但联合优化还没系统做。
+- *和 token eviction 联动*: 重要 token 高秩、低权 token 低秩或干脆扔。
+- *把 layer-output 优化思路移到 MLA 的训练上*: 目前 MLA 的 latent 维度是手调的，能不能用 StiefAttention 这套 layer-output objective 去自动选每层 latent 大小？
+
+* 一张图看懂
+
+#+begin_example
+                  "投影目标到底是什么" 这条河
+                  --------------------------------
+
+  优化目标         代表方法         离 layer 输出的距离
+
+  K 本身            K-SVD                  ~~~~~~~~~~~~~~ (远)
+  (Yuan 2023)        |
+                     |  "Q 也被压了，加 Q 一起"
+                     v
+  [K; Q] 联合       EigenAttention         ~~~~~~~~~ (近一点)
+  (Saxena 2024)      |
+                     |  "K 和 Q 都是 proxy, 重建它们的乘积"
+                     v
+  QK^T (分数)       KQ-SVD                 ~~~~~ (再近)
+  (Lesens 2025)      |
+                     |  "QK^T 之后还有 softmax/V/FFN, 全跳过"
+                     v
+  整层 layer 输出   StiefAttention         . (到家了)
+  (Benfenati 2026)
+
+
+  正交约束怎么保:
+    K-SVD/Eigen/KQ-SVD : 闭式 SVD, 天然正交
+    StiefAttention     : MLP 输出 A -> QR 分解取 Q -> 落在 Stiefel manifold
+
+  rank 怎么选:
+    前三者: 均匀分配或经验启发
+    StiefAttention : 预存每层 error 曲面, 按预算查表分配
+#+end_example
+
+* 洞见
+
+这条线背后真正在发生的，是 *"代理目标" 一步步退场* 的过程。
+
+每一代方法都更逼近真目标:
+- K-SVD 信 "重建 K 就够了"
+- EigenAttention 修正为 "K 和 Q 一起"
+- KQ-SVD 修正为 "他们的乘积"
+- StiefAttention 修正为 "整层的最终输出"
+
+但每一次"更逼近"，都要付出代价: 闭式解变成 SGD、几行 numpy 变成几百 epoch 的 MLP 训练、可解释的几何性质 (奇异值排序) 让位给黑盒优化。
+
+这是一个普遍模式: *当你能负担起更复杂的优化，你就应该把目标从 proxy 拉到真目标*。早年 SVD 流行是因为它一发即得；现在校准只要 512 条样本，几小时训完——直接梯度下降到真目标已经不贵了。
+
+更深一层: 这个模式不只在 KV cache。剪枝、量化、KD 都有同样的演化轨迹——从 "重建中间张量" 到 "重建 layer 输出" 到 "重建最终 logits/loss"。每次目标拉远一步，效果好一档，复杂度涨一档。当算力变便宜，这种迁移就会发生。
+
+下一步最可能往哪走？我打赌是 *输入自适应*。Decoder layer 输出本身是依赖输入的，不同 prompt 的最优投影基本来就不一样。目前所有方法都在求 "一组校准数据上的平均最优基"——下一步要么按 prompt 类型分桶，要么直接做 input-conditional 的轻量预测。
+
+* 启发
+
+这条河给我们三条做研究/选问题的提示:
+
+1. *盯着"代理 vs 真目标"的缝隙*。哪里有人在用 proxy 优化、但其实可以直接对真目标？那就是机会。SVD 在 KV cache 压缩里用了三年，没人质疑它的目标对不对——直到有人把目标换了，立刻拿到 11.9 PPL 的提升。
+
+2. *复用算力下降的红利*。十年前 SVD 是唯一现实选项，因为 GPU 跑不动梯度下降到 layer 输出。今天能跑了——所有"被迫用 SVD 替代"的地方都值得回头看一遍。
+
+3. *约束流形优化是被低估的工具*。当你的参数必须满足某种结构 (正交、低秩、稀疏)，比起 "post-hoc 投影回流形" 或者 "加 penalty 项"，直接在流形上做梯度下降通常更稳。Stiefel/Grassmann manifold 在 LLM 时代值得重新捡起来。
+
+落点在"能用": 这意味着你可以——下次看到一个用 SVD/PCA/谱方法解决的问题时，问一句 "如果我直接对最终目标做 SGD，能不能更好？" 答案大概率是 yes。

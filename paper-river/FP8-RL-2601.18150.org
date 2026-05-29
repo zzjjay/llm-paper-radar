@@ -1,0 +1,234 @@
+#+title:      FP8-RL: A Practical and Stable Low-Precision Stack for LLM Reinforcement Learning
+#+date:       [2026-05-29 Fri 08:09]
+#+filetags:   :paper:river:
+#+identifier: 20260529T080954
+#+source:     https://arxiv.org/abs/2601.18150
+#+authors:    Zhaopeng Qiu, Shuang Yu, Jingqi Zhang, Shuai Zhang, Xue Huang, Jingyi Yang, Junjie Lai (NVIDIA)
+#+venue:      arXiv preprint, 2026 (Under review)
+
+* 问题之河
+
+一个简单的问题：训练一个会推理的大模型（RL 阶段），你能不能用更低精度的算力把它训快一点，又不让它学崩？
+
+听起来像两件事——「快」是工程，「不崩」是算法。但这条研究线上的人发现：这俩根本是一件事。每一次你想抠出更多速度，模型就更容易学崩。每一次你想压住崩溃，速度就被你勒回去。十几篇论文，就是在这两头之间来回拉扯，一点点找到平衡点。
+
+为什么难？因为 RL 训练有个尴尬结构：模型一边在"生成答案"（rollout），一边在"根据答案打分更新自己"（training）。生成那一头要快，所以用推理引擎、用低精度；更新那一头要准，所以用高精度。结果就是同一个模型，两边长得不一样——"我以为我在改的那个我，跟实际跑出答案的那个我，已经不是同一个人了"。这个错位（train-inference mismatch）小则掉点，大则训练直接崩盘。
+
+* 溯源地图
+
+#+begin_example
+[2023] DeepSpeed-Chat
+  |
+  | 问题: 训练和生成挤在一个进程里，GPU 利用率烂
+  | 解法: 把 RLHF 工程化，但还是同步执行
+  v
+[2024] HybridFlow / verl (Sheng et al.)
+  |
+  | 问题: 同步架构没法用最好的训练后端 + 最好的推理引擎
+  | 解法: 解耦——训练用 FSDP/Megatron，生成用 vLLM/SGLang
+  | 副作用: 解耦之后，两边的数值/kernel 不一样了 → mismatch 埋下伏笔
+  v
+[2025] When Speed Kills Stability (Liu et al.)
+  |
+  | 问题: 大家都在用解耦架构，但训练偶尔莫名其妙崩
+  | 解法: 不解法——这篇是诊断书，证明崩溃就来自 train-inference mismatch
+  |       并给出 token-level Truncated Importance Sampling (TIS) 作为药方
+  v
+[2025] FlashRL (Liu et al.)
+  |
+  | 问题: 既然 TIS 能压住 mismatch，那能不能更激进地把 rollout 砍到 INT8？
+  | 解法: INT8 rollout + TIS，验证 8-bit 真的可行
+  | 副作用: INT8 只是个起点，FP8 是 Hopper/Blackwell 的原生格式，速度上限更高
+  v
+[2026] FP8-RL (本篇, NVIDIA)         <<< 目标论文
+  |
+  | 问题: FP8 比 INT8 更适配硬件，但 RL 里 FP8 有两个独特坑：
+  |       (1) RL 每步权重都变，要反复量化和同步
+  |       (2) FP8 误差比 INT8 更刁钻，mismatch 更难压
+  | 解法: 工程上做动态权重同步 + blockwise FP8 + KV cache 量化；
+  |       算法上沿用 TIS，并探索 end-to-end FP8 进一步收窄差距
+  v
+[2025-11] vLLM Bitwise-Consistent  +  [2025] Qi et al. FP16
+  |
+  | 反方向的两条路:
+  | 路A (vLLM): 算子层面做到 bitwise 一致，mismatch = 0
+  | 路B (FP16): 别折腾 BF16/FP8 了，直接用 FP16，根源上消除 rounding 漂移
+#+end_example
+
+* 演化叙事
+
+** 2023 | DeepSpeed-Chat: 把 RLHF 工程化
+
+*** 它看到了什么问题
+
+InstructGPT 发表后，大家都知道 RLHF 是 ChatGPT 成功的关键，但代码没人有。研究者要训一个 RLHF 模型，得自己从 PPO 开始拼。
+
+*** 它的解法
+
+微软把整个 RLHF 三阶段（SFT、奖励模型、PPO）打包成开箱即用的库，Actor、Critic、Reward、Reference 四个模型都在同一个进程里同步跑。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它确实让 RLHF 跑起来了。但所有模型挤在一起意味着两件事：第一，你没法给"生成"这一步单独用最快的推理引擎；第二，rollout 阶段慢，但训练那几张卡只能干等着。集群越大，浪费越严重。这就是下一代框架要解的题。
+
+** 2024 | HybridFlow / verl: 解耦训练和推理
+
+*** 它看到了什么问题
+
+DeepSpeed-Chat 把所有东西捆在一起，但 LLM 世界里训练框架（FSDP、Megatron-LM）和推理框架（vLLM、SGLang）各自都在飞速进化。你要么用最强的训练，要么用最强的推理，没法两个都要。
+
+*** 它的解法
+
+字节的 verl 用 Ray 把训练和推理彻底拆开——训练那边随便挑后端，生成那边随便挑引擎，中间用一个调度层把权重同步过去。OpenRLHF、NeMo-RL 走的是类似思路。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+速度立刻起来了，因为生成可以用 vLLM 的 PagedAttention 这种最先进技术。但有个新东西冒出来：训练那一边的 FSDP forward pass 和推理那一边的 vLLM forward pass，虽然权重一模一样，但 kernel 实现不同、并行切分不同、累加顺序不同——同一个 prompt 喂进去，两边算出来的 logits 居然不完全一样。这个差异平时看不见，但在长序列上会累积，变成下一个故事的主角。
+
+** 2025 | When Speed Kills Stability: 给"莫名崩溃"开诊断书
+
+*** 它看到了什么问题
+
+很多人用 verl 训 RL，跑着跑着模型就崩了——loss 飞掉、accuracy 突然归零，但没人说得清为什么。大家凭经验加各种 trick，没人去搞清根因。
+
+*** 它的解法
+
+这篇文章把崩溃的根因坐实了：训练以为自己在做 on-policy RL（用当前 policy 的样本更新当前 policy），但因为解耦架构里 rollout policy 和 training policy 数值上不同，更新实际上是 off-policy 的。off-policy 没做修正，PPO 这种算法在长序列上会被放大的 likelihood ratio 推到爆炸。药方是经典的 importance sampling，但要做截断（Truncated IS / TIS）：把过大的权重 clip 在一个上限里，控制方差。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+诊断 + 药方，让大家知道"哦原来不是 RL 算法不行，是工程上数值漂移"。但 TIS 处理的只是"两边都是 BF16 但 kernel 不同"这种小差异。如果有人故意让 rollout 跑得更糙——比如直接用低精度——TIS 还压得住吗？
+
+** 2025 | FlashRL: 把 rollout 压到 INT8
+
+*** 它看到了什么问题
+
+既然 mismatch 可以用 TIS 修，那 rollout 这边为什么还要老老实实用 BF16？低精度 rollout 能省内存、提吞吐，按理说能让 RL 训练快一大截。但之前没人敢试，怕训崩。
+
+*** 它的解法
+
+FlashRL 把 rollout 直接量化成 INT8，配合 TIS 做修正，证明了"激进降精度 + 软性修正"这条路在 RL 里是走得通的。8-bit rollout，full power RL。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+它打开了一扇门——原来 rollout 精度是可以单独砍的。但 INT8 在硬件上是上一代的优化对象，新的 Hopper / Blackwell GPU 原生支持的是 FP8，理论上速度比 INT8 还要快。而且 INT8 的量化误差结构和 FP8 不一样：FP8 有指数位，动态范围大但精度分布不均，对 RL 这种"长序列累积误差"的场景到底有什么影响？没人系统试过。
+
+** 2026 | FP8-RL: 把 FP8 推上 RL 主战场 (目标论文)
+
+*** 它看到了什么问题
+
+FP8 在推理（vLLM、TensorRT-LLM）和预训练（DeepSeek-V3）都已经成熟，但 RL 里几乎没人用。因为 RL 有两个静态推理没有的坑：
+
+第一，*权重每步都变*。静态推理只需要量化一次模型就完事，但 RL 每个训练 step 之后，最新权重都要重新量化、重新搬到推理引擎里。这个反复同步在解耦架构下工程极其难做。
+
+第二，*FP8 的误差比 INT8 更微妙*。INT8 是均匀量化，误差好预测；FP8 有指数位，小值精度高、大值精度低，在长序列（20K tokens）的自回归生成里，误差累积形态完全不一样。TIS 还压得住吗？要不要更狠的修正？
+
+*** 它的解法
+
+把整套 stack 在 verl 框架里打通：
+
+1. *Linear 层 W8A8 blockwise FP8 量化* —— 权重静态量化、激活动态量化、按 block 分别算 scale。Block 粒度细，精度损失小。
+2. *KV cache FP8 量化* —— 这是真正的大头。长上下文（20K tokens）里，KV cache 才是内存瓶颈，把它从 BF16 砍到 FP8，effective cache 容量翻倍，并发量上去，吞吐量飞涨。难点是 K/V 的分布每步都在变，所以每个 step 都要重新校准 QKV 的 scale。
+3. *沿用 token-level TIS（C=2）做 mismatch 修正* —— FlashRL 那一套继续用，验证在 FP8 下依然有效。
+4. *探索 end-to-end FP8* —— 不只 rollout 用 FP8，连训练也用 FP8（参考 DeepSeek-V3 的 hybrid recipe：forward E4M3、backward E5M2），这样两边都是低精度，反而 mismatch 更小。
+
+结果：dense 模型 rollout 提速 10-20%，MoE 模型 30-50%，组合 KV cache 量化最高 44% 加速，accuracy 跟 BF16 baseline 几乎一致。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+管用的关键不在 FP8 本身，而在"工程 + 算法"两条腿走路：工程上把动态量化和权重同步做扎实，算法上承认 mismatch 必然存在，用 TIS 软性修正。两边都不追求完美，但合起来够稳。
+
+但留下了几个坑：
+- MoE 模型在某些配置下，仅靠 TIS 还不够，需要 Rollout Router Replay (R3) 或 Masked IS (MIS) 这类专门修正路由的技术。
+- 更激进的精度（NVFP4）他们试了一下，会因为量化误差累积失稳。
+- 最根本的问题没解：mismatch 还在，只是被压住了。能不能让它从根上消失？
+
+* 前沿延伸
+
+** 2025-11 | vLLM Bitwise-Consistent: 算子层面消除 mismatch
+
+跟 FP8-RL 完全相反的思路。FP8-RL 是"承认 mismatch 必然存在，用 TIS 软修"；vLLM 和 TorchTitan 团队这条路是"从工程上做到 bitwise 一致——训练和推理算出来的每一个 bit 都相同"。做法是统一 kernel、强制确定性、对齐并行切分。代价是放弃了一些推理优化，速度可能没 FP8-RL 那么夸张。但如果做到了，TIS 这类修正都不需要了。
+
+** 2025 | Qi et al. - Defeating the Mismatch via FP16
+
+更釜底抽薪的诊断。这篇说："你们都在 BF16 上折腾 mismatch，但根本原因可能就是 BF16 本身——BF16 的 rounding 误差在自回归解码里会累积，导致 rollout 和 training 漂移。" 解法：所有地方换成 FP16（不是 BF16），rounding 行为一致，mismatch 立刻收窄。
+
+这条路跟 FP8-RL 是对立的：FP8-RL 是"更低精度 + 修正"，FP16 派是"换个精度格式，根上消除"。哪条路赢，可能取决于硬件下一步往哪走。
+
+** 后续可能的方向（论文自己提的）
+
+- NVFP4（4-bit floating point）—— 更激进，但目前不稳定
+- 大模型上的验证
+- 多轮对话 / Agentic RL 场景，序列更长，rollout 瓶颈更夸张
+
+* 一张图看懂
+
+#+begin_example
+                  RL 的「速度 vs 稳定」拉锯战 (2023 -> 2026)
+                  ==========================================
+
+  精度     |
+  (高 -> 低)|
+           |  [BF16, 同步执行]
+   BF16    |  DeepSpeed-Chat (2023)
+           |  - 慢但稳，没人讨论 mismatch
+           |        |
+           |        v 解耦架构出现
+           |
+   BF16    |  HybridFlow/verl (2024)  --[副作用]-->  mismatch 第一次冒头
+           |  - 训练/推理分家，速度起飞
+           |        |
+           |        v 训练开始莫名崩溃
+           |
+   BF16    |  When Speed Kills (2025)
+           |  - 诊断: mismatch 是元凶
+           |  - 药方: TIS (软修正)
+           |        |
+           |        v 「软修正」开了个口
+           |
+   INT8    |  FlashRL (2025)
+           |  - 既然能修，rollout 砍到 INT8
+           |        |
+           |        v 但 INT8 不是硬件原生
+           |
+   FP8     |  >>> FP8-RL (2026, 本篇) <<<
+           |  - 工程: 动态量化 + KV cache + 权重同步
+           |  - 算法: TIS 继续用 + E2E FP8 探索
+           |  - 44% 提速，accuracy 不掉
+           |       /  \
+           |      /    \
+           |     v      v
+   FP16/  | vLLM Bitwise   Qi et al. FP16
+   Bitwise| (2025-11)      (2025)
+   一致   | "0 mismatch"   "换 FP16 根除"
+           |
+           |
+   未来: NVFP4? 多轮 Agentic RL?
+#+end_example
+
+* 洞见
+
+读完这条线，看到的不是 "FP8 终于来了 RL"，而是一个反复出现的模式：
+
+*每一次工程优化（解耦、低精度、并行加速）都会破坏算法的一个隐含假设。* 解耦破坏了"训练和推理是同一个 policy"的假设；低精度破坏了"数值精确"的假设。然后算法人出来打补丁（importance sampling），把假设放宽一点：from "完全 on-policy" 放宽到 "near on-policy + 修正"。
+
+但这种打补丁是有上限的。补丁越多，方差越大，稳定性越差。所以你看到 2025 年开始出现两条岔路：
+
+- *补丁路（FP8-RL 这一派）*：继续在工程上往低精度走，靠 TIS/MIS/R3 这类越来越精细的修正撑住。优势是吞吐持续往上，劣势是修正本身有副作用，且对超参敏感。
+- *根除路（vLLM bitwise / FP16 派）*：承认补丁是死胡同，回头从根上消除 mismatch。优势是干净，劣势是放弃了一些工程灵活性。
+
+哪条路赢，本质上取决于一个判断：*mismatch 是 RL 的本质属性还是工程实现的人为产物？* 如果是前者，补丁是宿命；如果是后者，根除是终局。
+
+下一步最可能往哪走？我赌 *两条路并行，且 MoE 会成为试金石*——因为 MoE 的 router 让 mismatch 多了一个新维度（专家选择都不一样），仅靠 IS 不够，R3 这种"重放"机制说明业界已经开始从"修正"转向"对齐"。一旦"对齐"思路成熟，FP8 这条路上也会出现"FP8 但 bitwise 一致"的杂交品种。
+
+* 启发
+
+这条线最深的启发不是技术，是研究品味：
+
+1. *先有诊断书，再有药方*。"When Speed Kills Stability" 这篇没提出任何新方法，但它把一个大家都模糊感受到的问题坐实了，整个领域才能往前走。做研究不一定要发明新东西，把别人的麻烦说清楚也是核心贡献。
+
+2. *别只看自己解的题，看你解题时引入了什么新假设*。HybridFlow 解了"框架灵活性"问题，但顺手破坏了"on-policy"假设；FP8-RL 解了"rollout 速度"问题，但顺手放大了 mismatch。每一次贡献都要问：我让别人接下来要解什么新问题？
+
+3. *工程和算法是同一个问题的两面*。这条线上工程派（NVIDIA、vLLM 团队）和算法派（importance sampling、FP16 派）的工作互相咬合，谁也离不开谁。能把两边都看进去的人，能看到下一个机会在哪。
+
+这意味着你可以——在自己的工作里养成"找诊断书"的习惯：每次决策前先问，这个问题到底卡在哪儿？把这个想清楚，解法往往自己跳出来。

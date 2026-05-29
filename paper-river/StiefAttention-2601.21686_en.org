@@ -1,0 +1,293 @@
+#+title:      Don't be so Stief! Learning KV Cache low-rank approximation over the Stiefel manifold
+#+date:       [2026-05-29 Fri 08:28]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T082849-en
+#+source:     https://arxiv.org/abs/2601.21686
+#+authors:    Luca Benfenati, Matteo Risso, Andrea Vannozzi, Ahmet Caner Yüzügüler, Lukas Cavigelli, Enrico Macii, Daniele Jahier Pagliari, Alessio Burrello
+#+venue:      arXiv preprint, 2026-01-29
+
+* The River of the Problem
+
+During long-context inference, the model stores every token's key and value in GPU memory — that is the KV cache. The problem is that it bloats. Llama3-8B running a 32K context with batch size 4 needs 16 GB for the KV cache alone, as much as the model weights themselves. Memory runs out, bandwidth starves, and the entire inference pipeline is bottlenecked by it.
+
+Many approaches have been tried: dropping unimportant tokens, compressing values to low precision, redesigning attention architectures. Another route is: since each head's key/value vectors have a high dimension d_h (typically 128), project them into a smaller subspace and store only the projected coefficients. This is the "low-rank compression" route.
+
+The difficulty is not the projection itself — one SVD gives the optimal low-rank approximation. The difficulty is *what the projection should actually minimize*. SVD minimizes the reconstruction error of the keys themselves; but keys are not the final output — they pass through softmax, multiply values, go through the FFN, through LayerNorm, add residuals, and propagate to the next layer. Reconstructing the keys accurately up front does not mean the final layer output still resembles the original. This has been the stubborn knot in this river for five years.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani - Attention Is All You Need
+  |
+  | KV cache is born as a side-effect of inference acceleration,
+  | but no one yet realizes it will become a bottleneck
+  v
+[2023] Pope et al. - Efficiently Scaling Transformer Inference
+  |
+  | Quantifies the problem: KV cache grows linearly with
+  | (seq_len * batch * layers); long contexts exhaust HBM
+  v
+[2023] Ainslie - GQA (Grouped-Query Attention)
+  |
+  | Multiple query heads share one KV head,
+  | directly cutting the number of KV heads
+  | But: requires retraining; compression ratio is limited
+  |      (can only cut along the head axis, not within a head)
+  v
+[2024] DeepSeek-V2 - MLA (Multi-Head Latent Attention)
+  |
+  | Projects K/V into a low-dimensional latent at the architecture level,
+  | compressing from the source
+  | But: requires training from scratch or heavy fine-tuning;
+  |      existing models cannot use it as-is
+  v
+[2023] Yuan et al. - ASVD / K-SVD (post-training starting point)
+  |
+  | Applies SVD directly to a trained model:
+  | projection matrix = top-r right singular vectors of K
+  | No retraining needed, immediately applicable
+  | But: only reconstructs K itself, ignores how Q scores
+  v
+[2024] Saxena - EigenAttention
+  |
+  | Observes that projecting K implicitly projects Q too
+  | (since QK^T shares the projection space)
+  | Solution: stack [K; Q] vertically and SVD the joint matrix
+  | But: whichever has larger variance dominates; K and Q crowd each other out
+  v
+[2025] Lesens - KQ-SVD
+  |
+  | Instead of reconstructing K or Q, directly reconstruct their product QK^T
+  | (the attention scores themselves)
+  | But: QK^T still passes through softmax and value mixing — still a proxy
+  v
+[2026] StiefAttention (this paper)
+  |
+  | No more proxies: directly minimize the output error of the entire decoder layer
+  | An MLP learns the projection basis from activation statistics;
+  | QR decomposition enforces orthogonality; lives on the Stiefel manifold
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Attention Mechanism Brings KV Cache as a "Side Effect"
+
+*** What Problem It Saw
+
+RNNs must process one token at a time, with no parallelism — slow to train and unable to handle long sequences.
+
+*** Its Solution
+
+Discard temporal recurrence entirely and use attention — every token directly attends to all others globally. All positions are computed in parallel during training.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+Parallelism unlocked the full compute capacity of GPUs, enabling larger models. But inference is different: generating the N-th token requires the keys and values of the preceding N-1 tokens. Recomputing them every time would cost O(N^2). So people cached the previously computed K and V — the KV cache was born.
+
+At the time, nobody thought of this as a problem. Until models grew larger, contexts grew longer, and the cache's storage and bandwidth demands drained HBM.
+
+** 2023 | Pope et al.: Quantifying "KV Cache Too Large" as a Hard Wall
+
+*** What Problem It Saw
+
+The larger the model, the longer the context, and the larger the batch, the more linearly the KV cache's memory footprint grows. At the time, researchers were still grinding on weight quantization, not realizing that the cache was the true bottleneck in long-context scenarios.
+
+*** Its Solution
+
+Not a new algorithm, but a clear accounting: a single formula shows that PaLM-540B running 2K context with batch 512 needs hundreds of GB for the KV cache alone. From that point on, "KV cache optimization" became an independent research direction.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+Naming the problem sent the entire community running down this path. But exactly how to compress? Three branches sprouted simultaneously:
+- Drop unimportant tokens (eviction: StreamingLLM, H2O)
+- Compress values to 4-bit/2-bit (quantization: KVQuant)
+- Reduce the dimension (low-rank: the line that follows)
+
+This paper takes the third branch.
+
+** 2023 | GQA: Multiple Query Heads Share One KV, Cutting "Redundant Heads"
+
+*** What Problem It Saw
+
+Standard multi-head attention pairs each query head with an independent K head and V head. Llama-2-70B has 64 heads, so the KV cache must store 64 copies. But many heads learn highly correlated representations — storing this much is wasteful.
+
+*** Its Solution
+
+Let multiple query heads share one K/V head — for example, 8 query heads sharing 1 KV head cuts the KV cache by 8×.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+Simple and effective; the entire Llama-3 family uses it. But it can only cut along the "head count" dimension — the 128 features inside each head are stored intact. To compress further, you must go inside the head. And GQA is an architectural change that requires retraining.
+
+** 2024 | MLA (DeepSeek-V2): Inserting a Latent Space Directly Into the Architecture
+
+*** What Problem It Saw
+
+GQA is a "coarse grouping" — it can only cut in whole groups. To more finely compress the 128 dimensions inside each head, GQA offers no help.
+
+*** Its Solution
+
+Project each head's K and V into a shared low-dimensional latent space (e.g., 512 dimensions) and cache only the latent variables. When K/V are needed, project back up. DeepSeek-V2/V3/R1 all rely on this to compress the cache to 1/10 of its original size while maintaining performance.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+It acknowledges at the architectural level that K and V have intrinsically low-rank structure. But there is a hard limitation: existing Llama, Qwen, and Mistral models have no such latent space — to use MLA, you either train from scratch or heavily fine-tune after a major architectural change. TransMLA (Meng et al., 2025) attempts a post-training conversion but still cannot avoid fine-tuning.
+
+Is there a way to apply this kind of compression to an already-trained model *without touching weights or fine-tuning*? That is the starting point of the SVD route.
+
+** 2023 | K-SVD / ASVD: The First Post-Training Compression of the Head Dimension
+
+*** What Problem It Saw
+
+MLA is too heavy — Llama models already deployed in production cannot be changed at will. What is needed is a *plug-and-play* method: no retraining, no fine-tuning, just a few hundred calibration samples and it is done.
+
+*** Its Solution
+
+The most natural idea: apply SVD to each head's K matrix and take the top-r right singular vectors as the projection matrix. During compression: K_compressed = K @ P; during use: K_reconstructed = K_compressed @ P^T. SVD guarantees that the reconstruction error of "K itself" is minimized. The same is done for V.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+SVD is the optimal low-rank approximation of "the matrix K." But K is not the endpoint — it must form an inner product with Q, then pass through softmax to produce attention scores.
+
+Consider: suppose K has a dimension with large variance that is nearly orthogonal to Q. SVD will prioritize that dimension (because of large variance), but it contributes nothing to attention scores. The truly important direction is discarded. "K reconstructed well" and "attention computed correctly" are not the same thing.
+
+The accuracy drop was intolerable. The next step focused squarely on this gap.
+
+** 2024 | EigenAttention: "Projecting K Also Projects Q — So Project Them Together"
+
+*** What Problem It Saw
+
+K-SVD optimizes only against K, missing the fact that Q and K share a projection space — when you compress K, you are implicitly constraining which dimensions of K are visible to Q. Directions that are important to Q but have small variance in K get ruthlessly discarded by K-SVD.
+
+*** Its Solution
+
+Stack K and Q vertically into a single matrix [K; Q] and apply SVD to this *joint matrix*. The selected projection directions then account for the variance of both K and Q. The trade-off is that the projection matrix retains directions that benefit both parties.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+One step better than K-SVD. But a problem surfaces: when stacking for SVD, *whoever has larger magnitude dominates*. If K's magnitude is 10× that of Q, SVD is mainly preserving K — and Q is ignored again. EigenAttention is a "hope-for-the-best" solution that only works when K and Q happen to be at similar scales.
+
+** 2025 | KQ-SVD: Don't Project K or Q — Directly Reconstruct Their Product
+
+*** What Problem It Saw
+
+Stacking K and Q for SVD is merely a hack. What actually determines attention is their product QK^T — the pre-softmax attention scores. Directly minimizing the reconstruction error of QK^T is the genuinely correct target, isn't it?
+
+*** Its Solution
+
+Write QK^T as (Q @ P_Q)(K @ P_K)^T, apply truncated SVD to the original QK^T, and solve in closed form for the optimal P_Q and P_K. Q is compressed via P_Q and K via P_K, and the resulting attention score matrix is the optimal reconstruction under the low-rank constraint.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+At last the target is aimed at "attention scores" rather than "K itself." But QK^T is still not the endpoint — it passes through softmax, is multiplied by V, goes through the output projection, then through residuals, LayerNorm, and FFN, propagating to the next layer.
+
+Softmax is nonlinear. No matter how well QK^T is reconstructed beforehand, nobody can say how the error will be amplified after softmax. This proxy is closer than the previous two, but it is still a proxy.
+
+To go all the way, the target must be pulled to the very end — directly optimizing against the *decoder layer's output*.
+
+** 2026 | StiefAttention: Pulling the Target to the Decoder Layer's Output
+
+*** What Problem It Saw
+
+K-SVD optimizes K, EigenAttention optimizes [K;Q], KQ-SVD optimizes QK^T — this is a chain gradually "moving downstream," each step closer to the true evaluation metric, but none arriving there. A layer's output = norm(softmax(QK^T/√d) @ V @ W_O + residual) fully computed, then + FFN(...), is the final output of that layer. Every prior proxy stops at some intermediate station.
+
+Moreover, the relative quality of these proxies is not intuitive: the paper empirically finds that SVD-based methods *reconstruct attention output more accurately* (29.6% lower attention error), yet *the final layer output is actually worse* — because small deviations after softmax are amplified by V mixing, the output projection, and the FFN.
+
+*** Its Solution
+
+Directly use *the layer output reconstruction error* as the objective. The difficulty is that the projection matrix must be orthogonal (without orthogonality it is not a valid subspace projection and breaks the geometric structure of K/V). This problem — gradient descent under a constraint manifold — is Stiefel manifold optimization.
+
+How it works:
+1. For each layer, collect per-dimension mean and variance of K and V (μ, σ^2) — a simple 4·d_h-dimensional feature vector.
+2. A small MLP maps these statistics to a d_h × d_h matrix A.
+3. QR decomposition is applied to A and the Q factor is taken — guaranteeing orthogonality.
+4. The first r columns are truncated to obtain the projection matrix P.
+5. P is used to reconstruct K/V, a full layer forward pass is run, and the relative error against the original layer output is computed.
+6. Gradients propagate back to the MLP parameters. Each layer is trained independently.
+
+KV heads share the K projection basis (since K is already group-shared in GQA), but each KV head learns its own V projection basis (since V directly feeds into the head-specific output projection, where differences are large).
+
+The error surface for each layer at different (r_K, r_V) values is precomputed and stored. At deployment, given an error budget ε, ranks are allocated per layer by table lookup — no retraining required, just a weighted Pareto selection.
+
+*** Why It Worked (and Where a New Trap Was Buried)
+
+The target is pulled from a proxy to the true objective. At the same compression ratio on Llama3-8B, StiefAttention achieves 11.9 points lower C4 perplexity and 5.4% higher MMLU than EigenAttention.
+
+Remaining gaps:
+- The projection bases have no structure beyond parameter sharing — each layer and each head must be learned separately.
+- Although the MLP predictor is only used offline, training requires one full forward pass per layer per rank, so calibration cost is non-trivial.
+- The error surface is precomputed; ranks are still *determined offline*. If input distributions vary widely (e.g., code vs. natural language), the same basis may not be optimal for each.
+
+* Frontier Extensions
+
+StiefAttention was posted as a preprint in January 2026, the latest step along this line. Foreseeable next steps:
+
+- *Input-adaptive rank allocation*: ranks are currently determined offline per layer; a natural extension is dynamic adjustment per input — low rank for simple prompts, high rank for complex ones.
+- *Orthogonal combination with quantization*: low-rank compression handles "dimensionality," quantization handles "bits per dimension." The two are theoretically multiplicative (low-rank + 4-bit quantization), but joint optimization has not been done systematically.
+- *Joint use with token eviction*: important tokens get high rank; low-weight tokens get low rank or are dropped entirely.
+- *Applying the layer-output optimization idea to MLA training*: MLA's latent dimension is currently hand-tuned; could StiefAttention's layer-output objective automatically choose the latent size per layer?
+
+* One Diagram to Understand It All
+
+#+begin_example
+                  The river of "what exactly is the projection target"
+                  -----------------------------------------------------
+
+  Optimization Target    Representative Method    Distance to Layer Output
+
+  K itself               K-SVD                       ~~~~~~~~~~~~~~ (far)
+  (Yuan 2023)             |
+                          |  "Q is also projected — add Q together"
+                          v
+  Joint [K; Q]           EigenAttention              ~~~~~~~~~ (closer)
+  (Saxena 2024)           |
+                          |  "Both K and Q are proxies — reconstruct their product"
+                          v
+  QK^T (scores)          KQ-SVD                      ~~~~~ (closer still)
+  (Lesens 2025)           |
+                          |  "softmax/V/FFN all come after QK^T — all skipped"
+                          v
+  Full layer output      StiefAttention              . (arrived)
+  (Benfenati 2026)
+
+
+  How orthogonality is enforced:
+    K-SVD / Eigen / KQ-SVD : closed-form SVD, naturally orthogonal
+    StiefAttention          : MLP outputs A -> QR decomposition takes Q
+                              -> lands on the Stiefel manifold
+
+  How rank is chosen:
+    First three : uniform allocation or empirical heuristics
+    StiefAttention : prestore per-layer error surfaces,
+                     allocate by budget via table lookup
+#+end_example
+
+* Insight
+
+What is truly happening along this line is a process of *proxy targets progressively stepping aside*.
+
+Each generation moves closer to the true objective:
+- K-SVD trusts that "reconstructing K is enough"
+- EigenAttention corrects to "K and Q together"
+- KQ-SVD corrects to "their product"
+- StiefAttention corrects to "the full layer's final output"
+
+But each step "closer" comes at a cost: closed-form solutions become SGD, a few lines of numpy become hundreds of epochs of MLP training, interpretable geometric properties (singular value ordering) give way to black-box optimization.
+
+This is a universal pattern: *when you can afford more complex optimization, you should pull the target from a proxy to the true objective*. SVD was popular in the early days because it yielded results instantly; now calibration requires only 512 samples and finishes in a few hours — direct gradient descent to the true target is no longer expensive.
+
+One level deeper: this pattern is not unique to KV cache. Pruning, quantization, and knowledge distillation all follow the same evolutionary arc — from "reconstruct intermediate tensors" to "reconstruct layer outputs" to "reconstruct final logits/loss." Each time the target is pulled one step further downstream, performance improves one tier and complexity rises one tier. When compute gets cheaper, this migration happens.
+
+Where is the next step most likely to go? My bet is *input-adaptive*. The decoder layer output is itself input-dependent; the optimal projection basis genuinely differs for different prompts. Every existing method is finding "the average optimal basis over a set of calibration data" — the next step is either bucketing by prompt type or doing lightweight input-conditional prediction directly.
+
+* Implications
+
+This river gives us three prompts for doing research and choosing problems:
+
+1. *Watch the gap between "proxy" and "true target."* Wherever someone is optimizing a proxy when they could optimize the real objective directly — that is an opportunity. SVD was used for KV cache compression for three years, with nobody questioning whether its target was correct. The moment someone swapped the target, they immediately gained 11.9 PPL points.
+
+2. *Harvest the dividend of falling compute costs.* A decade ago, SVD was the only realistic option because GPUs could not afford gradient descent to layer outputs. Today they can — every place where "SVD was used as a substitute under duress" is worth revisiting.
+
+3. *Manifold-constrained optimization is an underrated tool.* When your parameters must satisfy some structural constraint (orthogonality, low-rank, sparsity), gradient descent directly on the manifold is generally more stable than "projecting back post-hoc" or "adding a penalty term." Stiefel/Grassmann manifold methods deserve to be picked back up in the LLM era.
+
+The practical takeaway is this: next time you see a problem solved with SVD/PCA/spectral methods, ask — "If I did SGD directly against the final objective, would that be better?" The answer is almost certainly yes.

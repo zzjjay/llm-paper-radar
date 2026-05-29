@@ -1,0 +1,270 @@
+#+title:      KBVQ-MoE: KLT-guided SVD with Bias-Corrected Vector Quantization for MoE Large Language Models
+#+date:       [2026-05-29 Fri 09:10]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T091002-en
+#+source:     https://arxiv.org/abs/2602.11184
+#+authors:    Zukang Xu, Zhixiong Zhao, Xing Hu, Zhixuan Chen, Dawei Yang
+#+venue:      ICLR 2026
+
+* The Problem River
+
+Squeezing a hundred-billion-parameter "committee of experts" model onto a consumer GPU — without letting it get dumb.
+
+What makes this hard? MoE (Mixture of Experts) models split a large model into dozens or hundreds of "experts" to make inference cheap, activating only two or three at a time. That sounds frugal, but the total parameter count is actually several times larger than a dense model of equivalent capability — because all the expert weights must live in VRAM permanently, even though most of them are idle most of the time.
+
+The natural response: compress the weights — 4-bit, 3-bit, 2-bit storage. For dense models, people have already blazed that trail; GPTQ and AQLM pushed bit-widths down to the floor. But the moment you apply the same techniques to MoE models, accuracy collapses. Why? Nobody had a clear answer.
+
+This river is the story of successive generations asking: *Where exactly is the boundary of extreme low-bit compression? And why is MoE a uniquely hard nut to crack?*
+
+* Source Map
+
+#+begin_example
+[2010] Jegou et al. - Product Quantization (PQ)
+  |
+  | Problem: hundreds of millions of image vectors won't fit in RAM
+  | Solution: slice each high-dimensional vector into segments; each
+  |           segment looks up its nearest representative in a small codebook
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: a 175B LLM can't be served on a single GPU
+  | Solution: quantize weights column by column, compensate errors with
+  |           Hessian, achieve near-lossless 4-bit compression
+  v
+[2024] Egiazarian et al. - AQLM (Additive Quantization for LM)
+  |
+  | Problem: scalar quantization collapses at 2-bit — only 4 values per weight
+  | Solution: bring PQ ideas back to LLMs — sum multiple small codebooks
+  |           to represent a group of weights; holds up even at 2-bit
+  v
+[2025] Zhang et al. - MoEQuant
+  |
+  | Problem: rare experts get too few calibration samples in MoE,
+  |          amplifying their quantization error
+  | Solution: rebalance the calibration set by routing statistics so
+  |           cold experts receive adequate coverage
+  v
+[2026] Xu et al. - KBVQ-MoE  (this paper)
+  |
+  | Problem: all of the above break at ≤3-bit on MoE because they miss
+  |          the two true root causes:
+  |            (a) experts share large amounts of redundant "common" weights,
+  |                wasting codebook capacity by encoding them repeatedly
+  |            (b) multiple expert outputs are summed by the router, so
+  |                quantization errors accumulate and amplify
+  | Solution: use KLT in the input space to separate "common" from
+  |           "individual" components; keep the common part in high
+  |           precision via SVD; send only the individual residuals into VQ;
+  |           then add a channel-wise affine correction layer to pull
+  |           the accumulated output bias back
+  v
+[?]   Next generation — see "Frontier Extensions"
+#+end_example
+
+* Evolutionary Narrative
+
+** 2010 | PQ: Packing High-Dimensional Vectors into Your Pocket
+
+*** What Problem Did It See?
+
+In that year, Jegou et al. were solving an image retrieval problem: hundreds of millions of images, each represented as a several-hundred-dimensional feature vector, all heaped in memory for nearest-neighbor search — servers couldn't cope. The dominant approach at the time was hashing (LSH and relatives), compressing vectors into short binary strings to save memory. But the problem was that after hashing you could only compute Hamming distance, which diverges badly from the original Euclidean distance, causing recall to drop alarmingly.
+
+"Save memory" on one side, "compute distances accurately" on the other — before 2010, no one could do both at once.
+
+*** Its Solution
+
+PQ's (Product Quantization) clever idea is simple: *don't try to compress an entire vector into a single code — slice it into segments and compress each segment independently.*
+
+Concretely: a 128-dimensional vector is split into 8 segments of 16 dimensions each. A separate "mini-dictionary" of 256 representative 16-dimensional vectors is trained for each segment. Each segment of the original vector is stored as the index of its closest representative — a single byte.
+
+A 128-dimensional vector becomes 8 bytes, a compression ratio of over 60×, and distances can still be computed quite accurately — because reconstruction looks up real numeric values from the mini-dictionary rather than doing a crude binary approximation.
+
+*** Why It Worked (and What New Pit It Dug)
+
+PQ's power comes from getting one thing right: *letting compression and semantics happen in the same space*. Each mini-dictionary is learned by clustering, inherently encoding the data distribution as a prior.
+
+The pit it dug: PQ was designed for *search* — all it needs is an approximate direction. It never answered: if these vectors are neural-network weights, can the network still compute correctly after compression? That question would wait over a decade for an answer.
+
+** 2022 | GPTQ: Running a Giant Model on a Single GPU
+
+*** What Problem Did It See?
+
+Jump to 2022 — the LLM explosion. OPT-175B, BLOOM-176B land, and everyone is dumbfounded: just loading the weights into VRAM costs 350 GB. Ordinary people can't afford to play. Earlier methods (QAT, quantization-aware training) required retraining the entire model — starting at millions of dollars, nobody could swing it. Other post-training quantization (PTQ) methods suffered severe accuracy drops at 4-bit.
+
+The specific pain point: when you naively round weights from FP16 to INT4, *errors between adjacent weights compound each other* — one weight rounded wrong biases the next computation, which then errors even more.
+
+*** Its Solution
+
+GPTQ revived a classic technique. In 1990, LeCun introduced OBS (Optimal Brain Surgeon): when deleting a weight, use the remaining weights to compensate for the loss, with a formula involving the inverse Hessian. GPTQ replaced "deletion" with "quantization" and turned the compensation into a column-by-column sweep.
+
+Intuitive version: *you quantize the first column of weights, producing an error. You spread that error according to a formula across the columns not yet quantized, nudging them slightly in advance so that when they themselves are quantized the correction is already baked in.*
+
+Sweeping through the entire weight matrix this way, OPT-175B at 4-bit runs on a single A100 with nearly no PPL drop.
+
+*** Why It Worked (and What New Pit It Dug)
+
+GPTQ's brilliance is treating "quantization error" as something that can be deliberately *propagated and compensated*, rather than an immediate one-time loss. It is essentially a clever accountant — every error has someone to pick up the tab.
+
+The pit it dug: it is fundamentally *scalar* quantization — each weight independently picks one of 4 values. Push further down — 3-bit gives only 8 values, 2-bit gives only 4 — and Hessian compensation alone cannot save you, because the expressible precision is simply insufficient. At that point, people remembered PQ from 2010.
+
+** 2024 | AQLM: Bringing PQ Ideas Back to LLMs
+
+*** What Problem Did It See?
+
+The 2-bit barrier stopped everyone. GPTQ, AWQ, SmoothQuant all thrived at 4-bit; drop to 2-bit and the model starts talking nonsense. The reason was stated above: scalar quantization's "resolution is too coarse" — each weight has only 4 values to choose from, and no compensation algorithm, however clever, can undo that.
+
+*** Its Solution
+
+AQLM (Additive Quantization for Language Models) breaks through by: *instead of quantizing one weight at a time, packing 8 weights into a group and assigning the whole group a single codeword.*
+
+One step further: the group is represented as a *sum of multiple codebook entries* — for example, entry 17 from codebook A plus entry 42 from codebook B plus entry 5 from codebook C. Three codebooks each with 256 entries; each group of 8 weights needs only 3 bytes (24 bits), averaging 3-bit.
+
+This is the PQ idea: *let weights be compressed in their natural space rather than element-by-element*. Eight weights forming a vector in 8-dimensional space have structure — AQLM finds and exploits that structure.
+
+*** Why It Worked (and What New Pit It Dug)
+
+AQLM's core insight: *weights within a group are correlated and should be represented jointly*. This lifts "resolution" from 4 possible values per element to millions of possible combinations per 8-element group — an enormous leap in expressiveness.
+
+The pit it dug: AQLM was designed for dense models. Once you move it to MoE — each expert is a separate FFN, dozens to hundreds of experts — every assumption starts to crack. What is the relationship between experts? How similar are their weights? Should each expert have its own codebook, or share one? In 2024, no one answered.
+
+** 2025 | MoEQuant: The First Serious Look at MoE Quantization
+
+*** What Problem Did It See?
+
+Applying GPTQ or AWQ directly to MoE produces a strange phenomenon: *some experts are quantized cleanly, while others are destroyed completely.*
+
+Why? Calibration. All PTQ methods run a batch of "calibration samples" first, profiling the activation distribution of each layer. In MoE, each token activates only 2 experts — a cold expert might be activated just 3 times in 1,000 calibration samples. With such a thin statistical basis, quantization error explodes.
+
+*** Its Solution
+
+MoEQuant uses routing statistics to drive sampling in reverse: experts that are rarely activated get extra calibration samples chosen specifically to trigger them; weight allocation also favors cold experts. The essence is *rebalancing the calibration set according to the routing distribution*, ensuring every expert has enough samples for proper calibration.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It was right — but only half right. It noticed MoE's *usage* heterogeneity (uneven routing), but missed MoE's *structural* heterogeneity (overlapping weight patterns across experts). It works at 4-bit; push to 3-bit and it runs out of steam, because it doesn't change the quantization method itself, only the calibration strategy.
+
+And it sidestepped a fundamental issue: in MoE, *multiple expert outputs are summed at the routing layer* — if every expert carries a small quantization error, the accumulated error after summation is amplified several-fold. MoEQuant did not see this.
+
+** 2026 | KBVQ-MoE: Seeing the Two True Root Causes
+
+*** What Problem Did It See?
+
+The authors of KBVQ-MoE applied AQLM directly to Qwen1.5-MoE and found that 3-bit was still usable but 2-bit caused a cliff-edge accuracy drop. Looking carefully, they discovered two things everyone else had overlooked:
+
+First: *the weights of different experts contain large amounts of redundant "common" components.* You trained 60 experts, but most of what they do overlaps — all of them need to recognize nouns, all of them need to handle basic syntax. VQ independently learns a codebook for each expert, effectively storing the same "common" weights 60 times in 60 separate codebooks. Codebook capacity is inherently limited, and it is all wasted on repeated content.
+
+Second: *MoE output is the weighted sum of multiple expert outputs.* Each expert's individual quantization error may seem small — but the router sums them together, errors accumulate, and the total is far worse than in a dense model. This is *cumulative output bias*.
+
+Without addressing both, 2-bit is a dead end.
+
+*** Its Solution
+
+Two diseases, two remedies:
+
+*Remedy 1: IDRE (Input-Driven Redundancy Elimination) — extract the common part first.*
+
+Stack all expert weights together and do SVD, which in principle separates "common principal components + per-expert residuals." But plain SVD is not accurate enough — it only looks at the weight space, ignoring what the input activations actually look like.
+
+So an extra step is added: first apply a KLT transform to the *input activations* to find the directions along which input signal energy is most concentrated; then perform SVD on the weights in this "principal input direction coordinate system." The common components extracted this way are *genuinely used by the inputs*, not an artifact of the weight space alone.
+
+The common part is retained in full-precision SVD (its rank is low, so the overhead is modest); only the individual residuals (each expert's unique remainder) go into VQ. Codebook capacity is instantly freed — no more repeatedly encoding the common content.
+
+*Remedy 2: BCOS (Bias-Corrected Output Stabilization) — pull the accumulated bias back.*
+
+A *channel-wise affine transform* (one scale and one offset per channel) is attached to each expert's output. It is not trained; it is solved in closed form from a small batch of calibration samples to align the mean and variance of the quantized expert output with the full-precision output.
+
+This is equivalent to fitting a *small funnel* at each expert's output that squeezes out the systematic shift introduced by quantization before the outputs are handed to the router for summation.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The true spirit of this approach is: *stop treating MoE as a collection of parallel FFNs — it has internal structure, and that structure harbors compression headroom.*
+
+- Experts share common patterns → this is *cross-expert* redundancy
+- Outputs are summed → this is *cross-expert* error accumulation
+
+KBVQ-MoE uses KLT-SVD for the former and BCOS for the latter. At 3-bit on Qwen1.5-MoE-A2.7B, average accuracy is 67.99 (FP16 baseline: 68.07) — nearly lossless. This is the first time extreme low-bit MoE quantization has reached this level.
+
+Pits it dug:
+1. Both KLT and SVD require calibration data to estimate the input covariance; calibration set quality is decisive.
+2. The common part is stored in full precision — if its share exceeds a certain threshold, the overall compression ratio suffers.
+3. The method assumes "cross-expert common components are separable." Whether this holds for newer architectures like DeepSeekV3, which have a layered "shared experts + routed experts" design, has not been verified.
+
+* Frontier Extensions
+
+KBVQ-MoE is very new (ICLR 2026) and no clear successor has appeared yet. But two parallel lines of work in the same time window are worth watching:
+
+- *D2-MoE / SubMoE* — take a different path: directly apply low-rank decomposition + distillation to expert weights, bypassing VQ entirely. Compression ratio is limited by rank (typically 2×–3×), but the implementation is simpler. These are complementary to KBVQ-MoE and a future merger seems likely.
+- *EAC-MoE* — simply prune redundant experts. More blunt than KBVQ-MoE and incurs greater loss, but the most engineering-friendly option.
+
+Predictable next steps:
+1. Extend KBVQ-MoE ideas to "shared experts + routed experts" layered MoE architectures such as DeepSeekV3 / Kimi-K2 — shared experts are literally the "common" component, potentially cutting the IDRE extraction step in half.
+2. Make the KLT-SVD extraction phase learnable — instead of statistics gathered from a fixed calibration set, derive it end-to-end.
+3. Combine with activation quantization — KBVQ-MoE currently only compresses weights; activations remain in FP16, which is the next wall to hit.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                   The River of "Extreme Low-Bit Compression"
+   Time ──────────────────────────────────────────────>
+
+   2010      2022       2024        2025         2026
+    PQ      GPTQ       AQLM      MoEQuant     KBVQ-MoE
+  (vector)  (LLM)      (LLM)      (MoE)        (MoE)
+    |        |          |           |            |
+    |        |          |           |            |
+  Slice    Scalar +   Multi-     Calibration  Structure-
+  into     Hessian    codebook   rebalancing  aware VQ
+  indep.   compen-    additive                + bias
+  code-    sation     VQ                       correction
+  books       |          |           |            |
+    |        |          |           |            |
+  "Compress  "Errors   "Weights    "Samples     "MoE's
+   in the    should     should be   should be    internal
+   data      be         expressed   redistributed structure
+   space"    propagated jointly,    by routing,  must be
+             in a       not         so cold      exploited;
+             principled element-    experts      extract
+             way"       wise"       are cared    common
+                                    for"         parts,
+                                                 correct
+                                                 errors"
+
+  Key Turning Points:
+  ------------------
+  PQ -> GPTQ        : carry "compression for vector search" over to
+                      "neural network weights"
+  GPTQ -> AQLM      : see "scalar 2-bit hits a wall", retrieve PQ
+  AQLM -> MoEQuant  : see that MoE can't reuse dense-model recipes;
+                      fix calibration first
+  MoEQuant -> KBVQ  : see that fixing calibration is not enough;
+                      must reach inside MoE's internal structure
+
+  Direction of the Current:
+  -------------------------
+  From "per-element -> per-group -> per-expert-group -> cross-expert structure"
+  From "correct after the fact -> correct during the sweep ->
+        correct during calibration -> correct at the output"
+  From "look at weights -> look at weights×inputs ->
+        look at weights×routing -> look at weights×routing×summation"
+#+end_example
+
+* Insight
+
+Tracing the whole line, *what truly changes is not the technology but the cognitive granularity of the "compression target"*:
+
+- At first, everyone assumed the compression target was a single weight (scalar quantization), so all effort went into "how to represent each number more accurately."
+- Then people realized weights have group structure (VQ), and shifted to "compress a group of weights together."
+- Then people realized that MoE introduces "experts" as a new unit, prompting per-expert-customized calibration (MoEQuant).
+- With KBVQ-MoE, it finally became clear that *experts are not independent units* — there is cross-expert commonality and cross-expert error accumulation. The compression target rises to "the internal structure of the expert ensemble."
+
+Each step forward is the *granularity of the compression target* becoming coarser — from one number, to a group of numbers, to a cluster of experts, to the relationships among experts. Each coarsening exposes another layer of exploitable redundancy.
+
+The most likely next step: treat "experts + router" as a single unit to compress. All current methods compress only the weights and keep the router fixed in FP16. But the router is itself part of the MoE model — if the router's decisions are corrupted by quantization, the entire MoE is effectively choosing experts blindly. The next paper worth writing is *routing-aware joint quantization*.
+
+* Takeaway
+
+The river's biggest lesson for "how to find research problems": *don't ask "how do I compress harder" — ask "what am I treating as the compression target."*
+
+Every advance came not from a more intricate algorithm but from looking at redundancy at a different level. GPTQ→AQLM was not because AQLM's math is more sophisticated, but because it made a "group" the compression target. KBVQ-MoE was not because it invented a new algorithm, but because it made "cross-expert relationships" the compression target.
+
+The practical takeaway: the next time you face a performance bottleneck, don't rush to tune hyperparameters or swap frameworks — *first list what the current method treats as its "minimal unit of operation,"* then ask: can that unit be lifted one level up? Can multiple minimal units be bundled into a new, larger unit for joint treatment? The redundancy is almost always hiding in the blind spot of that one level of perspective.

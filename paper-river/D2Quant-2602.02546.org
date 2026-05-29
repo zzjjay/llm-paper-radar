@@ -1,0 +1,357 @@
+#+title:      D$^2$Quant: Accurate Low-bit Post-Training Weight Quantization for LLMs
+#+date:       [2026-05-29 Fri 09:02]
+#+filetags:   :paper:river:quantization:llm:
+#+identifier: 20260529T090211
+#+source:     https://arxiv.org/abs/2602.02546
+#+authors:    Xianglong Yan, ChengZhu Bao, Zhiteng Li, Tianao Zhang, Shaoqiu Zhang, Ruobing Xie, Samm Sun, Yulun Zhang
+#+venue:      arXiv 2026 (cs.LG)
+
+* 一句话定位
+
+D²Quant 是 2026 年初的一篇权重量化论文，专攻"4 比特以下还能保持精度"这件难事。
+它做了两件事：(1) 给 MLP 里那一层最难量化的 down-projection 偷偷加了一组等效缩放，
+不花一个比特就降低了量化难度；(2) 发现权重量化后激活会"整体偏移"，
+在 LayerNorm 里加一个均值修正就能把这股偏移抹平。
+
+要看懂这篇为什么这么写，得倒回去看一条从 2022 年一直长到今天的演化线。
+
+* 溯源地图
+
+#+begin_src text
+
+  [2022] GPTQ ---------+
+   逐层求 Hessian       |
+   把权重一个个钉好     |
+                        |
+                        v
+  [2023] SmoothQuant ---+
+   发现激活有 outlier   |
+   把难度从激活搬到权重 |
+   (per-channel scale)  |
+                        |
+                        v
+  [2023] AWQ -----------+
+   权重也有 salient channel
+   用激活分布找出关键列 |
+   只保护这些列          |
+                        |
+                        v
+  [2024] QuaRot --------+
+   outlier 是坐标系问题 |
+   Hadamard 旋转打散    |
+   activation outlier   |
+                        |
+                        v
+  [2024] OmniQuant -----+
+   per-layer 学一个     |
+   smoothing + clipping |
+   (但要训练)            |
+                        |
+                        v
+  [2025] GPTAQ / BoA ---+
+   重新打磨 GPTQ 的 Hessian
+   一路把 4 bit 做到极限|
+                        |
+                        v
+  [2026] >>> D2Quant <<<  <-- 你在这里
+   两个新发现:
+   1. down_proj 可以再榨一次 (DSQ)
+   2. 激活漂移只在 post-attention LN 是"方向性"的 (DAC)
+                        |
+                        v
+  [展望] 更激进的 sub-3-bit
+   weight + activation 联合方案
+   学习型 LN 修正
+
+#+end_src
+
+* 主角是谁
+
+主角不是论文，是一个问题：
+
+#+begin_quote
+LLM 越来越大，能不能把权重压到 3 比特、2 比特，
+还让模型基本不变笨？而且不能重训——重训太贵了。
+#+end_quote
+
+这个问题从 2022 年 GPT-3 之后一直没解决干净。每一代方案都把上限往下推一点，
+但都在 4 比特那道坎前打转。D2Quant 是这条线上的最新一个推手。
+
+下面顺着时间走，看这个问题怎么一步步逼出今天这个解。
+
+* 第一站：GPTQ — 把"量化"当成一道数学题
+
+** 它看到了什么
+
+2022 年之前，大家量化权重靠的是"舍入到最近的低比特数"。简单，但精度掉得离谱。
+GPTQ 的作者意识到：你不能孤立地量化每个权重，因为权重之间是相关的——
+你把 w1 压低一点，激活会变，整层的输出就偏了，那 w2 就应该往反方向补。
+
+** 它的解法
+
+把量化变成最小化"输出误差"的问题。对每一层 W，已知输入 X，目标是找到 Ŵ
+使 ‖WX − ŴX‖ 最小。这是个二阶问题，需要 Hessian。GPTQ 的工程贡献是
+把 Hessian 求逆这件大事用一个 Cholesky 分解+逐列处理搞定了，
+让百亿参数模型也能在几小时内量化完。
+
+** 它留下了什么问题
+
+4 比特好用，3 比特还能撑，2 比特就崩。
+原因之一是——它只盯着权重本身，没看激活的事。
+
+* 第二站：SmoothQuant — 把难度从激活搬到权重
+
+** 它看到了前人什么问题
+
+GPTQ 关心的是权重，但人们很快发现：激活里有 outlier。
+某些通道的激活值能比平均大几十倍。如果你想做 W8A8（权重激活都 8 比特），
+那几个 outlier 通道就会把整层的 scale 顶死，其他通道全被压扁。
+
+** 它的解法
+
+一个非常聪明的等价变换：
+
+#+begin_src text
+  Y = X * W
+    = (X / s) * (s * W)        <-- 数学上完全等价
+       变温和    变难一点
+#+end_src
+
+把一个对角矩阵 diag(s) 从激活那边除掉，再乘到权重这边。
+激活变得平滑（outlier 没了），权重稍微难一点（但权重本来就好量化）。
+s 怎么定？看激活的 per-channel 最大值。
+
+** 它留下了什么问题
+
+它是设计来做"权重+激活"联合量化的。
+如果你只想做权重量化（weight-only），SmoothQuant 这个等价变换其实用得没那么彻底。
+而且 s 是静态算出来的，没有针对量化误差去优化。
+
+—— 记住这个"等价变换"的思路。它是 D2Quant 那个 DSQ 的祖宗。
+
+* 第三站：AWQ — 不是所有权重都同样重要
+
+** 它看到了前人什么问题
+
+SmoothQuant 把 scale 加在通道上，是按"激活大小"算的。
+AWQ 的作者发现：权重里只有 ~1% 的通道是关键的（salient weights）。
+把这 1% 保住，其他随便压，效果就很好。怎么找？还是看激活——
+激活值大的那些通道对应的权重列就是关键列。
+
+** 它的解法
+
+per-channel 找一个 scale，让关键列被"放大"再量化（量化后再除回去），
+等于给了它们更高的有效比特。其他列照常。
+
+** 它留下了什么问题
+
+AWQ 在 4 比特很猛，3 比特开始有压力，2 比特也撑不住。
+而且它只能"放大某些列"，没办法处理某些层结构性的难量化问题
+（比如下面要讲的 down-projection）。
+
+* 第四站：QuaRot — outlier 是坐标系的问题
+
+** 它看到了前人什么问题
+
+SmoothQuant 和 AWQ 都在跟 outlier 缠斗。QuaRot 的作者退一步问：
+outlier 为什么会出现？是不是因为我们选错了坐标系？
+
+如果你把权重和激活都乘以一个正交矩阵 R（再乘上 R^T 抵消），
+数学上完全等价，但 outlier 会被"打散"到所有维度上。
+随机 Hadamard 矩阵特别适合这件事——它是稠密的、正交的、计算便宜。
+
+** 它的解法
+
+在 LLM 的关键位置（attention 输出、FFN 输入等）插入隐式 Hadamard 旋转。
+旋转后激活变得"白噪声化"，per-channel 极差大幅缩小，整层都好量化了。
+
+** 它留下了什么问题
+
+Hadamard 旋转主要打的是激活那边。权重那边的难量化层
+（比如 down-projection，下面就讲）旋转不一定能解决。
+而且 Hadamard 是"全局抹平"，无法照顾每个通道的具体特性。
+
+* 第五站：OmniQuant 等 QAT 路线 — 干脆训一点
+
+** 它看到了前人什么问题
+
+GPTQ/AWQ/QuaRot 都是 PTQ（post-training），训练完不再动。
+OmniQuant、BitDistiller、LLM-QAT 这一票方法说：
+我们让 scale 和 clipping 阈值"可学习"，用少量数据训一下，
+精度立刻上一个台阶。
+
+** 它的解法
+
+把 quantizer 里的 scale、zero-point、clipping 阈值全做成可微参数，
+用 STE（直通估计器）让梯度过得去，跑几十个 step 的微调。
+
+** 它留下了什么问题
+
+要训。要数据。要时间。OmniQuant 训一个 LLaMA-70B 要几十张卡跑几天。
+回到 PTQ 这条路，怎么 *不训* 还能继续往下挖？
+
+—— 这就把舞台让回给了 PTQ 路线，也就是 D2Quant 上场的位置。
+
+* 第六站：GPTAQ / BoA — GPTQ 的精修
+
+** 它看到了什么
+
+2025 年这一波工作把 GPTQ 的 Hessian 估计重新打磨：
+- *GPTAQ* 把输入误差也算进去（前面层量化误差会传到后面层）
+- *BoA* 用 attention 结构感知去重新算 Hessian，不需要反传
+
+这两个把 PTQ 在 4 比特的性能又推上去一截，
+基本是 D2Quant 出场前的 SOTA。
+
+** 它们留下了什么问题
+
+它们没动两件事：
+1. 都默认所有线性层用"同一种"per-row 量化策略，没看到 down-projection 的特殊性
+2. 都没修激活漂移——他们只看权重重构误差，但权重错了，激活就跟着错
+
+—— 这两个空白点，就是 D2Quant 钻进去的两个洞。
+
+* 终点站（暂时）：D2Quant — 钻两个新洞
+
+** 洞一：down-projection 还可以再榨一次（DSQ）
+
+*** 它看到了什么
+
+LLaMA 系列的 MLP 是这样的：
+
+#+begin_src text
+  X --> [W_gate] --\
+                    + --> SiLU(.) * (.) --> [W_down] --> Y
+  X --> [W_up]  --/
+#+end_src
+
+W_up 和 W_down 是配对的。前面的工作都把这三个矩阵当成"独立的层"分别量化。
+D2Quant 的作者发现：W_up 和 W_down 之间也可以做 SmoothQuant 那种等价变换！
+
+#+begin_src text
+  原始:    (...) * W_up * W_down
+  变形:    (...) * (W_up * diag(η)) * (diag(η)^-1 * W_down)
+                    ===========       =================
+                    变化可以忽略       column-wise scale 缩小了
+#+end_src
+
+为什么 "变化可以忽略" 这边真的几乎免费？
+因为 W_up 本来就用 per-row scale 量化，乘上 diag(η) 之后
+那个 η 可以"吸收"进每一行的 scale 里——不增加任何比特数，不增加运行时开销。
+
+而 W_down 那边 column-wise 极差被缩小了，量化误差立刻下降。
+这就是 *Dual-Scale Quantizer*——每个 W_down 有两个 scale：
+原来的 per-row scale s，加上新的 per-column scale s^c。
+
+*** 怎么解
+
+最小化 ‖W - Q(W) * s^c‖²。固定 s^c 算 Q，固定 Q 闭式解 s^c，
+两步交替大约 15 轮就收敛。
+
+*** 和 SmoothQuant 的差别
+
+SmoothQuant 是 *静态* 算 scale（看激活最大值），D2Quant 是 *动态* 优化
+（直接最小化量化误差）。而且 SmoothQuant 是用在 activation→weight 转移，
+D2Quant 用在 weight→weight 转移（up→down），这是新方向。
+
+** 洞二：权重量化会让激活漂移（DAC）
+
+*** 它看到了什么
+
+权重量化了，激活也会跟着变——你把 W 改成 Ŵ，那 Y = XW 也就变成 Y' = XŴ。
+没人不知道这件事，但 D2Quant 的作者多看了一眼：
+*ΔY = Y - Y' 这个漂移，在不同位置长得不一样。*
+
+具体说：
+- *attention 之后那个 LayerNorm 的输入* —— ΔY 的均值很显著（方向性偏移）
+- *MLP 之后下一层 LayerNorm 的输入* —— ΔY 大致是零均值噪声
+
+用 SNR = |μ|/σ² 一量，post-attention LN 的 SNR 高出一大截。
+
+*** 为什么这件事重要
+
+如果漂移是 *有方向的*（高 SNR），你减掉一个常数偏置 μ 就把它修了，
+误差从 μ² + σ² 降到只剩 σ²。如果是零均值噪声（低 SNR），你减常数没用。
+
+所以 D2Quant 只在 *post-attention LN* 那一处加一个学到的 bias，
+其他地方不动。这就是 *Deviation-Aware Correction*。
+
+*** 和前人的差别
+
+也有人改过 LayerNorm（比如 Norm Tweaking），但都是"哪里都改一改"。
+D2Quant 第一次说清楚 *为什么有些位置该改、有些位置不该改*，
+而且给了一个简单的 SNR 判据。
+
+* 一张图压缩整条线
+
+#+begin_src text
+
+  问题:  权重压到 sub-4-bit 不掉点
+  --------------------------------------------------------
+  GPTQ          把量化当 Hessian 优化     权重内的相关性
+                                          解决了
+  --------------------------------------------------------
+  SmoothQuant   等价变换 X/s, sW         激活 outlier
+                                          搬到权重侧
+  --------------------------------------------------------
+  AWQ           找 1% salient 列保护      不是所有权重
+                                          一样重要
+  --------------------------------------------------------
+  QuaRot        Hadamard 旋转打散         outlier 是
+                                          坐标系问题
+  --------------------------------------------------------
+  OmniQuant     可学 scale + clip          静态参数不够
+                (但要训)                  (但要训不爽)
+  --------------------------------------------------------
+  GPTAQ / BoA   精修 Hessian 估计         4-bit SOTA
+                                          但还没碰 down_proj
+                                          和激活漂移
+  --------------------------------------------------------
+  D2Quant       DSQ: up<->down 等价变换   down_proj 一直
+                DAC: post-attn LN 修偏置  被忽视; 激活漂移
+                                          没人修过
+  --------------------------------------------------------
+
+  共同主题:  *用等价变换/重参数化, 把"难量化"搬到"好量化"的地方*
+            从 SmoothQuant(X<->W) 一路演化到 D2Quant(W_up<->W_down)
+            是同一个动作在不同对象上的复用
+
+#+end_src
+
+* 这条线背后真正在发生什么
+
+表面看是"比特数越压越低"，但更深的转变是 *认知粒度*：
+
+1. *从权重 → 看到激活*（GPTQ → SmoothQuant）
+2. *从均匀 → 看到非均匀重要性*（SmoothQuant → AWQ）
+3. *从坐标轴 → 看到坐标系*（AWQ → QuaRot）
+4. *从层 → 看到层间结构*（前面所有 → D2Quant 的 DSQ）
+5. *从权重误差 → 看到激活误差的传播*（前面所有 → D2Quant 的 DAC）
+
+每一步都是把"原来不算变量的东西"变成了"可优化的变量"。
+压缩问题正在从"找好的 quantizer"演变成"找好的 *表示*"——
+先把模型重参数化到一个更好量化的形式，再用最朴素的 quantizer 就够了。
+
+* 下一步可能往哪走
+
+1. *Up-Down 等价变换* 的思路可以推广。LLaMA 的 attention 里
+   W_Q, W_K 和 W_O 之间是不是也存在类似的可吸收 scale 对？
+2. *SNR 判据* 给了一个原则化的"该不该修"标准。
+   能不能扩展到 attention 的 K/V cache、residual stream？
+3. *DSQ + DAC 都还是 PTQ*。如果在 PTQ 之后做几个 step 的
+   "对齐式 finetune"（只学这些等价 scale 和 LN bias，
+   主权重冻结），可能就能把 sub-3-bit 也推过去。
+4. *活体推理*：DSQ 加的 s^c 是离线吸收的，运行时零开销；
+   DAC 加的 bias 也是常量。这意味着这套方法可以无缝塞进
+   现有的 vLLM/SGLang 推理栈，不需要改 kernel。
+
+* 诚实声明
+
+- *引用关系*：D2Quant 论文明确引用了 GPTQ、SmoothQuant、AWQ、QuaRot、
+  OmniQuant、GPTAQ、BoA 等，都是 confirmed 的批判/对比对象。
+- *演化逻辑*：从 GPTQ → SmoothQuant → AWQ → QuaRot 这条线
+  是社区公认的主线，D2Quant 论文也是按这个顺序在 related work 里铺排的。
+- *未来推测*：上面"下一步"那一节是基于这条演化趋势的合理外推，
+  不是论文的明确预测，应被理解为分析者的判断。
+- *没读到细节*：本溯源主要依赖论文摘要、引言、相关工作和方法的 HTML 提取，
+  没有读完整的实验结果。具体 perplexity 数字、模型对比表格未纳入此叙事。

@@ -1,0 +1,429 @@
+#+title:      D$^2$Quant: Accurate Low-bit Post-Training Weight Quantization for LLMs
+#+date:       [2026-05-29 Fri 09:02]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260529T090211-en
+#+source:     https://arxiv.org/abs/2602.02546
+#+authors:    Xianglong Yan, ChengZhu Bao, Zhiteng Li, Tianao Zhang, Shaoqiu Zhang, Ruobing Xie, Samm Sun, Yulun Zhang
+#+venue:      arXiv 2026 (cs.LG)
+
+* One-line positioning
+
+D²Quant is an early-2026 weight-quantization paper that tackles the hard
+problem of "staying accurate below 4 bits." It does two things: (1) it
+quietly inserts a set of equivalent scaling factors into the hardest-to-
+quantize layer inside the MLP — the down-projection — without spending a
+single extra bit, thereby reducing quantization difficulty; (2) it
+discovers that quantizing weights causes a "global shift" in activations,
+and adds a mean-correction term inside LayerNorm to cancel that shift.
+
+To understand why the paper is structured the way it is, you have to trace
+back an evolutionary line that has been growing since 2022.
+
+* Origin map
+
+#+begin_src text
+
+  [2022] GPTQ ----------+
+   Per-layer Hessian     |
+   Pin weights one by one|
+                         |
+                         v
+  [2023] SmoothQuant ----+
+   Discovered activation  |
+   outliers; migrated     |
+   difficulty from        |
+   activations to weights |
+   (per-channel scale)    |
+                         |
+                         v
+  [2023] AWQ ------------+
+   Weights also have      |
+   salient channels;      |
+   use activation         |
+   distribution to find   |
+   key columns; protect   |
+   only those columns     |
+                         |
+                         v
+  [2024] QuaRot ---------+
+   Outliers are a         |
+   coordinate-system      |
+   problem; Hadamard      |
+   rotation scatters      |
+   activation outliers    |
+                         |
+                         v
+  [2024] OmniQuant ------+
+   Learn one per-layer    |
+   smoothing + clipping   |
+   (but requires training)|
+                         |
+                         v
+  [2025] GPTAQ / BoA ----+
+   Re-polish GPTQ's       |
+   Hessian; push 4-bit    |
+   to the limit           |
+                         |
+                         v
+  [2026] >>> D2Quant <<<   <-- you are here
+   Two new findings:
+   1. down_proj can be squeezed again (DSQ)
+   2. Activation drift in post-attention LN is "directional" (DAC)
+                         |
+                         v
+  [Outlook] More aggressive sub-3-bit
+   Joint weight + activation schemes
+   Learned LN correction
+
+#+end_src
+
+* Who is the protagonist
+
+The protagonist is not the paper — it is a problem:
+
+#+begin_quote
+LLMs keep growing larger. Can we compress weights down to 3 or even 2 bits
+while keeping the model largely intact? And without retraining — retraining
+is too expensive.
+#+end_quote
+
+This problem has never been cleanly solved since GPT-3 in 2022. Each
+generation of methods pushes the ceiling a little lower, but they all
+stall around the 4-bit barrier. D2Quant is the latest thrust along this
+line.
+
+The sections below follow the timeline to see how this problem has step by
+step forced today's solution into existence.
+
+* First stop: GPTQ — treating quantization as a math problem
+
+** What it saw
+
+Before 2022, weight quantization meant "round to the nearest low-bit
+number." Simple, but accuracy dropped catastrophically. The GPTQ authors
+realized you cannot quantize each weight in isolation: weights are
+correlated — compress w1 a little and the activations shift, the entire
+layer's output drifts, so w2 should compensate in the opposite direction.
+
+** Its solution
+
+Cast quantization as minimizing the output reconstruction error. For each
+layer W with known input X, find Ŵ that minimizes ‖WX − ŴX‖. This is a
+second-order problem that requires the Hessian. GPTQ's engineering
+contribution was to handle the costly Hessian inversion with a Cholesky
+decomposition plus column-by-column processing, making it feasible to
+quantize a 10B-parameter model in a few hours.
+
+** What problem it left behind
+
+4-bit works well, 3-bit still holds, 2-bit collapses. One reason: it only
+looks at the weights themselves and ignores the activation side.
+
+* Second stop: SmoothQuant — migrating difficulty from activations to weights
+
+** What problem it saw in its predecessors
+
+GPTQ cares about weights, but it quickly became clear that activations
+contain outliers. Certain channels can have values tens of times larger
+than the average. If you want W8A8 (weights and activations both at 8
+bits), those few outlier channels peg the whole layer's scale, squashing
+all other channels to near zero.
+
+** Its solution
+
+A very clever equivalent transformation:
+
+#+begin_src text
+  Y = X * W
+    = (X / s) * (s * W)        <-- mathematically identical
+       smoother   a bit harder
+#+end_src
+
+Divide a diagonal matrix diag(s) out of the activations and multiply it
+into the weights. Activations become smooth (outliers gone), weights
+become slightly harder to quantize (but weights are easier to quantize to
+begin with). How to set s? Look at the per-channel maximum of the
+activations.
+
+** What problem it left behind
+
+It was designed for joint weight + activation quantization. For weight-only
+quantization, the equivalent transformation is not exploited to its full
+potential. Moreover, s is computed statically and is not optimized against
+the actual quantization error.
+
+—— Remember this "equivalent transformation" idea. It is the ancestor of
+D2Quant's DSQ.
+
+* Third stop: AWQ — not all weights are equally important
+
+** What problem it saw in its predecessors
+
+SmoothQuant attaches scales to channels based on activation magnitude. The
+AWQ authors found that only ~1% of channels in the weight matrix are truly
+critical (salient weights). Protect that 1%, let the rest be freely
+compressed, and the result is very good. How to find them? Again, look at
+the activations — the weight columns corresponding to large activation
+values are the key columns.
+
+** Its solution
+
+Find a per-channel scale that "amplifies" the key columns before
+quantization (then divides back afterwards), effectively giving them higher
+effective bit-width. Other columns are handled as usual.
+
+** What problem it left behind
+
+AWQ is powerful at 4 bits, starts showing stress at 3 bits, and cannot
+hold at 2 bits. Moreover, it can only "amplify certain columns" and cannot
+address the structurally difficult quantization of certain layers (such as
+the down-projection discussed below).
+
+* Fourth stop: QuaRot — outliers are a coordinate-system problem
+
+** What problem it saw in its predecessors
+
+SmoothQuant and AWQ both wrestle with outliers. The QuaRot authors stepped
+back and asked: why do outliers appear at all? Could it be that we chose
+the wrong coordinate system?
+
+If you multiply both weights and activations by an orthogonal matrix R
+(then multiply by R^T to cancel), the math is completely equivalent, but
+the outliers get "scattered" across all dimensions. Random Hadamard
+matrices are ideal for this — they are dense, orthogonal, and cheap to
+compute.
+
+** Its solution
+
+Insert implicit Hadamard rotations at key positions in the LLM (attention
+output, FFN input, etc.). After rotation the activations become
+"white-noise-like," the per-channel dynamic range shrinks dramatically, and
+the entire layer becomes easy to quantize.
+
+** What problem it left behind
+
+The Hadamard rotation mainly targets the activation side. Difficult-to-
+quantize weight layers (such as the down-projection, discussed next) are
+not necessarily resolved by rotation. Also, Hadamard is a "global
+smoothing" and cannot accommodate the specific characteristics of each
+individual channel.
+
+* Fifth stop: OmniQuant and the QAT family — just train a little
+
+** What problem it saw in its predecessors
+
+GPTQ / AWQ / QuaRot are all PTQ (post-training): training is finished and
+nothing is touched afterwards. OmniQuant, BitDistiller, LLM-QAT and
+similar methods argue: make the scale and clipping threshold "learnable,"
+fine-tune with a small dataset, and accuracy jumps up a level.
+
+** Its solution
+
+Make the quantizer's scale, zero-point, and clipping threshold differentiable
+parameters; let gradients flow through with STE (Straight-Through
+Estimator); run a few dozen steps of fine-tuning.
+
+** What problem it left behind
+
+It requires training. It requires data. It requires time. Fine-tuning
+OmniQuant on a LLaMA-70B takes dozens of GPUs running for days. Staying
+on the PTQ path — how do you keep pushing *without training*?
+
+—— That question hands the stage back to the PTQ line, which is exactly
+where D2Quant enters.
+
+* Sixth stop: GPTAQ / BoA — polishing GPTQ
+
+** What they saw
+
+This 2025 wave of work re-polished GPTQ's Hessian estimation:
+- *GPTAQ* folds in input error (quantization error from earlier layers
+  propagates to later layers)
+- *BoA* recomputes the Hessian with attention-structure awareness, without
+  needing back-propagation
+
+Both push PTQ's 4-bit performance up another notch and represent roughly
+the SOTA just before D2Quant appears.
+
+** What problem they left behind
+
+Two things were left untouched:
+1. They assume a uniform per-row quantization strategy for all linear
+   layers, missing the special nature of the down-projection
+2. They do not correct activation drift — they only minimize weight
+   reconstruction error, but wrong weights mean wrong activations
+
+—— These two gaps are the two holes D2Quant drills into.
+
+* Final stop (for now): D2Quant — drilling two new holes
+
+** Hole one: down-projection can be squeezed again (DSQ)
+
+*** What it saw
+
+The MLP in the LLaMA family looks like this:
+
+#+begin_src text
+  X --> [W_gate] --\
+                    + --> SiLU(.) * (.) --> [W_down] --> Y
+  X --> [W_up]  --/
+#+end_src
+
+W_up and W_down are paired. Prior work treats these three matrices as
+"independent layers" and quantizes each separately. The D2Quant authors
+noticed that the same SmoothQuant-style equivalent transformation can be
+applied *between* W_up and W_down:
+
+#+begin_src text
+  Original:  (...) * W_up * W_down
+  Rewritten: (...) * (W_up * diag(η)) * (diag(η)^-1 * W_down)
+                      ===========       =================
+                      negligible change  column-wise scale reduced
+#+end_src
+
+Why is the "negligible change" side truly almost free? Because W_up is
+already quantized with a per-row scale; multiplying by diag(η) means η
+can be "absorbed" into each row's existing scale — zero extra bits, zero
+runtime overhead.
+
+Meanwhile, the W_down side sees its column-wise dynamic range shrink,
+immediately reducing quantization error. This is the *Dual-Scale
+Quantizer* — each W_down has two scales: the original per-row scale s,
+plus a new per-column scale s^c.
+
+*** How it is solved
+
+Minimize ‖W - Q(W) * s^c‖². Fix s^c, solve for Q; fix Q, solve for s^c
+in closed form. Alternating for about 15 iterations converges.
+
+*** Difference from SmoothQuant
+
+SmoothQuant computes the scale *statically* (from activation maxima).
+D2Quant *dynamically optimizes* it (directly minimizing quantization
+error). Furthermore, SmoothQuant transfers difficulty from activation to
+weight; D2Quant transfers it from weight to weight (up → down). That is a
+new direction.
+
+** Hole two: weight quantization causes activation drift (DAC)
+
+*** What it saw
+
+Quantize the weights and the activations follow — replace W with Ŵ and
+Y = XW becomes Y' = XŴ. Nobody is unaware of this, but the D2Quant
+authors looked one step further: *ΔY = Y - Y', this drift, looks
+different at different locations.*
+
+Specifically:
+- *Input to the LayerNorm after attention* — ΔY has a significant mean
+  (a directional bias)
+- *Input to the next layer's LayerNorm after the MLP* — ΔY is
+  approximately zero-mean noise
+
+Measured by SNR = |μ|/σ², the post-attention LN has a much higher SNR.
+
+*** Why this matters
+
+If the drift is *directional* (high SNR), subtracting a constant bias μ
+fixes it, reducing the error from μ² + σ² to just σ². If the drift is
+zero-mean noise (low SNR), subtracting a constant does nothing useful.
+
+So D2Quant adds a learned bias at *only* the post-attention LN, leaving
+all other positions untouched. This is *Deviation-Aware Correction*.
+
+*** Difference from prior work
+
+Others have modified LayerNorm (e.g. Norm Tweaking), but they apply
+corrections everywhere indiscriminately. D2Quant is the first to clearly
+explain *why certain positions should be corrected and others should not*,
+and it provides a simple SNR criterion to make that determination.
+
+* One diagram compressing the whole line
+
+#+begin_src text
+
+  Problem:  push weights to sub-4-bit without accuracy collapse
+  --------------------------------------------------------
+  GPTQ          Quantization as Hessian    Inter-weight correlations
+                optimization               resolved
+  --------------------------------------------------------
+  SmoothQuant   Equiv. transform X/s, sW  Activation outliers
+                                           migrated to weight side
+  --------------------------------------------------------
+  AWQ           Protect ~1% salient        Not all weights are
+                columns                    equally important
+  --------------------------------------------------------
+  QuaRot        Hadamard rotation          Outliers are a
+                scatters outliers          coordinate-system problem
+  --------------------------------------------------------
+  OmniQuant     Learnable scale + clip      Static params insufficient
+                (but requires training)    (training is costly)
+  --------------------------------------------------------
+  GPTAQ / BoA   Re-polished Hessian        4-bit SOTA; but
+                estimation                 down_proj and activation
+                                           drift untouched
+  --------------------------------------------------------
+  D2Quant       DSQ: up<->down equiv.      down_proj always
+                transform                  overlooked; activation
+                DAC: post-attn LN bias     drift never corrected
+                correction
+  --------------------------------------------------------
+
+  Common theme: *use equivalent transforms / reparameterization to move
+                "hard-to-quantize" structure to "easy-to-quantize" places*
+               From SmoothQuant (X <-> W) to D2Quant (W_up <-> W_down)
+               — the same move applied to different objects
+
+#+end_src
+
+* What is really happening along this line
+
+On the surface it looks like "pushing the bit-count lower and lower," but
+the deeper shift is one of *cognitive granularity*:
+
+1. *From weights → seeing activations* (GPTQ → SmoothQuant)
+2. *From uniform → seeing non-uniform importance* (SmoothQuant → AWQ)
+3. *From coordinate axes → seeing the coordinate system* (AWQ → QuaRot)
+4. *From individual layers → seeing inter-layer structure* (all prior
+   work → D2Quant's DSQ)
+5. *From weight error → seeing activation error propagation* (all prior
+   work → D2Quant's DAC)
+
+Each step takes something that "wasn't treated as a variable before" and
+makes it "an optimizable variable." The compression problem is evolving
+from "find a good quantizer" to "find a good *representation*" — first
+reparameterize the model into a form that quantizes more easily, then the
+most basic quantizer is sufficient.
+
+* Where the next steps might go
+
+1. The *up–down equivalent transform* idea can be generalized. In LLaMA's
+   attention, do W_Q, W_K, and W_O also have analogous absorbable scale
+   pairs?
+2. The *SNR criterion* provides a principled "should this be corrected or
+   not" standard. Can it be extended to the attention K/V cache and the
+   residual stream?
+3. *DSQ and DAC are both PTQ*. If a few steps of "alignment fine-tuning"
+   follow PTQ — learning only the equivalent scales and LN biases while
+   freezing the main weights — it may be enough to push sub-3-bit over
+   the line.
+4. *Live inference*: the s^c added by DSQ is absorbed offline with zero
+   runtime cost; the bias added by DAC is also a constant. This means the
+   whole approach can be dropped seamlessly into existing vLLM / SGLang
+   inference stacks without kernel changes.
+
+* Honest caveats
+
+- *Citation relationships*: the D2Quant paper explicitly cites GPTQ,
+  SmoothQuant, AWQ, QuaRot, OmniQuant, GPTAQ, BoA and others as
+  confirmed points of comparison and critique.
+- *Evolutionary logic*: the GPTQ → SmoothQuant → AWQ → QuaRot line is the
+  community-recognized main thread; D2Quant's related-work section lays it
+  out in exactly that order.
+- *Forward-looking speculation*: the "next steps" section above is a
+  reasoned extrapolation from this evolutionary trend, not an explicit
+  prediction made in the paper, and should be understood as the analyst's
+  own judgment.
+- *Details not read*: this analysis is based primarily on the paper's
+  abstract, introduction, related work, and method sections as extracted
+  from HTML. The full experimental results, specific perplexity numbers,
+  and model comparison tables have not been incorporated into this account.

@@ -1,0 +1,231 @@
+#+title:      Fast KVzip: Efficient and Accurate LLM Inference with Gated KV Eviction
+#+date:       [2026-05-29 Fri 08:03]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T080332-en
+#+source:     https://arxiv.org/abs/2601.17668
+#+authors:    Jang-Hyun Kim, Dongyoon Han, Sangdoo Yun (NAVER AI Lab)
+#+venue:      arXiv preprint, Feb 2026
+
+* The River of the Problem
+
+After you feed a large model a hundred thousand words, why does it suddenly slow to a crawl and run out of GPU memory? Because it has to remember the "intermediate state" for every single token — this is called the KV cache. The longer the context, the larger this cache grows, until it finally blows the GPU. 
+
+Can we just throw some of it away? Of course. The question is: *which parts*. Throw out the wrong ones and the model instantly becomes dumb; figure out which ones matter precisely and you burn a pile of compute doing the figuring — the savings don't cover the overhead. For three straight years, every generation of researchers has wrestled with the same dilemma: *either fast but dumb, or accurate but slow*.
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: attention must be recomputed at every step, which is slow
+  | Solution: cache the computed K/V states (KV cache)
+  v
+[2019+] KV cache becomes standard practice
+  |
+  | New problem: longer context → larger KV cache → GPU memory explosion
+  v
+- - - - - - - - - First wave: sparsity observed, things start getting dropped - - - - - - - - -
+[2023] H2O (Zhang et al.)
+  |
+  | Observation: attention is inherently sparse; most KVs are never looked at
+  | Solution: evict based on "who got the most attention in the past" (query-dependent)
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Observation: H2O mainly helps decoding; prefill phase is left unoptimized
+  | Solution: do a big sweep at the end of prefill using recent query attention scores
+  v
+[2024] StreamingLLM (Xiao et al.) - attacks a hidden assumption
+  |
+  | Observation: dropping the first few tokens causes model collapse
+  | Solution: always retain the first few "attention sinks"
+  v
+- - - - - - - - - Second wave: stop watching the query, predict the future - - - - - - - - -
+[2025] KVzip (Kim et al.)
+  |
+  | Observation: selecting KVs by "past queries" leaks when a new query arrives
+  | Solution: query-agnostic — let the model "reconstruct" the source text;
+  |           whoever gets used is important
+  | New pitfall: reconstruction itself requires a full second forward pass;
+  |              prefill time doubles
+  v
+[2026] Fast KVzip (this paper)
+  |
+  | Observation: KVzip's accuracy is bought with 2× compute — not deployable
+  | Solution: train an ultra-light gate directly on hidden states to predict
+  |           "which KVs will be needed later," no reconstruction required
+  v
+[Concurrent] KVzap, TrimKV, DMS, Locret — all converging toward gating
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer + KV Cache: Planting the Seed of "Expensive" Inside "Fast"
+
+*** What Problem It Saw
+
+Before Transformers, RNNs processed one token at a time — painfully slow. The attention mechanism broke that sequential dependency: every position could attend to all other positions in parallel.
+
+But inference still has to generate one token at a time. If every new token required recomputing the K (key) and V (value) for every preceding token from scratch, the parallelism would be worthless.
+
+*** Its Solution
+
+Store the K and V produced for each token and reuse them for the next — this is the *KV cache*. When generating the (N+1)-th token, the K and V for the previous N tokens need not be recomputed.
+
+*** Why It Worked (and What New Problem It Buried)
+
+Time traded for space: compute is saved, but things must be stored. Every token, at every layer, for every head, requires one K-V pair. The larger the model and the longer the context, the bigger the cache. Llama-2 70B with a 128K context requires upwards of 60 GB for the KV cache alone — more than the model weights themselves.
+
+The buried problem: *KV cache size scales linearly with context length, with no upper bound*. Once "1 million token context" became a standard selling point, this was a bomb waiting to go off.
+
+** 2023 | H2O: Picking Up the Scissors for the First Time
+
+*** What Problem It Saw
+
+The entire KV cache is kept in memory, yet the attention matrix is extremely sparse in practice — most positions carry attention weights close to zero, meaning they are "never looked at." If no one looks at them, why should they occupy GPU memory?
+
+*** Its Solution
+
+H2O (Heavy-Hitter Oracle) tracks how many times each KV has been attended to over a recent window (cumulative attention scores), retains the "heavy hitters," and evicts the rest. The core idea is *using past attention distributions to predict whether a KV will be needed in the future*.
+
+*** Why It Worked (and What New Problem It Buried)
+
+The empirically observed sparsity is real — in most settings, 20% of KVs absorb 80% of attention. So discarding 70% of the cache can still preserve most model quality.
+
+The buried problem: this is *query-dependent* — it assumes "frequently attended in the past → will be attended in the future." But the user's very next question might be entirely new, requiring KVs that happened to receive little past attention. The result: *in multi-turn or multi-query scenarios, the evicted KVs are exactly what the new question needs*.
+
+** 2024 | SnapKV: Moving the Scissors to Prefill
+
+*** What Problem It Saw
+
+H2O evicts gradually during the decoding phase. But many real workloads — long-document QA, code comprehension — are *prefill-heavy*: reading a hundred-thousand-token document into memory already exhausts GPU RAM before decoding even begins, so waiting until decoding to act is too late.
+
+*** Its Solution
+
+In the final short window just before prefill ends, count how often each KV is attended to by the queries in that window, then do a single large sweep. The compression happens earlier and saves more memory.
+
+*** Why It Worked (and What New Problem It Buried)
+
+The queries at the tail of the prefill typically carry a "question signal" (the user's actual prompt), so using them to select KVs is more meaningful than using the document's own internal queries.
+
+But fundamentally it shares the same affliction as H2O: *it is still query-dependent*. If the user asks a completely different second question, the KVs that survived the first sweep may not be relevant to it at all.
+
+** 2024 | StreamingLLM: Attacking a Hidden Assumption
+
+*** What Problem It Saw
+
+Both H2O and SnapKV evict by the rule "high attention score → keep." But researchers noticed a strange phenomenon: *dropping the very first few tokens causes immediate model collapse* — even when those tokens seem semantically irrelevant (e.g., `<s>` or `"The"`).
+
+*** Its Solution
+
+This introduced the concept of *attention sinks*: the model uses the first few tokens as a "reservoir" — softmax must have somewhere to "drain" probability mass, or the distribution breaks down. Therefore, regardless of how aggressively you compress, *the first few tokens must never be evicted*.
+
+*** Why It Worked (and What New Problem It Buried)
+
+This offered a fundamentally new understanding of what makes a KV important — not purely semantic importance, but also *mechanical importance* (maintaining numerical stability). Fast KVzip's later "sink-attention gating" design borrows this insight directly.
+
+The remaining problem: beyond the sinks, how to select which other KVs to keep remained unsolved, still relying on after-the-fact attention signals.
+
+** 2025 | KVzip: A Paradigm Flip — Stop Watching the Query, Watch the Text
+
+*** What Problem It Saw
+
+Every prior method shared the same soft underbelly: *predicting the future from the past*. This breaks in multi-query and multi-turn settings. Could we reason about KV importance in a way that is *independent of any specific query*, looking only at how critical each KV is for carrying information from the source text?
+
+*** Its Solution
+
+Ask the model to do one thing: *reconstruct the original text* based on the current KV cache. Whoever gets used frequently during reconstruction is important. This is *query-agnostic* — no matter what the user asks in the future, the resulting importance scores remain valid.
+
+*** Why It Worked (and What New Problem It Buried)
+
+Reconstruction is an "unsupervised" introspective task, in spirit similar to BERT's masked language modeling: a task-agnostic objective that produces broadly transferable features. The result: on multi-query benchmarks, KVzip substantially outperforms H2O and SnapKV.
+
+The buried problem: *the reconstruction itself requires running the model forward a second time* — prefill time doubles outright. Accurate, yes, but a 14B model processing 170K tokens takes ~150 seconds (versus ~90 seconds without compression). No production system can afford that.
+
+** 2026 | Fast KVzip: Predict Without Reconstructing
+
+*** What Problem It Saw
+
+KVzip's core compute cost is "running the full LLM again to do reconstruction." But think carefully: the model has *already* encoded every token's semantics into the hidden states *during that one prefill forward pass*. Could we skip the second pass entirely and instead *read "how important will this KV be later" directly from the hidden states already at hand*?
+
+*** Its Solution
+
+Attach an ultra-light *gating module* beside each attention layer — its input is the hidden state at that layer, its output is an importance score for each KV head.
+
+Where does the training signal for this gate come from? *Exactly the KVzip reconstruction scores* — but reconstruction is run only *during training*, never during inference.
+
+Architecturally, it borrows StreamingLLM's attention-sinks insight: letting the gate observe the attention patterns of a few sink tokens when scoring, which yields the best results.
+
+Training updates only the gate's parameters (the LLM is frozen); for a 14B model this takes less than one H100 GPU-hour.
+
+*** Why It Worked (and What New Problem It Buried)
+
+This is an elegant "objective separation":
+- *Accuracy* (generalization) comes from the query-agnostic reconstruction objective — inherited from KVzip
+- *Speed* comes from distilling the expensive judgment process into a lightweight gate — bypassing KVzip's bottleneck
+
+Result: on RULER-4K at 25% budget, quality is nearly lossless; 170K-token prefill is ~2× faster than KVzip and uses less memory than uncompressed inference.
+
+New open question: the gate is still an add-on module, not baked into pretraining. If future base models treat "predicting KV importance" as part of the pretraining objective itself, this add-on may not be needed at all.
+
+* Frontier Extensions
+
+Fast KVzip itself sits at the frontier — but it is not alone:
+
+- *KVzap* (Jegou & Jeblick, 2026): *concurrent* with this paper; proposes a nearly identical gating optimization objective, with slightly different architecture and training details. Two independent works converging on the same idea strongly suggests this is the "inevitable next step" in problem evolution.
+- *TrimKV* (Bui et al., 2025): uses a time-decaying retention gate; primarily targets mathematical reasoning, and shows noticeable quality degradation in prefill-heavy scenarios.
+- *DMS* (Łańcucki et al., 2025): trains an eviction policy via logit distillation.
+- *Locret* (Huang et al., 2024): uses a gate to predict KV importance, but only for the prefill phase; decoding is unmanaged.
+
+Taken together, *gating* has become the consensus vocabulary for KV compression in 2025–2026. Fast KVzip's core contribution is systematizing three decisions — what the gate should observe, what objective it should train on, and where in the architecture it should sit — not charting a brand-new direction, but *formalizing one that was already emerging*.
+
+* A Single Diagram
+
+#+begin_example
+                  What makes a KV "important"? How do you decide?
+                                   |
+        +--------------------------+---------------------------+
+        |                                                      |
+   query-dependent                                       query-agnostic
+   "who got the most attention in the past"               "who carries information from the text"
+        |                                                      |
+   +----+----+----+                                       +----+----+
+   |    |    |    |                                       |         |
+  H2O SnapKV ...  +-- StreamingLLM patch:                KVzip     Fast KVzip
+ 2023  2024        attention sinks must never be evicted   2025      2026
+   |    |              (Xiao 2024)                          |         |
+   |    |                                                   |         |
+   v    v                                                   v         v
+  Fast but leaks KVs needed by new queries              Accurate but  Accurate and
+  (fails in multi-query / multi-turn settings)          prefill ×2    near-zero overhead
+
+  Timeline -->     2023            2024            2025           2026
+
+  Vertical: from "after-the-fact statistics" → "introspective reconstruction" → "distilled oracle"
+  Horizontal: each step removes the previous generation's bottleneck — leaks → slow → (?)
+#+end_example
+
+* Insights
+
+The real throughline of this story is not "how to compress the KV cache," but *"how to distill a cheap approximation from an expensive oracle."*
+
+- H2O uses *past attention scores* as the oracle — cheap, but the oracle itself is inaccurate (query-dependent)
+- KVzip uses *a full reconstruction task* as the oracle — accurate, but the oracle is too expensive (two forward passes)
+- Fast KVzip *distills KVzip's oracle into a small gate* — the source of accuracy is unchanged, but the cost of accessing the oracle drops to ~1%
+
+This is a pattern that has been validated repeatedly: *first-generation methods use heuristics; second-generation methods use expensive but correct targets as an oracle; third-generation methods distill that oracle into a lightweight module.* The same script has played out in RLHF (PPO → DPO), speculative decoding, and model distillation.
+
+Where is this most likely to go next? Two directions:
+
+1. *Bake the gate into pretraining* — no more add-ons; instead, the model is trained from the start to "self-evaluate KV importance." Trends in MoE / MoD / MoBA suggest this path is viable.
+2. *Combine the gate with quantization / low-rank compression* — the current gate solves "which ones to evict"; quantization solves "how to store each remaining entry more compactly." The two are orthogonal, and the combination space is vast.
+
+* Takeaways
+
+What this evolutionary line says about *how to do research*:
+
+- *Decompose the problem into "accuracy" and "speed" as two independent dimensions.* Most breakthroughs do not improve both simultaneously — they discover that the two can be *optimized separately*. KVzip first pushes "accuracy" to its ceiling (cost be damned), then Fast KVzip recovers "speed" — this staged approach is more pragmatic than searching for a single global optimum.
+- *An expensive oracle is a treasure.* If you already have a slow-but-correct method, don't rush to discard it — *it is a natural source of training signal*. Distilling a lightweight approximation is almost always more effective than designing a new heuristic from scratch.
+- *Concurrent work is a signal.* Fast KVzip and KVzap appeared almost simultaneously with nearly identical proposals — when you see multiple independent works converging on one direction, that direction is the "inevitable next step" in problem evolution, and it is worth going all-in.
+
+The practical upshot: the next time you encounter a method that is "accurate but slow," don't give up on it too quickly. First ask: *"Is there an oracle in here that could be distilled into a gate?"* Ask that question, and you already have half the solution.
