@@ -1,0 +1,248 @@
+#+title:      KV Cache Offloading for Context-Intensive Tasks
+#+date:       [2026-05-28 Thu 17:35]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T173525-en
+#+source:     https://arxiv.org/abs/2604.08426
+#+authors:    Andrey Bocharnikov, Ivan Ermakov, Denis Kuznedelev, Vyacheslav Zhdanovskiy, Yegor Yershov (HSE / Yandex / NSU)
+#+venue:      arXiv 2604.08426 [cs.LG], 2026-04-09 (v4: 2026-05-15)
+
+* The Problem River
+
+During long-context LLM inference, the KV cache keeps growing until it can dwarf the model weights themselves. How do you fit it into GPU memory without losing accuracy?
+
+The difficulty lies in a fundamental tension: to save memory you have to drop some KV entries; once dropped, they are gone when you actually need them. Every generation of researchers is placing a bet on "which KV entries can safely be absent right now." From the earliest *just discard it* camp (eviction) to the later compromise of *temporarily move it to CPU memory* (offloading), the bets have become ever more refined — yet with every step forward, someone discovers that the scenarios where the previous bet paid off were actually only *easy scenarios*.
+
+* Source Map
+
+#+begin_example
+[2022] DeepSpeed-Inference (Aminabadi et al.)
+  |
+  | Problem: GPU memory is insufficient to hold large models at inference time;
+  |          ZeRO-Offload already moves weights to CPU during training
+  | Solution: Split inference as well — weights / KV / activations can all be
+  |           offloaded to CPU / NVMe
+  v
+[2023] FlexGen (Sheng et al.)
+  |
+  | Problem: A single GPU cannot run OPT-175B; offloading schedules are chaotic
+  | Solution: Frame the movement of weight/KV/activation across three tiers as
+  |           a linear program and solve for the optimal offline schedule
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | Problem: Attention is naturally sparse — most tokens are almost never
+  |          attended to; why keep them all?
+  | Solution: Track a running "cumulative attention score" per token and
+  |           *permanently discard* (evict) the low-scoring ones
+  v
+[2024] InfiniGen (Lee et al.)
+  |
+  | Problem: Permanently discarded KV cannot come back — some tasks
+  |          (translation, code refactoring) genuinely need everything
+  | Solution: Don't discard; move to CPU memory. Use a low-rank SVD
+  |           approximation to predict *which KV are needed this step*
+  |           and prefetch them ahead of time
+  v
+[2025] ShadowKV (Sun et al.)
+  |
+  | Problem: Computing per-token importance is too slow; prefetch hit rate
+  |          is still insufficient
+  | Solution: Group every 8 consecutive tokens into a "chunk"; compute one
+  |           *landmark* per chunk (channel-wise mean of the 8 keys) as its
+  |           representative; score queries against landmarks; also compress
+  |           raw keys with SVD to save bandwidth
+  v
+[2026] YAKV (this paper)  <-- target paper
+  |
+  | Problem: All prior work is evaluated on NIAH/RULER-style tasks that only
+  |          ask you to find a single needle; on tasks that require extracting
+  |          dozens of structured fields from a long document
+  |          (context-intensive), landmarks are wrong, SVD corrupts retrieval,
+  |          and accuracy collapses
+  | Solution: Replace both complex components with the simplest possible
+  |           per-key quantization — store raw KV in 4-bit HIGGS, select keys
+  |           on GPU with 2-bit HIGGS; no chunks, no landmarks, no outlier
+  |           buckets
+  v
+[2026] Concurrent work (Pitfalls of KV Compression / LRQK / etc.)
+       Questioning KV compression on hard tasks from different angles
+#+end_example
+
+Note: The chain DeepSpeed-Inference → FlexGen → H2O → InfiniGen → ShadowKV → YAKV is *explicitly* cited and directly compared in YAKV's introduction, Background section, and Section 3.2. Contemporaneous work such as StreamingLLM, Quest, and SnapKV belongs to the same era but does not lie on YAKV's direct line of critique.
+
+* Evolutionary Narrative
+
+** 2022 | DeepSpeed-Inference: Systematically Offloading "The Model Is Too Big to Fit"
+
+*** What Problem It Saw
+
+GPT-3-scale models — tens to hundreds of billions of parameters — far exceed the memory capacity of a single GPU. ZeRO could already shard optimizer states, gradients, and parameters to CPU or NVMe during *training*, but the *inference* side had received no systematic treatment; everyone was simply stacking more GPUs.
+
+*** Its Solution
+
+Turn "do we have enough memory?" from a hard constraint into a scheduling problem: weights, KV cache, and activations can all be shuttled between GPU ↔ CPU ↔ NVMe on demand. When a layer is being computed, its corresponding KV is pulled up; once finished, it can be swapped back down.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+It proved that *offloading is viable* — it does not necessarily kill inference throughput. But the scheduling policy was hand-crafted and heuristic; nobody had systematically worked out "what to move when, to minimize wasted bandwidth." That gap was FlexGen's opening.
+
+** 2023 | FlexGen: Solving the Movement Policy as a Math Problem
+
+*** What Problem It Saw
+
+Systems like DeepSpeed were right to move things to CPU, but *what* to move, *when*, and *in what order* was never made precise. The result was chronic bandwidth waste and a GPU constantly waiting on the CPU.
+
+*** Its Solution
+
+Cast "moving weights/KV/activations among GPU, CPU, and disk" as a linear program and solve for an *offline-optimal transport schedule* ahead of time. This was also the first work to treat *KV cache offloading to CPU* as a first-class design citizen.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+It made running OPT-175B on a single GPU a practical reality and properly opened the road for KV offloading. But FlexGen's assumptions were *throughput-oriented* — large batch sizes, latency not a priority. The moment you care about per-request latency (interactive applications), shuttling *all* KV back and forth becomes prohibitively slow; you need to move only the entries that will actually be used. That need was the shared entry point for H2O and InfiniGen.
+
+** 2023 | H2O: If Attention Is Sparse, Why Not Just Discard the Rest?
+
+*** What Problem It Saw
+
+Attention matrices are highly sparse in practice — the vast majority of tokens accumulate negligible attention scores and are almost never attended to. Moving them back and forth as FlexGen does is wasted effort.
+
+*** Its Solution
+
+During inference, maintain a running "cumulative attention score" (heavy hitter score) for every token. Keep the high-scoring tokens; *permanently delete* the low-scoring ones from the KV cache. Once deleted, they are gone.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+Simple, aggressive, and effective — nearly lossless on summarization and QA benchmarks. But *the bet it places is that low-scoring tokens will never be needed later*. That bet loses on tasks like translating an entire book, refactoring a whole codebase, or extracting many structured fields: the passage you discarded is exactly what the next sentence needs to reference. Permanent eviction carries an irreversible cost. This irreversibility is the core motivation for InfiniGen.
+
+** 2024 | InfiniGen: Don't Discard — Move It, and Bring It Back When Needed
+
+*** What Problem It Saw
+
+H2O's evicted KV are gone forever, which is fatal for many real tasks (translation, long codebase processing). But loading the entire CPU-side KV cache at every step is too slow. What is needed is a mechanism that can *accurately predict which KV will be needed at each step*.
+
+*** Its Solution
+
+Keep the full KV cache in CPU memory — never discard. Then compute a low-dimensional *SVD approximation* for each key to serve as a lightweight representative that fits on the GPU. At query time, score the query against these representatives, select the top-k, and prefetch them from CPU in advance, overlapping with the computation of the previous layer.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+It finally replaced "irreversible discard" with "reversible offload." SVD representatives are cheap and faithfully capture the directional content of each key. However, InfiniGen computes a separate representative per token, which carries non-trivial overhead; and GQA (Group Query Attention), common in modern models, is not naturally supported. ShadowKV's motivation stems from exactly these two observations.
+
+** 2025 | ShadowKV: Group Tokens into Chunks, Keep One Representative per Group
+
+*** What Problem It Saw
+
+InfiniGen's per-token SVD representatives are too dense — expensive both in GPU compute and bandwidth. But research on sparse attention had established that neighboring tokens exhibit highly correlated attention patterns, so grouped processing incurs little accuracy loss.
+
+*** Its Solution
+
+Pack every 8 consecutive tokens into a chunk; compute one *landmark* per chunk by averaging the 8 keys along the channel dimension. Only landmarks are kept on the GPU. At query time, score the query against landmarks, select the top-k chunks, and pull each full chunk from CPU. Additionally, compress the raw keys with SVD (recommended rank=160) to reduce bandwidth. An extra "outlier" bucket catches tokens whose pattern deviates from their group.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+On standard long-context benchmarks — RULER, LongBench, NIAH — the approach is nearly lossless, throughput improves dramatically, and ShadowKV became the state-of-the-art paradigm for KV offloading for a period.
+
+But — and this is YAKV's entry point — all of these benchmarks *only ask you to find a single needle*. The moment the task becomes "extract dozens of structured fields from a long document" (context-intensive), two latent flaws blow up simultaneously:
+- *SVD compresses too aggressively*: rank 160 cannot capture the fine-grained distinctions that context-intensive tasks require for key retrieval; wrong entries are frequently selected;
+- *Landmarks are a lie*: averaging 8 tokens into one representative is blind to information-dense passages; no matter how large the outlier bucket, it cannot compensate.
+
+** 2026 | YAKV: Cut Everything Complex and Replace It with the Simplest Possible Quantization
+
+*** What Problem It Saw
+
+The entire research lineage had implicitly assumed that "no accuracy drop on NIAH = method is sound." But real workloads — structured extraction, HTML→TSV conversion, multi-document QA — are context-intensive. ShadowKV's accuracy on Text2JSON falls from 91 to 69; on LongProc it falls from 50 to 15. The problem is not offloading itself — offloading is in principle the right approach for such tasks — the problem is that *the key-selection step is broken*.
+
+*** Its Solution
+
+Starting from ShadowKV, *remove components one by one*:
+- Remove SVD: replace with 4-bit HIGGS quantization (data-free, no calibration data required) to store raw KV;
+- Remove chunks + landmarks: let every key speak for itself; keep an extreme 1–2-bit quantized key on the GPU for selection;
+- Remove the outlier bucket: without landmarks the concept of "outlier" is meaningless;
+- Remove prefetch sophistication: straightforward on-demand loading.
+
+What remains is extremely minimal — just "quantize everything + select per key." The name YAKV (Yet Another KV Offloading) carries a note of self-deprecation.
+
+*** Why It Worked (and What Trap It Left Behind)
+
+The intuition is clean: reduce ShadowKV's chunk size from 8 to 1, and the landmark degenerates to the key itself; replace SVD with equal-bandwidth quantization — at the same bit budget, quantization preserves retrieval accuracy better than SVD. After two degeneracy steps, all complex structure collapses, leaving an approach that achieves 90.83 on Text2JSON (vs. ShadowKV's 69.38) while still delivering 1.5–3× throughput improvements.
+
+Remaining gaps: YAKV is intentionally a minimal baseline. It incorporates no prefetching, no adaptive budget, and no improved quantization grid. The paper itself notes in Appendices E/F that Residual Quantization, Top-P budget scheduling, and similar enhancements are composable add-ons left for future work. The entire analysis also covers only full-attention models; new architectures such as MLA and Gated DeltaNet are not addressed.
+
+* Frontier Extensions
+
+YAKV v1 was released in April 2026. The main concurrent and follow-on work identified so far falls into two threads:
+
+- *LRQK* (Tenghui et al. 2026) — takes a different path: does not abandon low-rank structure, but uses a more carefully designed low-rank decomposition to *select* keys rather than to *compress* them. In YAKV's own comparison table, LRQK can match or slightly edge YAKV on the simpler MultiNeedle task, but falls clearly behind on the harder LongProc and Text2JSON settings. It is still fundamentally betting that "low-rank structure can describe the selection signal," and YAKV's quantization lands a punch against that bet.
+- *The Pitfalls of KV Cache Compression* (Chen et al. 2025) — takes a more philosophical angle: argues from attention dynamics that KV compression faces fundamental difficulties. It can be read as an empirical companion to YAKV — one challenges the field with benchmarks, the other argues theoretically that "this was never expected to be universally robust."
+
+Looking further ahead, this line of work will likely pivot toward *co-design with the model's own attention structure* — architectures such as MLA, Gated DeltaNet, and NSA are already redefining what "KV" even means, and offloading and compression strategies will be forced to follow.
+
+* One Diagram
+
+#+begin_example
+                  KV Memory Pressure (Problem Intensity)
+                  ---------------------------------------->
+
+  Memory fine    GPU not enough      GPU far too small   GPU tight + task hard
+  -----------    ---------------     -----------------   ---------------------
+  Full           DeepSpeed-Inf       FlexGen             H2O (discard)
+  attention      (2022) can offload  (2023) optimal      (2023) keep heavy
+                                     schedule            hitters
+                                                          |
+                                                          v
+                                                    Discarded = gone ==> switch to "move"
+                                                          |
+                                                          v
+                                                    InfiniGen (2024)
+                                                    SVD representative + prefetch
+                                                          |
+                                                          v
+                                                    Per-token representative too costly
+                                                          |
+                                                          v
+                                                    ShadowKV (2025)
+                                                    chunk + landmark + SVD
+                                                          |
+                                                          v
+                                              OK on NIAH; landmark / SVD both
+                                              collapse on structured-field extraction
+                                                          |
+                                                          v
+                                                    YAKV (2026)
+                                                    Cut everything: 1 key = 1 representative
+                                                                    quantization replaces SVD
+                                                                    no landmark
+                                                                    no outlier bucket
+
+  Solution dimensions (axis each generation optimized):
+    Discard vs. offload  :  DeepSpeed/FlexGen offload all  -> H2O discard  -> InfiniGen offload "the useful"
+    How to select keys   :  Full load  -> attention score  -> SVD rep  -> chunk landmark  -> per-key quantization
+    How to compress keys :  None       -> none             -> none     -> SVD compression  -> data-free quantization
+    Where evaluated      :  General    -> general          -> NIAH     -> NIAH/LongBench   -> context-intensive
+
+  Core progression:
+    "Save memory" --> "Save reversibly" --> "Move precisely" -->
+    "Precision is a lie (on hard tasks)" --> "Fall back to the simplest per-element treatment"
+#+end_example
+
+* Insights
+
+On the surface this line is *technical stacking* (DeepSpeed → FlexGen → H2O → InfiniGen → ShadowKV → YAKV). Underneath it is a *cognitive arc of increasingly refined bets, repeatedly broken by new difficulty*.
+
+Each generation exploited structural ideas — group structure, low-rank approximation, landmark proxies — betting that sparse attention contains *compressible structure* that can be represented cheaply. The bet paid off on simple tasks again and again, encouraging methods to grow ever more clever and elaborate. Then YAKV changed the task from "find one needle" to "extract fifty fields," and every clever trick failed simultaneously: *structural proxies (SVD, landmarks, digests) are simply inaccurate when information density is high*.
+
+YAKV's response carries an important lesson: rather than inventing a smarter landmark, it *replaced every layer of clever approximation with the most naive per-element quantization possible*. In regimes where both bandwidth and precision are under extreme pressure, "honest, low-overhead representation of each individual unit" consistently beats "clever compressed representation of an entire group." This mirrors the trajectory of hardware quantization over the past decade (INT8 → FP8 → MXFP4) with striking consistency — simple, data-free, element-wise approximation ended up winning the KV cache selection battle.
+
+Where might the field go next? Two directions seem worth betting on:
+- *Evaluation before methods* — YAKV's deepest contribution may not be YAKV itself but the Text2JSON benchmark and the "context-intensive" evaluation perspective. Once evaluation exposes a method's true capability, the direction of methodological progress is forcibly redirected; one can expect dedicated context-intensive offloading frameworks (adaptive granularity, hybrid landmark+quantization, query-aware compression) to appear within the year.
+- *Renegotiating with attention itself* — KV offloading on top of full attention has been studied in fine detail. But once architectures like MLA, Gated DeltaNet, and NSA *redefine what KV is at the model level*, offloading must be re-modeled from scratch — the goal shifts from "move fewer KV, correctly" to "make the KV inherently more amenable to movement."
+
+* Takeaways
+
+This line of work offers at least three lessons that translate into one's own research practice:
+
+1. *Find the "NIAH illusion" in your own field* — When you see a benchmark on which all methods appear lossless, be immediately suspicious: that benchmark may be missing a critical dimension of real-world need. YAKV did not invent new technology; it invented a *new lens* that revealed where existing technology breaks. This means: you can establish a paper by *constructing an evaluation set that exposes the failure modes of current methods* — you do not need a better method first.
+
+2. *Subtraction is a contribution* — YAKV removed five things from ShadowKV: SVD, chunks, landmarks, the outlier bucket, and prefetch sophistication. What remained was "raw quantization + per-key selection." The result is more accurate, simpler, and easier to implement. The lesson: every time you inherit a complex system from prior work, ask first "if I strip all the cleverness away, what does the simplest version achieve?" — very often the simple version is already sufficient, and the complexity was built for a problem that does not actually exist.
+
+3. *Simple × data-free × element-wise is a robust winning position* — When the task distribution shifts (NIAH → context-intensive), every approximation that *exploits a structural assumption about the data* (SVD assumes low rank; landmarks assume intra-group correlation) collapses. Only *element-wise, data-free* representations (HIGGS quantization) held up. In engineering terms: when you are uncertain about the downstream task distribution, prefer a method that is *slightly more expensive but distribution-agnostic* over one that is *cheaper but structurally assumption-dependent* — the latter will silent-fail on unexpected inputs.

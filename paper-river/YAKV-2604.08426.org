@@ -1,0 +1,230 @@
+#+title:      KV Cache Offloading for Context-Intensive Tasks
+#+date:       [2026-05-28 Thu 17:35]
+#+filetags:   :paper:river:
+#+identifier: 20260528T173525
+#+source:     https://arxiv.org/abs/2604.08426
+#+authors:    Andrey Bocharnikov, Ivan Ermakov, Denis Kuznedelev, Vyacheslav Zhdanovskiy, Yegor Yershov (HSE / Yandex / NSU)
+#+venue:      arXiv 2604.08426 [cs.LG], 2026-04-09 (v4: 2026-05-15)
+
+* 问题之河
+
+长上下文 LLM 推理时，KV cache 越堆越大，最后能比模型参数本身还大。怎么把它塞进显存又不丢精度？
+
+这条线难就难在一个矛盾：你想省内存，就得扔掉一些 KV；你扔掉了，等真要用的时候就回不来了。每一代人都在赌"哪些 KV 现在可以不在身边"。从最早的 *直接扔掉* 派（eviction），到后来妥协的 *暂时搬到内存里* 派（offloading），赌注越来越精细——但每往前一步，都会有人发现：你之前赌赢的那些场景，其实只是 *简单场景*。
+
+* 溯源地图
+
+#+begin_example
+[2022] DeepSpeed-Inference (Aminabadi et al.)
+  |
+  | 问题: 大模型推理时，显存装不下；ZeRO-Offload 已经能把权重放 CPU
+  | 解法: 把推理也拆开——权重/KV/activation 都能下沉到 CPU/NVMe
+  v
+[2023] FlexGen (Sheng et al.)
+  |
+  | 问题: 单卡跑不动 OPT-175B；offloading 调度太混乱
+  | 解法: 把 weight/KV/activation 的搬运当成线性规划问题，离线算最优策略
+  v
+[2023] H2O (Zhang et al.)
+  |
+  | 问题: 注意力天然稀疏，大多数 token 几乎没人看；为什么要全留？
+  | 解法: 算每个 token 的"累计注意力分"，把分低的 *永久扔掉*（eviction）
+  v
+[2024] InfiniGen (Lee et al.)
+  |
+  | 问题: 永久扔了的 KV 回不来——某些任务（翻译、改代码）真的会用到全部
+  | 解法: 别扔，搬到 CPU 内存。用一个低秩 SVD 近似预测 *这一步要哪些*，提前 prefetch
+  v
+[2025] ShadowKV (Sun et al.)
+  |
+  | 问题: 一个一个 token 算重要性太慢；prefetch 命中率还是不够
+  | 解法: 把 KV 切成 8 个一组的"chunk"，每组算个 *landmark*（通道均值）当代表；查询时和 landmark 算分；keys 再用 SVD 压缩省带宽
+  v
+[2026] YAKV (本文)  <-- 目标论文
+  |
+  | 问题: 上面这些都在 NIAH/RULER 这类"只找一根针"的任务上测的；
+  |       真到要从长文档里抽几十条结构化信息（context-intensive），
+  |       landmark 是错的，SVD 压坏了，准确率塌方
+  | 解法: 把这两件复杂事都换成最朴素的"逐 key 量化"——
+  |       4-bit HIGGS 存原 KV，2-bit HIGGS 在 GPU 上选 key，没有 chunk 没有 landmark 没有 outlier
+  v
+[2026] 同期工作（Pitfalls of KV Compression / LRQK / 等）
+       从不同角度也在质疑 KV 压缩在难任务上的表现
+#+end_example
+
+注：DeepSpeed-Inference → FlexGen → H2O → InfiniGen → ShadowKV → YAKV 这条链是 YAKV 在引言、Background、Section 3.2 中 *明确* 提到并直接对比的。中间像 StreamingLLM、Quest、SnapKV 等也属同一时期但不在 YAKV 的直接批判路径上。
+
+* 演化叙事
+
+** 2022 | DeepSpeed-Inference: 把"模型太大装不下"这件事彻底搬下去
+
+*** 它看到了什么问题
+
+GPT-3 这种百亿到千亿参数模型，单卡显存远远不够装权重。ZeRO 已经能在训练时把优化器状态、梯度、参数切到 CPU 甚至 NVMe，但 *推理* 这一侧没人系统地做过——大家还在堆 GPU。
+
+*** 它的解法
+
+把"内存够不够"这件事从问题变成调度问题：权重、KV cache、激活值都可以按需在 GPU ↔ CPU ↔ NVMe 之间搬。哪一层算到了，就把对应 KV 拉上来；算完了，可以再换下去。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+证明了 *offloading 是可行的*，不一定会把推理拖死。但当时的策略是手写的、按经验来的，没有人系统地算"什么时候搬什么最划算"。这个空白就是 FlexGen 的入口。
+
+** 2023 | FlexGen: 把搬运策略当成数学题来解
+
+*** 它看到了什么问题
+
+DeepSpeed 之类把东西搬到 CPU 是对的，但搬什么、什么时候搬、按什么顺序，没人讲清楚。结果就是带宽常常浪费，GPU 在等 CPU。
+
+*** 它的解法
+
+把"在 GPU/CPU/磁盘三层之间搬 weight/KV/activation"当成线性规划，提前算出一个 *离线最优搬运计划*。同时第一次把 *KV cache 可以下沉到 CPU* 当成一等公民来设计。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+第一次让单卡跑动 OPT-175B 成为现实，并把 KV offloading 这条路真正铺开。但 FlexGen 的假设是 *吞吐场景*——大批量、不在意单条延迟。一旦你在意延迟（比如交互式应用），把所有 KV 全部搬来搬去就太慢；得只搬"会用到的"那部分。这是 H2O 和 InfiniGen 的共同入口。
+
+** 2023 | H2O: 既然注意力是稀疏的，为啥不直接扔？
+
+*** 它看到了什么问题
+
+观察到注意力矩阵高度稀疏——大多数 token 的累计注意力分极低，几乎从来没被看过。FlexGen 把它们搬来搬去等于白干。
+
+*** 它的解法
+
+边推理边给每个 token 算"累计注意力分"（重击者，heavy hitter）。分高的留下，分低的 *直接从 KV cache 里删掉*。删掉就是删掉，不再考虑。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+简单粗暴有效，在 summarization、QA 等任务上几乎无损。但 *它赌的是"低分 token 以后也不会被用到"*。这个赌注在翻译一整本书、refactor 一整个 codebase、抽取大量结构化信息这种任务上会输：你删掉的那段，下一句话可能就要回头读。永久 eviction 是有代价的，而且代价不可逆。InfiniGen 的核心动机就是这个。
+
+** 2024 | InfiniGen: 别删——搬走，要用再拿回来
+
+*** 它看到了什么问题
+
+H2O 把扔掉的 KV 永远没了，这对很多真实任务是致命的（翻译、长 codebase 处理）。但每一步都全量加载 CPU 里的 KV 又太慢。需要一个能 *精准预测下一步要哪些 KV* 的机制。
+
+*** 它的解法
+
+把全量 KV 放 CPU 内存，*不删*。然后用一个 *SVD 近似* 给每个 key 算一个低维代表——这个代表轻量、能放 GPU 上。查询时和这些代表算分，挑出 top-k，提前从 CPU prefetch 上来，和上一层算力 overlap。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+终于把"不可逆扔"换成"可逆搬"。SVD 代表又便宜又能反映 key 的方向。但 InfiniGen 是给每个 token 单独算代表，开销不小；而且 GQA（Group Query Attention）这种现代结构不天然支持。ShadowKV 看到的就是这两点。
+
+** 2025 | ShadowKV: 把 token 打包成组，一组只留一个代表
+
+*** 它看到了什么问题
+
+InfiniGen 一个 token 算一个 SVD 代表太密集——又费 GPU 又费带宽。但稀疏注意力研究告诉我们：相邻 token 的注意力模式高度相关，按组处理也不会差太多。
+
+*** 它的解法
+
+把每 8 个连续 token 打包成一个 chunk，每个 chunk 只算一个 *landmark*（通道维度上对 8 个 key 取均值）。GPU 上只留 landmark。查询时和 landmark 算分，挑出 top-k 个 chunk 整组从 CPU 拉上来。另外用 SVD 把原始 key 也压一道（推荐 rank=160）省带宽。再加一个 "outlier" 桶接住不符合组内分布的 token。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+在 RULER / LongBench / NIAH 这些标准长上下文 benchmark 上几乎无损，吞吐量大幅上升，一度成为 KV offloading 的 SOTA 范式。
+
+但——这就是 YAKV 的入口——这些 benchmark 都 *只要找一根针*。一旦任务变成"从长文档里抽几十个结构化字段"（context-intensive），两个隐患同时爆雷：
+- *SVD 压得太狠*：rank 160 表达不了 context-intensive 任务对 key 的细致区分，retrieval 经常找错；
+- *Landmark 是个谎言*：8 个 token 平均成一个代表，遇到信息密集的段落时根本认不清哪一组该来；outlier 桶再大也救不了。
+
+** 2026 | YAKV: 把复杂的事全砍掉，换成最朴素的量化
+
+*** 它看到了什么问题
+
+整条线上的研究都默认 "NIAH 上没掉点 = 方法没问题"。但真实业务（结构化抽取、HTML→TSV、多文档 QA）就是 context-intensive。ShadowKV 在 Text2JSON 上准确率从 91 掉到 69，在 LongProc 上从 50 掉到 15。问题不在 offloading 本身——offloading 原则上能解决这类任务——问题在 *选 KV 的那一步不行*。
+
+*** 它的解法
+
+从 ShadowKV 出发，*一个一个砍*：
+- 砍掉 SVD：换成 4-bit HIGGS 量化（data-free，无须校准数据）存原始 KV；
+- 砍掉 chunk + landmark：每个 key 自己做主，GPU 上保留 1-2 bit 的极限量化 key 用来选；
+- 砍掉 outlier 桶：没有 landmark 就没有 outlier 这个概念；
+- 砍掉 prefetch 的花活：纯粹按需加载。
+
+最后剩下的东西非常短——就是"全部量化 + 逐 key 选"。叫它 YAKV（Yet Another KV Offloading）也是带点自嘲。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+变形可以这样想：把 ShadowKV 的 chunk size 从 8 减到 1，landmark 退化成 key 本身；把 SVD 换成等位 bit 的量化——quantization 在等带宽下保 retrieval 比 SVD 更准。两步退化之后，复杂结构全坍掉，留下一个能在 Text2JSON 上达 90.83（vs ShadowKV 69.38）、吞吐还能拿到 1.5-3× 加速的极简方案。
+
+新坑：YAKV 是有意保持最小的 baseline，没接 prefetch、没做自适应 budget、没用更好的 quantization grid。论文自己在附录 E/F 提了 Residual Quantization、Top-P budget 等可叠加优化，留给后续。另外整套分析只针对 full attention 的模型，MLA / Gated DeltaNet 这类新结构没覆盖。
+
+* 前沿延伸
+
+YAKV v1 是 2026 年 4 月放出的，目前能找到的同期/后续工作主要有两条：
+
+- *LRQK* (Tenghui et al. 2026) — 走的是另一条路：不放弃低秩，但用更专门设计的低秩分解去选 key（不再用它去 *压缩* key）。在 YAKV 自己的对照表里，LRQK 在简单的 MultiNeedle 上能追平甚至略胜，但在更难的 LongProc / Text2JSON 上明显落后。本质上还是赌"低秩能描述选择信号"，而 YAKV 用量化打了它一巴掌。
+- *The Pitfalls of KV Cache Compression* (Chen et al. 2025) — 角度更哲学：从 attention dynamics 出发论证 KV 压缩的根本困难。可以看作 YAKV 在实证侧的同行——一个用 benchmark 打脸，一个用理论说"这事本来就不该期望普适"。
+
+更长期看，这条线很可能转向 *和模型本身的注意力结构协同设计*——MLA、Gated DeltaNet、NSA 这类结构天然就在重新定义"什么叫 KV"，offloading 与压缩策略会被迫跟着变。
+
+* 一张图看懂
+
+#+begin_example
+                  KV 内存压力（问题强度）
+                  ----------------------->
+
+  内存够用      显存装不下         显存远远装不下     显存装不下+任务还难
+  -----------   --------------    ------------------ ----------------------
+  Full          DeepSpeed-Inf     FlexGen            H2O (扔)
+  attention     (2022) 能搬       (2023) 算最优搬法  (2023) 重击者保留
+                                                     |
+                                                     v
+                                                    扔了回不来 ==> 改"搬"
+                                                     |
+                                                     v
+                                                    InfiniGen (2024)
+                                                    SVD 代表 + prefetch
+                                                     |
+                                                     v
+                                                    一 token 一代表太贵
+                                                     |
+                                                     v
+                                                    ShadowKV (2025)
+                                                    chunk + landmark + SVD
+                                                     |
+                                                     v
+                                              在 NIAH 上 OK，在抽结构化
+                                              字段时 landmark / SVD 都崩
+                                                     |
+                                                     v
+                                                    YAKV (2026)
+                                                    全砍：1 key 1 代表
+                                                          量化代替 SVD
+                                                          无 landmark
+                                                          无 outlier
+
+  解法维度（每代关注的轴）:
+    搬还是扔        :  DeepSpeed/FlexGen 搬全部  -> H2O 扔  -> InfiniGen 起搬"会用的"
+    选 key 怎么选   :  整体加载  -> 注意力分     -> SVD 代表 -> chunk landmark -> 单 key 量化
+    压 key 怎么压   :  不压      -> 不压         -> 不压     -> SVD 压缩       -> 数据无关量化
+    评测在哪里      :  通用      -> 通用         -> NIAH     -> NIAH/LongBench -> context-intensive
+
+  核心转变:
+    "省内存" --> "可逆地省" --> "精准地搬" --> "精准是个谎言（在难任务上）" --> "退回最朴素的逐项处理"
+#+end_example
+
+* 洞见
+
+整条线表面是 *技术堆叠*（DeepSpeed → FlexGen → H2O → InfiniGen → ShadowKV → YAKV），底下是一条 *赌注精细化、然后被新难度打回原形* 的认知曲线。
+
+每一代人都在用前人想不到的"组结构 / 低秩近似 / landmark"去赌：稀疏注意力里有 *可压缩的结构*，可以代理出来。这个赌注在简单任务上一次次赢，让方法越来越巧、越来越花。直到 YAKV 把任务从"找一根针"换成"抽几十条字段"，所有花活集体失灵——*结构化代理（SVD、landmark、digest）在信息密度高时就是不准*。
+
+YAKV 的应对方式很有 lesson 意义：不是再发明一个更聪明的 landmark，而是 *把每一层巧妙的近似都换回最朴素的逐项量化*。在带宽和精度都极致紧张的场景，"对每个单元做最低开销的诚实表达"经常打败"对整组做聪明的压缩表达"。这和过去十年硬件量化（INT8 → FP8 → MXFP4）的演化曲线惊人一致——简单的、数据无关的、按元素的近似，最终成了 KV cache 选取这一仗的赢家。
+
+下一步可能往哪走？两个方向看起来都很值得押注：
+- *评测先于方法* — YAKV 真正的贡献不是 YAKV 自己，是 Text2JSON 和"context-intensive"这个评测视角。一旦评测把方法的真实能力照出来，方法的演化会被强行转向；可以预期一年内会有专门为 context-intensive 设计的 offloading 框架（自适应粒度、混合 landmark+quantization、查询感知压缩）。
+- *和注意力本身重谈* — full attention 之上的 KV offloading 已经被研究得很细。但 MLA / Gated DeltaNet / NSA 这类 *从模型侧重新定义 KV 是什么* 的工作出现后，offloading 必须重新建模——目标不再是"少搬正确的 KV"，而是"先让 KV 本身更适合搬"。
+
+* 启发
+
+这条线对"怎么做研究"的启发，至少有三点能落进自己的工作里：
+
+1. *找你领域里那个"NIAH"假象* —— 当你看到一个 benchmark 让所有方法都不掉点，要立刻警觉：可能是这个 benchmark 漏掉了真实需求里某个关键维度。YAKV 不是发明了新技术，是发明了一个 *新视角* 来照出旧技术的失效。这意味着：你可以靠"造一个能暴露当前方法弱点的评测集"立住一篇 paper，不需要先有更好的方法。
+
+2. *"减去"也是 contribution* —— YAKV 砍掉了 ShadowKV 的 SVD、chunk、landmark、outlier、prefetch 五样东西，剩下的只是"原始量化 + 逐 key 选择"。结果更准、更简单、更易实现。这意味着：每次接手前人的复杂系统时，先问"如果我把这些花活都去掉，最朴素的版本能跑成什么样？"——很多时候，简单版本已经够了，复杂部分是为不存在的问题而做的。
+
+3. *简单×数据无关×按元素，是稳健的赢面* —— 当 task distribution shift 时（NIAH → context-intensive），所有"利用了某种数据结构假设"的近似（SVD 假设低秩、landmark 假设组内相关）都会塌。只有 *按元素的、数据无关的* 表示（HIGGS quantization）扛住了。在工程上，这意味着：当你不确定下游任务分布时，宁可选一个 *稍微贵一点但对分布不敏感* 的方法，也不要选一个 *便宜但依赖结构假设* 的方法——后者会在意料之外的输入上 silent fail。

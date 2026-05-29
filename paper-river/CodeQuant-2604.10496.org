@@ -1,0 +1,288 @@
+#+title:      CodeQuant: Unified Clustering and Quantization for Enhanced Outlier Smoothing in Low-Precision Mixture-of-Experts
+#+date:       [2026-05-28 Thu 17:49]
+#+filetags:   :paper:river:
+#+identifier: 20260528T174903
+#+source:     https://arxiv.org/abs/2604.10496
+#+authors:    Xiangyang Yin, Xingyu Liu, Tianhua Xia, Bo Bao, Vithursan Thangarasa, Valavan Manohararajah, Eric Sather, Sai Qian Zhang
+#+venue:      arXiv 2604.10496 (cs.LG), Apr 2026
+
+* 问题之河
+
+LLM 想跑得快、占得少，就得把权重和激活从 16 比特压到 4 比特。但每次一压，模型就崩——准确率跌得离谱。所有人查到最后都指向同一个怪东西：*outlier（离群值）*。
+
+激活张量里大部分元素都很乖，集中在某个小范围。但每隔几列就冒出一个比邻居大 100 倍的怪物。你用 4 比特去量化，量化区间被这几个怪物撑得巨宽，结果普通值全挤在最低的两三档，精度全丢了。
+
+这条河的所有论文都在回答同一个问题：*怪物存在，怎么办？* 一代人换一种回答方式，每次都自以为搞定了，下一代又发现还差一截。
+
+* 溯源地图
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | 发现: 激活里有少数 outlier 通道，比其他大 100x
+  | 答法: 把它们挑出来，单独用 fp16 算，剩下的用 int8
+  v
+[2022/23] Xiao et al. - SmoothQuant
+  |
+  | 看到 LLM.int8 的问题: 挑出来 + 混合精度 = 硬件碎成一地
+  | 答法: 不挑，把激活的难度用 per-channel 缩放转嫁到权重
+  v
+[2024] Chee et al. - QuIP / QuIP#
+  |
+  | 看到 SmoothQuant 的问题: per-channel 缩放只能搬不能稀释
+  | 答法: 给激活乘个随机正交矩阵（Hadamard rotation），把 outlier 拌进所有通道
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | 看到 QuIP 的问题: 只是理论分析，没真正端到端跑通 LLM 推理
+  | 答法: 把 rotation 折进权重，做出"无 outlier 推理"，INT4 跑通真实 LLM
+  v
+[2025] Liu et al. - SpinQuant
+  |
+  | 看到 QuaRot 的问题: rotation 是固定 Hadamard，没针对模型优化
+  | 答法: 用 Cayley 变换把 rotation 参数化、可学，端到端微调
+  v
+[2026] Yin et al. - CodeQuant  (target)
+  |
+  | 看到 SpinQuant 的问题: rotation 再优化也只能把 outlier 摊平，权重端剩余误差仍在
+  | 答法: 权重不用均匀量化，改用 K-means 聚类——质心可以直接坐在 outlier 上把它"吞掉"
+  v
+  |
+  +--- 同时融合另一条平行线 ---
+       [2016] Han et al. - Deep Compression (聚类压缩的源头)
+            v
+       [2024] Kim et al. - SqueezeLLM (把聚类带进 LLM 权重)
+            v
+       并入 CodeQuant
+#+end_example
+
+* 演化叙事
+
+** 2022 | LLM.int8(): 第一次给"怪物"起了名字
+
+*** 它看到了什么问题
+
+在 LLM.int8() 之前，大家把神经网络量化当成解决问题。CNN 时代 INT8 跑得好好的，搬到 LLM 上就翻车——尤其是 6.7B 以上的模型，一压就废。没人知道为什么。
+
+*** 它的解法
+
+Dettmers 团队把激活张量画出来看，发现一个反常识的事实：模型里只有不到 0.1% 的特征通道，里面的值能比其他通道大上 100 倍甚至更多。这些通道叫 *outlier features*，而且它们恰好对模型预测至关重要。
+
+既然就那么几个通道作妖，那就别去欺负它们：把这几个通道拎出来用 FP16 跑，剩下 99.9% 的通道用 INT8。一次矩阵乘法拆成两部分，最后加回来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度回来了，因为 outlier 没被压扁。但这套方案在硬件上是噩梦：
+
+- 每层都要在线判断"哪些列是 outlier"——动态的，没法静态调度
+- 一次矩阵乘要拆两个 kernel，FP16 那条路完全用不上 INT8 张量核
+- 推理实际不比 FP16 快多少，省的是显存不是时间
+
+下一代人面对的问题就清晰了：*能不能不要混合精度？能不能让所有通道都老老实实用同一种位宽？*
+
+** 2022/23 | SmoothQuant: 把难度"搬家"
+
+*** 它看到了什么问题
+
+SmoothQuant 直接把 LLM.int8 的硬件痛点摊开：混合精度跑不快。但它注意到一个数学上的对称性——既然 Y = X·W，那 Y = (X/s) · (s·W) 也成立。意思是激活的难度可以"借"给权重。
+
+*** 它的解法
+
+引入一个 per-channel 的缩放向量 s。对 outlier 严重的通道，s 取大值，激活被缩小，权重被放大。算完是等价的，但激活分布变平了——可以放心 INT8 量化。权重虽然变陡了一点，但权重一向比激活好压，扛得住。
+
+类比：你和一个胖子背一袋米过桥，你瘦扛不动 40 斤，他壮但已经背了一袋。你把你的米往他袋里塞一点，桥过了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+激活的动态范围被压下来了，整个矩阵乘法都是 INT8，硬件干净。
+
+但 per-channel 缩放是个非常有限的工具：它只能给每列乘一个数，不能改变 outlier 在通道内部的分布。如果一个通道的 outlier 比邻居大 1000 倍，缩放下来邻居就被压到接近 0，精度照样丢。
+
+更深的问题：缩放只是把难度搬到权重端。权重端原本能轻松吃下，但要往 INT4 走，权重也开始扛不住了。
+
+下一代问题：*能不能从根本上让 outlier 不再集中在某几个通道，而是分散到所有通道？*
+
+** 2024 | QuIP / QuIP#: 用旋转把 outlier "拌"进所有通道
+
+*** 它看到了什么问题
+
+QuIP 团队的洞察更狠：per-channel 缩放只能对每个通道分别动手脚，治标。真正想稀释 outlier，得做通道之间的"混合"。
+
+*** 它的解法
+
+引入一个正交矩阵 R（开始是随机 Hadamard），把激活 X 变成 X·R。同时把权重 W 变成 R^T·W。算完是 Y = X·R·R^T·W = X·W，完全等价。
+
+但 X·R 的分布变了——根据 Johnson-Lindenstrauss 引理这类结果，正交旋转会把任何分布"洗"得更接近高斯。原本集中在某几个通道的 outlier，被拌进所有通道里，每个通道都分摊一点点，没有谁特别突出。
+
+类比：你有一锅粥里几粒石子，你看得见也躲得开。搅一下，石子被磨碎和粥融在一起，谁也咬不到了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+这是认识上的一次大跃迁：从"挑出 outlier"到"消灭 outlier 这个概念本身"。QuIP 主要做了理论分析和算法证明，QuIP# 跟进做了实践。
+
+但留下两个口子：
+
+- rotation 是随机 Hadamard，没针对具体模型的激活分布调优——平均看下去 outlier 被摊平了，但具体看某些层，残余的极值还是不小
+- 部署上还没和 LLM 推理栈深度结合
+
+下一代问题：*能不能把 rotation 真正端到端跑通在 INT4 的真实 LLM 上？*
+
+** 2024 | QuaRot: 把"无 outlier 推理"做成可部署的工程
+
+*** 它看到了什么问题
+
+QuIP 证明了 rotation 在数学上可行，但没人在真实生产模型上跑通端到端的 INT4 推理。QuaRot 看到这个空白：理论已经够了，缺的是工程兑现。
+
+*** 它的解法
+
+把 rotation 矩阵 *预先折进* 模型权重——R 吸收到上游线性层、R^T 吸收到下游线性层。推理时模型外观和原来一样，只是权重和激活都被等价地 rotate 过了。每层激活一冒出来就是接近高斯的，INT4 量化直接干净。
+
+针对 Self-Attention 的 KV cache、残差连接、FFN 里 SwiGLU 这种破坏 rotation 不变性的非线性，都给出了具体处理方案（必要时做 online Hadamard）。
+
+第一次有人在 Llama 这一级别模型上跑通了 W4A4 推理。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+rotation 的实战可行性被夯实了。后续所有 rotation-based 工作都默认以 QuaRot 为基础设施。
+
+但 rotation 还是随机的——固定的 Hadamard 矩阵，没看过模型一眼就拍上去。这是一个"通用解药"，对所有模型都一样，但每个模型的激活分布不同，必有更优的 rotation 没被找到。
+
+下一代问题：*能不能让 rotation 自己学？*
+
+** 2025 | SpinQuant: 让 rotation 自己学
+
+*** 它看到了什么问题
+
+SpinQuant 看 QuaRot 的眼神：你都把 rotation 当作可调维度了，怎么不调？模型有的，校准集有的，量化误差是可微的，全齐了，差一个优化器。
+
+*** 它的解法
+
+把 rotation 矩阵参数化。直接学一个矩阵会破坏正交性，所以用 Cayley 变换：先学一个反对称矩阵 S，再用 R = (I − S)(I + S)^−1 算出 R——这玩意儿天然是正交的，而且整个过程对 S 可微。
+
+目标函数就是最小化量化误差。用一小撮校准数据（比如 WikiText 的 1024 个样本），跑上百个迭代步，rotation 端到端被打磨得贴合当前模型的激活分布。
+
+OSTQuant 紧跟着加了 KL 散度目标做联合微调。这条线（学习版的 rotation）算是确立了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+精度比 QuaRot 又好一截。但本质上还是在做同一件事：*把 outlier 摊平*。摊得再均匀，分布里还是有非高斯的尾巴，4 比特均匀量化拿这种尾巴没办法——尾巴上的少数极值，量化区间根本覆盖不到。
+
+更要命的是，rotation 摊平了激活，但代价是 *权重* 那边的方差变得更不均匀了。AOS 让激活老实了，weight 就接锅。SpinQuant 仍然用 INT4 均匀量化打 weight，残余误差堆在这里下不去。
+
+而且新场景出来了：MoE（混合专家）模型——参数量爆炸（670B 这种），更迫切要量化，但 router、专家间不平衡、超级专家的存在带来新的 outlier 模式。
+
+下一代问题：*权重端这堆残余误差，能不能换个范式直接吃掉？* 顺便，*MoE 的特殊结构怎么处理？*
+
+** 2026 | CodeQuant: 不再"摊平"权重，而是用聚类"吞掉"它
+
+*** 它看到了什么问题
+
+CodeQuant 看到了 rotation 这条线的天花板：
+
+- rotation 把激活摊得再平，权重端的 outlier 还在。所有 rotation-based 方法的权重还在用 GPTQ/AWQ 这种均匀量化，本质上还是切 16 个等宽桶——outlier 必然落进最稀疏的两端桶，精度被锁死
+- MoE 的路由器对 token-expert 分配极其敏感，传统量化套上去会把分配打乱，整个模型语义崩
+
+同时它瞄到平行的另一条线——*聚类量化*：
+- Han et al. 2016（Deep Compression）：用 K-means 把权重聚成有限的几个值，存索引而不是值。压缩比惊人，但当时模型小、应用面窄
+- SqueezeLLM (Kim 2024)：把这套搬进 LLM 权重量化，认识到 LLM 权重分布远非均匀，聚类比均匀量化更贴合。但没碰激活，没碰 rotation，没碰 MoE
+
+CodeQuant 的"灵感"：rotation 这条线和聚类这条线，一直没人接到一起。
+
+*** 它的解法
+
+四块拼成一台机器：
+
+1. *AOS（Activation-Oriented Outlier Smoothing）*——继承 SpinQuant 的学习型 rotation，但只为激活服务。Cayley 变换保证正交，目标函数只盯激活量化误差，权重端的责任完全甩出去
+2. *ACCF（Adaptive Weight Clustering with Centroid Finetuning）*——权重不再用均匀 INT4，改用 K-means 聚成 16 个质心。质心可以"坐"在 outlier 上，等于给极值开了专属抽屉。再用交替优化：固定 assignment 训质心，固定质心算 assignment（用解析解逼近 K-means 的硬分配）
+3. *POG（Permutation-Invariant Outlier Grouping）*——发现旋转后的权重对聚类不友好（某些 group 方差巨大），借鉴 DuQuant 的"用置换矩阵重排列"思路，把高方差元素均匀分散到各 group 里。置换矩阵 P 也折进权重，运行时零开销
+4. *LUT kernel*——聚类后每个权重就是一个 4-bit 索引。GEMM 改成查表：预算好 16 个质心 × 16 个激活值 = 256 个乘积放共享内存，运行时 mux 选择，省去乘法
+
+针对 MoE，专门给 FFN 的 loss 加 KL 散度项保护 router 的 token-expert 分配。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+认识层面的关键跃迁：*不再试图消灭 outlier，而是给 outlier 单独留位置*。前面五代人都在"平均化"——挑出去、搬走、旋转洗匀、学着洗得更匀。聚类的本质完全不同——直接承认 outlier 存在，给它一个质心，把它的精度保留下来。
+
+效果：在 Mixtral 8x7B、Qwen3-30B-A3B、DeepSeek-V2-Lite、Phi-Mini-MoE 上，A4W4 设置下精度显著超 QuaRot、SpinQuant、SqueezeLLM；LUT kernel 跑出 4.15× 加速。
+
+留下的口子：
+- 聚类需要可微的 assignment 近似，且交替优化不保证全局最优
+- LUT kernel 在 GPU 上有 bank conflict 和 tensor core 兼容性问题，全靠 Accel-Sim 仿真，没真正的硬件实测
+- 预处理开销不小（Mixtral 8x7B 需要 4-5 小时校准）
+- 只覆盖 PTQ，没碰 QAT。是否能进一步扩展到激活也聚类，仍未知
+
+* 前沿延伸
+
+CodeQuant 2026 年 4 月才挂 arXiv，截至本文写作（2026 年 5 月），尚未观察到明确针对它做改进的后续论文。但可以预判几条最可能的延伸方向：
+
+- *激活也聚类*：当前激活仍走整数量化，下一步顺理成章把 LUT 思路也用在激活端，但激活动态生成，质心 online 计算的代价是关键
+- *更狠的 MoE 专属处理*：CodeQuant 把所有专家共享一个 rotation 矩阵，下一代很可能会按专家/按层学不同的 rotation 和 codebook
+- *真实硬件落地*：Cerebras WSE 的 sparsity indexing、Apple Neural Engine 的 LUT、Arm Ethos-U 都已支持类似机制，CodeQuant 论文也提到了——所以"算法+硬件协同的真正商用部署"很可能是下一个发力点
+
+注：以上为推测，非确认的后续论文。
+
+* 一张图看懂
+
+#+begin_example
+        outlier 怎么办？六代人的答法
+        =================================
+
+时间 ->  2022          2023            2024              2025          2026
+        +-----+      +---------+      +-------+         +--------+    +-----------+
+       | LLM  |      | Smooth  |      | QuIP  |  ==>   | Spin   |    | CodeQuant |
+       | int8 |  ==> | Quant   |  ==> | QuaRot|  ==>   | Quant  | ==>|           |
+        +-----+      +---------+      +-------+         +--------+    +-----------+
+认识      "挑"          "搬"           "拌"               "学着拌"        "吞"
+core
+策略   mixed       channel-wise      random             learnable       cluster +
+       precision   scaling           rotation           rotation        learned rot
+                                    (Hadamard)         (Cayley)         (K-means)
+
+权重     INT8        INT8             INT4              INT4            16 centroids
+处理   (大部分)      (uniform)        (uniform)         (uniform)      (non-uniform)
+
+激活     混 fp16     INT8 (smoothed) INT4 (rotated)    INT4 (rotated) INT4 (rotated)
+
+硬件     拆 kernel   一体化但         折进权重           折进权重         LUT kernel
+                    per-ch scale     运行时零开销       同上            (查表代乘法)
+
+留下     硬件碎       per-ch 不够细  rotation 没优化   权重端误差    GPU 兼容性
+的坑                                                  仍在堆积       仍待打磨
+
+                                                        |
+                            另一条线                    |
+                            ---------                   |
+             [2016 Han Deep Comp.]  -->  [2024 SqueezeLLM]  ----+
+             K-means 聚类压缩         K-means 进入 LLM 权重    汇入
+
+整条河的方向：从"特别对待 outlier" 走向 "彻底重写量化的语义"
+             - 第一代认为 outlier 是异常 -> 隔离它
+             - 中间四代认为 outlier 是数学难题 -> 数学转换它
+             - 最新一代认为 outlier 是分布的真实形状 -> 表达它
+#+end_example
+
+* 洞见
+
+读完这条线，最大的感受不是技术细节，而是 *研究者对 outlier 的态度在变*：
+
+- *第一代（LLM.int8）* 把 outlier 当成异常——"这几个家伙不正常，单独处理"。这是科学的本能反应：先把异常隔离
+- *中间四代（SmoothQuant 到 SpinQuant）* 把 outlier 当成数学难题——"既然你存在，我用代数手段把你重写"。每一代手段更精细：从缩放到随机旋转到学习旋转。但他们共享一个隐含信念："均匀量化是正确的，问题在数据"
+- *最新一代（CodeQuant）* 把 outlier 当成数据真实的形状——"数据本来就不是均匀分布，凭什么用均匀量化逼它？" 换掉量化语义本身，用聚类拥抱非均匀性
+
+这是一种典型的范式跃迁：当所有人都在更精巧地"修正数据"的时候，有人开始问"是不是工具本来就错了"。
+
+更底层的规律：*工程难题往往不是被新方法解决的，而是被换框架解决的*。
+- LLM.int8 → SpinQuant 一直在 "uniform quantization + 数据预处理" 这个框架里精雕细琢
+- CodeQuant 直接把"uniform quantization"这一前提换掉
+
+这条河也给硬件设计者一个明确信号：未来的 AI 芯片需要 *表达分布* 的能力（LUT、稀疏索引），而不只是 *表达数值* 的能力。Cerebras、Apple、Arm 已经下注。
+
+* 启发
+
+如果你在做研究、做工程、做产品决策：
+
+- *卡在某条线上久攻不下时，回头看看那条线的核心假设*。CodeQuant 不是把 rotation 做得更好，而是把"均匀量化"这个全行业默认的前提换掉。能跳出当前框架，常常比在框架内卷更值钱
+- *盯住被忽视的"平行线"*。聚类量化在 LLM 主流走 rotation 的时候被边缘化，但它一直在那里等着。当主流方法逼近天花板，平行线就成了最近的出路
+- *别太快尊敬"标准做法"*。SmoothQuant、QuaRot、SpinQuant 一个比一个精巧，但它们都共享一个未被审视的前提。技术世界里几乎所有"大家都这么做"的事情，都值得隔几年问一次"还应该这样做吗"
+
+落点在能用：这意味着你下次面对一个"领域已经卷到精雕细琢、增益越来越小"的问题，你可以直接去查 *它的核心假设是什么、有没有平行框架其实能直接吃掉这个假设*。

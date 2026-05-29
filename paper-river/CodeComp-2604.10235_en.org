@@ -1,0 +1,269 @@
+#+title:      CodeComp: Structural KV Cache Compression for Agentic Coding
+#+date:       [2026-05-28 Thu 17:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T174616-en
+#+source:     https://arxiv.org/abs/2604.10235
+#+authors:    Qiujiang Chen, Jing Xiong, Chenyang Zhao, Sidi Yang, Ngai Wong
+#+venue:      arXiv preprint, 2026-04
+
+* The Problem River
+
+Getting a large model to understand an entire codebase — tens of thousands of lines stuffed into context — blows up GPU memory. How do you compress the KV cache without discarding exactly the few critical tokens the model needs to understand the code?
+
+The hard part lies in a fundamental split. Since 2023, everyone has used *attention scores* to judge which tokens matter and which can be dropped. This works well for natural language. But code is different — code's semantics rest on *structure* (who calls whom, which branch governs which logic, where each variable is defined), not surface word frequency. High-attention tokens are not necessarily structurally critical, and structurally critical tokens frequently have low attention scores.
+
+The whole river, then, is a community growing ever more precise at *"how to judge whether a token is important"* — from "keep the recent ones," to "keep the high-attention ones," to "keep whole chunks," until CodeComp finally steps outside the frame and says: "Attention itself is the wrong proxy; we need a different signal source."
+
+* Source Map
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al.)
+  |
+  | Problem observed: KV cache grows linearly; long sequences simply OOM
+  | Solution: keep the first few "attention sink" tokens + a recent window, drop the rest
+  |
+  | Gap left open: all tokens in between — "not in recent window but actually important" — are gone
+  v
+[2023.10] H2O (Zhang et al.) - Heavy Hitter Oracle
+  |
+  | Problem observed: shouldn't rely on position alone; should track how often each token is "heavily attended"
+  | Solution: accumulate attention scores, keep "heavy hitters"
+  |
+  | Gap left open: heavy hitters are only discovered during decoding, not helpful during the prompt phase
+  v
+[2024.04] SnapKV (Li et al.)
+  |
+  | Problem observed: by the end of the prompt the model already "knows" what it is looking for
+  | Solution: use attention at the prompt's tail tokens to retrospectively select which prompt KVs to keep
+  |
+  | Gap left open: still selects token by token, fragmenting semantically contiguous content
+  v
+[2025.02] ChunkKV (Liu et al.)
+  |
+  | Problem observed: single-token selection destroys semantic units (splitting sentences into scattered pieces)
+  | Solution: score and retain at the chunk level; keep or drop entire blocks together
+  |
+  | Gap left open: scoring within a chunk still uses attention — the signal source is unchanged
+  v
+[2025.03] ParallelComp (Xiong et al.)
+  |
+  | Problem observed: chunked long-context can be processed in parallel, but throughput hasn't been maximized
+  | Solution: chunk-level parallel compression, making ultra-long context engineering-feasible
+  |
+  | Gap left open: signal source is still attention — in code scenarios this is a fundamental error
+  v
+[2026.04] CodeComp (Chen et al.) <--- target paper
+  |
+  | Problem observed: attention and code structure are misaligned (Jaccard only 0.094)
+  |                   callsite/branch/assignment tokens are systematically dropped
+  | Solution: swap the signal source — use static analysis (Joern extracts CPG)
+  |           apply "span-level protection" to structurally critical tokens
+  |           perform "structure-aware budget allocation" by structural importance
+  |           then apply traditional attention-based compression on the remaining budget
+  v
+[ ? ] Future work
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.09 | StreamingLLM: Stop Trying to Keep Everything — Head and Tail Are Enough
+
+*** What Problem Did It See
+
+In 2023 people were running Transformers for streaming dialogue, and a tricky phenomenon emerged: once context exceeded the pretraining length, the model started hallucinating. The root cause was that the KV cache couldn't grow forever; once it hit a length and the sliding window chopped it, the model collapsed.
+
+*** Its Solution
+
+Xiao et al. made a counterintuitive discovery: Transformers dump a large share of their "attention budget" onto the very first few tokens of the sequence, even when those tokens are semantically irrelevant — like a drain that absorbs excess attention. They called these *attention sinks*.
+
+The solution is strikingly blunt: keep the first few sink tokens plus a recent sliding window; drop everything in between. The model stops collapsing and can run in a streaming fashion.
+
+*** Why It Works (and What Pit It Dug)
+
+It works because the model was "exploiting" position rather than genuinely needing all intermediate content.
+
+But the pit is obvious: tokens that are *semantically important yet neither near the head nor the tail* simply vanish. A key fact mentioned in turn 50 of a conversation — neither a sink nor in the recent window — disappears entirely.
+
+H2O noticed this pit.
+
+** 2023.10 | H2O: Forget Position — Look at What Gets Repeatedly Attended
+
+*** What Problem Did It See
+
+StreamingLLM decides survival by position, which is too coarse. A token's importance should be measured by how often it has *actually been heavily attended* across historical decoding steps — that is its true "standing" in the model's memory.
+
+*** Its Solution
+
+Zhang et al. proposed the Heavy Hitter Oracle (H2O): accumulate each token's attention scores across all past decoding steps; tokens with high cumulative scores are "heavy hitters" and are kept; low-cumulative ones are dropped.
+
+Viewed as a progression: StreamingLLM scores by position; H2O scores by cumulative attention. The former is a prior; the latter is observation.
+
+*** Why It Works (and What Pit It Dug)
+
+It upgrades "importance" from a positional heuristic to behavioral statistics, with clear gains on natural language.
+
+But heavy hitters can only be identified *after* decoding has been running for a while. If your bottleneck is the prompt phase itself — a prompt of tens of thousands of tokens that immediately exhausts memory before you even generate — H2O cannot prune irrelevant tokens before you "ask the question."
+
+SnapKV noticed this pit.
+
+** 2024.04 | SnapKV: Before the Question Is Asked, the Model Already Knows What It's Looking For
+
+*** What Problem Did It See
+
+H2O needs decoding to start before heavy hitters can be identified, but in many scenarios you already know "what the user will ask" — the question is written at the end of the prompt. Can you *use the question itself as a cue* to retrospectively filter which KVs in the large upstream context are worth keeping?
+
+*** Its Solution
+
+Li et al. found that the attention distribution of the last few tokens of the prompt (typically the tail of the user's question) already "rehearses" where the model will look during decoding. They extract this distribution as a scorer, assign scores to all preceding prompt tokens, and keep the high-scoring ones.
+
+Viewed as a progression: H2O accumulates past attention looking backward; SnapKV borrows the question-tail's attention as a proxy for the future, looking forward.
+
+*** Why It Works (and What Pit It Dug)
+
+Introducing query-aware selection allows compression to happen at the prompt phase — a major engineering leap.
+
+But SnapKV still scores *token by token*. Scores within a sentence vary; what remains might be "the," "is," while the nouns that actually carry meaning get dropped for low attention — semantic units are shattered.
+
+ChunkKV noticed this pit.
+
+** 2025.02 | ChunkKV: Don't Shred Words — Keep Whole Blocks
+
+*** What Problem Did It See
+
+SnapKV treats context as a loose collection of tokens, but language has "chunks" — a phrase, a clause, an argumentative unit. Tear any of them apart and meaning is lost. Token-level selection is like tearing a book into individual characters and then deciding which characters to keep.
+
+*** Its Solution
+
+Liu et al. proposed ChunkKV: divide context into fixed-size chunks, score at the chunk level, and decide which whole blocks to keep and which to discard. All tokens within a chunk share the same fate.
+
+Viewed as a progression: SnapKV treats KVs like sand, sifting grain by grain; ChunkKV treats KVs like rocks, moving them block by block.
+
+*** Why It Works (and What Pit It Dug)
+
+Chunking preserves local semantic continuity and is amenable to parallelism. Keeping a coherent semantic unit intact is far friendlier to downstream generation than "important tokens scattered at random positions."
+
+But how are chunks scored? Still with attention. Chunk-level scoring merely aggregates point signals into block signals — *the signal source is unchanged*.
+
+ParallelComp pushed chunking to the engineering limit, but also never changed the signal source — CodeComp was the one that did.
+
+** 2025.03 | ParallelComp: Parallelize Chunk Compression to Handle Ultra-Long Context
+
+*** What Problem Did It See
+
+ChunkKV is on the right chunk track, but when context truly surges to hundreds of thousands of tokens, single-process serial chunk scoring becomes its own bottleneck. How do you make chunk compression itself parallelizable so that "codebase-scale" or "long-document-scale" inputs become tractable?
+
+*** Its Solution
+
+Xiong et al. (note: this Xiong is also the second author of CodeComp) proposed ParallelComp: run attention scoring and compression across chunks in parallel, lifting pipeline throughput so that agentic and long-context pipelines can actually run in practice.
+
+*** Why It Works (and What Pit It Dug)
+
+On the engineering side, it transforms "compression" from a serial bottleneck into a parallel operator, making methods like ChunkKV usable at production scale.
+
+But — and this is the source of all the tension in CodeComp — the signal source is still attention. For natural language this is fine. But once the input is *code*, a fundamental error surfaces:
+
+Code's semantics don't live in "which token gets looked at repeatedly" but in "who calls whom, who defines whom, which if controls which execution path." Structurally critical tokens — callsites, branch conditions, assignments — may have very low attention scores at a particular decoding step, yet delete them and the model can no longer understand the program.
+
+CodeComp noticed this pit — and this time the pit is not in an *implementation detail* but in *the signal source itself*.
+
+** 2026.04 | CodeComp: Swap the Signal Source — Let Program Structure Speak
+
+*** What Problem Did It See
+
+The authors made a straightforward measurement: take the top-20% chunks ranked by attention-based scoring, take the top-20% chunks ranked by CPG (Code Property Graph) structural importance, and compute the intersection. The Jaccard similarity is only *0.0944* — almost completely disjoint.
+
+This means that five years of attention-based compression methods have been systematically cutting the wrong things in code scenarios. Figure 2(b) shows that structurally critical token classes — callsites, returns, assignments — are dropped by attention baselines at an alarming rate.
+
+*** Its Solution
+
+Step outside attention; use *static program analysis* as an independent signal source:
+
+1. Use Joern to extract a CPG (Code Property Graph, a unified graph representation combining AST, CFG, and PDG) from the code.
+2. *Span-level structural protection*: mark structurally critical spans — callsites, branches, assignments — and force their retention during compression; low attention is not grounds for dropping them.
+3. *Structure-aware budget allocation*: instead of distributing the KV budget evenly across chunks, allocate according to the density of structurally critical tokens per chunk — denser chunks get more budget.
+4. Within the remaining budget, apply conventional attention-based compression.
+
+Viewed as a progression: the previous five generations were all "swapping the scoring formula within the single signal source of attention." CodeComp *wires in a second signal source in parallel*, using structural signals to patch attention.
+
+Training-free, plugs into SGLang, leaves model weights untouched.
+
+*** Why It Works
+
+On the LCA code-generation benchmark, API precision jumps from SnapKV's 0.0196 and ParallelComp's 0.1318 to CodeComp's 0.1929; edit distance also improves markedly. The callsite token retention rate rises from ParallelComp's 0.48 and SnapKV's 0.52 to 1.00.
+
+The fundamental reason it works is: *attention is a query-driven proxy learned by the model, while the CPG is the real structure that exists when the program executes*. The two signals cross-correct each other and are more reliable than either alone.
+
+* Frontier Extensions
+
+CodeComp was submitted on 2026-04-11, just weeks ago. As of this writing (2026-05-28), no public direct follow-ups have appeared.
+
+But three directions seem predictable:
+
+- *Signal-source expansion*: beyond the CPG, one could incorporate type information, dataflow traces, or test-coverage signals.
+- *Dynamization*: static analysis is a one-shot operation at the prompt phase; could the structural graph be updated dynamically during decoding (e.g., when the model is generating a patch, newly generated code also feeds into structural analysis)?
+- *Cross-domain reuse*: the paradigm of "find an independent signal source to patch attention" can transfer to mathematics (formal proof structure), SQL (schema structure), chemistry (molecular graphs), and any domain with a strong structural prior.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                                   Signal Source Evolution
+
+ Time       Position Heuristic   Cumulative Attn   Query Attn       Chunk Attn       Structural Signal
+ ====       ==================   ==============    ==========       ==========       =================
+
+ 2023.09    StreamingLLM
+            |sink + window|
+               |
+               | "position is too coarse"
+               v
+ 2023.10                         H2O
+                                 |heavy hitter|
+                                      |
+                                      | "only known after decoding — too late"
+                                      v
+ 2024.04                                           SnapKV
+                                                   |question-tail proxy|
+                                                         |
+                                                         | "token-by-token shatters semantics"
+                                                         v
+ 2025.02                                                              ChunkKV
+                                                                      |keep/drop whole blocks|
+                                                                           |
+                                                                           | "signal source unchanged"
+                                                                           v
+ 2025.03                                                              ParallelComp
+                                                                      |parallel chunks|
+                                                                           |
+                                                                           | "fundamentally wrong for code"
+                                                                           v
+ 2026.04                                                                              CodeComp
+                                                                                      | CPG span protection  |
+                                                                                      | structural budget     |
+
+ Shared trait   ----------- all swap the formula within the single signal source of attention -----------   <-- source swapped
+#+end_example
+
+* Insight
+
+On the surface this river is a technical iteration on KV cache compression. What is really happening is *the evolution of the signal source*.
+
+The first five generations of researchers all accepted one implicit premise: token importance == some attention function f(attention). What they changed was always the form of f — from a "positional f," to a "cumulative f," to a "query-aware f," to a "chunk-aggregate f." Each generation refined f further, but no one asked "is the equals sign itself correct?"
+
+CodeComp's real contribution is not that it used the CPG — it is that it *broke open that equals sign*. Once you acknowledge that "attention is not the only proxy for token importance," the rules of the game change entirely: you can wire in any independent signal source as a corrective.
+
+This is a classic *framework reset* moment in research: previous generations optimized known formulas horizontally; this generation *changed the very object being optimized*, vertically. Once the framework shifts, a wide range of new paper positions opens up — every structural prior, every symbolic signal, every tool artifact could become the next CodeComp.
+
+Where will the next step most likely go? Not inside the KV cache, but in *the ecosystem of signal sources*. Whoever can find a second and third independent signal source to complement attention will claim the next stretch of the river.
+
+* Takeaways
+
+At the level of research methodology:
+
+- When you notice that every paper in a field is varying the form of f without questioning f's input, that is where the *framework reset* opportunity lives. Ask once: "What if the signal source itself is wrong?"
+- Importing cross-disciplinary signals is often more powerful than refining formulas within a domain: program analysis (software engineering) grafted onto KV cache (systems/ML) opens an entirely new area. "Between two seemingly unrelated fields, there is a new paper waiting."
+- Training-free solutions diffuse faster in industry than training-based ones. If you can use something without touching weights, you bypass all fine-tuning costs and compatibility debates.
+
+At the level of actionable practice:
+
+- If you are building any engineering system that scores by attention (reranking, retrieval, compression, pruning), *first measure the correlation between attention scores and the ground-truth importance you actually care about*. If Jaccard is below 0.2, you may be systematically cutting the wrong things — this is exactly the measurement CodeComp made at the outset.
+- To lift an existing system by one tier, you don't necessarily need to train a new model — first find *a second independent signal source*. The entire core of CodeComp can be distilled into that single sentence.

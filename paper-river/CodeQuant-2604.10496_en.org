@@ -1,0 +1,295 @@
+#+title:      CodeQuant: Unified Clustering and Quantization for Enhanced Outlier Smoothing in Low-Precision Mixture-of-Experts
+#+date:       [2026-05-28 Thu 17:49]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T174903-en
+#+source:     https://arxiv.org/abs/2604.10496
+#+authors:    Xiangyang Yin, Xingyu Liu, Tianhua Xia, Bo Bao, Vithursan Thangarasa, Valavan Manohararajah, Eric Sather, Sai Qian Zhang
+#+venue:      arXiv 2604.10496 (cs.LG), Apr 2026
+
+* The River of the Problem
+
+LLMs need to run fast and fit in less memory, which means compressing weights and activations from 16 bits down to 4 bits. But every time you compress, the model collapses — accuracy plummets. Everyone who investigates eventually traces the problem back to the same strange culprit: *outliers*.
+
+Most elements in an activation tensor are well-behaved, clustered within a small range. But every few columns, a monster appears that is 100× larger than its neighbors. When you try to quantize with 4 bits, those monsters stretch the quantization interval to enormous width, and all the ordinary values get crammed into the two or three lowest buckets — precision is completely lost.
+
+Every paper in this river is answering the same question: *Outliers exist — now what?* Each generation offers a different answer, each convinced it has solved the problem, only for the next generation to discover there is still a gap.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Discovery: a small number of outlier channels in activations, ~100x larger than the rest
+  | Answer: extract them, compute in fp16 separately, use int8 for the remainder
+  v
+[2022/23] Xiao et al. - SmoothQuant
+  |
+  | Problem with LLM.int8: extraction + mixed precision = hardware fragmentation
+  | Answer: don't extract; transfer activation difficulty to weights via per-channel scaling
+  v
+[2024] Chee et al. - QuIP / QuIP#
+  |
+  | Problem with SmoothQuant: per-channel scaling can relocate outliers but can't dilute them
+  | Answer: multiply activations by a random orthogonal matrix (Hadamard rotation)
+  |         to blend outliers across all channels
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Problem with QuIP: only theoretical analysis; no end-to-end LLM inference actually validated
+  | Answer: fold rotation into weights, achieve "outlier-free inference", run INT4 on real LLMs
+  v
+[2025] Liu et al. - SpinQuant
+  |
+  | Problem with QuaRot: rotation is a fixed Hadamard, not optimized for the specific model
+  | Answer: parameterize rotation via Cayley transform, make it learnable, fine-tune end-to-end
+  v
+[2026] Yin et al. - CodeQuant  (target)
+  |
+  | Problem with SpinQuant: even optimal rotation only spreads outliers; residual error on
+  |   the weight side persists
+  | Answer: replace uniform quantization of weights with K-means clustering — centroids can
+  |         sit directly on outliers and "absorb" them
+  v
+  |
+  +--- simultaneously merges a parallel line ---
+       [2016] Han et al. - Deep Compression (the origin of clustering-based compression)
+            v
+       [2024] Kim et al. - SqueezeLLM (brings clustering into LLM weight quantization)
+            v
+       merged into CodeQuant
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): The First Name for the Monster
+
+*** What Problem It Saw
+
+Before LLM.int8(), people treated neural-network quantization as a solved problem. INT8 worked fine in the CNN era, but porting it to LLMs caused failures — especially for models above 6.7B parameters, which collapsed the moment they were compressed. Nobody understood why.
+
+*** Its Solution
+
+The Dettmers team visualized activation tensors and discovered a counterintuitive fact: fewer than 0.1% of feature channels contained values 100× or more larger than those in any other channel. These are called *outlier features*, and they happen to be critical for model predictions.
+
+Since only those few channels were causing trouble, the answer was to leave them alone: pull those channels out and compute them in FP16, while running the remaining 99.9% of channels in INT8. One matrix multiplication is split into two parts, then the results are added back together.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Accuracy recovered because outliers were not squashed. But the scheme was a hardware nightmare:
+
+- Every layer must dynamically identify "which columns are outliers" — dynamic, impossible to schedule statically
+- Each matrix multiplication requires two separate kernels; the FP16 path cannot use INT8 tensor cores at all
+- Inference was barely faster than FP16 in practice — memory savings, not speed
+
+The next generation's problem became clear: *Can we avoid mixed precision? Can every channel behave and use the same bit-width?*
+
+** 2022/23 | SmoothQuant: Relocating the Difficulty
+
+*** What Problem It Saw
+
+SmoothQuant laid out the hardware pain of LLM.int8 explicitly: mixed precision is not fast. But it noticed a mathematical symmetry — since Y = X·W, it follows that Y = (X/s) · (s·W). The difficulty of the activations can be "lent" to the weights.
+
+*** Its Solution
+
+Introduce a per-channel scaling vector s. For channels with severe outliers, s is set large: activations are shrunk, weights are enlarged. The result is mathematically equivalent, but the activation distribution is flattened — safe for INT8 quantization. The weights become slightly more stretched, but weights have always been easier to compress than activations, so they can absorb it.
+
+Analogy: you and a big friend need to carry sacks of rice across a bridge. You are too light to carry 40 kg; he is strong but already carrying one sack. You shift some of your load into his bag — you cross the bridge together.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The dynamic range of activations is compressed, the entire matrix multiplication runs at INT8, and the hardware path is clean.
+
+But per-channel scaling is a very limited tool: it can only multiply each column by a scalar — it cannot change the intra-channel distribution of outliers. If one channel's outlier is 1000× larger than its neighbors, scaling it down crushes the neighbors to near zero, losing precision all the same.
+
+The deeper problem: scaling merely moves the difficulty to the weight side. Weights could easily absorb it in INT8, but as you push toward INT4, weights start to buckle too.
+
+Next generation's question: *Can we fundamentally prevent outliers from concentrating in a few channels — distributing them across all channels instead?*
+
+** 2024 | QuIP / QuIP#: Blending Outliers Away with Rotation
+
+*** What Problem It Saw
+
+The QuIP team's insight was sharper: per-channel scaling operates on each channel independently — it treats the symptom. To truly dilute outliers you need to *mix* across channels.
+
+*** Its Solution
+
+Introduce an orthogonal matrix R (initially a random Hadamard) and transform activations from X to X·R, while transforming weights from W to R^T·W. The output is Y = X·R·R^T·W = X·W — fully equivalent.
+
+But the distribution of X·R changes. By results analogous to the Johnson-Lindenstrauss lemma, orthogonal rotation "washes" any distribution closer to Gaussian. Outliers that were concentrated in a few channels are blended into all channels; each channel absorbs a little, and none stands out dramatically.
+
+Analogy: you have a pot of porridge with a few pebbles you can see and dodge. Stir it vigorously and the pebbles are ground into the porridge — nobody bites one anymore.
+
+*** Why It Worked (and What New Pit It Dug)
+
+This was a major conceptual leap: from "isolate the outliers" to "eliminate the concept of outliers altogether." QuIP provided theoretical analysis and algorithmic proof; QuIP# followed with practical implementation.
+
+But two gaps remained:
+
+- The rotation is a random Hadamard, not tuned to the specific model's activation distribution — on average outliers are spread out, but in specific layers residual extremes remain sizable
+- Deployment was not deeply integrated with real LLM inference stacks
+
+Next generation's question: *Can rotation be made to run end-to-end in INT4 on real deployed LLMs?*
+
+** 2024 | QuaRot: Engineering "Outlier-Free Inference" into a Deployable System
+
+*** What Problem It Saw
+
+QuIP proved rotation is mathematically valid, but nobody had run end-to-end INT4 inference on a real production model. QuaRot saw that gap: the theory was sufficient; what was missing was engineering execution.
+
+*** Its Solution
+
+*Pre-fold* the rotation matrix into the model weights — R is absorbed into the upstream linear layer, R^T into the downstream linear layer. At inference time the model looks exactly the same as before; the weights and activations have simply been equivalently rotated. As each layer's activations emerge they are already approximately Gaussian, and INT4 quantization applies cleanly.
+
+Specific solutions were provided for cases that break rotation equivariance: KV cache in Self-Attention, residual connections, and nonlinearities like SwiGLU in the FFN (online Hadamard where necessary).
+
+For the first time, W4A4 inference was demonstrated on a Llama-class model.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The practical viability of rotation was firmly established. All subsequent rotation-based work takes QuaRot's infrastructure as the baseline.
+
+But the rotation was still random — a fixed Hadamard matrix applied without ever looking at the model. It is a "universal antidote," identical for every model, yet every model's activation distribution is different, so a better rotation surely exists and remains unfound.
+
+Next generation's question: *Can the rotation learn?*
+
+** 2025 | SpinQuant: Letting the Rotation Learn
+
+*** What Problem It Saw
+
+SpinQuant looked at QuaRot with one observation: you have already treated rotation as a tunable degree of freedom — so why not tune it? The model is there, the calibration set is there, quantization error is differentiable, everything is in place — all that's missing is an optimizer.
+
+*** Its Solution
+
+Parameterize the rotation matrix. Learning an unconstrained matrix would break orthogonality, so SpinQuant uses the Cayley transform: learn an anti-symmetric matrix S, then compute R = (I − S)(I + S)^{−1} — this is guaranteed to be orthogonal, and the entire process is differentiable with respect to S.
+
+The objective is to minimize quantization error. Using a small calibration set (e.g., 1024 samples from WikiText) for hundreds of gradient steps, the rotation is end-to-end polished to fit the current model's activation distribution.
+
+OSTQuant followed immediately, adding a KL-divergence objective for joint fine-tuning. The line of learned rotations was established.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Accuracy improved another notch over QuaRot. But fundamentally the same thing was happening: *spreading outliers thinner*. No matter how evenly they are spread, the distribution still has non-Gaussian tails, and uniform 4-bit quantization cannot handle those tails — the few extreme values at the edges are simply beyond the reach of the quantization grid.
+
+More critically, rotation smooths the activations at a cost: variance on the *weight* side becomes more uneven. AOS tames activations; the weights inherit the burden. SpinQuant still uses uniform INT4 for weights, and residual error accumulates there with no way out.
+
+A new scenario also arrived: MoE (Mixture-of-Experts) models — parameter counts exploding (670B scale), making quantization even more urgent, but with the router, expert-load imbalance, and "super-experts" introducing new outlier patterns.
+
+Next generation's question: *Can this residual weight-side error be eliminated by switching paradigms entirely?* And: *How do we handle MoE's unique structure?*
+
+** 2026 | CodeQuant: No Longer "Spreading" Weights — Instead "Absorbing" Them with Clustering
+
+*** What Problem It Saw
+
+CodeQuant identified the ceiling of the rotation line:
+
+- No matter how well rotation flattens activations, outliers on the weight side persist. Every rotation-based method still uses GPTQ/AWQ-style uniform quantization for weights — 16 equally-wide buckets — so outliers inevitably fall into the sparsest end buckets, and precision is permanently capped.
+- MoE routers are exquisitely sensitive to token-expert assignment; applying conventional quantization disrupts those assignments, causing the whole model's semantics to collapse.
+
+At the same time it spotted a parallel line — *clustering-based quantization*:
+- Han et al. 2016 (Deep Compression): K-means clusters weights into a finite set of values; store indices instead of values. Remarkable compression ratio, but models were small and applications limited.
+- SqueezeLLM (Kim 2024): brings this into LLM weight quantization, recognizing that LLM weight distributions are far from uniform and clustering fits them better. But it did not touch activations, rotation, or MoE.
+
+CodeQuant's insight: the rotation line and the clustering line had never been connected.
+
+*** Its Solution
+
+Four components assembled into one machine:
+
+1. *AOS (Activation-Oriented Outlier Smoothing)* — inherits SpinQuant's learned rotation, but serves activations exclusively. The Cayley transform guarantees orthogonality; the objective targets only activation quantization error, completely offloading weight-side responsibility.
+2. *ACCF (Adaptive Weight Clustering with Centroid Finetuning)* — weights no longer use uniform INT4; instead K-means clusters them into 16 centroids. Centroids can sit directly on outliers, giving extreme values their own dedicated slot. An alternating optimization follows: fix assignments and train centroids; fix centroids and recompute assignments (using an analytic approximation to K-means hard assignment).
+3. *POG (Permutation-Invariant Outlier Grouping)* — rotated weights are found to be unfriendly to clustering (certain groups have enormous variance). Drawing on DuQuant's idea of using permutation matrices to reorder elements, POG redistributes high-variance elements evenly across groups. The permutation matrix P is folded into the weights, incurring zero runtime overhead.
+4. *LUT kernel* — after clustering, each weight is a 4-bit index. GEMM becomes a table lookup: precompute 16 centroids × 16 activation values = 256 products in shared memory; at runtime a mux selects the result, eliminating multiplications.
+
+For MoE specifically, a KL-divergence term is added to the FFN loss to protect the router's token-expert assignments.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The key conceptual leap: *stop trying to eliminate outliers; instead give outliers their own reserved slot*. The previous five generations all pursued "averaging" — extract, relocate, rotation-wash, learn to wash better. Clustering is fundamentally different — it openly acknowledges that outliers exist, assigns a centroid to each, and preserves their precision.
+
+Results: on Mixtral 8x7B, Qwen3-30B-A3B, DeepSeek-V2-Lite, and Phi-Mini-MoE, A4W4 accuracy significantly exceeds QuaRot, SpinQuant, and SqueezeLLM; the LUT kernel achieves 4.15× speedup.
+
+Gaps that remain:
+- Clustering requires a differentiable approximation of hard assignment, and alternating optimization does not guarantee a global optimum
+- The LUT kernel faces bank-conflict and tensor-core compatibility issues on GPUs; all results rely on Accel-Sim simulation, not real hardware measurement
+- Calibration overhead is substantial (4–5 hours for Mixtral 8x7B)
+- Only PTQ is covered; QAT is untouched. Whether clustering can extend to activations as well remains unknown
+
+* Frontier Extensions
+
+CodeQuant was posted to arXiv in April 2026; as of the time of writing (May 2026) no follow-up papers explicitly targeting it for improvement have appeared. But several extension directions are predictable:
+
+- *Clustering activations too*: activations still use integer quantization; the next logical step is applying LUT-style thinking to the activation side as well, though online centroid computation cost will be the key challenge
+- *More aggressive MoE-specific treatment*: CodeQuant shares one rotation matrix across all experts; the next generation will likely learn distinct rotations and codebooks per expert or per layer
+- *Real hardware deployment*: Cerebras WSE sparsity indexing, Apple Neural Engine LUT support, and Arm Ethos-U already support analogous mechanisms — the paper mentions this explicitly — so "algorithm-hardware co-design for true commercial deployment" is likely the next major thrust
+
+Note: the above are projections, not confirmed follow-up papers.
+
+* One Diagram to See It All
+
+#+begin_example
+        Six generations' answers to the outlier problem
+        =================================================
+
+Time ->  2022          2023            2024              2025          2026
+        +-----+      +---------+      +-------+         +--------+    +-----------+
+       | LLM  |      | Smooth  |      | QuIP  |  ==>   | Spin   |    | CodeQuant |
+       | int8 |  ==> | Quant   |  ==> | QuaRot|  ==>   | Quant  | ==>|           |
+        +-----+      +---------+      +-------+         +--------+    +-----------+
+Mindset   "extract"    "relocate"      "blend"           "learn        "absorb"
+                                                         to blend"
+Core
+strategy  mixed       channel-wise    random             learnable      cluster +
+          precision   scaling         rotation           rotation       learned rot
+                                     (Hadamard)         (Cayley)        (K-means)
+
+Weight    INT8        INT8            INT4               INT4           16 centroids
+handling  (mostly)    (uniform)       (uniform)          (uniform)      (non-uniform)
+
+Activat.  mixed fp16  INT8 (smoothed) INT4 (rotated)    INT4 (rotated) INT4 (rotated)
+
+Hardware  split       unified but     folded into        folded into    LUT kernel
+          kernel      per-ch scale    weights,           weights,       (lookup
+                      overhead        zero runtime       same           replaces
+                                      overhead                          multiply)
+
+Pit left  hardware    per-ch too      rotation not       weight-side    GPU compat-
+behind    fragmented  coarse          optimized          error still    ibility still
+                                                         accumulates    needs work
+
+                                                        |
+                        Parallel line                   |
+                        -------------                   |
+         [2016 Han Deep Comp.]  -->  [2024 SqueezeLLM]  --------+
+         K-means clustering       K-means into LLM weights    merges in
+
+Overall direction: from "treating outliers specially" toward "rewriting the semantics of quantization"
+             - Generation 1 saw outliers as anomalies  -> isolate them
+             - Middle four generations saw them as a math problem -> transform them algebraically
+             - Latest generation sees them as the true shape of the distribution -> represent them
+#+end_example
+
+* Insight
+
+After reading through this entire line of work, the deepest impression is not the technical details but *how researchers' attitude toward outliers has shifted*:
+
+- *Generation 1 (LLM.int8)* treated outliers as anomalies — "these guys are abnormal; handle them separately." This is the scientific instinct: isolate the exceptional first.
+- *The middle four generations (SmoothQuant through SpinQuant)* treated outliers as a mathematical problem — "since you exist, I will algebraically rewrite you." Each generation's technique grew more refined: from scaling to random rotation to learned rotation. But they all shared a hidden belief: "uniform quantization is correct; the problem is in the data."
+- *The latest generation (CodeQuant)* treats outliers as the genuine shape of the data — "the data is simply not uniformly distributed; why force uniform quantization onto it?" It replaces the quantization semantics itself, using clustering to embrace non-uniformity.
+
+This is a textbook paradigm shift: while everyone is more cleverly "correcting the data," someone finally asks "was the tool wrong to begin with?"
+
+A deeper pattern: *engineering problems are often not solved by a new method but by switching frameworks*.
+- LLM.int8 through SpinQuant all refined "uniform quantization + data preprocessing" within the same framework
+- CodeQuant simply replaced the premise "uniform quantization" itself
+
+This river also sends a clear signal to hardware designers: future AI chips need the ability to *express distributions* (LUT, sparse indexing), not just *express numerical values*. Cerebras, Apple, and Arm have already placed their bets.
+
+* Takeaways
+
+If you are doing research, engineering, or product decision-making:
+
+- *When you are stuck on one line and progress stalls, look back at that line's core assumptions.* CodeQuant did not make rotation better — it replaced the industry-wide default premise of "uniform quantization." Stepping outside the current framework is often worth more than competing harder within it.
+- *Keep an eye on the neglected parallel line.* Clustering-based quantization was marginalized while the mainstream pursued rotation, but it was always there waiting. When the mainstream approach approaches its ceiling, the parallel line becomes the shortest path forward.
+- *Don't be too quick to respect "standard practice."* SmoothQuant, QuaRot, and SpinQuant are each more elegant than the last, yet they all share an unexamined premise. Almost everything in the technical world that "everyone does this way" is worth asking every few years: "Should we still be doing it this way?"
+
+The practical upshot: the next time you face a problem where a field has been polished to fine detail and gains are shrinking, go directly and ask — *what are its core assumptions, and is there a parallel framework that can simply eat those assumptions whole?*

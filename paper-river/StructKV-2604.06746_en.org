@@ -1,0 +1,266 @@
+#+title:      StructKV: Preserving the Structural Skeleton for Scalable Long-Context Inference
+#+date:       [2026-05-28 Thu 17:21]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T172105-en
+#+source:     https://arxiv.org/abs/2604.06746
+#+authors:    Zhirui Chen, Peiyang Liu, Ling Shao
+#+venue:      ACL 2026 Findings
+
+* The River of Problems
+
+Large language models can now "read" a million-token context — an entire book, an entire codebase, all stuffed in. But every time the model generates a new token, it must look back at the "memory" of every past token. That memory is called the KV cache, and the longer the context, the more GPU memory it consumes and the slower everything gets. The problem in one sentence: *Can we discard part of the memory without making the model dumber?*
+
+The difficulty is that you do not know which tokens will be needed again later. A character's name introduced in paragraph one may not be referenced until paragraph fifty. If you discard it at paragraph three, everything breaks downstream. For more than a decade, researchers have been asking essentially the same question — how do you define "important"? Each generation got the definition slightly wrong, and the next generation kept digging at exactly that wrong spot.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Origin of the problem: attention lets every token attend to all
+  |   past tokens; KV cache grows linearly with context length
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem seen: long-context KV cache exhausts GPU memory
+  | Solution: keep only the first few tokens (attention sink)
+  |           + a recent sliding window
+  v
+[2023] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | Problem seen: middle content is thrown away wholesale, losing
+  |               too much information
+  | Solution: retain "heavy hitters" ranked by accumulated
+  |           attention scores
+  v
+[2024] Li et al. - SnapKV
+  |
+  | Problem seen: H2O must recompute at every decoding step,
+  |   adding latency; the query at the prompt's end already tells
+  |   you what the model cares about — why not decide once?
+  | Solution: use the final segment of prefill as an observation
+  |           window; aggregate attention to identify key tokens
+  v
+[2024] Shi et al. - GemFilter / Yang et al. - PyramidInfer
+  |
+  | Problem seen: all three above leave prefill computation
+  |   untouched — you still compute full attention before knowing
+  |   what to drop
+  | Solution: prune tokens at a very early layer; later layers
+  |           only compute over the surviving subset
+  v
+[2025] Jo et al. - FastKV
+  |
+  | Problem seen: aggressive early pruning hurts quality;
+  |   prefill compression ratio is hard-coupled to decode cache size
+  | Solution: Token-Selective Propagation — prune once at a
+  |   fixed "pivot layer", accelerating prefill while controlling
+  |   cache size
+  v
+[2026] Chen et al. - StructKV  <-- target paper
+        Problem seen: FastKV judges token importance at a single
+          fixed layer — like the blind men and the elephant.
+          A token might be "dim" at that layer yet be a critical
+          hub deep in the network.
+        Solution: accumulate attention cross-layer to find global
+          information hubs; detect the pivot layer dynamically;
+          decouple the compute budget from the storage budget
+#+end_example
+
+* Evolutionary Narrative
+
+The through-line of this research thread in one sentence: *the definition of "important token" keeps getting refined*. From position-important, to score-important, to layer-important, to globally-structure-important. Each generation spotted what the previous definition missed.
+
+** 2017 | Transformer: The Source of the Problem
+
+*** What problem it saw
+
+It did not see a problem — it *created* one. Before Transformer, RNNs carried a fixed-size hidden state and forgot as they went. Transformer spreads all of the past on the table and lets every new token browse freely — that is the KV cache.
+
+*** Its solution
+
+When generating each token, attend to the Keys and Values of every past token, aggregate by similarity-weighted sum. The performance gains were remarkable.
+
+*** Why it worked (and what trap it set)
+
+"Seeing everything" means no information is ever lost. The price: when context grows from 512 to 1 million tokens, the KV cache grows from a few MB to tens of GB. Every subsequent paper is cleaning up this mess.
+
+** 2023 | StreamingLLM: The First and Last Tokens Matter Most
+
+*** What problem it saw
+
+The most naive fix: just drop the oldest tokens. People tried it; the model started hallucinating incoherently.
+
+*** Its solution
+
+A surprising discovery: models assign enormous attention weight to the very first tokens in the sequence — even when those tokens are semantically meaningless. This was named the *attention sink*.
+
+The strategy follows from that: keep the leading sink tokens + keep a recent sliding window, discard everything in between.
+
+*** Why it worked (and what trap it set)
+
+Preserving the "anchor" tokens keeps generation stable. But *whatever gets discarded from the middle might be exactly the crucial information* — a character's name from paragraph five, asked about in paragraph fifty, simply vanishes. The definition is too coarse: position ≠ importance.
+
+** 2023 | H2O: Look at Attention Scores, Keep the "Heavy Hitters"
+
+*** What problem it saw
+
+StreamingLLM uses *position* to decide what to keep, which is unfair to middle tokens that are genuinely referenced frequently. Can we use *how much attention a token receives* as the criterion instead?
+
+*** Its solution
+
+Track statistics during generation: how many times has each token been attended to with a high score? Tokens with a high accumulated score are *heavy hitters* — keep them; drop the rest.
+
+*** Why it worked (and what trap it set)
+
+It genuinely recovers many important middle tokens, and quality beats StreamingLLM by a clear margin. But two new traps appear:
+
+1. You must compute the full attention matrix before identifying heavy hitters — *prefill computation is untouched*.
+2. The scoring window is local; long-range structural dependencies can still be silently severed.
+
+** 2024 | SnapKV: Decide Once, Stop Recomputing Every Step
+
+*** What problem it saw
+
+H2O dynamically identifies heavy hitters during decoding — expensive. More importantly, the user's query is almost always at the end of the prompt, and the attention from that segment is already signalling "here are the parts of the context I care about." Why not use that signal to decide once and for all?
+
+*** Its solution
+
+At the end of prefill, use the final short segment as an *observation window*. Aggregate its attention over the preceding context, cluster by token proximity, select the most important cluster representatives, discard the rest. One decision, never revisited.
+
+*** Why it worked (and what trap it set)
+
+Simple, blunt, and effective — widely adopted in industry. But *prefill still runs full attention* — a million-token input still incurs O(n²) computation. The computational bottleneck is untouched.
+
+** 2024 | GemFilter / PyramidInfer: Prune Early, Save Prefill
+
+*** What problem it saw
+
+The previous three methods only save decode-time memory; prefill is still slow. Can we *prune tokens at a very early layer* so that later layers only operate on the surviving subset?
+
+*** Its solution
+
+GemFilter: at layer N (e.g., layer 13), inspect attention, select the top-k tokens, and run the remaining 20+ layers only over those k tokens.
+
+PyramidInfer: let the number of surviving tokens decrease layer by layer, forming a pyramid shape.
+
+*** Why it worked (and what trap it set)
+
+Prefill throughput jumps dramatically — computation in the second half of the network drops by an order of magnitude. But the cost is concrete:
+
+- *Single-layer local view.* If token A has low attention at layer 13 and gets dropped, but it was a hub at layers 7 and 11, those deeper layers can never recover it.
+- Dropped tokens participate in neither prefill computation nor the KV cache, so *compute budget and storage budget are hard-coupled* — saving more memory forces more compute reduction, with no way to tune them independently.
+
+** 2025 | FastKV: Token-Selective Propagation, State of the Art
+
+*** What problem it saw
+
+GemFilter-style methods are too aggressive; quality degrades noticeably. Can we choose the pruning layer more wisely, so tokens have already propagated enough information before being cut?
+
+*** Its solution
+
+Token-Selective Propagation (TSP): choose a relatively deep fixed layer (e.g., layer 15 for Llama-3.1-8B) on the assumption that attention patterns have stabilised there, perform a single pruning pass at that layer. The first 15 layers run on all tokens; subsequent layers run only on the selected subset.
+
+*** Why it worked (and what trap it set)
+
+A good balance — prefill acceleration, decode cache compression, manageable quality loss. It held the SOTA position through 2025.
+
+But StructKV identifies two core vulnerabilities:
+
+1. *"Layer 15" is an empirical constant.* Switch to a different model (Qwen-2.5-32B has 64 layers) and it is completely wrong. The paper demonstrates empirically that the optimal pivot layer slides from layer 12 for a 7B model to layer 28 for a 32B model — a fixed layer simply does not generalise.
+2. *A single-layer snapshot is dangerous.* A token might be "dim" at layer 15, yet it was an attention hub at layers 5, 8, and 11. FastKV cannot see cross-layer accumulated importance and silently cuts these latent hub tokens.
+
+** 2026 | StructKV: Cross-Layer Accumulation + Dynamic Pivot + Budget Decoupling
+
+*** What problem it saw
+
+Laying the two vulnerabilities side by side, they share a single root cause: FastKV's *field of view for token importance is too narrow* — one layer, one snapshot. But "structural importance" is a *cross-layer accumulated* property, not a property of any single moment.
+
+Analogy: to judge whether someone is a key node in a company, you cannot just look at how many meetings they attended on one particular day. You track how many people cc'd them over the whole quarter, how many decisions depended on them.
+
+*** Its solution
+
+Three mechanisms, one per vulnerability:
+
+1. *Global In-Degree Centrality*: from layer 1 to the pivot layer, accumulate each token's received attention scores across every layer (with a layer-wise decay weight), producing a cross-layer "centrality" score. Importance judgements use this score, not any single layer.
+2. *Dynamic Pivot Detection*: the pruning layer is no longer fixed. Monitor the gradient of attention entropy, sparsity, and variance at each layer, and find the phase-transition point where attention shifts from "broad exploration" to "focused extraction" — that layer becomes the optimal pivot. Works automatically for any model.
+3. *Structural Propagation & Decoupling*: separate "how many tokens participate in subsequent computation" (controls speed) from "how many tokens stay in the KV cache" (controls memory) — two independent budgets. Want more speed? Prune compute aggressively. Want better quality? Retain more cache. Neither constrains the other.
+
+*** Why it worked (and what traps it sets)
+
+Empirically: on LongBench at 10% KV budget, FastKV scores 47.59, StructKV scores 48.61, approaching full-context at 49.33. On the RULER long-context benchmark the gap is even clearer: 75.6 → 80.1.
+
+Traps the paper leaves open (visible by following the logic):
+
+- *Cross-layer accumulation* increases metadata-maintenance overhead during prefill. The paper mitigates this with GQA intra-group aggregation, but whether it scales to extremely long contexts remains to be seen.
+- *Dynamic pivot detection* relies on attention statistics gathered during one prefill pass — it is essentially online detection, and may fail to find a clear phase-transition point for very short or very simple prompts.
+- "Structural skeleton" is a metaphor — importance is still *inferred from attention statistics*, not from any explicit model of causal or semantic relationships between tokens. The next generation will very likely attack exactly this point.
+
+* Frontier Extensions
+
+StructKV was posted in April 2026 (ACL 2026 Findings) and sits right at the frontier. As of May 2026, no public follow-up has appeared that explicitly critiques or improves upon it. Following its logic, the three most likely next directions are:
+
+1. *From statistical centrality to causal structure.* StructKV's weighted accumulation of attention scores is fundamentally correlation. The next step may introduce explicit dependency or causal graphs to select skeleton tokens.
+2. *Compression-aware training.* All current KV compression methods are post-hoc inference-time solutions. Teaching the model during pre-training or fine-tuning to recognise which tokens are hubs could address the problem at its root.
+3. *Hardware co-design.* StructKV notes that block-level aggregation in vLLM is a patch-style adaptation. A deeper direction is co-designing KV compression granularity with the GPU memory hierarchy (HBM / L2 / registers).
+
+* One Chart to See It All
+
+#+begin_example
+                Evolution of the "Important Token" Definition
+  Time -->  2017       2023         2023      2024      2024          2025          2026
+  --------+----------+-----------+---------+--------+------------+-----------+--------------
+  Defn    | Keep all | Position  | Single- | End-   | Single-    | Single-   | Cross-layer
+          | (no      | (first +  | layer   | segment| layer attn | layer attn| accumulation
+          | compress)| recent)   | attn    | attn   | (early     | (mid-layer| + dynamic
+          |          |           | accum   | aggreg | pruning)   | TSP)      | pivot
+          |          |           |         |        |            |           | + decoupling
+  --------+----------+-----------+---------+--------+------------+-----------+--------------
+  Paper   | Transf.  | Streaming | H2O     | SnapKV | GemFilter  | FastKV    | StructKV
+          |          | LLM       |         |        | Pyramid    |           |
+  --------+----------+-----------+---------+--------+------------+-----------+--------------
+  Saves   | nothing  | decode    | decode  | decode | prefill    | prefill   | prefill
+          |          | memory    | memory  | memory | + decode   | + decode  | + decode
+          |          |           |         |        | (coupled)  | (coupled) | (decoupled)
+  --------+----------+-----------+---------+--------+------------+-----------+--------------
+  Key gap | cache    | middle    | doesn't | doesn't| single-    | fixed     | (open)
+          | explodes | content   | save    | save   | layer view;| layer +   |
+          |          | all lost  | prefill | prefill| too aggres.| snapshot  |
+  --------+----------+-----------+---------+--------+------------+-----------+--------------
+
+  Field-of-view evolution: none → position → score → end-segment → early layer → mid-layer → all layers
+
+  Core transitions:
+    [I]   No compression  --> compression  (starts at StreamingLLM)
+    [II]  Save memory only --> also save compute  (starts at GemFilter)
+    [III] Local judgment   --> global judgment  (starts at StructKV)
+#+end_example
+
+* Insight
+
+Surveying the whole river, what is really happening is not "compression algorithms got better" — it is that *the concept of "importance" is being peeled back one layer at a time*.
+
+- StreamingLLM equates importance with *position* — beginning and recent.
+- H2O / SnapKV equate it with *frequency of being attended to* — but within a limited statistical window.
+- GemFilter / FastKV push it to *an attention snapshot at a specific layer* — still a cross-section at one moment.
+- StructKV pushes it to *cross-layer accumulated centrality* — from cross-section to longitudinal profile.
+
+Each generation sees one more dimension than the last: position → score → layer → cross-layer. This is a very characteristic research pattern: *whatever "metric" you think you have found, the next generation will show it was merely one projection of a deeper metric.*
+
+The next step will almost certainly reach the *cross-instance* dimension — a token that looks unimportant in this particular context, but is consistently a hub across all contexts of this task type. And beyond that, probably the *causal* dimension — not statistically "attended to," but semantically "depended upon."
+
+A second observation: no paper in this thread came from nowhere. Every one grew out of the *failure cases of the paper before it*. StreamingLLM broke on long-document QA → H2O; H2O was too slow → SnapKV; SnapKV didn't save prefill → GemFilter; GemFilter was too aggressive → FastKV; FastKV's fixed layer didn't generalise → StructKV. *Knowing where the previous generation broke is more valuable than knowing how it worked.*
+
+* Takeaways
+
+If you are doing research or engineering:
+
+- *Treat vague concepts like "importance" as decomposable.* Every time you use a scalar score, ask yourself: what cross-section is this score projecting from? Does it still hold from a different angle?
+- *Hunt for problems in failure cases, not success cases.* The limitations section of the SnapKV paper is worth more than its methods section — it tells you directly what the next paper should be about.
+- *Watch out for empirical constants.* FastKV's "layer 15" is both a performance bottleneck and an opening for disruption. Any fixed hyperparameter written into a paper is a potential attack surface for the next generation.
+- *Decoupling is more profound than optimisation.* StructKV's cleverest contribution is not a new scoring function — it is separating the compute budget from the storage budget. Structural redesign outlasts tactical improvement.
+
+If you are deploying long-context LLMs:
+
+- *For open-source KV compression today, pick FastKV; watch StructKV's open-source release in the second half of 2026.*
+- *Do not trust a "universal compression ratio."* The same method behaves very differently on a 7B versus a 32B model — StructKV's experiments demonstrate this directly. Always re-benchmark when you switch models.

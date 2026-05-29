@@ -1,0 +1,314 @@
+#+title:      Bit-by-Bit: Progressive QAT Strategy with Outlier Channel Splitting for Stable Low-Bit LLMs
+#+date:       [2026-05-28 Thu 17:26]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T172623-en
+#+source:     https://arxiv.org/abs/2604.07888
+#+authors:    Binxing Xu, Hao Gu, Lujun Li, Hao Wang, Bei Liu, Jiacheng Liu, Qiyuan Zhu, Xintong Yang, Chao Li, Sirui Han, Yike Guo
+#+venue:      arXiv:2604.07888 [cs.LG], 2026-04
+
+* The Problem River
+
+A very concrete question: can you compress a large language model with tens of billions of parameters from 16-bit floating point down to *just 2 bits per weight* — without making it dumb?
+
+Why is this hard? 2 bits can only represent 4 distinct values. Forcing a network that once expressed any real number with fine precision to pick from just 4 options necessarily introduces enormous "quantization noise." Worse, that noise compounds across the dozens of transformer layers; the loss landscape becomes riddled with pits during training, trapping the optimizer in bad local minima; and to achieve convergence you often have to burn through *trillions* of tokens retraining from scratch.
+
+This is the thread — twelve years of researchers in succession answering the same question: "How do you feed ever-larger models on ever-fewer bits, burning ever-less compute?"
+
+* Source Map
+
+#+begin_example
+[2013] Bengio - STE (Straight-Through Estimator)
+  |
+  | Problem: round() is non-differentiable, so low-bit networks can't
+  |          be trained with gradient descent
+  | Solution: pretend round() is the identity function;
+  |           let gradients pass straight through
+  v
+[2015] Courbariaux - BinaryConnect
+  |
+  | Problem: STE is just a trick; nobody proved it could sustain
+  |          an entire CNN
+  | Solution: actually binarize all CNN weights to +1/-1,
+  |           proving decent accuracy is achievable
+  v
+[2019] Esser - LSQ (Learned Step Size Quantization)
+[2019] Zhao - OCS (Outlier Channel Splitting)
+  |
+  | Problem: quantization step size always hand-tuned;
+  |          a few outlier channels ruin everything
+  | Solution: LSQ makes step size a learnable parameter;
+  |           OCS splits each outlier channel into two
+  v
+[2021] Li et al. - BRECQ (Block-wise Reconstruction)
+  |
+  | Problem: tuning the whole model together is too costly;
+  |          outliers devastate low-bit PTQ
+  | Solution: calibrate transformer block by block,
+  |           targeting output alignment per block
+  v
+[2022] Dettmers - LLM.int8() | [2023] Xiao - SmoothQuant | [2024] Lin - AWQ
+  |
+  | Problem: LLM-era emergent activation outliers make PTQ collapse
+  | Solution: detect & protect a minority of salient weights;
+  |           migrate quantization difficulty from activations to weights
+  v
+[2023] Liu et al. - LLM-QAT
+  |
+  | Problem: PTQ fails below 4-bit; must return to QAT,
+  |          but LLMs are too large to retrain
+  | Solution: KD from teacher logits, self-distillation QAT,
+  |           no original data required
+  v
+[2024] Ma et al. - BitNet b1.58
+  |
+  | Problem: LLM-QAT still needs a 16-bit teacher resident in memory;
+  |          enormous overhead
+  | Solution: train a ternary model {-1,0,+1} from scratch —
+  |           proven feasible, but burns 2T tokens
+  v
+[2024] Chen et al. - EfficientQAT
+[2025] Liu et al. - ParetoQ
+  |
+  | Problem: 2T tokens unaffordable for most teams;
+  |          finding the "best bit-width" requires a separate training run each
+  | Solution: EfficientQAT brings BRECQ block calibration into QAT;
+  |           ParetoQ systematically sweeps 1–4 bit Pareto frontier —
+  |           cost: 7.2T tokens for one full sweep
+  v
+[2026] Xu et al. - Bit-by-Bit (this paper)
+  |
+  | Problem: can't afford that many tokens; each bit-width also
+  |          needs its own separate model checkpoint
+  | Solution: progressive precision curriculum 8→4→2;
+  |           4-bit grid naturally contains the 2-bit grid
+  |           (one training run → any-precision deployment);
+  |           OCS revived with rounding-aware splitting so the
+  |           output of the two halves exactly equals the original
+#+end_example
+
+* Evolutionary Narrative
+
+** 2013 | STE: Opening the Door to Low-Bit Training with a "Well-Intentioned Lie"
+
+*** What Problem It Saw
+
+Bengio was staring at one issue: neural networks need to make stochastic, discrete decisions (gating, sampling, quantization), but operations like ~round()~ and ~argmax()~ have gradients that are either zero or undefined. The moment such a node appears in the graph, backpropagation cannot pass through — the optimizer goes blind.
+
+*** Its Solution
+
+"Just pretend not to notice." Perform round normally in the forward pass; in the backward pass, treat round as the identity function (derivative identically 1) and let gradients pass straight through. This is the Straight-Through Estimator, STE.
+
+*** Why It Worked (and What Pit It Left)
+
+Theoretically this is pure hand-waving — the gradient you compute is not the true gradient at all. In practice, as long as the rounded value does not stray too far from the original, this "biased gradient" still points roughly in the right direction. The pit: when quantization becomes coarse (e.g., 2-bit), the assumption that "the gap is small" collapses, the STE gradient starts wandering, and training destabilizes. Everyone who came after was trying to patch this pit.
+
+** 2015 | BinaryConnect: Pushing STE to the Limit, Proving 1-Bit Is Not Fantasy
+
+*** What Problem It Saw
+
+STE is a tool, but nobody had verified it could sustain an entire deep network. Courbariaux wanted to know: if every weight in a CNN is squeezed to only +1 and -1, can it still be trained?
+
+*** Its Solution
+
+Maintain a full-precision float copy of the weights for updates; in the forward pass, take the sign of each weight (+1 if positive, −1 if negative) and feed that into the network; in the backward pass, use STE to send gradients back to the float weights.
+
+*** Why It Worked (and What Pit It Left)
+
+It turned something that seemed impossible into a baseline — BinaryConnect on CIFAR-10 lost very little accuracy. This gave the entire field a shot of confidence: extreme low-bit is viable. The pit: as networks go deeper and models get larger, accuracy collapses. The research arc from 2015 to 2020 was entirely about nudging the bit-width up one notch at a time (+1/−1 → +1/0/−1 → 4-bit/8-bit) to buy back accuracy.
+
+** 2019 | LSQ + OCS: The Problem Is Not the Bit Count — It's the Step and the Outliers
+
+*** What Problem It Saw
+
+People gradually realized that 2-bit failures are not necessarily because 2 bits are genuinely insufficient, but because:
+1) the quantization step size (the distance between adjacent quantized values) was always set by hand or with simple min-max heuristics — never optimized;
+2) weight matrices always contain a few "outlier channels" whose value range is one to two orders of magnitude larger than the rest, forcing a coarse step size that crushes the remaining 99% of weights.
+
+*** Its Solution
+
+Esser's LSQ: treat the step size as an ordinary learnable parameter and optimize it via backpropagation alongside the weights, jointly seeking the position that minimizes output error.
+
+Zhao's OCS: scan the weight matrix for those oversized outlier channels and *split* them — one channel becomes two, each value halved, the corresponding downstream connections duplicated. Mathematically the output is exactly equivalent, but step size is no longer held hostage by the outlier values during quantization.
+
+*** Why It Worked (and What Pit It Left)
+
+LSQ gave 2-bit/3-bit CNNs usable accuracy for the first time. OCS was the first to acknowledge that "the tail of the distribution is the true enemy." The pit: CNN-era outliers were relatively mild; in the LLM era, activations can exhibit "super-outliers" whose absolute values are thousands of times larger than normal values. OCS as a structural modification was not easy to transplant directly. It fell into obscurity for years — until this paper revived it.
+
+** 2021 | BRECQ: Quantizing Large Models Cannot Be Done Globally — It Must Be Done Block by Block
+
+*** What Problem It Saw
+
+Full-network backprop training like LSQ is manageable on small CNNs but unaffordable for large models. Yet if you skip retraining and directly round a trained large model to 4-bit, errors accumulate across layers and the output is completely distorted.
+
+*** Its Solution
+
+Li et al. observed that transformers are naturally organized into blocks (attention + FFN is a natural unit). So calibrate one block at a time — the objective is not to match the final output but to make *this block's output as close as possible to the original block's output*. This avoids both the cost of full-network backprop and the snowballing errors of layer-by-layer calibration.
+
+*** Why It Worked (and What Pit It Left)
+
+Block-wise reconstruction set the pace for the entire subsequent PTQ/QAT field — nearly every low-bit large-model paper (including this one) uses a block-wise loss. The pit: BRECQ is still PTQ at heart; 2-bit still does not work for LLMs.
+
+** 2022–2024 | LLM.int8 → SmoothQuant → AWQ: The "Emergence" of LLM Outliers
+
+*** What Problem It Saw
+
+While working on LLM int8 quantization, Dettmers discovered something alarming: LLM activations contain extreme channels with *absolute values above 100 or even 1000*, and these channels are highly concentrated with fixed patterns. These "emergent outliers" are completely absent in models below 6.7B parameters and appear suddenly at larger scale. Once they show up, standard quantization collapses.
+
+*** Its Solution
+
+- *LLM.int8()*: keep the outlier channels in FP16 and run the rest in int8, cobbling together mixed precision;
+- *SmoothQuant (Xiao 2023)*: since activation outliers are hard to handle, use a scaling matrix to transfer "difficulty" from activations to weights — divide activations by s, multiply weights by s, output unchanged but distribution smoothed;
+- *AWQ (Lin 2024)*: not all weights matter equally — find the "salient weights" based on activation magnitudes, protect them specifically, and compress the rest aggressively.
+
+*** Why It Worked (and What Pit It Left)
+
+This sequence of work made 4-bit PTQ the practical standard for LLM inference. But *2-bit PTQ remains a dead end* — no matter how cleverly you handle outliers, 4 quantization levels simply do not have enough expressive power. That dead end pushed the battlefield back to QAT.
+
+** 2023 | LLM-QAT: First QAT on LLMs, at the Cost of Enormous KD Overhead
+
+*** What Problem It Saw
+
+Bringing QAT to LLMs faces two obstacles: first, data — original pretraining data is usually unavailable; second, compute — nobody wants to retrain a 70B model.
+
+*** Its Solution
+
+Liu et al. proposed letting the original FP16 model serve as its own teacher, generating next-token distributions as soft labels, and training the quantized student model with KL divergence to match the teacher's logits. No original data needed — only some prompts for distillation.
+
+*** Why It Worked (and What Pit It Left)
+
+LLM-QAT turned "QAT on LLMs" from a fantasy into an engineering reality. The pit: teacher and student both have to reside on GPU simultaneously, logits must be stored, and memory explodes; running this on a 2T-parameter model means the teacher alone requires many A100s.
+
+** 2024 | BitNet b1.58: Don't Quantize After Training — Train Ternary from Scratch
+
+*** What Problem It Saw
+
+LLM-QAT is "post-hoc" — take an already-trained FP16 model and then apply QAT. Ma et al. asked: since we're going to quantize anyway, why not train with ternary weights {−1, 0, +1} from the start? That way the model searches for the optimal solution directly on the low-bit manifold, rather than finding an FP16 solution first and then forcibly cramming it in.
+
+*** Its Solution
+
+The entire network uses ternary weights from initialization ("1.58-bit," since log₂(3) ≈ 1.58). Forward pass uses ternary values; backward pass uses STE.
+
+*** Why It Worked (and What Pit It Left)
+
+It proved one thing: LLMs can learn at 1.58 bits. But the cost is staggering — to achieve stable convergence, *2 trillion (2T) tokens* are required. This is essentially an impossible budget for academic institutions. The problem was then forced into the next stage: how to bring that 2T down?
+
+** 2024–2025 | EfficientQAT + ParetoQ: Compressing Budgets and Sweeping the Frontier
+
+*** What Problem It Saw
+
+BitNet's 2T tokens is too expensive. Simultaneously a new practical problem emerged: deployment scenarios differ — some can run 4-bit, others only 2-bit. Training one run yields a 4-bit model, another run yields a 2-bit model — every additional target bit-width requires another full training run and another stored checkpoint.
+
+*** Its Solution
+
+- *EfficientQAT (Chen 2024)*: brings BRECQ's block-wise reconstruction idea into QAT. No full-model backprop needed; each block is optimized independently, dramatically cutting training cost;
+- *ParetoQ (Liu 2025)*: systematically trains one run each at 1-bit, 2-bit, 3-bit, and 4-bit, mapping out the "training budget vs. accuracy" Pareto frontier to show the community "how much quality you can buy for how much compute."
+
+*** Why It Worked (and What Pit It Left)
+
+EfficientQAT cut QAT training cost by an order of magnitude. ParetoQ provided the field with empirical benchmarks — to train a 2-bit LLaMA following its recipe, you need roughly 7.2T tokens (one run per bit-width). The pit: this is *still* a massive budget; and storing one checkpoint per bit-width is also a deployment burden.
+
+** 2026 | Bit-by-Bit: Curriculum Learning + Nested Grids + OCS Revival
+
+*** What Problem It Saw
+
+This paper focuses on three specific issues:
+
+1) *Direct 2-bit QAT training is unstable* — the loss landscape is too jagged, loss spikes are frequent, and the model gets trapped in bad local minima;
+2) *ParetoQ-style "one training run per bit" is wasteful* — theoretically the 2-bit grid is already embedded inside the 4-bit grid (the 4-bit step is half the 2-bit step), so there is no need to retrain at all;
+3) *The outlier problem resurfaces in W2A2 (both weights and activations at 2-bit)* — SmoothQuant-style multiplicative transforms entangle with gradients during QAT training, and the old OCS does not guarantee output consistency after quantization.
+
+*** Its Solution
+
+- *Progressive bit curriculum*: don't start at 2-bit. First train at 8-bit (nearly lossless, provides a good starting point), then 4-bit, then 2-bit. Each stage is a "good initialization" for the next. This essentially transforms "unstable low-bit QAT" into "fine-tuning from high-bit QAT" — the former is hard, the latter is familiar territory;
+- *Once-for-any-precision*: during training, a single master set of weights is seen simultaneously by all three precisions 8/4/2 (multi-objective joint loss). At deployment, a simple bit-shift switches precision — one checkpoint is all you need;
+- *Rounding-aware OCS revival*: after detecting outlier channels and splitting each one into two, the *cut point is aligned precisely to step boundaries*, so that the sum of the rounded values of the two new channels exactly equals the rounded value of the original channel. OCS is no longer an approximate transform but a *mathematically exact identity transform* in quantization space;
+- *Microscaling + E4M3 scale*: aligned with the OCP/NVIDIA MX standard — activations are scaled in small groups using E4M3 (4-bit exponent, 3-bit mantissa micro-float) to record each group's scale, better capturing activation dynamic range;
+- *Custom 2-bit kernels*: CUDA operators written for both W2A2 and W2A16, up to 11× faster than BF16.
+
+*** What It Achieved
+
+LLaMA-2 7B at W2A2 reaches a WikiText2 PPL only 2.25 points above FP16 (7.72 vs. 5.47). Compared with ParetoQ, token budget drops by 3600×. Compared with BitDistiller and EfficientQAT at the same token budget, results are significantly better.
+
+*** What Pits It Left
+
+- The progressive strategy requires multi-stage hyperparameter tuning; the hyperparameter space has not disappeared, only been structured;
+- LLaMA-3, which is inherently harder to quantize (deeply trained, "fuller" weight distributions), outperforms the baselines but still has a larger gap from FP16 than LLaMA-2;
+- Custom kernels remain NVIDIA-only; cross-hardware portability is a follow-on engineering problem.
+
+* Frontier Extensions
+
+This paper appeared in early April 2026, essentially the latest step on this line. Directions that are nearest and most likely to appear next:
+
+** Inference: Mixture-of-Precision + Any-Precision Deployment
+
+Once Bit-by-Bit's "train once, deploy at any precision" idea matures, the next step will almost certainly combine it with MoE routing — dynamically selecting bit-width based on token difficulty, routing easy tokens through a 2-bit path and hard tokens through 4-bit/8-bit. The paper's nested grids are a natural fit for this paradigm.
+
+** Inference: Native Low-Bit Pretraining
+
+BitNet proved that training low-bit from scratch is feasible; Bit-by-Bit proved that progressive training keeps costs manageable. The next step is combining the two: apply progressive precision scheduling from scratch during pretraining, potentially compressing the low-bit pretraining cost to approach that of full-precision training.
+
+** Inference: Cross-Hardware Standardization
+
+The MX format (microscaling) is already being jointly pushed by OCP/NVIDIA/AMD. Bit-by-Bit is already aligned with MX; the next paper will very likely show equivalent throughput on ROCm, as well as deeper integration of MXFP4/MXINT4 on the training side.
+
+(Note: all three items above are inferences based on the direction of this paper — they are not existing publications.)
+
+* A Single-Figure Overview
+
+#+begin_example
+                 1-bit       2-bit       4-bit       8-bit       16-bit
+                  ^           ^           ^           ^            ^
+                  |           |           |           |            |
+  Technique       |           |           |           |            |
+  ----------     +-----------+-----------+-----------+------------+
+  STE gradient   . [2013].................................. lying gradient
+  Binary CNN     . [2015 BinaryConnect]..............    +1/-1 trainable
+  Learned step   ...... [2019 LSQ]..............         step is a param
+  Outlier split  ...... [2019 OCS]....................   channel halved
+  Block recon.   ............ [2021 BRECQ]..........     align block output
+  Outlier detect ................. [2022 LLM.int8]       LLM emergent outliers
+  Migrate diff.  ................... [2023 SmoothQuant]  activation→weight
+  Salient wts.   ......................... [2024 AWQ]    protect key weights
+  QAT on LLM     ............... [2023 LLM-QAT]          self-distill KD
+  Scratch ternary ........................ [2024 BitNet]  2T tokens
+  Efficient QAT  ......................... [2024 EQAT]   BRECQ + QAT
+  Pareto sweep   ............................ [2025 PQ]  7.2T tokens
+
+  ============================================================
+  >>> 2026 Bit-by-Bit: progressive curriculum (8->4->2)
+                       + nested grids (once-for-any-precision)
+                       + OCS revival (rounding-aware)
+                       + MX microscaling
+                       --- 3600x fewer tokens, one ckpt for all bit-widths ---
+  ============================================================
+
+  Timeline ----> 2013 ---- 2015 ---- 2019 ---- 2021 ---- 2023 ---- 2026
+#+end_example
+
+* Insights
+
+Reading this line from end to end, what emerges is not "bit-width being compressed ever lower" but *three fundamental shifts in focus*:
+
+*First shift: from "can it?" to "is it stable?"* STE and BinaryConnect answered "can low-bit training work at all?" Once that was settled, the new bottleneck was optimization stability — LSQ's learnable step size is essentially an admission that "quantization parameters must participate in training dynamics too."
+
+*Second shift: from "adjusting weights" to "taming distributions."* The discovery of emergent outliers in the LLM era is the watershed. SmoothQuant/AWQ/OCS stopped wrestling with "smarter rounding" and instead accepted that *the shape of the distribution itself is the enemy*, requiring active reshaping. Bit-by-Bit's rounding-aware OCS is the precise culmination of this line of thinking.
+
+*Third shift: from "one training run per bit-width" to "one training run for all bit-widths."* BitNet needed 2T tokens for ternary; ParetoQ needed 7.2T to sweep the frontier. Bit-by-Bit noticed that *all low-bit grids are nested inside higher-bit grids* — a fact everyone in the field always knew but nobody had used as the central axis. Once you seriously treat it as the central axis, progressive training + a single master checkpoint simultaneously solve both "stability" and "multi-precision deployment."
+
+One level deeper: the entire field is evolving from "approximate → exact." Early STE was approximate; BinaryConnect was approximate; the original OCS was approximate (output after splitting was only *roughly* equivalent). Bit-by-Bit's rounding-aware OCS is the first to make this transformation a *mathematically exact* identity in quantization space. This matters: the low-bit quantization toolbox is finally acquiring "side-effect-free" atomic operations that can be combined without worrying that each new addition multiplies errors.
+
+Where is the field most likely heading next? Two directions: (1) progressive precision scheduling descends into the pretraining phase, making large models *natively* multi-precision from birth; (2) once MX-format hardware primitives mature, 2-bit training will transition from "research trick" to "training default" — just as BF16 replaced FP32.
+
+* Takeaways
+
+For how to do research:
+
+*Dig up good ideas that were abandoned.* OCS was proposed in 2019, had its moment, and then sank for seven years because it was "not good enough for LLMs." Bit-by-Bit invented no new mechanism — it simply *made the old mechanism exact* (rounding-aware) and that was enough. The biggest dividend in research often comes not from inventing something new, but from discovering that "the discarded idea failed only because of one missing engineering detail."
+
+*Use as your central axis "facts everyone knows but nobody acts on."* The nesting of low-bit grids inside high-bit grids is elementary mathematics you can look up in any table. Every QAT researcher knows it, yet nobody used it as a core mechanism — everyone was wrestling with gradient estimation, teacher logits, and loss design variants. Bit-by-Bit promotes this trivial fact to center stage and gets once-for-any-precision. The lesson: *look for "obvious but bypassed facts" in a field — there is often gold there.*
+
+The practical landing point: this means you can —
+
+- Deploy a single Bit-by-Bit master checkpoint, switching online between 2/4/8-bit based on user hardware (phone / edge / datacenter) without retraining;
+- Use the progressive training idea to extend an existing 4-bit QAT project (the affordable cost tier) to 2-bit without building an entire 2-bit training pipeline from scratch;
+- Implement a W2A2 kernel on ROCm to benchmark against Bit-by-Bit's training efficiency, liberating it from CUDA-only — a clear opportunity on the AMD side.

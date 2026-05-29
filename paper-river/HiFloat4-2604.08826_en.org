@@ -1,0 +1,277 @@
+#+title:      HiFloat4 Format for Language Model Pre-training on Ascend NPUs
+#+date:       [2026-05-28 Thu 17:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T173819-en
+#+source:     https://arxiv.org/abs/2604.08826
+#+authors:    Mehran Taghian, Yunke Peng, Xing Huang, et al. (Huawei)
+#+venue:      arXiv preprint, 2026
+
+* The River of Problems
+
+When training a large model, how far can you compress each number — in bits — before training collapses?
+
+Eight years ago that question was still set at FP32 (32 bits). Today people are betting on FP4 (4 bits). Every time you halve the bit-width, memory and compute costs drop by roughly half — but the model becomes far more likely to "blow up": gradient overflow, weight oscillation, loss that refuses to fall. Every paper on this trajectory is wrestling with the same core tension: *how do you keep pushing bit-width down without destabilizing training?*
+
+The difficulty is fundamental: 4 bits can represent only 16 distinct values. You are asked to use those 16 values to carry the weights and gradients of a massive model spanning many orders of magnitude. One misstep and most gradients collapse to zero, and the model stops learning. Each generation solves one problem and bequeaths a deeper one to the next.
+
+* Source Map
+
+#+begin_example
+[2017] Micikevicius et al. - Mixed Precision Training
+  |
+  | Problem: training large models in FP32 is prohibitively expensive in memory and compute
+  | Solution: weights/activations in FP16; gradient accumulation and master copy kept in FP32
+  v
+[2022] Micikevicius et al. - FP8 Formats for Deep Learning
+  |
+  | Problem: FP16 is still expensive — can we halve it again to FP8?
+  | Solution: two FP8 formats (E4M3 forward, E5M2 backward) + per-tensor scaling
+  v
+[2023] Rouhani et al. - Microscaling (MXFP4, OCP)
+  |
+  | Problem: one scale per tensor is too coarse — outliers kill it; FP8 is still too expensive
+  | Solution: cut into blocks of 32, each block gets an E8M0 scale; elements use E2M1 (4 bits)
+  v
+[2025] Tetrajet / Quartet / Tseng et al. - FP4 stabilization techniques
+  |
+  | Problem: naive MXFP4 training has biased gradients; weights oscillate near quantization thresholds
+  | Solution: SR (stochastic rounding) removes bias + RHT (random Hadamard transform) spreads outliers
+  |           + truncation-free scaling avoids hard clipping
+  v
+[2025] Abecassis et al. - NVIDIA NVFP4 Pretraining Recipe (Blackwell)
+  |
+  | Problem: the FP16/FP32 auxiliary compute of various stabilization tricks eats the FP4 speedup
+  | Solution: choose the lightest subset (selective high-precision layers + SR + RHT),
+  |           run on native NVFP4 hardware
+  v
+[2026] Taghian et al. - HiFloat4 on Ascend NPUs  <==  this paper
+  |
+  | Problem: MXFP4/NVFP4 both use single-level block scaling; range–precision trade-off is stuck;
+  |          nobody has done FP4 training on Ascend NPUs yet
+  | Solution: replace the format itself with 3-level hierarchical scaling (E6M2 + E1 + S1P2,
+  |           block=64); use only RHT, no SR; let the format absorb part of the stability burden
+  v
+[2026] Hu et al. (M2XFP) / Yan et al. - deeper outlier handling and MoE extensions
+#+end_example
+
+Note: MXFP4 and NVFP4 are contemporaneous parallel branches for different hardware; I flatten them onto one main axis to make the causal chain "format → stabilization → recipe → new format" clear. Tseng 2025 / Quartet / Tetrajet are three papers from the same period on the same theme; they are grouped together under "FP4 stabilization techniques."
+
+* Evolutionary Narrative
+
+** 2017 | Mixed Precision: the first cut, from 32 bits to 16 bits
+
+*** What problem it saw
+
+In 2017, training neural networks was a luxury. GPU memory was measured in gigabytes, model parameters in hundreds of millions, and every parameter lived in FP32 (32 bits, ~4 bytes). A single matrix multiply required streaming all those 4-byte values through the memory subsystem into the compute units — both memory bandwidth and arithmetic throughput were bottlenecked by 32 bits.
+
+*** Its solution
+
+Micikevicius et al. asked: what if we store weights and activations in FP16 (16 bits, ~2 bytes)? Memory footprint halves immediately, and hardware executes FP16 far faster. But FP16 has a narrow representable range — small values underflow to zero, large values overflow — so naïve FP16 training causes small gradients to vanish.
+
+Their answer was *mixed precision*: compute the forward and backward passes in FP16, but accumulate gradients and keep a *master copy* of parameters in FP32, and apply loss scaling to lift small gradients into the FP16 representable range before casting back.
+
+*** Why it worked (and what new pit it dug)
+
+The high-precision master copy ensures small update steps are not rounded away; loss scaling pushes small gradients into the range FP16 can represent. This became the backbone of modern large-model training.
+
+Three pits remained: (1) FP16's range is still narrow, requiring careful loss-scale tuning; (2) 16 bits only cuts memory in half — there is room to go further; (3) "two precision levels at once" became the industry default template that every subsequent paper inherits.
+
+** 2022 | FP8 Formats: halving again, introducing per-tensor scaling
+
+*** What problem it saw
+
+Models grew from hundreds of millions to hundreds of billions of parameters. The FP16 + loss-scaling recipe had been tamed, but memory and compute were straining again. Could we halve once more, to FP8 (8 bits, 1 byte)?
+
+Cutting directly reveals a new obstacle: 8 bits represents too few values, and a single FP8 format does not suffice. The magnitude range of forward activations and weights differs enormously from that of backward gradients.
+
+*** Its solution
+
+Micikevicius et al. proposed *two FP8 formats*:
+- E4M3 (4-bit exponent + 3-bit mantissa): narrower range but better precision — used in the forward pass (activations, weights)
+- E5M2 (5-bit exponent + 2-bit mantissa): wider range but lower precision — used in the backward pass (gradients)
+
+Each tensor also receives one FP32 scaling factor: divide every element in the tensor by a single coefficient to push values into the FP8 representable range.
+
+*** Why it worked (and what new pit it dug)
+
+Two formats matched the statistical characteristics of forward and backward tensors respectively; one scale per tensor was simple but sufficient. This became the core of NVIDIA H100 Transformer Engine.
+
+The pit: *one scale per tensor is too coarse*. If a tensor contains one or two outliers — say, values 100× larger than the typical element — the scale for the entire tensor is dominated by those outliers, compressing ordinary values toward zero and resurrecting the old underflow problem.
+
+** 2023 | MXFP4 / Microscaling: cutting scale granularity to the block level, pushing to 4 bits
+
+*** What problem it saw
+
+Per-tensor scale being hijacked by outliers was already visible at FP8; at FP4 (4 bits, only 16 representable values) it becomes fatal. To go to FP4, the fundamental problem — "one scale governs a huge chunk of numbers" — had to be solved first.
+
+*** Its solution
+
+The Open Compute Project (OCP) consortium introduced the *Microscaling Format (MX)*: slice a tensor into contiguous blocks (typically 32 elements), each block getting its own *8-bit E8M0 scale*. MXFP4 is the 4-bit instance of this specification — each element within a block uses the E2M1 format (2-bit exponent + 1-bit mantissa, representable values ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}). Average storage per value: 4 + 8/32 = 4.25 bits.
+
+A single outlier can corrupt only the 32-element block it belongs to; its blast radius is contained.
+
+*** Why it worked (and what new pit it dug)
+
+Block-level scaling confines outlier damage to a small cage. Hardware implementations are also more flexible than per-tensor — which is why NVIDIA Blackwell, AMD MI-series, and Huawei Ascend all bake MX-style formats (or close relatives) into silicon.
+
+But applying MXFP4 naively across all GEMMs during training shows that *it simply cannot train stably*: (1) quantized gradients are systematically biased toward zero, causing divergence over time; (2) weights oscillate back and forth across E2M1 quantization thresholds; (3) when the maximum value in a block exceeds the E2M1 range of ±6, hard clipping discards a large amount of information. MXFP4 delivered a hardware-friendly format but left "how to actually train with it" as an open question.
+
+** 2025 | Tetrajet / Quartet / Tseng et al.: the three-piece patch — SR, RHT, truncation-free scaling
+
+*** What problem it saw
+
+Naïve MXFP4 training has three concrete defects: (1) *nearest rounding* of gradients introduces a systematic bias; (2) gradients in the backward pass have wildly varying per-dimension dynamic ranges that block scaling cannot fix; (3) hard-clipping outliers loses too much information.
+
+*** Its solution
+
+These papers — Chen et al.'s Tetrajet, Castro et al.'s Quartet, and Tseng et al. — appeared almost simultaneously, each contributing key techniques that are combined in practice:
+
+1. *Stochastic Rounding (SR)*: instead of always rounding to the nearest representable value, round probabilistically based on distance — a value closer to the upper neighbor is more likely to round up; closer to the lower neighbor, more likely to round down. In expectation this is *unbiased*, replacing systematic bias with zero-mean noise.
+
+2. *Random Hadamard Transform (RHT)*: before quantizing, left-multiply the tensor by a random Hadamard matrix H and a sign matrix S. The Hadamard matrix "smears" a sparse outlier across all dimensions — the outlier disappears and every dimension ends up with a similar dynamic range, making block scaling effective. Because H S (H S)^T = I, the result after the matrix multiply is mathematically consistent.
+
+3. *Truncation-free scaling*: when the maximum value in a block exceeds the E2M1 representable range of ±6, instead of hard-clipping, enlarge the block's scale so the maximum value lands exactly at ±6. Smaller values lose a bit of precision, but that is better than discarding the outlier entirely.
+
+*** Why it worked (and what new pit it dug)
+
+The three techniques each hit a specific defect: SR removes bias, RHT spreads outliers, truncation-free scaling rescues boundary values. Combined, MXFP4 training finally approaches a BF16 baseline.
+
+But an awkward pit remained: *these patches themselves cost compute*. SR requires sampling, RHT requires a Hadamard multiply — all running in FP16 or FP32. You were expecting FP4 to multiply throughput by 4×; instead, much of that gain is consumed by auxiliary computation. Quartet II with MS-EDEN and Metis with SVD spectral decomposition push the overhead even higher.
+
+** 2025 | NVIDIA NVFP4 Recipe: pick the lightest combination and run on native hardware
+
+*** What problem it saw
+
+Abecassis et al. surveyed the growing zoo of patches — Tetrajet, Quartet, Metis — and identified a fundamental engineering tension: for real large-model pretraining on Blackwell, *overhead is the dominant cost*. Academia competes on loss gap; industry competes on who can finish training within a fixed time budget.
+
+*** Its solution
+
+NVIDIA's recipe is a subtraction: from all candidate stabilization techniques, pick the *lowest-overhead* subset:
+- *Selective high-precision layers*: a small number of quantization-sensitive layers (e.g., output projection) stay in BF16; everything else runs FP4
+- *SR* only for backward gradient quantization
+- *RHT* only for the weight-gradient step
+- 2D weight quantization to keep forward and backward passes consistent
+- Switch a few layers back to high precision near the end of training to recover the last bit of perplexity
+
+This runs on Blackwell's native NVFP4 hardware support — the hardware handles round-to-nearest quantization; software manages only the minimal extra operations.
+
+*** Why it worked (and what new pit it dug)
+
+Engineering-wise, "minimal stabilization operations + native FP4 hardware" is the right match for real pretraining: within a 1.5% loss gap of full precision, while achieving wall-clock speedups close to the theoretical limit.
+
+Pits remaining: (1) *this is a story exclusive to NVIDIA* — the format is locked to NVFP4, the hardware locked to Blackwell; (2) *both MXFP4 and NVFP4 use single-level block scaling* — one scale per block, 4-bit elements. That range–precision trade-off is baked in; gaining further precision requires more sophisticated algorithms, not a better format.
+
+** 2026 | HiFloat4 on Ascend NPU: replace the format itself with 3-level hierarchical scaling
+
+*** What problem it saw
+
+By this point the bottleneck of the entire trajectory was clear: *single-level block scaling hits its ceiling at 4 bits*. The only options are increasingly elaborate stabilization algorithms (which eat the hardware dividend) or a fundamentally different format.
+
+The Huawei team also faced a concrete constraint: on Ascend NPU hardware, FP4 training had never been demonstrated. NVIDIA's NVFP4 recipe could not be ported (hardware lacks NVFP4 support), and MXFP4 with the three-piece patch was too heavy.
+
+*** Its solution
+
+Luo et al. (2026) proposed *HiFloat4 (HiF4)* — a 4-bit floating-point format designed specifically for Ascend NPU, centered on *3-level hierarchical scaling*:
+
+- *Level 1*: every 64 elements share one 8-bit *E6M2* global scale (6-bit exponent + 2-bit mantissa — unlike MXFP4's E8M0, it carries mantissa information)
+- *Level 2*: the 64 elements are split into 8 sub-groups; each sub-group gets a 1-bit *E1* micro-exponent
+- *Level 3*: another split — a 16-way micro-exponent *E1* corresponding to every 4 elements
+- *Level 4 (elements)*: each 4-bit element is in *S1P2* format (1-bit sign + 1-bit integer part + 2-bit fractional part, equivalent to E1M2)
+
+Amortized, each value costs an average of 4.5 bits.
+
+The key distinction: *MXFP4 is one scale + one element format; HiF4 is three nested scales + an element format with an explicit integer bit*. The three-level nesting lets dynamic range and local precision coexist — a block can accommodate an outlier (via the E6M2 global scale) while still doing fine-grained scaling in a small neighborhood (via the E1 micro-exponents).
+
+Algorithmically, HiF4 uses *only RHT* — no SR, no truncation-free scaling. MXFP4 retains the full three-piece patch (RHT + SR + truncation-free) as the comparison baseline.
+
+*** Why it worked (and what new pit it dug)
+
+Results: across OpenPangu-1B, Llama3-8B, and Qwen3-MoE-30B, *HiF4 achieves a loss gap vs. full precision of ≈ 1.0%*; *MXFP4 ≈ 1.5%*. More importantly, *HiF4 does not need SR* — one source of overhead is eliminated.
+
+Why does dropping SR still yield stability? Because 3-level hierarchical scaling gives every element a "well-suited scale landing spot," so quantization error is naturally smaller and SR is no longer needed to remove bias. In other words, *HiF4 shifts part of the stabilization burden from the algorithm layer back into the format layer* — that is its central trade-off.
+
+Remaining pits: (1) 4.5 bits/value is slightly higher than MXFP4's 4.25 bits (6% more storage); (2) three-level scaling is more complex to implement in hardware and currently exists only on the Ascend roadmap; (3) 90% of training runs in FP4, but sensitive layers (output projections) remain in high precision — just like the NVFP4 recipe, true "all-FP4" training has not been achieved.
+
+* Frontier Extensions
+
+** 2026 | M2XFP (Hu et al.)
+
+Observing that extreme values within a block are still swamped in MXFP4, this work proposes *attaching auxiliary metadata to each block* that explicitly records the most extreme values, allowing hardware to restore them accurately during dequantization. The cost is metadata storage and management overhead.
+
+This is the *dual* of the HiF4 approach — HiF4 nests scales hierarchically; M2XFP keeps a separate ledger for extreme values. Both lines attack the same core contradiction: single-level block scaling cannot accommodate extreme values.
+
+** 2026 | Quartet II (Panferov et al.)
+
+Pushes stabilization to an extreme: uses *MS-EDEN* (micro-scale EDEN — random Hadamard + SR at micro-scale granularity) for unbiased gradient quantization. Theoretically elegant, but extra compute overhead ≈ 2K(M+N) per GEMM — the direction that HiFloat4's engineering line deliberately avoids.
+
+** 2026 | Yan et al. — Large-Scale MoE Training Framework
+
+Rather than innovating on format, this work extends NVIDIA's Abecassis NVFP4 recipe to large-scale MoE training, focusing on system throughput and the stability of expert routing under low precision. This is the critical step that moves "FP4 training" from feasibility paper to industrial usability.
+
+* One Diagram
+
+#+begin_example
+    Memory / Compute Cost                          Stabilization Pressure
+         High                                             High
+          |                                               |
+ FP32 ----+                                               |
+ 2017     |                                               |
+          v                                               |
+ FP16 + FP32 master copy + loss scaling --------+         | <-- 1st paradigm: mixed precision
+ 2017     |                                     |         |
+          v                                     |         |
+ FP8 (E4M3 fwd / E5M2 bwd) + per-tensor scale  |         | <-- 2nd cut: two formats
+ 2022     |                                     |         |
+          v                                     |         |
+ MXFP4 (E2M1 + E8M0 block-of-32) ------+        |         | <-- scale granularity → block
+ 2023     |                            |        |         |
+          v                            |        |         |
+ MXFP4 + SR + RHT + trunc-free scale   |        |         | <-- algorithms patch the format
+ 2025     |                            |        |         |
+          v                            |        |         |
+ NVFP4 (NVIDIA Blackwell hw-native)    |        |         | <-- engineering subtraction:
+ 2025     |                            |        |         |     pick the lightest combo
+          v                            v        v         v
+ HiF4 (3-level: E6M2 + E1 + S1P2,           <-- this paper: shift stabilization pressure
+ block=64, Ascend NPU)                          from algorithms into the format itself
+ 2026     |
+          v
+ M2XFP / Quartet II / MoE Frameworks
+ 2026+        <-- still working on "single-level block scaling can't hold extreme values"
+         Low                                             Low
+    Memory / Compute Cost                          Stabilization Pressure
+
+    Main thread: bit-width 32 -> 16 -> 8 -> 4
+    Branches:    every cut must solve the "scale too coarse" problem left by the previous generation
+    Key turning point: after 2025, algorithm overhead itself becomes the dominant cost;
+                       HiF4 chooses to change the format rather than add more algorithms
+#+end_example
+
+* Insights
+
+Reading through this trajectory, the surface story is "bit-width cut from 32 to 4," but what is really happening underneath is a *war of attrition over scale granularity*.
+
+The core tension at every generation is not "are there enough bits?" but rather *how many values does one scale govern?*:
+- FP32 era: each number carries its own implicit scale (the IEEE exponent bits) — no block scaling needed
+- FP16 / FP8 per-tensor era: one scale per tensor — killed by outliers
+- MXFP4 era: one scale per 32-element block — but elements have only 16 possible values, so quantization error surges again
+- HiF4 era: three nested scales — coarse and fine granularity can coexist
+
+*The next step on this trajectory is almost predictable*: someone will push scale granularity finer still (perhaps one scale per 4 elements), and someone else will try making scales *learnable parameters* rather than values derived from data statistics. M2XFP and HiF4 have already opened the door in both directions.
+
+A second hidden thread: *the pendulum between algorithmic patches and hardware formats*. By 2025, algorithmic patches piled up to a peak (Quartet II's MS-EDEN, Metis's SVD). HiF4 swings the pendulum back — compressing the stabilization burden into the hardware format. This swing will almost certainly continue: over the next two years, expect more "complex format + simple algorithm" designs, because algorithm overhead at scale is real money.
+
+A final observation: *FP4 is not the endpoint*. The OCP specification already includes placeholders for MXFP6, MXINT8, and even lower-bit formats. The true terminus of this trajectory is "represent model weights and activations with the fewest bits such that training cost approaches the information-theoretic lower bound." We are still at least an order of magnitude away from that bound.
+
+* Takeaways
+
+If you work on systems or hardware research, the most direct lesson from this trajectory is: *never compare formats in isolation — compare the total overhead of "format + its required algorithmic support."* The HiFloat4 paper includes a key table (Table 1) that explicitly accounts for the extra compute beyond the FP4 GEMM itself for every method, because the authors recognized that this is the true deciding factor. If you are working on low-precision training, make sure to include that table in your paper.
+
+A broader lesson: *when the algorithmic patches on top of a design accumulate to a third generation, it is usually time to revisit the underlying abstraction.* MXFP4 + SR + RHT + truncation-free is a three-piece patch; HiF4 simply replaces the format. This pattern recurs throughout compiler, operating system, and network-protocol evolution — the moment when "it needs to be rewritten" becomes undeniable.
+
+Practically, this means *the next time you evaluate a low-precision training scheme, you can ask three questions directly*:
+1. What fraction of total FLOPs does the stabilization auxiliary compute account for? (HiF4: only RHT)
+2. How many levels of scale granularity does it use? (single-level block / multi-level nested / per-element)
+3. Can it avoid switching back to high precision at the end of training? (Nobody can do full-FP4 end-to-end yet — this is an open problem)
+
+These three questions will filter out nine-tenths of the low-precision training papers that look impressive but are not practically viable.

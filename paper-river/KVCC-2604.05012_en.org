@@ -1,0 +1,315 @@
+#+title:      Comparative Characterization of KV Cache Management Strategies for LLM Inference
+#+date:       [2026-05-28 Thu 17:06]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T170640-en
+#+source:     https://arxiv.org/abs/2604.05012
+#+authors:    Oteo Mamo, Olga Kogiou, Hyunjin Yi, Weikuan Yu (Florida State University)
+#+venue:      arXiv 2604.05012 [cs.AR], 2026-04-06
+
+* The Problem River
+
+An 8B model running at 128K context can eat an entire H100 just in "memory." The model weights occupy only 16 GB; the remaining 60-plus GB is consumed by something called the KV cache.
+
+The KV cache is the Transformer's "scratch pad" during autoregressive generation. Rather than recomputing the attention over all previous tokens from scratch every time a new token is generated, the key and value vectors for every layer are cached and reused. This drops inference complexity from quadratic to linear—but the price is GPU memory that grows linearly with sequence length, layer count, and head count.
+
+The core question of this river, in one sentence: *The KV cache is blowing up GPU memory. What do we do?*
+
+Nine years ago, Vaswani replaced recurrent networks with self-attention, curing "slow computation"—but planting the landmine of "can't fit in memory." Since then, every KV-cache paper has been wrestling with the same beast, just grabbing different parts: some hate fragmentation, some hate retaining useless tokens, some hate that the GPU can't hold everything and want to offload to CPU. Every solution works, yet every solution leaves a new gap. By the time this 2026 paper appeared, three entirely different paradigm-level solutions had been running in parallel, and nobody could clearly say which one to pick for their particular scenario.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: RNN computes serially—painfully slow, can't model long-range dependencies
+  | Solution: Drop RNN entirely; pure attention, fully parallel
+  | Landmine: Attention is O(n^2); memory scales with the square of token count
+  v
+[~2020] KV-Cache engineering trick solidifies (no landmark paper)
+  |
+  | Problem: Autoregressive generation recomputes K,V for all n previous tokens each step
+  | Solution: Cache each layer's K,V after first computation; reuse it
+  | Landmine: The cache itself explodes memory—8B model, 128K context → 60+ GB
+  v
+[2022] Dao - FlashAttention / FA-2 (2023)
+  |
+  | Problem: Standard attention materializes the n×n score matrix to HBM—slow and huge
+  | Solution: Tile-wise computation in SRAM; online softmax; never write full matrix
+  | Landmine: Reduces "compute" memory, not "storage" memory—cache still has to fit
+  v
+[2022] Yu et al. - ORCA (OSDI)
+  |
+  | Problem: Static batching forces fast requests to wait on slow ones; low GPU utilization
+  | Solution: Continuous batching at token granularity; dynamic batch assembly each step
+  | Landmine: Larger batches → worse cache fragmentation; still bottlenecked on memory
+  v
+[2023] Kwon et al. - vLLM / PagedAttention (SOSP)        <----+
+                                                              |
+[2023] Zhang et al. - H2O: Heavy-Hitter Oracle (NeurIPS)  <---+--- Three
+                                                              |    diverging
+[2024] Lee et al. - InfiniGen (OSDI)                      <---+    paradigms
+                                                              |
+  | vLLM     : Paged memory—no fragmentation, no eviction; but cache stays on GPU → OOM
+  | H2O      : Evict unimportant tokens; fits in memory, but wrong eviction → lost info
+  | InfiniGen: Full cache lives on CPU; fetch on demand; no information loss, but slow
+  v
+[2026] Mamo et al. - This paper (KVCC: Comparative Characterization)
+  |
+  | Problem: Three paradigms, never benchmarked head-to-head; practitioners guess blindly
+  | Solution: Run all three under the same benchmark; expose each one's sweet spot and dead zone
+  | Landmine: No silver bullet—each paradigm has forbidden regions; awaits hybrid frameworks
+  v
+[2026+] Next: paradigm fusion / NVLink-C2C interconnects / cross-chunk attention statistics
+#+end_example
+
+Note: FlashAttention does not sit on the direct KV-cache-management line, but vLLM, InfiniGen, and H2O all depend on it (or are rescued by it) in long-context experiments, so it is included at the source. ORCA is the direct predecessor vLLM surpasses; this paper also uses it as a comparison point.
+
+* Evolutionary Narrative
+
+** 2017 | Vaswani et al. "Attention Is All You Need": Turning Sequential Processing into Parallel
+
+*** What Problem It Saw
+
+LSTMs, GRUs, and other RNNs process a sequence one token at a time—the 100th word cannot be computed until the first 99 are done. A GPU has thousands of parallel cores, all sitting idle. Worse, long-range dependencies are fragile: for the 100th token to "see" the 1st, the signal must propagate through 99 time steps, arriving so diluted it is nearly gone.
+
+*** Its Solution
+
+Throw away the recurrent structure entirely. Every token computes an attention score against every other token in the sequence—"who am I related to, and by how much?" All tokens compute simultaneously; the GPU runs at full capacity. Any two positions are "one hop" apart; no signal decay.
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Parallelism and long-range modeling were both achieved. But the cost is hidden inside softmax(Q K^T): n tokens attending to one another produces an *n×n matrix*. Double the sequence, quadruple compute and memory. During training, n is manageable. During inference—especially autoregressive generation—this O(n^2) becomes the root of every story that follows.
+
+** ~2020 | KV-Cache Engineering Trick: Trading Space for Time
+
+*** What Problem It Saw
+
+Autoregressive generation of one token requires the current query to attend over the K and V of all preceding tokens. If every new token recomputes all prior K and V from scratch, step n does n recomputations—the entire generation is O(n^2) redundant work.
+
+*** Its Solution
+
+Store the K and V computed at each position the first time; reuse them at every subsequent step, computing only the K and V of the new token. Per-step attention drops from O(n^2) to O(n); total generation drops from O(n^3) to O(n^2).
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Complexity drops a full order—an optimization you simply must do in practice. But the cost is memory: every layer, every head must store a t × d_h K matrix and a t × d_h V matrix; models have dozens of layers and dozens of heads; and t keeps growing. OPT-6.7B at 2048 context already needs 1 GB; batch=8 needs 8 GB; Llama-3.1-8B at 128K context needs 60+ GB. The model weights themselves are only 16 GB—the cache has become the dominant tenant. From this moment on, "how do you fit the KV cache" becomes the central question of LLM inference systems.
+
+** 2022 | Dao "FlashAttention" (FA-2 2023): Moving Attention Computation into SRAM
+
+*** What Problem It Saw
+
+Standard attention writes the full n×n score matrix to HBM—large and slow. HBM bandwidth is roughly 1/10 that of SRAM; at long sequences, most time is spent moving data, not computing. And the n×n matrix itself consumes O(n^2) memory; sequences beyond 16K simply cannot be materialized.
+
+*** Its Solution
+
+Partition Q, K, V into tiles and compute attention tile-by-tile in the GPU's on-chip SRAM, maintaining a running softmax (online softmax) and updating the output incrementally. *The full n×n matrix is never materialized.* The final output is mathematically identical to standard attention, but HBM access drops from O(n^2) to O(n).
+
+*** Why It Worked (and What New Landmine It Buried)
+
+It rescued prefill: without FA-2, vLLM, InfiniGen, and H2O all OOM on long-context prefill just from the attention computation alone. But FlashAttention reduces "compute" memory, not "storage" memory—the KV cache is still there. There is also an ironic detail visible in this paper's experiments: H2O cannot use FlashAttention at all, because its Heavy-Hitter selection must inspect the full materialized softmax(QK^T) to count attention scores. Optimizing one dimension often blocks another.
+
+** 2022 | Yu et al. "ORCA" (OSDI): Turning Batching from Static to Continuous
+
+*** What Problem It Saw
+
+Traditional inference servers use static batching: eight requests enter together and nothing moves until the slowest one finishes generating. Short requests sit idle waiting for long ones; the GPU is half-empty.
+
+*** Its Solution
+
+Stop batching at the request level; batch at the *token level*. Every decode step freely assembles all currently active requests into one attention computation. Whoever finishes generating first is released immediately; new requests can join at any time.
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Throughput took off. But cache management broke: every request has a different length and a different lifespan. Traditional per-request pre-allocated cache memory was shredded into fragments, and "30% of GPU memory is technically free yet no new request can be admitted" became routine. ORCA pushed batching to the limit, and in doing so exposed memory management as the next bottleneck. That is exactly where vLLM picks up.
+
+** 2023 | Kwon et al. "vLLM / PagedAttention" (SOSP): Bringing OS Virtual Memory into the GPU
+
+*** What Problem It Saw
+
+ORCA's continuous batching made cache fragmentation severe. The conventional approach was to pre-reserve a contiguous cache region sized for the "maximum possible length" per request—say, 2048 tokens of space when only 500 are actually used, wasting the other 1548. With requests arriving and departing at random, memory fills with holes of varying sizes; finding a contiguous block for a new request becomes impossible.
+
+*** Its Solution
+
+Copy the OS's virtual memory design: partition the KV cache into fixed-size *blocks* (e.g., 16 tokens per block), store them at non-contiguous physical locations, and maintain a per-sequence block table as a page table. Sequences sharing a common prompt use copy-on-write so even prefixes are not duplicated. The attention kernel is rewritten as a PagedAttention operator that works across non-contiguous blocks.
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Fragmentation nearly vanishes; memory utilization jumps from ~60% to 96%. In this paper's experiments vLLM delivers the most stable throughput and latency across all batch sizes—it is the baseline of baselines. But it has one iron constraint: *the entire cache lives on the GPU*. When memory is sufficient, it is the fastest option; when memory runs out, it OOMs immediately. An 8B model on 1×H100 can reach 128K; a 70B model on 4×H100 actually OOMs earlier—because the model is distributed across cards but the attention score matrix is still computed per-card, shrinking the usable space on each individual GPU. vLLM solved memory management but not absolute memory volume. The next paradigm attacks that directly.
+
+** 2023 | Zhang et al. "H2O: Heavy-Hitter Oracle" (NeurIPS): Attacking "Most Cached Tokens Are Useless"
+
+*** What Problem It Saw
+
+vLLM dutifully keeps every token's K and V. But experiments reveal a striking fact: attention scores are highly concentrated—a small minority of tokens capture the vast majority of attention weight, while most tokens receive almost none. If only those high-scoring tokens are kept, the attention output is nearly identical. If the full cache cannot fit, don't keep all of it.
+
+*** Its Solution
+
+H2O frames KV eviction as *dynamic submodular optimization*: during prefill, accumulate the attention score of each token; keep the top-scoring "Heavy Hitters" together with a recency window (to ensure recent tokens are preserved); permanently evict everything else. Compressed to 20–30% of the original size, most task quality is retained.
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Memory is cut by 70%; throughput matches vLLM. In this paper's experiments H2O achieves the highest "throughput per GB of memory." But there are two hard flaws.
+
+First, *Heavy-Hitter selection itself requires computing the full softmax(QK^T)*—FlashAttention is incompatible. When a long prompt arrives, prefill OOMs; chunked prefill must be used instead, but chunking means cross-chunk attention statistics are lost, potentially evicting a genuine Heavy Hitter that spans chunk boundaries.
+
+Second, *eviction is permanent*. Once a token is misjudged as unimportant and discarded, any information it contained is gone forever. This paper designs a dedicated retention test: a fact ("my dog's name is Barkley") is inserted at the start of a conversation, several unrelated turns are generated, then the model is asked to recall the fact. H2O's retention accuracy already drops 17 percentage points at 1K–2K context, and falls 27 percentage points at 4K–8K. H2O looks fine on standard benchmarks, but it systematically harms *knowledge-intensive* and *long-range dependency* tasks.
+
+These two flaws directly motivate the next paradigm: can we retain information *without loss*, while still fitting in memory?
+
+** 2024 | Lee et al. "InfiniGen" (OSDI): Keeping the Full Cache on CPU, Fetching to GPU On Demand
+
+*** What Problem It Saw
+
+H2O's information loss is irreversible. vLLM OOMs when memory runs out. A naive idea: CPU memory is more than ten times cheaper per GB than GPU memory—could the bulk of the cache live on CPU and be transferred to GPU only when needed?
+
+The naive approach fails: transferring everything is too slow; PCIe bandwidth cannot keep pace with decode throughput. What is needed is a way to transfer *only the tokens that will actually receive attention*.
+
+*** Its Solution
+
+InfiniGen does two things.
+
+First, *offline skewing*: apply SVD to the query and key weight matrices to identify the few dimensions that dominate attention computation. At runtime, only the "partial K" along these dimensions is kept on the GPU—very small.
+
+Second, *online speculation*: at each decode step, use the GPU-resident partial K to compute a cheap attention estimate with the current query, predicting which tokens in the next layer will receive high scores. Only the full K and V of those tokens are prefetched from CPU to GPU.
+
+Net effect: *the complete cache lives on CPU and nothing is discarded*; *the GPU dynamically holds only the small set of tokens needed right now*. Arbitrarily long contexts become feasible.
+
+*** Why It Worked (and What New Landmine It Buried)
+
+Retention accuracy nearly matches vLLM—this is InfiniGen's decisive advantage over H2O. But the cost is severe: in this paper's experiments InfiniGen achieves only 8 tokens/second decode throughput—1/15 of vLLM and 1/10 of H2O. The reason is that *every decode step requires a PCIe transfer of a batch of K and V tensors*, serializing the entire batch computation. Larger batch sizes make things worse—more requests means more transfers, not amortized fixed overhead. Latency at batch=96 is 14× higher than vLLM.
+
+InfiniGen's bet is that "NVLink-C2C and similar CPU-GPU interconnects will mature." This paper measures performance on PCIe Gen5, where bandwidth is the bottleneck. The fate of this paradigm is tied to a hardware trend.
+
+** 2026 | Mamo et al. This Paper: Placing All Three Paradigms inside the Same Benchmark and Seeing Who Wins Where
+
+*** What Problem It Saw
+
+vLLM, H2O, and InfiniGen each compare favorably to "a baseline"—but *the baselines are all different* and *the evaluation dimensions are all different*. The vLLM paper optimizes throughput; the H2O paper optimizes memory compression ratio; the InfiniGen paper optimizes supported context length. The result: practitioners facing a concrete deployment—say, "4×H100 serving a 70B model at batch 32, mainly 16K-turn dialogues"—have no principled way to choose. Academia knows three paradigms exist; industry guesses.
+
+Worse, none of the three papers openly acknowledges its own dead zones. To map the boundaries from an engineering standpoint, you have to run the experiments yourself.
+
+*** Its Solution
+
+No new method is invented. Instead, the paper *honestly performs a head-to-head benchmark*. Same hardware (4×H100), same set of models (Llama-3.1-8B/70B, GPT-OSS-20B), same datasets (LMSYS-Chat-1M conversations + Wikipedia long documents + six reasoning benchmarks + one custom retention test), three frameworks evaluated on: TTFT, decode throughput, memory footprint, long-context support, the impact of sparsity on accuracy, and conversational memory retention.
+
+The custom retention test is the highlight: standard benchmarks cannot surface H2O's hard flaw, because reasoning tasks typically place critical information near the end of the prompt—within the recency window. The authors deliberately design a test where a fact is buried at the beginning of a conversation and queried several turns later, directly measuring the cost of permanent eviction.
+
+*** Its Conclusions (and the New Landmine It Buries)
+
+No silver bullet. Each paradigm has a clear sweet spot:
+
+- *vLLM*: GPU memory is sufficient → choose it. Best throughput, latency, and accuracy; simple and robust.
+- *H2O*: Memory is tight but high throughput is required, and the task is not sensitive to early-context recall → choose it. 70% memory savings; throughput matches vLLM.
+- *InfiniGen*: Memory is extremely tight, long context must be supported, and 1/10 the throughput is acceptable → choose it. Retention accuracy nearly matches vLLM.
+
+But this "pick by scenario" conclusion is itself an invitation: can we *simultaneously* achieve vLLM's throughput, H2O's memory efficiency, and InfiniGen's retention? The hard tensions among the three paradigms are now laid on the table for the first time; the next generation of frameworks must find new solutions within this three-way tension.
+
+* Frontier Extensions
+
+As of this paper's publication (April 2026), the first systematic head-to-head comparison in this line of work has been completed. The frontier is moving in two directions.
+
+*Direction 1: Paradigm Fusion.* Signs already exist. The paper itself mentions *SqueezedAttention* (K-means clustering) and *Quest* (min-max block indexing) as approaches that attempt to reduce InfiniGen's transfer cost within a "dynamic selection" paradigm. There are also efforts to let H2O's Heavy-Hitter statistics accumulate across chunks, mitigating the side effects of chunked prefill. By forcing all three frameworks into the same test bed, this paper effectively hands future researchers a map: any proposed fusion scheme must clear these same hurdles.
+
+*Direction 2: Hardware Evolution Rewrites the Playing Field.* InfiniGen's bottleneck is PCIe bandwidth. The paper states plainly: "NVLink-C2C's 7× bandwidth improvement over PCIe Gen5 could substantially close the gap between InfiniGen and vLLM." This is an honest and specific prediction: the winner among algorithmic paradigms is not determined by algorithms alone—a generational leap in hardware interconnects can turn *yesterday's dead zone into tomorrow's sweet spot*.
+
+The papers most worth reading in 2027–2028 on this line will likely fall into two categories: "H2O+InfiniGen hybrids" that use sparse statistics to select tokens up front and SVD-accelerated transfer to move them; and re-evaluations of InfiniGen on NVLink-C2C or CXL interconnect hardware, testing whether it can graduate from a niche solution to a general one.
+
+* One Diagram
+
+#+begin_example
+              Evolution of "How to Fit the KV Cache"
+              ========================================
+
+Timeline --------------------------------------------------------->
+       2017     2020     2022       2023            2024        2026
+
+Problem  Attn    Must     n×n       Fragmen-       Eviction    Can't
+focus    O(n^2)  reuse    blows     tation +       loses       choose
+                K,V      up HBM    importance     information  which
+
+Main     Vaswani (no      FA-2      vLLM    H2O    InfiniGen   This
+actor    attn    landmark SRAM      Paging  evict  CPU offload paper
+         mech    paper)                            +speculate  compare
+
+Solution Parallel Cache   tile +    virtual perma- SVD +       unified
+axis     compute K,V      online    page    nent   speculative benchmark
+                          softmax   table   evict  prefetch
+                                            heavy
+                                            hitter
+
+Landmine Can't   Cache    Doesn't   Hard    Loses  Decode 15x  Dead
+         store   too big  solve     OOM     info   slower than zones;
+         (n^2            storage   ceiling  irrev. vLLM        needs
+         attn)           problem                               hybrid
+
+                                     +---------------+
+                                     |  Three para-  |
+                                     |  digms run in |
+                                     |  parallel;    |
+                                     |  no head-to-  |
+                                     |  head compare |
+                                     +-------+-------+
+                                             |
+                                             v
+                                  [This paper maps sweet spots / dead zones]
+                                             |
+                                             v
+                                  +------------------------+
+                                  |  Next gen: paradigm    |
+                                  |  fusion + NVLink-C2C   |
+                                  |  rewrites the field    |
+                                  +------------------------+
+
+
+Position of the three paradigms on the (memory, throughput, retention) triangle:
+
+         Memory efficiency
+            ^
+            |
+       H2O  *   <-- 70% memory savings, high throughput, but retention drops 20+ pp
+            |
+            |
+            |  InfiniGen
+            |    *   <-- Unlimited memory (CPU-side), near-perfect retention, but 1/15 throughput
+            |
+            +----------*---------------> Throughput / Latency
+                       vLLM
+                       (best retention, best throughput, but hard memory ceiling)
+
+       (Closer to a corner = stronger on that dimension, weaker on the other two)
+#+end_example
+
+* Key Insight
+
+Compressing nine years of evolution into one sentence: *We have always been running from the same O(n^2) monster—each generation simply chooses to offload the cost onto a different place.*
+
+- Vaswani traded "slow computation" for "more computation" (n^2 attention).
+- KV cache traded "more computation" for "more storage" (n^2 → n×L memory).
+- FlashAttention traded "stored intermediate matrix" for "dynamic tile scheduling" (complexity unchanged, but constant factor greatly reduced).
+- vLLM traded "fragmented memory" for "paging-index complexity."
+- H2O traded "absolute memory volume" for "information fidelity loss."
+- InfiniGen traded "GPU memory ceiling" for "PCIe transfer time."
+
+No generation *eliminated* the problem; each generation *relocated* it—pushed it onto whichever hardware dimension was cheapest at the time. The true throughline of this river is therefore not algorithmic but a kind of *hardware-algorithm conservation of energy*: wherever cheap resources exist, the problem gets squeezed there.
+
+This also explains the paper's real contribution. It does not claim "we are better than X." It *lays out, for the first time, the direction each paradigm offloads its cost*: vLLM offloads to software complexity, H2O to accuracy, InfiniGen to bandwidth. Every paradigm is rational, as long as what it offloads is cheap enough in your particular scenario.
+
+The next steps are almost predictable.
+
+First, *at the hardware level*: once CPU-GPU interconnects (NVLink-C2C, CXL, UALink) gain another order of magnitude in bandwidth, "fetch-on-demand" paradigms like InfiniGen will shift from niche to default. When bandwidth is cheap, offloading to bandwidth is a free lunch.
+
+Second, *at the algorithm level*: pure single-paradigm approaches may soon hit their ceiling. The next wave of breakthroughs will be *paradigm-hybrids* that automatically switch between paging, eviction, and offloading strategies across different time windows, sequence segments, and task types. This paper's benchmark matrix will become the standard test bed for such hybrids.
+
+Third, *at the evaluation level*: the most-cited contribution of this paper is likely not its conclusions but the retention test it constructed. That test transforms "conversational memory" from a soft intuition into a quantifiable hard metric. Future KV-cache sparsification papers will be expected to clear this bar—just as, a few years ago, perplexity alone was no longer enough and MMLU had to be added. A good benchmark advances an entire field.
+
+* Takeaways
+
+Reading through this river suggests a few landing points for "how to find research problems."
+
+*Look not at the technology but at who bears the relocated cost.* Behind every popular method hides a sacrificed dimension. vLLM assumes memory is sufficient; H2O assumes early tokens are unimportant; InfiniGen assumes transfer is cheap. Find the compressed spring, and that is where the next paper lives.
+
+*In a crowded field, doing a benchmark first can have more leverage than rushing out a new method.* This paper invents no algorithm, yet it will be cited by every KV-cache paper in the next three years—because it defines how the game is played. When a field has three or more "we beat the baseline" papers but no head-to-head comparison, *the person who builds the map is the cartographer*: anyone who wants to draw a new route has to consult the map first.
+
+*Predicting hardware trends is predicting algorithmic paradigm shifts.* InfiniGen is criticized today for being slow, but if you bet that NVLink-C2C will become ubiquitous, it is the next-generation default. Algorithm researchers rarely spend time reading hardware roadmaps, yet every generational leap in hardware interconnects turns some "counterintuitive algorithm" into the new mainstream. CXL, UALink, NVLink-C2C—these names are worth an afternoon of study for anyone working on algorithms.
+
+*A practical framing you can reuse*: the "relocating costs" lens from this river applies directly to any systems-optimization domain—storage, networking, compilers, schedulers all obey the same conservation. The next time you see a new method blow past prior work on a benchmark, ask first: "Where did it relocate the cost?" That relocated cost is exactly the gap the next paper is waiting for you to fill.

@@ -1,0 +1,311 @@
+#+title:      Does a Global Perspective Help Prune Sparse MoEs Elegantly?
+#+date:       [2026-05-28 Thu 18:00]
+#+filetags:   :paper:river:moe:pruning:llm:efficiency:en:
+#+identifier: 20260528T180000-en
+#+source:     https://arxiv.org/abs/2604.06542
+#+authors:    Zeliang Zhang, Nikhil Ghosh, Jiani Liu, Bin Yu, Xiaodong Liu
+#+venue:      arXiv preprint, 2026-04-08
+
+* The River of Problems
+
+Making LLMs bigger means adding more parameters. But more parameters mean more FLOPs per token at inference time — slower and more expensive. Mixture-of-Experts (MoE) found an elegant shortcut: build 8, or even 256, expert networks, but activate only 2 of them per inference step. You only compute 2 experts at a time, so speed feels like a small model; all 8 participate during training, so capacity feels like a large one.
+
+It sounds like the best of both worlds — but one detail remains unsolved: all 8 experts must reside in GPU memory, because the routing decision depends on the input and you cannot predict in advance which two experts the next token will need. Mixtral-8x22B runs only 39B parameters at inference, yet you need enough HBM to hold all 141B. MoE decouples "how much to compute" from "how much to store" — it solves the first problem while actually making the second worse.
+
+This line of research is a sustained fight against the second problem: *how to identify and discard useless experts inside a MoE model*. Every generation of solutions answers the same question — "what does 'useless' mean?" — but the definition keeps evolving:
+
+- "Rarely used on my task" → "Rarely used on general corpora" → "Measured by how much loss rises when removed" → "Too similar to another expert" → "From a network-wide view, its entire layer has no redundancy at all"
+
+GRAPE is the latest step in this chain, and its claim is: "Every prior method shares the same hidden mistake — they assume every layer should be pruned by the same amount."
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE (1701.06538)
+  |
+  | Problem: Model capacity is limited by parameter count, but FLOPs grow too
+  | Solution: Thousands of FFN experts; each token activates only top-k of them
+  | Residual: All experts must stay in memory; more capacity = memory explosion
+  v
+[2022] Chen et al. - TSEP (2206.00277)
+  |
+  | Problem: MoE inference requires expert parallelism; hard to deploy anywhere
+  | Solution: Prune while fine-tuning — every k steps check each expert's
+  |           "expertise"; drop those below a threshold; eventually one expert
+  |           remains per layer
+  | Residual: Requires fine-tuning and is task-specific; prohibitive in the
+  |           LLM era; judging usefulness by "routing frequency" is too coarse
+  v
+[2024] Lu et al. - NAEE / "Not All Experts Are Equal" (2402.14800)
+  |
+  | Problem: TSEP's training cost is unacceptable; nobody can fine-tune at
+  |           LLM scale
+  | Solution: No training — use a small calibration set (a few hundred C4
+  |           samples), enumerate "which experts to delete" combinations, and
+  |           keep the combination that minimizes loss increase
+  | Residual: Each layer is searched independently with the same budget;
+  |           only "how much loss changes after deletion" is inspected —
+  |           pairwise expert similarity is ignored entirely
+  v
+[2025] Zhang et al. - DEK (2407.09590, ACL'25 Findings)
+  |
+  | Problem: NAEE asks "who can be removed with least damage," but sometimes
+  |           two experts are *both important* yet *mutually redundant* —
+  |           removing either one hurts, but merging them together does not.
+  |           NAEE is blind to this case.
+  | Solution: Within each MoE layer, compute pairwise CKA similarity between
+  |           experts; merge the most similar pair (weights + routing together)
+  | Residual: Still "process each layer independently." Whether the budget is
+  |           "drop N experts per layer" or "merge M pairs per layer," the
+  |           layer is treated as the natural budget unit
+  v
+[2026] GRAPE - Global Redundancy-Aware Pruning (this paper, 2604.06542)
+  |
+  | Problem: All methods above (Chen / Lu / Zhang / Li / He / ...) share the
+  |           same hidden assumption: "every layer should be pruned equally."
+  |           But Zhang's own CKA measurements show redundancy varies by
+  |           several-fold across layers: later layers have very similar experts
+  |           (high redundancy), earlier layers are diverse (low redundancy).
+  |           Uniform pruning = forcing cuts in low-redundancy layers, hurting
+  |           the model
+  | Solution: Stack all layers' similarity matrices into one large
+  |           block-diagonal matrix; solve globally — "remove K experts total
+  |           to minimize total similarity loss" — letting the algorithm decide
+  |           how many to prune per layer
+  v
+[2026.05] Concurrent & follow-up work: REAM, EvoESAP, MoE Pathfinder, REAP,
+          DiEP ... (multiple threads simultaneously questioning uniform
+          layer-level budgets in 2025–2026)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al. — Sparse MoE: Decoupling Capacity from Computation
+
+*** What Problem It Saw
+
+At the time, a neural network's "capacity" — how much knowledge it could absorb — was bounded by its parameter count. If you wanted the model to learn more, you had to stack more parameters. But stacking parameters had a cost: every forward pass had to touch all of them, making inference painfully slow.
+
+The idea of "letting a network activate different parts for different inputs" — conditional computation — had been theorized for years. Nobody had built a version that could actually run, train, and perform well.
+
+*** Its Solution
+
+Shazeer (later a co-inventor of the Transformer, working alongside Hinton and Jeff Dean) actually made it work. Specifically:
+
+- Replace one FFN layer with N FFN experts (up to thousands)
+- Prepend a "gate" network that takes a token's representation and outputs N scores
+- Activate only the top-k experts by score (k is typically 1 or 2); skip all others for this token
+- Add noise and a load-balancing loss to prevent all tokens from routing to the same expert
+
+The result: parameter count scales by 1000×, compute barely increases.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It worked because different inputs genuinely deserve different experts — an expert specialized in English is wasted on Chinese. Letting the model learn its own division of labor is more efficient than forcing every parameter to handle every input.
+
+But it dug one critically important pit: *all experts must reside in memory*. Because the gate decides based on the input, you cannot know in advance which two experts the next token will activate. The consequence: MoE saves on "how much to compute" but is actually more expensive than a dense model on "how much memory to occupy." This pit sat buried for seven years until MoE reached LLM scale (Mixtral and others), at which point memory became an unavoidable bottleneck.
+
+** 2022 | Chen et al. — TSEP: The First Cut
+
+*** What Problem It Saw
+
+By 2022, MoE had produced trillion-parameter models for NMT and pretraining. The problem was obvious: you could train it, but you couldn't deploy it. Cloud inference required expert parallelism and cross-device communication — slow and expensive; edge deployment was simply out of the question.
+
+And there was another layer of frustration for downstream tasks: if you want to fine-tune for sentiment classification, you don't need 64 experts — maybe only 2 or 3 are relevant to that task.
+
+*** Its Solution
+
+TSEP (Task-Specific Expert Pruning) did something intuitive: kill experts while fine-tuning.
+
+- Every k training steps, compute each expert's "expertise" (essentially routing frequency plus contribution to loss)
+- Directly drop experts below a threshold
+- Repeat until only one expert per layer remains
+- At that point, MoE collapses into a dense model: inference doubles in speed, cross-device communication vanishes
+
+Results across 6 downstream tasks: 99.3% of the original MoE performance retained, 2× faster inference.
+
+*** Why It Worked (and What New Pits It Dug)
+
+It worked because fine-tuning is task-specific — most experts learned capabilities during pretraining that are irrelevant to your target task, making them redundant. Removing them costs little for that task.
+
+But it left three new pits:
+
+1. *Requires fine-tuning* — In the LLM era, fine-tuning Mixtral-8x22B itself is astronomically expensive; TSEP becomes immediately inapplicable
+2. *Task-specific only* — Want a general-purpose pruned model? Not possible
+3. *"Frequency" is a coarse proxy* — Low routing frequency doesn't mean unimportant; high frequency doesn't mean irreplaceable
+
+These three pits directly defined the next generation's direction: training-free + task-agnostic + a smarter definition of "importance."
+
+** 2024 | Lu et al. — NAEE: No Training, Just Search
+
+*** What Problem It Saw
+
+LLM-era MoE models were too large for anyone to fine-tune. TSEP's "prune while training" approach no longer worked. Yet the need was more urgent than ever — Mixtral-8x7B required 45 GB VRAM just to hold the expert weights; ordinary researchers couldn't run it.
+
+Deeper still: using routing frequency as an importance signal was naive. An expert barely activated on a calibration set might just mean the calibration set was biased — it doesn't imply the expert is unimportant on the true distribution.
+
+*** Its Solution
+
+NAEE (Not All Experts Are Equal) switched to a *post-training* paradigm:
+
+- Model weights are completely frozen — nothing is updated
+- Take a small calibration set (a few hundred C4 sentences)
+- Enumerate different "which experts to delete" combinations; run a forward pass on the calibration set for each
+- Keep the combination that causes the least increase in loss
+- Mathematically this is a combinatorial search problem (NP-hard); they use greedy search plus heuristics
+
+Results: pruning 25% of experts from Mixtral-8x7B with almost no performance drop. Completely training-free.
+
+*** Why It Worked (and What New Pits It Dug)
+
+It worked because "how much does loss rise when this expert is removed" is far more honest than "how often is it used" — it directly measures how important an expert is to the final output. And post-training takes a few hours at most, which is LLM-friendly.
+
+But two pits remain:
+
+1. *Each layer is searched independently with the same fixed budget* — it assumes layer 1 and layer 30 should each have 2 experts removed
+2. *Search is unidirectional*: it only asks "which removals have the least impact," never "which experts are duplicates of each other such that merging them incurs less loss"
+
+The second pit is especially important. Imagine two experts with 90% overlapping behavior: deleting either one drops performance slightly (because the other covers most of it), yet you also can't delete both. NAEE cannot see this kind of "pairwise redundancy" — it only looks at each expert's *marginal importance*, not the *relationships between experts*.
+
+** 2025 | Zhang et al. — DEK: Stop Asking "Who Can Be Deleted," Ask "Who Looks Like Whom"
+
+*** What Problem It Saw
+
+DEK (Diversifying Expert Knowledge)'s author — the same Zeliang Zhang who wrote GRAPE — zeroed in on what NAEE was blind to: pairwise redundancy.
+
+They ran a diagnostic experiment: feed a batch of data into Mixtral, record each expert's output activations at each layer, then compute pairwise similarity using CKA (Centered Kernel Alignment, a standard metric for comparing how similar two neural network layers are).
+
+The finding: *within the same layer, several expert pairs had CKA scores above 0.8* — they were doing almost the same thing. NAEE's search was blind to this, because it only measured "how much does deletion hurt," and for a pair of redundant experts, deleting either one barely hurts (since the other compensates).
+
+*** Its Solution
+
+DEK switched from *deletion* to *merging*:
+
+- Within each MoE layer, compute pairwise CKA similarity for all experts, yielding an N×N similarity matrix D
+- Use hierarchical clustering to merge the most similar pair: average their weights (or weighted average), and *merge their routing* — tokens that previously routed to either expert now route to the merged one
+- Repeat until K experts remain
+
+Results: better than NAEE on Mixtral, especially at high compression rates.
+
+*A key byproduct*: after running these experiments, they produced a figure showing the *average CKA similarity per layer*. What that figure revealed directly motivated the next paper (GRAPE): *redundancy varies by several-fold across layers* — later layers have CKA consistently above 0.7; early layers barely reach 0.3.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It worked because merging beats deletion. Deletion discards information; merging compresses two similar representations into one, retaining more information. Combined with CKA-based similarity measurement, it can precisely identify "pairwise redundancy" — the kind of waste NAEE couldn't see.
+
+But a glaring pit remained: *each layer is still processed independently*. "Merge N pairs per layer" — but if layer 30 has redundancy 0.8 and layer 3 has 0.2, why should both layers merge the same number of pairs? Forcing merges in layer 3 hurts the model; not merging more in layer 30 wastes an opportunity.
+
+DEK's author saw that figure — and wrote GRAPE.
+
+** 2026 | GRAPE: Account for Inter-Layer Variation
+
+*** What Problem It Saw
+
+GRAPE's core observation is an extension of that DEK figure: "redundancy is non-uniform across layers." They formalized it:
+
+1. Use the same CKA metric as DEK to compute the average intra-layer similarity R^l for each layer
+2. Normalize to [0, 1] and plot: in Mixtral-8x22B, the second half of layers has R^l ≈ 0.9, while the first few layers have R^l ≈ 0.1. A 9× difference.
+3. The curve is not monotonically increasing — some middle layers also dip sharply
+
+This observation breaks the hidden assumption shared by every existing method (Chen 2022, Lu 2024, Zhang 2025, Li 2024, He 2024): *"layers are the natural budget unit; every layer should be pruned equally."*
+
+Why does everyone do it this way? Because divide-and-conquer is the easiest implementation — optimize each layer independently = simple algorithm, parallelizable. That's engineering convenience, not scientific correctness.
+
+*** Its Solution
+
+GRAPE breaks the "per-layer independence" assumption and performs *global joint optimization*:
+
+- Still use CKA to compute an intra-layer similarity matrix D^l for each layer (following DEK)
+- *The key transformation*: stack all L layers' D^l matrices into one large block-diagonal matrix A (of size LN × LN). Off-diagonal blocks are 0 (cross-layer merging is forbidden, since experts in different layers do fundamentally different things); on-diagonal blocks are the per-layer similarity matrices
+- Then solve on A: select a mask M (size LN × LN) such that the total similarity loss of retained experts is minimized, subject to the constraint that exactly LN − K experts are removed in total
+- This optimization has *no hard per-layer budget constraint* — the algorithm decides how many experts to prune per layer automatically: high-redundancy layers get pruned more, low-redundancy layers get pruned less
+
+Formally, GRAPE differs from DEK only in that single "block-diagonal" step — but semantically it is a qualitative leap: from local budget to global budget.
+
+Experiments across Mixtral-8x7B, Mixtral-8x22B, DeepSeek-MoE, Qwen-MoE, and GPT-OSS, at various pruning ratios: on average 1.40% better than the strongest "uniform per-layer" baseline, with a peak gain of 2.45%.
+
+*** Why It Worked (and What New Pit It Dug)
+
+It works because budget allocation should match the redundancy distribution — collecting equal amounts of water from a desert and a rainforest makes no logical sense. GRAPE's essential contribution is incorporating "layer-level redundancy" as a variable into the optimization objective, letting it automatically redistribute the budget.
+
+But the paper honestly acknowledges a new pit: *on DeepSeek-MoE, global pruning can collapse the model*. The reason is that DeepSeek's inter-layer redundancy distribution is too extreme — certain layers have near-zero redundancy, so GRAPE barely touches them and concentrates all the budget on the high-redundancy layers; those layers end up over-pruned, critical experts get merged away, and the whole model breaks. Their fix is to add a per-layer maximum pruning ratio cap — but that partially surrenders the "global freedom" they worked to achieve.
+
+A deeper issue: CKA measures "how similar representations look," but "looking similar" does not equal "functionally identical." Two experts with CKA = 0.8 might serve critically different roles on rare inputs. The global perspective amplifies the cost of such mis-merges — when you get it wrong, you get it wrong at the most consequential location.
+
+* Frontier Extensions
+
+GRAPE is not isolated. From late 2025 through early 2026, *at least four parallel threads* were reconsidering "uniform layer-level budgets" simultaneously — a signal that a field-wide consensus is forming:
+
+** 2025.09 | DiEP (2509.16105)
+Parameterizes the pruning rate per layer and learns it via gradient descent. The same spirit as GRAPE: both convert "how much to prune" from a hard-coded value into a learnable variable. The difference is that DiEP takes the differentiable-optimization route while GRAPE takes the combinatorial-optimization route.
+
+** 2025.12 | MoE Pathfinder (2512.18425)
+More radical — looks not just at per-layer redundancy but at *redundancy along each activation trajectory*. Treats the entire MoE as a directed graph; pruning becomes a path-planning problem. Conclusion is likewise non-uniform allocation.
+
+** 2026.03 | EvoESAP (2603.06003)
+Replaces GRAPE's global optimization objective with a different one: a proxy for speculative-decoding acceptance rate (ESAP). The difference is in the choice of objective function; the shared consensus is "non-uniform allocation."
+
+** 2026.04 | REAM (2604.04356)
+Returns to the meta-question behind the DEK → GRAPE chain: is merging actually better than pruning? Under what conditions? This thread pulls out another variable in that chain — merge vs. delete — and reexamines it from scratch.
+
+GRAPE is not the end of this story; it is one participant in a broader wave of consensus. The next step in this whole line will almost certainly be *simultaneously* performing joint optimization across layers, across trajectories, and over the merge-vs.-delete choice — folding all these degrees of freedom into one unified search framework.
+
+* One Figure to See It All
+
+#+begin_example
+                      "What does 'useless expert' mean?"
+                                       |
+                                       v
+       +--------+--------+--------+--------+--------+--------+
+       |        |        |        |        |        |        |
+  [frequency] [freq+  [loss]  [pairwise  [cross-  [trajectory [acceptance
+             threshold]        similarity] layer    -level      rate
+                                          mutual   redundancy] proxy]
+                                          similarity]
+       |        |        |        |        |        |        |
+       v        v        v        v        v        v        v
+   ?-2022   2022      2024     2025      2026      2025.12   2026.03
+  (various)  Chen      Lu       Zhang    *GRAPE*   Path-     EvoESAP
+             TSEP      NAEE      DEK                finder
+
+  Definition: "rarely   "loss    "similar  "layer    "whole    "speculative
+              used"     rises    to whom"  has no    path      acceptance"
+                        when               redundancy counts"
+                        removed"           → don't
+                                           touch it"
+
+  Paradigm:   needs     train-   train-   train-    train-    train-
+              fine-tune free     free     free      free      free
+
+  Granularity: expert   expert   expert   layer     layer     path    layer
+                                          (indep.)  (joint)
+
+  Budget:     prune to  fixed N  fixed M  fixed M   *global*  global  global
+              1 expert  per      per      per       auto-     auto-   auto-
+              per layer layer    layer    layer     allocated alloc.  alloc.
+
+                              Core Progress Axis
+                       ===========================>
+                       Increasingly wider view / coarser granularity /
+                       freer budget allocation / less training required
+#+end_example
+
+* Insights
+
+Having read through this entire line of work, I see three things:
+
+1. *The definition of "importance" keeps retreating* — from "how often is it used" (behavior) to "how much does removal hurt" (marginal counterfactual) to "who does it look like" (structural similarity). Each step reveals something more fundamental, at the cost of increasing computational expense. This is a familiar trajectory in scientific understanding: observe the phenomenon first, then the counterfactual, then the structure.
+
+2. *Divide-and-conquer is the easiest shortcut* — every generation along this line performs the same small upgrade: "divide-and-conquer → joint optimization." TSEP divides by expert and by time step; NAEE divides by layer and by combination; DEK divides by layer and by pair; GRAPE is the first to break the "by layer" division. The next step is almost predictable: GRAPE's current "off-diagonal blocks are 0" — the hard constraint forbidding cross-layer merging — will also be broken. Some "functionally equivalent" experts across different layers may be better candidates for merging than redundant pairs within the same layer.
+
+3. *Self-referential research rhythm* — DEK and GRAPE are two steps of work by the same author within one year; the second step arose directly from an observation in the first step's byproducts. This is a healthy research rhythm: each paper not only solves a problem but leaves behind a diagnostic figure showing "what the next paper could attack." Most people finish drawing the figure and move on; a few stare at it and plan the next paper — and the compounding effect for that minority is remarkable.
+
+* Takeaways
+
+If you are doing pruning, compression, or any "budget allocation" work:
+
+- *Plot the distribution first* — before making any cuts, draw the density distribution of "the thing you're about to cut." When you see non-uniformity, don't use a uniform strategy. The only thing GRAPE does that all its predecessors don't is this one step — drawing that figure.
+- *Turn hard constraints into soft objectives* — any rule of the form "do the same amount of Y for every X" is worth questioning. Ask yourself: "Is this equality constraint physically necessary, or just easy to implement?" If it's the latter, there's room for improvement.
+- *Watch the byproduct figures in other people's papers* — diagnostic figures in published papers are often gold mines. The inter-layer redundancy figure in DEK was drawn almost as an aside; GRAPE made it the main course. When reading papers, treat these figures as "ore the author didn't realize they'd struck" — most of the time you won't realize it either, but occasionally you will.
+
+The practical takeaway: starting today, every time you read a methodology paper, flip to the diagnostics and visualization section and ask: "What does this figure reveal that even the authors didn't fully articulate?" — that is the seed of the next paper.

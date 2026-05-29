@@ -1,0 +1,251 @@
+#+title:      eOptShrinkQ: Near-Lossless KV Cache Compression Through Optimal Spectral Denoising and Quantization
+#+date:       [2026-05-28 Thu 17:55]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T175520-en
+#+source:     https://arxiv.org/abs/2605.02905
+#+authors:    Pei-Chun Su (Yale)
+#+venue:      arXiv preprint, 2026-04-06
+
+* The River of the Problem
+
+Why does LLM inference keep getting slower and more memory-hungry? The answer hides inside something called the *KV cache* — every time the model generates a new token, it stores the keys and values for all previous tokens so it never has to recompute them. Once the context grows long, several gigabytes of GPU memory vanish into this cache.
+
+So researchers started asking: can we compress it? What if instead of storing each number in 16-bit float, we squeezed it down to 4 bits, 3 bits, even 2 bits — without losing accuracy?
+
+That quest has been running for four or five years now, and each generation has patched the crack left by the one before. First came *outliers* — a handful of channels with values so extreme they blow up the entire quantization range. Then came outlier isolation. Then people realized isolation was still too blunt, and switched to random rotations that scatter every vector into an isotropic cloud. But after scattering, a new problem surfaced: attention scores are inner products, and minimizing MSE doesn't guarantee *unbiased inner products*. That's where eOptShrinkQ steps in and says: all those patches missed the real root — KV vectors carry a shared low-rank structure inside them. Peel that out first, and the residual is naturally isotropic; all the patches become unnecessary.
+
+The truly interesting twist is that the peeling tool — *optimal singular-value shrinkage* — didn't grow out of the LLM world at all. It came from a field that looks completely unrelated: extracting fetal ECG signals from a pregnant woman's abdominal recordings.
+
+* The Source Map
+
+#+begin_example
+                    [1967] Marchenko-Pastur
+                    What the "bulk spectrum" of a random matrix looks like
+                            |
+                            v
+                    [2005] BBP Phase Transition
+                    A signal must exceed a critical threshold to separate from noise
+                            |
+                            v
+            [2013-14] Donoho-Gavish / Nadakuditi
+            OptShrink: optimal singular-value shrinkage (white noise)
+                            |
+                            v
+                [2025] Su-Wu - eOptShrink
+                Extended to colored noise (application: fetal ECG extraction)
+                            |
+                            |
+                            |   ............ cross-domain fusion ............
+                            |                                      |
+                            v                                      v
++------------------+    +-----------------------------------------------+
+|  KV Quantization |    |               eOptShrinkQ (2026.04)            |
+|  main line       |    |  RMT shrinkage as a "denoising pre-step"       |
+|                  |    |  before quantization                           |
++------------------+    +-----------------------------------------------+
+        |                                      ^
+        |                                      |
+        v                                      |
+[2022] Dettmers - LLM.int8()                   |
+Discovered outliers in transformer activations |
+Fix: outliers stay in FP16, rest go INT8      |
+        |                                      |
+        v                                      |
+[2024] Liu - KIVI                              |
+K quantized per-channel (2-bit)               |
+V quantized per-token  (5-bit)                |
+        |                                      |
+        v                                      |
+[2024] Hooper - KVQuant                        |
+Added per-channel pre-rotation + non-uniform  |
+data types; still treating the symptom        |
+        |                                      |
+        v                                      |
+[2025] Zandieh - TurboQuant                    |
+Abandoned symptom treatment, aimed for cure:  |
+random orthogonal rotation makes each vector  |
+isotropic + Lloyd-Max + QJL bias correction   |
+        |                                      |
+        +--------------------------------------+
+        (eOptShrinkQ follows directly after TurboQuant
+         and says: your "isotropy" assumption is wrong)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering the Outlier Ghost
+
+*** What problem it saw
+
+Everyone had assumed: mapping model weights from FP16 to INT8 is just a simple linear rescaling, right? Dettmers ran it on large models and found things were far messier. Transformer activations contain a small number of "outlier channels" — most dimensions sit within ±2, but a few dimensions spike to ±60. Feed that into uniform quantization and the quantization range gets stretched to accommodate those outliers, leaving 99% of the "normal" values crammed near zero — effectively zeroed out.
+
+*** Its solution
+
+Isolate the outliers. In practice: detect which channels are outlier channels, keep those in FP16 as-is, and quantize the rest to INT8. The underlying stance is "accept reality — some numbers are just big; don't force them into a narrow range."
+
+*** Why it worked (and what new crack it left)
+
+This work nailed down the fact that outliers are the central obstacle to LLM quantization. But the solution is "hard isolation" — you have to dynamically decide what goes FP16, complicating both storage and computation. The new crack: can we avoid isolation altogether and use a smarter quantization scheme that makes outliers stop being extreme?
+
+** 2024 | KIVI: Treating K and V Separately
+
+*** What problem it saw
+
+LLM.int8() dealt with weights and activations. But the KV cache is a special kind of activation — it accumulates with every new token, and over long sequences it dominates memory. Liu et al. took a careful look at the statistical structure of the KV cache and found an asymmetry: *K's outliers cluster in fixed channels* (certain dimensions are inherently large), while *V's outliers are distributed across the token dimension* (certain tokens are large across the board).
+
+Treating K and V with the same strategy — as LLM.int8() would — inevitably over-fits one and under-serves the other.
+
+*** Its solution
+
+Treat each according to its structure: quantize K per-channel so each channel has its own scale, and quantize V per-token so each token has its own scale. The outliers are then "locally absorbed" by their respective scales. The final configuration: 2 bits for K and 5 bits for V.
+
+*** Why it worked (and what new crack it left)
+
+It revealed that the KV cache is not homogeneous — keys and values have fundamentally different statistical structures. But the crack is clear: per-channel and per-token are both heuristic pipelines of "group → compute scale → quantize." When outliers become more extreme (say, dozens of channels all blow up), a single scale still can't hold. Can we eliminate "outlier channels" as a concept entirely?
+
+** 2024 | KVQuant: Intervening Before Quantization
+
+*** What problem it saw
+
+KIVI says "since you're big, I'll give you your own scale." Hooper's team thought one step further: what if we do something *before* quantization to make the values stop being big?
+
+*** Its solution
+
+Two moves. First, *pre-rotation* — multiply a fixed rotation matrix along the channel dimension so that the energy of outlier channels spreads across many channels, leaving no single channel particularly prominent. Second, *non-uniform data types* — since the data distribution is not uniform, the quantization codebook shouldn't be uniform either; push resolution toward high-density regions.
+
+*** Why it worked (and what new crack it left)
+
+It was already moving toward a root-cause fix — using rotation to flatten outliers. But the rotation is still a hand-picked, fixed transform. The problem: every head and every layer has different statistical structure. Can one fixed rotation hold across all cases? Furthermore, non-uniform data types increase hardware complexity. It would be better to find a unified, theoretically optimal, distribution-agnostic treatment.
+
+** 2025 | TurboQuant: One Random Rotation to Rule Them All
+
+*** What problem it saw
+
+KVQuant's rotation is data-dependent and requires an accurate distribution estimate. Zandieh's team took a more radical position: random rotation.
+
+The reasoning is mathematical: in high dimensions, a random orthogonal rotation will "almost surely" scatter any vector into an isotropic cloud — meaning each coordinate after rotation approximately follows the same Gaussian distribution. Once that holds, each coordinate can be compressed independently with a standard Lloyd-Max quantizer, and Lloyd-Max is asymptotically optimal for Gaussian inputs.
+
+*** Its solution
+
+Each incoming KV vector → multiply by a random orthogonal rotation → apply Lloyd-Max scalar quantization to each coordinate → store. At retrieval, invert the rotation. In terms of MSE this pipeline is near-optimal among known methods.
+
+But a new problem emerges: attention scores are inner products of q and k. MSE-optimal does not imply *unbiased inner products*. If quantization causes inner products to be systematically over- or under-estimated, the attention pattern drifts. TurboQuant corrects this inner-product bias with a technique called *QJL* — but that correction costs one extra bit per coordinate.
+
+At 3.5 bits per coordinate, TurboQuant matches FP16 on LongBench. That is a very hard baseline.
+
+*** Why it worked (and what new crack it left)
+
+Random rotation + Lloyd-Max is "theoretically optimal" — *provided* the input vectors are truly isotropic (i.e., have no directional preference). But is the KV cache actually like that?
+
+eOptShrinkQ's answer: no.
+
+** 2026.04 | eOptShrinkQ: Your "Isotropy" Assumption Is Wrong
+
+*** What problem it saw
+
+Su looked carefully: within a single attention head, the key vectors from n consecutive tokens form an n × d matrix S~, and *this matrix is not isotropic*. Adjacent tokens share context (the same topic, the same discourse thread), so their key vectors share strong common structure.
+
+Mathematically, S~ decomposes as *S + Z*:
+- *S* is the low-rank part — the "contextual directions" shared across all tokens
+- *Z* is the full-rank residual — the truly unique content of each token
+
+This is precisely the *spiked model* that random matrix theory has studied for decades.
+
+Now look at TurboQuant's assumption again: it assumes each key is drawn from an isotropic distribution. But in reality every key carries a bias component pointing toward the shared contextual directions. That bias is the root cause of the inner-product bias that QJL must correct — TurboQuant is treating the symptom, spending 1 bit to patch the bias, rather than eliminating its source.
+
+*** Its solution
+
+Replace symptom treatment with root-cause treatment: *before* quantization, use optimal singular-value shrinkage (eOptShrink) to peel out the low-rank shared structure S and store it separately (cheap, because the rank is small), then feed the residual Z to TurboQuant.
+
+Key points:
+1. The residual Z mathematically *truly* satisfies thin-shell and delocalization conditions — meaning it is *genuinely* isotropic. TurboQuant only achieves its theoretical optimum on this kind of clean input.
+2. No outlier handling is needed (the shared structure is gone; the residual has no outliers).
+3. No QJL inner-product bias correction is needed (the inner-product bias of the residual is theoretically ≈ 0).
+4. All the saved bits go entirely toward reconstruction quality.
+
+The eOptShrink used for peeling is not an ordinary truncated SVD — it comes from the author's own 2025 statistics paper, originally written to extract fetal ECG from a pregnant woman's abdominal signals (the mother's heartbeat is "signal S," the fetal ECG is "residual Z," and the goal is to cleanly recover Z). eOptShrink's advantage is that it automatically determines how many singular values to keep (via the BBP phase-transition threshold), requiring no manual rank tuning and no knowledge of the noise covariance structure.
+
+*** Why it worked (and what new crack it left)
+
+Numbers: eOptShrinkQ at ~2.2 bits per coordinate outperforms TurboQuant at 3.0 bits per coordinate. On multi-needle retrieval tasks, 2.2-bit eOptShrinkQ even *surpasses* FP16 (explanation: stripping the redundant shared structure acts as a beneficial regularization).
+
+Remaining cracks:
+1. Requires block processing — must accumulate 128 tokens before compressing. A FP16 buffer is needed during generation.
+2. Slight degradation on summarization tasks — because "shared structure" carries useful signal for those tasks and some of it gets peeled away.
+3. The entire pipeline rests on the assumption that "the spiked model applies to real LLMs." The paper provides empirical validation, but how well this generalizes to all architectures (e.g., non-RoPE or alternative positional encodings) is unknown.
+
+* Frontier Extensions
+
+This paper appeared in April 2026; as of May 2026 no published follow-up work builds directly on it. Likely directions include:
+
+1. *Combining with token eviction methods* (SnapKV, PyramidKV) — eOptShrinkQ compresses "bits per token," while token eviction compresses "how many tokens to keep." The two are orthogonal.
+2. *From offline BBP thresholds to online adaptation* — the current approach does a static SVD per block (n = 128). Can incremental eOptShrink be done in streaming settings (analogous to how OjaKV uses Oja's rule)?
+3. *Sharing the low-rank basis across heads / layers* — xKV has already shown that singular vectors are aligned across layers; combining that with eOptShrink's optimal shrinkage could reduce storage further.
+4. *Porting the same idea to activation and weight quantization* — SVDQuant is a fixed-rank predecessor; eOptShrink provides automatic rank selection and should be a drop-in replacement.
+
+* One Diagram to Understand It All
+
+#+begin_example
+Timeline      Core problem                   Representative solution        Crack left behind
+-------------------------------------------------------------------------------------------
+2022          Outliers blow up the           LLM.int8()                     Hard isolation
+              quantization range             (outliers stay FP16)           is cumbersome
+
+              |
+              v
+2024          KV cache: K and V have         KIVI                           per-channel scale
+              asymmetric structure           (K per-channel, V per-token)   still heuristic
+
+              |
+              v
+2024          Can we eliminate outliers      KVQuant                        Fixed rotation +
+              as a phenomenon?              (pre-rotation + non-uniform     non-uniform codebook
+                                             codebook)                      depends on dist. est.
+              |
+              v
+2025          A unified, theoretically       TurboQuant                     Inner product biased;
+              optimal treatment             (random rotation + Lloyd-Max)   QJL costs 1 bit
+                                           + QJL inner-product correction
+
+              |
+              v
+2026.04       "Isotropy" assumption is       eOptShrinkQ                    Block processing needs
+              wrong — KV blocks carry       (eOptShrink peels low-rank S   a buffer; summarization
+              spike structure               + TurboQuant quantizes          tasks slightly degrade
+                                             residual Z)
+
+
+------------- Theoretical tools imported from other fields -------------
+
+1967    Marchenko-Pastur           Bulk spectrum of random matrices
+2005    BBP phase transition       Critical threshold for signal separability
+2013    Donoho-Gavish truncation   Optimal hard threshold
+2014    Nadakuditi OptShrink       Optimal singular-value shrinkage (white noise)
+2025    Su-Wu eOptShrink           Extended to colored noise + automatic rank selection
+                                   (originally for fetal ECG extraction)
+                                   |
+                                   v
+2026.04 Transplanted into LLM KV cache compression
+#+end_example
+
+* Insights
+
+Looking at the full arc, what's really happening is not "compression ratio marching from 4-bit down to 2-bit" — it is a shift in *how we conceptualize the KV cache*:
+
+1. *From "numerical phenomenon" to "geometric structure."* Early work (LLM.int8(), KIVI, KVQuant) treated the KV cache as a pile of numbers whose problem was "the distribution has outliers." TurboQuant began treating it as a geometric object — the position of a single vector on a high-dimensional sphere. eOptShrinkQ goes one level higher: it treats the cache as a *matrix*, studying the singular-value structure of n token vectors stacked together. The higher the abstraction, the more powerful the mathematical tools available.
+
+2. *From "treating symptoms" to "curing the cause" to "reframing the problem."* Treating symptoms (isolating outliers) → curing the cause (rotating them away) → rewriting the question entirely (peeling structure first, then quantizing the clean residual). Each generation asks: "what is the root of what the previous generation was patching?"
+
+3. *Cross-domain transplantation is the biggest lever.* eOptShrinkQ's key innovation is not inventing a new algorithm — eOptShrink already existed, written in 2025 for fetal ECG. The real work was *seeing* that the mathematical structure of the KV cache and the mathematical structure of fetal cardiac signals are the same spiked model. This kind of insight — "two fields share the same mathematical skeleton" — is often worth far more than incremental optimization within a single field.
+
+The most likely next step: extending the spiked model + optimal shrinkage toolkit to *weight quantization* and *training dynamics analysis*. If the KV cache is spiked, weight gradients almost certainly are too; and if gradients are, then optimizer-state compression follows from the same tools. A single framework that turns out to apply everywhere is exactly the kind of structural advantage worth pursuing.
+
+* Takeaways
+
+1. *Find problems by looking at the patches the previous generation added.* TurboQuant uses QJL to correct inner-product bias — that looks like a minor engineering detail. But the patch itself is a clue: where does the bias come from? Is some underlying assumption wrong? eOptShrinkQ was born from interrogating exactly that one line. Whenever you see "to handle X we added Y," ask: why not eliminate the source of X directly?
+
+2. *Cross-disciplinary training is a structural advantage.* Su has an applied-mathematics background in random matrix theory and biomedical signals — both relatively niche in the LLM community. Precisely because of that, looking at the KV cache, she saw a layer that others missed. If you're working in an engineering field while simultaneously digging into some seemingly unrelated branch of mathematics or physics, don't rush to abandon it. When the intersection appears, that "seemingly unrelated" knowledge becomes your moat.
+
+3. *Theoretical guarantees are the paper's pitch; experiments are what keep readers in their seats.* The BBP phase transition guarantees automatic rank selection; the proof that inner-product bias ≈ 0; the delocalization guarantee of near-optimality — three beautiful theoretical guarantees. But what actually makes reviewers and readers nod is the table that follows: 2.2-bit eOptShrinkQ beats 3.0-bit TurboQuant. Theory draws readers in; experiments pin them to the chair. You need both; neither alone is enough.
+
+4. *Honestly labeled limitations are a signal.* The paper says at the end that "summarization tasks show a slight drop" — proactively owning that admission usually means the authors have actually thought their limitations through rather than hiding them. When reading papers, these passages deserve close attention: they are where the paper truly defines when to use the method and when not to.

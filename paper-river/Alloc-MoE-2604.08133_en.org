@@ -1,0 +1,276 @@
+#+title:      Alloc-MoE: Budget-Aware Expert Activation Allocation for Efficient Mixture-of-Experts Inference
+#+date:       [2026-05-28 Thu 17:32]
+#+filetags:   :paper:river:en:
+#+identifier: 20260528T173224-en
+#+source:     https://arxiv.org/abs/2604.08133
+#+authors:    Baihui Liu, Kaiyuan Tian, Wei Wang, Zhaoning Zhang, Linbo Qiao, Dongsheng Li (NUDT)
+#+venue:      arXiv preprint, 2026-04
+
+* The Problem River
+
+During MoE inference, every token must light up several experts to compute; the more experts activated, the more latency explodes. Can we activate fewer experts without losing accuracy?
+
+The difficulty lies in a simple fact: experts do not contribute equally. In some layers, for some tokens, removing one expert causes a collapse; in others it hardly matters at all. Yet if you apply a blanket rule (Top-K=2 everywhere), you are cutting "can't-be-skipped" positions and "easily-skipped" positions with the same blade — and you suffer on both ends: the positions that could have been skipped are not skipped enough, and the ones that cannot afford to be skipped are cut too deeply.
+
+Every generation of researchers on this river has answered the same question: *Given a fixed compute budget, how do you spend the "expert activation" coin where it counts most?* From Shazeer's "sparsely-gated" a decade ago to Alloc-MoE in 2026 writing "budget" right into the title, the question has not changed — only the granularity keeps getting finer.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: Larger models are more accurate, but dense FFN compute explodes
+  | Solution: Introduce "experts" + a gating network; each token activates only Top-K experts
+  v
+[2022] Fedus et al. - Switch Transformer
+  |
+  | Problem: Top-K (K=2) training is unstable and communication cost is high
+  | Solution: Radical simplification — K=1, each token visits only one expert
+  v
+[2024.01] Jiang et al. - Mixtral 8x7B
+  |
+  | Problem: Single expert capacity is limited; K=1 quality ceiling is too low
+  | Solution: Bring back Top-2, scale MoE to flagship LLM size, prove it matches GPT-3.5
+  v
+[2024.x] Yang et al. - XMoE (Top-P routing)
+  |
+  | Problem: Top-K is rigid — easy and hard tokens activate the same number of experts
+  | Solution: Switch to "accumulate gating scores until threshold P is reached"; each
+  |           token decides for itself how many experts to activate
+  v
+[2024.x] Lu et al. - NAEE  /  Zhong et al. - AdapMoE
+  |
+  | Problem: Top-P requires calibration at training time; NAEE/AdapMoE want post-training solutions
+  | Solution: Inspect the relative weight of the second expert (NAEE) /
+  |           offline sensitivity-threshold calibration (AdapMoE),
+  |           then conditionally skip "dispensable" activations
+  v
+[2025.x] Yang et al. (2025b)  /  Chitty-Venkata et al. - LExI
+  |
+  | Problem: All prior work acts at the token level; layer-level importance differences
+  |          have never been seriously addressed
+  | Solution: Assign different K per layer — but using heuristics or data-free proxy metrics
+  v
+[2026.04] Liu et al. - Alloc-MoE  <-- This paper
+  |
+  | Problem: Token-level and layer-level approaches each solve only half the puzzle.
+  |          Token-level redistributes within each layer; layer-level carves up the budget
+  |          across layers — but nobody has jointly optimized both under a single "budget"
+  |          framework. Moreover, layer-level allocation is mostly heuristic with no
+  |          optimality guarantees.
+  | Solution: Formalize "total activated experts" as a global budget B.
+  |           Alloc-L: end-to-end sensitivity profiling + dynamic programming to solve
+  |                    the optimal per-layer K assignment
+  |           Alloc-T: within each layer, dynamically redistribute token activation counts
+  |                    based on routing scores
+  |           Joint two-level optimization; at half budget, DeepSeek-V2-Lite suffers
+  |           almost no quality loss; inference speeds up 1.15–1.34×
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al.: One Idea Ignites MoE — "Don't Make All Parameters Work for Every Token"
+
+*** What problem it saw
+
+In 2017 the community was scaling up models, but scaling meant every token had to pass through all parameters — FLOPs rose linearly and training costs exploded.
+
+Shazeer noticed something: *this is actually very wasteful*. A sentence about the weather does not need the "brain circuit" specialized in parsing legal clauses to be activated. A large model does not mean every sample needs to run the entire brain.
+
+*** Its solution
+
+Split the heavy FFN block into N small experts, then add a "gatekeeper" — a lightweight gating network that computes N scores per token, selects only the top K experts to activate, and ignores all others for that step.
+
+The formula is just one line: =y = sum_{i in TopK} w_i * E_i(x)=. But the idea is large: *sparse activation, on-demand invocation*.
+
+*** Why it worked (and what new pitfalls it buried)
+
+Total parameter count can be ten or a hundred times larger than a dense model, yet a single forward pass touches only a small fraction. Capacity goes up; compute does not.
+
+Pitfalls buried: First, choosing K experts via the gating is non-differentiable and requires softmax + noise + various tricks to train stably. Second, K is a hyperparameter — whether to pick 2, 4, or 8 is essentially guesswork. Third, expert load is unbalanced — some experts are called constantly while others are never invoked. Much of the next decade's work fills these three holes.
+
+** 2022 | Switch Transformer: Just Use K=1 — Simplify Whatever You Can
+
+*** What problem it saw
+
+The trouble with Top-2 routing (the direction Shazeer later advocated): each token requires two expert computations, communication cost doubles — on TPU pods, cross-device All-to-All communication is the dominant cost. Training stability with K=2 is also poor.
+
+*** Its solution
+
+K=1. Each token visits exactly one expert. The gate picks only the highest-scoring one.
+
+This looks radical but is actually pragmatic: it cuts MoE's engineering complexity in half and frees room to scale the model to a trillion parameters. Switch Transformer demonstrated that K=1 can work, with a load-balancing loss to distribute traffic evenly.
+
+*** Why it worked (and what new pitfalls it buried)
+
+Simplification opened up the scale ceiling. But the cost of K=1 is limited expressiveness — a token can only borrow one expert's "perspective," and complex samples suffer visibly. The quality ceiling is depressed. That hole is left for the next generation to fill.
+
+** 2024.01 | Mixtral 8x7B: Bring K=2 Back, Push MoE onto the LLM Main Stage
+
+*** What problem it saw
+
+K=1 simplified engineering, but in the open-source LLM world it became clear that quality was insufficient. A dense 7B model still outperformed the Switch K=1 equivalent in active parameters.
+
+*** Its solution
+
+Bring back Top-2: eight 7B experts, K=2, 47B total parameters but only ~13B compute per token. Straightforward, but well-tuned. When Mixtral 8x7B was released, its quality matched GPT-3.5, turning "MoE for LLMs" from a paper idea into a product direction.
+
+*** Why it worked (and what new pitfalls it buried)
+
+K=2 gives the model two parallel "thinking channels"; quality recovers. But the pitfalls are laid out plainly on the table:
+
+- Every token activates exactly two experts — simple tokens, complex tokens, stop words, keywords, all treated identically
+- Every layer uses K=2 — shallow layers, deep layers, critical layers, redundant layers, all treated identically
+
+This "one-size-fits-all" waste is the attack surface for all subsequent efficient-MoE work.
+
+** 2024 | XMoE (Top-P Routing): Let Each Token Decide How Many Experts to Activate
+
+*** What problem it saw
+
+Top-K is a fixed count, but the "difficulty" of different tokens varies enormously. Why should "the" and a rare technical term activate the same number of experts?
+
+*** Its solution
+
+Mimic nucleus sampling from language model decoding: sort experts by gating score, accumulate, and stop once the cumulative score exceeds threshold P. A simple token might need just one expert; a hard token might need four. Overall average activation count drops; quality is preserved.
+
+*** Why it worked (and what new pitfalls it buried)
+
+Demand-driven allocation is more precise than a flat cut. Pitfalls:
+
+- Requires joint calibration of P during training — not plug-and-play
+- Prone to over-activation — in some layers where routing scores are uniformly flat, every token triggers many experts, and the extra cost can exceed the savings
+
+Subsequent Dynamic-MoE added routing-entropy regularization to mitigate this, but the Top-P family never escaped the requirement of training-time intervention.
+
+** 2024 | NAEE / AdapMoE: Post-Training Can Achieve Savings Too
+
+*** What problem it saw
+
+The XMoE family requires training-time modifications, which is unfriendly to already-released open-source models (Mixtral, DeepSeek). The community wanted "install and run" solutions.
+
+*** Its solution
+
+- *NAEE*: Targets Mixtral-style Top-2 models specifically — if the relative weight of the second expert falls below a threshold, skip it. Essentially "is the second vote weighty enough?"
+- *AdapMoE*: Runs offline sensitivity analysis on a calibration set to obtain a per-layer skip threshold; at inference time, dynamically decides whether to activate based on gating scores.
+
+Both are post-training and do not touch model weights.
+
+*** Why it worked (and what new pitfalls it buried)
+
+Cheap and plug-and-play. But the pitfalls are glaring:
+
+- NAEE only works for K=2; completely inapplicable to models like DeepSeek with K=6 or K=8
+- AdapMoE's thresholds are decided offline and statically; not robust to distribution shift at inference time
+- Neither touches "inter-layer budget allocation" — by default every layer is pruned with the same policy
+
+** 2025 | Yang et al. (2025b) / LExI: Start Allocating Across Layers, but Still Coarse
+
+*** What problem it saw
+
+Token-level squeezing had been pushed fairly far, but *cross-layer differences* had never been seriously addressed. Intuitively, some layers (especially shallow and final ones) are extremely sensitive to expert count — cut one and quality drops; middle layers are redundant and can lose half their experts with no effect. A uniform cut is obviously suboptimal.
+
+*** Its solution
+
+Assign different K per layer:
+
+- *Yang et al. (2025b)*: Use heuristic strategies (linearly increasing, decreasing, rule-based) to give each layer a different K, then pick whichever works best
+- *LExI*: A data-free post-training method that computes how many experts each layer should receive based on a proxy metric (no calibration set required)
+
+*** Why it worked (and what new pitfalls it buried)
+
+Acknowledging "layers are not equal" is a conceptual advance. But the remaining pitfalls are large:
+
+- Heuristics carry no optimality guarantee; must be re-tuned for every new model
+- Not driven by true end-to-end performance — proxy metrics are used instead
+- *Token-level and layer-level methods never meet*: once per-layer K is chosen, how should token-level redistribution happen within that layer? Nobody unified the two threads.
+
+** 2026 | Alloc-MoE: Make the "Budget" Explicit, Jointly Optimize Both Levels
+
+*** What problem it saw
+
+Looking back over the whole timeline: every generation has been saving expert activations, but nobody formalized what "saving" means. Saving a fraction? Saving a total count? How much saving is enough? All vague.
+
+Worse, layer-level and token-level methods *have never been jointly optimized under the same mathematical framework* — the former carves the pie (how much per layer), the latter redistributes within a slice (how tokens share within a layer), and the two worlds never intersect. The result is that both are suboptimal.
+
+*** Its solution
+
+Step one: formalize "total activated experts" as an *activation budget B*. For a model with L layers, the global budget B is the total number of expert activations accumulated across all layers for one token (B = Σ K_i). The optimization objective becomes clear: minimize performance loss subject to fixed B.
+
+Step two, two branches:
+
+- *Alloc-L (inter-layer)*: Proposes an allocation-isolating sensitivity profiling method — when profiling layer i, temporarily compress all downstream layers to K=1, so that downstream "compensation" cannot mask layer i's true sensitivity. This yields an L × K_orig sensitivity matrix, which is then fed into *dynamic programming* to solve exactly for the optimal K_i assignment under the budget constraint B. This is a true global optimum, no longer a heuristic.
+
+- *Alloc-T (intra-layer)*: Given the per-layer budget K_i, the T tokens in a batch share T × K_i activation slots, but each token need not receive exactly K_i. Tokens whose routing scores concentrate on a few experts get fewer activations; those with flat score distributions get more — because "uncertainty about whom to ask" means activating more experts is actually protective. This internal redistribution improves quality without increasing total latency.
+
+*** Why it worked (and what new pitfalls it buried)
+
+Once "budget" is made explicit, everything becomes a constrained optimization problem that can be solved to optimality. The two-level joint optimization operates at different time scales: inter-layer is a one-time offline DP producing a static assignment, while intra-layer is online per-batch dynamic adjustment.
+
+Remaining pitfalls (and the starting point for the next paper):
+
+- The sensitivity matrix is profiled using perplexity; relevance to downstream tasks still needs validation
+- The global budget B is fixed in advance; no provision for request-level dynamic adjustment (e.g., small budget for a simple prompt, large budget for a complex one)
+- The token-level redistribution relies on routing scores, but routing scores themselves may be distorted by budget-constrained training — whether a self-referential bias exists is left unexamined
+
+* Frontier Extensions
+
+Alloc-MoE is an April 2026 paper. As of this note's writing (2026-05-28), no public follow-up work has directly critiqued or improved it. Predictable next steps:
+
+- *Request-level budget*: Upgrade the budget from a model constant to a per-request dynamic variable; let the model itself decide how many experts a simple prompt deserves
+- *Training–inference co-design*: All current expert-saving methods are post-training; the next wave may embed "budget awareness" into the router at pretraining time, so the model learns from the start to perform well under varying budgets
+- *Joint optimization of budget with quantization / KV-cache*: Inference budget is not only about expert activation — it also spans KV cache size, quantization precision, and attention head pruning, forming a high-dimensional joint optimization space
+
+* One Figure to Understand It All
+
+#+begin_example
+
+  Time ---->  2017          2022           2024.01        2024           2024-2025       2026
+              Shazeer       Switch-T       Mixtral        XMoE           NAEE/AdapMoE    Alloc-MoE
+                                                          Dynamic-MoE    LExI            (this paper)
+
+  Solution dimension
+  ----------------------------------------------------------------------------------------------
+  Routing     Top-K(fixed)  Top-1          Top-2(scaled)  Top-P(adapt)   conditional     budget-DP+
+  granularity                                                             skip            adaptive
+
+  Intervention train         train          train          train          post-train      post-train
+  timing
+
+  Allocation  None          load           load           token          token           layer+token
+  dimension   (uniform)     balance        balance        (Top-P)        (per-token      (joint
+                                                                         skip)           optimization)
+
+  Optimality  ad hoc        K=1 fixed      K=2 fixed      heuristic      heuristic       DP optimal
+                                                          (P threshold)  (threshold)     (provably)
+
+  ----------------------------------------------------------------------------------------------
+  Running theme: "Given a fixed budget, where does spending the expert-activation coin pay off most?"
+  ----------------------------------------------------------------------------------------------
+  Granularity evolution:  model-wide uniform cut -> layer-uniform cut -> token-adaptive -> joint layer+token optimum
+  Intervention evolution: training-time design -> training-time regularization -> post-training threshold -> post-training optimization
+  Optimality evolution:   guessed constant -> heuristic strategy -> calibrated threshold -> dynamic programming for exact optimum
+
+#+end_example
+
+* Insights
+
+Reading through this timeline, several things stand out.
+
+*First, over a decade "saving" transformed from a verb into a noun.* Early on, Shazeer used it as a verb — "activate fewer"; later it became an adjective — "adaptive activation"; by Alloc-MoE it became a noun — "budget." Once it becomes a noun, it becomes something that can be allocated, optimized, and constrained. This shift from process to object is the hallmark of an engineering problem reaching maturity.
+
+*Second, granularity always moves finer.* First, saving at the model level (choose a smaller K); then at the layer level (different K per layer); then at the token level (different K per token within the same layer); now both levels at once. The next step is almost certainly *request level* and *phase level* (different budgets for prefill vs. decode). The direction of granularity refinement is monotone, because each additional cut squeezes out a little more performance.
+
+*Third, the discourse on optimality has quietly returned over ten years.* Early MoE papers asked "work or not?"; mid-period papers asked "scale or not?"; now papers ask "optimal or not?" Alloc-MoE's use of dynamic programming is essentially a declaration: *everything you used before was a heuristic — can we please solve for the actual optimum?* This is a signal that the engineering community is beginning to borrow from operations research — LLM inference optimization is increasingly resembling classical resource scheduling.
+
+*Fourth, the target of critique has shifted from "another specific paper" to "another class of methods."* Alloc-MoE's criticism is no longer aimed at particular prior work but at the abstract categories of "token-level methods" and "layer-level methods." This signals that the field has moved from "individual breakthroughs" to "school consolidation" — and the next stage is likely a grand unified framework that packs all dimensions (layer, token, request, cache, quantization) into a single optimization problem.
+
+* Takeaways
+
+For those searching for problems:
+
+- *Look at a problem that has been repeatedly improved and ask yourself: "Has it been formalized?"* If people are still using heuristics, thresholds, and rules — that is usually where a paper waiting to be solved with optimization theory is hiding. Alloc-MoE's core innovation is not a new algorithm; it is writing a clean mathematical definition (activation budget) for an old problem.
+- *Look at two technical threads developing in parallel and ask: "Can they be jointly optimized under a single objective function?"* Token-level and layer-level methods ran in parallel for years with nobody unifying them; Alloc-MoE unified them and a result came out. Similar opportunities are everywhere: pruning + quantization, KV-cache + attention, prefill + decode.
+- *Granularity refinement is the monotone direction of engineering optimization.* When you see a coarse-grained allocation strategy, ask: can it be cut one level finer? Down to token, to head, to step, to request. Every such cut is the location of a paper.
+
+The takeaway: you can apply this "identify the heuristic → formalize it → jointly optimize → solve to exact optimality" decomposition to scan any sub-field of LLM inference optimization today. There is almost certainly a corner still using thresholds — and that is where the next Alloc-X sits.

@@ -1,0 +1,337 @@
+#+title:      DualDiffusion: A Speculative Decoding Strategy for Masked Diffusion Models
+#+date:       [2026-05-28 Thu 17:10]
+#+filetags:   :paper:river:diffusion:llm:inference:speculative:en:
+#+identifier: 20260528T171020-en
+#+source:     https://arxiv.org/abs/2604.05250
+#+authors:    Satyam Goyal, Kushal Patel, Tanush Mittal, Arjun Laxman
+#+venue:      arXiv preprint, 2026-04-06
+
+* The Problem River
+
+Getting a language model to think up an entire sentence at once — rather than spitting out one token at a time like GPT — sounds like it should be faster. But the reality is exactly the opposite: bidirectional "think-together" models are actually much slower at inference than unidirectional "one-token-at-a-time" models. The culprit is a detail that looks harmless: bidirectional attention cannot use a KV cache.
+
+This research thread is a fight against that paradox. Every step forward requires choosing among three things that are constantly pulling against each other:
+
+- *Bidirectional context* — every token can see all other tokens, giving the model the ability to iteratively refine, which is what drives quality
+- *KV cache* — previously computed key/value tensors are stored and reused, dropping complexity from O(N^2) to O(N) and making speed viable
+- *Parallel decoding* — generating multiple tokens per step, cutting the number of diffusion steps T, bringing overall latency to an acceptable level
+
+The first two are inherently incompatible (bidirectional = representations change with context = cannot cache), and the third pulls against the first (parallel = conditional independence assumption among tokens = weakened refinement). Every generation of solutions makes a compromise on one side of this triangle. DualDiffusion is an attempt on this thread to sidestep the compromise itself — picking up the knife of speculative decoding from another field and driving it into this triangle.
+
+* Source Map
+
+#+begin_example
+[2020] Ho et al. - DDPM (continuous diffusion)
+  |
+  | Problem: GAN training is like walking a tightrope — collapse is common.
+  |           VAE is stable but blurry.
+  | Solution: Reframe generation as "start from pure noise, iteratively
+  |           denoise." Each step learns one small thing.
+  | Residual: All the math is continuous Gaussian — pixels, amplitudes,
+  |           latent vectors. Discrete tokens don't fit.
+  v
+[2021] Austin et al. - D3PM (discrete diffusion)
+  |
+  | Problem: Gaussian noise applied to token ids is meaningless.
+  | Solution: Redefine "adding noise" as "corruption via a transition
+  |           matrix." Introduce [MASK] as an absorbing state.
+  | Residual: Only validated on small corpora/models; unclear whether
+  |           it can scale to LLM size.
+  v
+[2024] Sahoo et al. / Nie et al. - LLaDA, MDLM (Masked Diffusion LM)
+  |
+  | Problem: D3PM's complex transition matrices are unstable at scale.
+  | Solution: Retreat to the simplest absorbing state — only [MASK].
+  |           Becomes "randomly mask some tokens; have the model fill them in."
+  | Residual: Every inference step requires O(N^2) full attention recomputation;
+  |           much slower than AR.
+  v
+[2025] Wu et al. - Fast-dLLM            [2025] Ma et al. - dKV-Cache
+  |                                       |
+  | Problem: Bidirectional attention       | Problem: Fast-dLLM's block
+  |          cannot use KV cache          |          boundaries cut off
+  | Solution: Chunk the sequence;         |          cross-block iterative
+  |           reuse KV within a block,    |          refinement
+  |           refresh after the block     | Solution: Don't cache at the
+  |           is done                     |          decoding step; cache
+  | Residual: Representations frozen      |          *the next step* after
+  |           within the block —          |          the token is decoded
+  |           iterative refinement lost   | Residual: Long-range "drift"
+  |           inside each block           |          patched with periodic
+  |                                       |          refresh and local window
+  +-----------------+---------------------+
+                    |
+                    | Shared residual: both trade approximation for speed,
+                    |   pushing the Pareto front to the "slightly worse" side
+                    v
+              ----------------------------
+              A second tributary (flowing in from the AR side)
+              ----------------------------
+[2023] Leviathan, Chen et al. - Speculative Decoding (for AR)
+  |
+  | Problem: Large AR models are slow; every token requires a full
+  |          network pass.
+  | Solution: A small model drafts k tokens; the large model verifies
+  |           all k at once. Rejection sampling preserves the large
+  |           model's distribution.
+  | Key property: AR's conditional independence makes single-pass
+  |               verification possible.
+  v
+[2026] Goyal et al. - DualDiffusion (this paper)
+  |
+  | Problem: Existing MDM speedups sacrifice quality;
+  |          AR speculative decoding cannot be ported directly
+  |          (tokens in MDM are not conditionally independent).
+  | Solution: Use Fast-dLLM / dKV-Cache as the *drafter*,
+  |           use vanilla LLaDA as the *verifier* —
+  |           let "fast-but-coarse" approximations handle multi-step
+  |           progress while "slow-but-accurate" full attention
+  |           periodically corrects errors.
+#+end_example
+
+* Evolutionary Narrative
+
+The thread below runs from "what is diffusion" all the way to "why DualDiffusion has to look the way it does." Each step asks only one thing: what hole did the previous paper leave, and how did the next paper step into it?
+
+** 2020 | DDPM: Turning Generation into "Iterative Erasure"
+
+*** What problem did it see?
+
+GAN training is like walking a tightrope — one wrong hyperparameter and it collapses, mode collapse is routine. VAEs are stable but blurry. Neither path was clean.
+
+*** Its solution
+
+Change the frame entirely: generating an image is not "conjuring something from nothing" but rather "starting from pure noise and erasing it clean, step by step." Each step learns only one small thing — given an image with a bit of noise, predict what that noise looks like. A thousand small learning problems stacked together are far easier to learn than one huge one.
+
+*** Why it worked (and what new hole it dug)
+
+Spreading difficulty evenly across steps keeps gradient signals clean at each stage. But all the math is continuous Gaussian: image pixels, audio amplitudes, latent vectors — things you can add noise to and smooth out.
+
+The hole left behind: *text is discrete*. "Cat" plus a little noise does not become 0.7 cat plus 0.3 dog; it is either cat or not cat. The entire continuous-diffusion mathematics of DDPM cannot be transplanted onto tokens.
+
+** 2021 | D3PM: A Discrete Version of Diffusion
+
+*** What problem did it see?
+
+DDPM is beautiful, but it only works with pixels. Language models must model token ids — discrete symbols drawn from a finite vocabulary. "Adding Gaussian noise" to id 49328 is meaningless.
+
+*** Its solution
+
+Redefine "adding noise" as "corruption via a transition matrix." A token at each step jumps to another token with some probability, or to a special state. Austin et al. proposed several transition matrix designs: uniform (jump to any token), absorbing (collapse to [MASK]), and Gaussian-like discretized (jump according to token embedding distance). The *absorbing state* is the simplest — every token eventually becomes [MASK], and the reverse process is "starting from all-[MASK], fill the words back in one step at a time."
+
+*** Why it worked (and what new hole it dug)
+
+The mathematical structure is clean: the forward process is a Markov chain, the reverse is trained with an ELBO, isomorphic to DDPM.
+
+The hole left behind: D3PM was only validated on small corpora such as text8 and LM1B, with small models. Nobody knew whether this could support billion-parameter LLMs. Worse, the optimization difficulty introduced by complex transition matrices kept early attempts half-dead — until someone realized that the simplest variant (absorbing / pure mask) was paradoxically the easiest to scale.
+
+** 2024 | LLaDA & MDLM: Scaling Masked Diffusion to LLM Size
+
+*** What problem did it see?
+
+D3PM was too complex. Fancy transition matrices, each requiring its own loss derivation and hyperparameter tuning, consistently underperformed AR baselines. This line of work was close to being abandoned.
+
+*** Its solution
+
+Return to the most primitive variant in D3PM — the absorbing state, using only [MASK] as "noise." The forward process degenerates to "randomly mask some tokens with probability t," and the reverse process degenerates to "given a sentence with blanks, fill them in." This sounds exactly like BERT, but with one crucial difference: *the masking rate t is a continuous variable*, ranging from 0 to 1, and the model must learn to fill from "almost entirely masked" all the way to "almost not masked at all."
+
+Sahoo et al. (MDLM) showed that the ELBO for this simplified version has a very clean form, aligning with the loss functions from all prior masked LM work. Nie et al. (LLaDA) scaled it to 8B parameters and demonstrated it could compete with LLaMA at the same size — especially on tasks requiring "global planning," such as mathematics and reasoning, where it was actually stronger.
+
+*** Why it worked (and what new hole it dug)
+
+Bidirectional attention plus iterative refinement: at every step the model sees the complete sentence and adjusts its predictions for unmasked positions based on what has already been filled in. This is something AR's unidirectional generation cannot do.
+
+The hole left behind is the battle this research thread fights for the next three years: *inference is too slow*. Generating one sequence requires T denoising steps (typically T=64 to 256), and each step performs full self-attention over a sequence of length N. AR models use a KV cache to bring each step from O(N^2) to O(N); MDM cannot do this at all — because under bidirectional attention, every token's key/value changes as context changes, so a cached value cannot be reused. The total complexity O(T·N^2) is an entire factor of N higher than cached AR's O(T·N), making it especially devastating for long sequences.
+
+** 2025 | Fast-dLLM: Cache Within Chunks, Accept the Approximation
+
+*** What problem did it see?
+
+LLaDA runs too slowly — for a sequence of length 1024, 64 denoising steps take several times as long as AR. The root cause is that KV representations keep changing.
+
+*** Its solution
+
+If you cannot cache the entire sequence, *chunk it* — split the sequence into blocks of length 32 or 64. Within a block, across several denoising steps, pretend the KV values of all other blocks are fixed and reuse their cached representations. Once the block is decoded, refresh the global KV once and proceed to the next block.
+
+A second trick: originally MDM decodes the k tokens with the highest confidence per step (fixed k). Fast-dLLM switches to a *confidence threshold* — any token exceeding the threshold is decoded immediately. More tokens can be decoded in parallel per step, naturally reducing T.
+
+*** Why it worked (and what new hole it dug)
+
+At best, 27.6× speedup (in the DualCache variant where both prefix and suffix blocks are cached). Quality drops only modestly on most benchmarks.
+
+The hole left behind is direct: *block boundaries sever iterative refinement*. A token within its block is decoded exactly once; there is no way to go back and revise it across blocks, because the previous block's KV is already frozen. Larger blocks yield better cache efficiency but lose more refinement ability; smaller blocks barely benefit from caching. This is an irresolvable deadlock — you can only pick a point in the middle.
+
+** 2025 | dKV-Cache: Cache at the Right Moment
+
+*** What problem did it see?
+
+Fast-dLLM's block-cutting approach is too coarse. MDM token representations are not "changing wildly at every single step" — Ma et al. observed a key phenomenon: *a token stabilizes only after it has been decoded*. A position that is still [MASK] has key/value tensors that change dramatically at every step; but a position that has already been filled in has key/value tensors that barely move over the next several steps.
+
+*** Its solution
+
+Do not cache at block boundaries; instead cache at the *token dimension* — and with a *one-step delay*. When a token transitions from [MASK] to a specific token at step t, do not cache it yet (its representation has not stabilized at that step); wait until step t+1, then store its K/V for reuse.
+
+Two variants: dKV-Cache-Decode (long cache plus periodic refresh to handle drift), and dKV-Cache-Greedy (cache only a local window around the current decoding position, more aggressive).
+
+*** Why it worked (and what new hole it dug)
+
+2–10× speedup with smaller quality loss. Importantly, it points to a key insight: the "MDM cannot cache" claim was overstated — in practice, most tokens are stable most of the time.
+
+The hole left behind: long-range "representation drift" still accumulates — a token filled in early on may have its "ideal" K/V shift significantly dozens of steps later as many new tokens are filled in around it, but the cache still holds the old values. Ma et al. patch this with periodic refresh and local windowing, but the core trade remains: accept "slightly stale" values in exchange for "many steps of savings."
+
+** 2023 | Speculative Decoding: The Source of Another River
+
+(This section follows a separate tributary — speculative decoding originally had nothing to do with diffusion models, but DualDiffusion imports it.)
+
+*** What problem did it see?
+
+A GPT-4-scale AR model with hundreds of billions of parameters must pass through the entire network for every single token generated. The latency and cost are unbearable. At the same time — a 7B small model predicts most simple tokens ("the," "of," punctuation, common words) just as accurately as the big model.
+
+*** Its solution
+
+Let a small model (drafter) greedily guess k tokens in a row, then have the large model (verifier) *verify all k tokens in a single pass* — because AR is causal, verifying k positions requires only one forward pass (each position's attention only looks leftward). Verification uses rejection sampling: the drafter provides probability q, the verifier computes probability p, and the token is accepted with probability min(1, p/q). Rejected positions are resampled from a corrected distribution; the rest are discarded.
+
+The result: each "one large-model forward pass" produces on average 1+ε tokens, not exactly 1. Most critically — *the verifier's output distribution is identical to running the verifier alone*. Not a single bit of quality is lost.
+
+*** Why it worked (and what new hole it dug)
+
+The entire magic depends on two properties:
+1. *Conditional independence* — given the prefix, the probability of each position's token is independent of the others, so verification can be parallelized
+2. *Single-step verification suffices* — AR produces each position's final distribution in one shot; there is no concept of "iterative refinement"
+
+The hole left behind — the hole most critical for the next paper: *neither of these properties holds in MDM*. MDM is bidirectional, tokens are strongly coupled through attention and are not conditionally independent; MDM is iterative, the distribution produced at one step is only an "intermediate state," still T-1 steps away from the final distribution. So the full theoretical apparatus of AR speculative decoding cannot be transplanted directly.
+
+** 2026 | DualDiffusion: Using Speculative Decoding to Skirt the Compromise
+
+*** What problem did it see?
+
+The two lines of work on MDM acceleration were both narrowing:
+
+- The *cache-approximation* route of Fast-dLLM and dKV-Cache had reached its ceiling. Each new method nudged the quality-speed Pareto front by a small amount, but none could claim both simultaneously. The root cause is not that "caching is not yet clever enough" but the paradigm itself — "trade approximation for speed." The moment you freeze some representations, you necessarily sacrifice some refinement.
+- *Speculative decoding* had already validated a different path on the AR side: pairing a fast and a slow model can achieve speedup *without sacrificing quality*. But the mathematical guarantee in AR depends on conditional independence, which MDM does not have.
+
+The authors' bet: import the *framework* of speculative decoding but abandon the "strictly preserve the distribution" mathematical guarantee from AR, replacing it with a *probabilistic remasking* verification strategy suited to MDM.
+
+*** Its solution
+
+If you think of Fast-dLLM as "a fast but occasionally erroneous approximator" — that is precisely the definition of a drafter in speculative decoding. The natural solution surfaces:
+
+#+begin_example
+Loop:
+  1. drafter (Fast-dLLM or dKV-Cache) runs k denoising steps,
+     quickly producing a batch of candidate tokens
+  2. verifier (LLaDA full attention) runs 1 step,
+     producing the "true" distribution over all drafter-decoded tokens
+  3. compare verifier's distribution with drafter's predictions;
+     decide which tokens to trust and which to remask
+  4. remasked tokens are left for subsequent steps to decide
+#+end_example
+
+The key is how step 3 makes its "decision." The authors provide three *verification algorithms*:
+
+- *Trust Verifier* — trust the verifier. If the verifier and drafter disagree on the top-1 prediction for a position, replace it with the verifier's choice.
+- *KL Divergence-Based Remasking* — compare the KL divergence between the drafter and verifier distributions at each position. Large divergence means the drafter was badly wrong here; remask the token back to [MASK] for the next round. Small divergence means accept. Can be threshold-based, or probabilistic (higher divergence → higher probability of being remasked).
+- *Confidence-Based Remasking* — look only at the verifier's top-1 confidence at each position. Below threshold → remask to [MASK].
+
+Note: unlike AR speculative decoding's "accept/reject the entire suffix," here the operation is *per-position probabilistic remasking* — rejected positions are not discarded but returned to [MASK] for the next round to fill in. This fits naturally with MDM's iterative structure.
+
+*** Why it worked (and what new hole it dug)
+
+It dominates both LLaDA (pure verifier, not fast) and Fast-dLLM (pure drafter, not accurate) on the quality-vs-steps Pareto front. Consistent improvements are seen on both MMLU and GSM8K. The intuition: the drafter is right about "easy" tokens with high probability; the verifier only intervenes on "hard" tokens — spending expensive full-attention steps on precise judgment of a few difficult tokens is more cost-effective than running every step expensively.
+
+New holes left behind (and the next questions for this thread):
+
+- *How to set the drafter/verifier ratio* — k=2 or k=8? What threshold? These hyperparameters are task-dependent; the authors provide only empirical values.
+- *No distributional preservation guarantee like AR's* — all three verification algorithms are heuristic; there is no proof that the output distribution equals the pure verifier's output. Practical quality is good, but mathematically this is "close to" not "equivalent to."
+- *Drafter and verifier share the same model* — these are not truly two separate models; the drafter is the same LLaDA with Fast-dLLM/dKV-Cache approximations applied. This means there is no way to use a much smaller model as the drafter to further cut costs, as in AR speculative decoding.
+
+* Frontier Extensions
+
+DualDiffusion has only been on arXiv for a month (2026-04); no work directly critiquing it has appeared yet. But several adjacent directions are already growing:
+
+- *Esoteric Language Models* (Yang et al. 2025) — takes the path of "since bidirectional caching doesn't work, partially retreat to causality." The model architecture mixes causal and bidirectional blocks; causal blocks directly enjoy KV caching, while bidirectional blocks handle refinement. This is essentially stepping back from "fully bidirectional MDM" to buy deterministic speed.
+- *Hybrid AR-MDM training* — some work attempts to let the same model support both AR and MDM decoding modes, switching at deployment time based on latency budget. If this pans out, the speculative decoding drafter can run in AR mode (fastest) while the verifier runs in MDM mode (most accurate) — more aggressive than DualDiffusion's current "same model, different approximations."
+- *DualDiffusion's own stated next step* — in the Discussion section, the authors note that a theoretically sound "distribution-preserving" version of speculative decoding for MDM (with mathematically guaranteed rejection sampling rules) is an open problem. Finding a set of rules that strictly preserves the verifier's marginal distribution would be the true MDM-world counterpart of AR speculative decoding.
+
+In honesty: there are no papers beyond the sixth layer that "critique DualDiffusion" — it is too new. The directions forward from this point are informed inferences, not confirmed citation relationships.
+
+* One Diagram
+
+#+begin_example
+                                          Quality
+                                            ^
+                                            |
+   Pure LLaDA  *  <-- most accurate,        |   * DualDiffusion
+                   slowest (O(T*N^2))       |    (drafter + verifier)
+                                            |
+   dKV-Cache   *  <-- near-original         |
+                   quality, 2-10x speedup   |
+                                            |
+   Fast-dLLM   *  <-- 27x speedup,          |
+                   but quality drops        |
+                                            |
+                                            +-------------------> Speed
+                                                    (1/T)
+
+
+   Timeline        |    Quality-Speed Tradeoff       |    Key Insight
+   --------------- + -------------------------------- + -----------------------
+   2020 DDPM       |   Continuous; doesn't fit text  |  Generation = iterative
+                   |                                 |  denoising
+   2021 D3PM       |   Discrete but hard to train    |  Absorbing state is
+                   |                                 |  simplest
+   2024 LLaDA      |   Quality arrives; O(T*N^2)     |  Minimal mask can scale
+   2025 FastdLLM   |   Block cache; freezes block    |  Cache failure is real
+                   |   representations               |
+   2025 dKV-C      |   Delayed cache; local window   |  Stable after decoding,
+                   |                                 |  not during
+   2023 SpecDec    |   (AR world) draft + verify     |  Fast+slow pairing can
+                   |                                 |  preserve quality
+   2026 DualDif    |   Import speculative decoding   |  Per-position probabilistic
+                   |   into MDM                      |  remasking sidesteps
+                   |                                 |  "approximate-for-speed"
+
+   The true problem running through this thread:
+
+       Bidirectional attention ←┐
+                                │  Triangle: pick any two, lose the third
+       KV caching            ←┤
+                                │
+       Parallel decoding     ←┘
+
+       Every generation moves along one edge of the triangle.
+       DualDiffusion is the first to stop looking for a point inside
+       the triangle and instead introduce a fourth dimension from
+       outside (speculative decoding).
+#+end_example
+
+* Insights
+
+Reading through this thread, one pattern recurs: *what was thought to be a physical limit repeatedly turns out to be a wrong choice of abstraction layer*.
+
+- "Diffusion can only handle continuous values" → D3PM shows it can be discrete
+- "Complex transition matrices are needed" → MDLM shows the simplest absorbing state suffices
+- "Bidirectional attention cannot cache" → dKV-Cache shows you can cache with a delay
+- "Speculative decoding requires AR's conditional independence" → DualDiffusion shows you can abandon the strict guarantee and replace it with probabilistic rules suited to MDM
+
+Every time things get stuck, it is not because "we have hit a theoretical ceiling" but because "some assumption from the previous generation was silently promoted to a hard constraint." Shift that assumption, and a new dimension opens up.
+
+At a deeper level: the evolution of the MDM thread is *not fundamentally about diffusion models* — it is about *how to manage time inside a bidirectional language model*. AR models equate "time" with token position, monotonically left to right, so KV caching is natural. MDM equates "time" with denoising step number, decoding positions in arbitrary order within the sequence, so representations change at every step. Every acceleration method on this thread is essentially asking: *which tokens, at which steps, can we pretend are not changing?* Fast-dLLM says "not changing within a block," dKV-Cache says "not changing after decoding," and DualDiffusion says "can be treated as not changing from the drafter's perspective, with the verifier stepping in occasionally to correct."
+
+The most likely next direction: *learn a dynamic router* that decides, for each token at each step, whether to trust the drafter or invoke the verifier. All three verification algorithms are currently hand-crafted heuristics (KL threshold, confidence threshold); it is obvious that a small neural network will eventually replace them — just as MoE routers ultimately replaced fixed gating.
+
+* Takeaways
+
+At least three takeaways for how to do research:
+
+1. *Keep your eye on the assumption that has been silently treated as a hard constraint* — "MDM cannot cache" was accepted as fact for three years, until dKV-Cache thought to ask "under what conditions can it not cache?" Every time you hear "X is impossible" in a field, ask "under what conditions is X impossible?" — the conditions are usually narrower than imagined.
+
+2. *The transfer cost of cross-domain tools is routinely overestimated* — speculative decoding looked deeply coupled to AR mathematics (rejection sampling requires token conditional independence). DualDiffusion shows you can keep the *framework* of "pair a fast model with a slow model," discard the mathematical guarantee, replace it with rules suited to the new domain, and still get practical wins. Frameworks are portable; proofs are not — these two things need to be kept separate.
+
+3. *The Pareto front is a real signal* — all three acceleration methods (Fast-dLLM, dKV-Cache, DualDiffusion) cannot prove they are optimal, but all show a Pareto plot. When everyone is nudging points along the front rather than pushing the front outward, it usually means it is time to change paradigms. A stagnating frontier = a signal of paradigm saturation.
+
+Practical implications:
+
+- If you are working on MDM inference optimization, *stop tuning cache strategies* and move toward the drafter/verifier direction — the space left to you is designing better verification rules and dynamic scheduling.
+- If you are working on "bidirectional + want caching" problems in other domains (message passing in graph neural networks, bidirectional Transformer retrievers), the *framework* of DualDiffusion is directly borrowable — find a coarser, faster version as the drafter, use the original as the verifier, and add a probabilistic fallback mechanism.
+- If you are deciding whether a research thread is worth going all-in on, *count the points on the Pareto front* — few and steep means early-stage; dense and flat means saturation. The MDM acceleration thread has already shifted from steep to flat, but DualDiffusion has pointed to a new dimension that may steepen again for a while.
