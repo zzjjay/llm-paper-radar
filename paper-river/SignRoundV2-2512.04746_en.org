@@ -1,0 +1,249 @@
+#+title:      SignRoundV2: Toward Closing the Performance Gap in Extremely Low-Bit Post-Training Quantization for LLMs
+#+date:       [2026-05-29 Fri 12:57]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T125754-en
+#+source:     https://arxiv.org/abs/2512.04746
+#+authors:    Wenhua Cheng, Weiwei Zhang, Heng Guo, Haihao Shen, Zaner Ma
+#+venue:      arXiv 2025 (v1: 2025-12-04, v2: 2026-05-18)
+
+* The Problem River
+
+A large model easily runs to tens or hundreds of gigabytes. Can you "squash" it onto a consumer GPU — or even a phone — and lose almost nothing in performance?
+
+The difficulty lives in a detail that sounds almost boring: every weight is originally a 16-bit float (FP16), and now you must pack it into a 4-bit, 3-bit, or even 2-bit integer slot. Each weight has only a handful of discrete choices. Which one do you pick?
+
+The most naïve answer is "round to nearest" — whichever integer is closest. That seems self-evident. But once you do this to tens of billions of weights, the model starts hallucinating. Generation after generation of researchers has charged at the same question: *should this particular weight round up or round down?*
+
+* A Map of Origins
+
+#+begin_example
+[2020] Nagel et al. - AdaRound
+  |
+  | Problem seen: Is round-to-nearest optimal? On what grounds?
+  | Solution: Let each weight learn its own tiny "up or down" switch
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem seen: AdaRound is too slow and OOMs on LLMs
+  | Solution: Use Hessian information; quantize column by column
+  |           and compensate the rounding error into remaining columns
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem seen: GPTQ treats all weights equally, but 1% of weights
+  |               carry 99% of the performance
+  | Solution: Identify "salient weights"; multiply their channels by a
+  |           protective scale factor before quantization
+  v
+[2024] Cheng et al. - SignRound / AutoRound (v1)
+  |
+  | Problem seen: AdaRound is slow to tune; AWQ only adjusts scale,
+  |               not rounding. Why haven't these two lines merged?
+  | Solution: Jointly learn rounding perturbations + clipping scale
+  |           using sign-SGD in a few hundred steps
+  v
+[2025] Cheng et al. - SignRoundV2  <--- this paper
+  |
+  | Problem seen: v1 still collapses at 2-bit extreme low precision;
+  |               all layers are treated equally, yet layer sensitivity
+  |               can differ by orders of magnitude
+  | Solution: Score each layer by |gradient × quantization deviation|
+  |           (DeltaLoss); use dynamic programming to allocate bit-width
+  |           within a budget; add loss filtering + scale pre-search
+  v
+[2025-2026] Concurrent / follow-up: SFMP, MicroMix, MxMoE, AMQ
+              — pushing mixed precision to MoE, activations,
+                and kernel co-design
+#+end_example
+
+* The Evolutionary Narrative
+
+Why not just describe what SignRoundV2 does? Because every design choice it makes is a direct response to a specific wound left by its predecessors. Tracing all the way back to AdaRound in 2020, you discover that *"should this weight round up or down?"* is a question researchers have wrestled with for five years.
+
+** 2020 | AdaRound: The First Challenge to Round-to-Nearest
+
+*** What Problem It Saw
+
+Before 2020, the unwritten rule of PTQ (post-training quantization) was round-to-nearest — each weight goes to whichever integer is closest.
+
+The Nagel team ran a simple experiment: fix one layer of ResNet18, then enumerate all combinations of "round up vs. round down" for every weight in that layer and find which combination minimizes the overall downstream loss. The result was striking: *the optimal combination is not round-to-nearest*. A weight with value 0.4 is sometimes better rounded up to 1 than down to 0 — as long as doing so keeps the next layer's input distribution closer to the original.
+
+In other words, looking at the rounding error of a single weight in isolation is meaningless. What matters is how all the weights together shape the output of the next layer relative to the unquantized original.
+
+*** Its Solution
+
+Attach a learnable scalar v ∈ (0, 1) to every weight. The final quantized value is not round(w) but floor(w) + sigmoid(v) (with an annealing regularizer that drives sigmoid toward binary). Optimize all these v's using a per-layer reconstruction loss on mini-batches.
+
+*** Why It Works (and What New Pit It Digs)
+
+The intuition: round-to-nearest considers each weight in isolation, but weights can compensate for one another — one that rounds high can be offset by another that rounds low. AdaRound explicitly learns that compensation.
+
+The pit: this mechanism was designed for vision models. Once LLMs arrive — hundreds of millions to hundreds of billions of parameters — running backprop through every layer to learn its v's becomes prohibitively slow and memory-hungry.
+
+** 2022 | GPTQ: Bringing AdaRound's Spirit to LLMs
+
+*** What Problem It Saw
+
+The idea of "learning a switch per weight" is right, but it falls apart at GPT-3 scale — you cannot backpropagate through a 175B model to learn every weight's v.
+
+*** Its Solution
+
+GPTQ swapped in a different mathematical tool: the second-order approximation of OBQ (Optimal Brain Quantization). It quantizes weights column by column. *After quantizing each column, it takes the rounding error that column introduced and, guided by the Hessian, redistributes an optimal compensation onto all remaining unquantized columns.*
+
+An analogy: you are allocating a budget, and the first line item must be rounded to a whole number. What do you do with the rounding shortfall? You immediately adjust every subsequent line item's target so the grand total stays balanced. GPTQ does exactly this; the Hessian tells it which direction to adjust.
+
+*** Why It Works (and What New Pit It Digs)
+
+It bypasses backprop — only the weights and a Hessian computed from a small calibration set are needed. A 175B model can be quantized to 4-bit in a few hours.
+
+The pit: it treats every weight equally. But there is a counter-intuitive fact inside LLMs: roughly 1% of weight channels are critically important to the final output; the other 99% can be mangled freely. GPTQ works at 4-bit but begins to collapse at 3-bit and 2-bit, because it spreads precious precision uniformly over unimportant weights.
+
+** 2023 | AWQ: 1% of Weights Carry 99% of Performance
+
+*** What Problem It Saw
+
+The Lin team ran a controlled experiment: keep the top 1% most "salient" weight channels in FP16 and quantize the rest to 3-bit — accuracy barely drops. Swap the retained 1% for a random 1% — accuracy plummets. The conclusion is hard: *salient weights objectively exist, and they are determined by the magnitude of activations flowing through them, not by the weight values themselves.*
+
+GPTQ is blind to this. Its Hessian terms only reflect local curvature of the loss with respect to weights; they do not distinguish "this channel carries large activations" from "this channel's activations are nearly zero."
+
+*** Its Solution
+
+AWQ does something elegantly minimal: before quantization, multiply each salient channel's weights by a scale s (and divide the corresponding activations by s). This gives salient weights finer quantization grid resolution, while the math remains equivalent on the activation side.
+
+No learning, no backprop — s is chosen by a grid search with a simple criterion.
+
+*** Why It Works (and What New Pit It Digs)
+
+It is essentially non-uniform allocation of precision — reserving more quantization grid points for the weights that matter most.
+
+The pit: it only adjusts scale, not rounding itself. AdaRound's line ("each weight learns its own switch") and AWQ's line ("scale by importance") run in parallel — *nobody has merged them*. Also, at 2-bit, even with scale adjustment, accuracy collapse remains severe.
+
+** 2024 | SignRound / AutoRound (v1): Merging the Two Lines
+
+*** What Problem It Saw
+
+By 2024 the PTQ community had split into two camps:
+- The "learn rounding" camp (AdaRound lineage): high accuracy but slow, and they only learn rounding — not clipping.
+- The "adjust scale" camp (AWQ, SmoothQuant): fast but does not learn rounding.
+
+The Cheng team's observation: rounding and clipping (scale / zero-point) are actually two components of the same optimization problem. Tighten clipping and the rounding choices shift; relax it and they shift back. *Optimizing them separately is inherently suboptimal.*
+
+There was also a practical frustration: AdaRound uses Adam with annealing schedules — a painful hyperparameter sea. Could there be an optimizer simple enough to need almost no tuning?
+
+*** Its Solution
+
+Define three learnable parameters: v (rounding perturbation, initialized to 0) and α, β (scale and zero-point correction factors, initialized to 1.0). Optimize all three jointly with *Signed Gradient Descent* — look only at the sign of the gradient, ignore its magnitude, and take a fixed-size step.
+
+Why sign-SGD? Because the objective landscape is extremely non-smooth for these parameters (the rounding part is inherently step-wise). Standard SGD requires careful step-size tuning; sign-SGD is stable by design. The whole process finishes within 200 steps, without backpropagating through the full LLM — only a local per-layer reconstruction is needed.
+
+*** Why It Works (and What New Pit It Digs)
+
+It tunes "rounding direction" and "clip boundary" together — move one and the other adapts automatically. The cost is nearly zero (comparable to GPTQ, an order of magnitude faster than AdaRound, two to three orders faster than QAT).
+
+The pit: it works beautifully at 4-bit but still collapses at 2-bit. And it treats every layer identically — yet different layers of an LLM differ in "quantization tolerance" by orders of magnitude; the first and last layers are typically the most fragile. Applying a uniform bit-width is like making every player on a team wear the same shoe size: someone always suffers.
+
+** 2025 | SignRoundV2: Fitting Every Layer with the Right Shoe Size, and Fixing Two Stability Bugs
+
+*** What Problem It Saw
+
+v1's collapse at 2-bit has three root causes:
+
+1. *All layers share the same bit-width.* On knowledge-intensive tasks like MMLU, quantizing layer 0 and the final few layers to 2-bit is simply destructive. Yet you cannot raise everything to 3-bit globally — that improves the average but eliminates the deployment benefit.
+2. *The initialization is too naïve.* α = β = 1.0 means "scale equals max / range," which is clearly a poor starting point for long-tailed weight distributions. The first several sign-SGD steps march in the wrong direction.
+3. *Calibration data contains noise.* An occasional extreme sample in a batch causes the loss to spike, and sign-SGD dutifully follows the resulting corrupted gradient sign. At extremely low bit-widths, once you drift it is very hard to recover.
+
+Mixed precision itself is not a new idea — HAWQ (2019) already used Hessian to score layers. But HAWQ's assumption that "gradients are approximately zero near the optimum" simply does not hold in quantization scenarios: quantization causes a significant loss increase, and gradients are far from small. AutoQ / HAQ / AMQ use reinforcement learning to search — intolerably slow. MixLLM applies a hard threshold — too coarse.
+
+*** Its Solution
+
+A three-part toolkit:
+
+1. *DeltaLoss scoring + DP bit-width allocation.* Each layer's quantization sensitivity is scored as |g · Δw| — g is the gradient of the loss with respect to that layer's weights, and Δw is the actual deviation introduced by simulated quantization. This combines Hessian-free sensitivity with quantization-aware evaluation: the gradient says "how much does loss change per unit perturbation," and Δw says "how large is the perturbation that a given bit-width actually induces." Given an average bit-width budget, dynamic programming finds the globally optimal assignment of bit-widths across all layers — which layers get 4-bit, which get 2-bit.
+2. *Pre-tuning scale search.* Borrowing the importance-matrix idea from llama.cpp, before quantization begins, the calibration data is used to sweep candidate scale values and select the one that minimizes reconstruction error as the initial value of α. This takes only seconds but places the starting point of the 200-step sign-SGD in the right region.
+3. *Loss filtering.* Within each batch, the top 0.1% of samples by loss value are dropped before computing gradients, blocking extreme samples from corrupting the sign direction.
+
+*** Why It Works (and What New Pits It Leaves)
+
+The three components target the three wounds precisely, and each is cheap: DeltaLoss requires only one forward + one backward pass; DP runs in time proportional to the number of layers; scale search is a grid-level operation. The result: under MXFP mixed precision at an average of 4.5-bit, the gap relative to BF16 is compressed to ~1%; at 2-bit weight-only quantization it substantially outperforms GPTQ, AWQ, and v1.
+
+Remaining new pits:
+- Mixed bit-widths are hardware-unfriendly. GPU GEMM kernels prefer tensors with a single uniform dtype. Running a mixture of 4-bit and 2-bit layers requires specialized kernels. SignRoundV2 does not solve this — it assumes you are using a block-wise micro-scaling format like MXFP4 / NVFP4, or that you are willing to write custom deployment kernels.
+- DeltaLoss only examines weight gradients, not activation distributions. For weight-activation joint quantization (W-A low-bit), the sensitivity on the activation side still needs to be estimated separately.
+- Validation is only on dense LLMs. In MoE models, the tolerance of individual experts varies even more widely; the DP state space expands accordingly.
+
+* Frontier Extensions
+
+SignRoundV2 is a December 2025 paper, so direct follow-up work has not yet accumulated in large volume. But several concurrent lines are moving in adjacent directions and are worth reading together:
+
+- *SFMP (2026)*: Uses Hessian plus second-order terms to score mixed-precision assignments more precisely, but requires specialized kernels to run efficiently. A useful contrast to SignRoundV2's "lightness" — SFMP bets on hardware co-design; SignRoundV2 bets on "squeeze the most out of the universal MXFP format."
+- *MicroMix (2025)*: Pushes mixed precision *inside* a single block — different bit-widths within a 64-element block — requiring dedicated micro-scaling kernels.
+- *MxMoE (2025)*: Addresses mixed precision specifically for MoE models, assigning different bit-widths to different experts with routing-aware training. This is the scenario SignRoundV2 does not cover.
+- *AMQ (2025)*: Uses RL to search for bit-width assignments, making it a conceptual competitor to DeltaLoss-DP. AMQ is more accurate but much slower; SignRoundV2 is fast and only slightly behind.
+
+The trajectory is clear: since the second half of 2025 the PTQ community's consensus has shifted from "find one universal low-bit method" to "accept that different layers / blocks / experts need different bit-widths, and figure out how to allocate them cheaply and generally."
+
+* A Single Diagram
+
+#+begin_example
+              Five Years in Quantization: "Should This Weight Round Up or Down?"
+
+Year   Paper           What It Moved         What It Left Fixed   What It Left Broken
+----   -----------     ---------------       -----------------    -------------------
+2020   AdaRound        Learned rounding      Scale fixed          Can't run on LLMs
+                       (per-weight v)        Same precision        at scale
+                                             for all layers
+
+2022   GPTQ            Hessian compensation  No learned rounding  Ignores importance
+                       (column-wise)         Scale fixed
+
+2023   AWQ             Scale salient         No learned rounding  2-bit still collapses
+                       channels              No fine-grained
+                       (top 1% weights)      scale learning
+
+2024   SignRound v1    Joint rounding +      All layers same      2-bit still collapses
+                       clipping              bit-width            Naive initialization
+                       (sign-SGD)            All batches equal
+
+2025   SignRoundV2     + Per-layer           Hardware kernels     MoE not covered
+       <-- this paper  bit-width             W-A joint not        W-A joint imprecise
+                       (DeltaLoss + DP)      fully precise
+                       + Scale pre-search
+                       + Loss filtering
+
+----   -----------     ---------------       -----------------    -------------------
+
+      Direction of conceptual shift ----->
+
+      "Learn how each weight should round"
+      --> "Learn how each channel should scale"
+      --> "Learn rounding + clipping jointly"
+      --> "Learn how many bits each layer deserves"
+
+      Shared theme: introduce progressively finer-grained "non-uniform allocation"
+                    into quantization, while holding firm to PTQ's red lines:
+                    fast, no training data required.
+#+end_example
+
+* Insights
+
+Reading through this lineage, what is actually evolving is not "algorithms getting smarter" — it is *"allocation granularity getting finer"*:
+
+- AdaRound: fine allocation within each weight (up or down)
+- AWQ: fine allocation per channel (more resolution for important channels)
+- SignRound v1: fine-grained rounding per weight and clipping per layer, jointly
+- SignRoundV2: fine allocation per layer (even bit-widths can differ)
+
+The next granularity level is obviously: per block / per expert / per token path / or even dynamic at runtime. MicroMix and MxMoE are already walking that road.
+
+There is also a quieter thread running through all of this: *the boundary between PTQ and QAT is being eroded*. Methods like EfficientQAT / AQLM / QuIP# achieve high accuracy by retraining. The PTQ camp's reply is "we can nearly match you with smarter non-uniform allocation plus a tiny number of optimization steps, and we need no training data at all." SignRoundV2 demonstrates this path still has room to grow — at 2-bit it approaches QAT quality at a fraction (tens of times less) of the cost.
+
+But in the longer run, hardware is the ceiling. The maturity of block-level micro-scaling formats like MXFP4 / NVFP4 and variable-bit-width kernels will determine which line wins. SignRoundV2 bets on "universal MXFP format + algorithmic intelligence"; SFMP / MicroMix bet on "custom hardware co-design." Both paths can win, but commercially the former wins first — because it does not require waiting for the next chip generation.
+
+* Takeaways
+
+On the posture of finding research problems, this lineage offers two very direct lessons:
+
+1. *"Treating everything uniformly" is almost always wrong.* Before AdaRound, rounding every weight to nearest was wrong. After GPTQ, treating every channel equally was wrong. After v1, giving every layer the same bit-width was wrong. Every time someone excavated "which of these are actually more important" and modeled it explicitly, a strong paper followed. The next "assumed uniform but actually not" to excavate: sensitivity per token at inference time? Per head? Per time step (decode vs. prefill)?
+2. *Combining existing wheels beats inventing new ones.* The three components of SignRoundV2 — DeltaLoss, DP allocation, loss filtering — are individually not new. DeltaLoss is a classic Hessian-free trick; DP is textbook; loss filtering is just outlier removal. But fitted precisely onto the specific wounds v1 left open, they combine into SOTA. Research output is often not in "inventing the new" but in "making an accurate diagnosis of the pits the predecessors left behind."
+
+Practical landing point: if you are working on LLM deployment or compression, *you can start now* — Intel has open-sourced the implementation in the =intel/auto-round= repository. If you are doing research, follow the "finer allocation granularity" direction and look for the next dimension where everything is treated uniformly yet the underlying differences are actually enormous (token / head / expert / time step), then make that variation explicit in your model.

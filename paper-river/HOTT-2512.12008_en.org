@@ -1,0 +1,281 @@
+#+title:      Hold Onto That Thought: Assessing KV Cache Compression On Reasoning
+#+date:       [2026-05-29 Fri 13:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T130929-en
+#+source:     https://arxiv.org/abs/2512.12008
+#+authors:    Minghui Liu, Aadi Palnitkar, Tahseen Rabbani, Hyunwoo Jae, Kyle Rui Sang, Dixi Yao, Shayan Shabihi, Fuheng Zhao, Tian Li, Ce Zhang, Furong Huang, Kunpeng Zhang
+#+venue:      arXiv preprint, 2025-12 (cs.CL)
+
+* The Problem Stream
+
+When a large model "thinks" while writing its answer, its memory balloons until it blows the GPU—can you let it think while *discarding* some of that memory, without letting it forget the question?
+
+The difficulty runs three layers deep:
+
+The first layer: *memory growth is linear*. Every time the Transformer generates a new token, that token must attend to *all previous* tokens, so it must store the key and value for every prior token—that is the KV cache. An 8B model on a 32K context can easily consume 8 GB of GPU memory, heavier than the model weights themselves.
+
+The second layer: *you cannot know in advance which tokens matter*. What you want to drop are the "useless" tokens, but attention is dynamic—a token ignored this step may suddenly become the focal point next step. Pick wrong, and the model starts hallucinating.
+
+The third layer (where this paper truly cuts in): *reasoning models changed the rules of the game entirely*. Previous compression methods all assumed "long input, short output"—you feed the model a long document and it returns a one-sentence summary. So everyone optimized how to compress the prompt (the prefill phase). But reasoning models like o1 and DeepSeek-R1 invert this—*the prompt is short, but the model itself writes tens of thousands of tokens of chain-of-thought*. Here the cache inflates gradually during the decoding phase, and no one had designed compression specifically for this scenario.
+
+Generation after generation of researchers has been spinning around a single question: *how do you define "this token is still useful"?*
+
+* The Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: computing attention requires seeing all tokens; must recompute every step
+  | Solution: cache the key/value of past tokens (KV cache)
+  | Buried hole: cache grows linearly with context length, GPU memory explodes
+  v
+[2023-09] Xiao et al. - StreamingLLM
+  |
+  | Problem: long sequences overwhelm the cache; a naive sliding window crashes the model
+  | Solution: discovered "attention sinks" — keep the first few tokens + a recent window
+  | Buried hole: only looks at position, not content; middle tokens are discarded wholesale
+  v
+[2023-10] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |
+  | Problem: the middle also has important tokens; position alone is not enough
+  | Solution: use cumulative attention scores to find "heavy hitters" and retain them dynamically
+  | Buried hole: tracking global attention every step is expensive; still step-by-step
+  v
+[2024-04] Li et al. - SnapKV
+  |
+  | Problem: H2O re-selects every step at repeated cost; compression can be decided once
+  | Solution: use an "observation window" at the end of the prompt to vote on important prefix positions; lock them in and never revisit
+  | Buried hole: only compresses the prompt (prefill); completely ignores tokens generated during decoding
+  v
+[2025-06] Cai et al. - R-KV
+  |
+  | Problem: the reasoning model's chain-of-thought lives entirely in decoding; SnapKV's approach is a dead end there
+  | Solution: designed for reasoning; jointly compresses using attention + cosine similarity between key vectors
+  | Buried hole: highest compute overhead of any method; actually loses to simpler heavy-hitter approaches on many tasks
+  v
+[2025-12] Liu et al. - HOTT (this paper)
+  |
+  | Problem: no one has systematically compared reasoning-phase compression methods; good ideas like SnapKV were never implemented for decoding
+  | Solution: large-scale benchmark + SnapKV adapted for decoding (SnapKV-D)
+  | Finding: heavy-hitter methods (H2O, SnapKV-D) win; over-aggressive compression makes the model think even longer
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2017 | Transformer: Speed Came With a Memory Time Bomb
+
+*** What Problem It Saw
+
+Before the Transformer, the dominant language models were RNNs—processing one token at a time, where step t had to wait for step t-1 to finish. This could not be parallelized, and training was painfully slow. Vaswani et al. wanted an architecture that could fully unroll on GPUs in parallel.
+
+*** Its Solution
+
+Replace RNNs with attention: every token directly attends to *all* other tokens, with weights determined by similarity. During training all tokens are fed together and all attention is computed at once.
+
+*** Why It Worked (and What New Hole It Buried)
+
+Parallelism arrived, and ever-larger models became tractable. But there was a ticking bomb hidden in *inference*: generating the t-th token requires the keys and values of the previous t-1 tokens; recomputing from scratch every step costs O(t²). So the community invented the *KV cache*—store each token's computed key/value and simply read it later.
+
+The price: cache size grows linearly with context length. 8K tokens is manageable; 128K eats GPU memory whole. This buried hole sat untouched for seven years, until the researchers below started digging.
+
+** 2023-09 | StreamingLLM: Discovering the "Attention Sink"
+
+*** What Problem It Saw
+
+The most natural idea is: if the cache is too large, just keep the most recent N tokens—a sliding window. Xiao et al. tried it and found that the moment the window slid past the initial tokens, the model *collapsed outright*—perplexity shot from single digits into the thousands and output became gibberish.
+
+Why? They made a strange discovery: at every layer and every attention head, *the attention weights on the first few tokens are abnormally high*, even when those tokens are semantically empty words like "the."
+
+*** Its Solution
+
+They called this phenomenon the *attention sink*—softmax must distribute weight somewhere, and the strategy the model learns is "when in doubt, dump it onto the first few tokens." The fix is elegantly simple: always retain the first 4 tokens (the sink), plus a sliding recent window.
+
+#+begin_example
+[sink][sink][sink][sink] ......discarded...... [recent recent recent recent]
+       always kept                                    sliding window
+#+end_example
+
+*** Why It Worked (and What New Hole It Buried)
+
+It revealed a counter-intuitive truth: *token importance is strongly correlated with position*—but only at the very beginning and the very end. The large middle segment is cut wholesale. If the key information happens to sit in the middle ("Alice put the book in the kitchen"—the premise is mid-sequence, the question asks "where is the book?"), StreamingLLM is completely blind.
+
+The next paper focused on this gap: *can we select which tokens to keep based on content rather than position?*
+
+** 2023-10 | H2O: Letting "Heavy Hitters" Emerge on Their Own
+
+*** What Problem It Saw
+
+StreamingLLM looks only at position, not at whether a token is actually useful. Zhang et al. ran statistics: in real tasks, attention matrices are indeed sparse—but *the sparse positions are not fixed*. A small number of tokens are repeatedly attended to across many queries; they called these tokens *heavy hitters*.
+
+As long as these heavy hitters can be dynamically identified and retained, performance does not collapse.
+
+*** Its Solution
+
+At each generation step, maintain a cumulative attention score for every token (the running sum of how much it has been attended to). When the cache is full, evict the token with the lowest score, keeping the heavy hitters and the most recent tokens.
+
+#+begin_example
+StreamingLLM:  [fixed sink][......dropped......][sliding recent window]
+H2O:           [heavy heavy ... heavy scattered throughout][sliding recent window]
+                 dynamically selected by attention scores
+#+end_example
+
+*** Why It Worked (and What New Hole It Buried)
+
+H2O was the first to make cache compression follow *content* rather than positional heuristics. But the cost was significant: *every new token requires updating the cumulative scores of all historical tokens* and performing another top-k sort—O(N·B·d) overhead injected directly into the hot path.
+
+A deeper problem: all of H2O's decisions are made *one step at a time during decoding*. If your scenario is "very long prompt, short output" (the most common use case at the time—long-document QA), tens of thousands of tokens flood in during prefill, and H2O cannot help there: it selects step-by-step, while that entire block of KV entries has already been written to memory.
+
+The next paper focused on this gap: *can the prefix be compressed once and for all before decoding even starts?*
+
+** 2024-04 | SnapKV: Let the Last Few Tokens Vote for the Rest
+
+*** What Problem It Saw
+
+H2O assumes you compress while you generate. But the most expensive scenario in 2024 was long-context QA—you feed the model an entire book, ask one question, and the output might be only a couple hundred words. Here, *99% of cache usage is the prompt itself*; the KV entries added during decoding are negligible.
+
+Li et al. made a key observation: think of the prompt as a "prefix + question." The attention in the question portion (the last few dozen tokens) already tells you *which positions in the prefix it cares about most*. Given that, why re-select at every generation step? Just let the question vote on the prefix once, decide everything up front, and be done.
+
+*** Its Solution
+
+Cut an "observation window" from the end of the prompt (e.g., the last 32 tokens). Sum the attention that every query in this window pays to the prefix, pick the highest-scoring prefix positions, discard the rest. Compression is done; decoding runs on the compressed cache without any further selection.
+
+#+begin_example
+prompt: [........long prefix........][problem question? <-obs window]
+                  |                              |
+                  |  <----observation window attention votes on prefix
+                  v
+compressed: [sparsely retained prefix positions] + [full obs window]
+        then decoding begins; no further selection is performed
+#+end_example
+
+*** Why It Worked (and What New Hole It Buried)
+
+SnapKV moved the "selection" step off the hot path—compress once, run indefinitely. On long-context QA it immediately became the new state of the art.
+
+But it carried an implicit assumption: *the generation phase will not be very long*. If the model outputs only 200 words, the additional cache from decoding is too small to matter.
+
+That assumption shattered in the second half of 2024. OpenAI o1 arrived. DeepSeek-R1 arrived. Reasoning models routinely generate tens of thousands of tokens. SnapKV's "compress the prefix and call it done" logic fails outright: *it was never designed to compress the decoding phase*. A 32K chain-of-thought blows up the GPU regardless.
+
+The next paper focused on this gap: *how do you compress the chain-of-thought of a reasoning model?*
+
+** 2025-06 | R-KV: The First Compression Designed for "Thinking"
+
+*** What Problem It Saw
+
+The output structure of reasoning models differs from ordinary generation—the model talks to itself, self-corrects, backtracks ("Wait, let me reconsider..."), and leaves behind large volumes of repetitive or near-duplicate intermediate steps. Cai et al. argued that these redundant tokens dominate cache usage but cannot be distinguished by attention scores alone (repeated content attends to itself and therefore receives non-trivial scores).
+
+*Attention alone is not enough; you also need to check whether tokens resemble each other.*
+
+*** Its Solution
+
+R-KV combines two signals:
+1. *Cumulative attention* (inherited from the H2O approach)
+2. *Cosine similarity between key vectors*—if two keys are highly similar, the corresponding tokens are semantically redundant; keep one and drop the other
+
+Every w steps, a joint score is computed and low-scoring tokens are evicted. This is the first compression method explicitly motivated by "optimizing for reasoning traces."
+
+*** Why It Worked (and What New Hole It Buried)
+
+Theoretically sound. In practice, two problems emerge:
+
+First, *its compute overhead is the highest in this entire lineage*—O(N/w · B²·d) for pairwise cosine similarity, where B is the cache size. The compression step itself consumes the time it was meant to save.
+
+Second, more embarrassingly, HOTT's benchmarks show that *R-KV actually loses to simpler heavy-hitter methods (H2O and SnapKV-D) on reasoning tasks*. Its more elaborate heuristics do not translate into better performance.
+
+The next paper focused on this gap: *among all these methods, which ones actually work? No one has compared them systematically.*
+
+** 2025-12 | HOTT: The First Systematic Picture of Reasoning-Phase Compression
+
+*** What Problem It Saw
+
+By late 2025, this research line had accumulated more than a dozen competing methods, but every benchmark used a *long prompt + short output* setup (LongBench, RULER, etc.). In the *short prompt + very long output* regime that defines reasoning models, nobody had rigorously compared what actually works.
+
+Two specific gaps:
+- *SnapKV's good ideas were locked in the prefill*—nobody had extended them to the decoding phase.
+- *Nobody had quantified the compression-vs-reasoning-quality tradeoff*—when you compress too aggressively, exactly how does the model degrade?
+
+*** Its Solution
+
+Two moves:
+
+First, an *engineering contribution*: transplant SnapKV's observation-window mechanism into the decoding phase—every N steps, treat the most recent N tokens as the observation window and let them vote on what came before. This is called *SnapKV-D* (D for decoding). In essence it applies SnapKV's "decide once, pay over many steps" philosophy to amortize the per-step overhead of H2O.
+
+Second, a *systematic benchmark*: run StreamingLLM, H2O, SnapKV-D, KNorm, PyramidKV, and R-KV across 10 reasoning benchmarks (GSM8K, MATH500, ReClor, FOLIO, and others), covering both a standard model (Llama-3.1-8B) and a reasoning model (DeepSeek-R1-distill).
+
+*** Why It Worked (and What New Holes It Buried)
+
+Three core findings, each counter-intuitive:
+
+1. *Simple heavy-hitter methods win.* For reasoning models, H2O and SnapKV-D outperform everything else across the board, including R-KV which was purpose-built for reasoning. Elaborate heuristics do not help; the attention signal alone is already strong enough.
+
+2. *Compression makes the model think longer.* This is a hidden cost—the smaller the cache, the longer the model's generated trace, and sometimes it never stops (KNorm frequently produces "looping incoherence"). You believe you are saving memory; in reality total inference time may actually increase.
+
+3. *There is no universal optimum.* For non-reasoning models, the best method varies by dataset; StreamingLLM performs surprisingly well on GSM8K but poorly elsewhere.
+
+Holes left for the next generation: HOTT is a benchmark, not a solution. The fundamental tension—"how do you compress without lengthening the trace?"—remains unresolved. That is where the next round of papers begins.
+
+* Frontier Extensions
+
+As of May 2026, HOTT is the *most recent systematic evaluation* on this research line. The two open problems it identifies—"compression-induced trace inflation" and "optimal compression strategy for the decoding phase"—will very likely catalyze two families of follow-up work:
+
+1. *Reasoning-aware compression*: incorporate output length as an optimization target in the compression decision, rather than looking only at downstream task accuracy.
+2. *Dynamic budget*: adjust cache size dynamically based on the current generation phase (early exploration vs. late convergence), instead of holding a fixed budget throughout.
+
+If you encounter a KV compression paper from 2026, search the introduction for "decoding-phase" or "reasoning trace length"—it will almost certainly cite HOTT as the source of its problem formulation.
+
+* One Diagram
+
+#+begin_example
+                         Which tokens should the KV cache keep?
+                                        |
+            +---------------------------+---------------------------+
+            |                           |                           |
+        By position                 By content                 By structure
+            |                           |                           |
+   [2023] StreamingLLM          [2023] H2O                   [2025] R-KV
+   sink + sliding window        cumulative attention          attention + key similarity
+   "the beginning always        "heavy hitters emerge         "duplicate tokens
+    matters"                     dynamically"                  should be deduped"
+            |                           |                           |
+            |                           v                           |
+            |                  [2024] SnapKV                       |
+            |                  observation window (prefill only)    |
+            |                  "the end tells you what             |
+            |                   the front should keep"             |
+            |                           |                           |
+            +---------------------------+---------------------------+
+                                        |
+                                        v
+                               Scene shift: reasoning models
+                               (short prompt + long decoding)
+                                        |
+                                        v
+                             [2025-12] HOTT (this paper)
+                             1) SnapKV-D: move the obs window to decoding
+                             2) Benchmark: heavy-hitter class wins
+                             3) Warning: over-compress -> think even longer
+
+  Timeline: 2017 ----------> 2023 -----> 2024 -----> 2025 -----> 2025.12
+            KV cache born   position  content   decide once  reasoning  systematic
+                                                 upfront              eval + new baseline
+#+end_example
+
+* Insights
+
+Reading through this line, three things deeper than any specific method come into motion:
+
+*1. From positional heuristics to content heuristics, and then to "evaluation as contribution."* Early on, StreamingLLM intuited "the beginning matters." Then H2O said "let the data tell you what matters." Then SnapKV said "compression can be decided once and for all." By the time HOTT arrives, *no new method is proposed—only a careful comparison is run*—and that itself is the contribution. This indicates that the subfield had reached the stage where "too many methods, no idea which ones work." At that inflection point, an honest comparative evaluation is worth more than yet another new technique. This is the inevitable turning point for any rapidly expanding research direction.
+
+*2. Reasoning models shattered every "long prompt" assumption.* Every compression paper from 2023–2024 silently assumed "long prompt, short output." The o1/R1 series directly overturned that assumption. A shift in benchmark assumptions can reshuffle an entire generation of methods—SnapKV did not get worse; it was moved to a different playing field. The lesson: whenever you run an evaluation, first ask yourself: *which year's workload does my benchmark actually reflect?*
+
+*3. Compression can "save memory while costing time."* HOTT's most counter-intuitive finding is that smaller caches lead to longer generated traces. This is a hidden negative feedback loop—you believe you are optimizing resource usage, but you may actually be worsening total cost. Any research that "optimizes a single dimension" should be wary: *is the part you are compressing simply transferring its cost to another dimension you are not watching?*
+
+* Implications
+
+This research line carries three layers of implication for how to do research:
+
+*First, watch closely for the moment an assumption collapses.* StreamingLLM, H2O, and SnapKV are all solid contributions, but the moment o1 was released, their hidden premises all became invalid. This means you can *actively hunt for scenarios where premises have broken down*—find a gap where "everyone assumes X, but X has actually changed," and write your paper into it. That is exactly how HOTT was found.
+
+*Second, benchmarking is a form of research.* Proposing a new method is not the only way to contribute. When a subfield is flooded with methods but no one can say which ones are better, *running a rigorous evaluation is itself state-of-the-art work.* HOTT proposes no new theory, but it is the first paper to map the entire landscape clearly—the value of "clearing the battlefield" is consistently underestimated.
+
+*Third, always look at one extra dimension.* HOTT discovered "compression-induced trace inflation" because it *simultaneously tracked both memory and output length.* Had it looked only at accuracy, this tradeoff would have remained invisible forever. The actionable takeaway: next time you run an optimization study, *force yourself to record one seemingly unrelated metric*—there is a good chance your method is quietly bleeding resources on that dimension.

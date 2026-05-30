@@ -374,3 +374,5 @@
 - [05-27](digests/2026-05-27.md) — 394 scanned, 5 passed, top: Pruning and Distilling Mixture-of-Experts into Den
 
 - [05-28](digests/2026-05-28.md) — 98 scanned, 0 passed, top: (no papers passed)
+
+- [05-29](digests/2026-05-29.md) — 98 scanned, 1 passed, top: CONF-KV: Confidence-Aware KV Cache Eviction with M

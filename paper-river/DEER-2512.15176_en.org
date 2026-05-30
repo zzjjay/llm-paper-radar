@@ -1,0 +1,315 @@
+#+title:      DEER: Draft with Diffusion, Verify with Autoregressive Models
+#+date:       [2026-05-29 Fri 13:16]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T131647-en
+#+source:     https://arxiv.org/abs/2512.15176
+#+authors:    Zicong Cheng, Guo-Wei Yang, Jia Li, Zhijie Deng, Meng-Hao Guo, Shi-Min Hu
+#+venue:      arXiv 2512.15176 (2025-12)
+
+* The River of the Problem
+
+Why is large-model inference so slow? Because it must emit tokens one by one — this is called autoregression. The next token depends on the previous one; there is no way to parallelize.
+
+People devised a clever workaround: let a *small model* first guess the next few tokens (a "draft"), then let the *large model* verify all of them in a single pass. If the guesses are right, you win; if they are wrong, you discard and retry. This is called *speculative decoding*.
+
+But after three years of work, the approach has hit a wall: *the longer the draft, the more likely it gets rejected*. The small model guesses token 1, then uses its own guess to predict token 2, then token 3 … An early small mistake gets amplified by every subsequent prediction, drifting further and further until the large model rejects the whole segment.
+
+The central question of this entire research thread is: *how do you keep a "draft" from tripping over itself?*
+
+What makes this hard: the drafting mechanism and the large model it serves are *pulling in opposite directions*. You want the draft to be fast and long, which means letting the small model run freely — but the moment it runs freely, it starts accumulating its own errors and diverging from the large model. Generation after generation of researchers has circled inside this contradiction.
+
+DEER is the latest reversal on this thread: *stop making the small model emit tokens one by one — have it emit an entire segment all at once.*
+
+* Source Map
+
+#+begin_example
+[2023] Leviathan / Chen et al. - Speculative Decoding (SPS)
+  |
+  | Problem: large model decodes one token at a time, too slow
+  | Solution: small model drafts + large model verifies in one pass
+  v
+[2024-01] Medusa
+  |
+  | Problem: the small model is itself AR, so drafting is still slow
+  | Solution: attach several "parallel prediction heads" on top of the large
+  |           model, predicting multiple future positions simultaneously
+  v
+[2024-01] EAGLE-1
+  |
+  | Problem: Medusa's heads are independent of each other — head N has no
+  |           idea what head 1 predicted, violating autoregressive structure;
+  |           next-next prediction accuracy only ~60%
+  | Solution: perform autoregression at the "feature level" —
+  |           second-to-last hidden layer + the token sampled in the previous step
+  v
+[2024-06] EAGLE-2
+  |
+  | Problem: EAGLE's draft tree is static; confidence varies wildly across
+  |           positions but every position is treated the same way
+  | Solution: dynamic draft tree — expand by confidence, prune low-probability branches
+  v
+[2025-03] EAGLE-3
+  |
+  | Problem: adding more training data barely helps EAGLE-2 — bottlenecked by
+  |           the "feature prediction loss"; top-layer features encode only
+  |           next-token information, which is insufficient for next-next prediction
+  | Solution: remove feature regression loss + fuse multi-layer features +
+  |           simulate self-consumption during training (TTT)
+  v
+[2025-12] DEER (this paper)
+  |
+  | Problem: even with EAGLE-3's TTT mitigation, the causal chain of
+  |           "consuming one's own output" is still there — longer drafts mean
+  |           larger KL divergence; error accumulation is inevitable
+  | Solution: replace the drafter with a diffusion language model (dLLM);
+  |           denoise an entire draft segment in one shot so that each position's
+  |           prediction does not depend on previous draft tokens,
+  |           severing accumulation at the root
+  v
+[Concurrent / frontier]
+  - Fast-dLLM, dInfer: add KV cache and high-throughput engines to dLLMs
+  - DiffuSpec, SDD: also use diffusion drafting, but in continuous space
+    or with multi-step denoising — room for further work remains
+  - TiDAR: trains diffusion and AR into a single model; DEER criticizes
+    this for conflicting training objectives
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | SPS: Let the Small Model Draft, Let the Large Model Verify
+
+*** What problem did it see?
+
+The deadlock of large-model inference: generating every single token requires a full forward pass through hundreds of billions of parameters. A 100-token response means 100 forward passes. GPU compute is not actually saturated; the bottleneck is *latency* — you must wait for the previous step to finish before you can start the next.
+
+*** Its solution
+
+Let a *small* model (1/10 or even 1/100 of the parameters) first guess the next 5 tokens, then feed all 5 to the large model in *a single forward pass* — the large model only needs to answer "do I accept these 5?"
+
+This is a no-lose trade: that one large-model forward pass had spare compute anyway; the small model guesses quickly, and every correct guess saves 5 decoding steps.
+
+*** Why it works (and where new problems are buried)
+
+Mathematically provable to be *lossless*: the distribution the large model ultimately generates is exactly the same as one-by-one decoding.
+
+But the small model is itself AR — it guesses token by token. So the *drafting phase* is itself slow. And accuracy drops sharply as draft length grows, because the small model and large model are simply different things.
+
+This leaves two problems for later: can the drafting phase be parallelized? And how do you align the small model with the large one?
+
+** 2024 | Medusa: Attach Parallel Prediction Heads to the Large Model
+
+*** What problem did it see?
+
+SPS uses an independent small model for drafting, which creates two issues: the small model's own drafting is slow, and the small model's weights are separate from the large model's, so alignment is poor.
+
+*** Its solution
+
+Drop the independent small model. Instead, attach K new prediction heads ("Medusa heads") in parallel after the large model's final layer. Head 1 predicts the next token, head 2 predicts next-next, head K predicts next-K.
+
+All K heads produce output *simultaneously*. The drafting phase collapses from K steps to 1.
+
+*** Why it works (and where new problems are buried)
+
+Drafting is parallelized — genuinely faster. But two new problems remain:
+
+1. The K heads are *mutually independent* — head 5 has no idea what head 1 predicted. This violates the inherently autoregressive nature of language, so top-1 accuracy is only about 60%.
+2. *Not lossless*: under non-greedy sampling, Medusa's output distribution does not exactly match the original model's.
+
+** 2024 | EAGLE-1: Autoregression at the Feature Level
+
+*** What problem did it see?
+
+Medusa's parallel heads abandon the causal "previous step influences the next" dependency, and accuracy has a hard ceiling. Yet going back to SPS's independent small model means poor alignment with the large model.
+
+Is there a third path: preserve autoregressive causality without a separate model?
+
+*** Its solution
+
+EAGLE noticed a key fact: the *hidden features* at the large model's second-to-last layer carry far more information than the token itself — they are a continuous vector encoding the model's "thoughts," which pass through one more LM head to become token probabilities.
+
+So EAGLE moves autoregression from the *token level* to the *feature level*: a lightweight small network takes "previous step's feature + previous step's sampled token" as input, outputs the "next step's feature," and feeds that feature back into the large model's own LM head to get the next token.
+
+*** Why it works (and where new problems are buried)
+
+Reusing the large model's LM head means the draft is *naturally aligned* with the large model. Causal dependency is preserved, accuracy reaches 80%, and the method is *lossless*.
+
+But a new problem appears: the draft is organized as a *tree* (exploring multiple tokens per position in parallel), yet the tree is static — every position expands the same number of branches. In practice, some positions have high confidence (no need to explore many alternatives) and others have low confidence (worth having more backup options). Resources are not spent where they matter most.
+
+** 2024-06 | EAGLE-2: Making the Draft Tree Dynamic
+
+*** What problem did it see?
+
+EAGLE-1's draft tree has a fixed shape — say, 4 branches per level, 6 levels deep. But during drafting, the model itself knows which tokens it is "70% sure about" versus "50-50." Expanding every position with the same fixed shape wastes compute.
+
+*** Its solution
+
+*Dynamic expansion*: use the drafting model's own confidence (output logits) to decide which branches are worth extending further. Prioritize high-confidence branches for deeper exploration; prune low-confidence ones.
+
+In practice this is a simple prune-and-expand loop.
+
+*** Why it works (and where new problems are buried)
+
+Under the same compute budget, the expected acceptance length grows. But EAGLE-2 does not change the training mechanism — it still trains with the *feature regression loss* from EAGLE-1.
+
+This buries the problem EAGLE-3 will have to pierce: training the small network to fit the large model's high-dimensional feature vectors (MSE loss) is an extremely tight constraint. Adding more data barely moves accuracy — *it does not scale*.
+
+** 2025-03 | EAGLE-3: Remove the Feature Loss, Simulate Self-Consumption
+
+*** What problem did it see?
+
+The EAGLE-3 team identified two things:
+
+First, adding training data barely helps EAGLE-2. The bottleneck is the *feature regression loss* ~l_fea~ — forcing the drafting network to mimic the large model's high-dimensional feature vectors is like shackling it.
+
+Second, "reusing the top-layer feature" carries an internal contradiction: the top-layer feature is designed to predict the *next* token, so all its information is focused on that one step ahead. Using it to predict next-next or next-next-next leaves too little signal.
+
+There is a third, sharper issue: during training the small network consumes *real features from the large model*; during inference it consumes *its own predicted features from the previous step* — training and test distributions are inconsistent, and errors accumulate.
+
+*** Its solution
+
+Three moves at once:
+
+1. *Remove the feature regression loss*: no longer require fitting high-dimensional features; only require token-distribution alignment. Loosen the constraint, add more data, and accuracy rises.
+2. *Fuse multi-layer features*: concatenate low-, mid-, and high-layer features for the small network instead of using only the top layer.
+3. *Training-Time Test (TTT)*: during training, actively feed the small network its own predicted output, simulating the inference-time distribution and adapting to it in advance.
+
+*** Why it works (and where new problems are buried)
+
+The effect is immediate — 6.47x speedup on HumanEval against Vicuna-13B. Training data can now be scaled.
+
+But *the most fundamental problem is untouched*: drafting is still AR. The mathematical structure — "prediction of draft position i is conditioned on all previous draft positions" — is unchanged. TTT only *mitigates* accumulated error; it does not eliminate it. Draft length tops out around 10–15 tokens; beyond that, quality collapses.
+
+As long as drafting is AR, that ceiling is there.
+
+** 2025-12 | DEER: Replace the Drafter with a Diffusion Model
+
+*** What problem did it see?
+
+DEER traces the entire line above from beginning to end and reaches one verdict: *the problem is not how smart the drafting model is — the problem is that the drafting process is AR.*
+
+Let us be precise. When an AR drafter generates token i, the formula is ~p_draft(x_i | x_1, x_2, ..., x_{i-1})~ — the condition includes all of its own previous guesses. Any early deviation propagates forward. Mathematically, the KL divergence between the draft distribution and the large model's distribution *grows monotonically* with i. The further back a position is, the more likely it gets rejected. This is why every AR drafter collapses once drafts exceed 10–15 tokens.
+
+This is not a failure of effort by Medusa, EAGLE, EAGLE-2, or EAGLE-3 — the AR drafting paradigm itself has a ceiling.
+
+*** Its solution
+
+Simply switch to a different drafting paradigm: a *diffusion language model* (dLLM).
+
+How does a diffusion model generate text? It starts from a sequence of *all [MASK] tokens* and denoises all positions simultaneously in a single step. Each position's prediction is conditioned on the same masked initial sequence — positions are *mutually independent* — so there is no causal chain linking position i to position j.
+
+DEER uses a dLLM as the drafter: given a prefix (what the large model has already generated), the dLLM performs *a single denoising step* to produce a complete N-token draft segment.
+
+But a new problem arises: off-the-shelf dLLMs are trained on *full-sequence infilling* tasks, not *prefix-conditioned continuation*. Used directly, their distribution is misaligned with the AR large model. DEER addresses this with two-stage training:
+
+1. *AR-style continuation distillation*: training with truncated teacher answers marked by a SEP token, teaching the dLLM how to "generate a suffix given a prefix."
+2. *Prefix-conditioned accuracy fine-tuning*: suffix masking weighted by exponential decay, so positions closer to the prefix are predicted more accurately (since those are the ones most likely to be accepted by the large model).
+
+*** Why it works (and where new problems are buried)
+
+Error accumulation is severed at the root. The prediction of draft position i is no longer conditioned on draft positions 1..i-1 — it is conditioned only on the *true prefix*. Whether position i is correct or not depends solely on how well the dLLM matches the AR model's distribution at that position, *independently of i*.
+
+Results: acceptance length can reach 32 tokens (EAGLE-3 achieves roughly 10). On HumanEval against Qwen3-30B-A3B, DEER achieves 5.54x speedup versus EAGLE-3's 2.41x.
+
+Remaining problems: the dLLM drafter is heavier to train and has more parameters than EAGLE's small heads; validation is currently concentrated on code tasks; and it remains to be confirmed whether the dLLM's single-step denoising quality holds up on more complex reasoning tasks.
+
+* Frontier Extensions
+
+Around the time DEER appeared, several closely related threads were advancing in parallel:
+
+- *Fast-dLLM*, *dInfer*: add KV cache and high-throughput inference engines to dLLMs. DEER benefits directly from this infrastructure.
+- *DiffuSpec*, *SDD (Speculative Diffusion Decoding)*: similar in spirit but operating in *continuous space* or with *multi-step denoising*. DEER argues that continuous space makes precise temperature control difficult, and that multi-step denoising accumulates a small drift against the AR verifier at each step. DEER uses *discrete space + single step*.
+- *TiDAR*: trains diffusion and AR into a single model so one model both drafts and verifies. DEER argues that dual training objectives *conflict*, degrading base model performance; DEER keeps the drafter and verifier separate.
+
+As of now (2026-05), DEER represents the clearest engineering solution along the "diffusion drafter for AR target" path. Likely next steps include:
+
+1. Making the dLLM drafter smaller and cheaper to train;
+2. Exploring stability on *reasoning tasks* (CoT, agentic settings);
+3. Orthogonally combining with *test-time compute* (long CoT, ToT) — the longer the draft, the more long-CoT inference benefits.
+
+* A Single Diagram
+
+#+begin_example
+                              Drafter architecture
+                              v
+              SPS (2023) ---- Independent AR small model ----+
+                | Slow, misaligned                           |
+                v                                            |  Drafting process
+              Medusa (2024) -- Parallel multi-head           |  v
+                | Low accuracy, not lossless                 |  Each position
+                v                                            |  independent
+              EAGLE-1 (2024) - Feature-level AR -------------+
+                | Draft tree is static                       |
+                v                                            |  Drafting process
+              EAGLE-2 (2024) - Dynamic draft tree            |  v
+                | Training does not scale                    |  Previous step
+                v                                            |  influences
+              EAGLE-3 (2025) - Drop feature loss + TTT       |  next step
+                | KL accumulation not cured at root          |  (AR)
+                v                                            |
+              DEER (2025) ---- Diffusion drafter ------------+
+                                v
+                              Single denoising step
+                              entire segment in parallel
+                              no error accumulation
+
+
+  Timeline / Paradigm evolution
+
+  2023 ----------- 2024 ----------- 2025 ----------- 2026
+   |               |   |   |          |   |             |
+  SPS            Medusa EAGLE-1     EAGLE-3          DEER
+                       EAGLE-2
+
+  Paradigm 1: AR drafting + AR verification ========================>
+                                          |
+                                          | DEER's inflection point
+                                          v
+  Paradigm 2: Diffusion drafting + AR verification ===============>
+
+
+  Evolution of the core tension
+
+  Early      "Is the small model accurate enough?"   --> add parameters, add data
+  Middle     "Train-test distribution mismatch"      --> TTT, feature reuse
+  Now        "AR paradigm has built-in accumulation" --> switch to non-AR drafting
+#+end_example
+
+* Insights
+
+Looking at the entire thread from end to end, three layers of what is really happening emerge:
+
+1. *From "build a better small model" to "reuse the large model itself" to "switch the generation paradigm."* In the SPS era, people believed that perfecting the small model was enough. In the EAGLE era, reusing the large model's own features proved smarter. In the DEER era, the realization is that *the drafting process itself* is the bottleneck, not the drafting model. Each upgrade moves closer to the root of the problem.
+
+2. *The bottleneck is not capability — it is train-test distribution mismatch.* EAGLE-3's TTT was already addressing this — making training consume the model's own output. DEER goes further — making the training and inference conditions *completely identical* (neither conditioned on draft tokens). This is a recurring pattern: in any sequential task, the covariate shift caused by "consuming one's own output" is the hidden final boss.
+
+3. *Speculative decoding, at its core, is about widening the gap between "parallel compute" and "serial latency."* GPU compute has always had slack; sequential dependencies are what constrain us. Each generation of work asks: "Which step that used to be serial can be made parallel?" Parallel drafting (Medusa) → parallel draft tree (EAGLE) → parallel full-segment drafting (DEER). The next step may be *parallel verification* or *cross-request draft reuse*.
+
+Where is the line most likely to go next?
+
+- *Lightweight dLLM drafters*: the dLLM drafter is still relatively heavy; whoever can compress it to the scale of EAGLE's small heads will win.
+- *Diffusion drafting + long CoT verification*: DEER's advantage is long drafts. Long-CoT reasoning inherently needs long sequences, so DEER's speedup in that setting could be an order of magnitude larger than in general dialogue.
+- *Adaptive draft length*: the dLLM can generate 32 tokens at once, but sometimes only 5 are accepted before rejection — can draft length be adjusted dynamically based on prefix difficulty?
+
+* Lessons
+
+What this evolutionary thread teaches about how to do research:
+
+1. *Watch the ceiling of the paradigm, not the optimizations within it.* The EAGLE series went from 1 to 3, patching the AR paradigm with each iteration. EAGLE-3's TTT is as clever as it gets within that paradigm — yet the ceiling is still there, because as long as drafting is AR, KL accumulation is there. DEER switches paradigms and punches straight through. The weight of a contribution is measured by whether it touches the underlying assumption.
+
+2. *"What predecessors couldn't change" is often the new opportunity.* The feature loss ~l_fea~ was carried from EAGLE-1 all the way through EAGLE-2, treated as given. Only when EAGLE-3 removed it did scaling kick in. Every paradigm shift has a long-held assumption underneath that gets overturned. Research sensitivity means seeing which "conventions" are actually "assumptions."
+
+3. *Borrow across paradigms.* DEER did not grow from within speculative decoding — it pulled *diffusion language models*, an independently evolving research thread, and repurposed them. When one line hits a wall, the solution often cannot come from inside that line — you have to go to the neighboring line for tools. The dLLM property of "parallel generation of an entire segment" was framed as an advantage within the dLLM community; in the speculative decoding community it becomes "severing error accumulation." This *reframing of an advantage* is the core move in cross-domain research.
+
+Practical takeaways:
+
+- If you are working on inference acceleration: you can now confidently include DEER-style diffusion drafters in your candidate pool, without being stuck on the EAGLE family;
+- If you are working on dLLM training: your work has a *non-generative* application outlet — serving as a drafter for AR models;
+- If you are making research judgments: when you see any "draft-verify" paper, the first question should be "is the drafting process itself sequential?" If yes, the draft-length ceiling is already there.
+
+* Honest Annotations
+
+- DEER's criticisms of SPS, the EAGLE family, Medusa, SDD, and TiDAR are *stated directly in the paper*.
+- EAGLE-3's criticisms of EAGLE-2 (feature loss limiting scaling, top-layer features ill-suited for multi-step prediction) are stated directly in the EAGLE-3 paper.
+- The criticism of Medusa's "independent heads without sequential dependency" was raised collectively by multiple subsequent papers (EAGLE, Hydra).
+- DEER's relationship with SDD/DiffuSpec/TiDAR is one of *concurrent competing work*, not a strict "predecessor → improvement" chain — the causal chain at this layer is not as clean as SPS → Medusa → EAGLE.
+- All "where things go next" points are *speculations* based on the evolutionary pattern of this thread; they are not explicitly stated in the paper.

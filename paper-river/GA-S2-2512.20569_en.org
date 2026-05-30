@@ -1,0 +1,319 @@
+#+title:      Distilling to Hybrid Attention Models via KL-Guided Layer Selection
+#+date:       [2026-05-29 Fri 13:43]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T134313-en
+#+source:     https://arxiv.org/abs/2512.20569
+#+authors:    Yanhong Li, Songlin Yang, Shawn Tan, Mayank Mishra, Rameswar Panda, Jiawei Zhou, Yoon Kim
+#+venue:      arXiv 2025-12 (preprint)
+
+* The Problem River
+
+An LLM gets slower the longer it runs, and more expensive the longer the context. Can we make it decode as fast as an RNN while retaining the memory of a Transformer?
+
+This is the question that the LLM inference line has been grinding on for the past eight years. Softmax attention must scan all previous tokens every time it generates a new one — the longer the sequence, the larger the KV cache, and the more memory must be moved at each step. A 32K-context model can consume several GB of GPU memory just for the KV cache, and generation speed is hard-locked by memory bandwidth.
+
+The alternatives — RNNs, linear attention, state-space models (SSMs) — all compress "scan all history" into "maintain a fixed-size hidden state." The cost: a fixed-size state cannot hold fine-grained long-range retrieval (in-context recall). On needle-in-haystack tasks like RULER, pure linear-attention models fall off a cliff.
+
+This gave rise to *hybrid architectures*: most layers use linear attention (cheap), a small number retain softmax (critical). But two new problems immediately surface:
+
+1. *Pre-training such a hybrid model from scratch is too expensive* — large companies can do it (Jamba, MiniMax-01, Falcon-H1), but small teams cannot.
+2. *Once "distill from an existing Transformer" becomes the preferred route, the next question is — which layers should be kept as softmax?*
+
+The second question is what this paper solves. It sounds like a tuning detail, but it sits on a genuine cognitive gap: how do you know which layer is the most "irreplaceable"?
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Solution: full softmax attention, parallel training, KV cache for inference
+  | New hole: KV cache grows linearly with sequence length; decoding locked by memory bandwidth
+  v
+[2020] Katharopoulos et al. - Linear Transformers
+  |
+  | Solution: rewrite softmax(QK)V as phi(Q)(phi(K)^T V), turning it into an RNN
+  | New hole: fixed hidden state cannot hold fine-grained recall; long-context collapse
+  v
+[2023-24] Gu&Dao - Mamba / Dao&Gu - Mamba-2 / Yang et al. - GLA
+  |
+  | Solution: add data-dependent gating / selective scan to the hidden state, stronger recall
+  | New hole: pure SSMs still fail on needle-in-haystack
+  v
+[2024-25] Lenz et al. - Jamba / MiniMax-01 / Falcon-H1
+  |
+  | Solution: pre-train hybrid models from scratch with a fixed ratio (e.g. 1:7) of softmax layers
+  | New hole: pre-training cost too high + fixed ratio is a guess; nobody knows why 1:7
+  v
+[2024-25] Wang et al. - MOHAWK / Bick et al. - Llamba / Goldstein et al. - RADLADS
+  |
+  | Solution: skip pre-training; distill directly from an existing Transformer into a hybrid
+  | New hole: distillation still uses uniform-interval layer selection; layer importance unused
+  v
+[2025] Yang et al. - SMART / Chaudhry et al. - AR-probe / Gu et al. - PostNAS
+  |
+  | Solution: abandon uniform; use diagnostic tasks (synthetic recall) or NAS to select layers
+  | New hole: diagnostic tasks misalign with real tasks; NAS needs 50B tokens — too costly
+  v
+[2025-12] *Li et al. - GA-S2 (this paper)*
+  |
+  | Solution: no external diagnostics needed; the distillation KL loss is itself
+  |           the most natural signal of layer importance
+  v
+[Future]   Test-time compute scaling places higher demands on in-context recall
+           for distilled hybrid models (Paliotta 2025, Chaudhry 2025)
+#+end_example
+
+* Evolutionary Narrative
+
+For each of the following seven papers, the focus is not "what it did" but "what problem it saw in the one before it."
+
+** 2017 | Vaswani et al. - Attention Is All You Need: Attention Killed the RNN
+
+*** What problem it saw
+
+LSTM training was agonizingly slow because gradients had to be computed one token at a time. 90% of the GPU's parallel capacity was wasted.
+
+*** Its solution
+
+Rewrite sequence modeling from scratch: every position attends directly to every other position (self-attention), and all tokens are computed in one shot during training.
+
+*** Why it worked — and where the new hole was buried
+
+Training was blazingly fast. But a landmine was planted for inference: autoregressive generation of a new token requires looking at the K and V of all previous tokens, so they must be cached — this is the KV cache. The longer the sequence T, the larger the cache, and the more data must be transferred from GPU memory at each decoding step.
+
+By 2023 it became clear: long-context LLM inference was despairingly slow, and the bottleneck was not compute but memory bandwidth. The landmine exploded.
+
+** 2020 | Katharopoulos et al. - Linear Transformers: Rewriting Attention Back into an RNN
+
+*** What problem it saw
+
+Vaswani's softmax(QK^T)V cannot "reuse computation" during inference — at every generated token, the full KV cache must participate. Could it be made recurrent, maintaining only a fixed-size state like an RNN?
+
+*** Its solution
+
+A mathematical trick. Approximate softmax(qK^T)V with a kernel feature map phi as phi(q)(phi(K)^T V). The inner product is a d×d matrix S; each new token requires only ~S = S + phi(k)v^T~.
+
+This is a fixed-size hidden state with constant update cost. No KV cache needed during decoding.
+
+*** Why it worked — and where the new hole was buried
+
+Mathematically elegant, and the speed gains were real.
+
+But accuracy dropped significantly. The intuition is simple: softmax attention distributions are sparse and can precisely "point at" a specific historical token; phi(Q)phi(K)^T is dense, effectively averaging all historical tokens into a single d×d matrix. If you need to retrieve "the person's name that appeared at token 3000 in the passage," a fixed-size state cannot hold that kind of fine-grained information.
+
+This limitation was later named the *fixed-state bottleneck*, and long-context recall collapsed.
+
+** 2023–2024 | Mamba / GLA / DeltaNet: Adding Gates to the Hidden State
+
+*** What problem it saw
+
+Katharopoulos's update ~S = S + phi(k)v^T~ is "mindless accumulation" — all historical tokens are treated equally, old information never gets cleared, and the state saturates into noise.
+
+*** Its solution
+
+Make the update rule *data-dependent*. Mamba's formulation (simplified): ~S_t = M_t S_{t-1} + k_t v_t^T~, where ~M_t~ is a transition matrix computed from the current token. The intuition is an evolved LSTM forget gate — the model decides for itself what to forget and what to remember.
+
+GLA, DeltaNet, HGRN2, and RWKV/Eagle are all variants of this idea, differing in the shape of ~M_t~ (diagonal, low-rank, Delta rule, …).
+
+*** Why it worked — and where the new hole was buried
+
+On short-context tasks (commonsense reasoning, MMLU), these SSM/linear variants can already match Transformers.
+
+But on *associative recall* tasks like RULER and Zoology, they still trail softmax by a wide margin. Arora et al. proved this is a fundamental limitation of fixed-state models — no matter how flexible the state dynamics, fixed size is fixed size.
+
+This kicked the ball back: if you need recall, softmax is still the only answer.
+
+** 2024–2025 | Jamba / MiniMax-01 / Falcon-H1: Why Not Mix Both?
+
+*** What problem it saw
+
+Pure linear models fail at recall. Pure softmax models are too slow to serve. Neither side would yield.
+
+*** Its solution
+
+Hybrid: use linear/SSM for most layers, insert one softmax layer every few layers. Jamba uses 1:7 (one softmax per 8 layers); MiniMax-01 is similar. Pre-training this architecture from scratch yields performance that approaches pure Transformers while being much faster to serve.
+
+*** Why it worked — and where the new hole was buried
+
+The intuition is sound: softmax layers handle global information aggregation, linear layers handle local information processing. Each does its part.
+
+But two new holes appeared:
+
+1. *Pre-training a hybrid model from scratch burns thousands of H100s.* Small and medium teams cannot play.
+2. *Why 1:7?* Nobody can explain it. It was guessed. Once "distill from an existing Transformer" became viable, "which layers to keep as softmax" immediately became the central question.
+
+** 2024–2025 | MOHAWK / Llamba / RADLADS: Skip Pre-training, Distill Instead
+
+*** What problem it saw
+
+Jamba's approach required pre-training from scratch — too expensive. But thousands of open-source Transformer checkpoints already exist. Could you take an existing Qwen2.5 or Llama-3.2 and "convert" it into a hybrid model?
+
+*** Its solution
+
+A knowledge-distillation pipeline. RADLADS (the backbone actually used in this paper) has two stages:
+- *Stage 1 hidden-state alignment*: pull the student's per-layer hidden states ~U_student~ toward the teacher's ~U_teacher~ with an L2 loss. Only the student's newly inserted linear-attention parameters are trained; FFN weights are frozen.
+- *Stage 2 KL distillation*: unfreeze all parameters and match the student's output distribution softmax(l_student/τ) to the teacher's softmax(l_teacher/τ).
+
+With only ~600M training tokens, a Qwen2.5-3B can be distilled into a hybrid student that is faster to serve.
+
+*** Why it worked — and where the new hole was buried
+
+Ludicrously cheap compared to pre-training. On short-context tasks such as commonsense reasoning, the quality drop is minimal.
+
+But there is an awkward issue: almost all of these works inherit Jamba's *uniform interleaving* — keep one softmax layer every 4 or 7 layers. The authors of the present paper ran a key experiment (Figure 2): sweeping K (the number of softmax layers) from 1 to L-1, they found that commonsense tasks are nearly insensitive to K (one softmax layer suffices), while RULER-style recall tasks are extremely sensitive to K and improve monotonically.
+
+In other words: *which specific layers are kept as softmax directly determines long-context capability.* Uniform selection is certainly suboptimal.
+
+** 2025 | SMART / AR-probe / PostNAS: Use Diagnostic Tasks to Pick Layers
+
+*** What problem it saw
+
+Uniform spacing is clearly wrong. Each layer's "importance" should differ — some layers primarily perform local pattern matching (linear is enough), while others are critical hubs for long-range retrieval (must be softmax). How do you find the latter?
+
+*** Its solution
+
+Three schools of thought:
+
+- *AR-probe* (Chaudhry 2025): construct a synthetic key-value retrieval task (associative recall), swap each layer to linear one at a time, and see which layers cause the biggest drop. Those layers are "recall-critical" and keep their softmax.
+- *SMART* (Yang 2025): use teacher–student KL but measured only when *swapping a single layer*, combined with a heuristic (retain layers near the input and output; pick the most sensitive ones for the remainder).
+- *PostNAS* (Gu 2025): build a SuperNet, train for 50B tokens, then beam-search for the optimal K-layer combination.
+
+*** Why it worked — and where the new hole was buried
+
+All outperform uniform selection; the direction is right. But each approach has its own flaw:
+
+- *Diagnostic tasks misalign with real tasks*: layers that are critical in the synthetic AR task may not be critical on RULER. Task distribution shift.
+- *Heuristics are ad hoc*: SMART requires "retaining layers near the input/output" — why? No theoretical backing.
+- *NAS is expensive*: PostNAS needs 50B tokens, nearly as costly as re-training.
+
+The deeper issue: the importance signal used by these methods is *inconsistent with the final objective* — you ultimately want to minimize the KL divergence between the distilled student and the teacher, so why not use that objective directly?
+
+** 2025-12 | GA-S2 (This Paper): The Distillation KL Is Itself the Importance Signal
+
+*** What problem it saw
+
+The preceding approaches all took a long detour — using proxy tasks (AR), heuristics (SMART), or brute-force search (NAS) to estimate "layer importance." But RADLADS already told us: what we ultimately care about is the teacher–student KL divergence.
+
+So use the KL itself as the importance signal.
+
+*** Its solution
+
+Clean and tight, three steps (Algorithm 1):
+
+1. *Distill a fully-linear student* M_all-linear first (using RADLADS Stage 1 + Stage 2). This is the baseline.
+2. *Per-layer one-swap*: for each layer ℓ, *swap back* layer ℓ of M_all-linear to the teacher's softmax layer, yielding M^(-ℓ). Run another round of Stage 1 + Stage 2 distillation. Measure KL_KD(M^(-ℓ)).
+3. *Importance score* I(ℓ) = -E[L_KL(M^(-ℓ))]. A higher score means "restoring this layer to softmax reduces distillation KL more" — i.e., this is the layer least safely replaced by linear.
+4. *Greedy Addition*: starting from the all-linear model, rank layers by I(ℓ) and greedily add back the top-K layers as softmax.
+
+The total training-token budget is ~5–6B, an order of magnitude less than PostNAS's 50B.
+
+*** Why it worked — and where the new holes are
+
+Three intuitive reasons make this approach elegant:
+
+1. *Objective alignment*: the signal used to select layers is the same signal used to train them — no task distribution shift.
+2. *Hybrid-aware*: importance is measured by "restoring one layer" rather than "removing one layer," which naturally captures how a layer behaves in coexistence with other linear layers — something other methods (including SMART's swap-in) cannot do.
+3. *Variant-aware*: switching the linear-layer type from GDN to GLA causes the importance scores to adapt automatically.
+
+Experimental results (Figure 3): at a 12.5% softmax budget (5 layers), GA-S2 achieves 0.662 on RULER, beating the strongest baseline AR by 0.12 and uniform selection by 0.22. At the 7B scale, a +0.047 advantage is maintained.
+
+New holes:
+
+- *Layer selection depends on the student architecture.* The layers selected for GDN versus GLA have a Jaccard similarity of only ~0.54–0.65. "Which layer matters" is not a pure property of the teacher but a joint property of teacher + student. This means re-selection is required whenever the student architecture changes.
+- *The full distillation pipeline must still run L times.* Even at only 5–6B tokens, this is ~10× more expensive than a pure heuristic.
+- *Greedy is locally optimal.* The paper itself acknowledges that the globally optimal combination may differ.
+
+* Frontier Extensions
+
+The most interesting recent extension of this line concerns *test-time compute scaling and its demands on hybrid models*.
+
+Paliotta et al. (2025) and Wang et al. (2025b) are attempting to make distilled hybrid models capable of reasoning-style long-chain inference (analogous to o1/Deepseek-R1). Chaudhry et al. (2025) point out: the longer the reasoning chain, the heavier the dependence on in-context retrieval — the model must be able to "look back" at intermediate steps.
+
+This kicks the ball back to the GA-S2 line:
+
+- If reasoning becomes the primary deployment scenario, the softmax budget may need to be much higher.
+- The selection criterion may need to shift from "matching the teacher's next-token distribution" to "matching the teacher's multi-step reasoning trajectory."
+- The principle of "distillation loss as layer importance" naturally extends to *multi-step reasoning trace loss as layer importance*.
+
+GA-S2 is a *mechanism*, not just a number. What it says is: when you are designing a search or selection problem, *let the objective you ultimately want to optimize serve as the selection signal itself*, rather than detour through a proxy task. This pattern clearly has legs beyond its original application.
+
+* One Diagram
+
+#+begin_example
+                    Problem                         Solution                       New Constraint
+  --------------------------------------------------------------------------------
+  2017 Vaswani      RNN training too slow           Full softmax attention          KV cache grows linearly
+                                                                                   -> slow decoding
+                          |
+                          v
+  2020 Katharopoulos KV cache too heavy             phi(Q)(phi(K)^T V)             Fixed state cannot hold
+                                                    rewritten as RNN               fine-grained long recall
+                          |
+                          v
+  2023-24 Mamba/GLA Linear attn can't forget        Data-dependent gating          SSMs still lose to softmax
+        DeltaNet                                                                    on RULER
+                          |
+                          v
+  2024 Jamba/MiniMax Pure linear fails recall       Hybrid: 1:7 softmax insert     Pre-training costly
+        Falcon-H1     Pure softmax too slow         Pre-train hybrid from scratch  + 1:7 is a guess
+                          |
+                          v
+  2024-25 MOHAWK     Hybrid pre-training too costly Knowledge distillation:        Inherits uniform selection;
+        RADLADS                                      Stage1 hidden-state align      layer importance unused
+        Llamba                                       Stage2 KL distribution match
+                          |
+                          v
+  2025 SMART/AR     Uniform selection suboptimal    Diagnostic tasks / heuristics  Proxy task drift;
+        PostNAS                                      / NAS to find "key" layers     NAS costs 50B tokens
+                          |
+                          v
+  2025-12 *GA-S2*   Proxy tasks misalign target     Distillation KL = importance   Selection depends on
+                    NAS too costly                  One-swap + Greedy Add          student architecture;
+                                                                                   Greedy is locally optimal
+                          |
+                          v
+  2026+   Test-time reasoning needs stronger        ??? Use reasoning trace loss as importance ???
+          in-context retrieval
+
+  Timeline: the "reduce KV cache" thread compressed to one sentence:
+  ---> Every generation (a) compressed the state, then (b) found cleverer ways to recover what was lost
+#+end_example
+
+* Insight
+
+After reading the entire line, the deepest observation is: *for eight years, the "long-context LLM inference" thread has been doing exactly one thing — a tug-of-war between compression and recovery.*
+
+Every generation compressed further (KV cache → fixed hidden state → selective hybrid). Every compression lost information. Then the next generation spent its energy recovering what was lost (gating, hybrid architecture, smart layer selection).
+
+By the time we reach GA-S2, *an interesting cognitive shift has occurred at the conceptual level*:
+
+- Earlier generations were *designing* how to compress (at the architectural level).
+- GA-S2 is the first to *search* for how to compress (at the instance level). It tells you: on a specific pre-trained model, the optimal hybrid pattern is not designed a priori — it is mined from the statistical properties of that model itself.
+
+This hints at a larger turn: future efficient architectures may no longer be "one-size-fits-all designs" but rather *per-model adaptive configurations*. The efficient distilled version of each open-source model may place its softmax layers in different positions. The architecture search space shifts from "global" to "once per checkpoint."
+
+Where is the next step most likely to go? Two directions seem probable:
+
+1. *Extend the selection signal to reasoning loss.* GA-S2 uses "next-token distribution" as the signal. The next paper will use "multi-step reasoning trajectory consistency" — because that is what test-time scaling actually cares about.
+2. *Push selection granularity below the layer level to the head level.* Currently the choice is full-layer softmax or full-layer linear. But different heads within the same layer do different things; mixing at finer granularity is possible. MoE-style attention mixing may be the endgame.
+
+* Takeaways
+
+For researchers, the biggest lesson this line offers is:
+
+*When you are using a proxy objective to solve a problem, stop and ask — can you use the final objective directly?*
+
+GA-S2's core innovation fits in one sentence: where others used synthetic tasks / heuristics / NAS to estimate "which layer matters," the authors said: distillation KL is exactly what we ultimately care about — why not use it directly as the ranking signal?
+
+This "remove the proxy" move has appeared repeatedly throughout ML history:
+- Early NAS used accuracy proxies → later work used final task metrics directly.
+- Early RLHF used a reward model proxy → DPO uses the preference loss directly.
+- Early model selection used validation accuracy → now downstream task loss is used directly.
+
+Each time a proxy layer is removed, a wave of performance gains follows.
+
+Practical implications:
+
+- If there is a step in your pipeline that uses an "approximate criterion" (synthetic task, proxy metric, heuristic score), stop and ask: can the loss you ultimately want to optimize be used as the criterion directly? If it is computationally feasible, it will almost always beat the proxy.
+- The next time you want to "slim down" an LLM — pruning, quantization, distillation, head/layer selection — *run one pass of the final objective loss as the ranking signal first*. It will be more reliable than any heuristic.
+- Using the same loss for both selection and training is a principle that generalizes broadly. At its core it says: "let the ruler you use to measure be made of the same material as the wood you intend to cut."

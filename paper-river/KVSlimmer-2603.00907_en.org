@@ -1,0 +1,308 @@
+#+title:      KVSlimmer: Theoretical Insights and Practical Optimizations for Asymmetric KV Merging
+#+date:       [2026-05-29 Fri 14:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T140000-en
+#+source:     https://arxiv.org/abs/2603.00907
+#+authors:    Lianjun Liu, Hongli An, Weiqi Yan, Xin Du, Shengchuan Zhang, Huazhong Liu, Yunshan Zhong
+#+venue:      arXiv 2026
+
+* The Problem River
+
+Every time a large language model generates one more token, it must store the "working notes" for every previous token in GPU memory — this pile of notes is called the KV cache. The longer the text, the more notes accumulate, until memory explodes and throughput collapses.
+
+The problem sounds simple: just compress the notes, right?
+
+But this river has been flowing for three years, and every generation of researchers has been blocked by the same question — *how do you know which notes can be dropped or merged, and which must stay intact?* Drop the wrong one and the model starts hallucinating; merge the wrong pair and the attention distribution gets warped. From the earliest "discard by importance," to "merge discarded entries into surviving ones," to "cluster by similarity," to "treat K and V differently," and now KVSlimmer's claim that "I can prove from pure mathematics why K should be merged while V should be retained" — this is a path of *"gut feeling" → "empirical evidence" → "mathematical proof"* converging on the truth.
+
+* Source Map
+
+#+begin_example
+[2023] H2O (Heavy-Hitter Oracle)
+  |  Problem: KV cache bursts GPU memory on long sequences
+  |  Solution: Track cumulative attention scores; keep only the top-K
+  |            "heavy hitters" and a short recency window; evict the rest
+  |  Left open: Evicted tokens are gone forever; if needed later, info is lost
+  v
+[2024] CaM (Cache Merging, ICML)
+  |  Problem: H2O's hard eviction is too brutal; even "unimportant"
+  |            token values carry semantic content
+  |  Solution: Before evicting, probabilistically merge the value of the
+  |            evicted token into a surviving token's value, weighted by
+  |            attention scores; proved current-step output can be preserved
+  |  Left open: Only merges V, not K; merging is probabilistic (can still drop);
+  |             same logic applied to both K and V
+  v
+[2024] KVMerger ("Model Tells You Where to Merge")
+  |  Problem: CaM doesn't specify which token to merge into, or with
+  |            what weight
+  |  Solution: Use cosine similarity of K vectors to cluster tokens;
+  |            within each cluster pick the highest-attention "pivotal state";
+  |            merge others into it weighted by a Gaussian kernel
+  |  Left open: Still treats K and V as symmetric; merge weights are
+  |             heuristic with no error guarantee
+  v
+[2025] AsymKV ("Homogeneous Keys, Heterogeneous Values")
+  |  Problem: Experiments show adjacent K vectors are nearly identical
+  |            while adjacent V vectors differ significantly —
+  |            so why use the same strategy for both?
+  |  Solution: Merge K + retain V; solve a second-order optimization problem
+  |            for K merge weights, approximating the Hessian via Fisher
+  |            information computed by gradient back-propagation
+  |  Left open: 1. "Homogeneous K, heterogeneous V" is observation, not theory
+  |             2. Hessian is approximate; off-diagonal coupling between
+  |                adjacent K's is dropped
+  |             3. Requires a backward pass at inference time
+  v
+[2026] KVSlimmer  <-- target paper
+       Problem: AsymKV's asymmetry has no theory; its Hessian is coarse;
+                it still needs gradients
+       Solution: 1. Derive K homogeneity and V heterogeneity from the
+                    spectral energy distribution of the weight matrices
+                 2. Write an exact closed-form Hessian that captures
+                    coupling between adjacent K's
+                 3. Solve for merge weights algebraically using only
+                    forward-pass variables — zero gradients needed
+       Result:   +0.92 avg on LongBench (Llama3.1-8B), -29% memory, -28% latency
+
+[2025+] Frontier extensions
+       KeepKV (2025-04): Identifies "Attention Sag" as a shared pathology
+                         in all merging methods
+       WeightedKV (2025-03): Replaces CaM's probabilistic merging with a
+                             deterministic convex combination
+#+end_example
+
+* Evolutionary Narrative
+
+The protagonist of this line is not any single paper but a question that keeps changing its face: *"How do you compress the KV cache in long-context generation without losing information?"* Over five years, the answer has moved from "use your judgment" toward "compute it exactly."
+
+** 2023 | H2O: The First Cut — Just Evict
+
+*** What Problem It Saw
+
+When large models generate long text, the KV cache snowballs in GPU memory. The dominant memory-saving technique at the time was quantizing model weights, but the KV cache is dynamically generated, so quantization couldn't touch it.
+
+*** Its Solution
+
+The authors noticed that attention scores are highly sparse: 95% of tokens receive almost no attention. Looking closer, that active 5% follows a power-law distribution — a small number of tokens capture most of the attention.
+
+The recipe followed naturally: at each generation step, rank tokens by cumulative attention score, keep the top-20% "heavy hitters" plus a short recency window, and evict everything else from the cache.
+
+*** Why It Works (and What New Problem It Creates)
+
+It works because most tokens genuinely receive no attention, so evicting them has no effect on the current generation step.
+
+The trap it sets: *"no one is looking now" ≠ "no one will ever look."* Evicted tokens are truly deleted from history. If the model later needs to refer back to some early content, that content is simply gone — and the model can only fabricate. This is the exact pain point CaM would set out to fix.
+
+** 2024 | CaM: Merge Before You Evict
+
+*** What Problem It Saw
+
+H2O's hard eviction is too violent. Even "unimportant" tokens carry semantic information in their value vectors. Cutting them out perturbs the output distribution, and the higher the compression ratio, the larger the perturbation.
+
+*** Its Solution
+
+Replace "evict" with "merge" — instead of clearing a token, absorb its value into a surviving token's value, weighted by attention scores, in a *probabilistic* manner. It provides a mathematical proof: as long as the weighting formula is satisfied, the current step's output is preserved.
+
+*** Why It Works (and What New Problem It Creates)
+
+It turns "information deletion" into "information folding" — the semantics of the dropped token are folded into a surviving vector.
+
+But it leaves three gaps:
+
+1. Only values are merged; keys are simply dropped.
+2. The merge is probabilistic: there is a nonzero chance the value is still lost.
+3. No explanation is given for why K doesn't need merging while V does — K is simply assumed to be overwritten by new content.
+
+The first two gaps are what WeightedKV later fills; the third leads directly to AsymKV.
+
+** 2024 | KVMerger: Merging Needs Rules
+
+*** What Problem It Saw
+
+CaM says "merge the value of the evicted token into some surviving token" — but *which one*? *How do you set the weights*? CaM doesn't say; it derives probabilities from attention scores, which is strongly heuristic.
+
+*** Its Solution
+
+The authors observe that within a sequence, adjacent token key vectors have very high cosine similarity and naturally cluster together. They reframe merging as a *clustering problem*:
+
+1. Cluster tokens by K-vector similarity.
+2. Within each cluster, pick the highest-attention token as the "pivotal state."
+3. Merge all other cluster members into the pivot, weighted by a *Gaussian kernel* — closer tokens get higher weight, farther ones get lower weight.
+
+*** Why It Works (and What New Problem It Creates)
+
+Clustering provides an objective criterion for "merge with whom"; the Gaussian kernel provides a smooth transition for merge weights.
+
+But the gaps are clear:
+
+- It still treats K and V as symmetric — same cluster, same weights, merge both. If K and V have fundamentally different statistical properties, this is wrong.
+- "Cluster threshold = 0.8," "pivot = highest attention" — still empirical values, with no error guarantee.
+
+AsymKV next punctures the first assumption directly: K and V are not the same thing.
+
+** 2025 | AsymKV: First to Say "K and V Should Not Be Treated the Same"
+
+*** What Problem It Saw
+
+KVMerger and its predecessors assume K and V are symmetric — same clusters, same merging strategy. AsymKV ran extensive measurements and found a long-overlooked phenomenon:
+
+- *Adjacent K vectors are extremely similar* (homogeneous) — merging one or two barely costs anything.
+- *Adjacent V vectors differ significantly* (heterogeneous) — merging them genuinely deletes a unique piece of information.
+
+Given this asymmetry, K should be aggressively merged and V should be retained as much as possible.
+
+*** Its Solution
+
+Asymmetric compression:
+
+- K: merge adjacent pairs, achieving large savings.
+- V: retain; apply at most lossless compression.
+
+How to merge K? To minimize output perturbation, a second-order optimization problem must be solved — requiring the *Hessian matrix* to quantify the second-order impact of each K merge on the loss. AsymKV approximates the Hessian's diagonal with the *Fisher information matrix*, computed via gradient back-propagation.
+
+*** Why It Works (and What New Problem It Creates)
+
+"Homogeneous K, heterogeneous V" is the first time this line of work escapes the cognitive trap of "universal merging." Compression ratios jump by a tier.
+
+But it leaves three tails that KVSlimmer must clean up:
+
+1. *No theoretical explanation* — "why K is homogeneous and V heterogeneous" is purely observational, not derived from the model's mathematical structure. On a new architecture, the observation may not hold.
+2. *Approximate Hessian* — only the diagonal block is taken; the off-diagonal coupling between adjacent K's is discarded. But the adjacent K's are precisely what is being merged, so this coupling is the most critical information.
+3. *Requires gradient back-propagation* — running a backward pass at inference time is a significant overhead that makes deployment impractical.
+
+** 2026 | KVSlimmer: Replacing "Gut Feeling" with "Computed Proof"
+
+*** What Problem It Saw
+
+AsymKV's asymmetry was *observed*; its Hessian was *approximated*; its merge weights were computed via *gradients*. KVSlimmer is dissatisfied with all three:
+
+- Observations may not hold on some models — a mathematical proof of why is needed.
+- The approximate Hessian drops critical coupling — an exact analytic expression is needed.
+- Gradient back-propagation is a deployment burden — a purely forward-pass solution is needed.
+
+*** Its Solution
+
+Three problems, three breakthroughs:
+
+1. *Spectral energy distribution explains the asymmetry*: Analyze the singular value distributions of W_Q, W_K, and W_V. The singular values of W_Q and W_K are highly concentrated (spectral energy packed into the first few directions), which causes the K vectors they project to naturally fall in a low-dimensional subspace — adjacent K's therefore look alike. This is the mathematical root of "homogeneity." W_V is the opposite: singular values are spread out, so V vectors span a high-dimensional space and adjacent V's naturally differ widely.
+
+   *Deriving asymmetric KV behavior from the spectral properties of the weight matrices* — this is the first time in five years that "homogeneous K, heterogeneous V" receives a theoretical justification.
+
+2. *Exact Hessian*: No approximation. The second-order impact on the output loss of simultaneously merging multiple adjacent K pairs is written as an explicit analytic expression. This expression naturally includes the off-diagonal coupling between K's — exactly the part AsymKV dropped.
+
+3. *Closed-form solution + zero gradients*: Because the Hessian is an exact analytic expression, the optimal merge weights can be solved algebraically (closed-form), using only variables already computed during the forward pass. No backward pass is required at all.
+
+*** Why It Works (and What New Problem It Creates)
+
+It works because it elevates this line of work from "empirical engineering" to a "provably optimal problem" — rather than merging first and measuring loss after, it writes the equations first and solves for the optimum.
+
+Remaining gaps:
+
+- The spectral energy explanation depends on the standard Transformer architecture; does it hold for MoE, hybrid attention, or other variants?
+- The closed-form solution assumes the second-order Taylor expansion of the loss around the merge point is sufficiently accurate. Under extremely aggressive compression (e.g., 80%+), higher-order terms may bounce back.
+- It resolves the *weight* problem for "already decided whom to merge." The step of *choosing whom to merge* still relies on heuristics like similarity thresholds.
+
+* Frontier Extensions
+
+After KVSlimmer (as of 2026-05), the same problem continues to be pushed forward in two directions:
+
+** KeepKV (2025-04, arXiv:2504.09936)
+
+Discovers that all merging methods (including CaM, KVMerger, AsymKV) share a common pathology — *Attention Sag*: the merged vector receives a lower attention score in softmax than the sum of the scores of the original vectors it replaced. This means the merging operation itself "steals" attention.
+
+It proposes an *Electoral Votes* mechanism: record for each KV pair how many original tokens it represents, then compensate proportionally during softmax. In theory this achieves *per-step lossless* merging.
+
+KeepKV and KVSlimmer are orthogonal — KeepKV fixes the *representation* after merging; KVSlimmer fixes the *weights* during merging. The two are likely to be combined in future work.
+
+** WeightedKV (2025-03, arXiv:2503.01330)
+
+Fills CaM's gap: CaM's merging is probabilistic sampling, which can still truly discard values. WeightedKV replaces this with a *deterministic convex combination* — weights computed from token importance, guaranteed to merge without loss. However, it does not engage with the AsymKV asymmetry line, so it does not reach KVSlimmer's theoretical depth.
+
+* One Diagram
+
+#+begin_example
+              KV Cache Compression Evolution (2023 -> 2026)
+              ==============================================
+
+  Solution dimension
+     ^
+"Theory"  |                                      KVSlimmer
+          |                                       (spectral energy +
+          |                                        exact Hessian +
+          |                                        closed-form solution)
+          |                                          *
+          |
+"Asymm."  |                                  AsymKV
+          |                                  (homogeneous K /
+          |                                   heterogeneous V,
+          |                                   gradient Hessian)
+          |                                      *
+          |
+"Cluster" |                          KVMerger
+          |                          (K similarity clustering,
+          |                           Gaussian kernel merge)
+          |                              *
+          |
+"Merge"   |                  CaM
+          |                  (probabilistic V-merge
+          |                   before eviction)
+          |                      *
+          |
+"Evict"   |        H2O
+          |        (keep top-K
+          |         heavy hitters)
+          |          *
+          +-----------------------------------------------> Time
+         2023      2024              2025               2026
+
+  Shared problem: Long-context KV cache exhausts GPU memory;
+                  how to compress without losing information?
+  Shared trend:   Increasingly fine-grained + increasingly theoretical
+  Shared avoidance: "Choosing whom to merge" still relies on
+                    similarity thresholds
+
+#+end_example
+
+* Insights
+
+Reading this line, what emerges is not "five papers" but a miniature specimen of *how a field grows from engineering intuition into mathematical structure*.
+
+Three observations:
+
+*First, every generation's breakthrough consists of excavating the hidden assumption of the previous generation.* H2O assumes "what gets evicted is unimportant"; CaM excavates "eviction equals output perturbation." CaM assumes "dropping V is enough"; KVMerger excavates "there's no principled rule for who to drop or how." KVMerger assumes "K and V are symmetric"; AsymKV excavates "K is homogeneous, V is heterogeneous." AsymKV assumes "asymmetry is an empirical fact"; KVSlimmer excavates "it has a mathematical root." *Real progress is not inventing a new method — it is finding the assumption buried in the old method that everyone overlooked.*
+
+*Second, the shift from "observing behavior" to "examining weights" is a key leap.* H2O looks at attention scores (runtime statistics); CaM looks at output perturbation (runtime loss); KVMerger looks at K similarity (runtime geometry); AsymKV looks at K/V distributions (runtime statistics); KVSlimmer looks at *the singular values of W_Q, W_K, W_V* (the model parameters themselves). The first four generations all ask "what does the model do when running"; KVSlimmer asks "what does the model look like standing still." *When behavior can be predicted from the weights alone, a field is usually beginning to mature.*
+
+*Third, "theory + closed-form solution" is a decisive advantage for deployment.* In engineering terms, AsymKV's "run gradient back-propagation at inference time" is nearly impossible to ship. KVSlimmer's closed-form solution using only forward-pass variables makes the theoretical result directly usable — which is why it simultaneously wins on accuracy, memory, and latency. *A theory that can be deployed is a real theory.*
+
+Where does the next step go? Two directions are most probable:
+
+1. *Theoretical treatment of "whom to merge"* — KVSlimmer resolves the merge *weights*, but merge *pair selection* still relies on similarity thresholds. The next paper will fold pair selection into the same optimization problem.
+2. *Spectral analysis across architectures* — KVSlimmer's spectral argument depends on standard Transformers. The statistical properties of KV in MoE, Mamba, and hybrid attention architectures need fresh analysis, which will spawn a series of "spectral-energy-merging for architecture X" papers.
+
+* Implications
+
+This line offers a few concrete lessons for "how to do research" and "how to find problems":
+
+*Treat "why did predecessors do it this way" as the starting point.* H2O → CaM is one example: CaM didn't invent a new compression paradigm — it just stared at H2O's eviction step and asked "how does the output change after eviction?" KVSlimmer does the same — it doesn't change the question, it just stares at AsymKV's observation and asks "why is this true?" *Good problems often don't lie in territory no one has entered — they lie in territory someone has covered but never fully explained.*
+
+*Between "observation" and "proof" there is always room for one paper.* AsymKV was published for nearly a year before KVSlimmer turned its observation into a theorem. If you see a paper in any field that says "we found phenomenon X" without explaining why, *that is a clearly marked research position.*
+
+*Closed-form solutions are genuine craftsmanship.* The LLM field is full of "train a small network to predict X" — being able to avoid that "use a network to explain a network" circularity, and produce an *analytic formula derived from the model's own existing variables*, is a tier above. This is why KVSlimmer emphasizes "only forward-pass variables" — those five words are its core selling point.
+
+*"Deployable" = memory numbers + latency numbers + a one-line code change.* The reason this paper could be written is not that "the theory looks nice" — it is "theory + closed-form solution + empirically measured 29% memory reduction and 28% latency reduction." In the second half of any project, the numbers and engineering costs must be stated clearly. That is the last mile that translates "progress in a paper" into "progress in production."
+
+Takeaway: you can use this line as a template and apply it to any sub-field driven by empirical observation — find the phenomenon that has not yet been theorized, ask "why," give a closed-form answer, and nail it down with engineering numbers. That is KVSlimmer's recipe, and a reusable research path.
+
+* Sources and Credibility
+
+| Paper | Citation relationship | Credibility |
+|-------+-----------------------+-------------|
+| H2O (NeurIPS 2023, arXiv:2306.14048) | Listed as eviction baseline in KVSlimmer | Confirmed |
+| CaM (ICML 2024, OpenReview LCTmppB165) | Listed as merging baseline in KVSlimmer | Confirmed |
+| KVMerger (arXiv:2407.08454) | Appears in KVSlimmer reference list (ge2024model/wang2024) | Confirmed |
+| AsymKV (arXiv:2506.05410) | KVSlimmer explicitly states "building on this insight, AsymKV..." | Confirmed |
+| KeepKV (arXiv:2504.09936) | Appears in KVSlimmer reference list | Confirmed |
+| WeightedKV (arXiv:2503.01330) | Concurrent merging work, complementary to KVSlimmer | Inferred as related; not directly compared in KVSlimmer |
+
+Note: A different paper also named AsymKV (arXiv:2410.13212, COLING 2025) addresses asymmetric KV in 1-bit quantization and is unrelated to this river; included here to avoid confusion.

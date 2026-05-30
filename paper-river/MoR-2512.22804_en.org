@@ -1,0 +1,275 @@
+#+title:      MoR: Mixture Of Representations For Mixed-Precision Training
+#+date:       [2026-05-29 Fri 14:01]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T140148-en
+#+source:     https://arxiv.org/abs/2512.22804
+#+authors:    Bor-Yiing Su, Peter Dykas, Mike Chrzanowski, Jatin Chhugani
+#+venue:      arXiv preprint (Nvidia + Meta), Dec 2025
+
+* The River of the Problem
+
+Training a trillion-parameter model burns through thousands of H100s for months. Could we compress every number from 16 bits down to 8 or even 4 bits — making computation faster and fitting more into memory — while keeping the model just as capable?
+
+This has been stuck for nearly a decade. The difficulty is not "can hardware compute in 8 bits" — it has been able to for years. The difficulty is *cramming a tensor whose values span 1e-9 to 1e9 into a tiny box that can only represent a few hundred numbers, without crashing training*. Each generation has been pulling at two levers: either slice the tensor into ever finer pieces (each row or block gets its own scale factor), or craft ever more elaborate numeric formats (FP8, MXFP8, NVFP4). Finer slicing yields higher fidelity, but the metadata overhead and engineering complexity grow with it. MoR sits at the latest point on this line and proposes an escape: *instead of obsessing over "how fine to slice," ask "which representation should this chunk use."*
+
+* Source Map
+
+#+begin_example
+[2019] Sun et al. - Hybrid FP8 (HFP8)
+  |
+  | Problem: training with INT8 throughout fails (insufficient precision and range)
+  | Solution: use two FP8 formats - E4M3 for forward pass (higher precision),
+  |           E5M2 for backward pass (wider range)
+  v
+[2022] Micikevicius et al. - "FP8 Formats for Deep Learning"
+  |
+  | Problem: HFP8 is a paper-grade hack; no industry standard exists
+  | Solution: formalize E4M3/E5M2 into the OCP spec + propose per-tensor scaling
+  |           (delayed scaling: use historical amax; current scaling: use current amax)
+  v
+[2023] OCP Microscaling (MXFP8) + [2024] Block Scaling
+  |
+  | Problem: one scale factor per tensor — a single outlier corrupts the whole tensor
+  | Solution: cut tensor into small tiles (1x32 sub-channels, or 128x128 blocks),
+  |           one scale per tile
+  v
+[2024] DeepSeek-V3
+  |
+  | Problem: MX's 1x32 tiles are too fine, metadata is expensive;
+  |          one block size does not fit all tensor types
+  | Solution: mixed granularity - activations use 1x128 sub-channel scaling,
+  |           weights use 128x128 block scaling
+  v
+[2024] FGMP - Fine-Grained Mixed Precision
+  |
+  | Problem: uniform FP8 is still too coarse; FP4 saves more but some rows can't survive it
+  | Solution: at per-channel granularity, use an error metric to decide
+  |           whether each row/column uses FP4 or FP8
+  v
+[2025] MoR - Mixture of Representations  <-- target paper
+  |
+  | Problem: FGMP only selects along the "precision" axis and still assumes
+  |          finer is always better; nobody explains *why* fine slicing works
+  | Solution: propose "relative quantization error" as the invariant to preserve;
+  |           instead of fighting over granularity, dynamically select
+  |           which representation (E4M3 / E5M2 / BF16) each chunk should use
+  v
+[2025+] NVFP4 ?  (named by MoR itself as the next step)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2019 | HFP8 (Sun et al.): first proof that "8-bit can train large models"
+
+*** What problem it saw
+
+Before 2018, the mainstream was FP32 training, with FP16 mixed precision at best. INT8 quantization existed but was confined to inference; the moment you tried to train with it, gradients exploded — INT8 can only represent 256 values, while gradient dynamic range spans several orders of magnitude.
+
+*** Its solution
+
+If fixed-point (INT8) cannot hold up, use floating-point. FP8 has two natural variants:
+- *E4M3*: 4-bit exponent + 3-bit mantissa. Higher precision, narrower range (max ~448).
+- *E5M2*: 5-bit exponent + 2-bit mantissa. Wider range (max ~57344), lower precision.
+
+Sun's key insight: *the activations and weights in the forward pass have modest range but demand precision — use E4M3*; *the gradients in the backward pass have wide range but can tolerate noise — use E5M2*. A single network uses both FP8 variants simultaneously.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: use the right tool for the right job. Forward pass needs "image quality"; backward pass needs a "wide-angle lens."
+
+Remaining pit: HFP8 is a hand-crafted recipe at research-lab level. Nobody knows how to systematize it. Which format a tensor gets, how each tensor's scale factor is computed — all tuned by hand. Training a 100B model in industry requires a *recipe*, not a one-off paper example.
+
+** 2022 | Micikevicius et al. (FP8 Formats): formalized into OCP spec + scaling protocol
+
+*** What problem it saw
+
+Three years after HFP8, nobody could reproduce "train a SOTA model with FP8." One reason: formats were not standardized — each chip vendor defined its own FP8. Another reason: how to compute scale factors was never clearly specified.
+
+*** Its solution
+
+Two things. First, codify E4M3 / E5M2 into the OCP (Open Compute Project) standard, giving the Nvidia H100 its first genuine hardware-level FP8 support. Second, propose two flavors of *per-tensor scaling*:
+
+- *Current scaling*: compute the amax (absolute maximum value) of the current batch's tensor and use it to map the range into the FP8-representable interval. Simple, but requires computing amax every step.
+- *Delayed scaling*: estimate the current amax from recent historical amaxes, avoiding synchronization overhead. Breaks when the data distribution shifts abruptly.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: first align a single tensor's range to the format's sweet spot, then quantize. This is the foundation on which all subsequent FP8 training rests.
+
+Remaining pit: *one tensor, one amax*. If one row in the tensor contains an outlier, the entire table's scale is pulled toward that outlier, and every other row underflows to zero.
+
+** 2024 | Microscaling (MXFP8) + Block Scaling: chop it up, each tile lives by its own scale
+
+*** What problem it saw
+
+The fundamental flaw of per-tensor scaling: *one number governs a whole region*. Transformer activations have outlier channels; weight matrices have dead channels; gradients have localized spikes. A single scale factor forces 99% of values to pay for 1% of anomalies.
+
+*** Its solution
+
+Slice the tensor into small tiles, *one scale factor per tile*. The OCP Microscaling standard defined 1×32 sub-channel tiles; others proposed 128×128 2D tiles. The smaller the tile, the more contained the outlier's damage.
+
+To prevent metadata explosion, scale factors are themselves compressed — MX uses E8M0 (exponent only, no mantissa) for scales.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: changing from "one currency for the whole country" to "one currency per city." Local exchange rates are more accurate, but you have to print vastly more notes.
+
+Remaining pits:
+- 1×32 is too fine; storing and fetching metadata is expensive.
+- E8M0 scale factors sacrifice precision — they can only represent powers of two, leaving scaling error uncontrolled.
+- A single tile size cannot suit all tensor types (activations, weights, and gradients have very different statistical profiles).
+
+** 2024 | DeepSeek-V3: reconcile with mixed tile sizes
+
+*** What problem it saw
+
+MX's 1×32 works well for activations (because activation outliers are channel-level), but is wasteful for weights — weight distributions are smooth and don't need such fine tiles. Conversely, a 128×128 tile is coarse enough for weights but too coarse for activations.
+
+*** Its solution
+
+*Different tensors, different tile sizes*:
+- *Activations*: 1×128 sub-channel scaling (along the channel dimension)
+- *Weights*: 128×128 2D block scaling
+
+This is the key engineering detail behind DeepSeek-V3 training a 671B model with FP8.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: activation outliers are "certain channels that are naturally anomalous," so slice along the channel axis; weight statistics are smoother in 2D, so use square blocks.
+
+Remaining pits:
+- Still a "tuned by engineers" recipe. Change the model or the dataset and you have to retune the tile sizes and slicing strategy.
+- Slicing is finer, *but every tile is still forced into the same numeric format (FP8)*. What if some tiles' statistical properties simply don't fit FP8?
+
+** 2024 | FGMP: choose a different precision for each row — opening the door to "mixed representations"
+
+*** What problem it saw
+
+After DeepSeek-V3, the next target was to halve cost again: go from FP8 to FP4. But FP4 has only 16 representable values; applying it to an entire table guarantees collapse.
+
+*** Its solution
+
+*At per-channel granularity, judge each row or column independently*: compute a local error metric (quantization error, estimated matmul error, or block sensitivity), and use it to decide whether the row should be FP4 or FP8.
+
+This is the first time the decision "which format to use" was brought down from a global level to the sub-tensor level.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: this is the natural next step from DeepSeek-V3's "different tile sizes for different tensors" — *different tiles use different formats*.
+
+Remaining pits:
+- The choice is only between FP4 and FP8; BF16 fallback is not considered.
+- Decision granularity stays at per-channel; it never goes down to 2D tile level.
+- Most critically: *nobody explains why this kind of fine-grained slicing reliably preserves model quality*. All these works are stacking tricks; no one digs for the underlying invariant.
+
+** 2025 | MoR: step outside "ever finer slicing," and instead ask "which representation fits this chunk"
+
+*** What problem it saw
+
+After surveying the entire line above, MoR's authors asked a question everyone had skipped: *Why does DeepSeek-V3's fine-grained slicing preserve accuracy? What is the underlying invariant?*
+
+If you don't know why something works, your only recourse is to keep making the slicing finer and the recipe more complex — and that road has an end.
+
+*** Its solution
+
+Two layers of innovation.
+
+*Layer one: find the invariant.* They propose that the *relative quantization error* (the mean of |x − Q(x)| / |x| across elements) is the key metric. As long as this relative error stays below a threshold (4.5% in experiments), model quality matches the BF16 baseline — *regardless of slicing granularity*. This means: DeepSeek-V3's fine 128×128 tiles are not strictly necessary; per-tensor scaling is fine too, as long as the relative error is low enough.
+
+*Layer two: dynamic format selection (the MoR framework).* For each tile or tensor, rank candidate formats from most aggressive to most conservative (E4M3 → E5M2 → BF16), then check relative error for each in turn. Use the first format that passes; fall back if it doesn't. Alongside this they propose *GAM (Group Amax Mantissa) scaling*: decouple the mantissa of the scale factor (shared at FP32 precision) from the exponent (per-tile E8M0), achieving metadata overhead close to MX but precision close to FP32.
+
+Final result: 98.38% of tensors are quantized to FP8; the remaining 1.62% automatically fall back to BF16; overall accuracy matches the BF16 baseline, *with no fine-grained tiling required*.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: previous work was all about "slicing"; MoR switches to "selecting." Once you know the criterion is "relative error < threshold," you can comfortably use large tiles — as long as that large tile's relative error is low enough. And when a tile's relative error exceeds the threshold, rather than forcing FP8 and fiddling with the scale, simply fall back to BF16.
+
+Remaining pits:
+- The relative error criterion is sufficient but not necessary — it is conservative. Some tiles that exceed the threshold might not actually hurt model quality.
+- Not yet validated on NVFP4, a more aggressive format (the authors themselves name this as the next step).
+- E5M2 is almost never selected in tensor-level experiments, suggesting the three-way framework degenerates in practice to a two-way choice (E4M3 / BF16).
+
+* Frontier Extensions
+
+As of December 2025 (when MoR was released), this is the state of the art. MoR itself names two extension directions:
+
+1. *More aggressive formats*: apply the same "relative error invariant + dynamic format selection" framework to NVFP4 (1×16 sub-channel, E4M3 scale factors, FP4 values). NVFP4 is a format Nvidia proposed in 2025; current SOTA models are still probing whether it can be used for training.
+2. *Better invariants*: relative error is conservative — can we find a tighter invariant that lets more tensors use lower precision?
+
+Follow-on work (if any) will appear at 2026 ICLR / MLSys / arXiv. Key terms worth tracking: "dynamic mixed-precision training," "invariance metric for quantization," "NVFP4 training recipe."
+
+* One Diagram
+
+#+begin_example
+                    Granularity axis (how fine the slicing is)
+                          ^
+                          |
+       128x128 tiles +----+------+
+                     |           |
+                     | DeepSeek  |   <-- "different tile sizes for different tensors"
+       1x128 sub-ch  |           |
+                     +----+------+
+                          |
+       1x32 sub-ch   +----+------+
+                     |  MXFP8   |   <-- "slice even finer"
+                     +----+------+
+                          |
+       per-channel   +----+------+--------+
+                     | Llama3   | FGMP   |   <-- "different precision per row (FP4/FP8)"
+                     +----+------+--------+
+                          |
+       per-tensor    +----+------+
+                     | Micikevicius|  <-- "one scale per whole tensor"
+                     |    2022     |
+                     +----+------+
+                          |
+                          v
+                    Single format
+       -------+------+-----+-----+----------+-----------> Format axis
+              HFP8          FP8         MoR (E4M3/   NVFP4
+              (2019)       (2022)      E5M2/BF16     (2025+)
+                                        dynamic)
+                                        (2025)
+
+
+      Evolution trajectory:
+
+      Early:  exploring the "format" axis (E4M3 vs E5M2)
+       |
+       v
+      Middle: moving to the "granularity" axis
+              (per-tensor -> per-block -> sub-channel)
+       |
+       v
+      Recent: FGMP crosses both axes (select format at per-channel granularity)
+       |
+       v
+      MoR:    steps outside both axes — proves "as long as relative error is met,
+              granularity doesn't matter," then makes dynamic decisions on the format axis
+#+end_example
+
+* Insight
+
+On the surface, this decade-long evolution looks like "ever fancier numeric formats and ever finer slicing." But underneath it is *a methodological awakening*.
+
+The first five generations (HFP8 → FP8 Formats → MXFP8 → DeepSeek-V3 → FGMP) were all doing the same thing: *stacking tricks empirically*. Each generation said "I made the tiling finer" or "I added a new format," and nobody stopped to ask: *what invariant are we actually preserving?*
+
+MoR is the first paper to answer that question explicitly. Its real contribution is not the "mixture of representations" algorithm itself — that algorithm is quite plain: try formats in order, fall back if the criterion is not met. The real contribution is *identifying "relative quantization error" as a computable invariant*. Once you have that invariant in hand, every question of "how fine to slice" or "which format to use" becomes an engineering choice within the same framework.
+
+This is the shift from alchemy to physics. The previous five papers were alchemists competing over who had the finest furnace. MoR says: "You're all right, but as long as the temperature (relative error) stays within a certain range, the shape of the furnace doesn't matter."
+
+The most likely next directions:
+1. *Tighter invariants.* Relative error is crude. The second-order information of the loss surface (Hessian / Fisher) is what truly governs model quality. The next generation of work will try to move the invariant from "4.5% relative error" toward something like "preserve the dominant eigenvalues of the Fisher information matrix."
+2. *Unifying MoR across training and inference.* MoR currently targets training, but the relative error criterion is naturally applicable to PTQ. Using the formats chosen at training time directly at inference would eliminate the QAT step.
+3. *Hardware co-design.* If 98.38% of tensors are FP8 and 1.62% are BF16, the next generation of GPUs should include dedicated "mixed-dtype GEMM" units, avoiding the overhead MoR currently pays by upcasting the BF16 tensors before computation.
+
+* Takeaways
+
+A takeaway for *how to do research*: the earlier generations competed on engineering effort (finer tiles, more complex recipes), but the real breakthrough came when someone stopped and asked "what invariant are we actually optimizing?" This is Pearl's "level jump": when you can't outcompete others at one level, go up a level and redefine the problem.
+
+A takeaway for *how to find problems*: when a field is already fighting over the third decimal place (DeepSeek-V3 tunes to 1×128, MXFP8 to 1×32, FGMP to per-channel), it usually means everyone has taken a wrong turn. MoR did not compete to reach 1×8; it asked "why slice at all?" The next time you see a field where everyone is stacking tricks, first suspect that they have all missed a shared invariant.
+
+This means you can:
+- When reading papers, *don't only look at the claimed contribution — look at the unstated assumptions*. Before MoR, everyone assumed "finer is better" without ever proving it. Next time you read "we achieved finer-grained slicing," ask: "does finer slicing actually make sense, or is it just easy to implement?"
+- When doing engineering optimization, *find the invariant before tuning the parameters*. If you don't know what invariant you're protecting, every optimization you make is local, and the next paper will supersede it.
+- When you see names like "Mixture of X" or "Dynamic X," *check whether they propose a new criterion*. If it is merely "try and pick," that is engineering. If there is a backing principle — "we select this way in order to preserve invariant Y" — that is research.

@@ -1,0 +1,302 @@
+#+title:      UniQL: Unified Quantization and Low-rank Compression for Adaptive Edge LLMs
+#+date:       [2026-05-29 Fri 12:54]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T125411-en
+#+source:     https://arxiv.org/abs/2512.03383
+#+authors:    Hung-Yueh Chiang, Chi-Chih Chang, Yu-Chen Lu, Chien-Yu Lin, Kai-Chiang Wu, Mohamed S. Abdelfattah, Diana Marculescu
+#+venue:      arXiv 2025-12 (preprint)
+
+* The River of the Problem
+
+In a single sentence: memory and compute on a phone are constantly shifting — switch to a game, switch to the camera, switch to a background sync, and the headroom left for a large model shrinks. Can we prepare a model just once in the cloud, then compress it further on the fly at runtime, based on exactly how many resources happen to be available?
+
+The hard part is not "how to make a model smaller" — everyone can do that. The hard part is "how small should be continuously adjustable."
+The conventional approach is to run one offline pass to get a 7B model, another to get 4B, another to get 2B, each size trained separately, stored separately, and loaded separately.
+On the device side you either cram in a whole collection of models, or you are locked to one fixed size.
+But a real phone is not a three-mode dial labeled High/Medium/Low — it varies continuously from morning to night.
+
+There is an even deeper difficulty: low-bit quantization (each weight occupies only 4 bits), low-rank compression (replace one fat matrix with two thin ones via SVD), and structured pruning (drop entire heads or channels outright) have historically operated as three separate communities.
+Whichever one moves first tends to block the other two — quantize first and pruning becomes ineffective; prune first and recomputing SVD takes hours.
+So "adjust the compression level on the device whenever you want" has remained an open problem.
+
+* The Source Map
+
+#+begin_example
+[2017] Denton et al. (conventional wisdom)
+       Naive SVD: keep the largest singular values, discard the small ones
+         |
+         | Problem: matrix reconstruction error ≠ model task accuracy
+         v
+[2022] FWSVD - Hsu et al.
+       Weight by Fisher information: "preserve important parameters more carefully"
+         |
+         | Problem: still weights by W itself, not activations;
+         |          sensitivity varies enormously across layers
+         v
+[2023] ASVD - Yuan et al.
+       Rewrite W using activation distributions, then decompose; calibrate layer by layer
+         |
+         | Problem: when truncating singular values, only looks at W itself,
+         |          ignores downstream error propagated through the network
+         v
+[2025] SVD-LLM - Wang et al. (ICLR'25)
+       Truncation-aware whitening: makes "dropping a singular value"
+       directly correspond to "how much accuracy is lost"
+         |
+         | Problem: one compression ratio per run; no communication with
+         |          quantization; requires fine-tuning
+         |
+         | (Side branch: MoDeGPT - Lin et al. ICLR'25 Oral
+         |   Module-level decomposition, no fine-tuning, but requires
+         |   O(n^3) pseudo-inverse + FP64; numerically unstable when
+         |   intermediate >> hidden (e.g. Qwen-2.5-7B);
+         |   every new compression ratio requires a full rerun)
+         v
+[2025] UniQL - Chiang et al. (this paper)
+       Unifies quantization, SVD low-rank, and structured pruning into one:
+       one cloud pass produces a "column-sorted 4-bit model";
+       the device simply picks the top-k columns at runtime.
+       Covers Transformer + SSM + hybrid architectures.
+#+end_example
+
+Note: this lineage focuses on the *low-rank SVD compression* branch, because it is the most directly targeted by UniQL's introduction (SVD-LLM and MoDeGPT are its primary baselines).
+The two parallel branches — quantization (GPTQ → AWQ → QuaRot → SpinQuant) and elastic training (Flextron → LLaMaFlex → Jet-Nemotron) — are also critiqued by UniQL but are not its main axis.
+
+* The Evolutionary Narrative
+
+** Around 2017 | Naive SVD: Splitting a Matrix into Two Thin Ones
+
+*** What problem did it see?
+
+Large model weight matrices are big and dense.
+The most intuitive compression idea: use the cleanest tool from linear algebra — singular value decomposition (SVD) — to write a d×d matrix W as U·Σ·V, where Σ is a diagonal matrix of singular values.
+Keep the top k singular values and discard the rest, yielding a rank-k approximation W' that only occupies two thin d×k matrices.
+
+This had been done in image processing and recommendation systems and is theoretically clean: the singular values you drop are exactly those that minimize the reconstruction error ||W - W'||.
+
+*** Its solution
+
+Apply SVD directly to each layer's weight matrix; truncate singular values according to a target compression ratio.
+Done.
+
+*** Why this works on small models but collapses on large ones
+
+It collapses on a single detail: SVD optimizes for *minimum matrix reconstruction error*, not *maximum model task accuracy*.
+For a simple linear model, these two objectives are equivalent.
+For a 70-layer non-linearly stacked LLM, they are completely different — a "large" singular value you kept might correspond to a direction that has zero influence on next-token prediction, while a "small" one you dropped might encode the critical distinction between a question and a statement.
+
+The result: you believed you incurred only a 5% reconstruction loss, but perplexity doubles when you actually run the model.
+
+** 2022 | FWSVD: Let Parameters Declare Their Own Importance
+
+*** What problem did it see?
+
+SVD treats all parameters equally.
+But the model itself already knows which parameters are critical — run a small calibration batch through backpropagation and read the expected squared gradient (Fisher information) for each parameter; this directly measures "how much does moving this parameter change the loss."
+
+Hsu et al. realized: instead of letting SVD optimize an objective unrelated to the task, embed the task signal into the decomposition.
+
+*** Its solution
+
+Before performing SVD, weight each row/column of the weight matrix by its Fisher information — important rows get higher weight, making SVD "reluctant" to sacrifice them.
+Formally this is just SVD(diag(I_F) · W).
+
+*** Where it works and where it gets stuck
+
+It works philosophically: abandon "perfectly reconstruct the matrix," replace with "stay as close as possible to model behavior."
+This step pointed in exactly the right direction — every subsequent SVD-for-LLM paper followed it.
+
+The remaining problem: FWSVD still only looks at *the weights themselves* to decide weighting.
+But when a Transformer is running, weights are not isolated — each weight matrix multiplies an activation vector a, and the output is W·a.
+What matters downstream is not which row of W is large, but which directions in W·a are corrupted.
+LLM activations are notorious for outliers (a few channels are 100× larger than average), and FWSVD has no mechanism to handle this.
+
+** 2023 | ASVD: Absorbing the Activations' Character into the Weights
+
+*** What problem did it see?
+
+After seeing FWSVD, Yuan et al. pressed further: you weight the parameters by Fisher information, but how is Fisher information computed? It still requires a calibration batch and backpropagation.
+Since you already have data available, why not look directly at *the distribution of activations*?
+
+The more immediate pain point: LLM activations have those troublesome outlier channels.
+For W·a, a channel in a that is unusually large means the corresponding column of W is especially "sensitive" — compression errors in that column get amplified many times over.
+FWSVD is blind to this.
+
+*** Its solution
+
+Do not apply SVD directly to W.
+First, construct a diagonal scaling matrix S from the activation distribution, transforming W into W·S, then perform SVD on W·S.
+S's role is to "scale down" the aggressive channels on W's side before decomposition, then compensate afterwards.
+This is equivalent to *absorbing the activations' character into the weights*.
+
+One more layer: different layers tolerate compression differently — early layers shatter with even small perturbations, middle layers can be aggressively trimmed.
+So an iterative algorithm calibrates how much to cut per layer.
+
+*** Where it works and where it gets stuck
+
+Works: for the first time makes SVD genuinely "see" the activations; 10–30% compression with essentially no accuracy drop.
+
+Stuck: ASVD still operates each layer independently.
+What does dropping a singular value in this layer mean for the next layer? For the final logits?
+ASVD pretends not to know — it only minimizes the reconstruction error of W·S.
+Once the compression ratio exceeds 30%, errors accumulate and amplify across layers.
+
+** 2025 | SVD-LLM: Aligning "Dropping a Singular Value" with "Losing Accuracy"
+
+*** What problem did it see?
+
+Wang et al. pushed ASVD's incompleteness to its logical conclusion:
+after SVD you have a sequence of singular values σ₁ > σ₂ > ... > σ_n; in principle dropping σ_n should hurt less than dropping σ_{n-1}.
+But when you actually evaluate model accuracy, you often find dropping σ_n hurts more — the magnitude of a singular value and "how much the model degrades when you drop it" are not monotonically related at all.
+
+This is not a bug; it is because SVD's notion of "size" is relative to the matrix W itself, not to the output after passing through the entire network.
+
+*** Its solution
+
+Two steps:
+
+1. *Truncation-aware whitening*
+   Before SVD, whiten the weights using the square root of the activation covariance matrix — after whitening, the magnitude of each singular value *directly equals* the output L2 loss incurred by dropping it.
+   Now dropping the smallest is provably optimal.
+
+2. *Sequential low-rank updates*
+   After truncation, it does not simply leave behind "the truncated W"; instead a recursive update adjusts the not-yet-compressed layers so they compensate for the error introduced by earlier layers.
+
+*** Where it works and where it gets stuck
+
+Works: became the low-rank compression SOTA at ICLR'25.
+Theoretically, for the first time, "singular value magnitude = task loss" are properly aligned.
+
+Stuck (which is exactly what UniQL targets):
+
+1. *One compression ratio per run* — to get 20%, 25%, and 30% compression you need to run SVD-LLM three separate times. No way to adjust on the fly on a phone.
+2. *Requires fine-tuning to recover accuracy* — sequential updates plus extra fine-tuning means one preparation pass takes hours.
+3. *Handles only low rank, not quantization* — if you then want to quantize to 4-bit, the two pipelines conflict, and quantization noise destroys the carefully calibrated low-rank reconstruction.
+4. *Designed only for Transformers* — breaks down for Mamba-style SSMs or hybrid architectures like Nemotron-H that interleave Transformer and Mamba layers.
+
+The concurrent *MoDeGPT* tried to sidestep fine-tuning: instead of per-layer SVD it decomposes entire Transformer blocks as a *module*, claiming no fine-tuning needed.
+The cost is computing a pseudo-inverse — O(n³) complexity, FP64 precision required — which causes numerical instability for models like Qwen-2.5-7B where intermediate dimensions are much larger than hidden dimensions.
+And every new compression ratio requires starting over from scratch.
+
+** 2025-12 | UniQL: Three Pipelines Twisted into One — Cloud-Prepared, On-Device Adjustable
+
+*** What problem did it see?
+
+Merging all the accumulated pain points from above:
+
+- Low-rank side (SVD-LLM): one compression ratio per run, needs fine-tuning, slow, Transformer-only
+- Quantization side (GPTQ, AWQ, HQQ): 4-bit is mature, but incompatible with low-rank; embedding/output layers usually left at FP16
+- Elastic training side (Flextron, LLaMaFlex): can be "multi-setting" but requires training from scratch, a GPU cluster, and carefully curated datasets, and is locked to a single model family
+- Device side: memory and compute change at any moment; needs *runtime-adjustable*, not *offline multi-version*
+
+A deeper reframing: everyone had been thinking of "low-rank decomposition" as "compression." UniQL thinks of it as *sorting*.
+SVD does not merely split a matrix into two thin matrices — it *ranks information by importance*: σ₁ is most important, σ₂ is next, and so on.
+If you sort this ranking in the cloud and serialize it onto the device, the device can truncate however far down the list it wants, without any recomputation.
+
+*** Its solution
+
+One cloud pass, four things:
+
+1. *Structured weight ordering*: for each layer, perform a new *quantization-aware SVD* — the decomposition itself accounts for the fact that weights will be subsequently quantized to 4-bit, so the columns ranked at the top remain stable under quantization noise. Better than conventional SVD under quantization.
+2. *One fine-tuning pass + one GPTQ quantization pass*: all layers quantized to 4-bit, including embedding and output layers — more aggressive than AWQ/HQQ, which leave these in FP16.
+3. *State-aware SSM ordering*: for Mamba-class state-space models, rank the state dimensions as well — something nobody had done before.
+4. *Fused RoPE kernel*: rotary positional encoding is normally computed separately from attention; after pruning changes the dimensions, a naive implementation wastes a memory round trip; fusing them into a single kernel removes this overhead.
+
+At device runtime: how much memory do you have today? Want 10% pruning? Read the top 90% of columns. Want 35% pruning? Read the top 65%.
+All columns are already sorted, already quantized — no recomputation required.
+
+*** Why it works, and what it leaves behind
+
+The root reason it works: redefining "compression" as "sort + truncate," concentrating all offline work in the sorting step, and collapsing all online work to "read the top k columns."
+Four compression dimensions (low-rank, pruning, quantization, state-space) share a single timeline for the first time.
+
+Numbers: 4–5.7× memory compression, 2.7–3.4× token throughput, accuracy drop under 5% at 15% pruning.
+Approximately 22× faster than MoDeGPT.
+
+Remaining gaps:
+
+- 35% is the current safe upper bound; push further and accuracy collapses
+- The "sorted order" is derived from a fixed calibration dataset in the cloud; if the real input distribution on the device differs substantially, the optimal order may be different
+- Only covers Transformers and SSMs; next-generation architectures (linear attention, Hyena, other recurrent variants) will need separate treatment
+
+* Frontier Extensions
+
+UniQL only appeared on arXiv in 2025-12; as of 2026-05, public citation trackers (Semantic Scholar, Google Scholar) show no papers directly citing it yet.
+But several works in the same time window addressing adjacent problems are worth noting:
+
+- *CALDERA* (arXiv:2405.18886) — decomposes W as Q (low-precision) + L·R (low-rank residual); theoretically proves that joint low-rank + low-precision decomposition is optimal PTQ. UniQL's "SVD first, then quantize" is essentially an engineering simplification of this.
+- *LR-QAT* (arXiv:2406.06385) — attaches a low-rank auxiliary weight during quantization-aware training to absorb quantization gradients; the direction is reversed (training-time rather than PTQ), but equally blends low-rank and quantization.
+- *Low-Rank Correction for Quantized LLMs* (arXiv:2412.07902) — adds floating-point low-rank matrices on top of an already-quantized model to correct activation errors in W4A4.
+- *Jet-Nemotron* (Gu et al. 2025) — uses post-NAS to automatically find compact LLM architectures; UniQL cites it as "another elastic method that cannot generalize across model families."
+
+The next advances in this area will likely follow two directions:
+(a) Extending UniQL's "sorted-adjustable" idea to more compression dimensions (KV cache, attention heads, layer skipping);
+(b) Moving calibration from a fixed cloud dataset to *device-local data*, so the sort order can adapt to each individual user.
+
+* The Big Picture in One Diagram
+
+#+begin_example
+     "Compression" does not transfer to LLMs   "Compression" aligned with task loss   "Compression" becomes sorting
+                    |                                      |                                   |
+       Naive SVD --> FWSVD --> ASVD --> SVD-LLM --> MoDeGPT --> UniQL
+        (2017)     (2022)    (2023)    (2025)       (2025)     (2025-12)
+          |          |         |          |            |            |
+      Reconstruction Fisher  Activation Whitening  Module-level  QA-SVD + ordering
+        error      weighted   absorbed   alignment  decomposition + full-stack 4-bit
+      minimized   by Fisher   into W   of singular  no fine-tune  + SSM support
+                  information           values          |          + RoPE fusion
+                                                        v               v
+                                                  one ratio per run   one pass →
+                                                  numerical instability adjustable at runtime
+
+       (  compression only  ) ( weights ) ( activations ) ( downstream loss ) ( entire pipeline )
+                                    progressively "opening eyes"
+
+       ============== Quantization branch (parallel) ==============
+       GPTQ --> AWQ --> QuaRot --> SpinQuant
+                                       \
+                                        \   =========== Elastic training branch (parallel) ===========
+                                         \   Flextron --> LLaMaFlex --> Jet-Nemotron
+                                          \      (requires training / locked to a single architecture)
+                                           v
+                                       UniQL: three branches twisted into one
+                                       sort once + truncate anywhere at runtime
+#+end_example
+
+* Insight
+
+On the surface this evolutionary line looks like "SVD getting progressively more refined," but underneath it is really about *the compression problem being redefined step by step*:
+
+| Stage     | What everyone thought compression was solving | What turned out to be the real problem      |
+|-----------+-----------------------------------------------+---------------------------------------------|
+| Naive SVD | "Reconstruct a similar matrix"                | "Preserve model behavior"                   |
+| FWSVD     | "Preserve model behavior"                     | "Looking at weights is not enough; need activations" |
+| ASVD      | "Looking at activations is not enough"        | "Need to track downstream per-layer error"  |
+| SVD-LLM   | "Aligning loss is not enough"                 | "One ratio per run is not flexible enough"  |
+| UniQL     | "Flexibility is not enough"                   | "Must unify with quantization and pruning"  |
+
+Every step forward was *not* the invention of a cleverer mathematical trick — it was the discovery that *the previous generation's objective function was wrong all along*.
+SVD as a tool has existed since 1965 and the formula has not changed — what changed is our understanding of *who compression is actually serving*.
+
+The most transferable insight from this whole arc is UniQL's reinterpretation of SVD: *from "compression" to "sorting"*.
+When you rank all singular values by some importance metric, and you make that ranking robust enough to survive subsequent quantization, then "how much to compress" shifts from an *offline decision* to a *runtime decision*.
+Compression ratio is no longer a property of the model — it is a property of the query.
+
+Where might things go next? Two directions:
+
+1. *Further unification of compression dimensions* — beyond weight low-rank + quantization + column pruning, there are another ten-odd dimensions: KV cache quantization, attention head pruning, layer skipping, token pruning, and more, all currently operating independently. Whoever first brings these into the same "sort-and-truncate" framework claims the next SOTA.
+2. *Decentralizing calibration* — all current sorting is done in the cloud using a fixed calibration dataset. If the sorting could be incrementally updated on-device from each user's local data, "adaptive" would finally mean truly personal.
+
+* Takeaways
+
+For *doing research*: when a field looks like it has been "squeezed down to micro-optimizations," ask "what problem was it originally solving, and has the definition of that problem quietly shifted several times?" Low-rank compression from 2017 to 2025 advanced not because anyone invented a cleverer SVD variant, but because someone kept noticing that *the previous generation's objective function was fundamentally wrong*. That opportunity window is far wider than "add 0.5 points to the current SOTA."
+
+For *finding problems*: pay attention to *things that have been tacitly split apart by convention*.
+Quantization, low-rank, and pruning spent five years as three separate subcommunities, occasionally citing each other but rarely collaborating deeply.
+UniQL's contribution was not inventing any single-point technique, but *recognizing that these three things are three faces of the same thing*, and then writing one unified pipeline.
+Wherever you see "the field treats A and B as two separate problems," ask: "are they genuinely separate, or did they just happen to be done separately historically?"
+
+For *building things*: this means you can —
+- When designing any edge AI product, treat "compression ratio" as a *runtime dial* rather than a *parameter locked in at model selection time*;
+- When coordinating with hardware teams, upgrade from "I need 4-bit quantization" to "I need a cloud-sorted, device-side arbitrarily truncatable weight format";
+- When choosing model architectures, make "compression friendliness" a first-order criterion — can the model be cleanly decomposed? Can its states and channels be meaningfully ranked? Are there small details like RoPE that break pruning alignment? — rather than an afterthought.

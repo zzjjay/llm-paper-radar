@@ -1,0 +1,226 @@
+#+title:      Bandwidth-Efficient Adaptive Mixture-of-Experts via Low-Rank Compensation
+#+date:       [2026-05-29 Fri 13:27]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T132753-en
+#+source:     https://arxiv.org/abs/2512.17073
+#+authors:    Zhenyu Liu, Yunzhen Liu, Zehao Fan, Garrett Gagnon, Yayue Hou, Nan Wu, Yangwook Kang, Liu Liu
+#+venue:      arXiv preprint, 2025-12-18
+
+* The River of Problems
+
+MoE (Mixture-of-Experts) promised to be "effortless" — a trillion-parameter model that, for each incoming token, activates only a small handful of experts. But the moment you try to squeeze it into a memory-constrained machine, the ideal hits a wall: all parameters still have to be stored (you never know which experts will be called next), transfers are still point-to-point (routing is token-level, so batching is impossible), and compression makes things worse — push experts down to 3-bit and accuracy collapses; leave them uncompressed and they won't fit.
+
+In short: *MoE's sparse activation was supposed to save money, but at the bandwidth bottleneck it turns into waste*. This research thread traces a decade of people simultaneously complaining "why is MoE so hard to deploy" while painstakingly tightening the chain of routing → caching → quantization → compensation → adaptivity, one link at a time.
+
+Why is the problem hard? Because routing is fundamentally *unpredictable* — you have to run the router before you know which two experts the next token will select. That single property nullifies every classical "schedule-in-advance" trick: you can't pre-load weights the way dense models do, and you can't rely on natural LRU hits the way KV cache does. Every step forward is a head-on collision with routing uncertainty.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Outrageously Large NNs (Sparsely-Gated MoE)
+  |
+  | Contribution: a token activates only k experts -> compute saved
+  | Hidden cost:  all parameters still need storage; routing is unpredictable
+  v
+[2023] Eliseev & Mazur - Mixtral-Offloading (arXiv:2312.17238)
+  |
+  | Problem: can't fit all 16 experts on GPU
+  | Solution: most experts live on CPU/disk, fetched on demand (LRU cache + skip predictor)
+  | Hidden cost: on cache miss the entire expert travels over PCIe -- bandwidth explosion
+  v
+[2024] Tang et al. - HOBBIT (arXiv:2411.01433)
+  |
+  | Problem: pulling a full-precision expert on cache miss is too heavy
+  | Solution: high-importance experts -> FP16, low-importance -> INT4 (mixed precision)
+  | Hidden cost: coarse granularity (binary token-level choice); ignores intra-expert structure
+  v
+[2025] Huang et al. - MiLo (arXiv:2504.02658)
+  |
+  | Problem: compressing experts directly to 3-bit causes accuracy collapse
+  | Solution: quantize + add a small SVD residual matrix as compensation (low-rank compensator)
+  | Hidden cost: same rank for every expert -- heavy ones under-compensated, light ones wasteful
+  v
+[2025-12] BEAM-MoE / Liu et al. - (arXiv:2512.17073)  <-- this paper
+  |
+  | Problem: static low-rank compensation ignores token-level routing
+  | Solution: router-guided -- compensation factors sent only to Top-n experts;
+  |           rank allocated per expert by kurtosis
+  | (Looking ahead: further extended to GPU-NDP systems, moving compensation compute near memory)
+  v
+[2025-11] Chu et al. - DynaExq (arXiv:2511.15015) <-- parallel follow-up
+        Dawei et al. - Dynamic Quant for MoE
+  | Same era: a different angle -- no compensation; instead adjust precision online
+  |           (hot experts promoted to FP16)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Shazeer et al. (Sparsely-Gated MoE): "Let only a few experts do the work"
+
+*** What problem it saw
+
+By 2017 large NLP models were already hitting a wall: scaling up parameters meant exploding compute. A dense LSTM or Transformer uses every parameter on every forward pass. Shazeer found that unsettling — the human brain doesn't fire at full capacity for every stimulus, so why must neural networks?
+
+*** Its solution
+
+Add a *router*: for each incoming token, the router scores 256 experts and lets only the top two do the work. Model parameter count grows 100×; per-token compute barely increases.
+
+Analogy: instead of requiring every employee to attend every meeting, you now only summon the two most relevant people. The conference rooms still exist (parameters are still there), but meeting time barely grows.
+
+*** Why it works (and what it buried)
+
+It works because most parameters are *useful only for specific inputs*. But the "savings" are illusory — what it saves is *compute*, not *memory*. All 256 experts must be kept nearby because you never know which will be called next. On an 8-GPU A100 cluster that's fine; on a consumer GPU, nothing fits. This is the root that every subsequent paper attacks: *MoE saves compute but not memory*.
+
+** 2023 | Mixtral-Offloading: "What won't fit on GPU, move out — fetch it when needed"
+
+*** What problem it saw
+
+In 2023 Mistral open-sourced Mixtral-8x7B, and suddenly everyone wanted to run it — 47B parameters, 90+ GB in FP16, beyond almost any GPU.
+
+*** Its solution
+
+Eliseev & Mazur studied routing logs and found a lifesaving regularity: *consecutive tokens tend to select the same experts* (co-selection probability 2–3× above random). So: keep all experts on CPU or disk, maintain an LRU cache on GPU; after the router fires, fetch missing experts over PCIe; add a skip-connection predictor that begins prefetching slightly ahead of time.
+
+Analogy: a library too large for your desk — you keep the 10 books you read most recently at hand and run to the stacks for new ones. But because "someone reading the Zuozhuan will likely stay in classical history," hit rates reach 60–70%.
+
+*** Why it works (and what it buried)
+
+It works by converting "doesn't fit in memory" into "transfers are a bit slow." But on a cache miss you must move an *entire expert* (hundreds of MB) from CPU to GPU over PCIe — one miss costs as much as dozens of normal forward passes. The system bottleneck shifts entirely from compute to bandwidth, and PCIe is narrow and slow.
+
+The next question surfaces naturally: *can we make each fetched expert smaller?*
+
+** 2024 | HOBBIT: "High-importance experts get full precision; low-importance get quantized"
+
+*** What problem it saw
+
+Tang et al. stared at the cache-miss moment and asked: since misses are unavoidable, can the thing we fetch be cheaper? The router already assigns a score to every selected expert — that score is literally "how important is this expert for this token?" High-score experts deserve FP16; low-score experts can take INT4, because they barely affect the output anyway.
+
+*** Its solution
+
+Three components: (1) *token-level dynamics* — decide precision per expert based on the router score at inference time; (2) *layer-wise prefetching* — use the previous layer's input to predict which experts the next layer will call; (3) *sequence-level caching* — LRU + LFU hybrid, prioritizing retention of high-precision copies.
+
+Analogy: the same library, but instead of fetching the full book on a miss, you fetch the full text for important books and an abridged summary for less important ones. Summary: 1 MB; full text: 100 MB.
+
+*** Why it works (and what it buried)
+
+Bandwidth utilization improves noticeably — up to 9.93× end-to-end speedup. But HOBBIT's precision choice is *binary*: either FP16 or INT4, with nothing in between. And its importance signal is only the router score; it never looks at the *weight distribution inside each expert*. Some experts have benign weight distributions and quantize to INT4 with almost no loss; others have heavy-tailed outliers and collapse immediately upon quantization. HOBBIT treats both the same.
+
+The deeper question: *quantization is inherently lossy — can we recover that loss after the fact?*
+
+** 2025 | MiLo: "Compress, then patch the damage with SVD"
+
+*** What problem it saw
+
+Huang et al. wanted to push further — 4-bit wasn't aggressive enough, could they reach 3-bit? They tried; it collapsed: accuracy dropped 5–10 points. But staring at the quantization error distribution they noticed: the error matrix E = W − dequant(quant(W)) is not random noise; it has *structure*.
+
+*** Its solution
+
+Per expert: (1) quantize to INT3 to get the backbone; (2) perform SVD on the *residual matrix E*, keep the top-r singular values, and form a "low-rank compensator" U·V (U is d×r, V is r×d, r small e.g. 8). At inference: output = W_int3·x + U·V·x. The U·V term uses only 5–10% of the backbone's memory but recovers most of the accuracy loss.
+
+Analogy: compress a photo to JPEG (INT3 quantization) and lose detail; then separately store a "low-resolution sketch of the error" (low-rank compensator) and overlay it at display time — quality improves substantially with only a small storage overhead.
+
+*** Why it works (and what it buried)
+
+SVD captures the *most correlated directions* in the error, storing the highest-information-density content in the smallest space. But MiLo's weakness is that it assigns *the same rank to every expert*. Statistically some experts' error matrices have rapidly decaying singular value spectra (the first 4 suffice); others decay slowly (you need 32). Setting r=16 for everyone wastes half the budget on the former and still under-compensates the latter.
+
+And MiLo is an *offline static* scheme. It is unaware of which experts a given token actually selects, so all compensators must *reside permanently* in GPU memory. When a token arrives, bandwidth is as congested as ever.
+
+** 2025-12 | BEAM-MoE (this paper): "Router says who's selected — send compensation factors only to them"
+
+*** What problem it saw
+
+Liu et al. laid all prior work side by side and spotted a fact everyone had missed: MiLo pre-stores all compensation factors on GPU, quietly reinstating the "all experts always resident" problem in a smaller form; HOBBIT knows how to dispatch by router score but cannot *compensate*; Mixtral-Offloading schedules expert transfers but transfers static objects.
+
+Nobody combined the three strengths. Could you: compress expert backbones to very low precision and offload them to CPU, then *pull only the compensation factors for the Top-n experts actually activated by the current token*?
+
+*** Its solution
+
+Two steps:
+
+(1) *Router-guided compensation transfer*: all INT backbone weights live on CPU/slow storage; after the router fires, among the Top-k experts only the most important Top-n (n < k) have their low-rank compensation factors U·V fetched. The remaining k−n experts are computed from the INT backbone alone (no compensation — their router scores are low anyway).
+
+(2) *Kurtosis-aware adaptive rank allocation*: offline, measure the weight kurtosis of each expert (a proxy for how heavy-tailed the quantization error will be). High-kurtosis experts receive a larger rank budget; low-kurtosis experts receive a smaller one. Total rank budget is fixed, but distribution is unequal.
+
+Analogy: all books are summarized and stored in a warehouse (INT backbones on CPU). When a token arrives and its required books are known, only the top two by router score have their "detailed annotations" fetched (compensation factors). The annotations themselves vary in length — canonical texts (high kurtosis) have thick annotations; reference manuals have thin ones.
+
+*** Why it works (and what it buried)
+
+It converts MiLo's "globally static compensation" into *routing-driven on-demand transfer* — compensation-factor bandwidth is spent only where it matters. Kurtosis-based rank allocation fixes MiLo's one-size-fits-all problem. They also deploy the scheme on a GPU-NDP (near-data processing) system so that the compensation multiply-accumulate can happen on the CPU side, saving PCIe traffic.
+
+New costs: (1) the router decision is token-level and *Top-n is a fixed number* — but some tokens genuinely need 3 compensations and some need only 1; fixed n is still coarse. (2) Kurtosis is *measured offline* — it breaks under domain shift. (3) The whole scheme depends heavily on NDP hardware; a consumer GPU won't reproduce the paper's speedup curve.
+
+* Frontier Extensions
+
+Almost simultaneously (late 2025), a different branch diverged:
+
+** 2025-11 | DynaExq: "Skip compensation — just adjust precision online"
+
+Chu et al. observed that once batch size grows, active expert density exceeds 60%, at which point compensation and caching both fail to help. Their approach is *runtime monitoring* — experts that are activated frequently over time ("hot experts") are dynamically promoted to FP16; cold experts are compressed to INT3, with asynchronous switching throughout. This is *complementary* to BEAM-MoE: BEAM minimizes what you fetch; DynaExq adjusts what you keep resident according to thermal history. A merger of the two seems likely soon.
+
+Looking further out, several directions are visible:
+- *Speculative decoding + expert prefetching* (arXiv:2508.21706 family) — draft decoding simultaneously predicts which experts will be needed
+- *Workload-aware precision scheduling* (DynaExq opened this) — different precision configurations for code / math / text within the same model
+- *End-to-end router training* — jointly fine-tune the router and quantization policy so the router actively steers away from "expensive experts"
+
+* One Diagram
+
+#+begin_example
+                                        2017      2023      2024      2025      2025-12
+                                        Shazeer   Mix-Off   HOBBIT    MiLo      BEAM-MoE
+                                        (MoE)     (LRU)     (mix-p)   (LRC)     (this paper)
+   ---------------------------------------------------------------------------------------
+   Sparse activation: compute saved       O         O         O         O         O
+   ---------------------------------------------------------------------------------------
+   No need to keep all experts on GPU:              O         O                   O
+   memory saved                                    (LRU)    (LRU+mix)          (offload)
+   ---------------------------------------------------------------------------------------
+   Smaller fetches: bandwidth saved                           O         O         O
+                                                            (INT4)    (INT3)    (INT3+LR)
+   ---------------------------------------------------------------------------------------
+   Quantization loss recoverable:                                       O         O
+   accuracy preserved                                                  (SVD-LR)  (kurtosis)
+   ---------------------------------------------------------------------------------------
+   Token-routing-driven dynamic                               O                   O
+   decisions: no waste                                      (FP16/INT4)         (Top-n LR)
+   ---------------------------------------------------------------------------------------
+   Per-expert differentiation:                                                    O
+   fine granularity                                                             (kurtosis
+                                                                                rank)
+   ---------------------------------------------------------------------------------------
+   Dimensions covered                      1         2         3         4         6
+
+   Reading guide: each generation patches the gap exposed by the previous one,
+                  while covering one additional dimension.
+   BEAM-MoE = MiLo (compensation) + HOBBIT (routing awareness)
+              + Mixtral-Off (offload) + heterogeneous allocation.
+   In other words: it invented no new dimension -- it was the first to flip
+   all the switches simultaneously.
+#+end_example
+
+* Insights
+
+Stepping back and viewing the entire thread, *the true through-line of MoE deployment research is not "compression" — it is the progressive deepening of routing awareness*:
+
+- *Shazeer*: routing determines *what to compute*
+- *Mixtral-Off*: routing also determines *what to cache*
+- *HOBBIT*: routing also determines *what precision to use*
+- *MiLo*: routing is not consulted, but for the first time *experts are acknowledged as heterogeneous*
+- *BEAM-MoE*: routing determines *what to transfer, how much, and which experts to compensate* — when a token arrives, from backbone to compensation, from precision to rank, everything follows the router
+
+This is a textbook case of "control granularity sinking downward": early work treated the router as a simple dispatcher; later work increasingly revealed it to be the *central scheduler of the entire system*. The model-level sparsity of MoE can only deliver its full benefit once it is translated into system-level sparse scheduling.
+
+A secondary hidden theme: *quantization and system scheduling, originally two separate communities, were forced to merge by MoE as a stress test*. The GPTQ/HQQ line (how to compress more accurately) and the Mixtral-Offloading line (how to schedule faster) developed independently, began coupling at HOBBIT, and are fully fused at BEAM-MoE. This foreshadows the next wave — *the router itself may enter joint training*. Today the router is fixed and decided upstream; everyone downstream pays for its "whims." The logical next step is to reverse that: make the router actively accommodate the system's cost structure.
+
+Most likely near-term directions: (1) router enters the training loop (router-aware quantization training); (2) compensation + online precision scheduling merged (BEAM + DynaExq hybridized); (3) NDP system design customized specifically for MoE traffic patterns (already beginning in hardware papers such as PIMoE / MoNDE).
+
+* Takeaways
+
+For researchers — the cleanest lesson from this entire thread is: *don't fight unpredictability; treat it as a first-class citizen in your design*.
+
+MoE's router is inherently uncertain, and the first few years of work tried to "predict" it (skip-connection predictors, prefetchers, speculative routing). BEAM-MoE takes a different stance: it accepts that the router is token-level and computed on the fly, then *designs every layer of the system around that uncertainty* — transfer pipelines follow it, precision choices follow it, compensation factors follow it. The posture of "accept reality, then design" travels further than "pretend we can predict."
+
+Practical landing points:
+
+- If you work on MoE deployment — *first reason through which downstream variables your router controls, then design scheduling around those*. If your scheme does not depend on the router's real-time signal (as MiLo's static approach does not), there is almost certainly room to add routing awareness — and that gap is a paper's delta.
+- If you work on quantization — *stop designing schemes that compress all weights uniformly*. After 2025, such papers are hard to publish. Differentiate by token, by layer, by expert — or couple compression and compensation into a single joint design.
+- If you work on research methodology — *backward reading works especially well for this thread*: reading from BEAM-MoE backward reveals that every one of its components corresponds to a specific criticism leveled at the preceding paper. A strong systems paper almost always "simultaneously pins down the limitations of the previous 3–5 papers" rather than inventing something entirely new. Next time you write an introduction, list five limitations of prior work first, then design five corresponding remedies.

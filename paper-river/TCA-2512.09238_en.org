@@ -1,0 +1,280 @@
+#+title:      Training-free Context-adaptive Attention for Efficient Long Context Modeling
+#+date:       [2026-05-29 Fri 13:02]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T130202-en
+#+source:     https://arxiv.org/abs/2512.09238
+#+authors:    Zeng You, Yaofo Chen, Shuhai Zhang, Zhijie Qiu, Tingyu Wu, Yingjian Li, Yaowei Wang, Mingkui Tan
+#+venue:      arXiv preprint, 2025-12 (v1), 2026-01 (v2)
+
+* The River of the Problem
+
+Imagine asking a large model to read a 300,000-word novel and then answer questions about it. The catch: every time the model reads a new token, it has to glance back at every previous token — and the cost of that glance scales as the square of the token count. At 1k tokens that's fine; at 128k tokens it takes 30 minutes just to ingest the question. And once the reading is done, generating each new token still requires paging through the Key-Value cache of every prior token, stuffing over 100 GB of intermediate state into GPU memory.
+
+These are the two bottlenecks of long-context inference: the quadratic complexity of the *prefill phase* (reading the prompt), and the linearly growing KV cache during the *decode phase* (generating the answer).
+
+Why is this so hard to fix? Because everyone already knows that attention is mostly sparse — each token truly cares about only a handful of earlier tokens. But which handful? *It differs across heads, across inputs, and across the two phases.* For six years everyone has been wrestling with exactly this: either cut statically (lose accuracy), or optimize only one phase (the other stays slow), or select dynamically but retrain (expensive and non-general).
+
+TCA-Attention, at its core, is the evolutionary history of one question: how to make sparsity simultaneously dynamic, training-free, and effective on both phases.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Pain: attention is O(n^2), long sequences are unmanageable
+  v
+[2023.09] StreamingLLM (Xiao) - attention sinks + sliding window
+  |
+  | Pain: fixed pattern discards middle content; every head cut the same way
+  v
+[2023.??] H2O (Zhang) - Heavy Hitters
+  |       keep tokens based on cumulative attention scores
+  |
+  | Pain: only handles decode phase; prefill is still slow
+  v
+[2024.04] SnapKV (Li) - use the prompt's tail "observation window" to vote on which tokens to keep
+  |
+  | Pain: still only compresses KV after prefill; prefill itself isn't faster;
+  |       same compression rate applied to every head
+  v
+[2024.07] MInference (Jiang) - three fixed sparse patterns, dynamically selected
+  |       (A-shape / Vertical-Slash / Block-Sparse)
+  |
+  | Pain: only accelerates prefill; does not compress KV; decode is not helped
+  v
+[2024.10] DuoAttention (Xiao) - split heads into retrieval heads and streaming heads
+  |       retrieval heads keep full KV; streaming heads keep only sink + window
+  |
+  | Pain: head roles must be "trained" in;
+  |       patterns are still fixed in advance, not adaptive to content
+  v
+[2025.12] TCA-Attention (You et al.) -- this paper
+  |
+  | One forward pass calibrates "how much to keep" per head;
+  | at inference a lightweight redundancy metric dynamically selects tokens;
+  | training-free + both phases accelerated + head-aware + content-adaptive
+  v
+[2025+]  Ada-KV / GVote / DynamicKV - next wave of adaptive budget allocation
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Planting the Seed of Quadratic Complexity
+
+*** What Problem It Saw
+
+RNNs were too slow. A 100-word sentence required 100 sequential steps to process, ruling out GPU parallelism. LSTMs, meanwhile, kept forgetting earlier content.
+
+*** Its Solution
+
+Discard the idea of stepping through time entirely. Let every token attend to every other token at once, computing a softmax-weighted sum. That is self-attention.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Parallelism made training fly, and long-range dependencies no longer decayed. But the pit was just as large: n tokens attending to each other means n × n computations. At length 512 that's fine; at 128k it's a disaster — prefilling 1M tokens on a single A100 takes 30 minutes. That single design choice forced every "efficient attention" paper of the next six years into existence.
+
+** 2023.09 | StreamingLLM: Discovering "Attention Sinks," but Only Daring to Drop the Middle
+
+*** What Problem It Saw
+
+The simplest idea: to save compute, keep only the KV of the most recent N tokens and discard the rest — a sliding window. But experiments revealed that discarding the very first few tokens caused model perplexity to explode to 5158, essentially incoherent output.
+
+Why? Because softmax must distribute attention weights that sum to 1. When a query has nothing it genuinely wants to attend to, the model dumps the surplus weight onto the very first tokens — those tokens act as an emotional trash can; the authors called them *attention sinks*. Remove them and the model collapses.
+
+*** Its Solution
+
+Equally simple: always retain the first 4 tokens (attention sinks) plus a recent sliding window. Everything in between is dropped.
+
+*** Why It Worked (and What New Pit It Dug)
+
+As long as the trash can remains intact, the model stays coherent. Applied to LLaMA-2, this approach ran stably over 4 million tokens, 22× faster than recomputation.
+
+The pit is obvious: *the middle content is genuinely gone.* Ask it to answer questions about a clause buried in the middle of a 128k-token contract — sorry, the middle was discarded. This is a streaming solution, not a long-context understanding solution. And every head is cut identically, with no regard for per-head differences.
+
+** 2023 | H2O: Can We Dynamically Keep What Matters?
+
+*** What Problem It Saw
+
+StreamingLLM's cut was too blunt — position decided everything, regardless of token content. But in practice, *a minority of tokens account for the majority of attention quality.* Those tokens need not be at the start; they can be anywhere.
+
+*** Its Solution
+
+During decoding, accumulate an attention score for every token. Tokens with high scores are "Heavy Hitters." With a fixed budget (say, keep 20%), retain only heavy hitters plus the most recent few tokens.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Throughput improved 29× over HuggingFace Accelerate with accuracy largely preserved.
+
+But H2O is a *decode-phase* optimization — it prunes on the fly while generating. The prefill phase (the moment you pour 100k tokens of prompt into the model) is untouched; O(n^2) compute stands as before. The longer the prompt, the more you have only optimized "answering" while "reading" remains just as slow.
+
+** 2024.04 | SnapKV: The Moment After Reading, Let the Prompt Vote on Which Tokens Matter
+
+*** What Problem It Saw
+
+H2O has to wait until generation time to identify heavy hitters. But if the prompt itself is 100k tokens, *the prefill isn't even finished yet* — how do you decide which KV entries to keep?
+
+The authors noticed a key observation: toward the *end* of the prompt, attention has already stabilized. Each head's preferred prefix tokens have formed a consistent pattern. That means — *ask the last few query positions in the prompt to vote on which prefix tokens are important*, and you can compress the KV cache the instant prefill ends, before decoding begins.
+
+*** Its Solution
+
+Open a small "observation window" at the prompt's tail (a few dozen to a few hundred tokens). Pool and aggregate the attention scores those query positions assign to the prefix, let them vote, and select each head's individually important "token clusters." Compression is performed independently per head.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Generation speed improved 3.6×, memory efficiency 8.2×, and 128k-token contracts could run on a single A100. On Mistral-7B, SnapKV with a budget of 1024 outperformed H2O with a budget of 4096.
+
+Two pits remain. First, SnapKV *still does not accelerate prefill itself* — it only compresses KV after prefill completes. Second, *every head gets the same budget*: allocate 1024 tokens to all heads, but some heads genuinely need only 200 while others need 2000. That heterogeneity is invisible to SnapKV.
+
+** 2024.07 | MInference: Accelerate Prefill Itself — but Only Three Fixed Patterns
+
+*** What Problem It Saw
+
+SnapKV and H2O both "compress after prefill." MInference asked directly: *can we skip the useless attention computations during prefill itself?* That is, for a 128k × 128k attention matrix, can we compute only 4k columns?
+
+The authors measured: restricting computation to the top 4k columns still recalled 96.8% of attention quality. Sparsity is real.
+
+*** Its Solution
+
+Categorize every head's sparsity pattern into three canonical shapes:
+
+- *A-shape*: a leading segment plus a diagonal (the geometric signature of attention sinks)
+- *Vertical-Slash*: a few globally active columns plus several diagonal stripes
+- *Block-Sparse*: large contiguous sparse blocks
+
+Each head's category is determined offline. At inference time, a low-rank estimate quickly predicts sparse positions, and a dedicated GPU kernel computes only those.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Prefill accelerated 10×; LLaMA-3-1M running 1M-token sequences became feasible. It was the first method to actually touch prefill computation itself.
+
+But the pit is real: *the three patterns are hand-designed*, not learned from data, so any "none-of-the-above" pattern is out of scope. And MInference ignores the KV cache entirely — it does nothing for the decode phase. *Prefill is faster; decode is still slow; memory still explodes.*
+
+** 2024.10 | DuoAttention: Split Heads, Accelerate Both Phases — but Requires Training
+
+*** What Problem It Saw
+
+By this point a frustrating asymmetry was clear: *prefill and decode were always optimized separately.* MInference handled the former, SnapKV/H2O handled the latter; nobody covered both.
+
+DuoAttention's insight: *heads themselves fall into two categories.* Some are *retrieval heads* — they genuinely need to see the full context (e.g., for needle-in-a-haystack tasks). Others are *streaming heads* — their attention concentrates on sinks and the recent window, exactly the pattern StreamingLLM described.
+
+Identify the two types — give retrieval heads full KV, give streaming heads compressed KV — and you save both memory and compute simultaneously.
+
+*** Its Solution
+
+Use synthetic data plus a learnable gating value to score every head, letting the model declare which heads are retrieval heads and which are streaming heads. Once identified:
+- Retrieval heads: full KV cache, full attention
+- Streaming heads: store only sink + recent window KV, compute attention over only that small region
+
+Both prefill and decode benefit: long prefixes are never materialized for streaming heads, and their KV is never stored.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Memory reduced up to 2.55×, prefill and decode each accelerated 1.5–2×, and combined with quantization it ran 3.3M tokens on a single A100. It was the first method to genuinely achieve "both phases + head-aware."
+
+One large pit remained: *it requires training.* Identifying retrieval heads needs synthetic data and gate optimization — a rerun per new model. And once trained, each head's role is fixed regardless of input. The method is head-aware, but *not context-aware*: the same head probably needs different sparsity when processing code versus fiction, but DuoAttention cannot adapt.
+
+The authors later found that DuoAttention's official implementation still runs FlashAttention-2 full attention during prefill — the claimed "prefill speedup" comes from streaming heads having shorter stored KV, not from reduced attention computation.
+
+** 2025.12 | TCA-Attention: Training-free + Both Phases + Head-aware + Context-aware (This Paper)
+
+*** What Problem It Saw
+
+After DuoAttention, every dimension had been touched by someone — but no single method could claim all four simultaneously:
+
+| Dimension             | StreamingLLM | H2O | SnapKV | MInference | DuoAttention |
+|-----------------------|--------------|-----|--------|------------|--------------|
+| Accelerate prefill    | -            | -   | -      | +          | partial      |
+| Accelerate decode/KV  | +            | +   | +      | -          | +            |
+| Head heterogeneity    | -            | -   | partial| -          | +            |
+| Content-adaptive      | -            | +   | +      | +          | -            |
+| Training-free         | +            | +   | +      | +          | -            |
+
+TCA wanted all five. The core gap it identified: *head heterogeneity* and *content-adaptivity* lived in opposite camps — SnapKV/MInference were content-adaptive but applied a uniform cut across heads; DuoAttention was head-heterogeneous but pattern-fixed. Could you claim both without any training?
+
+*** Its Solution
+
+Two decoupled stages:
+
+1. *Offline calibration (one-time)*: Run one forward pass. For each head, sample candidate sparsity configurations via log-Gaussian sampling and select the sparsest configuration whose retained attention quality exceeds a threshold τ. This yields a *personalized budget* per head — no training, just one pass.
+
+2. *Online core-context selection (per inference)*: Use the *last query token* of the prompt as a "context summarizer" — its attention scores over the prefix suffice to measure block importance, cutting cost from O(k·L) to O(L). A lightweight redundancy metric (attention quality plus a Herfindahl-Hirschman concentration term) then allocates each head's budget dynamically across blocks.
+
+The same mechanism applies to both prefill and decode. No training required.
+
+*** Why It Worked (and What New Pits Remain)
+
+At 128k context: prefill 2.8× faster, KV cache reduced 61%, accuracy on par with full attention. On LongBench-E and RULER it outperforms XAttention by 2.6 points.
+
+More strikingly, the authors prove that the approximation error from core-context selection is bounded above by 2γ·‖V‖∞, where γ is the total attention mass of the discarded tokens and τ directly controls it. In other words — *the relationship between sparsity and error is analytic, not empirically guessed.*
+
+Two pits remain.
+
+First: *what calibration samples are used for the "one forward pass"?* If their sparsity distribution diverges from real inference inputs, the computed budgets will be off. The paper uses a LongBench subset for calibration; cross-task generalization needs further validation.
+
+Second: *using the last query token as context summarizer is a bet.* It assumes that the final query already captures "where I need to look," which holds for question-answering but may not hold in multi-turn dialogue or multi-instruction settings.
+
+* Frontier Extensions
+
+After TCA-Attention, the *adaptive budget allocation* line is evolving rapidly:
+
+- *Ada-KV* (NeurIPS 2025) was the first to systematically theorize the value of head-wise budget allocation; it has since been integrated into many follow-up works including NVIDIA's kvpress framework. The difference from TCA: Ada-KV frames the problem as "given a global budget B, how do we distribute it across heads," while TCA asks "given an error tolerance τ, how much budget does each head need" — the latter gives content the authority to decide budget size.
+
+- *GVote* (ICLR 2026) challenges the top-down "slice the cake" paradigm altogether: rather than fixing B first and then dividing, it uses Monte Carlo-sampled synthetic queries to vote, letting "how much to keep" emerge naturally. This is a direct extension of TCA's training-free + content-adaptive trajectory.
+
+- *DynamicKV* (2024.12) does at the layer dimension what TCA does at the head dimension — each layer's budget is also dynamic and task-adaptive. The next convergence point is clear: joint adaptation across layer × head × context simultaneously.
+
+* One Diagram to See It All
+
+#+begin_example
+                    Dimension ->  Prefill  KV     Head      Content    Training-
+  Time                            speedup  compr. heterog.  adaptive   free
+   |
+   v
+  2017 Transformer                  -       -       -          -          +     (seed of the problem)
+
+  2023 StreamingLLM                 -       +       -          -          +     (fixed pattern)
+  2023 H2O                          -       +       -          +          +     (dynamic but decode-only)
+  2024 SnapKV                       -       +       *          +          +     (uniform budget per head)
+  2024 MInference                   +       -       *          +          +     (prefill-only, fixed pattern set)
+  2024 DuoAttention                 +       +       +          -          -     (head-aware but requires training)
+                            ============================================
+  2025 TCA-Attention                +       +       +          +          +     <- all five
+                            ============================================
+  2025+ Ada-KV / GVote              +       +       +          ++         +     (budget allocation theorized)
+        DynamicKV                   +       +       +(+layer)  +          +     (layer dimension also adaptive)
+
+  + = satisfied   - = not satisfied   * = partial   ++ = stronger
+
+  Thread: each step fills in one blank left by the previous step.
+          TCA claims all five dimensions simultaneously — a convergence node, not a starting point.
+          The true next wave hands "budget determination" over to the data itself (Ada-KV, GVote).
+#+end_example
+
+* Insights
+
+Reading the full lineage, three things stand out.
+
+*First, "sparse attention" is not a technical problem — it is a problem of conceptual modeling.* What actually changed over six years was not the algorithms themselves — top-k, sliding windows, pooled scoring all existed in 2017 — but researchers' ever-deepening understanding of *which kinds of heterogeneity deserve to be modeled*:
+
+#+begin_example
+  Positional heterogeneity (StreamingLLM) -> Content heterogeneity (H2O/SnapKV)
+   -> Head heterogeneity (DuoAttention) -> Head × content joint heterogeneity (TCA)
+#+end_example
+
+Each step splits apart one dimension that had previously been collapsed. TCA is a convergence point on this line: it relaxes all four dimensions of heterogeneity simultaneously.
+
+*Second, "training-free" is an extremely hard engineering constraint, and far more important than it appears.* DuoAttention handles head heterogeneity thoroughly, but because it requires training, every new model demands a rerun — enormous deployment friction. TCA sidesteps training with a "one forward-pass calibration" — this looks like an engineering detail, but it lowers the threshold for entering production inference systems by an order of magnitude. It is no accident that NVIDIA kvpress, vLLM, and similar frameworks are rapidly integrating this class of training-free methods.
+
+*Third, the next step will almost certainly move toward "error control" rather than "cleverer patterns."* TCA proves that sparsity and approximation error have an analytic relationship (the 2γ·‖V‖∞ bound). Once that door is open, follow-up work will naturally move along the path of "given a downstream task's error tolerance, back-derive the sparsity level" rather than inventing new fixed patterns. GVote is already doing this.
+
+* Implications
+
+This means you can:
+
+1. *Look at any attention-optimization paper still using a fixed budget or fixed pattern, and immediately recognize it is one generation behind* — the next step is inevitably context-adaptive.
+
+2. *When building long-context systems yourself, prefer training-free dual-phase methods like TCA* — they are the most production-friendly, requiring no retraining when the underlying model changes.
+
+3. *Treat "how much to keep" as a derivable quantity rather than a hyperparameter.* Once your sparsity method is tied to an error bound, tuning stops being black magic and becomes "give me a τ, I give you a guarantee" — a qualitative engineering leap.
+
+4. *Recognize the evolutionary pattern of analogous research lines.* Any "efficiency" research track — quantization, pruning, KV compression, MoE routing — goes through a similar arc: positional heterogeneity → content heterogeneity → multi-dimensional joint heterogeneity → error-controllable. When a new research direction appears, ask where it currently sits on that arc, and you will know what needs to be done next.

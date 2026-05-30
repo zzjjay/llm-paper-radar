@@ -1,0 +1,244 @@
+#+title:      SliceMoE: Bit-Sliced Expert Caching under Miss-Rate Constraints for Efficient MoE Inference
+#+date:       [2026-05-29 Fri 13:12]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T131251-en
+#+source:     https://arxiv.org/abs/2512.12990
+#+authors:    Yuseon Choi, Sangjin Kim, Jungjun Oh, Gwangtae Park, Byeongcheol Kim, Hoi-Jun Yoo (KAIST)
+#+venue:      DAC 2026 (Design Automation Conference)
+
+* The River of the Problem
+
+Can your phone hold a 100B-parameter large model?
+
+Intuitively, no — the parameter file runs tens of gigabytes, and phone DRAM is only around 16 GB. But MoE (Mixture-of-Experts) models offer a tantalizing promise: even though the total parameter count is enormous, only a small fraction of experts are activated per inference step. In principle you could push "cold" experts onto Flash storage and keep only "hot" experts in DRAM.
+
+The bottleneck is precisely here: Flash is 10× slower than DRAM and 50× more power-hungry. Even if just 5% of requests miss the DRAM cache and land on Flash, those few misses drag the entire inference to a crawl. Can we push the miss rate below 5%? This is a river that has been navigated for a decade — from "expert routing" to "expert prefetching" to "expert compression" to "bit-sliced caching." Each generation spotted the gap the previous generation had missed.
+
+* Source Map
+
+#+begin_example
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: larger models are smarter, but FLOPs scale linearly
+  | Solution: each token activates only K out of N experts
+  | Unresolved: all N experts must reside in memory at inference time
+  v
+[2024.03] Hwang et al. - Pre-gated MoE (ISCA'24)
+  |
+  | Problem: phones have only 16 GB DRAM; can't fit all experts
+  | Solution: predict one layer ahead which expert is needed, prefetch from SSD
+  | Unresolved: misprediction stalls; prefetching itself is power-expensive
+  v
+[2024-25] AdapMoE / ProMoE / Cache-Prior
+  |
+  | Problem: modern MoE routing is increasingly random (load-balancing loss)
+  | Solution: adaptive thresholds + routing bias toward cached experts
+  | Unresolved: accuracy collapses when miss rate is forced below ~5%
+  v
+[2024.10] Tang et al. - HOBBIT (mixed-precision)
+  |
+  | Problem: not all experts deserve the same precision — key ones at 8-bit,
+  |          others at 4-bit
+  | Solution: critical experts stored at 8-bit, rest at 4-bit
+  | Unresolved: same expert stored twice (high + low precision); memory doubles
+  v
+[2025.04] Wang et al. - D2MoE (MobiCom'25)
+  |
+  | Problem: HOBBIT's two-copy problem
+  | Solution: Matryoshka nested quantization — low-bit embedded inside high-bit
+  | Unresolved: heavy reliance on calibration data + non-uniform quantization
+  |             (NUQ) tuning
+  v
+[2026.05] SliceMoE (KAIST, DAC'26)  <-- target paper
+  |
+  | Key insight: coupling precision and caching is the mistake; decouple them
+  | How: split each expert into MSB/LSB slices that enter/leave cache
+  |      independently
+  |      + calibration-free Matryoshka truncation (AMAT)
+  |      + prefill-phase cache warmup (PCW)
+  v
+[?] No successor yet — this is the current frontier
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Sparsely-Gated MoE: Scale the Model without Scaling the FLOPs
+
+*** What Problem It Saw
+
+The central paradox of the deep learning era: bigger models work better (scaling law), but compute scales linearly with size. Google wanted to push LSTMs to 137 billion parameters and found each training step took minutes — completely impractical.
+
+*** Its Solution
+
+Place 2,048 small "expert" networks in the model, give each token a routing network (gating network) that picks only the Top-K (e.g., 4) experts to execute. The remaining 2,044 experts do nothing for that step. Total parameter count explodes, yet FLOPs per token actually drop.
+
+*** Why It Worked (and What It Left Buried)
+
+The intuition is division of labor: train a "poetry expert," a "code expert," a "math expert" separately, and let the router decide who shows up.
+
+But it buried a headache for posterity: *at inference time every expert must sit in memory.* You don't know which experts the next token will activate, so you can't evict any of them. During training, compute is abundant and nobody cares. Once the model moves to phones or edge devices, the problem explodes — a 100B MoE model simply doesn't fit in DRAM.
+
+** 2024.03 | Pre-gated MoE: Guess One Layer Ahead, Grab from Disk
+
+*** What Problem It Saw
+
+By 2024, Mixtral, DeepSeek-V2, and Qwen-MoE had arrived one after another, each with tens of billions of parameters. Researchers wanted to run them on consumer GPUs or even phones. The obvious approach is to place infrequently used experts in SSD/CPU memory — but Flash access takes ~10 ms while a GPU layer takes ~1 ms, so one disk hit stalls ten layers' worth of work.
+
+*** Its Solution
+
+Predict one layer ahead which experts the next layer will need. The intuition: adjacent layers' routing decisions are correlated, so a small predictor can be trained to prefetch layer L+1's experts from SSD to DRAM while layer L is executing. Ideally, by the time layer L+1 runs, its experts are already in place.
+
+*** Why It Worked (and What It Left Buried)
+
+The analogy is branch prediction — CPUs have been doing this for decades. As long as predictions are accurate enough, latency hides behind computation.
+
+Three pits remain. First, *misprediction must be recovered from* — a miss means waiting for the SSD, and 10 ms shows up immediately. Second, *prefetching itself costs power* — SSD reads are 50× more energy-hungry than DRAM accesses, and aggressive prefetching can drain a battery. The third pit is more subtle: modern MoE training adds a load-balancing loss to prevent "expert collapse," which deliberately spreads routing uniformly across experts. This uniform routing *actively destroys token-to-token locality* — meaning the next generation of MoE models was designed to make Pre-gated's predictions ever less accurate.
+
+** 2024–25 | AdapMoE / ProMoE / Cache-Prior: Make the Router Cooperate with the Cache
+
+*** What Problem It Saw
+
+Pre-gated's predictions were failing. On high-entropy routing models like DeepSeek-V2, prefetch accuracy fell below 60%. How to rescue the situation?
+
+*** Its Solution
+
+Three parallel approaches:
+- *AdapMoE* evaluates each token's "sensitivity" — simple tokens skip some experts, important tokens activate more. This spreads the global prefetch pressure.
+- *ProMoE* uses more aggressive multi-step lookahead, prefetching 2–3 layers ahead.
+- *Cache-Prior* (Apple, TMLR'25) is the most radical: *directly modify routing scores* — add a bonus to experts already in cache so the router preferentially selects them.
+
+*** Why It Worked (and What It Left Buried)
+
+Cache-Prior's insight is elegant: instead of making the cache passively chase the router, make the router actively conform to the cache. This is a shift from "hardware adapts to software" to "software adapts to hardware."
+
+But the SliceMoE authors point out: *under strict low-miss-rate requirements (<5%), Cache-Prior's accuracy collapses.* When DRAM can only hold 20% of experts, the router is forcibly bent toward that 20%, effectively discarding 80% of expert diversity. MoE is MoE precisely because of that diversity — bend it hard enough and it is no longer a MoE.
+
+** 2024.10 | HOBBIT: Not Every Expert Deserves High Precision
+
+*** What Problem It Saw
+
+All previous approaches worked on the question of *which experts go into DRAM.* HOBBIT stepped back and asked: *why must every expert be stored at the same precision?* Store important ones at 8-bit, unimportant ones at 4-bit, and DRAM utilization doubles instantly.
+
+*** Its Solution
+
+Score each expert by its activation frequency and activation magnitude. The top 20% of critical experts get full 8-bit representation; the rest are compressed to 4-bit. At runtime, the routing score dynamically decides which precision to use.
+
+*** Why It Worked (and What It Left Buried)
+
+The intuition is selective protection: experts in a MoE already differ in importance, so direct scarce resources (high-precision bits) toward the ones that matter.
+
+But HOBBIT tripped over itself: *the high-precision and low-precision versions must each be stored separately.* One expert, 4-bit copy + 8-bit copy = 1.5× the storage. The space saved was immediately returned. On a phone where storage is at an absolute premium, this is fatal.
+
+** 2025.04 | D2MoE: Solve the "Two Copies" Problem with Matryoshka
+
+*** What Problem It Saw
+
+HOBBIT's two-copy problem had to be fixed. Could the low-bit version be *nested* inside the high-bit version — read all 8 bits and get the 8-bit weight, read only the top 4 bits and get the 4-bit weight?
+
+*** Its Solution
+
+Borrow the Matryoshka Representation (Russian nesting-doll representation) idea and apply it to quantization: train a set of non-uniform quantization (NUQ) codebooks such that the 4-bit representation is a true subset of the 8-bit representation. Storing one 8-bit copy gives the 4-bit version for free. Paired with extensive engineering optimization for the MobiCom deployment scenario.
+
+*** Why It Worked (and What It Left Buried)
+
+The Russian-doll metaphor fits perfectly: open the big doll and the smaller doll is inside at no extra cost.
+
+But D2MoE introduces two new pits. First, *NUQ requires calibration data* — you must run a dataset to profile weight distributions before designing the codebook. Switch models and you repeat the process. Second, *non-uniform quantization is hardware-unfriendly* — NUQ dequantization requires table lookups, which run slowly on GPUs and NPUs. The numbers in the paper look clean; on edge chips the story may differ.
+
+** 2026.05 | SliceMoE: Align the Granularity of Caching with the Granularity of Precision
+
+*** What Problem It Saw
+
+All prior methods implicitly assumed *one expert is one atomic unit* — it enters DRAM as a whole or leaves DRAM as a whole. But the SliceMoE authors observed a counterintuitive phenomenon: *under tight memory constraints, "more low-bit experts" is more valuable than "fewer high-bit experts."* Intuition: cache hit rate rises linearly with the number of experts that fit; accuracy rises only logarithmically with precision. The marginal return of hit rate is larger.
+
+Going further: the MSB (most significant bits) and LSB (least significant bits) of a single expert have *different locality.* MSBs determine the rough direction of a weight and are reused frequently across tokens; LSBs encode fine-grained adjustment and have low reuse. Binding them together as a single cache unit wastes the scarce slots that LSBs would otherwise occupy.
+
+*** Its Solution
+
+Three components:
+
+1. *DBSC (Dynamic Bit-Sliced Caching)*: split each expert into an MSB slice and an LSB slice that independently enter and leave the cache. MSB slices follow standard LRU; LSB slices have the lowest priority and are evicted first. Top-routed experts pull both slices; ordinary experts compute with only the MSB slice (automatically degrading precision).
+
+2. *AMAT (Asymmetric Matryoshka truncation quantization)*: solves the "low-bit nested in high-bit" problem *without any calibration.* Core trick: when truncating weight bits, also truncate the zero-point (the offset in asymmetric quantization). One-line formula: =q_low = q_high >> shift; zp_low = zp_high >> shift=. The paper shows that naive truncation sends PPL to 10^10; adding zero-point truncation brings it back to 10.18 (baseline 9.46).
+
+3. *PCW (Predictive Cache Warmup)*: solves the cold-start problem. During the prefill phase, the cache is already reordered by access frequency — so the LRU state is "warmed up" before decoding begins, and the very first decode token already achieves ~80% hit rate.
+
+*** Why It Worked (and What It Left Buried)
+
+Each of the three components closes a specific old pit:
+- DBSC addresses the *Pre-gated power pit*: no more aggressive prefetching; the dual-granularity cache naturally reduces the cost of a miss.
+- AMAT addresses the *HOBBIT two-copy pit* + *D2MoE calibration pit*: calibration-free nested quantization.
+- PCW addresses the *prefill→decode phase-transition pit*: every prior work began optimizing at the start of decoding; nobody managed the cache state that the prefill phase left behind.
+
+Measured results: on DeepSeek-V2-Lite, decode energy drops 2.37×, throughput improves 1.81×, accuracy barely changes.
+
+Pits that remain (not stated explicitly in the paper, but inferable):
+- DBSC needs hardware support for "slice-level access" — on a general-purpose GPU it must be emulated as two separate tensors, potentially losing efficiency.
+- AMAT is derived for uniform quantization and has not yet been integrated with mainstream PTQ methods like GPTQ or AWQ.
+- The slice granularity (MSB 4-bit + LSB 4-bit) is fixed; there is no dynamic adjustment.
+
+* Frontier Extensions
+
+The paper appeared on arXiv in May 2026 (DAC'26 conference); no direct follow-up work is publicly available yet. Two evolutionary directions seem most likely:
+
+1. *Make slice granularity dynamic as well* — e.g., choosing between MSB 4+LSB 4 vs. MSB 6+LSB 2 adaptively per layer, per token, or per hardware thermal state.
+2. *Extend PCW to KV-cache* — the same "prefill warms up decode" logic can be applied to page-level prefetching of KV-cache entries.
+
+As of 2026-05, this is the latest progress on the MoE caching line.
+
+* One Diagram
+
+#+begin_example
+        |  Atomic granularity  |  Sub-atomic granularity  |
+        |  Whole expert        |  Expert slice             |
+--------+----------------------+---------------------------+
+Expert  | Pre-gated            |                           |
+select  | AdapMoE              |    SliceMoE               |
+(which) | Cache-Prior          |     DBSC                  |
+--------+----------------------+---------------------------+
+Prec.   | HOBBIT               |                           |
+select  | D2MoE                |    SliceMoE               |
+(how    |                      |     AMAT                  |
+ sharp) |                      |                           |
+--------+----------------------+---------------------------+
+Timing  |                      |                           |
+(when)  |  ——                 |    SliceMoE               |
+        |                      |     PCW                   |
+--------+----------------------+---------------------------+
+
+Timeline:
+2017            2024.Q1        2024.Q4         2025.Q2        2026.Q2
+ |                |               |                |              |
+Sparsely-Gated  Pre-gated     HOBBIT          D2MoE          SliceMoE
+ (origin)       (space)       (precision)     (nesting)      (slice+warmup)
+                  |               |                |
+            "prefetch"        "importance"    "Matryoshka"
+             thinking          thinking        thinking
+                  \_______________|________________/
+                              |
+                 Three threads converge in SliceMoE
+#+end_example
+
+* Insights
+
+Reading the full line of work, three shifts emerge that run deeper than any individual technique.
+
+*First, granularity keeps descending.* Early work treated the "expert" as an atom — in and out of DRAM as a whole. Then researchers began splitting by precision — separating high bits from low bits within each expert. SliceMoE goes further and treats different bit-slices of the same expert as independent cache units. Every generation cuts finer, exposing more degrees of freedom to the scheduler. The next step may cut to the row, column, or even attention-head level.
+
+*Second, the problem keeps being redefined.* Pre-gated framed it as a branch-prediction problem; AdapMoE as a sensitivity problem; HOBBIT as an importance problem; D2MoE as a representation problem; SliceMoE as a slice-scheduling problem. The same MoE deployment challenge, recast at a different level of abstraction by each generation. Shifting the abstraction level tends to yield gains an order of magnitude larger than continuing to optimize within the current one.
+
+*Third, hardware awareness keeps moving earlier in the design process.* Early MoE papers were purely software-centric. Pre-gated began accounting for SSD latency. HOBBIT and D2MoE considered quantization and bit-widths. SliceMoE lands in DAC — a paper written by chip architects for chip architects. MoE deployment optimization has descended to the level of *system–architecture–circuit co-design.*
+
+Where does the field go next? My bet is *"reserve deployment budget at training time"* — everything so far is post-hoc remediation (PTQ + post-processing scheduling). The next generation of MoE models will be designed from the start with sliceable experts, cache-friendly routing, and Matryoshka-compatible precision. One more step beyond "system adapts to model": "model adapts to system."
+
+* Takeaways
+
+The more mature a research river becomes, the more the open problems migrate into the seams between layers.
+
+SliceMoE's three inventions — DBSC, AMAT, and PCW — are none of them standalone novel ideas: bit-sliced caching has been contemplated before, Matryoshka quantization predates this work, and cache warmup is a classical operating-systems concept. The lethal combination is bringing all three ideas — each mature in its own field — together in the specific context of MoE deployment.
+
+This suggests a practical heuristic:
+
+- When hunting for research problems, *don't only follow one field's vertical evolution; scan the horizontal seams between fields.* When everyone in a field is grinding the same thing, the marginal returns are usually exhausted. The people who produce genuinely new results are often importing a mature idea from an adjacent domain.
+- *Notice which pits have been repeatedly sidestepped across multiple generations of papers.* The prefill phase was ignored by everyone; PCW exploited it and immediately delivered 2.31× energy savings. Consistently avoided pits are frequently gold mines.
+- *Don't underestimate "engineering assembly" papers.* SliceMoE contains no theoretical breakthrough, yet combining known techniques to exactly the point of practical utility was enough to get into DAC. The real difficulty is not invention — it is knowing how to assemble.

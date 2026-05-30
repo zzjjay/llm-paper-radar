@@ -1,0 +1,368 @@
+#+title:      CTkvr: KV Cache Retrieval for Long-Context LLMs via Centroid then Token Indexing
+#+date:       [2026-05-29 Fri 13:19]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T131948-en
+#+source:     https://arxiv.org/abs/2512.15550
+#+authors:    Kuan Lu, Shuhang Lin, Sai Wu, Yichen Yao, Junhan Yang, Huan Li, Wei Chu, Xu Yinghui, Yuan Qi, Gang Chen
+#+venue:      arXiv preprint, 2025-12-17 (cs.CL)
+
+* The River of the Problem
+
+How can long-context LLMs "look things up" both quickly and accurately?
+
+After reading a million-word novel, the model must — in principle — scan everything it
+has read every time it generates a new token. Storing all that "previously read content"
+is called the KV cache, which exhausts GPU memory; scanning it all is called attention,
+which is agonizingly slow.
+
+For seven years researchers have charged at this deadlock one after another:
+- Store everything, scan everything: accurate but slow, and memory explodes;
+- Discard some of it: saves memory, but drop the wrong tokens and the model can't answer questions;
+- Scan only a subset: saves time, but the retrieval granularity is either too coarse or too fine.
+
+Every generation of solutions fixes one pain point of the previous generation and introduces a new one.
+CTkvr is the current downstream of this river.
+
+* Tracing the Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: as context grows, O(n^2) becomes intractable and KV cache won't fit
+  | The original sin nobody escapes
+  v
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Solution: keep only the first few "attention sink" tokens + the most recent N tokens
+  | New pain: everything in the middle is gone — ask "what did paragraph 500 say?" and it's lost
+  v
+[2023] H2O / [2024] SnapKV - heuristic eviction
+  |
+  | Solution: rank tokens by cumulative attention score; keep "important" ones, discard the rest
+  | New pain: eviction is permanent; early information can disappear mid-conversation
+  v
+[2024] Xiao et al. - InfLLM (block-level retrieval, first "store all, fetch on demand")
+  |
+  | Solution: keep all KV (offloaded to CPU), chunk into blocks, compute a representative vector per block
+  |           at generation time, find top-k blocks by representative similarity and pull them to GPU
+  | New pain: blocks are 8-16 tokens; irrelevant tokens inside the block dilute precision
+  v
+[2024] Tang et al. - Quest (ICML)
+  |
+  | Solution: represent blocks with per-dimension min/max envelopes; give each query a tight upper bound; select blocks more accurately
+  | New pain: still block-granularity; in-block noise remains; critical tokens still missed on long contexts
+  v
+[2024] Liu et al. - RetrievalAttention (token-level ANN)
+  |
+  | Solution: treat every token's Key as a database vector; build an ANN index (HNSW etc.); retrieve top-k tokens directly
+  | New pain: building and querying the ANN index is prohibitively expensive — prefill 3x slower, decode 5x slower
+  v
+[2024] Chen et al. - MagicPIG (token-level LSH)
+  |
+  | Solution: use LSH hashing to accelerate token retrieval; store hash tables on CPU
+  | New pain: hash tables consume enormous memory; throughput collapses at larger batch sizes
+  v
+[2025-12] CTkvr - centroid first, then token (this paper)
+  |
+  | Insight: after RoPE, positionally adjacent query vectors look very similar;
+  |          their respective top-k keys overlap heavily (>60% overlap when cos > 0.8)
+  | Solution: take the most recent C query vectors as "centroids"; pre-store each centroid's top-rho key indices;
+  |           for a new query, first find the nearest C' centroids (coarse filter),
+  |           then rerank within their merged key lists (fine filter)
+  | Gains: index construction 1000x–10000x faster, decode throughput 3x–4x, accuracy loss < 1%
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Nailing the Attention Formula into the Foundation of LLMs
+
+*** What Problem It Saw
+
+RNNs must process one token at a time; long sequences are slow to train and cannot be parallelized.
+
+*** Its Solution
+
+Drop the recurrence; let every token attend to all other tokens simultaneously (self-attention).
+Compute Q·K^T to obtain an n × n attention map, then take the weighted sum over V.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Training became parallel and quality improved. But O(n^2) is written into the formula: once n
+reaches 100K, the KV cache weighs tens of GB, and reading all K and V anew for every generated
+token is unavoidable. This is the hole every subsequent paper has been digging at.
+
+** 2023 | StreamingLLM: Chop the Middle, Keep Head and Tail
+
+*** What Problem It Saw
+
+Not enough memory — the most naive fix is a sliding window: keep only the most recent N tokens.
+But as soon as the very first tokens are dropped, the model collapses and produces gibberish.
+
+*** Its Solution
+
+It found that the first few tokens act as "attention sinks" — the model dumps surplus attention
+mass onto them by default. Keep the first 4 tokens plus the most recent N; discard everything else.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Memory stabilizes and the model no longer collapses. But ask "what did paragraph 500 say?" —
+it genuinely does not know, because paragraph 500 was physically deleted.
+"Long-context understanding" is never truly addressed; the model merely survives.
+
+** 2023–2024 | H2O / SnapKV: Pick "Important Tokens" by Attention Score
+
+*** What Problem It Saw
+
+StreamingLLM is too mechanical — it discards by position, ignoring content. A critical sentence
+in the middle can simply be slid away.
+
+*** Its Solution
+
+Observe which tokens accumulate high attention scores across history; those are "Heavy Hitters."
+Keep them; evict the low-scoring ones.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Smarter than a pure sliding window: information is no longer lost by position but by "how often
+it has been attended to." The problem is — *being unimportant now does not mean being unimportant later*.
+A passage that draws no attention in early turns may become key evidence in turn five of a
+multi-turn conversation. Once evicted, it is gone for good.
+This eviction line collapses most badly on long outputs and multi-turn dialogue.
+
+** Early 2024 | InfLLM: Don't Evict — Store Everything on CPU and Fetch on Demand
+
+*** What Problem It Saw
+
+The fundamental error of eviction methods is "once lost, lost forever." What if we *keep everything*
+but simply don't keep it all on the GPU?
+
+*** Its Solution
+
+Offload the entire KV cache to CPU memory; split it into blocks of 8–16 tokens each. Compute one
+representative vector per block (mean-pooled). During generation, the new query computes similarity
+against all block representatives and pulls the top-k blocks back to the GPU for attention.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+This is a paradigm shift: from "pruning KV" to "retrieving KV." Nothing needs to be permanently
+discarded.
+
+But blocks are coarse — a block of 16 tokens needs only one relevant token to be fetched in full,
+and the remaining 15 are noise. In long contexts this dilution makes attention computations blurry.
+ShadowKV and Quest are both bitten by this problem in experiments at 128K context length.
+
+** Mid 2024 | Quest: Add a Tight Bound on Block Representatives, Miss Fewer Key Blocks
+
+*** What Problem It Saw
+
+InfLLM's mean-pooled block representative gives an inaccurate relevance estimate — a highly
+relevant token inside a block can be averaged out by low-relevance neighbors, causing the whole
+block to be skipped.
+
+*** Its Solution
+
+Instead of storing a single mean vector, store the *per-dimension min and max* for each block.
+Given a query, compute an *upper bound* on the block's similarity to that query using the min/max
+envelope, then rank blocks by this upper bound. This prevents missing blocks that have a bright
+spot even when the block average is low.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Block selection is more accurate. But blocks are still blocks — the selected block still contains
+8–16 tokens, with irrelevant ones still present. The precision ceiling is capped by block
+granularity; the paper reports Quest dropping 5–7 points on 128K Ruler compared to FullKV.
+
+** Mid 2024 | RetrievalAttention: Go Down to Token Level with ANN
+
+*** What Problem It Saw
+
+Block granularity is inherently a compromise — trading accuracy for speed. What if retrieval
+operated directly at the token level?
+
+*** Its Solution
+
+Treat every token's Key as a vector in a database and build an Approximate Nearest Neighbor index
+(HNSW, etc.) over all of them. When a query arrives, look up the top-k tokens directly, bypassing
+blocks entirely.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Accuracy rises to near full-KV quality — this is the right direction for precision. But building
+an ANN index is prohibitively expensive: HNSW takes 800+ ms on a 128K context, KMeans takes
+6000+ ms. The paper reports prefill slowing down 3× and decode slowing down 5×.
+Accuracy wins; throughput collapses.
+
+** Late 2024 | MagicPIG: Swap the Index — LSH Hashing, Moved to CPU
+
+*** What Problem It Saw
+
+ANN indexes are too heavy to build and query. A lighter hash-based index (LSH) should be faster.
+
+*** Its Solution
+
+Use 9 random hash functions and 120 hash tables to locate tokens that land in the same bucket as
+the query. Store the hash tables entirely on CPU; compute attention only on the GPU.
+
+*** Why It Worked (and Where It Buried a New Problem)
+
+Queries are faster and CPU/GPU duties are split. But the hash tables themselves consume enormous
+memory: 120 tables × context length × number of heads. Once the batch size grows, CPU memory is
+exhausted. The paper shows MagicPIG's throughput collapsing at batch=8 and beyond.
+LSH is also a probabilistic index — when collision rates are high, accuracy remains unstable,
+dropping 7 points on 128K Ruler.
+
+** December 2025 | CTkvr: Don't Build a Complex Index for Tokens — Let Queries Index Themselves
+
+*** What Problem It Saw
+
+Looking back at this whole trajectory: on one side is block-level retrieval (fast but coarse); on
+the other is token-level + ANN/LSH (accurate but index overhead is too heavy).
+*The entire field has been working on the Key side* — indexing Keys, clustering Keys. But Keys
+are voluminous and static; no matter how you organize them, it is expensive. What if the problem
+were approached from the other side?
+
+CTkvr ran an experiment: take query vectors from different positions in the same long context and
+compute their cosine similarities. The result — *after RoPE, positionally adjacent queries
+(within ~1K positions) consistently exceed 0.8 cosine similarity*. A second experiment showed:
+*the higher the query similarity, the more their respective top-k Keys overlap (a clear positive
+correlation)*.
+
+In other words: you do not need to scan all Keys anew for every query — nearby queries have
+already done the scan, and the top-k Keys they found are almost certainly the same ones you need.
+
+*** Its Solution
+
+Two stages:
+1. *Query-Centroid IVF (coarse filter)*: take the most recent C query vectors as "centroids";
+   pre-store the indices of each centroid's top-rho Keys. When a new query arrives, find the
+   nearest C' centroids first, merge and deduplicate their Key lists, and obtain a "recall set"
+   L^Recall (roughly 10K entries).
+2. *Token-Level Rerank (fine filter)*: compute the exact Q·K^T scores within the recall set;
+   keep the top-rho' Keys (roughly 1K) and run attention on those.
+
+Engineering-wise: the coarse recall step stays on the GPU; the fine rerank step is offloaded to
+the CPU (where the KV cache already lives), with a custom CUDA kernel keeping both sides
+concurrent. A *Dynamic Centroid Update (DCU)* mechanism handles multi-turn settings: a FIFO
+queue rolls out the oldest centroids as new ones arrive.
+
+*** Why It Worked (and Where New Pain Remains)
+
+This is a genuine change of sides — *moving the index from the Key side to the Query side*.
+Keys are voluminous and static; indexing them will always be expensive. Queries are few, dynamic,
+and — thanks to RoPE — carry a natural structure of local similarity. Using queries to index
+themselves transforms "build an index over a dictionary" into "borrow the notes of someone who
+just looked this up." Index construction is 1000× faster (HNSW: ~6 s; CTkvr: ~0.4 ms); accuracy
+loss is under 1%; decode throughput improves 3–4×.
+
+Remaining pain: the centroid strategy depends on RoPE specifically — whether it holds for ALiBi,
+NoPE, or other positional encodings has not been verified. After more than 8 turns of dialogue,
+centroid drift accumulates, and DCU only partially compensates. The CPU-side attention path
+requires sufficient CPU FLOPs, which may be infeasible on smaller machines.
+
+* Frontier Extensions
+
+CTkvr was posted as a preprint on December 17, 2025, and is the latest advance along this line
+at the time of writing.
+
+Foreseeable next steps:
+- *Generalizing query-side indexing*: since RoPE clusters queries by position, could one go
+  finer — learning a separate set of centroids per head, per layer?
+- *Cross-request centroid reuse*: similar prompt templates (agent workflows, RAG pipelines) produce
+  highly overlapping centroids; caching and reusing them across requests could yield further gains.
+- *Orthogonal combination with KV quantization*: CTkvr decides *which* tokens to retrieve;
+  quantization decides *how large* each token representation is; stacking the two leaves
+  more room to compress.
+
+* One Diagram to See It All
+
+#+begin_example
+                          The River of KV Cache
+                         ============================
+
+Year   Paradigm               Action           Cost
+----   --------------------   --------------   ---------------------------
+2017   Full Attention         store all,       memory explosion + O(n^2)
+                              scan all
+                                |
+                                v  "too expensive, cut something"
+2023   StreamingLLM           cut by           middle lost, long-context broken
+                              position
+                                |
+                                v  "smarter to cut by content"
+2023   H2O / SnapKV           cut by           eviction is permanent,
+                              content          multi-turn dialogue collapses
+                                |
+                                v  "don't cut — just retrieve"
+2024   InfLLM                 block-level      in-block noise dilutes accuracy
+                              retrieval
+                                |
+                                v  "use envelope bounds, pick blocks more accurately"
+2024   Quest                  block + tight    still bottlenecked by block granularity
+                              bound
+                                |
+                                v  "go to token level"
+2024   RetrievalAttention     ANN index        index is expensive, prefill 3x slower
+                                |
+                                v  "switch to LSH to reduce overhead"
+2024   MagicPIG               LSH + CPU        hash tables exhaust memory, batch size limited
+                                |
+                                v  "switch sides: don't index Keys, let Queries be the index"
+2025   CTkvr                  centroid +       index 1000x faster, throughput 3-4x,
+       ^                      rerank           accuracy loss < 1%
+       |
+       +-- RoPE makes adjacent queries mutually covering, offloading the burden from the Key side
+
+The axis of the whole river:   how to break the "store vs. scan" tradeoff
+Seven years of trajectory:     full scan -> cut -> retrieve not cut -> finer retrieval -> remodel the index side
+CTkvr's turn:                  which side builds the index? switch to the Query side.
+#+end_example
+
+* Insight
+
+*Real progress often comes not from "optimizing the existing path by another factor of two"
+but from "thinking about the problem from the other side."*
+
+Every paper in this river's first seven years — InfLLM, Quest, RetrievalAttention, MagicPIG —
+worked on the Key side: chunking Keys, building ANN indexes over Keys, hashing Keys. Keys are
+voluminous and static; no matter how sophisticated the index, construction will be expensive.
+CTkvr's pivot lies in recognizing that *Queries are few, dynamic, and — courtesy of RoPE —
+carry a natural structure of local similarity*. Moving the index to the query side instantly
+transforms "build an index over a dictionary" into "borrow the notes of someone who just looked
+this up."
+
+At a deeper level, this is a shift from *"optimizing data structures"* to *"exploiting the
+intrinsic structure of the problem itself."* Earlier work borrowed ANN and LSH from the database
+community — applying off-the-shelf index technology. The observation CTkvr exploits — "positionally
+adjacent queries are similar" — is a property unique to the interior of LLMs (RoPE + autoregressive
+generation). You can only think of it once you have thoroughly internalized the domain structure.
+
+*Where is this most likely to go next?* Continue in the same direction — "what other internal
+structure of LLMs has not yet been exploited?" For instance: query distributions differ
+substantially across heads; could one apply distinct centroid strategies per head? Or: agent
+workflows repeat prompt templates at high frequency; could query index caches be reused across
+requests? Or: reasoning models generating long chain-of-thought traces exhibit stronger semantic
+clustering in their query distributions than ordinary generation; KV retrieval designed specifically
+for reasoning might compress another order of magnitude.
+
+* Lessons
+
+*When looking for a research breakthrough, start by asking: which side is everyone currently
+working on? Has anyone touched the other side?*
+
+The KV cache river spent a full seven years cutting, indexing, and compressing on the Key side.
+The reason CTkvr achieved a 1000× speedup in index construction is not that its algorithm is more
+clever — it is that they switched sides. When every paper in a subfield is improving by 10–30%
+and everyone is arguing in the same vocabulary, it usually does not mean the current path is
+exhausted; it means everyone has forgotten there is another path.
+
+The practical takeaway is this: whenever you face a "find top-k of X" problem, pause and ask —
+- Are all current methods building the index over X? Does the querying side Y have any internal
+  structure that has not been exploited?
+- Do Y's queries exhibit locality, periodicity, or template reuse?
+- If so, could "Y index itself," offloading the burden entirely from the X side?
+
+Concretely for LLM inference engineering: if you are building RAG pipelines, agent systems, or
+long-document QA, the CTkvr approach suggests you could *shift the index granularity from
+"knowledge-base chunks" to "query templates."* Users' queries are actually sparsely clustered in
+semantic space; caching the mapping from "query template → recall set" may save far more compute
+than caching "chunk embeddings."

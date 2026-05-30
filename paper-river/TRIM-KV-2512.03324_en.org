@@ -1,0 +1,221 @@
+#+title:      Cache What Lasts: Token Retention for Memory-Bounded KV Cache in LLMs
+#+date:       [2026-05-29 Fri 12:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T125011-en
+#+source:     https://arxiv.org/abs/2512.03324
+#+authors:    Ngoc Bui, Shubham Sharma, Simran Lamba, Saumitra Mishra, Rex Ying
+#+venue:      arXiv 2512.03324, Dec 2025 (rev. Mar 2026)
+
+* The Problem River
+
+LLMs remember as they talk. The longer the conversation, the more they must remember—until GPU memory gives out.
+
+Can they forget as they go? The human brain does it all the time. The hard question is: *what should be forgotten, and what must be kept*—and nobody has ever given a clean answer. For a decade, generation after generation of methods has gotten stuck in the same place: judging whether a token is "important" based on *how much attention it receives right now*. But "nobody is looking at it now" and "nobody will ever look at it again" are two different things. So models routinely discard critical facts that will only be needed later—before they have ever been used.
+
+TRIM-KV wants to flip the framing: what if, at the very moment a token is generated, the model *declares directly* whether that token should stick around? Turning "importance" from a post-hoc guess into an intrinsic property the token carries from birth.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: no problem—it created the problem.
+  | Solution: KV cache - store each token's K and V, avoid recomputation
+  | Side effect: cache grows linearly with sequence length, memory explodes
+  v
+[2023] StreamingLLM (Xiao et al.)
+  |
+  | Observed: cache fills up in long conversations; dropping everything causes collapse
+  | Solution: keep the first few "sink" tokens + a recent sliding window; discard the middle
+  | Gap left: is the middle really all noise? what about key facts buried there?
+  v
+[2023] H2O (Zhang et al.) - Heavy-Hitter Oracle
+  |
+  | Observed: can't blindly drop the middle; need to see what gets attended to
+  | Solution: accumulate each token's total attention score; keep high-scorers (heavy hitters)
+  | Gap left: "attended to in the past" != "needed in the future". Attention is a lagging signal
+  v
+[2024] SnapKV (Li et al.)
+  |
+  | Observed: H2O's per-step scoring during decoding is expensive; post-hoc judgment is too late
+  | Solution: as soon as the prompt arrives, use its last segment as an "observation window"
+  |           to score all preceding tokens and compress immediately
+  | Gap left: still uses attention as proxy. Only fixes prefill; cache grows again during decoding
+  v
+[2025] SeerAttention-R (Gao et al.)
+  |
+  | Observed: all heuristics are unreliable; let the model learn to select
+  | Solution: train a gate; offload the full KV cache to host memory; fetch blocks via query
+  | Gap left: the full cache is still stored, just not on the GPU. Orchestration overhead is real
+  v
+[2025] TRIM-KV (this paper)
+  |
+  | Observed: everyone above does "post-hoc judgment + full storage"—too reactive
+  | Solution: token scores a beta at birth, decays exponentially over time, truly discarded
+  | Gap left: see the Insight section
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer: Making "Remember Everything" the Default
+
+*** What problem did it see?
+
+RNNs process tokens one at a time, sequentially—slow, and long-range dependencies fade away.
+
+*** Its solution
+
+The attention mechanism. Each new token directly dot-products with every historical token, attending to whatever is relevant. To avoid recomputing historical K and V at every step, *cache them*—this is the KV cache.
+
+*** Why it worked (and what new pit it dug)
+
+Parallel training and long-range dependencies: both solved. But the cost is that cache size grows *linearly* with generation length, and attention computation grows *quadratically*. In a hundred-thousand-token conversation the cache can fill an entire GPU. Every KV compression paper that followed is paying back this debt.
+
+** 2023 | StreamingLLM: Keep the Head and Tail, Discard Everything in Between
+
+*** What problem did it see?
+
+A real scenario: you have been chatting with a model for three days. The cache can no longer hold. The most naive fix—drop the earliest tokens—causes the model to collapse immediately and start hallucinating.
+
+*** Its solution
+
+It noticed a strange phenomenon: the model's attention on the *very first few tokens* is disproportionately high, even when those tokens carry no content (e.g., BOS). These are called "attention sinks"—overflow valves for attention mass.
+
+Solution: *always keep those few initial sink tokens + a recent sliding window*; discard everything in between.
+
+*** Why it worked (and what new pit it dug)
+
+Simple, stable, almost zero compute overhead. But it equates "the middle" with "useless"—the moment your conversation contains "the password I mentioned three days ago is 7421," once the window slides past, it is gone forever. This is a *structural bias*: cutting by position, not by content.
+
+** 2023 | H2O: Cut by Attention Score, Not by Position
+
+*** What problem did it see?
+
+StreamingLLM is too blunt. Middle tokens are not uniformly useless—their importance is *unevenly distributed*: a minority of key tokens get attended to repeatedly, while most are noise. Could we keep the key ones and discard the noise?
+
+*** Its solution
+
+Define a score: each token's *cumulative attention score* (how many times subsequent tokens have looked at it in total). High-scorers are "heavy hitters"—important tokens. When the cache is full, evict the lowest-scoring ones.
+
+*** Why it worked (and what new pit it dug)
+
+Substantially better than StreamingLLM. But the logic carries a hidden assumption—*what was attended to in the past will be attended to again in the future*. In mathematical reasoning, code generation, and long-horizon planning this assumption routinely breaks: an intermediate conclusion the model derived early on may not be needed until token 8000. During the thousands of steps before it is "used," its cumulative attention score stays low—H2O discards it long before it matters.
+
+*A deeper pit*: attention scores are *lagging signals*. By the time you can observe that a token is important, it has been sitting in the cache for hundreds of steps unused—which is itself a waste.
+
+** 2024 | SnapKV: Just Compress Once at Prefill and Be Done With It
+
+*** What problem did it see?
+
+H2O updates scores and evicts at every decoding step—expensive, and the judgment is still reactive. Moreover, in many settings the prompt itself is enormous (tens of thousands of tokens), so even the prefill-phase cache is already alarming.
+
+*** Its solution
+
+As soon as the prompt arrives, use the attention of a small final segment (the "observation window") to score every preceding token, *in one shot* select the top-k to keep, and discard the rest immediately. The decoding phase then starts lean.
+
+*** Why it worked (and what new pit it dug)
+
+Fast and accurate for large-prompt scenarios. But it is fundamentally still on H2O's road—*using attention as a proxy for importance*. And it cannot address the decoding phase: once generation begins, the cache grows again. The problem is deferred, not eliminated.
+
+** 2025 | SeerAttention-R: Stop Relying on Heuristics; Let the Model Learn
+
+*** What problem did it see?
+
+Whether H2O or SnapKV, all importance criteria are hand-designed by researchers and tuned by intuition. The insight is: the model itself surely understands which tokens are critical better than we do—*let it learn how to select*.
+
+*** Its solution
+
+Train a gate network that learns an attention pattern from the query, and fetches relevant KV blocks accordingly. The full KV cache is still retained—just offloaded to CPU host memory, fetched back to GPU on demand.
+
+*** Why it worked (and what new pit it dug)
+
+The first method to make "which tokens to pick" a *learnable* capability; more robust than heuristics. But the cost is steep: *the full cache is still there*, just stored elsewhere. Every fetch incurs GPU-CPU orchestration overhead, and over a long conversation that overhead accumulates linearly. Nothing is truly discarded—the bill is only deferred.
+
+** 2025 | TRIM-KV: A Token Declares at Birth How Long It Deserves to Live
+
+*** What problem did it see?
+
+Stringing all five predecessors together, the authors identified a hidden thread: every method performs *post-hoc judgment*—either via attention scores (past signals) or query-based fetching (current demand). But attention is a noisy proxy, and query-based fetching requires paying for full storage.
+
+The more fundamental question: isn't a token's importance *roughly determined at the moment it is generated*? Common sense tells you "the" is almost certainly unimportant; a variable definition is almost certainly important—that judgment does not need to wait thousands of steps.
+
+*** Its solution
+
+At every layer and every head, add a lightweight gate (linear layer + sigmoid). The moment a token is generated, it emits a β ∈ [0,1]—its *intrinsic shelf life*.
+
+This β governs *exponential decay*: a token generated at step i has effective weight β^(t-i) at step t.
+- β close to 1: slow decay, long-term memory
+- β close to 0: fast decay, forgotten within a few steps
+
+The attention logit receives an additive term (t-i)·log β, which is equivalent to *folding forgetting into the attention formula itself*. When the cache is full, evict the token with the smallest current β^(t-i)—truly discarded, not offloaded.
+
+Training only learns these gates; the backbone is frozen. Loss = distillation + capacity penalty (keeping Σβ within budget M).
+
+*** Why it worked (and what new pit it dug)
+
+It transforms "forgetting" from a bolted-on eviction policy into a part of the model's *generation process*. The authors also note something striking: the learned β patterns *spontaneously reproduce* sink tokens, sliding windows, and gist compression—all the heuristics painstakingly hand-designed over the past decade. In other words, what humans spent years empirically figuring out about "what to keep" is something the model could have learned on its own all along—nobody had given it the opportunity.
+
+A more counterintuitive result: on some tasks TRIM-KV *outperforms the full-cache baseline*. The authors' interpretation: selective forgetting acts as a form of *regularization*, suppressing noise from irrelevant tokens.
+
+The new open question: β is fixed at generation time—*can it be revised later*? If a token turns out to be unexpectedly useful downstream, there is currently no mechanism to raise its β. The natural next step is likely toward "re-estimable shelf lives."
+
+* Frontier Extensions
+
+TRIM-KV is a December 2025 paper; as of May 2026, direct critical follow-ups in the public literature are still sparse. Visible directions:
+
+- *Re-estimable retention*: add a mechanism on top of TRIM-KV that allows later steps to raise a token's β—turning "one-time shelf-life assignment" into "dynamic renewal."
+- *Joint quantization*: β determines not just discard/keep but also whether a token is stored in fp16 or int4. Important tokens stored precisely; less important ones coarsely. This connects naturally with the KVQuant / KIVI quantization line.
+- *Budget-adaptive inference*: the current M is fixed; can the model decide how much cache it needs based on problem difficulty? This aligns with the test-time compute scaling thread.
+
+* One Diagram
+
+#+begin_example
+
+Time ----------------------------------------------------------------->
+
+       2017          2023            2023           2024         2025          2025
+      Vaswani    StreamingLLM        H2O            SnapKV    SeerAtt-R     TRIM-KV
+      ------     ------------    -----------       -------    ---------    ----------
+       KV         head+window     cumulative       obs-window  learn+offload  score at birth
+       cache      (by position)   attention        compress     (full stored)  (intrinsic beta)
+                                  (heavy hit)      prefill
+        |             |               |               |             |            |
+        v             v               v               v             v            v
+
+Decision criterion:
+  none --------> position -> past attention -> past attention -> learned query -> learned intrinsic
+                 (coarse)    (post-hoc, costly)  (one-shot)       pattern          retention
+                                                               (offload, no drop)  (at birth, truly dropped)
+
+Cost:
+  OOM ---------> lose middle -> costly decoding -> prefill only -> CPU-GPU overhead -> train gate
+
+Key turning points:
+   #1 From "keep all" to "keep selectively"      (StreamingLLM)
+   #2 From "position heuristic" to "content heuristic"  (H2O)
+   #3 From "hand-designed" to "learned"          (SeerAttention-R)
+   #4 From "post-hoc judgment" to "birth-time declaration"  (TRIM-KV — the real axis shift)
+
+#+end_example
+
+* Insight
+
+Compressed to a single sentence: *"When you decide" matters more than "what you decide with."*
+
+All five predecessors worked on upgrading the *criterion itself*—position → attention score → learned attention pattern. But the *moment at which judgment occurs* was never touched: always *after* a token entered the cache, its value inferred from external observation. TRIM-KV moves that moment forward to the instant of *generation*, letting the token carry a shelf-life label from the start.
+
+This is an inconspicuous but critical axis shift. The deeper cognitive transition it embodies is: from "importance is something we observe" to "importance is something the model already knows." If, in the instant of generating "the," the model's internal hidden state already encodes that this is a stop word—why take the long way around, spending compute to verify it post-hoc?
+
+The same axis shift is happening elsewhere: speculative decoding moves "what to output" from "token-by-token verification" toward "chunk-level prediction"; test-time compute scaling moves "how much to think" from "fixed budget" toward "model self-assessment." A unifying trend: *more and more judgments are migrating from external add-ons into the model itself*.
+
+Where might things go next? Two bets:
+1. *Reversible shelf lives*—β is no longer fixed at generation; subsequent steps can re-estimate it. This would stitch together TRIM-KV's "early commitment" with SeerAttention-R's "on-demand fetching."
+2. *Joint quantization*—β simultaneously governs discard/keep *and* precision. This could unify the KV compression and KV quantization lines into a single framework.
+
+* Takeaways
+
+The most direct takeaway for researchers: *when an entire field is busy improving "which criterion to use," ask whether the moment at which the judgment occurs can be moved.*
+
+This lesson applies broadly. Look at the cross-generational breakthroughs—Transformer moved "recurrent computation" to "parallel computation"; speculative decoding moved "per-token decision" to "chunk-level prediction"; TRIM-KV moved "post-hoc filtering" to "birth-time characterization." Their common thread is not inventing a smarter criterion—it is *shifting when the judgment happens*.
+
+Practical take: next time you survey a field, resist the urge to immediately compare accuracy numbers across methods. First draw a timeline and mark the *decision moment* of each method. If everyone is crowded at the same moment, the unoccupied moment is often where the next strong paper will land.

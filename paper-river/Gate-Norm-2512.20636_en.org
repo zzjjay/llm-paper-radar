@@ -1,0 +1,233 @@
+#+title:      Data-Free Pruning of Self-Attention Layers in LLMs
+#+date:       [2026-05-29 Fri 13:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T134657-en
+#+source:     https://arxiv.org/abs/2512.20636
+#+authors:    Dhananjay Saikumar, Blesson Varghese
+#+venue:      arXiv 2025.12
+
+* The Problem River
+
+Large model inference is too slow and too expensive. Can we just yank out the useless parts?
+
+Where is the difficulty? A model has tens of billions of parameters, and you don't know which ones are pulling their weight and which ones are just along for the ride. Early practitioners pruned weight by weight according to "importance scores," requiring gradients and data; later it became clear that removing entire layers at a time was more direct — but you still had to run the data through once to see which layers "did nothing." That is exactly the sticking point: *to prune, you first need to feed data*. Feeding data is slow, consumes GPU memory, and the pruned result varies with the data distribution. Could we identify useless layers by looking only at the weights themselves, with no data at all? This line runs from Wanda in 2023 to Gate-Norm in 2025, each generation inching toward a "cheaper way to declare a layer useless."
+
+* Source Map
+
+#+begin_example
+[2023.06] Wanda (Sun et al.)
+  |
+  | Problem: classic weight pruning (magnitude pruning) fails completely on LLMs
+  | Solution: |W| * ||X|| — supplement with an activation norm from a tiny
+  |           calibration set; a single forward pass is enough
+  | Residual: still requires calibration data; only prunes individual weights,
+  |           whole layers untouched
+  v
+[2024.03] Gromov et al. - Unreasonable Ineffectiveness of Deeper Layers
+  |
+  | Problem: weight-level granularity too fine for real inference speedup;
+  |          are entire layers redundant?
+  | Solution: measure the angular distance between input and output hidden
+  |           states for each consecutive block; small angle = block did
+  |           nothing, remove the whole block
+  | Residual: still requires a forward pass over data; removal still needs
+  |           QLoRA fine-tuning to "heal"
+  v
+[2024.03] ShortGPT (Men et al.)
+  |
+  | Problem: Gromov's angular score is still somewhat complex, and needs
+  |          fine-tuning after pruning
+  | Solution: Block Influence — directly measure cosine similarity between
+  |           each layer's input and output; high similarity → remove
+  | Residual: still requires data; treats attention and MLP as one block
+  v
+[2024.06] He et al. - Not All Attention Is Needed
+  |
+  | Problem: attention and MLP have different redundancy levels; removing
+  |          them together is too coarse
+  | Solution: score the attention sublayer separately; find that roughly
+  |           half of them can be removed
+  | Residual: still requires calibration data for the forward-pass similarity
+  v
+[2025.12] Gate-Norm (Saikumar & Varghese)  <-- target paper
+  |
+  | Problem: given that attention sublayers are massively redundant, can we
+  |          identify the useless ones with zero data?
+  | Solution: Attention Suppression Hypothesis + query-key coupling norm
+  |           computed directly from W_Q and W_K weights; scoring done in
+  |           under one second
+  v
+[Future] ?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.06 | Wanda: Score the weights — and also glance at the activations
+
+*** What problem did it see?
+
+The classic pruning recipe is "rank weights by absolute value and remove the small ones" — this worked for twenty years on models like ResNet. Frantar & Alistarh (2023) showed that the same recipe completely falls apart on LLMs: remove even a tiny fraction of parameters and the model collapses. LLMs have orders of magnitude more parameters, but the raw magnitude of each weight no longer tells you whether it matters.
+
+Why? Because a small number of feature dimensions in LLM activations are extraordinarily large (Dettmers et al. 2022). A weight that is itself not large can produce a huge output contribution if the input dimension it multiplies happens to be one of those giants — something you cannot see by looking at the weight alone.
+
+*** Its solution
+
+Include the "input size" in the score. Wanda scores each weight as =|W_ij| * ||X_j||=: the absolute value of the weight times the norm of the corresponding input channel. Where does the norm come from? Feed a small calibration set (128 samples), run one forward pass, and record the activation magnitudes.
+
+No gradients, no training — one forward pass is sufficient.
+
+*** Why it works (and what new pit it digs)
+
+The intuition is simple: a weight's actual influence = its own magnitude × the magnitude of the input it multiplies. The old method only counted the first factor; Wanda adds the second.
+
+But there are two ceilings:
+
+1. It prunes individual weights (unstructured sparsity). The model becomes sparse, but unless you have specialized sparse hardware the actual inference speed does not improve.
+2. It still requires data. How much data, and from what domain, both affect the outcome.
+
+The next generation asked: can we change the granularity — not pruning weights, but pruning entire layers?
+
+** 2024.03 | Unreasonable Ineffectiveness: Try pulling out whole blocks of layers
+
+*** What problem did it see?
+
+Wanda-style weight pruning, even at 50% sparsity, shrinks the model but delivers no real speedup on ordinary GPUs — you still execute all the matrix multiplications; most entries just happen to be zero.
+
+To actually go faster you need to remove entire layers. But which layers are removable?
+
+*** Its solution
+
+Gromov et al. (Meta + Roberts) devised a blunt but elegant approach: treat each consecutive block of n layers as a black box, and measure the *angular distance* between the hidden states going in and coming out. A small angle means this block barely rotated the representation — it did nothing — so remove the whole block.
+
+Sweeping LLaMA-2 (all sizes), Mistral, Qwen, and Phi-2, they found a consistent pattern: the *deeper* layers of each model are highly similar to one another (except the last layer), meaning the network increasingly "treads water" as it goes deeper. Remove that segment, then apply QLoRA fine-tuning to "heal" the wound, and Llama-2-70B loses only a small fraction of performance after removing nearly half its layers.
+
+*** Why it works (and what new pit it digs)
+
+This is a conceptual leap: LLM capacity is not uniformly distributed across layers. The shallow layers near the input are doing real work; many deep layers are redundant. Either pre-training never fully utilized the deep layers, or the shallow layers already packed in all the knowledge.
+
+The cost: (1) you still need to feed data for the forward pass to compute the angles; (2) healing via QLoRA takes hours of additional training.
+
+ShortGPT appeared almost simultaneously and said: both of those steps can be simplified further.
+
+** 2024.03 | ShortGPT: One cosine similarity is enough
+
+*** What problem did it see?
+
+Gromov computes "end-to-end angular distance" over consecutive blocks, making the scoring granularity relatively coarse (you must scan different starting points and block lengths). Could you score each layer independently and just remove whoever scores lowest?
+
+*** Its solution
+
+Men et al. proposed *Block Influence (BI)*: compute the cosine similarity between each layer's input and output. High similarity means the layer is essentially passing its input through unchanged — it did nothing, remove it.
+
+Sort layers by BI in ascending order and start removing from the least influential. On LLaMA 2-13B, removing 25% of layers (10 layers) costs only a tiny drop on MMLU — and *no fine-tuning is needed*.
+
+*** Why it works (and what new pit it digs)
+
+ShortGPT reduced "layer redundancy" to its simplest form: compute one number (similarity), rank, remove. It is orthogonal to quantization and can be combined with it. BI became the standard baseline for all subsequent layer-pruning papers.
+
+But there is a detail that was overlooked: ShortGPT treats the attention sublayer and the MLP sublayer inside each transformer block as a single unit to remove. Are attention and MLP really equally redundant?
+
+** 2024.06 | Not All Attention Is Needed: Attention sublayers are far more redundant
+
+*** What problem did it see?
+
+He et al. focused on the detail the previous paper glossed over: inside each transformer block there are two sublayers — the attention sublayer and the MLP sublayer. ShortGPT scores them as a bundle, implicitly assuming they rise and fall together.
+
+But once the two are separated it becomes obvious: their redundancy levels are not in the same ballpark. *Attention sublayers are dramatically more redundant.*
+
+*** Its solution
+
+Apply the BI cosine-similarity scoring separately to attention sublayers and MLP sublayers — called Attention Drop and MLP Drop respectively.
+
+The experimental result is striking: on Llama-3-70B, *removing half of all attention sublayers* causes essentially no performance degradation. MLP sublayers cannot be removed nearly as aggressively.
+
+*** Why it works (and what new pit it digs)
+
+This pulled the entire field's attention (literally) toward attention sublayers — it turns out that the most computationally expensive component of the transformer is largely unnecessary.
+
+Yet He et al. remain within the ShortGPT paradigm: calibration data, a forward pass, similarity computation. Scoring still takes on the order of minutes.
+
+At this point the question is sharp: *given that attention sublayers are massively redundant, can we identify the useless ones with no data and no forward pass, just by looking at the weights?*
+
+** 2025.12 | Gate-Norm: Zero data, scoring done in under one second
+
+*** What problem did it see?
+
+Gate-Norm directly targets the "must feed data" requirement. Even though He et al.'s method only needs one forward pass: (1) you still have to choose data (which domain, how many samples); (2) a single forward pass through a large model can take minutes to tens of minutes; (3) the scores drift with the data distribution. Eliminating data entirely removes all of these concerns at once.
+
+The deeper question: what does it mean, at the weight level, for an attention sublayer to be "redundant"? What do its W_Q, W_K, W_V, W_O matrices look like — can we read the answer directly from the shape of the weights?
+
+*** Its solution
+
+The authors propose the *Attention Suppression Hypothesis*: some deep attention sublayers have learned, during pre-training, to "self-mute" — actively driving their own output close to zero, ceding computation to the residual connection and the MLP.
+
+If an attention sublayer is self-muting, its Q and K projections should be nearly decoupled — because if it never intends for softmax to meaningfully select which token attends to which, the selection outcome does not matter. Gate-Norm's score is therefore: compute the *query-key coupling norm* between W_Q and W_K. Layers where coupling is weakest are the ones playing pretend; remove them.
+
+The entire procedure: *look only at the weights, feed no data, run no forward pass, do no fine-tuning, require no custom kernels*. A 40-layer 13B LLaMA is fully scored in under one second.
+
+*** Why it works (and what new pit it digs)
+
+Looking back, this entire line has been doing the same thing repeatedly: progressively compressing the notion of "importance."
+- Wanda: calibration data + one forward pass
+- Gromov / ShortGPT: calibration data + one forward pass + (optional) fine-tuning
+- He: calibration data + one forward pass (attention granularity)
+- Gate-Norm: 0 data, 0 forward passes
+
+The concept of "importance" has been flattened step by step: from "weight × activation" to "layer input-output similarity" to "internal coupling inside the weight matrices." Each generation asked the same question: you claim this layer is redundant — can that claim be verified at a cheaper cost?
+
+Gate-Norm's answer is: yes — W_Q and W_K alone are sufficient, because redundant attention sublayers carry a distinctive weight-level signature (self-muting = decoupled QK). Removing 8–16 attention sublayers yields a 1.30× inference speedup with at most a 2% accuracy drop, and scoring is approximately *1000× faster* than He et al.'s approach.
+
+Remaining open pits: (1) the hypothesis has only been validated on LLaMA; whether it holds for other architectures (MoE, Mamba hybrids) is unknown; (2) only attention sublayers are pruned; MLP redundancy is untouched; (3) the hypothesis claims these layers "learned to self-mute during training" — what training dynamics actually cause this remains unanswered.
+
+* Frontier Extensions
+
+As of now, Gate-Norm is the latest strike on the "data-free layer pruning" front. Liu et al. (2026)'s Prune&Comp, Song et al.'s SLEB, and Chen et al.'s LLM-Streamline all remain within the ShortGPT paradigm (data required). Directions worth watching:
+
+- Extend the "weight signature" idea from attention to MLP: MLP redundancy is lower, but can we find a weight signature identifying the "pretending" MLP sublayers?
+- Use the Attention Suppression Hypothesis in reverse during training: if some attention heads will self-mute anyway, can we pre-allocate fewer attention sublayers at pre-training time?
+- Validate the hypothesis directly: examine the layers Gate-Norm removes and trace when they begin "self-muting" on the training loss curve.
+
+* One Diagram
+
+#+begin_example
+                          Scoring cost    Granularity      Needs data?   Needs fine-tuning?
+                          ------------   -------------     -----------   ------------------
+  2023  Wanda             1 forward      single weight       yes              no
+  2024  Gromov            1 forward      block of layers     yes              yes (QLoRA)
+  2024  ShortGPT          1 forward      single layer        yes              no
+  2024  Not All Attn      1 forward      attn sublayer       yes              no
+  2025  Gate-Norm         < 1 second     attn sublayer       NO               NO
+                          ^^^^^^^^^                          ^^^              ^^^
+                          weights only                    weights only
+
+  Direction: --->  pruning cost continuously compressed; granularity
+                   increasingly focused on the attention sublayer
+
+  Conceptual evolution:
+  "weight importance"  -->  "layer input-output similarity"  -->  "intra-weight coupling signature"
+         |                            |                                      |
+   weight + activations          layer behavior                      weight geometry only
+#+end_example
+
+* Insight
+
+On the surface this line is "pruning method iteration"; underneath, what is happening is the *progressive internalization of the concept of "importance."*
+
+The first generation (Wanda) still defined importance in terms of "weights + data" — without feeding data, no judgment was possible. Generations two through four moved it to "the input-output relationship of a layer" — still data-dependent, but concerned only with layer-level behavior. The fifth generation (Gate-Norm) takes it to the extreme: importance is *fully encoded in the geometry of the weights themselves*, and data becomes a superfluous intermediary.
+
+Behind this lies a larger bet: *pre-training has already written everything worth knowing into the weights — including the fact of which layers are unimportant — and we simply hadn't learned how to read it*. Gate-Norm finds one way to read it through the specific mechanism of "self-muting." If that bet is correct, future model analysis, compression, and interpretability may no longer require feeding data at all, but instead involve "reading the shape of the weights."
+
+The most likely next direction: extend the "weight geometry tells you X" paradigm from attention to MLP, to training dynamics, and perhaps even to capability estimation (predicting a model's task performance without running a benchmark).
+
+* Takeaway
+
+The most valuable lesson from studying this line is not the invention of new algorithms — it is *the practice of picking out each "necessary step" and questioning whether it really is necessary*.
+
+No paper in this entire line invented "pruning," and no one invented the observation that "attention is redundant." The contribution of each generation is always the same sentence: *something the previous generation assumed was necessary, turns out not to be.*
+- Wanda says: gradients are not necessary.
+- Gromov says: pruning at the weight level is not necessary.
+- ShortGPT says: complex block-level scoring is not necessary.
+- He et al. say: bundling attention and MLP together is not necessary.
+- Gate-Norm says: feeding data is not necessary.
+
+The practical lesson: take any current SOTA in any field, list the steps it assumes are mandatory, and ask "why is this mandatory?" for each one. Every highly-cited paper in this line marks the moment some "necessity" was overturned.

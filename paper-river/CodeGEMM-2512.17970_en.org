@@ -1,0 +1,265 @@
+#+title:      CodeGEMM: A Codebook-Centric Approach to Efficient GEMM in Quantized LLMs
+#+date:       [2026-05-29 Fri 13:35]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T133523-en
+#+source:     https://arxiv.org/abs/2512.17970
+#+authors:    Gunho Park, Jeongin Bae, Byeongwook Kim, Baeseong Park, Jiwon Ryu, Hoseung Kim, Se Jung Kwon, Dongsoo Lee
+#+venue:      NeurIPS 2025
+
+* The River of the Problem
+
+Fitting a 405-billion-parameter model onto a single GPU card — this problem has been stuck for five years.
+
+Each weight originally requires 16 bits; 405 billion weights means 810 GB, more than eight H100s can hold. So people started compressing: first to 4 bits, with almost no accuracy loss; then down to 2 bits, where the model seemed to have its soul hollowed out — incoherent gibberish. Some then changed strategy: instead of letting each weight take an independent value, they drew a "color swatch book" (codebook) for an entire layer of weights, and each weight only recorded which color number it used from the swatch book. This path genuinely rescued 2-bit accuracy, but fell into a new trap — *the act of looking up the swatch book itself slowed the GPU to a crawl*.
+
+The model was made smaller, yet it barely ran faster. This is exactly the question CodeGEMM sets out to answer: *Why does "saving memory" fail to translate into "saving time"?*
+
+* The Source Map
+
+#+begin_example
+[2022.10] GPTQ (Frantar et al.)
+   |
+   | Problem: compress a 175B model to 3-4 bits all at once;
+   |   nobody dared go below 8 bits
+   | Solution: column-wise greedy quantization guided by second-order
+   |   Hessian; compensate errors on the fly
+   v
+[2022.06] LUT-GEMM (Park et al.)  ----.    [2023.06] AWQ (Lin et al.)
+   |                                  |       |
+   | Problem: GPTQ's kernel only saves|       | Problem: GPTQ prioritizes by
+   |   memory; still dequantizes      |       |   weight magnitude, but what
+   |   before matrix multiply         |       |   truly matters is activations
+   | Solution: use a look-up table to |       | Solution: find the 1% of channels
+   |   multiply BCQ weights directly  |       |   with the largest activation
+   |   with activations, skip dequant.|       |   magnitudes, scale them, then
+   |                                  |       |   use simple rounding
+   |                                  |       |
+   v                                  v       v
+[2024.01] AQLM (Egiazarian et al.)  <--- scalar quant collapses at 2 bits;
+   |                                         switch to vector quantization
+   |
+   | Problem: scalar quant breaks at 2 bits; individual weights lack
+   |   expressive power
+   | Solution: treat multiple weights as a vector; represent with
+   |   "additive codebooks" (reviving an old information-retrieval technique)
+   v
+[2024.02] QuIP# (Tseng et al.)
+   |
+   | Problem: AQLM's codebook geometry is loose and hardware-unfriendly
+   | Solution: rotate weights with a Hadamard matrix (incoherence processing)
+   |   to produce a near-uniform spherical distribution; use E8 lattice codebook
+   v
+[2024.09] VPTQ (Liu et al.)
+   |
+   | Problem: AQLM quantization is too slow; QuIP# codebook is too rigid
+   | Solution: second-order VQ + residual codebook; quantization time cut
+   |   to 10-19% of AQLM's
+   |   — but the kernel is still "dequantize then multiply"; root untouched
+   v
+[2025.12] CodeGEMM (Park et al.) <--- target paper
+   |
+   | Problem: everyone competed on how to build and train codebooks;
+   |   nobody changed the kernel.
+   |   Dequantization repeatedly pulls centroid vectors, saturating cache;
+   |   memory is saved but latency is not.
+   | Solution: don't cache centroids — cache "inner products of activations
+   |   with centroids" — the Psumbook.
+   |   The look-up retrieves a precomputed partial sum, not a weight value.
+   v
+[2026+] ? (no follow-up work yet)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022.10 | GPTQ: Compressing a Giant Model to 3–4 Bits in One Pass
+
+*** What Problem It Saw
+
+Before GPTQ, pushing an LLM below 8 bits was essentially off-limits. The simplest "round to the nearest grid point" approach still held at 6 bits, started failing at 4, and collapsed entirely at 3. Post-training quantization (PTQ) methods existed, but they all required re-running data and tuning hyperparameters — for a 175B model, a single quantization run could take days or weeks.
+
+*** Its Solution
+
+GPTQ revived a second-order optimization idea from the 1980s called OBS (Optimal Brain Surgeon). The intuition: you cannot quantize weights in isolation, because weights are coupled — when you round one weight, the others should compensate for the error. GPTQ made this work column-by-column, Hessian-guided, in a pipelined fashion. A 175B model, 4 GPUs, 4 hours to reach 4 bits.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it acknowledged that weights influence one another. But it also left two holes. First, *all judgments were based on weights themselves* — weight magnitudes and Hessian values — without looking at activations, which are the true arbiters of which weights actually matter. Second, *it delivered numbers, not a kernel* — you got 4-bit weights, but at runtime the GPU still had to dequantize them to FP16 before doing matrix multiplication. Memory was saved; time was not.
+
+** 2023.06 | AWQ: What Truly Matters Is Not Weight Magnitude, But Activation Scale
+
+*** What Problem It Saw
+
+GPTQ was solid at 4 bits but still struggled at 3, and its Hessian computation required a calibration set — if that set differed in distribution from real usage, the quantization result would "overfit" the calibration data. The deeper issue: GPTQ decided which weights to protect using statistics of the weights themselves, but a weight's true importance depends on how large its corresponding activation typically is — a small weight multiplied by a large activation can still have a big impact on the final output.
+
+*** Its Solution
+
+AWQ did something extremely minimal: measure activations on a small batch of samples, identify the top 1% of channels by activation magnitude, and *multiply the corresponding weights by a scaling factor greater than 1* before quantization (dividing the activations by the same factor equivalently). Then apply the most naive rounding. No Hessian, no backpropagation.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it moved the notion of "importance" from the weight side to the activation side, more faithfully reflecting what the model experiences at runtime. But it remained *scalar quantization* — each weight still independently took a single value. The expressive ceiling was fixed. At 2 bits, each weight has only 4 possible states; no amount of clever scaling can save that. Either give up on 2 bits, or switch to an entirely different representation.
+
+** 2022.06 | LUT-GEMM: Skip Dequantization, Compute by Table Lookup
+
+*** What Problem It Saw
+
+LUT-GEMM appeared at almost the same time as GPTQ, but asked a question at a different layer: once you have 3-bit or 4-bit weights, how does the GPU actually compute? The standard PyTorch path was — dequantize low-bit weights to FP16, then call cuBLAS for FP16 matrix multiply. There is a waste here: *the intermediate dequantized result occupies registers and cache, but it will be multiplied by activations and immediately discarded.*
+
+*** Its Solution
+
+If weights can only take a small number of values (e.g., 2 bits means 4 values), then *the result of multiplying the activation vector by each possible weight value* can be precomputed. Store those results in a look-up table (LUT); during matrix multiply, instead of doing multiplications, just do "table look-up + accumulation." LUT-GEMM used the BCQ (Binary Code Quantization) format, representing each weight as a linear combination of a few ±1 terms.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it moved "dequantization" from runtime to "precomputed ahead of time." But *it only worked with BCQ* — every weight had to be expressible as a linear combination of sign bits. Once methods like AQLM and QuIP# appeared with learned, arbitrary vector codebooks, LUT-GEMM's approach became incompatible. Its table look-up indexed on bits, not on codes.
+
+** 2024.01 | AQLM: Scalar Quantization Is Dead — Switch to Vector Codebooks
+
+*** What Problem It Saw
+
+GPTQ and AWQ are both scalar quantization — each weight independently picks a numeric value. At 2 bits, each weight has only 4 states; no further optimization recovers the accuracy. But people noticed something: *weights are not independent* — weights in the same row or column are highly correlated. Quantizing them together as vectors could exploit far more compression potential.
+
+*** Its Solution
+
+AQLM borrowed the "Additive Quantization" idea from information retrieval. It treated every 8 or 16 weights as a vector, then represented it as *the sum of entries from several codebooks* — for example, a 2×8 configuration uses two codebooks of 256 entries each, and each weight vector = one centroid from the first codebook + one centroid from the second. Each weight vector only needs to store two 8-bit indices, averaging 2 bits per weight. Expressiveness far exceeds scalar.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it changed the representation: no longer picking from 4 values, but selecting a learned "prototype vector" from a high-dimensional space. But it introduced two new problems. First, *kernel trouble*: a 1×16 codebook has 65,536 entries ≈ 1 MB, far exceeding A100's 164 KB shared memory; the GPU must fetch repeatedly from DRAM, devastating performance. The 2×8 configuration barely fits, but still requires "dequantize then multiply" — only marginally better throughput than FP16. Second, *quantization itself is extremely slow*: jointly optimizing all codebooks and all indices.
+
+** 2024.02 | QuIP#: Give the Codebook Geometric Symmetry
+
+*** What Problem It Saw
+
+AQLM's codebook was data-driven and structureless. This made two things hard: the codebook itself needed to be stored; and without geometric properties to exploit, hardware had no way to "anticipate" the data. Meanwhile, weight matrix distributions tend to be heavy-tailed and anisotropic, making VQ suboptimal.
+
+*** Its Solution
+
+QuIP# took a more "engineering" path. First, rotate the weights with a random Hadamard matrix — called incoherence processing — spreading any distribution into something close to a uniform spherical distribution. Then use the *E8 lattice* — the densest known sphere packing in 8 dimensions — as the codebook. Because E8 has mathematical structure, the codebook can be generated by formula rather than stored; because weights have been rotated, VQ error is more controlled.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it reframed "codebook design" from a purely data-driven problem to a "geometry + data" problem, finding a better-matched tool. The cost: *an extra rotation operation at runtime*, and the speed gains require a heavily optimized fused kernel. Also, the vector dimension is locked to 8 (E8 is 8-dimensional), sacrificing flexibility.
+
+** 2024.09 | VPTQ: Quantization Ten Times Faster, But the Kernel Is Unchanged
+
+*** What Problem It Saw
+
+AQLM had good accuracy but quantization times too long to tolerate. QuIP# was fast but E8 was too rigid. Could you get both speed and flexibility?
+
+*** Its Solution
+
+VPTQ recast VQ as a second-order optimization problem (inheriting GPTQ's spirit), performing per-channel updates, and adding a residual codebook and an outlier codebook. Quantization time fell to 10–19% of AQLM's, with slightly better accuracy.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it separated "how to quantize" from "what representation to use": the representation is still a codebook, but the solver changed. However, on the *kernel level* it barely moved — the CodeGEMM paper states it explicitly: "VPTQ's kernel is a straightforward dequantize-then-multiply pipeline with no operator fusion, achieving lower throughput than FP16."
+
+At this point, codebook quantization at the algorithm level had little room left — beyond VPTQ, accuracy gains were in the third decimal place. But *the kernel angle had been untouched for four full years*. Everyone assumed by default that "codebooks are there to be dequantized."
+
+** 2025.12 | CodeGEMM: Don't Cache the Codebook — Cache What the Codebook Has Already Computed
+
+*** What Problem It Saw
+
+CodeGEMM laid out the core sequence of operations in previous kernels:
+- Step 1: fetch a block of weight indices and the corresponding codebook from DRAM;
+- Step 2: look up the codebook using indices to obtain centroid vectors;
+- Step 3: multiply the centroid vectors by the activations and accumulate.
+
+It observed: *Steps 2 and 3 together are wasteful*. In GEMM, *the same block of activations is multiplied against many different weights* — yet those weights collectively reference only a limited set of centroid vectors. If the inner product of activations with each centroid is computed once and stored, all that remains later is to look up indices and add partial sums — no need to "dequantize to get centroids then multiply."
+
+It also noticed: when the codebook is large (e.g., 1×16 at ~1 MB), even caching centroid vectors overflows A100's 164 KB shared memory — this was the root cause of AQLM's poor performance.
+
+*** Its Solution
+
+Introduce the *Psumbook* — a "partial sums" table. At the start of each tile, compute the inner product of the activation against every centroid vector once, and store the results in shared memory. During the actual matrix multiply, weight indices no longer look up "what is the weight value?" but directly index "what is this weight's contribution to the output?" — fetch it and accumulate.
+
+An analogy: the old approach was "I have a recipe book (codebook); every time I cook I look up the recipe, gather ingredients, cook, and serve." CodeGEMM is "cook every dish on the menu once in the morning and keep them warm; when a customer orders, just plate and serve." The former requires looking up the recipe and preparing ingredients a thousand times to serve a thousand meals; the latter only cooks the 256 dishes on the menu, once each.
+
+*** Why It Worked (and What New Holes It Left)
+
+It worked because it completely changed *what is being cached*. Before, the cache held centroid vectors (to be used in computation later); now, the cache holds computation results (used directly). This reduces computational complexity from O(MNK) to roughly O(MNK·v/m), where v is the vector length and m is the codebook size. On Llama-3-70B at 2 bits, it achieved an 8.93× speedup over the state-of-the-art codebook quantization kernel.
+
+The new holes it introduced are equally clear:
+- *The Psumbook still must fit in shared memory* — so the single codebook width cannot increase (the paper fixes b=8 rather than 16); accuracy is recovered via fine-grained group normalization;
+- *Effective only at small batch sizes* — the advantage disappears when M > 32, because activation reuse is insufficient;
+- *Not validated on H100/H200/AMD GPUs* — shared memory budget is hardware-specific;
+- *The baseline is the HuggingFace path* — it has not been directly compared against industrial kernels like vLLM or TensorRT-LLM.
+
+* Frontier Extensions
+
+The CodeGEMM paper was posted to arXiv on December 19, 2025; as of May 2026, *no public follow-up paper has specifically critiqued or extended it*. The closest concurrent work is another paper on "highly optimized kernels + fine-grained codebooks" (arXiv 2501.00032), but it takes a different approach and does not cite CodeGEMM.
+
+This line of work is therefore in a very clear state: the algorithm layer (AQLM → QuIP# → VPTQ) has been pushed to diminishing returns; the kernel layer has been pried open from a new angle by CodeGEMM. One can expect two categories of work to appear in the next 6–12 months:
+
+1. *Porting the Psumbook idea to other codebook structures* — QuIP#'s E8 lattice can theoretically also precompute activation-centroid inner products, but requires a new kernel design;
+2. *Attacking CodeGEMM's pain points* — large batches, large codebooks, cross-hardware portability; especially combining the Psumbook idea with KV-cache quantization in attention.
+
+* One Diagram
+
+#+begin_example
+                   "What is compressed"     "How it is computed"
+                   --------------------     --------------------
+ [2022 GPTQ]    Each weight quantized        Dequantize → FP16 matmul
+                independently
+                       |                           |
+                       v                           v
+ [2022 LUT-GEMM]   Same                    Table lookup replaces dequant
+                                           (BCQ only)
+                       |                           |
+                       v                           v
+ [2023 AWQ]     Scalar, activation-scaled   Dequantize → FP16 matmul
+
+                       |                           |
+                       | (scalar hits wall at 2 bits)
+                       v                           v
+ [2024 AQLM]    Vector, additive codebook   Dequantize → matmul
+                                            (codebook too large to fit)
+                       |                           |
+                       v                           v
+ [2024 QuIP#]   Vector, rotation + E8       Dequantize (rotation fused kernel)
+
+                       |                           |
+                       v                           v
+ [2024 VPTQ]    Vector, 2nd-order + residual  Dequantize → matmul
+                                               (kernel unchanged)
+                       |                           |
+                       |  algorithm exhausted   (kernel untouched for 4 years)
+                       v                           v
+ [2025 CodeGEMM]  No new algorithm          ! Cache activation·centroid
+                  reuses additive codebook     inner products !
+                                              Look up partial sums,
+                                              accumulate directly
+
+
+  Timeline:  2022 ----- 2023 ----- 2024 ----- 2025
+  Algorithm: GPTQ  AWQ  AQLM QuIP# VPTQ
+  Kernel:                                   CodeGEMM
+                                              (new front)
+#+end_example
+
+* Insights
+
+Tracing this line end-to-end, three things were quietly shifting.
+
+*First, the "expressiveness" of quantization has reached diminishing returns.* From GPTQ scalar, to AWQ activation-aware scalar, to AQLM vector, to QuIP# geometrically symmetric vector, to VPTQ second-order vector — over four years, the accuracy loss at 2 bits went from "catastrophic" to "nearly on par with FP16." Pushing further yields differences in the third decimal place. *The algorithmic summit has essentially been flattened.*
+
+*Second, the bottleneck has shifted from "representation" to "execution."* Once everyone has roughly equivalent codebooks, the differentiator returns to how fast things run on the GPU — a problem that was neglected for four years. Everyone assumed by default that "codebooks are there to be dequantized"; nobody challenged that assumption. What CodeGEMM did, in essence, was transform one step in the entire pipeline — dequantization — from "must do" to "can be skipped."
+
+*Third, at a deeper level: this is a transformation of what gets cached.* Computer science has an old question — what should be cached, and what should be recomputed? The implicit assumption of codebook quantization from the start was "cache the compressed representation (the codebook)." CodeGEMM says: that's wrong — cache "the result of interacting with others (partial sums)." Because the compressed representation is only an intermediate product; what is ultimately used is not it, but its product with the activations.
+
+This mental shift is generalizable — for any "dequantize then compute" pipeline, ask: can I instead cache "the computational result after dequantization"?
+
+Where is the next step most likely to go? I would bet on two directions: (1) the Psumbook idea gets ported to KV-cache quantization in attention; (2) "Psumbook-friendly codebook design" emerges — where the codebook structure is designed to fit the Psumbook's memory budget, rather than being an afterthought.
+
+* Lessons
+
+The most straightforward lesson from this line of work is: *when everyone in a field is competing along the same dimension, it is usually because they all share an unquestioned assumption.*
+
+Across the four years from GPTQ to VPTQ, everyone competed on "how to design codebooks." But they shared the assumption that "codebooks are meant to be dequantized in the kernel." What CodeGEMM moved was not the algorithm — it was that assumption.
+
+In practical terms: the next time you face a field that looks like it has been pushed to its limits, resist the urge to squeeze another 1% on the existing dimension. Step back and ask: *what is the assumption that everyone in this field shares but that nobody has ever changed?* That assumption is usually where the next order-of-magnitude gain is buried.
+
+Specifically for LLM inference: if you are working on quantization or compression, ask yourself — are "what I compress" and "how I compute" truly decoupled? If they are, there is room to optimize the compression format and the computation kernel independently, rather than letting one lock in the design choices of the other.
+
+Honest disclosure: the critical chain from GPTQ → AWQ, AWQ → AQLM, and AQLM → QuIP# was read directly from the explicit citation relationships in each paper's related work section. LUT-GEMM as a side branch (an early attempt at the kernel level) is included based on explicit comparisons made in the CodeGEMM paper. The statement that "there are no follow-up papers as of 2026" reflects a search result as of May 2026 and may change within the next few months.

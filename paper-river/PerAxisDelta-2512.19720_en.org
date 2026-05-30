@@ -1,0 +1,190 @@
+#+title:      Per-Axis Weight Deltas for Frequent Model Updates
+#+date:       [2026-05-29 Fri 13:39]
+#+filetags:   :paper:river:en:
+#+identifier: 20260529T133950-en
+#+source:     https://arxiv.org/abs/2512.19720
+#+authors:    Stefan Kuyumdzhiev, Radostin Cholakov
+#+venue:      NeurIPS 2025 Workshop CCFM
+
+* The Problem River
+
+A company runs dozens or even hundreds of fine-tuned large models — one for customer service, one for code, one for medicine, one for law — all sharing the same Llama base. Cramming them all into GPU memory at once? Impossible. Loading one per request on demand? Fourteen-second cold starts, and users are gone.
+
+The core tension: every fine-tuned model has only changed a few percent of the base weights, yet you end up storing a full, multi-dozen-GB copy of each. You could in principle store only the *diff*, and that diff is itself highly compressible — down to 1 bit if needed — but how do you compress it without hemorrhaging accuracy? That is the pit every generation in this river has taken turns stepping into.
+
+* Source Map
+
+#+begin_example
+[2020] Nagel et al. - AdaRound
+  | Observation: rounding weights to the nearest discrete value
+  |              causes errors that compound layer by layer
+  | Solution:    don't round-to-nearest; let each weight learn
+  |              whether to round up or down
+  v
+[2021] Li et al. - BRECQ
+  | Observation: AdaRound optimizes one weight at a time,
+  |              missing cross-weight interactions within a block
+  | Solution:    reconstruct at "block" granularity using
+  |              second-order Hessian info to confine errors
+  v
+[2023] Frantar et al. - GPTQ
+  | Observation: BRECQ's approach is too slow for 175B LLMs;
+  |              Hessian computation is intractable at that scale
+  | Solution:    greedy column-wise quantization + Cholesky trick,
+  |              compresses an LLM to 3-4 bit in a few hours
+  v
+[2024] Liu et al. - BitDelta (NeurIPS'24)
+  | Observation: GPTQ compresses raw weights — wasteful.
+  |              Fine-tuning moves very little; compress the *delta*
+  | Solution:    store only sign(W_ft - W_base) + one scalar: 1 bit per entry
+  v
+[2025] Kuyumdzhiev & Cholakov - PerAxisDelta (this paper)
+  | Observation: BitDelta's single scalar per matrix is too coarse.
+  |              Different rows of the same matrix have very different magnitudes
+  | Solution:    keep 1-bit signs, but upgrade the scalar to a
+  |              per-row or per-column vector
+  v
+[Future]  blockwise per-group scaling? learnable sign structure?
+          INT4/FP8 co-design?
+#+end_example
+
+* Evolutionary Narrative
+
+** 2020 | AdaRound: Stop Rounding to Nearest
+
+*** What Problem It Saw
+
+Quantization had long relied on a single move: round each floating-point weight to the nearest integer (round-to-nearest, RTN). Intuitively reasonable — go wherever is closest. But Nagel slammed the table: wrong. Each weight's rounding error looks small in isolation, yet those errors get amplified by matrix multiplications, accumulated, and mutually interfere as they propagate through layer after layer. By the time you reach the output, the signal is hopelessly distorted. Below 4 bits, RTN simply collapses.
+
+*** Its Solution
+
+Let each weight learn its own "round up or round down" decision. Previously it could only go to the nearest discrete value (e.g., 2.6 must become 3). AdaRound introduces a learnable perturbation so the value can become either 2 or 3, decided by whichever choice keeps the network output closest to the original. In essence it replaces "geometrically nearest" with "task-optimal."
+
+*** Why It Works (and What New Pit It Digs)
+
+It was the first to show that quantization errors are not isolated — they have synergistic effects. But AdaRound optimizes the rounding direction of one weight at a time, blind to the mutual drag between an entire layer's or block's weights. That gap left room for the next generation.
+
+** 2021 | BRECQ: Block by Block
+
+*** What Problem It Saw
+
+AdaRound stares at one number at a time, but a neural network layer is a whole — this weight being slightly off may be fine, but if an entire block shifts together, the activation distribution collapses. AdaRound can be locally optimal yet globally disastrous.
+
+*** Its Solution
+
+Slice the network into "blocks" (a residual block or an attention block), approximate the block's output error using second-order Hessian information, and then jointly optimize all quantization parameters within that block. This was the first time PTQ (post-training quantization) was pushed to 2-bit with usable results.
+
+*** Why It Works (and What New Pit It Digs)
+
+The Hessian captures cross-weight interactions — changing this weight means that one must compensate. But there is a fatal problem: the Hessian is a d × d matrix, where d can be in the thousands. Fine for small models; for a model with tens of billions of parameters, computing the Hessian alone would burn through your GPU budget before you even start.
+
+** 2023 | GPTQ: Dragging BRECQ into the LLM Era
+
+*** What Problem It Saw
+
+LLMs arrived. OPT-175B, LLaMA-65B. Running BRECQ's second-order methods at this scale would take days. But RTN was genuinely broken below 4 bits. There was a gap in the middle.
+
+*** Its Solution
+
+Two tricks: (1) observe that the Hessian in PTQ only needs its diagonal and column-direction updates — a Cholesky decomposition computes everything needed in one shot; (2) quantize column by column greedily, and immediately after quantizing each column, propagate its error as a compensation to all remaining unquantized columns. Result: compress an entire LLM to 3–4 bit in a few hours with negligible accuracy loss.
+
+*** Why It Works (and What New Pit It Digs)
+
+It converts error handling from "acknowledge after the fact" to "transfer in the moment." But GPTQ still compresses *raw weights*. If you have 50 fine-tuned versions, you run GPTQ 50 times. Worse, it never exploits the critical fact that those 50 fine-tuned versions differ from one another by only a tiny amount.
+
+** 2024 | BitDelta: Compress the Delta, Not the Weights
+
+*** What Problem It Saw
+
+While the GPTQ crowd was polishing 3–4 bit precision, the BitDelta authors stepped back: wait — in a serving setting we have dozens of Llama-base fine-tunes, each independently quantized to 4 bits, stored 50 times over. But 99% of their content is identical.
+
+The sharper observation: W_finetuned − W_base, the delta, is *very small*, and its distribution is tightly concentrated around zero. Compressing it is far easier than compressing the full matrix.
+
+*** Its Solution
+
+Shockingly simple: store only sign(ΔW). Each weight's delta is recorded in 1 bit (+1 or −1), with a single FP16 scalar shared across the entire matrix to recover magnitude. The paper's title says it all: "Your Fine-Tune May Only Be Worth One Bit."
+
+At serving time: keep one copy of the base in memory, plus a pile of 1-bit masks and their scalars. Switch tasks by swapping masks; the base never moves. 10× compression, negligible accuracy drop.
+
+*** Why It Works (and What New Pit It Digs)
+
+Because ΔW is tiny and concentrated, discarding magnitude and keeping only sign already recovers most of the information. But the assumption of "one scalar per entire matrix" is in fact very strong — it assumes the "typical magnitude" of ΔW is roughly the same in all directions. Is it? In an attention projection's q_proj matrix, some rows correspond to one particular head and others to another — their ΔW magnitudes can differ by several times. A single shared scalar forces the large-magnitude rows to settle for the small-magnitude rows' scale.
+
+That crack is exactly where PerAxisDelta steps in.
+
+** 2025 | PerAxisDelta: One Scalar Is Not Enough — Use a Vector
+
+*** What Problem It Saw
+
+Replace BitDelta's "one scalar per matrix" with "one scalar per row" (or per column). What is the cost? A vector of length d, relative to a matrix of thousands of dimensions, adds less than 0.1% overhead. But what is the gain? The authors ran experiments and found that the *anisotropy* of fine-tuning deltas is strong — different rows or columns of the same matrix have noticeably different typical magnitudes.
+
+And — this is the genuinely clever part of this paper — whether to use row or column scaling cannot be decided by gut feeling. q_proj and v_proj prefer row scaling; gate_proj and up_proj prefer column scaling; k_proj splits evenly between the two. This is jointly determined by the input/output dimension ratio of the matrix and the task activation distribution.
+
+*** Its Solution
+
+Three steps:
+1. Replace BitDelta's scalar with a vector v (length = number of rows or columns), reconstructing W ≈ v ⊙ sign(ΔW) + W_base
+2. For each matrix, try both row mode and column mode, and keep whichever yields lower end-to-end validation loss
+3. Train v not by recovering the original weights, but via *activation matching* — make the compressed layer's output match the original layer's output as closely as possible. Only 50 C4 samples are used
+
+Empirical results: on Llama-3.1-8B, average improvement of +0.28 points over BitDelta; on Qwen3-14B, +0.37 points. Storage cost is nearly identical (5.24× compression), but loading time drops from 2.08s to 0.80s — because the per-axis structure can be packed into a single per-module transfer.
+
+*** Why It Works (and What New Pit It Digs)
+
+The root cause of success: the authors identified BitDelta's implicit assumption (isotropy), broke it, and paid only one vector in overhead. This is a classic engineering win of "spend 0.1% extra parameters to gain 0.3 points."
+
+New pits dug:
+- If a layer's delta really is nearly isotropic, the vector is pure waste
+- The 1-bit sign is still fixed; it cannot represent zero (every position is forced to contribute noise)
+- The choice is binary — per-row or per-column — with no finer per-block granularity
+- The scaling vector is trained via activation matching, so calibration set distribution shift will degrade results
+
+* Frontier Extensions
+
+As of this paper's publication (December 2025), this is the most recent node on the delta-compression branch. The authors themselves list several obvious directions:
+
+1. *Blockwise per-group scaling* — refine "one scalar per row" further into "one scalar per group of N columns within a row." This transplants the group-quantization idea from the GPTQ era onto deltas.
+2. *Learnable sign structure* — the binary mask B = sign(ΔW) is currently fixed. Under a more aggressive bit budget, making the sign itself learnable may actually be better.
+3. *INT4/FP8 co-design* — the delta uses 1 bit, but the base is still BF16, so the entire inference path remains BF16. Only when the base is also compressed to INT4 or FP8 does the full pipeline actually save computation.
+4. *Multi-tenant evaluation* — the paper only measures single-model quality and does not test a real serving scenario: with 100 fine-tunes online simultaneously, what do scheduling, memory footprint, and latency actually look like?
+
+This river will almost certainly keep flowing for a while.
+
+* One Diagram to See It All
+
+#+begin_example
+                    What is compressed       How                       Granularity         Savings
+  ----------------+-----------------------+-----------------------+-------------------+---------
+  AdaRound 2020   | raw weights           | learn up/down per     | per parameter     | 4-bit usable
+                  |                       | entry                 |                   |
+  BRECQ 2021      | raw weights           | block-level joint     | block-level       | pushed to 2-bit
+                  |                       | Hessian optimization  |                   |
+  GPTQ 2023       | raw weights (LLM)     | greedy column +       | column-level      | 3-4 bit, hours
+                  |                       | error compensation    |                   |
+  BitDelta 2024   | *delta* (W_ft - W_b)  | sign only + 1 scalar  | whole-matrix      | 1-bit, 10×
+                  |                       |                       | shared            |
+  PerAxisDelta    | *delta*               | sign + per-row/col v  | row-level /       | 1-bit, 5×
+   2025           |                       | (row vs col auto-     | col-level         | + load 2.6×
+                  |                       | selected)             | (binary choice)   |
+
+  Evolution direction ----->  from "compress parameters" to "compress the change";
+                              from "one-size-fits-all" to "structure-aware"
+#+end_example
+
+* Insights
+
+On the surface this line of work is about quantization precision; beneath the surface, what is really happening is that *two axes — "what to compress" and "at what granularity" — are being repeatedly re-sliced*.
+
+The first pivot came in 2024. BitDelta shifted "what to compress" from "weights" to "weight deltas." That single cut raised the ceiling: it lets you exploit the objective fact that many models are variants of the same base. All four years of effort from AdaRound → BRECQ → GPTQ were squeezing the last drops out of the old track of "compress weights." BitDelta simply switched tracks.
+
+The second pivot is happening now. PerAxisDelta shifts "compression granularity" from "one number per whole matrix" to "one number per row." This is not a new invention either — it is the old group-quantization idea from the GPTQ era transplanted onto deltas. But the act of transplanting is itself valuable: it signals that delta compression has not yet matured enough to directly inherit the accumulated wisdom of the old track, and every old trick needs to be re-traversed in the new setting.
+
+Where is the next step most likely to go? Two directions: (1) continue refining granularity (per-group, per-block), essentially re-doing the GPTQ playbook on deltas; (2) *co-compress* base and delta together — the base is still BF16 today, so the full path stays BF16, and delta savings are only partial. When the base is compressed to INT4 and the delta to 1 bit, that is when true end-to-end serving acceleration is realized.
+
+* Takeaways
+
+"Changing what you compress" is worth more than "compressing the same thing harder." It took years and many papers for GPTQ to push raw-weight quantization from 4 bits to 3 bits; BitDelta switched the object of compression (compress the delta instead) and dropped a whole order of magnitude. In research, "finding the right track" and "sprinting on the track" are two very different activities. The former is rare but worth ten times as much.
+
+"Re-doing an old trick in a new setting" is also a legitimate form of research. PerAxisDelta invented nothing — per-channel scaling existed as far back as 2018. It only asked "does this new BitDelta setting warrant re-doing this old trick?" The answer was yes, it was done, and the numbers went up. This "low-risk, high-certainty" kind of work is not inglorious; it is the necessary brickwork that paves the entire track.
+
+The practical landing point is "can be used today": if you are running LLM serving, you can replace BitDelta with PerAxisDelta's GitHub code almost without touching the inference path, and pick up roughly +0.3 average points and a 2.6× loading speedup. If you are doing research, the next paper can attack per-group or blockwise scaling, make the sign mask learnable, or co-compress the base for end-to-end co-design. The direction this river is flowing is already clear; what it lacks is finer granularity and more aggressive co-optimization.

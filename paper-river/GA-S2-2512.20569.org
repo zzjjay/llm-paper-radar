@@ -1,0 +1,317 @@
+#+title:      Distilling to Hybrid Attention Models via KL-Guided Layer Selection
+#+date:       [2026-05-29 Fri 13:43]
+#+filetags:   :paper:river:
+#+identifier: 20260529T134313
+#+source:     https://arxiv.org/abs/2512.20569
+#+authors:    Yanhong Li, Songlin Yang, Shawn Tan, Mayank Mishra, Rameswar Panda, Jiawei Zhou, Yoon Kim
+#+venue:      arXiv 2025-12 (preprint)
+
+* 问题之河
+
+一个 LLM 跑起来越用越慢，越长越贵。能不能让它跑得像 RNN 一样快，但记忆力还像 Transformer 一样好？
+
+这是过去八年大模型推理这条线一直在抠的问题。Transformer 的 softmax 注意力，每生成一个新 token 都要回头扫一遍前面所有 token——序列越长，KV cache 越大，每一步搬运的内存也越多。一个 32K 上下文的模型，光是 KV cache 就能吃掉几 GB 显存，generation 速度被内存带宽锁死。
+
+替代品有：RNN、线性注意力、状态空间模型（SSM）—— 它们都把"扫所有历史"压缩成"维护一个固定大小的隐状态"。代价是：固定大小的状态装不下精细的长程检索（in-context recall）。RULER 这种 needle-in-haystack 任务上，纯线性注意力模型断崖式掉。
+
+于是出现了 *混合架构*：大部分层用线性注意力（省钱），少数层留 softmax（保命）。但有两个新问题马上冒出来：
+
+1. *从头预训练这种混合模型太贵了* —— 大公司能玩（Jamba、MiniMax-01、Falcon-H1），小团队玩不起
+2. *改成"从现成 Transformer 蒸馏过去"以后，下一个问题是 —— 到底该把哪些层留成 softmax？*
+
+第二个问题就是这篇论文要解的。听起来像调参细节，但它卡在一个真正的认知断层上：你怎么知道哪一层最"不可替代"？
+
+* 溯源地图
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | 解法: 全套 softmax 注意力, parallel 训练, KV cache 推理
+  | 新坑: KV cache 随序列线性增长, decoding 被内存带宽锁死
+  v
+[2020] Katharopoulos et al. - Linear Transformers
+  |
+  | 解法: 把 softmax(QK)V 改写成 phi(Q)(phi(K)^T V), 变成 RNN 形式
+  | 新坑: 固定隐状态装不下精细 recall, 长上下文崩溃
+  v
+[2023-24] Gu&Dao - Mamba / Dao&Gu - Mamba-2 / Yang et al. - GLA
+  |
+  | 解法: 给隐状态加 data-dependent gating / selective scan, recall 强一些
+  | 新坑: 纯 SSM 在 needle-in-haystack 上还是不行
+  v
+[2024-25] Lenz et al. - Jamba / MiniMax-01 / Falcon-H1
+  |
+  | 解法: 从头预训练混合模型, 固定比例 (e.g. 1:7) 插入 softmax 层
+  | 新坑: 预训练成本太高 + 固定比例是猜的, 没人知道为什么是 1:7
+  v
+[2024-25] Wang et al. - MOHAWK / Bick et al. - Llamba / Goldstein et al. - RADLADS
+  |
+  | 解法: 别预训练了, 直接从现成 Transformer 蒸馏成混合模型
+  | 新坑: 蒸馏时仍然用 uniform 间隔选层, 没用上"哪层重要"的信息
+  v
+[2025] Yang et al. - SMART / Chaudhry et al. - AR-probe / Gu et al. - PostNAS
+  |
+  | 解法: 不再 uniform, 用诊断任务 (synthetic recall) 或 NAS 选层
+  | 新坑: 诊断任务和真实任务不对齐, NAS 跑 50B token, 太贵
+  v
+[2025-12] *Li et al. - GA-S2 (本文)*
+  |
+  | 解法: 不要外部诊断, 蒸馏 KL loss 自己就是层重要性的最自然信号
+  v
+[未来]   测试时计算扩展 (test-time compute) 对蒸馏混合模型
+         的 in-context recall 提出更高要求 (Paliotta 2025, Chaudhry 2025)
+#+end_example
+
+* 演化叙事
+
+以下七篇论文，重点都不是"它做了什么"，而是"它看到了前一篇的什么问题"。
+
+** 2017 | Vaswani et al. - Attention Is All You Need: 注意力把 RNN 干掉了
+
+*** 它看到了什么问题
+
+LSTM 训练慢得要死，因为序列必须一个 token 接一个 token 地算梯度。GPU 的并行能力浪费了 90%。
+
+*** 它的解法
+
+干脆把序列建模这件事整个改写：每个位置直接看所有其他位置（self-attention），训练时全部 token 一次性算出来。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+并行训练神快。但推理时埋了一颗雷：自回归生成一个新 token 要看前面所有 token 的 K 和 V，于是必须把它们缓存下来——这就是 KV cache。序列长度 T 越大，cache 越大，每步 decoding 要从显存里搬运的数据越多。
+
+到 2023 年大家发现：长上下文 LLM 推理慢得让人绝望，瓶颈不是算力，是内存带宽。这颗雷炸了。
+
+** 2020 | Katharopoulos et al. - Linear Transformers: 把注意力改写回 RNN
+
+*** 它看到了什么问题
+
+Vaswani 那篇的 softmax(QK^T)V 在推理时本质上不能"复用计算"——每生成一个 token，KV cache 都要全量参与。能不能让它递归起来，像 RNN 一样只维护一个固定大小的状态？
+
+*** 它的解法
+
+数学技巧。把 softmax(qK^T)V 用一个 kernel feature map phi 近似成 phi(q)(phi(K)^T V)。括号里那一坨是一个 d×d 的矩阵 S，每来一个新 token 只需要做 ~S = S + phi(k)v^T~。
+
+这是个固定大小的隐状态，更新成本恒定。Decoding 时不用 KV cache 了。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+数学上 elegant，速度提升真实。
+
+但精度掉得厉害。原因直觉上很简单：softmax 的注意力分布是稀疏的，可以精确"指向"某个历史 token；phi(Q)phi(K)^T 是 dense 的，相当于把所有历史 token 平均地揉进一个 d×d 的矩阵里。你想检索"段落里第 3000 个 token 出现的人名"——固定大小的状态装不下这种精细信息。
+
+这个限制后来被叫做 *fixed-state bottleneck*，长上下文 recall 一塌糊涂。
+
+** 2023-2024 | Mamba / GLA / DeltaNet: 给隐状态加门控
+
+*** 它看到了什么问题
+
+Katharopoulos 的更新 ~S = S + phi(k)v^T~ 是"无脑累加"——所有历史 token 同等重要，老信息永远清不掉，状态饱和了就乱。
+
+*** 它的解法
+
+让更新规则变得 *data-dependent*。Mamba 的写法（简化）：~S_t = M_t S_{t-1} + k_t v_t^T~，其中 ~M_t~ 是当前 token 算出来的转移矩阵。直觉是 LSTM 的 forget gate 进化版——模型自己决定要忘掉什么、记住什么。
+
+GLA、DeltaNet、HGRN2、RWKV/Eagle 都是这条思路的变种，区别在 ~M_t~ 长啥样（对角、低秩、Delta rule…）。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+短上下文任务（常识推理、MMLU）上，这些 SSM/线性变种已经能匹敌 Transformer。
+
+但 needle-in-haystack 这种 *associative recall* 任务（RULER、Zoology），它们还是输给 softmax 一大截。Arora 等人证明了这是 fixed-state 模型的根本性限制——状态再灵活，固定大小就是固定大小。
+
+这就把球踢回来了：要 recall 还是只能上 softmax。
+
+** 2024-2025 | Jamba / MiniMax-01 / Falcon-H1: 不如混着用
+
+*** 它看到了什么问题
+
+纯线性模型 recall 不行，纯 softmax 模型推理太慢。两边都不让步。
+
+*** 它的解法
+
+混合：大部分层用线性/SSM，每隔几层插一层 softmax。Jamba 是 1:7（每 8 层有 1 层 softmax），MiniMax-01 类似。从头预训练这种架构，效果竟然能逼近纯 Transformer，但推理快得多。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+直觉对：softmax 层做"全局信息聚合"，线性层做"局部信息处理"。两边各司其职。
+
+但两个新坑：
+
+1. *预训练混合模型从头来一遍，要烧几千张 H100。* 中小团队没法玩。
+2. *为什么是 1:7？* 没人能解释。是猜的。当 *从现成 Transformer 蒸馏* 这条路走通后，"该选哪些层留 softmax" 立刻变成核心问题。
+
+** 2024-2025 | MOHAWK / Llamba / RADLADS: 别预训练了，蒸馏过去
+
+*** 它看到了什么问题
+
+Jamba 那套要从头预训练，太贵。但现在已经有几千个开源 Transformer 检查点了——能不能拿一个现成的 Qwen2.5、Llama-3.2，把它"改造"成混合模型？
+
+*** 它的解法
+
+知识蒸馏管线。RADLADS（这篇论文实际用的 backbone）分两阶段：
+- *Stage 1 隐状态对齐*：把学生模型每层的隐状态 ~U_student~ 用 L2 loss 拽到老师对应层的 ~U_teacher~。只训学生新插入的线性注意力参数，FFN 冻结。
+- *Stage 2 KL 蒸馏*：放开所有参数，让学生的输出分布 softmax(l_student/τ) 匹配老师的 softmax(l_teacher/τ)。
+
+只要 ~600M token 的训练量，就能把 Qwen2.5-3B 蒸馏出一个跑得比它快的混合学生。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+便宜得离谱（相比预训练）。在常识推理这类短上下文任务上几乎不掉点。
+
+但有个尴尬：这些工作几乎都沿用了 Jamba 的 *uniform interleaving*——每 4 层 / 7 层选一层保留 softmax。本文作者做了个关键实验（Figure 2）：把 K=softmax 层数从 1 调到 L-1，发现常识任务对 K 几乎不敏感（一层 softmax 就够了），但 RULER 这种 recall 任务对 K 极度敏感且单调上升。
+
+也就是说：*选哪几层留 softmax，直接决定长上下文能力*。Uniform 选肯定不是最优的。
+
+** 2025 | SMART / AR-probe / PostNAS: 拿诊断任务挑层
+
+*** 它看到了什么问题
+
+Uniform 间隔显然不对。每层的"重要性"应该不一样——有的层主要做局部模式匹配（线性就够了），有的层是做长程检索的关键节点（必须 softmax）。怎么找出后者？
+
+*** 它的解法
+
+三派各显神通：
+
+- *AR-probe* (Chaudhry 2025)：构造一个合成的 key-value 检索任务（associative recall），把每层挨个换成线性，看哪些层换了之后这个任务掉得最厉害。掉得多的就是"recall 关键层"，留 softmax。
+- *SMART* (Yang 2025)：用 teacher-student KL 但只在 *swap 单层* 时测，加上启发式（保留 input/output 附近的层，剩下选最敏感的）。
+- *PostNAS* (Gu 2025)：搞一个 SuperNet，跑 50B token 训练，再 beam search 找最优 K 层组合。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+比 uniform 都强了，方向是对的。但每一派有自己的毛病：
+
+- *诊断任务和真实任务对不齐*：合成 AR 任务里关键的层，到 RULER 上未必是关键的。任务分布漂移。
+- *启发式靠拍脑袋*：SMART 要"保留 input/output 附近"——为什么？没理论支撑。
+- *NAS 贵*：PostNAS 50B token，几乎和重训差不多。
+
+更深层的问题是：这些方法用的"重要性信号"是 *与最终目标不一致* 的——你最终要优化的是蒸馏后学生模型的输出分布匹配老师，那为啥不直接用这个目标本身？
+
+** 2025-12 | GA-S2 (本文): 蒸馏 KL 自己就是重要性信号
+
+*** 它看到了什么问题
+
+前面几派绕了一大圈，都在用代理任务（AR）或启发式（SMART）或暴力搜索（NAS）来估计"层重要性"。但 RADLADS 已经告诉我们：我们最终关心的就是 teacher-student 之间的 KL 散度。
+
+那就用 KL 本身当重要性。
+
+*** 它的解法
+
+干净利落，三步（Algorithm 1）：
+
+1. *先蒸出一个全线性学生* M_all-linear（用 RADLADS 的 Stage 1 + Stage 2）。这是 baseline。
+2. *逐层 one-swap*：对每一层 ℓ，把 M_all-linear 的第 ℓ 层 *换回* 老师的 softmax 层，得到 M^(-ℓ)。再跑一轮 Stage 1 + Stage 2 蒸馏。测 KL_KD(M^(-ℓ))。
+3. *重要性分数* I(ℓ) = -E[L_KL(M^(-ℓ))]。这个分数越高，说明"恢复这一层成 softmax 后，蒸馏 KL 降得越多"——也就是这一层最不能替换成线性。
+4. *Greedy Addition*：从全线性出发，按 I(ℓ) 排序，贪心地加回 top-K 层做 softmax。
+
+整个过程的训练 token 量是 ~5-6B，比 PostNAS 的 50B 小一个数量级。
+
+*** 为什么这招管用（以及哪里埋了新坑）
+
+三个直觉理由让这招优雅：
+
+1. *目标一致*：用什么挑层就用什么训练，没有任务分布漂移。
+2. *Hybrid-aware*：度量"恢复一层"而不是"删一层"，自然考虑了和其他线性层共存时的行为——这是其他方法（包括 SMART 的 swap-in）做不到的。
+3. *Variant-aware*：换成 GDN 还是 GLA 当线性层，重要性分数会自适应调整。
+
+实验结果（Figure 3）：在 12.5% softmax 预算（5 层）下，GA-S2 在 RULER 上达到 0.662，比最强 baseline AR 高 0.12，比 uniform 高 0.22。在 7B 规模上也保持 +0.047 的优势。
+
+新坑：
+
+- *选层依赖学生架构*。GDN 选出来的层和 GLA 选出来的层 Jaccard 相似度只有 ~0.54-0.65。也就是说"哪层重要"不是纯粹的老师属性，而是老师+学生的耦合属性。这意味着换学生架构要重选。
+- *仍然要做整套蒸馏 L 次*。虽然只有 5-6B token，但比纯启发式贵 ~10×。
+- *Greedy 是局部最优*。文章自己也承认，全局最优组合可能不同。
+
+* 前沿延伸
+
+这条线最近最有意思的延伸是 *test-time compute scaling 对混合模型的要求*。
+
+Paliotta 等 (2025)、Wang 等 (2025b) 在试图让蒸馏出来的混合模型也能做 reasoning-style 长链推理（类似 o1/Deepseek-R1）。Chaudhry 等 (2025) 指出：reasoning 链条越长，对 in-context retrieval 的依赖就越重——你得能"回头看"中间步骤。
+
+这就把球又踢回 GA-S2 这条线：
+
+- 如果未来 reasoning 是主要应用场景，那么 softmax 预算可能要更高
+- 选层标准可能要从"匹配老师下一个 token 分布"换成"匹配老师的多步推理轨迹"
+- "蒸馏 loss 即层重要性"这个思路可以推广到 *蒸馏多步 reasoning trace 的 loss 即层重要性*
+
+GA-S2 是一个 *机制*，不只是一个数字结果。它说的事是：当你设计一个搜索/选择问题时，*让你最终要优化的目标自己来当选择信号*，比绕一圈用代理任务要强。这个套路明显还能往别处用。
+
+* 一张图看懂
+
+#+begin_example
+                    问题                          解法                       新限制
+  --------------------------------------------------------------------------------
+  2017 Vaswani      RNN 训练慢                  全 softmax 注意力           KV cache 线性增长
+                                                                            -> decoding 慢
+                          |
+                          v
+  2020 Katharopoulos KV cache 推理太重            phi(Q)(phi(K)^T V)         固定状态装不下
+                                                  改写成 RNN                 长程精细 recall
+                          |
+                          v
+  2023-24 Mamba/GLA 线性 attn 不会忘             data-dependent gating       SSM 仍输 softmax
+        DeltaNet                                                              在 RULER 上
+                          |
+                          v
+  2024 Jamba/MiniMax 纯线性 recall 不行           混合: 1:7 softmax 插入       预训练贵 + 1:7 凭感觉
+        Falcon-H1     纯 softmax 推理慢          从头预训练混合架构
+                          |
+                          v
+  2024-25 MOHAWK     预训练混合太贵              知识蒸馏:                    沿用 uniform 选层
+        RADLADS                                  Stage1 隐状态对齐            没用层重要性信息
+        Llamba                                   Stage2 KL 分布匹配
+                          |
+                          v
+  2025 SMART/AR     Uniform 选层不最优            诊断任务/启发式/NAS         代理任务漂移
+        PostNAS                                   挑出"重要"层                NAS 50B token 太贵
+                          |
+                          v
+  2025-12 *GA-S2*   代理任务不对齐目标            蒸馏 KL 本身 = 重要性        选层依赖学生架构
+                    NAS 太贵                     One-swap + Greedy Add        Greedy 局部最优
+                          |
+                          v
+  2026+   test-time reasoning 需要更强            ??? 把 reasoning trace loss 当重要性 ???
+          in-context retrieval
+
+  时间轴: 把"减少 KV cache" 这条线压缩成一句话:
+  ---> 每一代都在 (a) 把状态压小, 然后 (b) 用更聪明的方式把丢掉的信息找回来
+#+end_example
+
+* 洞见
+
+读完整条线，最深的一个观察是：*这八年里，"长上下文 LLM 推理"这条线一直在做同一件事——压缩与恢复的拉锯。*
+
+每一代都在压缩（KV cache -> 固定隐状态 -> 选择性混合）。每一次压缩都丢信息。然后下一代花精力把丢掉的信息找补回来（gating、混合架构、聪明的层选择）。
+
+到了 GA-S2 这一步，*认知层面发生了一个有趣的转变*：
+
+- 前几代都是在 *设计* 怎么压缩（架构层面）
+- GA-S2 第一次是在 *搜索* 怎么压缩（实例层面）。它告诉你：在一个具体的预训练模型上，最优的混合模式不是先验设计出来的，而是从这个模型自己的统计性质里挖出来的。
+
+这暗示了一个更大的转向：未来的高效架构可能不再是"一刀切的设计"，而是 *per-model 的自适应配置*。每个开源模型蒸馏出来的高效版本，softmax 层的位置都可能不一样。架构搜索空间从"全局"变成"每个 checkpoint 一次"。
+
+下一步最可能往哪走？我赌两个方向：
+
+1. *选择信号扩展到 reasoning loss*。GA-S2 是用"下一个 token 分布"当信号。下一篇会用"多步推理轨迹的一致性"当信号——因为那是 test-time scaling 真正关心的。
+2. *选择粒度从层下沉到 head*。现在是整层 softmax 或整层线性。但同一层里不同 head 做的事不一样，混合粒度可以更细。MoE-style 的注意力混合可能是终局。
+
+* 启发
+
+对做研究的人，这条线给的最大启发是：
+
+*当你在用一个代理目标 (proxy) 解决一个问题时，停下来想想——能不能直接用最终目标本身？*
+
+GA-S2 的核心创新一句话就讲完了：别人用合成任务 / 启发式 / NAS 来估计"哪层重要"，他们说：蒸馏 KL 就是我们最终关心的东西，为啥不直接拿它来排序？
+
+这种"取消代理"的动作在整个 ML 史上反复出现：
+- 早年 NAS 用准确率代理 -> 后来直接用最终任务指标
+- 早年 RLHF 用 reward model 代理 -> 现在 DPO 直接用 preference loss
+- 早年 model selection 用 validation accuracy -> 现在 直接用 downstream task loss
+
+每次"取消一层代理"都带来一波性能跃迁。
+
+落点在能用：
+
+- 你正在做一件事，里面有个步骤用了某个"近似的判断标准"（synthetic task、proxy metric、heuristic score），停下来问：能不能把最终要优化的那个 loss 直接搬过来当判断标准？如果计算上可行，多半能干掉那个代理。
+- 当你下次要给一个 LLM "瘦身"——剪枝、量化、蒸馏、选 head/layer——*先跑一次完整的目标 loss 当作排序信号*，比任何启发式都靠谱。
+- "选择"和"训练"用同一个 loss，这个原则可以推广到很多地方——它本质上是在说："让度量的尺子和你要切的木头是同一种尺子。"

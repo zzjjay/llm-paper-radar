@@ -1,0 +1,260 @@
+#+title:      CALM: A CKA-Guided Adaptive Layer-Wise Modularization Framework for LLM Quantization
+#+date:       [2026-05-29 Fri 13:23]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260529T132310-en
+#+source:     https://arxiv.org/abs/2512.16282
+#+authors:    Jinhao Zhang, Yunquan Zhang, Daning Chen, JunSun, Zicheng Yan
+#+venue:      arXiv preprint, 2025
+
+* The River of the Problem
+
+Take a 70-billion-parameter model and compress each number from 16 bits down to 4 bits — storage shrinks to one quarter, inference speeds up — but accuracy must not collapse. Every generation of researchers trips over the same stone on this compression road: *models are not uniform, yet we keep treating them as if they were*.
+
+Why is it so hard? Because the gap between layers in a large model is far wider than we imagine. Some layers have weights neatly clustered around zero with only a handful of outliers; in other layers a few columns suddenly spike a hundredfold. Apply the same blade everywhere and you will shred some layers while mangling others. "Switch blades" sounds simple enough — but how? At what cost? What happens when you choose the wrong one? This is the story of successive generations puzzling over "which blade to use, and how to know you used the right one."
+
+* The Origin Map
+
+#+begin_example
+[2022] LLM.int8() - Dettmers
+  |
+  | Finding: Large models contain a small number of "outlier feature columns";
+  |           a uniform INT8 cut collapses them.
+  | Fix: Keep those few columns in FP16; route everything else through INT8.
+  v
+[2022] GPTQ - Frantar
+  |
+  | Problem seen: The above mixes precisions at inference time — ugly engineering.
+  | Fix: Offline, refit weights column by column, absorbing errors with
+  |       second-order Hessian information.
+  v
+[2023] SmoothQuant - Xiao
+  |
+  | Problem seen: Outliers originate in activations; refitting weights is
+  |               treating the symptom, not the cause.
+  | Fix: Mathematically equivalent transform y = xW = (x/s)(sW) — migrate
+  |       the activation "spikes" into the weights.
+  v
+[2024] AWQ - Lin
+  |
+  | Problem seen: GPTQ ignores activations and refits blindly;
+  |               SmoothQuant does not distinguish weight importance.
+  | Fix: Use activation magnitudes to identify the top-1% "critical weights";
+  |       apply per-column scaling to protect them.
+  v
+[2024] OmniQuant - Shao
+  |
+  | Problem seen: All of the above are hand-crafted heuristics.
+  | Fix: Make clipping thresholds learnable parameters; find the optimum
+  |       via back-propagation.
+  v
+[2025] CALM - Zhang  <-- target paper
+  |
+  | Problem seen: Everyone is competing for "my single algorithm is better."
+  |               But there is no universally best single algorithm —
+  |               different layers suit different algorithms; one-size-fits-all
+  |               is a wrong premise.
+  | Fix: Treat GPTQ/AWQ/SmoothQuant as a pool of candidate blades. For each
+  |       layer, measure with CKA which blade cuts closest to the original,
+  |       then use that one.
+  v
+[??? later] Automating / learning the "blade selection" process itself
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering a Few "Bones" Inside Large Models That Cannot Be Touched
+
+*** What Problem It Saw
+
+INT8 quantization had worked fine on CNNs and BERT-base. But when people applied it to transformers with 6.7B or more parameters, accuracy suddenly collapsed — perplexity shot from the teens into the thousands. Not a gradual slide, but a cliff edge.
+
+Dettmers peeled back the surface: inside the activations of large models, a small number of specific "columns" — a handful of hidden dimensions — routinely carry values 20× or 100× larger than the rest. These columns carry the model's critical judgments about certain tokens. Quantize the entire tensor with a single uniform scale in INT8, and those large values drag the scale so high that all normal values get crushed into a few grid points near zero — information collapses entirely.
+
+*** Its Solution
+
+Since these columns are special, do not quantize them alongside the others. LLM.int8() does something crude at inference time: every matrix multiplication is split in two — *normal columns* go through INT8 matrix multiplication, while *outlier columns* (selected by an empirical threshold of 6.0, roughly 0.1–1% of columns) are extracted and kept in FP16, and the two results are added back together.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It strikes at the root cause: protect those columns and the model stays stable. But the cost is an inference path that runs as "half INT8 + half FP16" — ugly engineering: every matrix multiply must split the tensor, execute two GEMMs, and then reassemble. GPU kernels become messy and latency suffers. The deeper question: since the outlier columns can be identified at inference time, *can this be handled offline, so that at inference time every layer is a clean INT8/INT4 matrix multiply?*
+
+** 2022 | GPTQ: Absorbing Errors Column by Column in an Offline Pass
+
+*** What Problem It Saw
+
+LLM.int8() made inference ugly because it "deferred" quantization error to inference time — dodging the error by keeping FP16 columns alive. GPTQ asked: can we digest the error at offline quantization time instead?
+
+It inherited an older line — OBQ (Optimal Brain Quantization), tracing back to LeCun's OBS pruning from the 1990s. OBS's core idea: moving one parameter incurs a predictable loss change via second-order Hessian information, and *you can adjust other correlated parameters at the same time to cancel the error*. But OBQ was unaffordable on large models — the Hessian was too large.
+
+*** Its Solution
+
+GPTQ uses an engineering approximation that makes OBQ tractable: quantize one column at a time. When quantizing column i, round it to the nearest grid point — this introduces an error; use the inverse Hessian to determine how to distribute that error across the not-yet-quantized columns i+1, i+2, … so that subsequent columns "absorb" it. Combined with Cholesky decomposition and block-wise processing, the 175B-parameter OPT model can be 4-bit quantized on a single GPU in a few hours.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+GPTQ made "4-bit large models" a reality for the first time, and the inference path is entirely clean integer matrix multiplication — all the engineering ugliness of LLM.int8() disappears. But there is a blind spot: *it looks only at the statistical structure of weights, not at what activations look like*. The Hessian is computed from calibration-set activations, true, but quantization decisions target only the weights' own regularity — layers with smooth, compact weight distributions do well; layers with wild weight distributions (e.g., sharp outliers in a few columns) suffer. The problem has not gone away: do we or do we not handle those outlier activation columns?
+
+** 2023 | SmoothQuant: Outliers Root in Activations — So Move Them
+
+*** What Problem It Saw
+
+GPTQ performs well on INT4 weights, but people also wanted to quantize activations down to INT8 (or lower), so hardware could use pure integer GEMM for further speed-up. But as soon as activations are compressed, those outlier columns resurface — the old problem exposed by LLM.int8(), returning on a new battlefield.
+
+GPTQ cannot help because it only touches weights. The inference-time tensor-splitting approach of LLM.int8() is again frowned upon.
+
+*** Its Solution
+
+Xiao et al. stared at the matrix-multiplication formula:
+
+#+begin_example
+y = x · W   <==>   y = (x / s) · (s · W)
+#+end_example
+
+If a particular column of activations carries very large values, divide that dimension by a scale s (taming the activations), while multiplying that scale into the corresponding row of the weights (making the weights "steeper"). Mathematically completely equivalent. Then quantize the "tamed activations" and the "slightly steeper weights" separately — the activation side no longer has any outlier spikes; the weight side, though steeper, already has a larger dynamic range and can tolerate it.
+
+A single hyperparameter α controls how the "difficulty" is split — α = 0.5 means activations and weights each absorb half.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+This is a slap-your-forehead move: it neither breaks the math nor uglifies inference; it simply redistributes difficulty to the part of the model better equipped to absorb it. W8A8 quantization became stable for the first time.
+
+But two pitfalls are buried: first, α is a globally hand-tuned parameter — each model, and possibly each layer, may need a different α; second, *it treats all weights equally* — every weight is "steepened" by the same amount. But some weights are critical (perturb them and the model breaks), while others are expendable. Can a finer blade distinguish the two?
+
+** 2024 | AWQ: Only 1% of Weights Do the Heavy Lifting — Just Protect Them
+
+*** What Problem It Saw
+
+AWQ directly punctures GPTQ's blind spot and SmoothQuant's coarseness:
+
+- When GPTQ reconstructs weights it ignores activations and focuses solely on weight statistics. But how important a weight is *does not depend on how large it is; it depends on how large the activation it multiplies is* — a huge weight multiplied by zero contributes nothing to the output; a tiny weight multiplied by an outlier activation may contribute enormously.
+- SmoothQuant does look at activations, but only uses activation magnitudes to adjust a global scale, without identifying *which specific weight elements are critical*.
+
+*** Its Solution
+
+Lin et al. did something deceptively simple: score each weight column using the mean magnitude of the activation it multiplies. The larger the activation channel, the more important that weight column. They then discovered a striking finding: *protecting just the top-1% of weight columns — those with the largest activation magnitudes — is enough to keep quantization loss very low*.
+
+How to "protect"? The same mathematically equivalent transformation trick from SmoothQuant — apply a protective scale to these important columns so they land on higher-precision grid points during quantization. The remaining 99% of weights are processed as ordinary INT4.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It shifts the importance judgment from weight statistics to the activation–weight product — a conceptual leap: the true cost of quantization error is the perturbation it causes to the final output, not the perturbation to the weights themselves.
+
+But AWQ is still a "single algorithm." Its assumption is that *all layers exhibit a sparse-importance structure — a few critical weights plus many ordinary ones*. If some layers have uniformly distributed importance (every weight matters roughly equally), AWQ's "protect the top 1%" is meaningless; if some layers have no activation outliers at all, SmoothQuant's scale migration has nothing to do. In other words, *every algorithm has layers it handles well and layers it handles poorly — yet people have always competed on "whose single algorithm is best on average."*
+
+** 2024 | OmniQuant: Stop Hand-Tuning Parameters — Let Clipping Thresholds Learn Themselves
+
+*** What Problem It Saw
+
+GPTQ/AWQ/SmoothQuant all rely on hand-crafted heuristics: SmoothQuant's α, AWQ's protection ratio, GPTQ's group size. Choose them well and results are good; choose them poorly and results drop noticeably. Retuning is needed for every model and even every version — an engineering burden.
+
+*** Its Solution
+
+OmniQuant makes all these heuristic parameters learnable. The upper and lower clipping bounds for weights become two learnable parameters; the scale for the activation equivalent transformation also becomes learnable. A small calibration dataset is then used to run block-level BP optimization per layer — keeping the weights frozen and learning only these "control knobs," minimizing the divergence between the layer's quantized and full-precision outputs.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+OmniQuant automated the hand-crafted heuristics and pushed PPL another step forward. Around the same time QuIP took a different path — using random orthogonal matrices to render both weights and the Hessian "incoherent" (numerically isotropic, with no directional bias), thereby minimizing the quantization loss of uniform grids. SpinQuant learned orthogonal rotations to scatter outliers entirely.
+
+Yet all these efforts are still in the mode of "forge a better blade." Whether your blade is hand-crafted (SmoothQuant), second-order-optimized (GPTQ), importance-differentiated (AWQ), or learnable (OmniQuant, SpinQuant) — *you are still pursuing "my blade is universally best."*
+
+But what if there is no universally best blade?
+
+** 2025 | CALM: Stop Forging Blades — Use the Right Blade Per Layer
+
+*** What Problem It Saw
+
+The CALM authors ran a comparison experiment that predecessors had overlooked: apply GPTQ, AWQ, and SmoothQuant each to every layer independently, then check which is optimal per layer. The result: *within the same model, the best quantization algorithm varies completely across layers*:
+
+- Layers with smooth weight distributions and almost no outliers: GPTQ's second-order reconstruction is most accurate.
+- Layers with severe activation outliers and relatively uniform weights: SmoothQuant's equivalent migration is most stable.
+- Layers with highly concentrated weight importance (a few critical columns): AWQ's sparse protection is most cost-effective.
+
+Yet the entire field had kept asking "which algorithm is best" — a wrong premise. *The real question is not "which algorithm," but "which algorithm for each layer."*
+
+Equally important: prior "mixed-precision" work (HAWQ-V2, SpQR) played only with *bit-width heterogeneity* — important layers at 8-bit, less important ones at 2-bit. CALM's experiments show that bit-width heterogeneity under tight low-bit constraints actually underperforms uniform 4-bit (because 2-bit incurs too heavy a loss). The true lever is *algorithm heterogeneity*, not bit-width heterogeneity.
+
+*** Its Solution
+
+Three components: a candidate pool, a scoring criterion, and greedy per-layer selection.
+
+*Candidate pool*: GPTQ, AWQ, SmoothQuant (with multiple variants of α). SpinQuant is excluded because it requires an extra rotation operator at inference time — all candidates must add zero extra latency.
+
+*Scoring criterion*: Linear CKA (Centered Kernel Alignment) measures how similar the quantized layer's output is to the full-precision layer's output as a representation space. CKA is invariant to orthogonal transformations and uniform scaling — closer to "functional equivalence" than raw MSE. The authors run a validation experiment: inserting a learned linear matrix M after the quantized layer to align CKA, PPL genuinely recovers — confirming that high CKA truly corresponds to preserved functionality.
+
+*Greedy layer selection*: Starting from the first layer, run the full-precision input to obtain the target output. Then quantize this layer with each candidate algorithm, feeding *the already-quantized output of the previous layer* as input, and forward-pass to obtain candidate outputs. Compute CKA; the highest wins. Assemble into the mixed model and move to the next layer. The entire process is O(L × |candidate pool|) — 80 layers × 4 algorithms = 320 offline evaluations for a 70B model, completing in a few hours on a single machine.
+
+*** Why It Works (and What New Pitfall It Buries)
+
+It escapes the race to "forge a better blade." Once you accept that "no single blade cuts all materials," the work shifts from *designing algorithms* to *selecting algorithms* — a much lighter, composable problem. Every existing PTQ algorithm instantly becomes a callable module; none needs to be discarded.
+
+But there are two clear limitations:
+1. *Greedy* — each layer is selected independently for local optimum, without accounting for long-range inter-layer dependencies. If layer 30 with GPTQ combined with layer 31 with AWQ is jointly better than their respective local optima, CALM cannot capture that.
+2. *Fixed candidate pool* — adding a new algorithm requires re-running the whole procedure. Can we *predict* which algorithm suits a given layer without actually running through it?
+
+* Frontier Extensions
+
+CALM flipped PTQ from an "algorithm competition" into an "algorithm selection problem." Once that step is taken, the natural next moves are to automate and learn the selection itself. As of early 2026 this direction is still quite new, but several clear extensions are already visible:
+
+- *Cross-layer joint selection* — use dynamic programming or a small RL agent to handle the inter-layer dependencies that CALM's greedy approach discards.
+- *Zero-shot selection* — train a lightweight classifier that looks at a layer's weight/activation statistics and directly predicts the best algorithm, eliminating the O(L×|P|) offline evaluation overhead.
+- *Joint algorithm + bit-width heterogeneity* — CALM argues "algorithm heterogeneity > bit-width heterogeneity," but combining both may outperform either dimension alone.
+- *Training-time preparation for selectability* — all current PTQ approaches are post-hoc fire-fighting. If training nudges certain layers to "be ready for a particular quantization," the post-hoc selection space becomes much richer.
+
+Barring surprises, 2026 will see a wave of work making "algorithm selection" differentiable or amenable to reinforcement learning, turning CALM's "enumerate + CKA scoring" into an end-to-end pipeline.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                         "One-size-fits-all" era              "Right blade per layer" era
+                         ================================     ========================
+
+  2022    LLM.int8() ---.  Finding: large models have a few outlier activation columns
+                          \  Patch: keep them in FP16 at inference time
+                           \
+  2022    GPTQ -----------> Absorb errors offline using the Hessian
+            |               Blind spot: ignores activations
+            v
+  2023    SmoothQuant ----> Outliers live in activations; migrate them to weights via
+            |               equivalent transform
+            |               Blind spot: treats all weights equally
+            v
+  2024    AWQ ------------> Use activation magnitudes to identify the top-1% critical weights
+            |               Blind spot: still assumes the same structure across all layers
+            v
+  2024    OmniQuant ------> Make clipping thresholds learnable
+            |               Blind spot: still competing on "my single algorithm is better"
+            v
+  2025    CALM     ===>===> Shatters the premise of "one algorithm wins all"
+                            Turns all algorithms into candidates; uses CKA to select
+                            the best one per layer
+
+  The shared cognitive arc:
+   "Find a better universal blade"  ----->  "Accept there is no universal blade;
+                                             learn to match blade to material"
+
+  Where CKA sits on this arc:
+   Not a new algorithm — a new yardstick. When algorithm selection itself becomes
+   the problem, you need a ruler that does not depend on any particular algorithm's
+   assumptions. CKA happens to provide exactly that ruler.
+#+end_example
+
+* Insight
+
+On the surface this river looks like a technical progression — from INT8 to INT4, from hand-crafted to learnable, PPL dropping bit by bit. But what is really happening underneath is a *shift upward in cognitive level*.
+
+The first four generations all played the same game: *competing at the "algorithm" level, asking whose single algorithm averages best across all layers*. Each generation tried to forge a smarter blade. LLM.int8() used engineering partitioning, GPTQ used second-order mathematics, SmoothQuant used equivalent transformation, AWQ used sparse importance, OmniQuant used learning. Their citation chain is a single iron link — each generation saying "the previous one had these flaws; I fix them."
+
+CALM stepped out of that chain. Its claim is *"your premise is wrong"* — the universal blade does not exist, so the question "whose blade is better" itself needs to be reframed. Once you accept this, all the algorithms from prior years are not rendered obsolete — they are *demoted to modules*: each one still useful, but just one tool in the toolbox; the key question becomes "when to use which one."
+
+This is a pattern common in scientific progress: when a group of people are grinding ever deeper in one dimension with ever-diminishing returns, it is often not because that dimension has truly been exhausted, but because the question was asked wrong. Change the question — move the battlefield from "which X is best" to "when to use which X" — and the space opens up instantly.
+
+The most likely direction over the next one to two years is not some new algorithm, but *optimization of the "selection" itself*: replacing enumeration with learning, replacing greedy with joint optimization, turning "pick an algorithm per layer" from an offline tool into an intrinsic mechanism baked into training. Looking further ahead, "layer" may not even be the right granularity — attention heads, MoE experts, token routing paths could all be finer-grained selection units.
+
+* Takeaways
+
+*When you encounter a metric that has been relentlessly optimized, first ask whether the premise is correct.* If a direction sees each generation picking holes in its predecessor and improving only incrementally, that usually signals the direction is near a local optimum. The meaningful work at that point is typically not forging a sharper blade, but *accepting that this blade should not be the only one, and redefining the toolset*.
+
+Concretely, for engineering or research:
+- In the optimization you are working on, are you assuming a *single best solution*? Surface that assumption explicitly and see what happens when you drop it.
+- When you see N papers all claiming "my approach is better," notice that all N approaches being compared are still alive — this usually means every one of them has a scenario where it excels, and none is universally optimal. The potential of *combining* them may be greater than the potential of *replacing* any of them.
+- "Scoring criterion" and "algorithm" are two different things. When algorithms cannot decisively beat one another, finding a ruler that can score across algorithms (in this river, CKA) is often more valuable than inventing yet another algorithm.
