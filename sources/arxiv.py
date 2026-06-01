@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import feedparser
 import httpx
 
-from sources._arxiv_lookup import arxiv_get_with_retry
+from sources._arxiv_lookup import ArxivEmptyResponse, arxiv_get_with_retry
 from sources.base import Paper, Source, SourceRecord
 
 ARXIV_ID_RE = re.compile(r"abs/([\d.]+)(?:v\d+)?$")
@@ -53,9 +53,31 @@ class ArxivSource(Source):
                     f"&max_results={self.page_size}"
                     f"&sortBy=submittedDate&sortOrder=descending"
                 )
+
                 # arXiv 429s/503s shared CI IPs; back off + jitter and honor
                 # Retry-After. Shared helper handles 429/503/Timeout/TransportError.
-                resp = await arxiv_get_with_retry(client, url, context=f"arxiv(page {start})")
+                # On page 0 only, also treat an empty Atom feed as a soft
+                # failure: a typical cs.LG/cs.CL/cs.AR day has hundreds of
+                # submissions, and arxiv is observed to serve empty feeds
+                # (HTTP 200, zero entries) when its per-IP throttle is hot.
+                # Without this guard, a "fake-empty" response on page 0
+                # would short-circuit the loop and silently write 0 papers
+                # for the day. Later pages can legitimately be empty
+                # (pagination exhausted), so the validator only fires for
+                # start == 0.
+                def _validate_nonempty_page0(resp: httpx.Response) -> None:
+                    if feedparser.parse(resp.text).entries:
+                        return
+                    raise ArxivEmptyResponse(
+                        f"arxiv returned 0 entries on page 0 for {target_date.date()}"
+                    )
+
+                resp = await arxiv_get_with_retry(
+                    client,
+                    url,
+                    context=f"arxiv(page {start})",
+                    validate=_validate_nonempty_page0 if start == 0 else None,
+                )
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:
                     break

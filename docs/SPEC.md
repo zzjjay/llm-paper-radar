@@ -112,6 +112,7 @@ Organized into 3 tiers reflecting reliability and information density:
 - Categories: `cs.CL`, `cs.LG`, `cs.AR`
 - Window: papers with `submittedDate` in last 24 hours
 - Rate limit: 3 sec/request, paginate at 200/page
+- Retry: shared `arxiv_get_with_retry` helper, 7 attempts with exponential backoff + jitter (~10 min total budget), honors `Retry-After`. Retries 429 / 503 / Timeout / TransportError. Also retries HTTP 200 with an empty Atom feed on page 0 — arxiv is observed to serve empty feeds in lieu of 429 when throttled, and a real cs.LG/cs.CL/cs.AR day always has hundreds of submissions. Empty feeds on later pages remain the normal end-of-pagination signal.
 - Expected: ~300–500 papers/day
 
 #### `sources/hf_daily.py`
@@ -661,6 +662,7 @@ gh run watch
 |------|-----------|-----------|
 | Anthropic API rate limit | Low | 50 concurrency well within tier limits; backoff in client |
 | arXiv API outage | Low | Other Tier 1 source (HF Daily) still works |
+| arXiv throttle returning empty feeds instead of 429 | Medium | `sources/arxiv.py` page-0 empty-feed validator promotes "200 + 0 entries" to a retryable soft-failure inside the same 10-min backoff budget; persistent empties raise so the day is skipped instead of writing 0 papers |
 | LLM hallucinates relevance | Medium | Threshold + reason field allows audit; can adjust prompt |
 | Repo grows unbounded | Low | Sliding retention + cleanup workflow |
 | Cost overrun (>$25/mo) | Low | Hard concurrency limits; can tighten threshold to ≥8 |
