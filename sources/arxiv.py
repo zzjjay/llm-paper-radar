@@ -56,38 +56,44 @@ class ArxivSource(Source):
 
                 # arXiv 429s/503s shared CI IPs; back off + jitter and honor
                 # Retry-After. Shared helper handles 429/503/Timeout/TransportError.
-                # On page 0 of a WEEKDAY, also treat an empty Atom feed as a
-                # soft failure: a typical Mon–Fri (UTC) cs.LG/cs.CL/cs.AR day
-                # has hundreds of submissions, and arxiv is observed to
-                # serve empty feeds (HTTP 200, zero entries) when its
-                # per-IP throttle is hot — without this guard, a
-                # "fake-empty" response would short-circuit the loop and
-                # silently write 0 papers for the day.
                 #
-                # Weekends are different: arxiv barely processes new
-                # submissions on Sat/Sun UTC, so an empty page 0 is the
-                # legitimate "nothing was posted today" answer. Validating
-                # weekends would waste the full ~10-min retry budget and
-                # then mis-attribute a real zero day to a throttle.
-                # Later pages legitimately empty too (pagination exhausted).
-                is_weekend = target_date.weekday() >= 5  # 5=Sat, 6=Sun
-                def _validate_nonempty_page0(resp: httpx.Response) -> None:
-                    if feedparser.parse(resp.text).entries:
+                # On page 0, also disambiguate "200 + 0 entries":
+                #   - genuine zero day (Sat/Sun UTC, or any quiet day):
+                #     the Atom feed contains <opensearch:totalResults>0
+                #     and we should accept the empty result, write 0
+                #     papers, and let downstream steps proceed.
+                #   - throttle / proxy bug serving a truncated feed:
+                #     totalResults is missing or > 0 while entries == 0.
+                #     Retry inside the same backoff budget; if it never
+                #     recovers, raise so daily.sh's main() skips the day
+                #     rather than silently overwriting with 0 papers.
+                #
+                # Later pages (start > 0) can legitimately be empty
+                # (pagination exhausted), so the validator only runs for
+                # page 0.
+                def _validate_page0(resp: httpx.Response) -> None:
+                    feed = feedparser.parse(resp.text)
+                    if feed.entries:
+                        return
+                    total = feed.feed.get("opensearch_totalresults")
+                    if total is not None and str(total).strip() == "0":
+                        # arxiv explicitly says "this query has zero results";
+                        # accept it as a real empty day.
+                        print(
+                            f"arxiv(page 0): 0 papers for {target_date.date()} "
+                            f"(opensearch:totalResults=0; arxiv published nothing matching the query)"
+                        )
                         return
                     raise ArxivEmptyResponse(
-                        f"arxiv returned 0 entries on page 0 for {target_date.date()}"
+                        f"arxiv returned 0 entries on page 0 for {target_date.date()} "
+                        f"with no opensearch:totalResults=0 marker — suspected throttle"
                     )
 
-                validate = (
-                    _validate_nonempty_page0
-                    if start == 0 and not is_weekend
-                    else None
-                )
                 resp = await arxiv_get_with_retry(
                     client,
                     url,
                     context=f"arxiv(page {start})",
-                    validate=validate,
+                    validate=_validate_page0 if start == 0 else None,
                 )
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:

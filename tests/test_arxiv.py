@@ -16,6 +16,17 @@ EMPTY_FEED = (
     "</feed>"
 )
 
+# Real arxiv answer for a query with no matches: empty entries list
+# PLUS an explicit <opensearch:totalResults>0</opensearch:totalResults>.
+GENUINE_ZERO_FEED = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"'
+    ' xmlns="http://www.w3.org/2005/Atom">'
+    "<opensearch:totalResults>0</opensearch:totalResults>"
+    "<opensearch:startIndex>0</opensearch:startIndex>"
+    "</feed>"
+)
+
 
 def _nonempty_feed_on(date_str: str) -> str:
     """Minimal valid Atom feed with one entry inside the [date, date+24h) window."""
@@ -75,12 +86,11 @@ async def test_arxiv_or_query_uses_literal_plus():
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_retries_on_weekday_page0_empty_feed(monkeypatch):
-    """Regression: arxiv sometimes returns HTTP 200 with an empty Atom feed
-    while throttled instead of 429. Page 0 of a weekday cs.LG-style query
-    must not be empty (hundreds of submissions/day Mon–Fri UTC), so an
-    empty page 0 should consume the same backoff budget as a 429 rather
-    than silently writing 0 papers. 2026-05-11 is a Monday."""
+async def test_arxiv_retries_on_suspect_empty_feed(monkeypatch):
+    """Regression: arxiv sometimes returns HTTP 200 with a truncated empty
+    Atom feed while throttled (no <opensearch:totalResults> at all). That
+    is NOT a real zero day and must consume the backoff budget the same
+    way a 429 would, instead of silently writing 0 papers."""
     # Don't actually sleep through the backoff in tests.
     async def _no_sleep(_):
         return None
@@ -88,25 +98,24 @@ async def test_arxiv_retries_on_weekday_page0_empty_feed(monkeypatch):
 
     route = respx.get("http://export.arxiv.org/api/query").mock(
         side_effect=[
-            Response(200, text=EMPTY_FEED),                       # page 0 attempt 1: throttled
-            Response(200, text=EMPTY_FEED),                       # page 0 attempt 2: throttled
-            Response(200, text=_nonempty_feed_on("2026-05-11")),  # page 0 attempt 3: real data
-            Response(200, text=EMPTY_FEED),                       # page 1: pagination end
+            Response(200, text=EMPTY_FEED),                       # attempt 1: throttle (no totalResults)
+            Response(200, text=EMPTY_FEED),                       # attempt 2: throttle
+            Response(200, text=_nonempty_feed_on("2026-05-11")),  # attempt 3: real data
+            Response(200, text=GENUINE_ZERO_FEED),                # page 1: pagination end
         ]
     )
     src = ArxivSource(categories=["cs.CL"])
     papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
-    assert route.call_count == 4, "should retry empties on page 0, then paginate to end"
+    assert route.call_count == 4, "should retry suspect empties on page 0, then paginate to end"
     assert len(papers) == 1, "real feed on attempt 3 should produce one paper"
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_raises_after_persistent_weekday_empty_feeds(monkeypatch):
-    """When every retry attempt returns an empty feed on a weekday, the
-    budget is exhausted and fetch raises — the daily.sh main() catches
-    that and skips the day rather than writing 0 papers as if the day
-    were empty. 2026-05-11 is a Monday."""
+async def test_arxiv_raises_after_persistent_suspect_empty_feeds(monkeypatch):
+    """When every retry attempt returns a suspect empty feed (no
+    totalResults marker), the budget is exhausted and fetch raises so
+    daily.sh's main() skips the day instead of overwriting with 0 papers."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
@@ -121,32 +130,34 @@ async def test_arxiv_raises_after_persistent_weekday_empty_feeds(monkeypatch):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_weekend_page0_empty_is_legitimate(monkeypatch):
-    """Weekends (Sat/Sun UTC) are different: arxiv barely processes new
-    submissions, so an empty page 0 is the legitimate "nothing posted today"
-    answer. Validating weekends would waste the full ~10-min retry budget
-    and then mis-attribute a real zero day to a throttle. 2026-05-10 is a
-    Sunday — page 0 empty must return zero papers in a single request."""
+async def test_arxiv_genuine_zero_day_accepted_immediately(capsys, monkeypatch):
+    """When arxiv's response carries <opensearch:totalResults>0</...> the
+    query genuinely matched nothing (e.g. a quiet weekend day). Accept it
+    in a single request, write 0 papers, and log the reason so the day's
+    "why no papers" is visible without grepping for throttle errors."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
 
     route = respx.get("http://export.arxiv.org/api/query").mock(
-        return_value=Response(200, text=EMPTY_FEED)
+        return_value=Response(200, text=GENUINE_ZERO_FEED)
     )
     src = ArxivSource(categories=["cs.CL"])
-    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
-    assert route.call_count == 1, "weekend page-0 empty must not trigger retries"
+    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))  # Sunday
+    assert route.call_count == 1, "totalResults=0 must not trigger retries"
     assert papers == []
+    out = capsys.readouterr().out
+    assert "opensearch:totalResults=0" in out, (
+        "should explain in stdout why we got 0 papers"
+    )
 
 
 @respx.mock
 @pytest.mark.asyncio
 async def test_arxiv_later_page_empty_is_legitimate_pagination_end(monkeypatch):
     """The empty-feed validator only runs on page 0. A later page returning
-    empty is the normal end-of-pagination signal and must not trigger
-    retries — otherwise every fetch would waste the retry budget at the
-    natural pagination boundary. Uses a weekday so page 0 validation is on."""
+    empty (even without totalResults, since respx mock returns it as-is)
+    is the normal end-of-pagination signal and must not trigger retries."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)

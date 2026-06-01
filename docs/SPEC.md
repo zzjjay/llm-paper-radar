@@ -112,7 +112,7 @@ Organized into 3 tiers reflecting reliability and information density:
 - Categories: `cs.CL`, `cs.LG`, `cs.AR`
 - Window: papers with `submittedDate` in last 24 hours
 - Rate limit: 3 sec/request, paginate at 200/page
-- Retry: shared `arxiv_get_with_retry` helper, 7 attempts with exponential backoff + jitter (~10 min total budget), honors `Retry-After`. Retries 429 / 503 / Timeout / TransportError. Also retries HTTP 200 with an empty Atom feed on page 0 of a **weekday** (Mon–Fri UTC) — arxiv is observed to serve empty feeds in lieu of 429 when throttled, and a real weekday cs.LG/cs.CL/cs.AR batch always has hundreds of submissions. Weekends (Sat/Sun UTC) skip this check: arxiv barely processes new submissions on weekends, so an empty page 0 is the legitimate "nothing posted today" answer. Empty feeds on later pages always remain the normal end-of-pagination signal.
+- Retry: shared `arxiv_get_with_retry` helper, 7 attempts with exponential backoff + jitter (~10 min total budget), honors `Retry-After`. Retries 429 / 503 / Timeout / TransportError. Disambiguates "200 + 0 entries" on page 0 via the Atom feed's `<opensearch:totalResults>` marker: value `0` = genuine quiet day (accept and log "0 papers, totalResults=0"); missing or > 0 = suspected throttle (treated as `ArxivEmptyResponse`, retried within the same 10-min budget; persistent failure raises so `main()` skips the day without overwriting any existing `arxiv.json`). Empty feeds on later pages always remain the normal end-of-pagination signal.
 - Expected: ~300–500 papers/day
 
 #### `sources/hf_daily.py`
@@ -662,7 +662,7 @@ gh run watch
 |------|-----------|-----------|
 | Anthropic API rate limit | Low | 50 concurrency well within tier limits; backoff in client |
 | arXiv API outage | Low | Other Tier 1 source (HF Daily) still works |
-| arXiv throttle returning empty feeds instead of 429 | Medium | `sources/arxiv.py` page-0 empty-feed validator promotes "200 + 0 entries" to a retryable soft-failure inside the same 10-min backoff budget — only on weekdays (Sat/Sun are skipped because arxiv legitimately publishes ~0 papers then); persistent empties raise so the day is skipped instead of writing 0 papers |
+| arXiv throttle returning empty feeds instead of 429 | Medium | `sources/arxiv.py` page-0 validator inspects `<opensearch:totalResults>` to tell a genuine zero day (e.g. quiet weekend) from a throttle: `=0` accepted with a logged "0 papers" reason; missing/non-zero promoted to `ArxivEmptyResponse`, retried inside the same 10-min backoff budget, and raised if persistent so the day is skipped without overwriting existing data |
 | LLM hallucinates relevance | Medium | Threshold + reason field allows audit; can adjust prompt |
 | Repo grows unbounded | Low | Sliding retention + cleanup workflow |
 | Cost overrun (>$25/mo) | Low | Hard concurrency limits; can tighten threshold to ≥8 |
