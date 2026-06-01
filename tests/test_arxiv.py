@@ -17,6 +17,24 @@ EMPTY_FEED = (
 )
 
 
+def _nonempty_feed_on(date_str: str) -> str:
+    """Minimal valid Atom feed with one entry inside the [date, date+24h) window."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        "<entry>"
+        "<id>http://arxiv.org/abs/2605.00001v1</id>"
+        "<title>Stub</title>"
+        "<summary>stub</summary>"
+        f"<published>{date_str}T12:00:00Z</published>"
+        '<link rel="alternate" type="text/html" href="https://arxiv.org/abs/2605.00001"/>'
+        '<link type="application/pdf" href="https://arxiv.org/pdf/2605.00001"/>'
+        '<category term="cs.CL"/>'
+        "</entry>"
+        "</feed>"
+    )
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_arxiv_fetch_parses_entries():
@@ -57,11 +75,12 @@ async def test_arxiv_or_query_uses_literal_plus():
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_retries_on_page0_empty_feed(monkeypatch):
+async def test_arxiv_retries_on_weekday_page0_empty_feed(monkeypatch):
     """Regression: arxiv sometimes returns HTTP 200 with an empty Atom feed
-    while throttled instead of 429. Page 0 of a cs.LG-style query must not
-    be empty for a real day, so an empty page 0 should consume the same
-    backoff budget as a 429 rather than silently writing 0 papers."""
+    while throttled instead of 429. Page 0 of a weekday cs.LG-style query
+    must not be empty (hundreds of submissions/day Mon–Fri UTC), so an
+    empty page 0 should consume the same backoff budget as a 429 rather
+    than silently writing 0 papers. 2026-05-11 is a Monday."""
     # Don't actually sleep through the backoff in tests.
     async def _no_sleep(_):
         return None
@@ -69,24 +88,25 @@ async def test_arxiv_retries_on_page0_empty_feed(monkeypatch):
 
     route = respx.get("http://export.arxiv.org/api/query").mock(
         side_effect=[
-            Response(200, text=EMPTY_FEED),           # page 0 attempt 1: throttled
-            Response(200, text=EMPTY_FEED),           # page 0 attempt 2: throttled
-            Response(200, text=FIXTURE.read_text()),  # page 0 attempt 3: real data
-            Response(200, text=EMPTY_FEED),           # page 1: pagination end
+            Response(200, text=EMPTY_FEED),                       # page 0 attempt 1: throttled
+            Response(200, text=EMPTY_FEED),                       # page 0 attempt 2: throttled
+            Response(200, text=_nonempty_feed_on("2026-05-11")),  # page 0 attempt 3: real data
+            Response(200, text=EMPTY_FEED),                       # page 1: pagination end
         ]
     )
     src = ArxivSource(categories=["cs.CL"])
-    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
     assert route.call_count == 4, "should retry empties on page 0, then paginate to end"
-    assert len(papers) >= 1, "real feed on attempt 3 should produce papers"
+    assert len(papers) == 1, "real feed on attempt 3 should produce one paper"
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_raises_after_persistent_empty_feeds(monkeypatch):
-    """When every retry attempt returns an empty feed, the budget is
-    exhausted and fetch raises — the daily.sh main() catches that and
-    skips the day rather than writing 0 papers as if the day were empty."""
+async def test_arxiv_raises_after_persistent_weekday_empty_feeds(monkeypatch):
+    """When every retry attempt returns an empty feed on a weekday, the
+    budget is exhausted and fetch raises — the daily.sh main() catches
+    that and skips the day rather than writing 0 papers as if the day
+    were empty. 2026-05-11 is a Monday."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
@@ -96,7 +116,28 @@ async def test_arxiv_raises_after_persistent_empty_feeds(monkeypatch):
     )
     src = ArxivSource(categories=["cs.CL"])
     with pytest.raises(_arxiv_lookup.ArxivEmptyResponse):
-        await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
+        await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_weekend_page0_empty_is_legitimate(monkeypatch):
+    """Weekends (Sat/Sun UTC) are different: arxiv barely processes new
+    submissions, so an empty page 0 is the legitimate "nothing posted today"
+    answer. Validating weekends would waste the full ~10-min retry budget
+    and then mis-attribute a real zero day to a throttle. 2026-05-10 is a
+    Sunday — page 0 empty must return zero papers in a single request."""
+    async def _no_sleep(_):
+        return None
+    monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
+
+    route = respx.get("http://export.arxiv.org/api/query").mock(
+        return_value=Response(200, text=EMPTY_FEED)
+    )
+    src = ArxivSource(categories=["cs.CL"])
+    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
+    assert route.call_count == 1, "weekend page-0 empty must not trigger retries"
+    assert papers == []
 
 
 @respx.mock
@@ -105,18 +146,18 @@ async def test_arxiv_later_page_empty_is_legitimate_pagination_end(monkeypatch):
     """The empty-feed validator only runs on page 0. A later page returning
     empty is the normal end-of-pagination signal and must not trigger
     retries — otherwise every fetch would waste the retry budget at the
-    natural pagination boundary."""
+    natural pagination boundary. Uses a weekday so page 0 validation is on."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
 
     route = respx.get("http://export.arxiv.org/api/query").mock(
         side_effect=[
-            Response(200, text=FIXTURE.read_text()),  # page 0: real data
-            Response(200, text=EMPTY_FEED),           # page 1: pagination end
+            Response(200, text=_nonempty_feed_on("2026-05-11")),  # page 0: real data
+            Response(200, text=EMPTY_FEED),                       # page 1: pagination end
         ]
     )
     src = ArxivSource(categories=["cs.CL"], page_size=1)
-    papers = await src.fetch(datetime(2026, 5, 10, tzinfo=UTC))
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
     assert route.call_count == 2, "should stop at first empty later page, not retry it"
-    assert len(papers) >= 1
+    assert len(papers) == 1

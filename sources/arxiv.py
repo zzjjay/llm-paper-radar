@@ -56,15 +56,21 @@ class ArxivSource(Source):
 
                 # arXiv 429s/503s shared CI IPs; back off + jitter and honor
                 # Retry-After. Shared helper handles 429/503/Timeout/TransportError.
-                # On page 0 only, also treat an empty Atom feed as a soft
-                # failure: a typical cs.LG/cs.CL/cs.AR day has hundreds of
-                # submissions, and arxiv is observed to serve empty feeds
-                # (HTTP 200, zero entries) when its per-IP throttle is hot.
-                # Without this guard, a "fake-empty" response on page 0
-                # would short-circuit the loop and silently write 0 papers
-                # for the day. Later pages can legitimately be empty
-                # (pagination exhausted), so the validator only fires for
-                # start == 0.
+                # On page 0 of a WEEKDAY, also treat an empty Atom feed as a
+                # soft failure: a typical Mon–Fri (UTC) cs.LG/cs.CL/cs.AR day
+                # has hundreds of submissions, and arxiv is observed to
+                # serve empty feeds (HTTP 200, zero entries) when its
+                # per-IP throttle is hot — without this guard, a
+                # "fake-empty" response would short-circuit the loop and
+                # silently write 0 papers for the day.
+                #
+                # Weekends are different: arxiv barely processes new
+                # submissions on Sat/Sun UTC, so an empty page 0 is the
+                # legitimate "nothing was posted today" answer. Validating
+                # weekends would waste the full ~10-min retry budget and
+                # then mis-attribute a real zero day to a throttle.
+                # Later pages legitimately empty too (pagination exhausted).
+                is_weekend = target_date.weekday() >= 5  # 5=Sat, 6=Sun
                 def _validate_nonempty_page0(resp: httpx.Response) -> None:
                     if feedparser.parse(resp.text).entries:
                         return
@@ -72,11 +78,16 @@ class ArxivSource(Source):
                         f"arxiv returned 0 entries on page 0 for {target_date.date()}"
                     )
 
+                validate = (
+                    _validate_nonempty_page0
+                    if start == 0 and not is_weekend
+                    else None
+                )
                 resp = await arxiv_get_with_retry(
                     client,
                     url,
                     context=f"arxiv(page {start})",
-                    validate=_validate_nonempty_page0 if start == 0 else None,
+                    validate=validate,
                 )
                 feed = feedparser.parse(resp.text)
                 if not feed.entries:
