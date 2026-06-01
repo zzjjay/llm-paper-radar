@@ -4,9 +4,16 @@
 # so the week's last digest is in before the rollup runs). Mirrors daily.sh's
 # env setup so git push + uv work the same way under cron.
 #
+# Default window: yesterday UTC and the 6 days before it. When the cron
+# fires on Beijing Monday 16:00 (= UTC Monday 08:00), yesterday UTC is
+# Sunday, so the window becomes [last Mon, last Sun] — matching the
+# historical backfilled rollups (e.g. weekly/20260518-20260524.md).
+# Using "today UTC" instead would produce [last Tue, this Mon] and skip
+# the previous Monday whenever the cron fires.
+#
 # Usage:
-#   weekly.sh                       # today's 7-day window (ending today UTC)
-#   weekly.sh --end-date 2026-05-25 # explicit end date
+#   weekly.sh                       # default: yesterday UTC and the 6 days before
+#   weekly.sh --end-date 2026-05-25 # explicit end date (manual rerun)
 
 set -uo pipefail
 
@@ -19,6 +26,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Default to yesterday UTC when no --end-date is given. `date -u -d
+# 'yesterday'` works on GNU coreutils (the deploy host). Manual reruns
+# can pin any date via --end-date.
+if [[ -z "$END_DATE" ]]; then
+    END_DATE=$(date -u -d 'yesterday' +%Y-%m-%d)
+fi
+
 PROJECT_ROOT="/proj/xcohdstaff7/zhaolin/code/llm-paper-radar"
 LOG_DIR="${PROJECT_ROOT}/scripts/log"
 mkdir -p "$LOG_DIR"
@@ -26,7 +40,7 @@ LOG_FILE="${LOG_DIR}/weekly-$(date +%Y-%m-%d).log"
 
 exec >>"$LOG_FILE" 2>&1
 echo "================================================================"
-echo "[$(date -Is)] weekly.sh start (end_date=${END_DATE:-today})"
+echo "[$(date -Is)] weekly.sh start (end_date=${END_DATE})"
 
 # Pull in user env (ANTHROPIC_BASE_URL / ANTHROPIC_CUSTOM_HEADERS / PATH / uv).
 # Same -u dance as daily.sh.
@@ -42,13 +56,8 @@ export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 echo "[$(date -Is)] git pull --rebase"
 git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
 
-WEEKLY_ARGS=()
-if [[ -n "$END_DATE" ]]; then
-    WEEKLY_ARGS+=(--end-date "$END_DATE")
-fi
-
-echo "[$(date -Is)] step: pipeline.weekly"
-uv run python -m pipeline.weekly "${WEEKLY_ARGS[@]}" || { echo "weekly failed"; exit 4; }
+echo "[$(date -Is)] step: pipeline.weekly --end-date ${END_DATE}"
+uv run python -m pipeline.weekly --end-date "$END_DATE" || { echo "weekly failed"; exit 4; }
 
 if [[ -z "$(git status --porcelain weekly/)" ]]; then
     echo "[$(date -Is)] no weekly changes to commit"
