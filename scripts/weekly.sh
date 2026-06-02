@@ -59,10 +59,10 @@ git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
 echo "[$(date -Is)] step: pipeline.weekly --end-date ${END_DATE}"
 uv run python -m pipeline.weekly --end-date "$END_DATE" || { echo "weekly failed"; exit 4; }
 
-if [[ -z "$(git status --porcelain weekly/)" ]]; then
+if [[ -z "$(git status --porcelain weekly/ README.md)" ]]; then
     echo "[$(date -Is)] no weekly changes to commit"
 else
-    git add weekly/
+    git add weekly/ README.md
     if [[ -z "$(git diff --cached --name-only)" ]]; then
         echo "[$(date -Is)] nothing staged after add"
     else

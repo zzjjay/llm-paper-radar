@@ -533,6 +533,8 @@ def _compact_row(
 
 LATEST_START = "<!-- LATEST_START -->"
 LATEST_END = "<!-- LATEST_END -->"
+WEEKLY_START = "<!-- WEEKLY_START -->"
+WEEKLY_END = "<!-- WEEKLY_END -->"
 
 
 def _splice_into_readme(readme_path: Path, digest_text: str) -> None:
@@ -558,6 +560,36 @@ def _splice_into_readme(readme_path: Path, digest_text: str) -> None:
         f"{LATEST_START}\n\n{digest_text}\n\n{LATEST_END}",
     )
     readme_path.write_text(new)
+
+
+def _splice_weekly_into_readme(readme_path: Path, weekly_text: str) -> None:
+    """Inject the weekly rollup table between the WEEKLY markers in README.md.
+    If the markers are missing (older README that predates the weekly block),
+    insert a fresh weekly section right after the daily LATEST_END marker so
+    the daily digest stays on top. Leaves the daily LATEST block untouched."""
+    existing = readme_path.read_text() if readme_path.exists() else ""
+    if WEEKLY_START in existing and WEEKLY_END in existing:
+        before, _, rest = existing.partition(WEEKLY_START)
+        _, _, after = rest.partition(WEEKLY_END)
+        new = f"{before}{WEEKLY_START}\n\n{weekly_text}\n\n{WEEKLY_END}{after}"
+        readme_path.write_text(new)
+        return
+
+    block = (
+        "## 🗓️ Weekly rollup\n\n"
+        "> Auto-updated Mondays — the last 7 daily digests rolled up into one "
+        "table, best score per paper. Full per-day pages live under "
+        "[`digests/`](digests/).\n\n"
+        f"{WEEKLY_START}\n\n{weekly_text}\n\n{WEEKLY_END}\n"
+    )
+    if LATEST_END in existing:
+        before, _, after = existing.partition(LATEST_END)
+        new = f"{before}{LATEST_END}\n\n---\n\n{block}{after}"
+        readme_path.write_text(new)
+        return
+    # No daily block either — append the weekly section at the end.
+    sep = "" if existing.endswith("\n") or not existing else "\n"
+    readme_path.write_text(f"{existing}{sep}\n---\n\n{block}")
 
 
 def render_index_line(date: datetime, scanned: int, passed: int, top_title: str) -> str:

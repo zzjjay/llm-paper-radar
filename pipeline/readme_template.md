@@ -17,6 +17,15 @@ A small pipeline that fetches papers from arXiv + HF Daily + OpenReview + watche
 
 ---
 
+## 🗓️ Weekly rollup
+
+> Auto-updated Mondays — the last 7 daily digests rolled up into one table, best score per paper. Full per-day pages live under [`digests/`](digests/).
+
+<!-- WEEKLY_START -->
+<!-- WEEKLY_END -->
+
+---
+
 ## 🧮 How papers are scored
 
 Two stages: a cheap local **keyword prefilter**, then **Claude Sonnet 4.6** scoring with [`prompts/relevance.md`](prompts/relevance.md).
