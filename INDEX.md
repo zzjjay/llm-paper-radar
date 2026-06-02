@@ -380,3 +380,5 @@
 - [05-30](digests/2026-05-30.md) — 50 scanned, 0 passed, top: (no papers passed)
 
 - [05-31](digests/2026-05-31.md) — 50 scanned, 1 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+
+- [06-01](digests/2026-06-01.md) — 96 scanned, 1 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
