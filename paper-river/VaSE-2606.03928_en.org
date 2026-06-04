@@ -1,0 +1,221 @@
+#+title:      Value-Aware Stochastic KV Cache Eviction for Reasoning Models
+#+date:       [2026-06-04 Thu 00:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260604T003854-en
+#+source:     https://arxiv.org/abs/2606.03928
+#+authors:    Ting-Yun Chang, Harvey Yiyun Fu, Deqing Fu, Chenghao Yang, Jesse Thomason, Robin Jia (USC)
+#+venue:      arXiv preprint, 2026
+
+* The Problem River
+
+In one sentence: when a model reasons through a hard problem step by step, every token it generates gets written into the KV cache notebook, and the longer the chain of thought the thicker the notebook — until memory explodes. Can we *erase* unimportant entries on the fly as the model thinks (eviction), without making it think incoherently?
+
+This sounds like the same thing as "compressing the notebook," but it is a full order of magnitude different. Compression (quantization) writes the entries smaller — the entries are still there. Eviction crosses them out entirely, and once crossed out they can never be recovered. Eviction saves the most memory (the notebook stays a fixed size forever), but erase one critical entry and the model can completely collapse — not just answer a question wrong, but spiral into "let me think again… no, think again…" loops, spewing incoherent gibberish.
+
+The entire research thread is a group of people hammering the same question from every angle: *which entries should actually be erased?* Early on everyone stared at "which entries receive the most attention" (attention scores), erasing the ones nobody looked at. That intuition dominated for three years. Then someone discovered that a small handful of entries have perfectly ordinary attention scores, yet their *value magnitudes* are enormous — erase them and the sky falls. The criterion quietly shifted from "who gets looked at the most" to "whose weight is the heaviest."
+
+* Source Map
+
+#+begin_example
+[2023.06] Zhang et al. - H2O (Heavy-Hitter Oracle)
+  |  Discovery: attention scores follow a power law — a few tokens
+  |             absorb the vast majority of attention; called "heavy hitters"
+  |  Solution:  accumulate historical attention scores; keep top scorers
+  |             + recent tokens; evict the rest
+  |  Buried flaw: only looks at "attention / key"; never examines value shape
+  v
+[2024.04] Li et al. - SnapKV
+  |  Problem: H2O-style per-point attention selection breaks semantically
+  |           contiguous context into fragments, hurting retrieval tasks
+  |  Solution: use a short "observation window" at the end of the prompt
+  |            to vote + apply max-pooling along the sequence so that
+  |            selected key tokens bring their neighbors along,
+  |            preserving contextual coherence
+  |  Buried flaw: designed for one-shot long-document prefill; scoring
+  |               still uses only keys, and selection is deterministic
+  |               top-k — tokens below the cut are condemned with prob 1
+  v
+[2025.05] Cai et al. - R-KV (reasoning-model specialist, previous SOTA eviction)
+  |  Problem: reasoning chains are packed with repetitive "let me verify
+  |           again…" passages that inflate their own attention scores,
+  |           fooling H2O / SnapKV into hoarding redundant tokens
+  |  Solution: add a "redundancy penalty" on top of importance — if two
+  |            tokens' key vectors are too similar, don't keep both;
+  |            force cache diversity
+  |  Buried flaw: diversity is computed over keys; value magnitudes
+  |               still ignored by everyone
+  |
+  |   ...... (a parallel thread: why certain values must not be touched) ......
+  |
+[2023.09] Xiao et al. - StreamingLLM
+  |  Discovery: the first few tokens are "attention sinks" — semantically
+  |             meaningless, yet removing them collapses the entire
+  |             attention distribution
+  v
+[2024.02] Sun et al. - Massive Activations
+  |  Discovery: a tiny number of activations (<10) have magnitudes up to
+  |             100,000× larger than their neighbors; they function as
+  |             implicit bias terms — zero them out and the model
+  |             catastrophically collapses; fix them at their mean and
+  |             nothing changes. "Magnitude" matters more than "position."
+  v                                            v
+[2026.06] Chang et al. - VaSE  ★ target paper ★ <----+ (merges the parallel thread)
+  |  Problem: every eviction method is stuck in the same "score by
+  |           attention" tree; a small set of KV pairs with very large
+  |           value magnitudes, when evicted, causes catastrophic loops
+  |           (GSM8K drops to 14.3%, 38.9% below random eviction)
+  |  Solution: (1) reserve dedicated budget slots for "high-magnitude
+  |                values" — they never compete in the eviction lottery
+  |            (2) fill remaining slots by *sampling* rather than hard
+  |                top-k — every token has non-zero survival probability,
+  |                improving cache diversity
+  v
+[contemporaneous] SeerAttention-R / CurDKV / ForesightKV / ThinKV ...
+     Tug-of-war between selective sparse attention (keep all KVs, read
+     a subset) vs. eviction (erase permanently)
+#+end_example
+
+Note: H2O → SnapKV → R-KV → VaSE is the explicit critique/improvement chain the paper establishes (VaSE Table 1 lists them directly).
+StreamingLLM → Massive Activations is a parallel thread — VaSE's core insight (high-magnitude values must not be touched) is built directly on Sun et al.'s massive activations work, explicitly cited.
+
+* Evolutionary Narrative
+
+** 2023.06 | H2O: Attention Scores Hide "Heavy Hitters" — Just Keep Those
+
+*** What Problem It Saw
+
+The most naive memory-saving strategy is a sliding window — keep only the most recent N tokens and discard everything older. The problem is that the model frequently needs to look back at some critical piece of information from early on; throw it away and the model goes blind. Which old tokens should be kept? At the time, nobody had a reliable criterion.
+
+*** Its Solution
+
+H2O noticed something: if you accumulate the attention scores a token has received over its entire history, the distribution is a *power law* — a tiny minority of tokens absorb the vast majority of attention, like a few "heavy hitters." The rule is simple: keep those with the highest cumulative attention plus a recent-token window; evict everything else. The paper even proves this is equivalent to a dynamic submodular optimization problem with theoretical guarantees.
+
+*** Why It Works (and What Flaw It Buried)
+
+It works because tokens that are repeatedly attended to by many subsequent tokens genuinely tend to carry critical information. But a landmine is buried here: H2O looks exclusively at *attention scores*, which are computed from queries and keys — it *never looks at what the values look like*. Yet the output of attention is a weighted sum of values. Even if nobody pays much attention to a particular token, if its value is numerically enormous, its contribution to the final output can be decisive. H2O is completely blind to such tokens. That landmine would not be detonated until VaSE, three years later.
+
+** 2024.04 | SnapKV: Don't Shred Semantically Contiguous Context
+
+*** What Problem It Saw
+
+H2O-style "select top-k by per-point score" has a side effect: the chosen tokens are scattered one here, one there, slicing semantically coherent passages into fragments. On retrieval tasks like "needle in a haystack," the model receives a pile of fragments and can often reconstruct only half a correct answer.
+
+*** Its Solution
+
+SnapKV does two things. First, it uses queries from a short "observation window" at the end of the prompt to vote on which positions in the prompt the model cares about most — more focused than using the full history. Second, and crucially: when a key token is selected, it applies *max-pooling* along the sequence direction to pull in the token's neighbors. What remains in the cache is not isolated points but small, coherent clusters of context.
+
+*** Why It Works (and What Flaw It Buried)
+
+The pooling preserves contextual integrity and retrieval accuracy recovers immediately. But SnapKV's worldview is still "one-shot prefill" — stuff a long document in, compress once, then generate. It is not well adapted to the "compress while decoding" scenario of reasoning models. More importantly, its scoring still uses only keys and is still *deterministic* top-k: tokens below the threshold have a 100% probability of being evicted, with no chance of reprieve. That determinism would also become something VaSE needed to fix.
+
+** 2025.05 | R-KV: Reasoning Chains Are Full of "Repeated Verification" — Pure Importance Scores Are Fooled
+
+*** What Problem It Saw
+
+Reasoning models (the kind that write long chains of thought) exposed a new vulnerability in prior methods. Their chains of thought are stuffed with self-repeating passages like "let me verify once more…" and "wait, let me rethink…". These repetitive passages have an insidious property: *they inflate their own attention scores*. So H2O and SnapKV see high scores and keep them all — leaving the cache crammed with nearly identical redundant tokens while genuinely diverse information gets squeezed out.
+
+*** Its Solution
+
+R-KV adds a second dimension alongside importance: a *redundancy penalty*. It compares key vectors of tokens in real time; if two tokens are too similar (highly redundant), it does not keep both. The final keep/evict decision is a joint score of "important + non-redundant." This made R-KV the strongest eviction method on reasoning tasks at the time, matching or occasionally surpassing full-cache performance at just 10–34% cache budget.
+
+*** Why It Works (and What Flaw It Buried)
+
+"Forcing cache diversity" is the right instinct, and VaSE inherits this goal. But R-KV's diversity is computed over *keys* — it measures "how similar are these tokens to each other," which is still a key-space measurement. From H2O to SnapKV to R-KV, three generations refined "how to use attention and keys to select tokens" in increasingly sophisticated ways, yet not one of them ever incorporated *value magnitude* into the keep/evict criterion. The fruit on that tree had been picked clean. Breaking through required switching to a different tree entirely.
+
+** 2023.09 / 2024.02 | The Parallel Thread: Some "Weights" Must Not Be Touched
+
+*** What Problem It Saw (StreamingLLM)
+
+Almost simultaneously, a separate group was grappling with an apparently unrelated question: why can't models handle extremely long streaming text? StreamingLLM discovered a strange phenomenon — the first few tokens are "attention sinks": semantically meaningless, yet the moment you remove them the entire attention distribution collapses instantly. The conclusion: *some tokens' value is not semantic but structural — they underpin system stability*.
+
+*** Its Solution and the Upgrade (Massive Activations)
+
+Sun et al. dug to the bottom of this. They found that models contain "massive activations": a tiny number (often fewer than 10) of activation values with magnitudes up to 100,000× larger than their surroundings. These values barely change with input — they are essentially *implicit bias terms* that the model learned. Intervention experiments: zero them out and the model catastrophically collapses; fix them at their mean and nothing bad happens at all.
+
+*** Why This Parallel Thread Is the Key to VaSE
+
+Together these two papers delivered a lesson that all three prior generations of eviction methods had completely failed to absorb: *when judging whether a value can be discarded, magnitude is a dimension entirely independent of attention*. Something can have low attention yet be absolutely untouchable because its magnitude is enormous. The main-thread researchers had been spinning inside "attention / key" space all along, while the key had been lying in the next room the whole time. What VaSE does is pick up that key and insert it into the KV eviction lock.
+
+** 2026.06 | VaSE: Reserve Dedicated Seats for High-Magnitude Values, Then Let Eviction Be a Lottery
+
+*** What Problem It Saw
+
+VaSE first ran an experiment that makes your skin crawl: deliberately evict the KV pairs with the *largest* value magnitude (measured as Range(v) — the vector's maximum entry minus its minimum). The result: GSM8K accuracy crashed from its normal level to *14.3%* — 38.9% *below* random eviction. The model fell into "endless self-reflection loops" and began emitting incoherent gibberish. This is precisely the disaster the massive activations thread had predicted, now playing out in the value cache: a small set of values with enormous magnitude exert disproportionate influence on the output (since output is a weighted sum of values), and all three prior generations of eviction methods had left them completely unprotected.
+
+*** Its Solution
+
+Two steps, addressing two neglected dimensions.
+
+Step one: *reserve dedicated seats*. Out of the total budget K, carve off a fixed quota Nv (in practice Nv = K/4) exclusively for KV pairs with the largest Range(v). They are kept unconditionally and never enter the "compete by attention score" arena at all. Note the contrast with Guo et al.'s prior approach — they folded magnitude *into* the attention score as a multiplicative factor to nudge rankings; VaSE instead *quarantines a protected zone*, clean and decisive.
+
+Step two: *sampling instead of hard selection*. For the remaining slots, rather than cutting at a top-k threshold as SnapKV does, VaSE uses the scores as *weights for sampling*. The reason is subtle: under top-k, any token below the cut has zero probability of survival — it is permanently condemned. Under sampling, every token has a strictly positive retention probability, making it possible for a token to "survive at least once across T decoding steps," improving the cache's diversity and coverage. (The variant VaSE-DKV resamples a Gaussian projection matrix G at each step, preventing any token from being deterministically banished by a single unlucky projection.)
+
+*** Why It Works (and What New Flaw It Leaves)
+
+Breaking down the gains: adding value-based scoring alone recovers up to 16.2% accuracy; adding stochastic sampling on top contributes another 4.7%. Combined, at roughly 4× compression across six reasoning tasks, VaSE-AttnV outperforms the previous SOTA eviction method R-KV by 4.4% (Qwen3-4B, 59.09% vs 54.69%) and 4.9% (Qwen3-14B, 65.81% vs 60.90%); against CurDKV the margin is 7.7% / 9.2%.
+
+The most striking comparison is with the "selective" method SeerAttention-R: the latter achieves comparable accuracy (even slightly below VaSE) while *keeping the entire KV cache* and merely reading a subset each step, so memory grows linearly with sequence length. VaSE uses a *fixed-size* cache. Same accuracy, one notebook keeps getting thicker, the other stays the same thickness forever.
+
+The new flaw left behind: Nv = K/4 is a hand-tuned fixed ratio; different layers and tasks likely have very different proportions of "high-magnitude values." Range(v) is positively correlated with L2 norm and variance but is fundamentally a static heuristic — it may not capture "which high-magnitude values are actually useful at this particular step."
+
+* Frontier Extensions
+
+This thread was branching rapidly from late 2025 into 2026; VaSE is one branch:
+
+- *The eviction-vs.-selection tug-of-war is unresolved*. SeerAttention-R (using learned attention gating) represents "keep the full notebook, read only part of it" — high accuracy but linear memory growth, and VaSE notes that its learned gating "struggles to generalize under domain shift" (accuracy drops on coding tasks). VaSE represents "erase permanently, constant memory." Both approaches have their own fatal weaknesses.
+- *Computing "contribution" more accurately*. CurDKV uses leverage scores from CUR decomposition to jointly consider keys and values, but VaSE criticizes it for "not promoting diversity" and "using a fixed G that causes tokens to be deterministically evicted." ForesightKV, ThinKV, and others attempt to replace instantaneous attention snapshots with more forward-looking signals like "long-term contribution" or "thinking-adaptive" selection.
+
+As of now (2026.06), "value magnitude is an independent, non-negligible dimension for keep/evict decisions" is an insight VaSE has only just put on the table. It is very likely that follow-up work will make the fixed protected-seat ratio adaptive, and combine stochastic sampling with long-term contribution prediction.
+
+* A Diagram
+
+#+begin_example
+Evolution of criteria: from "who gets the most attention"
+                     → "whose weight is heavy + don't keep duplicates"
+
+Dimension              2023 H2O   2024 SnapKV  2025 R-KV   2026 VaSE
+-----------            --------   ----------   ---------   ----------
+Attention scoring        yes          yes          yes       yes (sampled)
+Preserve context         -           pooling       -           -
+Promote diversity        -           -          key redund.  sampling (prob>0)
+Check value magnitude    no           no           no        protected seats (key!)
+Deterministic?          top-k        top-k        top-k      sampling
+Target scenario        general dec.  prefill     reasoning   reasoning
+Memory                  fixed        fixed        fixed       fixed
+
+        "attention / key" — one tree            switch trees
+      <------------------------------>        <------------>
+      H2O ----- SnapKV ----- R-KV               VaSE
+                                                  ^
+                                                  | key came from parallel thread:
+                            StreamingLLM (attention sinks)
+                            + Massive Activations (high-magnitude values untouchable)
+
+Core proposition: output = Σ(attention × value). All three prior generations
+                  optimized only the "attention" half.
+                  VaSE is the first to seriously address the "value" half.
+#+end_example
+
+* Insights
+
+On the surface this thread is "KV eviction keeps getting better." What is actually happening underneath is a *migration of the criterion's center of gravity*.
+
+From H2O through R-KV, all three generations answer different variants of the same question: *"which token receives the most attention / attention without redundancy?"* They squeezed every drop out of the "attention score" signal — adding historical accumulation, adding pooling, adding redundancy penalties. But they all share an unexamined premise: *whether a token deserves to stay is determined by its standing in the attention distribution*.
+
+VaSE's contribution is not inventing yet another cleverer scoring function; it is *pointing out that this premise is one-sided*. Since the output of attention is a weighted sum of values, "weight" (attention) and "what is being weighted" (value magnitude) are two orthogonal dimensions. Three generations optimized only the former. Once the massive activations parallel thread demonstrated that "magnitude alone can be decisive," filling in that dimension became almost inevitable — VaSE was simply the first to act.
+
+There is a second, subtler cognitive shift: from *determinism* to *randomness*. From H2O to R-KV, "select the best K" was taken as self-evidently correct. VaSE points out that in a process running T steps with deletions at every step, deterministic top-k is equivalent to handing the losers a death sentence — whereas preserving a little randomness actually improves overall coverage. This is a small paradigm shift from "greedy optimum" to "explore for diversity," sharing the same tension as exploration vs. exploitation in reinforcement learning.
+
+Where the thread goes next is largely predictable: *replace static heuristics with adaptive or predictive ones*. The fixed protected-seat ratio Nv = K/4 and the static Range(v) criterion are both hand-tuned. Once someone computes "which high-magnitude values are genuinely useful at this particular step" with a lightweight predictor and combines it with stochastic exploration, this thread will evolve from "magnitude-based heuristics" to "contribution-prediction-based eviction."
+
+* Takeaways
+
+The most direct lesson this thread offers about *finding problems*: *when everyone in a field is polishing the same signal, go question the premise nobody has examined*.
+
+H2O, SnapKV, and R-KV are all solid work, but they spiraled ever deeper into the single dimension of "attention scoring." The real breakthrough came from an outsider's question — "wait, attention's output is literally a weighted sum of values, why has nobody ever looked at the values?" That question requires no higher mathematics; it only requires refusing to accept "everyone does it this way" as a hidden axiom.
+
+The second takeaway: *find the key in the next room*. VaSE's core weapon (high-magnitude things must not be touched) was not invented by VaSE — it was a conclusion already laid out by the "model interpretability" parallel thread of massive activations and attention sinks. The "efficiency" people on the main thread and the "understand the model" people on the parallel thread barely talked to each other for years. Whoever first carries the key from the next room and inserts it into their own lock is the one who breaks through.
+
+The practical implication: when reading a research thread, rather than only reading forward along it, also ask —
+(1) What premise does this group share that nobody has ever actually proven? Write it down and suspect each one.
+(2) Is there another field that has already thoroughly studied the very thing blocking me? What I need to do may not be invention, but translation.
