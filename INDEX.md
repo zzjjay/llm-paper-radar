@@ -386,3 +386,5 @@
 - [06-02](digests/2026-06-02.md) — 99 scanned, 0 passed, top: (no papers passed)
 
 - [06-03](digests/2026-06-03.md) — 90 scanned, 3 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
+
+- [06-04](digests/2026-06-04.md) — 50 scanned, 0 passed, top: (no papers passed)
