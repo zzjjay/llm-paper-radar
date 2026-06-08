@@ -537,6 +537,26 @@ WEEKLY_START = "<!-- WEEKLY_START -->"
 WEEKLY_END = "<!-- WEEKLY_END -->"
 
 
+def _current_latest_date(readme_path: Path) -> datetime | None:
+    """Parse the publication date currently shown in README's LATEST block, or
+    None if README/markers/date are absent. Used to stop a backfill that
+    re-renders an OLDER day from dragging the README's 'latest' pointer
+    backwards (the daily compact header carries `Daily · YYYY-MM-DD`)."""
+    if not readme_path.exists():
+        return None
+    text = readme_path.read_text()
+    if LATEST_START not in text or LATEST_END not in text:
+        return None
+    block = text.partition(LATEST_START)[2].partition(LATEST_END)[0]
+    m = re.search(r"Daily ·\s*(\d{4}-\d{2}-\d{2})", block)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1)).replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def _splice_into_readme(readme_path: Path, digest_text: str) -> None:
     """Inject the rendered digest between the LATEST markers in README.md.
     If the markers are missing (or README is the legacy whole-digest layout),
@@ -824,7 +844,19 @@ def render_daily(
         digest_filename=digest_filename,
         en_digest_filename=en_filename,
     )
-    _splice_into_readme(readme_path, compact_text)
+    # Don't let re-rendering an OLDER day pull the README's LATEST block
+    # backwards. A backfill that recovers several past days renders them one by
+    # one; without this guard the last (oldest) one would win and the README's
+    # "today's digest" would regress (observed: README stuck on 05-31 after a
+    # backfill sweep). The per-day digest file and INDEX line still update.
+    current_latest = _current_latest_date(readme_path)
+    if current_latest is None or date >= current_latest:
+        _splice_into_readme(readme_path, compact_text)
+    else:
+        print(
+            f"render: keep README latest ({current_latest.date()}); "
+            f"{date.date()} is older, digest+index updated only"
+        )
     _update_index(date, index_path, scanned, surviving)
 
 
