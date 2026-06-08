@@ -3400,3 +3400,17 @@ Plan complete and saved to `docs/superpowers/plans/2026-05-11-llm-paper-radar.md
 **2. Inline Execution** — Execute tasks in this session using executing-plans, batch execution with checkpoints.
 
 **Which approach?**
+
+---
+
+## Post-launch operational changes
+
+### 2026-06-08 — arXiv throttle mitigation
+
+Symptom: from 2026-05-28 the daily cron's `arxiv.json` was empty most days (429 storms on the shared egress IP), so digests were built from HF Daily trending alone and surfaced ~1 paper/day. Changes:
+
+- **User-Agent on every arXiv call** (`ARXIV_USER_AGENT` in `sources/base.py`, `mailto:zhaolin@amd.com`). Blank-UA clients are throttled harder. This alone restored the `api/query` main path in testing.
+- **Watched-authors merged into one OR query** (`sources/arxiv_authors.py`): 11 per-author requests → 1 `(au:"A" OR …)` query, reusing the shared backoff in `_arxiv_lookup.py`.
+- **OAI-PMH fallback** (`sources/_arxiv_oai.py`, wired into `sources/arxiv.py`): when `api/query` exhausts its budget or returns a suspected-throttle empty feed, harvest via `export.arxiv.org/oai2` instead. OAI filters on announcement date, so the fallback widens the window and re-filters locally to `<created>` == target to preserve submittedDate semantics. Genuine zero days (`totalResults=0`) are not affected. Decision: cross-listed older papers (whose `<created>` is refreshed on announce) are kept — the fallback is a superset of `api/query`, and prefilter + Sonnet handle the off-topic tail.
+- **Cross-day backfill** (`scripts/backfill_empty_arxiv.sh`, called from `daily.sh`): re-attempts the last 7 days' still-empty `arxiv.json` and re-renders any recovered day. Explicit — every outcome logged, failures WARN, never clobbers a non-empty file. Disable with `BACKFILL_EMPTY_SKIP=1`.
+- **Rejected**: making OAI-PMH the *main* path. OAI has no submittedDate axis and announcement lags submission by 1–2 working days (and skips weekends), so a pure-OAI main path would make each day's digest systematically incomplete at cron time or force a 2–3 day delay. Kept `api/query` primary, OAI as fallback only.

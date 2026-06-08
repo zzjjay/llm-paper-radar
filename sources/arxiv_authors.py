@@ -17,7 +17,8 @@ from datetime import UTC, datetime, timedelta
 import feedparser
 import httpx
 
-from sources.base import Paper, Source, SourceRecord
+from sources._arxiv_lookup import arxiv_get_with_retry
+from sources.base import ARXIV_USER_AGENT, Paper, Source, SourceRecord
 
 ARXIV_ID_RE = re.compile(r"abs/([\d.]+)(?:v\d+)?$")
 
@@ -50,24 +51,22 @@ class ArxivAuthorsSource(Source):
         window_start = target_date - timedelta(days=self.window_days)
         # arxiv_id -> (Paper, [matched_specs])
         merged: dict[str, tuple[Paper, list[WatchedAuthorSpec]]] = {}
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            for spec in self.authors:
-                try:
-                    entries = await self._fetch_one_author(client, spec.name, window_start)
-                except Exception as e:
-                    print(f"arxiv_authors: skip {spec.name}: {type(e).__name__}: {e}")
-                    continue
-                for p in self._to_papers(entries, window_start, target_date):
-                    # Only keep entries where the author actually appears in the
-                    # paper's author list (arXiv's au: is a prefix/substring
-                    # search and over-matches common names like "Song Han").
-                    if not _author_matches(p.authors, spec.name):
-                        continue
-                    if p.id in merged:
-                        merged[p.id][1].append(spec)
-                    else:
-                        merged[p.id] = (p, [spec])
-                await asyncio.sleep(3.0)  # arXiv rate limit guidance
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+            headers={"User-Agent": ARXIV_USER_AGENT},
+        ) as client:
+            entries = await self._fetch_all_authors(client, window_start)
+            for p in self._to_papers(entries, window_start, target_date):
+                # arXiv's au: is a prefix/substring search and over-matches
+                # common names ("Song Han"), so re-check each watched author
+                # against the paper's real author list and attribute the match.
+                for spec in self.authors:
+                    if _author_matches(p.authors, spec.name):
+                        if p.id in merged:
+                            merged[p.id][1].append(spec)
+                        else:
+                            merged[p.id] = (p, [spec])
 
         out: list[Paper] = []
         for paper, specs in merged.values():
@@ -84,17 +83,26 @@ class ArxivAuthorsSource(Source):
             out.append(paper)
         return out
 
-    async def _fetch_one_author(
+    async def _fetch_all_authors(
         self,
         client: httpx.AsyncClient,
-        author_name: str,
         window_start: datetime,
     ) -> list[dict]:
+        """One paginated query for ALL watched authors instead of one request
+        per author. Previously each author was a separate request hitting
+        export.arxiv.org from the same IP within seconds, which reliably tripped
+        arxiv's per-IP 429 throttle (observed losing the whole watchlist). A
+        single `(au:"A" OR au:"B" ...) AND (cat...)` query cuts that to a
+        handful of paginated requests sharing the same backoff helper as the
+        rest of the pipeline.
+        """
         # Build query by hand: arXiv treats `+` inside an encoded query as a
-        # literal AND token; httpx's params= would percent-encode it.
-        author_token = f'au:"{author_name.replace(" ", "+")}"'
+        # literal AND/OR token; httpx's params= would percent-encode it.
+        author_part = "+OR+".join(
+            f'au:"{spec.name.replace(" ", "+")}"' for spec in self.authors
+        )
         cat_part = "+OR+".join(f"cat:{c}" for c in self.categories)
-        query = f"{author_token}+AND+({cat_part})"
+        query = f"({author_part})+AND+({cat_part})"
         all_entries: list[dict] = []
         start = 0
         for _ in range(self.max_pages):
@@ -103,31 +111,9 @@ class ArxivAuthorsSource(Source):
                 f"&max_results={self.page_size}"
                 f"&sortBy=submittedDate&sortOrder=descending"
             )
-            resp = None
-            last_exc: Exception | None = None
-            for attempt in range(4):
-                try:
-                    resp = await client.get(url)
-                    if resp.status_code != 429:
-                        last_exc = None
-                        break
-                    wait = 5 * (2**attempt)
-                    print(
-                        f"arxiv_authors: 429 on {author_name} start={start},"
-                        f" sleeping {wait}s before retry"
-                    )
-                except (httpx.TimeoutException, httpx.TransportError) as e:
-                    last_exc = e
-                    wait = 5 * (2**attempt)
-                    print(
-                        f"arxiv_authors: {type(e).__name__} on {author_name} start={start},"
-                        f" sleeping {wait}s before retry"
-                    )
-                await asyncio.sleep(wait)
-            if last_exc is not None:
-                raise last_exc
-            assert resp is not None
-            resp.raise_for_status()
+            resp = await arxiv_get_with_retry(
+                client, url, context=f"arxiv_authors(start={start})"
+            )
             feed = feedparser.parse(resp.text)
             if not feed.entries:
                 break
@@ -136,7 +122,6 @@ class ArxivAuthorsSource(Source):
             if oldest < window_start:
                 break
             start += self.page_size
-            await asyncio.sleep(3.0)
         return all_entries
 
     def _to_papers(

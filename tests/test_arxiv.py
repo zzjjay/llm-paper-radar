@@ -6,6 +6,7 @@ import respx
 from httpx import Response
 
 import sources._arxiv_lookup as _arxiv_lookup
+import sources._arxiv_oai as _arxiv_oai
 from sources.arxiv import ArxivSource
 
 FIXTURE = Path(__file__).parent / "fixtures" / "arxiv_response.xml"
@@ -43,6 +44,37 @@ def _nonempty_feed_on(date_str: str) -> str:
         '<category term="cs.CL"/>'
         "</entry>"
         "</feed>"
+    )
+
+
+def _oai_feed_on(created: str, extra_created: str | None = None) -> str:
+    """Minimal OAI-PMH ListRecords response. One record with <created>==`created`
+    (kept by the fallback) and, optionally, a second record with a different
+    <created> (must be filtered out). No resumptionToken → single page."""
+    def _record(arxiv_id: str, created_d: str) -> str:
+        return (
+            "<record><header>"
+            f"<identifier>oai:arXiv.org:{arxiv_id}</identifier>"
+            f"<datestamp>{created}</datestamp>"
+            "</header><metadata>"
+            '<arXiv xmlns="http://arxiv.org/OAI/arXiv/">'
+            f"<id>{arxiv_id}</id>"
+            f"<created>{created_d}</created>"
+            "<authors><author><keyname>Doe</keyname>"
+            "<forenames>Jane</forenames></author></authors>"
+            "<title>Stub Paper</title>"
+            "<categories>cs.CL cs.LG</categories>"
+            "<abstract>stub abstract</abstract>"
+            "</arXiv></metadata></record>"
+        )
+    records = _record("2505.00001", created)
+    if extra_created is not None:
+        records += _record("2505.09999", extra_created)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        f"<ListRecords>{records}</ListRecords>"
+        "</OAI-PMH>"
     )
 
 
@@ -112,20 +144,55 @@ async def test_arxiv_retries_on_suspect_empty_feed(monkeypatch):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_arxiv_raises_after_persistent_suspect_empty_feeds(monkeypatch):
-    """When every retry attempt returns a suspect empty feed (no
-    totalResults marker), the budget is exhausted and fetch raises so
-    daily.sh's main() skips the day instead of overwriting with 0 papers."""
+async def test_arxiv_falls_back_to_oai_after_persistent_suspect_empty_feeds(monkeypatch):
+    """When api/query exhausts its budget on suspect empty feeds (the throttle
+    signature that was zeroing out whole days), fetch falls back to the OAI-PMH
+    endpoint instead of raising. The OAI harvest keeps only records whose
+    <created> == target, mapped into the same Paper shape."""
     async def _no_sleep(_):
         return None
     monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_arxiv_oai.asyncio, "sleep", _no_sleep)
 
     respx.get("http://export.arxiv.org/api/query").mock(
         return_value=Response(200, text=EMPTY_FEED)
     )
+    respx.get("https://export.arxiv.org/oai2").mock(
+        return_value=Response(200, text=_oai_feed_on("2026-05-11"))
+    )
     src = ArxivSource(categories=["cs.CL"])
-    with pytest.raises(_arxiv_lookup.ArxivEmptyResponse):
-        await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
+    assert len(papers) == 1, "OAI fallback should surface the one created==target record"
+    assert papers[0].id == "2505.00001"
+    assert papers[0].published_at.date().isoformat() == "2026-05-11"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_arxiv_oai_fallback_filters_by_created_date(monkeypatch):
+    """OAI's from/until filter on datestamp (announcement), so the widened
+    window pulls in records announced on target but submitted earlier (e.g. a
+    cross-list or a v2). The fallback must drop any record whose <created> is
+    not exactly the target submission date."""
+    async def _no_sleep(_):
+        return None
+    monkeypatch.setattr(_arxiv_lookup.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(_arxiv_oai.asyncio, "sleep", _no_sleep)
+
+    respx.get("http://export.arxiv.org/api/query").mock(
+        return_value=Response(200, text=EMPTY_FEED)
+    )
+    respx.get("https://export.arxiv.org/oai2").mock(
+        return_value=Response(
+            200,
+            text=_oai_feed_on("2026-05-11", extra_created="2026-05-09"),
+        )
+    )
+    src = ArxivSource(categories=["cs.CL"])
+    papers = await src.fetch(datetime(2026, 5, 11, tzinfo=UTC))
+    assert [p.id for p in papers] == ["2505.00001"], (
+        "record with created != target must be filtered out"
+    )
 
 
 @respx.mock

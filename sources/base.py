@@ -13,6 +13,11 @@ SourceName = Literal[
     "openreview",
 ]
 
+# arXiv throttles clients with no/blank User-Agent more aggressively, and its
+# API etiquette asks for a contact address. A UA carrying mailto: is treated as
+# a well-behaved client. Shared by every export.arxiv.org caller.
+ARXIV_USER_AGENT = "llm-paper-radar/1.0 (mailto:zhaolin@amd.com)"
+
 
 class SourceRecord(BaseModel):
     name: SourceName

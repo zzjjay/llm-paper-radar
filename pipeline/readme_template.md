@@ -160,6 +160,8 @@ star_bonus     = min(log(github_stars + 1) × 3, 25)
 
 Each stage is independently runnable from the CLI. Every command defaults to **today only** — add `--backfill-days N` to process today + N days back (e.g. `--backfill-days 6` for a 7-day batch). Windowed sources (`arxiv_authors`, `openreview`) take `--window-days` instead and fetch the whole window in one call.
 
+**arXiv throttling & OAI-PMH fallback.** All arXiv calls go through one shared egress IP and carry a `User-Agent` with a contact `mailto:` — arXiv throttles blank-UA clients harder. The watched-authors source issues a **single** `(au:"A" OR au:"B" …)` query instead of one request per author. The main day-fetch uses the `api/query` endpoint (precise `submittedDate` semantics); if that endpoint exhausts its retry budget or returns a suspected-throttle empty feed, it **falls back to OAI-PMH** (`export.arxiv.org/oai2`), which arXiv throttles far less. OAI filters on announcement date, so the fallback widens the window and re-filters locally to the target submission date (`<created>`). A *genuine* zero day (`opensearch:totalResults=0`, e.g. a quiet weekend) is accepted as-is and does not trigger the fallback. Any day still left with an empty `arxiv.json` after a failed fetch is re-attempted on the next run by `scripts/backfill_empty_arxiv.sh`.
+
 ```bash
 uv run python -m sources.hf_daily
 uv run python -m sources.arxiv
@@ -171,7 +173,7 @@ uv run python -m pipeline.summarize
 uv run python -m pipeline.render
 ```
 
-`scripts/daily.sh` chains all of the above end-to-end, runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. `PAPER_RIVER_MAX=N` caps how many paper-river `.org` files get generated per run (default: no cap).
+`scripts/daily.sh` chains all of the above end-to-end, re-attempts any recently-empty `arxiv.json` via `scripts/backfill_empty_arxiv.sh` (disable with `BACKFILL_EMPTY_SKIP=1`), runs `scripts/snapshot.sh` to archive the rendered paper list under `snapshots/`, then `git commit && git push` if anything changed. `PAPER_RIVER_MAX=N` caps how many paper-river `.org` files get generated per run (default: no cap).
 
 ### 🌊 Paper River
 
@@ -211,8 +213,10 @@ llm-paper-radar/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
 │   └── summary.md               # bilingual (zh + en) summary format prompt
 ├── sources/                     # one fetcher per upstream
-│   ├── arxiv.py
-│   ├── arxiv_authors.py
+│   ├── arxiv.py                 # main day-fetch (api/query, OAI-PMH fallback)
+│   ├── _arxiv_oai.py            # OAI-PMH harvest used as arxiv.py's throttle fallback
+│   ├── _arxiv_lookup.py         # shared arxiv GET + backoff/retry + by-id lookup
+│   ├── arxiv_authors.py         # watched authors, single merged OR query
 │   ├── hf_daily.py
 │   └── openreview.py
 ├── pipeline/
@@ -227,6 +231,7 @@ llm-paper-radar/
 │   └── weekly.py                # 7-day roll-up as a compact table
 ├── scripts/
 │   ├── daily.sh                 # cron entrypoint: fetch → ... → push (--no-fetch skips fetch)
+│   ├── backfill_empty_arxiv.sh  # re-fetch days whose arxiv.json was left empty by a throttle
 │   ├── snapshot.sh              # captures the current README paper-list into snapshots/
 │   ├── auto_paper_river.py      # scan summarized/, invoke ljg-paper-river per missing paper
 │   ├── gen_paper_river.sh       # headless wrapper that runs the ljg-paper-river skill

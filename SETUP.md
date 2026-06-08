@@ -30,6 +30,8 @@ export ANTHROPIC_CUSTOM_HEADERS="Subscription-Key: ..."
 
 All four sources (`hf_daily`, `arxiv`, `arxiv_authors`, `openreview`) work without credentials.
 
+If you run from a shared/corporate egress IP, arXiv's per-IP rate limit (`429`) bites. The fork mitigates this without an API key: every arXiv call sends a `User-Agent` with a contact `mailto:` (edit `ARXIV_USER_AGENT` in [`sources/base.py`](sources/base.py) to your address), watched-authors fetch in one merged query, and the main day-fetch falls back from the `api/query` endpoint to OAI-PMH when throttled. Days zeroed out by a throttle are retried on the next run by [`scripts/backfill_empty_arxiv.sh`](scripts/backfill_empty_arxiv.sh) (called from `daily.sh`; disable with `BACKFILL_EMPTY_SKIP=1`).
+
 ## 4. Customize the filter rubric
 
 The scoring rubric lives entirely in [`prompts/relevance.md`](prompts/relevance.md) — there is no Python change needed to retarget the radar at a different domain.

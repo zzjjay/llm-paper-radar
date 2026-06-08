@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import feedparser
 import httpx
 
-from sources.base import Paper, SourceName, SourceRecord
+from sources.base import ARXIV_USER_AGENT, Paper, SourceName, SourceRecord
 
 ARXIV_LINK_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})")
 
@@ -111,7 +111,11 @@ async def fetch_arxiv_by_ids(
     id_query = ",".join(ids)
     url = "http://export.arxiv.org/api/query"
     params = {"id_list": id_query, "max_results": len(ids)}
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=60.0,
+        follow_redirects=True,
+        headers={"User-Agent": ARXIV_USER_AGENT},
+    ) as client:
         resp = await arxiv_get_with_retry(
             client, url, params=params, context=f"_arxiv_lookup({len(ids)} ids)"
         )

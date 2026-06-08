@@ -373,11 +373,11 @@
 
 - [05-27](digests/2026-05-27.md) — 394 scanned, 5 passed, top: Pruning and Distilling Mixture-of-Experts into Den
 
-- [05-28](digests/2026-05-28.md) — 98 scanned, 0 passed, top: (no papers passed)
+- [05-28](digests/2026-05-28.md) — 540 scanned, 3 passed, top: HARP: Hadamard-Preconditioned Adaptive Rotation Pr
 
-- [05-29](digests/2026-05-29.md) — 98 scanned, 1 passed, top: CONF-KV: Confidence-Aware KV Cache Eviction with M
+- [05-29](digests/2026-05-29.md) — 495 scanned, 6 passed, top: Rethinking the Role of Temperature in Large Langua
 
-- [05-30](digests/2026-05-30.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [05-30](digests/2026-05-30.md) — 206 scanned, 1 passed, top: ProjQ: Project-and-Quantize for Adapter-Aware LLM 
 
 - [05-31](digests/2026-05-31.md) — 232 scanned, 3 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 

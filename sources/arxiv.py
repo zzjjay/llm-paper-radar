@@ -9,7 +9,8 @@ import feedparser
 import httpx
 
 from sources._arxiv_lookup import ArxivEmptyResponse, arxiv_get_with_retry
-from sources.base import Paper, Source, SourceRecord
+from sources._arxiv_oai import fetch_via_oai
+from sources.base import ARXIV_USER_AGENT, Paper, Source, SourceRecord
 
 ARXIV_ID_RE = re.compile(r"abs/([\d.]+)(?:v\d+)?$")
 
@@ -32,10 +33,34 @@ class ArxivSource(Source):
         and downstream folder/digest/README naming uses the same date,
         so everything stays consistent.
 
-        Uses an explicit `submittedDate:[start TO end]` query (not
-        descending-from-now pagination) so the same code path serves
-        both "yesterday" (cron) and "30 days ago" (backfill).
+        Primary path is the `api/query` endpoint. If that endpoint fails
+        (throttle exhaustion, suspected-throttle empty feed) we fall back to
+        the OAI-PMH harvesting endpoint, which arxiv throttles far less
+        aggressively — that is the exact failure that was zeroing out whole
+        days (see scripts/log/2026-06-0*.log). A *genuine* zero day
+        (opensearch:totalResults=0) returns [] from the primary without
+        raising, so it does NOT trigger the fallback.
         """
+        try:
+            return await self._fetch_via_api(target_date)
+        except (
+            ArxivEmptyResponse,
+            httpx.HTTPStatusError,
+            httpx.TransportError,
+            httpx.TimeoutException,
+        ) as e:
+            print(
+                f"arxiv: api/query failed for {target_date.date()} "
+                f"({type(e).__name__}: {e}); falling back to OAI-PMH"
+            )
+            papers = await fetch_via_oai(target_date, self.categories)
+            print(
+                f"arxiv: OAI-PMH fallback got {len(papers)} papers "
+                f"for {target_date.date()}"
+            )
+            return papers
+
+    async def _fetch_via_api(self, target_date: datetime) -> list[Paper]:
         cat_query = "+OR+".join(f"cat:{c}" for c in self.categories)
         ws = target_date
         we = target_date + timedelta(hours=24)
@@ -45,7 +70,11 @@ class ArxivSource(Source):
         )
         full_query = f"({cat_query})+AND+{range_q}"
         all_entries: list[dict] = []
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+            headers={"User-Agent": ARXIV_USER_AGENT},
+        ) as client:
             start = 0
             for _ in range(self.max_pages):
                 url = (

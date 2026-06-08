@@ -202,6 +202,22 @@ run_step "translate_paper_river" uv run python scripts/translate_paper_river.py 
 
 run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || exit 7
 
+# Recover days whose arxiv.json is still empty from an earlier throttle-failed
+# fetch. Runs every day so a day zeroed out by a 429 storm gets re-attempted on
+# the next (hopefully un-throttled) run instead of staying empty forever. Reuses
+# the OAI-PMH fallback baked into sources/arxiv.py. Re-renders any recovered day,
+# so its output is folded into this run's commit below. Non-fatal: a hard
+# failure is logged with WARN but doesn't sink the daily run. Skip the fetch
+# block above (--no-fetch) → skip this too, since we made no external calls.
+if [[ "$NO_FETCH" -eq 1 ]]; then
+    echo "[$(date -Is)] backfill_empty_arxiv: skipped (--no-fetch)"
+elif [[ "${BACKFILL_EMPTY_SKIP:-0}" -eq 1 ]]; then
+    echo "[$(date -Is)] backfill_empty_arxiv: skipped (BACKFILL_EMPTY_SKIP=1)"
+else
+    run_step "backfill_empty_arxiv" ./scripts/backfill_empty_arxiv.sh \
+        || echo "  (backfill_empty_arxiv reported failures, continuing)"
+fi
+
 # Snapshot the rendered paper list into snapshots/ (single-day: <YYYYMMDD>.md;
 # multi-day: <start>-<end>-<N>days.md)
 # so each run leaves a browsable record (git history is preserve-only;

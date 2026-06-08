@@ -28,7 +28,9 @@ Use `AskUserQuestion` with options like:
 
 Same principle applies to anything else in this repo: don't disable
 fetch, dedupe, summarize, translate, render, push, or cron-equivalent
-behavior unless the user explicitly asks. The cron-driven invocations
+behavior unless the user explicitly asks. This includes `BACKFILL_EMPTY_SKIP=1`
+(skips the empty-`arxiv.json` recovery sweep in `daily.sh`) — leave it on
+unless the user opts out. The cron-driven invocations
 (`cron/daily_wrapper.sh` etc.) intentionally run the full pipeline with
 no caps; manual runs should default to the same unless the user opts out.
 
