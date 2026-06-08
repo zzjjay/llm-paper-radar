@@ -379,16 +379,18 @@
 
 - [05-30](digests/2026-05-30.md) — 50 scanned, 0 passed, top: (no papers passed)
 
-- [05-31](digests/2026-05-31.md) — 50 scanned, 1 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [05-31](digests/2026-05-31.md) — 232 scanned, 3 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [06-01](digests/2026-06-01.md) — 96 scanned, 1 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
+- [06-01](digests/2026-06-01.md) — 445 scanned, 9 passed, top: OSCAR: Offline Spectral Covariance-Aware Rotation 
 
-- [06-02](digests/2026-06-02.md) — 99 scanned, 0 passed, top: (no papers passed)
+- [06-02](digests/2026-06-02.md) — 453 scanned, 8 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
 
-- [06-03](digests/2026-06-03.md) — 90 scanned, 3 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
+- [06-03](digests/2026-06-03.md) — 401 scanned, 5 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
 
-- [06-04](digests/2026-06-04.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [06-04](digests/2026-06-04.md) — 377 scanned, 5 passed, top: Compress-Distill: Reasoning Trace Compression for 
 
-- [06-05](digests/2026-06-05.md) — 99 scanned, 1 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
+- [06-05](digests/2026-06-05.md) — 270 scanned, 2 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
 
 - [06-06](digests/2026-06-06.md) — 50 scanned, 1 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
+
+- [06-07](digests/2026-06-07.md) — 50 scanned, 1 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
