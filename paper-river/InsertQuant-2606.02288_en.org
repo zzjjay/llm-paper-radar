@@ -1,0 +1,243 @@
+#+title:      Massive Spikes in LLMs are Bias Vectors: Mechanistic Uncovering and Spike-Free Quantization
+#+date:       [2026-06-08 Mon 02:21]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T022145-en
+#+source:     https://arxiv.org/abs/2606.02288
+#+authors:    Yung-Chin Chen, Chung Peng Lee, Ze-Wei Liou, Naveen Verma
+#+venue:      arXiv preprint, 2026
+
+* The River of the Problem
+
+Large models hide a few "monster numbers." Among tens of millions of activation values, one occasionally surfaces that is a hundred thousand times larger than its neighbors. Just those few numbers are enough to wreck low-bit quantization (compressing 16-bit floats down to 4-bit integers to save memory) — because compression requires a single shared scale, and one enormous number stretches that scale so far that every normal value gets crammed into the same tick mark and blurs into mush.
+
+The core question running through this river is: *What are these monster numbers, exactly? Why does a model need to grow them? And can we eliminate them without harming the model?*
+
+The difficulty is that you cannot simply delete them. People tried — zeroing out the four largest activations in LLaMA2-7B causes the model to collapse immediately into incoherence. So they are not noise; they are something the model cannot operate without. On one side: "they destroy quantization." On the other: "remove them and the model dies." This river is the story of generations of researchers bouncing back and forth across that dilemma, closing in on the truth one step at a time.
+
+* The Source Map
+
+#+begin_example
+[2022] LLM.int8() (Dettmers) --- Discovery: "emergent outliers" appear suddenly at the 6.7B scale
+  |                              Solution: isolate those few dimensions and compute them in fp16
+  | "Can we smooth outliers away instead of isolating them?"
+  v
+[2023] SmoothQuant (Xiao) ------ Discovery: outliers appear *per-channel*, systematically
+  |                              Solution: migrate quantization difficulty from activations to weights
+  | "Channel outliers can be smoothed, but a per-token massive spike cannot"
+  |
+  +----------------> [Understanding branch: what exactly are these spikes?]
+  |                    |
+  |              [2023] Attention Sink (Xiao) - the first token inexplicably absorbs enormous attention
+  |                    | softmax must sum to 1; attention must drain somewhere — into a "sink"
+  |                    v
+  |              [2024] Massive Activations (Sun) - spike = a fixed "bias term," input-independent
+  |                    | "Bias hypothesis, but treated as a scalar; geometric mechanism not excavated"
+  |                    v
+  |              [2024] Active-Dormant (Guo) - attention sink + value drain reinforce each other; a "no-op"
+  |                    | "Mechanism proven in toy models; how does it coordinate in real models?"
+  |                    v
+  |              [2025] Systematic Outliers (An) - root cause is softmax; spikes are implicit scale factors
+  |                    |
+  +----------------> [Engineering branch: so how do we actually quantize around it?]
+  |                    |
+  |              [2024] QuaRot (Ashkboos) - Hadamard rotation "rotates outliers away"
+  |                    | "Rotation requires rotational invariance; pre-LayerNorm breaks that"
+  |                    v
+  |              [2024] PrefixQuant (Chen) - pin outlier tokens into a KV-cache prefix
+  |                    | "Relies on heuristic of 'first occurrence of specific low-semantic tokens';
+  |                    |  only works for discrete-token language models — ViT has no rescue"
+  v                    v
+[2026] InsertQuant (this paper) --- Spikes are not scalar biases but whole-token "vector biases"
+                              W_K/W_Q/W_V act in concert to produce sink + drain, robust to RoPE
+                              Solution: clamp spikes to zero, then re-insert pre-computed "template vectors"
+                              No reliance on token identity — so it works even for ViT
+#+end_example
+
+Note: the understanding branch and the engineering branch share the same source (LLM.int8, SmoothQuant), diverge in the middle reaches, and this paper reunites them — *using mechanistic understanding to build a better quantizer*.
+
+* The Evolutionary Narrative
+
+** 2022 | LLM.int8(): Discovering that large models suddenly "grow spikes" past a certain scale
+
+*** What problem did it see
+
+Before this work, quantization was a fairly mundane engineering problem: scale floats to integers, error small enough to ignore. And on small models that held true. But Dettmers found that once a model crossed roughly 6.7 billion parameters, quantization would suddenly collapse — not gradually, but as a phase transition. Certain dimensions erupted with "outlier features" of extraordinary magnitude: up to 150,000 of them in a sequence, yet concentrated in just 6 dimensions. Those 6 dimensions acted like 6 spikes, blowing out the quantization scale.
+
+*** Its solution
+
+Since the outliers are so concentrated (just 6 dimensions), stop fighting them — pull those 6 dimensions aside and compute them at high-precision 16-bit; compress the remaining 99.9% of values to 8-bit as usual. Merge the two results afterward. This is called *mixed-precision decomposition*.
+
+*** Why it worked (and what new pit it buried)
+
+It worked because it acknowledged that "outliers are a minority" and traded space for precision. But it buried two problems: first, it must dynamically identify which dimensions are outliers at runtime, making it actually slower than pure fp16 in practice; second, and more deeply — it treated outliers as a nuisance to "route around," never asking *why the model grows these spikes in the first place*. That "why" would haunt the entire river for years.
+
+** 2023 | SmoothQuant: Outliers are not random; they grow systematically per channel
+
+*** What problem did it see
+
+LLM.int8() computed outlier dimensions separately — slow. SmoothQuant spotted a more useful regularity: these outliers do not appear randomly; they appear persistently in certain *channels* (feature dimensions), consistently across tokens. Since there is a pattern, you do not need to catch them dynamically every time.
+
+*** Its solution
+
+A small mathematical sleight of hand. The attention layer computes Y = (activation X) × (weight W). SmoothQuant reasons: activations are hard to quantize, weights are easy — so divide the difficult channels by a scale factor s and multiply the corresponding weights by s. The products cancel, Y is identical, but the "difficulty" has been transferred from activations to weights. Activations are smoothed out and become easy to compress; weights were already compressible and can shoulder a bit more.
+
+*** Why it worked (and what new pit it buried)
+
+This was the first time anyone converted outliers from "enemies to isolate" into "burdens that can be relocated" — a conceptual advance. But it only handled *per-channel* outliers. People later discovered a fiercer monster: *per-token* massive spikes (a specific token exploding in its entirety). This kind of spike is not pinned to a channel, so SmoothQuant's channel-wise scaling is powerless against it. The river had to keep flowing, and first someone needed to understand: what actually is this per-token spike?
+
+** 2023 | Attention Sink: The first token is an "attention garbage bin"
+
+*** What problem did it see
+
+Here the river forks into the understanding branch. The StreamingLLM authors, while studying long contexts, stumbled onto a peculiarity: the very first token in a sequence — semantically meaningless, often just a start-of-sequence marker — was attended to intensely by every subsequent token, absorbing enormous amounts of attention. Drop it from the cache, and model performance craters: perplexity on Llama-2-13B shoots from 5.4 to 5158.
+
+*** Its solution
+
+They did not try to eliminate it; they worked with it. Since the model cannot function without those opening tokens, in long-context streaming inference just keep the first 4 tokens pinned in the cache as permanent "anchors." They named the phenomenon *attention sink*.
+
+*** Why it worked (and what new pit it buried)
+
+The key insight was *why* the sink exists: softmax forces all attention weights to sum to 1. But many times a token genuinely does not need to import information from elsewhere — except softmax does not allow it to "attend to nothing." The full unit of attention must be deposited somewhere. So the model learns to dig a garbage bin (usually the globally visible first token) and pour unused attention into it. This was the first time "outliers in quantization" and "attention mechanism" were connected. But it stayed at describing the phenomenon: why does the model need this bin? Where does what gets poured in go?
+
+** 2024 | Massive Activations: These spikes are actually "bias terms"
+
+*** What problem did it see
+
+Attention Sink said "the model pours attention into a garbage bin" but did not explain why the garbage-bin token has gigantic activation values. Sun et al. nailed these two facts together and offered a bold explanation: the values of these massive activations are *almost invariant to input* — no matter what sentence you feed in, they stay at the same number.
+
+*** Its solution
+
+This was not really a solution but a hypothesis — the *bias hypothesis*. In a linear layer y = Wx + b, b is a constant offset independent of input. Sun argues these massive activations play the role of b: the model has commandeered certain tokens as warehouses for storing fixed biases. The evidence is crisp: setting them to their own *mean* (rather than zeroing them) leaves the model completely unharmed — proving their role is that of a constant.
+
+*** Why it worked (and what new pit it buried)
+
+The bias hypothesis unified the scattered phenomena (sink, massive activations, crash-on-deletion) in one stroke: they are fixed biases that the model has quietly stuffed inside itself. But Sun treated them as a *scalar* bias — one large number at a certain position in the residual stream. This paper (InsertQuant) will later argue this understanding is incomplete: the geometric mechanism was missed. A scalar cannot explain how W_K, W_Q, and W_V jointly pull off the whole operation.
+
+** 2024 | Active-Dormant Heads: Sink and "value drain" feed each other
+
+*** What problem did it see
+
+The bias hypothesis said "spikes are biases" but did not explain how this bias is *trained into existence and sustained*. Guo et al. approached from training dynamics and filled in another piece of the puzzle: in the heads where attention sinking occurs, the "value states" of sink tokens are anomalously small — they called this *value-state drain*.
+
+*** Its solution
+
+They reproduced the phenomenon in toy models of one to three layers and identified an "active-dormant" mechanism: an attention head is "dormant" (sinking, doing a no-op) on some inputs and active on others. Theoretical analysis revealed the crux — *attention sink and value drain mutually reinforce each other*: all queries fire nearly identical attention toward the sink token's key, while that token's value tends toward zero, so enormous attention flows in and nearly-zero updates flow out. It is a perfect no-op.
+
+*** Why it worked (and what new pit it buried)
+
+"Mutual reinforcement" explains why the structure is so stable — it is a self-consistent loop. But Guo's proof was mainly in toy models. In real large models, how exactly do W_K, W_Q, and W_V divide labor to implement the no-op of "high attention + zero value" with such precision? The geometric details remained a black box. That is exactly what this paper pries open.
+
+** 2025 | Systematic Outliers: The root cause is softmax
+
+*** What problem did it see
+
+Prior papers all described "what spikes look like and what they do." An et al. wanted to land the decisive answer to "where they come from." They categorized outliers into three types (activation, weight, attention) and traced them to a common source.
+
+*** Its solution
+
+The conclusion is clean: the root cause is *softmax*. Softmax forces attention to sum to 1, but different tokens have wildly different "information needs" — some (semantically vague) tokens need lots of context; others (delimiters, padding) need almost none. To express "I actually don't need to update" under the constraint that everything must sum to 1, the model has no choice but to manufacture huge dynamic range, pouring excess attention into an "implicit, context-dependent scale factor." That is where outliers come from.
+
+*** Why it worked (and what new pit it buried)
+
+It closed the understanding branch down to a single mechanism: softmax's normalization constraint → implicit scaling → systematic outliers. This is the conceptual terminus of that branch. But notice — this entire line was "explaining the phenomenon," while the quantization engineer needs "what to do about it." The understanding branch and the engineering branch now need to converge.
+
+** 2024 | QuaRot & PrefixQuant: Two flavors of "routing around" on the engineering branch
+
+*** What problem did it see
+
+On the engineering side, after SmoothQuant everyone was asking: can we make outliers *disappear* entirely, rather than just move them?
+
+*** Its solution
+
+Two roads. QuaRot takes the "rotation" path: apply a Hadamard matrix to rotate the entire hidden space by some angle. Mathematically the output is unchanged, but outliers are "spread" across all dimensions so that no single one blows out the scale. PrefixQuant takes the "isolate the token" path: since spikes reliably appear at the first occurrence of certain low-semantic tokens, pre-pin those "outlier tokens" into the KV-cache prefix before inference begins, so no dynamic spikes are produced at runtime — cutting the maximum value from 1000+ to 0.07 and letting cheap static quantization outperform expensive dynamic quantization.
+
+*** Why it worked (and what new pit it buried)
+
+Both are effective, but each has a fatal flaw. QuaRot's rotation requires rotational invariance, and ViT's pre-LayerNorm immediately violates that prerequisite, so the rotation approach fails on ViT. PrefixQuant is subtler: it is fundamentally a *heuristic* — "spikes only appear at the first occurrence of specific low-semantic tokens." This assumption is deeply bound to the concept of "discrete tokens." ViT operates on continuous image patches with no "token identity" to speak of, so PrefixQuant's entire logic has no foothold. Both engineering roads stall at "cannot generalize to ViT."
+
+** 2026 | InsertQuant: Spikes are "vector biases" — clamp them, then re-insert templates
+
+*** What problem did it see
+
+This paper fixes two gaps simultaneously. On the understanding side: Sun's bias hypothesis was only a *scalar*, leaving the geometric interplay of W_K/W_Q/W_V unexplained. On the engineering side: PrefixQuant relies on token identity and cannot generalize to ViT. The paper's judgment is that these two gaps are actually the same gap: because no one truly understood the spikes geometrically, engineers were forced to rely on a fragile heuristic like token identity to catch them.
+
+*** Its solution
+
+First, complete the understanding. The paper argues: a spike is not a scalar bias but a *whole-token vector bias*. The evidence: after RMSNorm, sink tokens converge to a fixed direction b that is nearly invariant to input (channel variance of sink tokens ≈ 1e-4, semantic tokens ≈ 1e0, four orders of magnitude apart). Then it lays out the division of labor among the three matrices:
+
+- *W_K (contrast amplifier)*: pushes sink keys and semantic keys to near-opposite directions (similarity ≈ −0.55), making the sink token unique in key space.
+- *W_Q (global attractor)*: aligns all semantic queries toward the sink key (similarity stable at +0.50), so every token pours attention onto the sink — this is *attention sink*.
+- *W_V (spectral annihilator)*: projects b into its own spectral null space, driving the sink token's value toward zero — this is *value drain*.
+
+It also explains a puzzle: RoPE rotates embeddings by position and should scramble this fixed alignment — why doesn't it? Because the model places the dominant channels at high-frequency indices (smallest rotation angle), and in about 80% of heads the top-2 channels form exactly a 2D RoPE rotation pair — rotation preserves the norm, so the alignment signal stays rock-solid. The paper calls this the *rotation-stable zone*.
+
+With this understanding, the quantization method follows naturally. Since the spike is a deterministic, pre-computable bias, there is no need to compute it at runtime. Three steps — *Clamp*: zero out sink-token activations before quantization; the activation space instantly becomes spike-free and compressible; *Insert*: at the entry point of the attention matrix multiply, re-inject the pre-stored template vectors k_sink/v_sink so that semantic tokens still have a target to attend to; *Restore*: in the residual stream, use the template to add back the cancellation that was removed. The entire apparatus occupies 0.948 MB (a +0.007% overhead on a 13.5 GB model) with 4.69% latency cost.
+
+*** Why it worked (and what new pit it buried)
+
+The crucial difference: it operates on *vector directions in embedding space*, not on *token identity*. PrefixQuant asks "which token is anomalous?" InsertQuant asks "which direction is the bias direction?" Directions are continuous and modality-agnostic, so the same method transfers directly to ViT — exactly what PrefixQuant cannot do. Results: on LLMs it matches PrefixQuant (LLaMA-2-7B commonsense reasoning 60.26 vs 60.17) and leaves RTN and QuaRot far behind; on ViT (where PrefixQuant simply cannot run), DINOv2 ViT-B at W8A8 sees RTN collapse to 6.00% accuracy while InsertQuant preserves 74.10%.
+
+New pits remain: the number of template vectors K is manually calibrated per model (2 for LLaMA2-7B, 3 for Mistral); on 70B models and Mistral, InsertQuant's perplexity is slightly worse than PrefixQuant's, indicating that "clamp and re-insert" is not yet lossless.
+
+* Frontier Extensions
+
+As of now (June 2026), InsertQuant is the latest advance on this line. But it already points toward the next steps. The understanding branch (softmax is the root cause) has already spawned a wave of "fix the architecture at the source" work — training with gated attention, clipped softmax, or sigmoid-gated attention so that the model *never grows* systematic outliers in the first place (e.g., approaches from the Qwen team and transformer designs like TWEO that avoid extreme outliers).
+
+This surfaces a clash of two philosophies:
+- *Post-hoc school* (where InsertQuant lives): the model is already trained, the spikes are already there — handle them cleverly at quantization time.
+- *Ex-ante school*: just don't let them grow during training.
+
+InsertQuant's value is that it applies immediately to the vast ocean of already-pretrained models, with no retraining. The ex-ante school requires training from scratch. In the short term the post-hoc approach is more practical; in the long run the ex-ante approach may be more thorough.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                    What are these "monster numbers" / how to deal with them
+
+  Time -->  2022        2023            2024              2025       2026
+  --------------------------------------------------------------------------
+  Discover  Emergent -> Per-channel  ------------------------------------+
+  phenomena outliers    systematics                                      |
+            (6 dims)  + Attention sink                                   |
+                        (first token                                     |
+                         absorbs attn)                                   |
+  --------------------------------------------------------------------------
+  Under-                            Bias hyp. -> Sink+drain -> softmax  |
+  standing                          (scalar)     reinforce    root cause |
+  depth                                |         each other  (implicit   |
+                                       |                      scaling)   |
+                                       +---- "only scalar, geometry     |
+                                              not excavated" -----------+
+                                                                        v
+  --------------------------------------------------------------------------
+  Engineer  Isolate   -> Migrate to -> Rotate     / Pin outlier token  Vector bias
+  solution  fp16 dims    weights        away         (by token identity, clamp +
+            (slow)       (channel only) (ViT fails)  ViT fails)        insert template
+                                                                        (cross-modal!)
+  --------------------------------------------------------------------------
+  Cognitive "Outliers   "A burden     "A fixed bias  "Forced by        "A geometrically
+  shift      are enemies  that can be   the model      softmax"          pre-computable
+             to isolate"  relocated"    needs"                           vector direction"
+
+  Tension running throughout: [delete them → model dies] <-----> [keep them → quantization dies]
+  InsertQuant's breakthrough: since it's a deterministic vector, "clamp (for the quantizer)
+                                                                  + re-insert (for the model)"
+#+end_example
+
+* Insight
+
+On the surface this river is "iterating quantization techniques"; underneath, what is really happening is a movement of *cognitive reduction followed by elevation*.
+
+Each generation's understanding of the "monster numbers" becomes one layer more concrete: from "6 disruptive dimensions" (pure statistical phenomenon), to "a relocatable per-channel burden" (has structure), to "a bias the model needs" (has function), to "an implicit scale forced by softmax" (has root cause), and finally to this paper's "a geometrically determined vector direction" (has mechanism and is computable). Each layer deeper in understanding transforms the engineering response from "routing around" to something more precise — until InsertQuant, where the understanding is deep enough to *pre-compute the thing and simply skip it at runtime*.
+
+The deepest lesson is: *understand a phenomenon thoroughly enough and the nuisance becomes a resource.* Those few monster numbers looked, to LLM.int8(), like enemies that had to be expensively served in fp16. To InsertQuant, because it sees through to their nature as deterministic vector biases, they become a sub-megabyte lookup table computed once offline. Same thing, same numbers — the depth of understanding determines whether it is a liability or an asset.
+
+Where the river forks next is already visible: either continue "post-hoc processing," extending the vector-bias understanding to more modalities and lower bit-widths, or "cut at the root" by eliminating softmax's incentive to manufacture spikes during pretraining. The river will most likely flow toward a confluence of "don't grow them + catch any that slip through."
+
+* Takeaways
+
+The most direct lesson this line of work offers for how to do research is: *don't rush to solve the trouble — first understand the trouble all the way to the bottom.*
+
+For four full years, the engineering camp kept inventing ever more elaborate ways to "route around" outliers (isolate, migrate, rotate, pin) — each trick effective, each trick leaving a blind spot precisely because no one truly understood what they were handling (the clearest case: PrefixQuant locked to token identity, unable to generalize to ViT). Only when InsertQuant connected the understanding branch (this is a vector bias with a clear W_K/W_Q/W_V geometric division of labor) to the engineering branch did generalization emerge naturally — not because a cleverer trick was invented, but because *the right question was asked*: "what is this direction?" rather than "what is this token?"
+
+The practical takeaway: the next time you face an engineering problem where tricks keep getting invented but every trick has a boundary, the real leverage probably lies not in inventing yet another trick, but in stepping back and explaining the mechanism of the disruptive thing completely. Once you have done that, the place where a trick was needed often simply disappears.

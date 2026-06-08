@@ -1,0 +1,242 @@
+#+title:      P-Cast Precision in FP8 Attention: Sink-Induced Collapse and the Optimality of S=2^8
+#+date:       [2026-06-08 Mon 03:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T034622-en
+#+source:     https://arxiv.org/abs/2606.06521
+#+authors:    Reed Lau
+#+venue:      arXiv preprint 2606.06521 [cs.AR], 2026
+
+* The River of the Problem
+
+In one sentence: *When you compute attention both fast and lean (using 8-bit floating point), a minor player you never noticed—the "attention garbage bin"—quietly churns your precision into mush. This paper answers: exactly how does it churn, and why do the two parameters engineers picked by gut instinct happen to be the mathematically optimal solution.*
+
+Why is this hard? Because it sits at the crossroads of three research lines that never talked to each other:
+
+1. *The Speed Line*: Transformer attention has quadratic complexity—as sequences grow, it grinds to a halt and blows memory. For a decade, people have been figuring out how to make it faster.
+2. *The Precision Line*: The ultimate tool for speed is "use fewer bits"—8 bits instead of 16. But fewer bits means numbers are represented less accurately.
+3. *The Mystical Line*: Large models exhibit a strange behavior—they pour enormous attention onto the first token even when that token carries no meaning. This was initially treated as a bug, then recognized as a feature, and then found to collide head-on with "saving bits."
+
+Each line ran independently for years, until one day they all crashed together: you want to save bits (Precision Line), but the very step that saves bits gets wrecked by the "attention garbage bin" (Mystical Line), and all of this happens inside the fastest attention kernel (Speed Line). This paper stands at the three-river confluence and uses a single closed-form formula to explain the whole accident.
+
+* The Provenance Map
+
+#+begin_example
+               Speed Line                          Precision Line
+                    |                                     |
+  [2022] Dao - FlashAttention            [2022] Micikevicius - FP8 Formats
+    Tiling + online softmax                  Defines E4M3 / E5M2 two 8-bit float formats
+    Fuses attention into one GPU kernel      (E4M3: 4 exponent bits, 3 mantissa bits)
+         |                                                |
+         v                                               |
+  [2024] Shah - FlashAttention-3                         |
+    On Hopper, introduces FP8 P-casting <------- Merges Precision Line into Speed Line
+    Picks S=256 + reverse iteration by engineering intuition   |
+         |     ^                                              |
+         |     |  (Side branch: SageAttention2, S=448)        |
+         |     |                                              |
+         |     +--------- Mystical Line --------------------+
+         |                      |
+         |   [2023] Xiao - StreamingLLM
+         |     Discovers "attention sink" (attention garbage bin)
+         |          |
+         |   [2024] Sun - Massive Activations
+         |     Cause of the sink: a few massive activation values
+         |          |
+         |   [2025] Barbero - Why first token?
+         |     Why sinks are necessary: preventing "over-mixing"
+         |          |
+         v          v
+  [2026] Reed Lau - P-Cast (this paper)
+    Three-river confluence: proves "sink + FP8 P-cast" causes collapse,
+    and proves FA3's intuition-picked S=256 + reverse iteration is optimal
+         |
+         v
+  [2025/2026] Frontier: SageAttention3 (FP4 microscaling) / FlashAttention-4 (Blackwell)
+#+end_example
+
+Note: Solid arrows represent explicit citation/critique relationships in the paper; the progression among the three Mystical Line papers (discover phenomenon → explain cause → explain purpose) is confirmed; this paper cites all three as background support for the sink phenomenon.
+
+* The Evolutionary Narrative
+
+** 2022 | FlashAttention: Fusing the Entire Attention into One Kernel
+
+*** What Problem Did It See
+
+Before it, the standard way to compute attention was "follow the formula faithfully": first compute a large N×N matrix (N is the sequence length), store it in memory, then apply softmax, then multiply by V. The problem: this matrix is enormous—a sequence of ten thousand tokens means a hundred million numbers. The real bottleneck was not slow computation but the constant shuttling of this large matrix between video memory (HBM) and on-chip cache (SRAM). The GPU's compute capacity was already more than sufficient; what was saturated was memory bandwidth.
+
+*** Its Solution
+
+The core trick is called "tiling + online softmax." An analogy: to compute the class average score, the standard approach copies everyone's scores onto one large sheet and then computes. FlashAttention instead looks at one group at a time, updating a "current maximum" and a "current running sum" after each group; after all groups are processed, the average falls out naturally—that large sheet never needs to be stored.
+
+Mathematically this means maintaining two statistics: m (running max) and ℓ (running sum). It lets you compute softmax "tile by tile" without ever materializing the full N×N matrix in memory. The entire attention is fused into a single GPU kernel, achieving a 7.6× speedup.
+
+*** Why It Works (and What Pit It Dug)
+
+It works because it eliminates "data movement"—the true bottleneck—and the result is *exact*, not approximate. But it dug a pit we would only detonate years later: *this "tile-by-tile" process has a direction*. Do you sweep from the beginning of the sequence forward, or from the end backward? In full precision (FP32), the direction is irrelevant—the result is identical either way. But once we start saving bits, this "direction" suddenly becomes a matter of life and death—which is precisely one of the cores of this paper.
+
+** 2022 | FP8 Formats: Standardizing "Bit Saving"
+
+*** What Problem Did It See
+
+Everyone wanted to compute with fewer bits, but what should an "8-bit float" look like? How many bits for the exponent, how many for the mantissa? Without a standard, every vendor did its own thing, and hardware could not unify around a single target.
+
+*** Its Solution
+
+NVIDIA, Arm, and Intel jointly defined two 8-bit floating-point formats:
+- *E4M3*: 4 exponent bits, 3 mantissa bits. Narrower range but relatively more precise; used for weights and activations (forward pass).
+- *E5M2*: 5 exponent bits, 2 mantissa bits. Wider range but coarser; used for gradients (backward pass).
+
+Key detail: E4M3 has only 3 mantissa bits, meaning each "binary slot" (binade) can represent only 8 distinct values. Compare this with BF16's 7 mantissa bits (128 values): E4M3 precision is roughly 16× coarser.
+
+*** Why It Works (and What Pit It Dug)
+
+It works because it gives hardware a clear target, so Hopper, Blackwell, and MI300 all built in FP8 compute. The pit: E4M3's 3 mantissa bits are genuinely sparse. When the numbers you need to represent are squeezed at the boundary of the range, or when the dynamic range is large, those few mantissa bits are nowhere near enough. Especially—if something *uniformly pushes down* the numbers you need to represent, driving them into the E4M3 underflow zone, those numbers simply become 0. What does the pushing? The answer is coming.
+
+** 2023 | StreamingLLM: Discovering the "Attention Garbage Bin"
+
+*** What Problem Did It See
+
+It was originally solving an engineering problem: chatbots need to handle infinitely long conversations, but memory cannot hold all historical tokens. The intuitive approach is a "sliding window"—keep only the most recent N tokens and discard the rest. But discarding caused immediate collapse: the moment a model drops the very first tokens, output quality falls off a cliff.
+
+*** Its Solution
+
+The authors discovered a strange phenomenon and named it *attention sink*: the model pours massive attention scores onto the first few tokens even when those tokens (such as an opening <bos>) have no semantic content. This is forced by the softmax mechanism—softmax requires all attention scores to sum to 1; when the model feels "none of the current tokens are very relevant," it still has to pour attention *somewhere*, and so it pours it onto the first token, which is visible from every position.
+
+The fix is elegantly simple: when sliding the window, *always keep the first 4 tokens* as the "garbage bin," and slide the rest normally. The model stabilizes immediately and can handle 4 million tokens.
+
+*** Why It Works (and What Pit It Dug)
+
+It works because that "garbage bin" is the anchor for stable model operation; discard it and everything becomes unstable. But remember the physical consequence of this phenomenon: *the attention scores for sink tokens are extremely large*. Before softmax, the corresponding raw score (logit) is far higher than everyone else's—denoted sink strength Δ in the paper, with empirical values between 6 and 13. This "far higher" is harmless for now, but once it enters the FP8 kernel, it becomes the invisible hand that pushes down everything else into the underflow zone.
+
+** 2024 | Massive Activations: How the Garbage Bin Grows
+
+*** What Problem Did It See
+
+StreamingLLM discovered the sink phenomenon but did not explain its physical cause. Sun et al. asked: what is actually happening inside the model that causes the first token to absorb all the attention?
+
+*** Its Solution
+
+They found that LLMs contain *massive activations*: an extremely small number of activation values are absurdly large—up to a hundred thousand times larger than others—their values barely change with the input, their positions are fixed, and they behave like hard-coded "bias terms." These massive activations are precisely what causes attention probability to concentrate on the corresponding tokens—that is, the sink.
+
+*** Why It Works (and What Pit It Dug)
+
+This grounded "mystery" into "physics": the garbage bin is not random; it is driven by structurally massive activation values, so it is *stable and predictable*. That "predictable" quality is critical—it means sink strength Δ is not noise but a quantity with a stable distribution. Later in this paper, that "Δ has a stable distribution" is what allows writing a closed-form underflow probability formula. The pit: these massive values are a nightmare for quantization; they monopolize the entire dynamic range, yet simply clipping them causes model collapse—they serve a function and cannot be removed.
+
+** 2024 | FlashAttention-3: Merging "Bit Saving" into "Fastest Kernel," Colliding with the Garbage Bin
+
+*** What Problem Did It See
+
+FlashAttention-2 used only 35% of H100 compute because it did not leverage Hopper's new features (asynchrony, FP8 compute). To fully utilize Hopper, FP8 had to be adopted.
+
+*** Its Solution
+
+Three techniques: asynchronous pipelines, warp specialization, and—most critically—*FP8 P-casting*. P-casting converts the probability matrix P computed by softmax into E4M3 (8-bit) before multiplying by V. This step directly invokes FP8 Tensor Cores, sending throughput skyward; the FP8 path reaches close to 1.2 PFLOPs/s.
+
+To prevent FP8 from making large errors, FA3 made two engineering choices:
+1. A static scaling factor *S = 256* (amplify P's values by 256× before converting to FP8, preventing small values from underflowing).
+2. *Reverse iteration*—KV tiles are scanned from back to front rather than front to back.
+
+*** Why It Works (and What Pit It Dug)
+
+In the FA3 paper, these two choices were "found to work well in engineering practice," *without any explanation of why*. This is the entire gap left for this paper.
+
+And the pit is deeply hidden: the P-casting step is precisely where FP8's 3 mantissa bits are most fragile (probability values are all squeezed into the narrow range [0,1]), and it is precisely hammered down by the "attention garbage bin" (the phenomenon described in the previous three papers). When scanning front to back (forward iteration), the sink token comes in first; it immediately raises the running max to a very high level, causing all subsequent *non-sink* probability values to fall below E4M3's underflow threshold and become 0—this paper calls it *P-collapse*. This is not a gradual degradation but a threshold discontinuity, occurring around Δ ≈ 6–7, which falls squarely within the real-model sink strength range.
+
+A side note: the concurrent *SageAttention2* took a different path (Q/K in INT4, P/V in FP8, smoothing outliers per block) and chose a scaling factor of S=448. This paper holds it up as a "suboptimal scaling" comparison—why 256 is better than 448 is exactly what this paper proves.
+
+** 2025 | Why First Token: Why the Garbage Bin Is Indispensable
+
+*** What Problem Did It See
+
+The earlier papers explained what the garbage bin "is" and "where it comes from," but not "why the model absolutely needs it." If it were merely an optional side effect, FP8 engineers could simply route around it. Barbero et al. set out to prove: it cannot be routed around.
+
+*** Its Solution
+
+They argue that the sink is the mechanism by which deep Transformers *prevent "over-mixing"*. In deep networks, repeated self-attention causes token representations to grow increasingly similar, eventually collapsing into a homogeneous mass (rank collapse / over-squashing). Pouring large attention into a fixed garbage bin opens an "identity operation" channel, constraining mixing and preserving each token's distinctiveness. They further prove that sink strength increases with context length and network depth, making it an essential component for long-context modeling.
+
+*** Why It Works (and What Pit It Dug)
+
+This gives this paper its final guarantee: *the garbage bin will not disappear; on the contrary, it grows stronger as models become larger and deeper*. So the "garbage bin + FP8" collision is not an edge case but a systemic problem that will only worsen over time. You cannot count on changing the model to eliminate the sink—it is part of the model's capability. The only way out is to handle this collision at the kernel level.
+
+** 2026 | P-Cast: Three Rivers Meet—Turning the Collision into a Single Formula
+
+*** What Problem Did It See
+
+It simultaneously sees the blind spot of everyone above:
+- FlashAttention-3 used S=256 and reverse iteration correctly, but *did not know why they were right*.
+- StreamingLLM / Sun / Barbero thoroughly studied the garbage bin, but *no one analyzed its interaction with FP8 P-casting* (the paper's own words: "None analyzed the interaction with FP8 P-casting").
+- FP8 Formats defined E4M3, but *the quantization of P∈[0,1]—such a special post-softmax distribution—had never been formally analyzed*.
+
+*** Its Solution
+
+It introduces no new technique; instead it delivers a quantitative explanation in three parts:
+
+1. *Closed-form formula for P-collapse*. The underflow fraction F(Δ, S) = Φ(Δ + δ_k − 6.93 − ln S), where Φ is the normal CDF, 6.93 = 10·ln2 (from E4M3's 10 binades), and δ_k is the intra-sink offset. This yields the critical threshold *Δ_c = 6.93 + ln S − δ_k*: once sink strength exceeds Δ_c, non-sink probabilities begin underflowing en masse to zero.
+
+2. *Sufficiency of reverse iteration*. Scanning back to front, the sink token arrives last; the preceding non-sink values have already been recorded on their own scale, thus avoiding being crushed the moment the sink enters. Combined with S=256, this delivers a probabilistic "zero-underflow guarantee."
+
+3. *S=256 is optimal*. Among all "power-of-two" scalings, 256 simultaneously satisfies three conditions: bit-exact scaling under IEEE 754 (amplifying/reducing introduces no rounding error whatsoever), minimal worst-case quantization step size, and maximum normal-range coverage. SageAttention2's 448 is not a power of two, cannot achieve bit-exactness, and is therefore suboptimal.
+
+*** Why It Works (and What Pit It Left)
+
+It works because it turns "engineering mysticism" into "predictable physical law": given a model's sink strength distribution, you can *compute in advance* whether it will collapse under FP8, and by how much. Experimentally, forward iteration + S=1 yields MSE 3.4× worse than reverse + S=256 at Δ=7, and roughly 10× worse at sequence length 16384; reverse iteration and S=256 each independently fix the problem, and together they converge to the same precision floor.
+
+The remaining pit (acknowledged by the authors): it only measures MSE; *perplexity and downstream task accuracy are not measured*. Its positioning is "zero cost and strictly no worse," not "guaranteed to be better." In other words, it proves "this is more accurate" but not "more accurate enough to make the model answer better." That is the next person's work.
+
+* Frontier Extensions
+
+The garbage-bin + low-precision line continues pushing toward even fewer bits after this paper:
+
+- *SageAttention3 (2025, Zhang)*: Goes directly to FP4 (each number has only 1 mantissa bit), using "microscaling" (one FP8 scaling factor per 128 numbers). It designs *two-stage quantization* specifically for the narrow range P∈[0,1]—first per-token normalization along rows, then FP4 microscaling—which is essentially the upgraded solution to the "P-cast precision bottleneck" revealed by this paper, now at the FP4 era. On Blackwell it reaches 1038 TOPS, 5× faster than the best FlashAttention.
+
+- *FlashAttention-4 (2026)*: Takes the opposite path. Instead of gambling on lower bits, it preserves BF16 precision and squeezes Blackwell dry through a redesigned pipeline, software-emulated exponential functions, and conditional softmax. Its existence reminds us: low precision is not the only way forward; "compute cleverly" and "compute coarsely" are two parallel philosophies.
+
+To date, this paper is the most complete quantitative account on the specific branch of "garbage bin × FP8 P-cast precision analysis"; SageAttention3 has pushed the battlefield into FP4.
+
+* A Single Diagram
+
+#+begin_example
+  Dimension↓ \ Time→   2022          2023-24         2024(FA3)       2026(This)       2025-26 Frontier
+  -----------------+-------------+---------------+---------------+----------------+------------------
+  How to compute   | FlashAttn  |               |  FA3 async    |                | FA4 pipeline
+  fast (Speed)     | Tiling +   |               |  Hopper FP8   |                | Blackwell
+                   | online     |               |               |                |
+                   | softmax    |               |               |                |
+  -----------------+-------------+---------------+---------------+----------------+------------------
+  How to save bits | FP8 Formats|               |  P-cast to    | Prove S=256    | SageAttn3
+  (Precision)      | E4M3/E5M2  |               |  E4M3, S=256  | optimal +      | FP4 microscaling
+                   | 3 mantissa |               |  (intuition)  | reverse iter   | two-stage quant
+                   | bits       |               |               | sufficient     |
+  -----------------+-------------+---------------+---------------+----------------+------------------
+  Garbage bin      |            | StreamingLLM  | (Gets hit,    | Quantization   |
+  mysticism        |            | -> cause: Sun |  no analysis) | collision:     |
+  (Sink Line)      |            | -> purpose:   |               | F=Φ(Δ-6.93    |
+                   |            |    Barbero    |               |  -lnS),        |
+                   |            |               |               |  P-collapse    |
+  -----------------+-------------+---------------+---------------+----------------+------------------
+                   Independent  ------------>  Collision ----->  Explained ----> Push to lower bits
+
+  Main thread: "How to compute attention fast and lean" keeps pressing forward ->
+               collides with "garbage bin" ->
+               this paper captures the collision in one formula: Δ_c = 6.93 + lnS - δ_k
+#+end_example
+
+* Insight
+
+What is really happening beneath this evolutionary line is *not simply "fewer and fewer bits over time," but a cognitive shift about "abstraction layer leakage."*
+
+In the early period, the three lines (Speed, Precision, Mystical) each treated the others as clean black boxes: FlashAttention assumed numerical precision was irrelevant (and in FP32, it genuinely was); the FP8 standard assumed input distributions were well-behaved; researchers studying the garbage bin assumed it was purely a modeling phenomenon unrelated to low-level arithmetic. Each abstraction held within its own world.
+
+The real turning point: *when you stack these abstractions and run them on real hardware, their implicit assumptions begin to fight each other*. The garbage bin (a modeling-layer phenomenon) leaks into the arithmetic layer (FP8 underflow), and the channel for this leakage is FlashAttention's "irrelevant iteration direction"—a degree of freedom that existed all along but was invisible under full precision. The paper's true contribution is not invention; it is *drawing the complete leakage path and proving that the engineers' intuition happened to plug exactly the right hole*.
+
+This foreshadows a trend: *as precision keeps being compressed (FP8 → FP4 → ?), every degree of freedom that was "irrelevant at high precision" will wake up one by one and become a life-or-death parameter*. The iteration direction has woken up; the scaling factor has woken up; next to wake might be accumulation order, rounding mode, or even token arrangement. Low precision is not simply "discarding precision"—it is waking up, one by one, every sleeping assumption embedded throughout the entire compute stack. The most likely next step is that someone will write the equivalent of this paper for FP4—and SageAttention3's two-stage quantization is already the first signal in that direction.
+
+* Lessons
+
+For "how to do research, how to find problems," this evolutionary line offers three very concrete takeaways:
+
+1. *The fattest problems hide at the seams between abstraction layers, not inside any single field*. This paper's author invented no new algorithm; he simply stood at the intersection of three mature research lines—Speed × Precision × Mystical—and asked "what happens when they collide?" This means you can—*stare at mature technical combinations that each work independently but have never been analyzed together, and look for where their implicit assumptions contradict each other*.
+
+2. *"Explaining why something is correct" is itself a first-rate contribution, no less than "making something new"*. FlashAttention-3 used S=256 and reverse iteration correctly, but left a vacuum of "why." This paper fills it with a single closed-form formula, and the value is no less than a new kernel. This means you can—*find engineering practices that "everyone uses but nobody can explain," write the mathematics clearly, and that is a paper*.
+
+3. *Honestly marking boundaries actually makes conclusions more credible*. The author explicitly acknowledges: "I only measured MSE, not downstream accuracy, so I only dare claim zero cost and no worse—not better." This restraint makes the strong claim "S=256 is optimal" appear especially trustworthy. This means you can—*proactively draw the boundary of where your conclusion applies rather than hiding it; the more clearly the boundary is drawn, the more weight the core conclusion carries*.

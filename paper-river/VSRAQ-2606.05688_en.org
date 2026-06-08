@@ -1,0 +1,242 @@
+#+title:      Value-and-Structure Alignment for Routing-Consistent Quantization of Mixture-of-Experts Models
+#+date:       [2026-06-08 Mon 03:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T033331-en
+#+source:     https://arxiv.org/abs/2606.05688
+#+authors:    Hancheol Park, Geonho Lee, Tairen Piao, Tae-Ho Kim
+#+venue:      arXiv preprint, 2026-06
+
+* The River of the Problem
+
+Compressing a massive model (quantization) so it fits in GPU memory and runs fast — people have been doing this for years, and the craft is mature. But when that model is a Mixture-of-Experts (MoE), the old craft fails in a place nobody anticipated.
+
+MoE works like this: the model hosts a large pool of "experts" (small sub-networks) plus a "router." For each incoming token, the router scores every expert and then selects only the top-k highest-scoring ones to do the actual computation. MoE therefore has enormous parameter counts but activates only a tiny fraction at a time — saving compute.
+
+Now you quantize it. Quantization is essentially stuffing high-precision numbers (say, 16-bit floats) into low-precision bins (say, 4-bit). This inevitably introduces error. In a dense model, that error just makes each number slightly rougher, nudging the final result a little — no big deal. But in MoE, the error seeps into the scores the router produces. And the router selects experts by *ranking* those scores — *once error swaps the relative order of two closely scored experts, the token gets routed to an entirely different expert*. The entire computation path changes.
+
+This is the core problem of this river: *quantization noise does not merely make numbers coarser; it alters the discrete decision of "who gets selected."* The difficulty lies in the fact that selection is a hard threshold (that top-k cutoff line), not a continuous function — you cannot gently protect it by "making the error a little smaller." No matter how small the error, if it crosses the ranking boundary, the decision flips. This river traces how, generation by generation, people gradually clarified *what actually needs to be protected*: from "protect the numbers" → "protect the routing scores" → "protect the routing structure."
+
+* Source Map
+
+#+begin_example
+[1990/93] OBD / OBS - How to judge "how much does removing/perturbing a parameter hurt"
+  |
+  | Core idea: don't look at parameter magnitude; look at its impact on the output
+  |            (second-order curvature)
+  | (This line of thinking later became the ancestor of all "quantization objectives")
+  v
+[2017] Shazeer et al. - Sparsely-Gated MoE
+  |
+  | Problem: want large capacity without exploding compute
+  | Solution: host a pool of experts; router uses top-k scoring to select only a few
+  |           —— from this point "which experts to choose" became a
+  |              *discrete, hard-thresholded* decision
+  v
+[2022] Fedus et al. - Switch Transformer
+  |
+  | Problem: top-k routing with k>1 is expensive in communication and training
+  | Solution: simply use top-1; each token goes to exactly one expert
+  |           —— selection collapses to a single argmax; one flip changes the
+  |              entire computation path (most fragile)
+  v
+[2020] Nagel et al. - AdaRound  /  [2023] Frantar et al. - GPTQ
+  |
+  | Problem: round-to-nearest is suboptimal; the rounding direction should be learned
+  | Solution: optimize rounding to minimize layer-output reconstruction error
+  |           —— but the objective only targets *numerical fidelity*
+  v
+[2024] Cheng et al. - AutoRound (SignRound)
+  |
+  | Problem: AdaRound's sigmoid relaxation is too heavy; rounding is just "up or down"
+  | Solution: give each weight a learnable ±0.5 perturbation; train with sign-SGD
+  |           —— VSRAQ is plugged into this framework
+  |              (but its objective still targets only numerical fidelity)
+  v
+[2024] Li et al. - QuantMoE-Bench    [2025] Hu et al. - MoEQuant
+  |  (MoE components differ in sensitivity)   (routing makes calibration data
+  |                                             inherently imbalanced)
+  |  —— both recognize "MoE needs special treatment," but neither addresses
+  |     "quantization changes the selection"
+  v
+[2025] EAQuant / EAC-MoE - Routing-aware quantization (most direct predecessor)
+  |
+  | Problem: quantization changes top-k expert selection ("expert shift")
+  | Solution: align routing *values* (logit MSE / probability KL) before and
+  |           after quantization
+  |           —— protects "values" only; not "structure (ranking order + margin)"
+  v
+[2026] Park et al. - VSRAQ  <<<target paper>>>
+  |
+  | Problem: values are aligned, yet rankings can still flip;
+  |          the threshold boundary can still be crossed
+  | Solution: beyond "value alignment," add "structure alignment" —
+  |           preserve ranking order + preserve top-k boundary margin
+#+end_example
+
+Note: OBD/OBS → AdaRound/GPTQ is not a direct citation but an inferred intellectual lineage — the idea of using impact on the output as the optimization objective. AdaRound → AutoRound, AutoRound ← VSRAQ (plug-in instantiation), and EAQuant/EAC-MoE ← VSRAQ (explicitly named and critiqued) are all confirmed relationships in the paper. Shazeer → Switch and QuantMoE-Bench / MoEQuant are MoE background references cited by VSRAQ (confirmed citations, but parallel background rather than a single critique chain).
+
+* Evolutionary Narrative
+
+** 2017 | Sparsely-Gated MoE: Host a Pool of Experts, Wake Only a Few
+
+*** What Problem It Saw
+
+The most direct path to a smarter model is stacking parameters. But in a traditional network every parameter fires for every input — double the parameters, double the compute, unsustainable. Could you instead have "many parameters but only use a small fraction each time"?
+
+*** Its Solution
+
+Replace a monolithic feed-forward layer with a collection of small networks (experts) plus a router. The router scores every expert, applies a =KeepTopK= operation to retain only the top-k scores, and pushes the rest to negative infinity so that after softmax they become exactly zero — those experts contribute nothing to the computation. Parameters can thus grow by orders of magnitude while each token passes through only k experts.
+
+*** Why It Worked (and What New Trap It Set)
+
+It decoupled "capacity" from "compute" — that is the entire source of MoE's power. But in doing so it quietly buried a consequential landmine: *"which experts to select" is a hard top-k threshold decision built on top of continuous scores*. Two experts with nearly identical scores are separated by nothing more than a razor-thin boundary. Nobody worried about the fragility of that line at the time — during training, scores change smoothly. That fragility would only be fully exposed years later, when the noisy knife of quantization was pressed against it.
+
+** 2022 | Switch Transformer: Push the Selection to the Extreme — Choose Just One
+
+*** What Problem It Saw
+
+Shazeer's top-k (k>1) routing carries a cost: sending each token to multiple experts is communication-heavy and training-unstable. Could it be simplified further?
+
+*** Its Solution
+
+Simply set k=1. Each token goes to exactly one expert; the output is that expert's result multiplied by its gate score. Communication, buffering, and compute all shrink dramatically, and this enabled the first trillion-parameter sparse model to be trained.
+
+*** Why It Worked (and What New Trap It Set)
+
+It proved that minimal routing can scale. But from the perspective of this river, it pushed the "selection decision" to its most fragile extreme: *the entire computation path for a token is now determined by a single argmax*. With top-k (k>1), selecting one wrong expert is partially offset by the others; with top-1, a single flip sends the token through a completely different FFN with no buffer whatsoever. Many modern MoEs operate in this low-k regime — which is precisely the structural reason why "quantization-induced selection flips" carry such severe consequences downstream.
+
+** 2020–2024 | AdaRound → GPTQ → AutoRound: Quantization Must "Learn to Round," but Still Chases Numbers Only
+
+*** What Problem It Saw
+
+The most naive quantization strategy is round-to-nearest. AdaRound was the first to point out that this is suboptimal. Whether a weight should round up or down should not be decided in isolation by which bin it is closer to; it should be decided by how much *the entire layer's output* is affected — weights interact with one another.
+
+*** Its Solution
+
+Turn rounding into an optimizable decision. AdaRound uses a sigmoid soft gate to learn the up/down direction for each weight, then an annealing regularizer forces it toward a hard 0/1. GPTQ takes a different route: quantize weights sequentially, and after each weight is quantized use the Hessian (second-order curvature — the old idea from OBS) to compensate the error into the remaining unquantized weights. AutoRound (SignRound) argues that AdaRound's sigmoid machinery is too heavy — rounding is fundamentally just "did it cross the flip threshold," so the direction is what matters, not the precise magnitude. It therefore gives each weight a learnable perturbation V constrained to ±0.5 and trains with *sign*-gradient descent, still targeting minimization of the layer-output reconstruction error =||WX - W̃X||²=.
+
+*** Why It Worked (and What New Trap It Set)
+
+This line made quantization progressively more accurate and more efficient, with AutoRound emerging as a clean, zero-inference-overhead framework — the very framework VSRAQ later plugs into. But keep your eye on the optimization objective: =||WX - W̃X||²= always pursues *numerical fidelity* — making the post-quantization output numbers stay as close as possible to the originals. This objective is designed for a *fixed computation graph*: the input's routing is predetermined, so you just need each number to be accurate. But MoE has an *input-dependent* computation graph — once scores change, the path the token takes changes too. In MoE, "computing numbers accurately" and "selecting the right expert" are two different things. That gap is exactly what MoE-specific quantization methods need to close.
+
+** 2024–2025 | QuantMoE-Bench & MoEQuant: Recognizing MoE Needs Special Treatment, but Not Yet Touching Selection Itself
+
+*** What Problem It Saw
+
+Directly applying dense-model quantization recipes to MoE causes severe performance drops. Why? These two papers offer clues from different angles.
+
+*** Its Solution
+
+QuantMoE-Bench ran extensive benchmarks and found that different components of an MoE have wildly different quantization sensitivities: shared experts, attention, and earlier layers are all more sensitive and deserve more bits. The conclusion is "don't use a uniform bit-width; use mixed precision." MoEQuant focused on calibration data: PTQ relies on a small calibration set to estimate quantization statistics, but in MoE that calibration data is *itself distributed by the router* — rarely visited experts receive too few samples to yield reliable statistics. It therefore introduces "expert-balanced sampling" to ensure each expert has sufficient representative data.
+
+*** Why It Worked (and What New Trap It Set)
+
+These two papers put MoE's special character squarely on the table, and MoEQuant in particular revealed something profound: *routing does not just determine which path is taken at inference time; it also determines which data calibrates which weights* — the selection mechanism and quantization are bidirectionally entangled. Yet both papers remained on the periphery: QuantMoE-Bench used full-precision routing frequencies purely as a heuristic for bit allocation, *never checking whether quantization would change the selection itself*; MoEQuant fixed the balance of calibration data, not the selection behavior. The core problem — "quantization noise directly flips top-k" — was still left wide open.
+
+** 2025 | EAQuant & EAC-MoE: The First Direct Defense of "Routing" — but Protecting Only the "Values"
+
+*** What Problem It Saw
+
+These two papers (the most direct predecessors to VSRAQ) finally named the core issue: quantization error *changes the top-k expert selection*. EAC-MoE gave it a name — "expert shift" — and ran a clean ablation: force the quantized model to use the full-precision expert selections, and perplexity immediately recovers from 4.65 to 4.21. This proves that a large share of the performance drop is not from "weight error" but from "selecting the wrong expert."
+
+*** Its Solution
+
+Align the router explicitly. EAC-MoE uses =TopK-MSE=: compute MSE only on the logits of the top-K experts, comparing scores under clean versus quantized inputs. (Why only the top-K? Because full-expert MSE is swamped by a large number of experts with negligible scores — all noise.) EAQuant goes further, using a dual objective of "logit MSE + KL divergence of routing probabilities," and finds that restricting the KL to the top-8 experts works best.
+
+*** Why It Worked (and What New Trap It Set)
+
+This was the pivotal leap: the optimization objective moved for the first time from "numerical fidelity" to "routing fidelity" — no longer just keeping the weight output numbers accurate, but keeping *the scores the router produces* accurate. But when VSRAQ looked back, it found that both methods shared the same subtle flaw: *they aligned "values," not "structure."* They brought the pre- and post-quantization scores closer together, implicitly assuming that "scores close → rankings and selections preserved." That assumption does not hold —
+
+Imagine a top-2 selection where expert A scores 0.51 and expert B scores 0.49, so A is selected and B is not. After quantization A becomes 0.49 and B becomes 0.50. Each score moved by only about 0.01; the MSE is tiny; "value alignment" looks great — *but the ranking has flipped, and the selected expert has changed*. EAC-MoE itself only *measured* the selection-change rate after the fact and never wrote "ranking order" or "the margin between rank k and rank k+1" into the optimization objective to *actively protect* them. Values can align and structure can still collapse.
+
+** 2026 | VSRAQ: Aligning Values Is Not Enough — Align the "Structure"
+
+*** What Problem It Saw
+
+VSRAQ identified that gap precisely: routing-aware methods protected values but not structure. Concretely, it points to two failure modes where "values are aligned but structure collapses":
+
+1. *Rank inversion*: like the 0.51/0.49 example above — scores barely move, but the relative order within the top-k flips, and the selected expert set changes.
+2. *Boundary violation*: the margin between rank k and rank k+1 is so thin that quantization noise easily pushes a non-selected expert inside the boundary or knocks a selected expert out.
+
+It also critiques the waste in prior methods: EAQuant's "full-dimension alignment" spends optimization budget on *low-ranked experts that will never enter the top-k and have no effect on the decision whatsoever*.
+
+*** Its Solution
+
+On top of the AutoRound quantization framework, VSRAQ adds an entirely new term to the optimization objective. The objective has two halves:
+
+- *Value alignment*: inherits the TopK-MSE direction, aligning routing-relevant scores; adds a "sigmoid-aware weighting" that concentrates the optimization near the p≈0.5 region of the sigmoid curve — precisely the boundary zone where flips are most likely to occur.
+- *Structure alignment*: this is the novel contribution. A *ranking loss* directly penalizes changes in the relative ordering of experts between pre- and post-quantization, actively suppressing rank flips; plus a *top-k boundary margin* term that actively widens the gap between the k-th and (k+1)-th ranked experts, making the selection more robust to noise.
+
+This objective operates purely at calibration time, is plug-in compatible (instantiated on AutoRound), and carries *zero additional overhead at inference*.
+
+*** Why It Worked (and What New Trap It Set)
+
+Return to the core problem — quantization noise flips discrete selections. Prior work tried to protect selection indirectly by "making value error smaller," but selection is a hard threshold: value error can be tiny and still cross the boundary. VSRAQ's breakthrough is *cutting out the indirection*: if what you ultimately care about is "rankings" and "whether the top-k boundary is crossed," then write rankings and boundary margins *directly into the loss function* and optimize them. This is the shift from "aligning the numerical output" to "aligning the structure of the decision."
+
+In results, VSRAQ achieves best-in-class quantization performance across all settings on Solar-Open-100B and Nemotron-3-Nano-30B, with expert-selection consistency (Jaccard similarity) improving more than 11.29% relative to the baseline, and the largest gains on generative extraction tasks (e.g., Solar NVFP4: 61.78 → 64.43).
+
+New traps set: the trade-off and weighting between the ranking loss and the boundary margin term remain empirically determined; and the method protects the structure at the level of a single routing layer, leaving the question of whether cascaded multi-layer routing flips require a deeper structural protection as an open problem.
+
+* Frontier Extensions
+
+As of this writing (2026-06), VSRAQ is the latest step on the "routing-consistent quantization" line. It has just pushed the frontier from "aligning routing values" to "aligning routing structure," and follow-on work will most likely proceed in two directions: first, enriching the definition of "structure" — not just single-layer ranking and margin, but the holistic consistency of the cross-layer routing path; second, transferring the core idea of "directly optimizing the stability of a discrete decision" from MoE routing to other "continuous scores + hard threshold" settings (e.g., retrieval, top-k selection in sparse attention). The next paper on this line will most likely focus on "how many levels does structure really have."
+
+* One Diagram to Understand It All
+
+#+begin_example
+        What actually needs to be protected? —— Three levels of descent in quantization objectives
+
+  Protected object ^
+                  |
+                  |  [2020-24] AdaRound / GPTQ / AutoRound
+   Numerical       |    Objective: ||WX - W̃X||²  make output numbers accurate
+   (fidelity)      |    Applies to: fixed computation graph (routing is predetermined)
+                  |    Blind spot: MoE's graph is input-determined; accurate numbers
+                  |               != selecting the right expert
+                  |          \
+                  |           v
+   Routing values  |  [2025] EAQuant / EAC-MoE
+   (value          |    Objective: align routing logits/probabilities (TopK-MSE / KL)
+    alignment)     |    Progress: first time targeting "the router's scores"
+                  |               rather than "the weight outputs"
+                  |    Blind spot: scores move only slightly -> tiny MSE ->
+                  |               but rankings can still flip
+                  |               (0.51/0.49 becomes 0.49/0.50 after quant;
+                  |                values aligned, selected expert changed)
+                  |          \
+                  |           v
+  Routing          |  [2026] VSRAQ  <<target>>
+  structure        |    Objective: value alignment + *structure alignment*
+  (structure       |              - Ranking loss: directly suppress top-k order flips
+   alignment)      |              - Boundary margin: directly widen the gap between
+                  |                               rank k and rank k+1
+                  |    Insight: selection is a hard threshold; stop protecting it
+                  |             indirectly by "shrinking value error";
+                  |             write "ranking / boundary" directly into the loss
+                  +-----------------------------------------------> Time
+
+  Underlying fragility: MoE selection = hard top-k threshold over continuous scores
+                        (planted by Shazeer 2017; pushed to the top-1 extreme by Switch 2022)
+#+end_example
+
+* Insights
+
+On the surface this river is about "how to quantize MoE"; underneath, what is really evolving is a more general insight: *when your system contains a discrete decision made of "continuous quantity + hard threshold," the right way to protect that decision is not to minimize the error in the continuous quantity — it is to directly optimize the stability of the decision itself.*
+
+- Classical quantization (GPTQ/AutoRound) assumes a "fixed computation graph" — get every number right and the result follows. This holds for dense models because there is no "branching."
+- MoE introduces "branching" (routing), so "numbers are accurate" and "decision is correct" split into two separate concerns. EAQuant/EAC-MoE recognized the need to protect routing, but they *still used the old worldview* to do it — assuming "if the routing values are also accurate, that's enough." This is an attempt to reach a discrete target through continuous means, and it is bound to leak.
+- VSRAQ's genuine breakthrough is *acknowledging the discreteness of discrete decisions*: rank inversion and boundary violation are properties of combinatorial/ordinal structure, not of numerical magnitude. So it brings ordinal structure (ranking) and boundary (margin) directly into the loss. Moving from "align values" to "align structure" is, at its core, switching from a continuous-quantity perspective to a discrete/ordinal-structure perspective.
+
+The deepest lesson from this line: *do not use a continuous error metric to guard a discrete decision*. When you find that "I've driven the error very small, but the result is still wrong," the problem is usually not that the error isn't small enough — it's that you're guarding the wrong thing. What you need to guard is the threshold that flips the decision, not the numerical values on either side of it.
+
+Where does it go next? Most likely by asking "how many levels does structure have?" VSRAQ guards the ranking/boundary of a single routing layer, but MoE is multi-layer and routing is cascaded — selecting the wrong expert in one layer changes the input distribution to the next layer, potentially triggering a chain of flips. Once single-layer structure alignment is in place, "path-level" structural consistency (stability of the entire computation path) is very likely the next battlefield.
+
+* Implications
+
+For "how to do research," this river offers one hard lesson: *when you've optimized a metric for a long time and the error is down, but performance won't budge, don't rush to tune hyperparameters — step back and check whether there is a "discrete gap" you haven't noticed between what your objective optimizes and what you actually care about.*
+
+- When you see a cluster of papers all competing on "who compresses the error more" (the MSE/KL arms race in value alignment), first step back and ask: *is this error really what I ultimately care about?* VSRAQ discovered that "what I actually care about is rankings and selections," bypassed the error competition entirely, and directly optimized rankings — immediately surpassing all methods that only fought over value alignment.
+- Around every discrete decision (top-k, argmax, sorting, threshold) there is almost always a crack where "continuous metrics can't protect it." Wherever there is a hard threshold, it's worth asking: "Am I directly optimizing this decision, or am I using some continuous proxy to indirectly approximate it?"
+- One good ablation is worth a thousand words. EAC-MoE's experiment — "force the quantized model to use full-precision expert selections; watch perplexity snap back immediately" — cleanly severed "performance drop from weight error" from "performance drop from wrong selection" with a single cut. That kind of experiment is the engine of this type of work; run it first, then design the method.
+
+The practical takeaway: the next time you face a task where "the metric is optimized but the effect won't move," start by locating the *discrete decision point* in the system (which step performs a hard selection / sorting / thresholding), then check whether your loss function is spinning around only the continuous quantities adjacent to it. If so, write that decision's *ordinal structure or boundary margin* directly into the loss — very often, that one step is the difference between "almost working" and "actually working."

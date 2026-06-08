@@ -1,0 +1,292 @@
+#+title:      MixFP4: Enhancing NVFP4 with Adaptive FP4/INT4 Block Representations
+#+date:       [2026-06-08 Mon 01:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T010007-en
+#+source:     https://arxiv.org/abs/2605.31035
+#+authors:    Jiaxiang Zou, Yonghao Chen, Ruilong Wu, Xinyu Chen
+#+venue:      ICML 2026 (PMLR 306)
+
+* The River of Problems
+
+In one sentence: *How do you store billions of numbers in a large model using a mere 4 bits each, while losing almost no accuracy?*
+
+Where is the difficulty? Four bits can only represent 16 distinct values. Yet the numbers inside a tensor vary wildly—some regions are flat plains (a bunch of similarly-sized small fractions), while others suddenly throw up a giant (an outlier, hundreds of times larger than its neighbors). You have only 16 slots, and no arrangement works: pack the slots tightly and the giant won't fit; space them out and all the fine detail on the plain blurs into mush.
+
+Worse still, this "flat here, steep there" pattern doesn't just appear across different layers or modules—it shows up *between adjacent small blocks inside the very same tensor*. That is why generation after generation of researchers has charged at this problem: each generation believed it had found "the right format," only for the next generation to discover that no single format is right for all data.
+
+The current endpoint of this river is the counterintuitive answer MixFP4 provides: *stop agonizing over FP versus INT—let each small block of data choose for itself*, and that "choice" costs not a single extra bit.
+
+* Provenance Map
+
+#+begin_example
+[2022] GPTQ (Frantar et al.)
+  |  Problem: 175B models don't fit on a single GPU; naive sub-8-bit
+  |           quantization collapses completely
+  |  Solution: use second-order (Hessian) information to decide
+  |            which direction to round each weight
+  |  Remaining gap: weights only — activations untouched
+  v
+[2022] ANT (Guo et al.)            [2023] SmoothQuant (Xiao et al.)
+  |  Problem: int/float each        |  Problem: activations contain
+  |  waste bits in their own way;   |  systematic outliers ~100× larger
+  |  fixed-length formats are       |  than normal values
+  |  inflexible                     |  Solution: migrate quantization
+  |  Solution: make the "data       |  difficulty from activations to
+  |  type" itself adapt to the      |  weights via per-channel scaling
+  |  distribution (flint / type     |  (mathematically equivalent)
+  |  selection)                     |  Remaining gap: outliers relocated,
+  |  Remaining gap: granularity     |  not eliminated; only reaches W8A8
+  |  stays at tensor level,         |
+  |  never drills down to blocks    |
+  |                               |
+  +---------------+---------------+
+                  |
+                  | (both lines converge on the same insight:
+                  |  either transform the data or transform the format)
+                  v
+[2023] MXFP4 / Microscaling (OCP standard, Rouhani et al.)
+  |  Problem: one shared scale per tensor — one outlier ruins everyone
+  |  Solution: push the scale down to groups of 32, each block gets
+  |            its own power-of-2 scale (E8M0)
+  |  Remaining gap: ① power-of-2 is coarse, can't approximate the
+  |  true block maximum  ② blocks still large (32), one outlier still
+  |  corrupts many neighbors
+  v
+[2024] QuaRot / SpinQuant (Ashkboos / Liu et al.)
+  |  Problem: outliers are still sitting in the data, refusing to leave
+  |  Solution: Hadamard orthogonal rotation "Gaussianizes" the data;
+  |            crest factor plummets
+  |  Remaining gap: after rotation the distribution changes — places
+  |  that should use FP may now benefit from INT
+  |  (NVFP4's small blocks can in turn weaken the effect of rotation)
+  v
+[2025] NVFP4 (NVIDIA, Blackwell)
+  |  Problem: MXFP4's power-of-2 scale is too coarse; blocks too large
+  |  Solution: shrink block to 16; replace E8M0 scale with FP8 E4M3;
+  |            add a per-tensor FP32 scale as a second tier
+  |  Remaining gap: no matter how accurate the scale, the whole model
+  |  is locked into one single codebook — E2M1
+  v
+[2025] Four-over-Six / 4-6 (Cook et al.)
+  |  Problem: E2M1's top end jumps from 4 to 6 in one large step;
+  |           66.6%–100% of values fall into the 4–6 gap
+  |  Solution: each block chooses between "map max to 6" and
+  |            "map max to 4" (adaptive block scale)
+  |  Remaining gap: still patching within one codebook; the format
+  |  itself is unchanged
+  v
+[2026] MixFP4 (this paper, Zou et al.)  <=== target paper
+     Insight: no single FP4 format is optimal for every block.
+     Solution: each block adaptively picks between E2M1 (FP-like)
+               and E1M2 (INT-like); the selection bit is hidden in
+               the otherwise-unused sign bit of the E4M3 block scale
+               — zero extra storage.
+#+end_example
+
+Credibility notes: the main chain GPTQ → SmoothQuant → MXFP4 → NVFP4 → 4/6 → MixFP4 is *explicitly cited and compared against* in the paper (NVFP4 is the direct baseline; 4/6 is "Cook et al., 2025"; MXFP4/microscaling is NVFP4's predecessor). ANT and QuaRot/SpinQuant are *explicitly cited* side branches—used to explain the conceptual roots of "adaptive data types" and "rotation changes which format is preferred." They are not in the direct lineage; they are tributaries that flow into the main current, shown in parallel above.
+
+* The Evolutionary Narrative
+
+The account below runs from oldest to newest. Each section opens not with "what this paper is" but with "what crack this paper spotted in the one before it"—letting the cracks themselves drive the story forward.
+
+** 2022 | GPTQ: Teaching Models to "Round Smartly"
+
+*** What problem it saw
+
+In 2022, models had grown to 175B parameters—far too large for a single GPU. Quantization was the only exit, but every naive approach below 8 bits collapsed, because plain rounding is too dumb: it treats every weight equally, yet some weights are so sensitive that nudging them even slightly detonates the output, while others can be shifted arbitrarily without consequence.
+
+*** Its solution
+
+GPTQ's core insight: *rounding has an order and a compensation mechanism*. It uses second-order information (the Hessian—essentially a map of "how sensitive the output is to each weight") to decide who gets quantized first and in what order, and after each weight is quantized the error it introduced is distributed as a correction to the still-unquantized neighbors. Think of it as a queue crossing a narrow footbridge: let the steadiest people cross first; after each crossing, those still waiting micro-adjust their stance to compensate for the gap left behind. The result: a 175B model can be compressed to 3–4 bits in four hours with almost no accuracy loss.
+
+*** Why it works (and what new pit it digs)
+
+It works because it acknowledges that weights are not equal. But it has a fatal blind spot: *it touches only weights, leaving activations completely alone*. The real trouble is in the activations, which harbor far nastier outliers than the weights. That passes the baton to the next paper.
+
+** 2023 | SmoothQuant: Tossing the Hot Potato from Activations to Weights
+
+*** What problem it saw
+
+GPTQ had cleaned up the weights, yet end-to-end low-bit inference still collapsed. SmoothQuant's diagnosis: *activations contain systematic outliers—certain channels are hundreds of times larger than normal ones*. If you set a single scale across the whole tensor, those few giants monopolize the dynamic range, leaving all the normal channels squeezed into only 2–3 quantization levels, smeared beyond recognition.
+
+*** Its solution
+
+A mathematically equivalent "shell game." The matrix multiply Y = XW can be rewritten as Y = (X·s⁻¹)(s·W): divide activations channel-wise by a factor s to shrink them, and multiply weights by s to compensate—the result is identical. Weights are naturally flat and easy to quantize; activations are naturally spiky and hard—so *migrate the difficulty from the activations onto the weights*. A migration-strength knob α (sweet spot near 0.5) controls how much gets shifted.
+
+*** Why it works (and what new pit it digs)
+
+It works because it exploits the asymmetry that weights are more "cooperative" than activations. But it only *relocates* the outliers—it does not destroy them; the outlier structure remains in the data, just in a different place. And it targets W8A8; at 4-bit activations it runs out of steam. This forces two divergent paths: either *actually eliminate the outliers* (rotation), or *let the format itself adapt to the spiky data* (adaptive types).
+
+** 2022 | ANT: Instead of Tolerating the Data, Change the "Number"
+
+*** What problem it saw
+
+ANT is actually contemporaneous with GPTQ—an early-branching tributary. Its focus is a more fundamental issue: *int and float each waste bits in their own way*. Integer grids are uniform, inadequate for data with large dynamic range; floating-point grids are dense near zero and sparse far out, wasting precision on uniform distributions. Meanwhile, variable-length encodings that represent outliers exactly carry prohibitive hardware decode costs.
+
+*** Its solution
+
+ANT proposes *fixed-length "adaptive numerical types."* Two ideas: first, flint, a float–int hybrid that within a single tensor can represent both small fractions and large values (intra-tensor adaptation); second, a framework that *automatically selects the most suitable type for each tensor based on its distribution* (inter-tensor adaptation).
+
+*** Why it works (and what new pit it digs)
+
+ANT is the ancestor of the idea "let the data type conform to the data distribution"—it was the first to treat "which number format to use" as a data-driven decision. But its granularity is only tensor-level, never drilling down to small blocks; and it appeared before rotation, so it tries to adapt types directly to raw data still full of outliers rather than first smoothing the data out. What MixFP4 does, in essence, is take ANT's idea and *push it down to 16-number block granularity, grafted onto a standardized FP4 grid*.
+
+** 2023 | MXFP4 / Microscaling: Shatter the Scale, One Shard per Block
+
+*** What problem it saw
+
+Whether GPTQ or SmoothQuant, the underlying assumption was still "one scale shared across a tensor (or a channel)." MXFP4 exposes this shared assumption's weak point: *the wider the sharing range of a scale, the more collateral damage one outlier can cause*. A single giant can push the entire tensor's dynamic range through the roof.
+
+*** Its solution
+
+OCP assembled an industry coalition (Microsoft, NVIDIA, AMD, Arm, Intel, Meta, Qualcomm) to ratify a standard: *push the scale down to blocks of 32 numbers*. Each block stores 32 4-bit E2M1 values (range ≈ ±6), plus one shared scale. That scale uses E8M0—all 8 bits go to the exponent, no mantissa—meaning it can only be an *integer power of 2*. Per-element cost: 4.25 bits.
+
+*** Why it works (and what new pit it digs)
+
+Shattering the scale does limit the blast radius of an outlier. But two big pits remain: ① *powers of 2 are too coarse*—a scale without a mantissa can only hop between steps like 2, 4, 8, never approaching a block's true maximum; every "ordinary block" therefore carries a non-trivial rounding error, and there are far more ordinary blocks than outlier blocks, so the accumulated errors become the dominant problem; ② *blocks are still large (32)*—one outlier can still push the shared exponent of its 32-number group skyward, squashing the other 31 toward zero. NVFP4 arrives aiming squarely at both pits.
+
+** 2024 | QuaRot / SpinQuant: Just "Rotate" the Data into a Normal Distribution
+
+*** What problem it saw
+
+Everyone before had been accommodating outliers—relocating them, or containing them with finer scales. QuaRot/SpinQuant ask a different question: *why not eliminate the outliers outright?* As long as outliers remain in the data, every format design has to revolve around them.
+
+*** Its solution
+
+Multiply the data by a Hadamard orthogonal rotation matrix (then fold it into the adjacent weights so the model's output is unchanged). The magic: rotation is a "weighted sum of many numbers" operation; by the central limit theorem, *the result is Gaussianized*—the long, sharp tail is smoothed away, and the crest factor (peak / RMS, a measure of "spikiness") plummets. SpinQuant goes further, discovering that different random rotations can differ by 13 accuracy points, so it *learns the rotation matrix* instead.
+
+*** Why it works (and what new pit it digs)
+
+This step is a *cognitive turning point* for the whole river. It delivers a fact that is critical to everything that follows: *after rotation, the preferred format for the data changes*. When outliers are still present, FP (dense near zero) is more economical because it handles large dynamic range; but once rotation irons the data into something near-Gaussian or near-uniform, INT (uniform grid) fits better. In other words—*"FP or INT" is not a fixed answer; it depends on whether and how much you have rotated*. This is the very foundation on which MixFP4 is built. (A small side-pit is also left: NVFP4's small blocks can partially undo the benefit of rotation.)
+
+** 2025 | NVFP4: Give the Scale a Mantissa, Shrink the Block
+
+*** What problem it saw
+
+NVFP4 surgically targets MXFP4's two pits: the coarse power-of-2 scale, and the overly large block size. MXFP4 falls about 10% short of high-precision accuracy, stalled on exactly these two points.
+
+*** Its solution
+
+Three changes: ① *block size from 32 down to 16*—finer granularity, fewer neighbors damaged by one outlier; ② *scale upgraded from E8M0 to FP8 E4M3*—two exponent bits traded for three mantissa bits, so the scale can now adhere closely to a block's true maximum rather than settling for the nearest power-of-2 step; ③ because E4M3's range is narrow (±448), add *a per-tensor FP32 global scale* to handle tensors with large dynamic range. The result is a two-tier scaling system.
+
+*** Why it works (and what new pit it digs)
+
+It works because the scale can now "speak precisely"—it tracks the data closely. Blackwell hardware supports it natively, winning on both throughput and memory, with accuracy loss held below 1%. But it leaves a subtler and more fundamental pit: *no matter how accurate your scale, the entire model is still locked to one single codebook—E2M1*. And QuaRot already told us: no single codebook is right for every block. NVFP4 perfected the scale yet never touched the format shape itself.
+
+** 2025 | Four-over-Six (4/6): A Patch Inside One Format
+
+*** What problem it saw
+
+4/6 targets a specific, concrete flaw in the E2M1 codebook. The representable magnitudes of E2M1 are {0, 0.5, 1, 1.5, 2, 3, 4, 6}—notice the *large jump from 4 to 6* at the top. Standard block scaling maps the block maximum to 6, so *any value between 66.6% and 100% of the maximum falls into the 4–6 gap*—unrepresentable. These happen to be the largest, most important values in the block; relative error spikes here, and training becomes unstable as a result.
+
+*** Its solution
+
+Each block chooses between two options: map the maximum to 6 (preserve the full range), or map it to 4 (sacrifice the headroom at the top in exchange for finer resolution near the maximum, filling in the gap)—"four over six." Both are computed; whichever yields lower MSE is stored. The selection bit rides on the existing E4M3 scale with no extra memory cost.
+
+*** Why it works (and what new pit it digs)
+
+It does close that gap, and the "each block adaptively picks a scale" trick quietly echoes ANT's old idea. But it is fundamentally *still patching within the single E2M1 codebook*—adjusting how to use the grid, not changing the grid itself. QuaRot had already said: after rotation you may need a completely different kind of grid (FP → INT). That last pane of glass is left for MixFP4 to break.
+
+** 2026 | MixFP4: Let Each Block Choose FP or INT, at Zero Bit Cost
+
+*** What problem it saw
+
+MixFP4 distills every prior thread into one sentence: *at 4 bits, no single FP4 format is optimal for all blocks and all modules*. It nails this down with two sets of evidence—crest factor measurements quantify the enormous variation in "spikiness" from block to block (Figures 2 and 3: even within Layer 0 of the same Q projection, block crest factors span from "flat plain" to "outlier highland"); and, more critically, it catches QuaRot's thread: *once Hadamard rotation is applied, format preferences flip wholesale* (Figure 5: before and after rotation, the selection rates for E2M1 and E1M2 trade places). Therefore "locking the whole model to one codebook"—whether NVFP4's or 4/6's—is always suboptimal.
+
+*** Its solution
+
+Push the "format selection" decision *down to each block*, choosing between two 4-bit codebooks:
+
+- =E2M1=: NVFP4's native format, FP-like, dense near zero with large dynamic range—suited to "steep" blocks that have not been smoothed by rotation and have high dynamic range.
+- =E1M2=: a variant that trades one exponent bit for an extra mantissa bit, giving *uniform steps, INT-like*—suited to "flat" blocks that have been Gaussianized by rotation and have low crest factor. The paper proves that E1M2's values {0, 0.5, 1, …, 3.5} multiplied by a fixed ×2 factor are *exactly equivalent to symmetric INT4's {0, 1, …, 7}* (Figure 6). In other words, E1M2 on an appropriate block is a bona fide uniform INT4 quantizer.
+
+The most elegant part is *where the selection bit lives*: MixFP4 spends zero extra storage—it *commandeers the unused sign bit of the E4M3 block scale*. The scale is always positive, so its sign bit is wasted; that wasted bit is repurposed to record "does this block use E2M1 or E1M2?" (Figure 1). Each block picks whichever yields lower MSE (Algorithm 1).
+
+The hardware story is equally clever: both formats are *decoded into the same internal E2M2 representation* (Figure 9), so the downstream compute sees only one data path—*no need to build two separate data paths for two formats*. The only cost is a few multiplexers and small logic at the decode front end: measured at *3.1% area and 1.5% power*.
+
+*** Why it works (and what new pit it digs)
+
+It works because it is the first paper in this river to merge two previously independent streams of insight: ANT's "let the format adapt to the data" + NVFP4's "GEMM-friendly block-scaled hardware" + QuaRot's "rotation flips format preference." Previous work either had the idea but no hardware (ANT), or had the hardware but no adaptation (NVFP4), or adapted the scale but not the format (4/6). MixFP4 pushes "adaptation" one layer deeper—from the *scale value* down to the *codebook shape itself*—and does it at zero storage cost by recycling a wasted bit.
+
+Remaining pits (acknowledged by the paper): ① only *two* formats are supported—E2M1 and E1M2—because experiments show block selections concentrate heavily on just a few formats (Figures 4 and 5); adding more formats yields rapidly diminishing accuracy returns at rapidly increasing system cost (Section 2.4, "Diminishing Returns from More Formats"); ② as block size grows (e.g., to 64), E1M2 weakens, because one shared scale spanning more numbers dilutes the uniform-grid advantage of the INT-like format (Table 5).
+
+* Frontier Extensions
+
+As of now (June 2026), MixFP4 is itself one of the latest entries in this line—it was posted at the end of May 2026. The paper already plants fuses pointing toward the most likely next steps:
+
+- *Rebalancing more formats against diminishing returns*: MixFP4 deliberately keeps only two formats. But if future hardware can make decode logic cheap enough, "are two formats truly sufficient" will be revisited—perhaps with different format pairs used per-layer or per-module, rather than a single global E2M1/E1M2 binary choice.
+- *Deeper co-design with rotation*: MixFP4 demonstrates that rotation flips format preferences, but currently treats rotation and per-block format selection as two sequential independent steps. The natural next question is whether one can *design the rotation specifically for the downstream per-block format selection* (joint optimization of the rotation matrix and the format assignments), rather than treating them as two separate pipeline stages.
+- *Scaling up the training story*: the paper already demonstrates pretraining on 114M and 476M Qwen3-style models (Figures 10 and 11); NVFP4 is unstable at 114M while MixFP4 trains more smoothly with a lower final loss. Validating this at a significantly larger pretraining scale is the most direct next step.
+
+* One Diagram to See It All
+
+#+begin_example
+          What truly changes along this river is the LEVEL at which
+                      "adaptation" is applied
+
+  A
+  d   Tensor-level ........ ANT (2022): select data type (int/float)
+  a                                     per tensor
+  p                              |
+  t                              | (granularity too coarse)
+  a                              v
+  t   Block-level·scale .. MXFP4 (2023): one power-of-2 scale per block
+  i                         NVFP4 (2025): scale upgraded to E4M3 with
+  o                                       mantissa; block shrunk to 16
+  n                         4/6   (2025): each block chooses between
+  |                                       "map to 6 / map to 4"
+  l                              |
+  e                              | (always tuning the scale,
+  v                              |  never touching the codebook)
+  e                              v
+  l   Block-level·codebook  MixFP4 (2026): each block chooses between
+                                           E2M1 (FP) / E1M2 (INT)
+                                           selection bit hidden in
+                                           scale's wasted sign bit
+                                           -> zero overhead
+
+  ----------------------------------------------------------------------
+  Two parallel tributaries converge into MixFP4:
+
+  [Eliminate-outlier line]              [Accommodate/adapt-to-outlier line]
+  GPTQ (smart weight rounding)          ANT (adaptive types)
+     |                                      |
+  SmoothQuant (relocate outliers)            |
+     |                                      |
+  QuaRot/SpinQuant (rotation->Gaussianize)   |
+     |  Key finding:                         |
+     |  "post-rotation FP preference       |
+     |   flips to INT preference"  ---------+
+     |                                      |
+     +----------------> MixFP4 <------------+
+                  (per-block adaptive FP/INT;
+                   naturally catches the
+                   "rotation flips format
+                   preference" fact)
+
+  Horizontal axis = time (2022 -> 2026)
+  Vertical axis   = level at which "adaptation" acts:
+                    tensor -> block scale -> block codebook shape
+#+end_example
+
+* Insights
+
+Reading the full river, what appears on the surface as "formats getting ever finer, scales getting ever more accurate" is a technical iteration. But underneath, three deeper shifts are actually occurring:
+
+1. *The point of application of "adaptation" keeps moving downward*. From ANT's "select type per tensor," to MXFP4/NVFP4/4-6's "tune scale per block," to MixFP4's "select codebook shape per block"—each generation pushes "make the representation conform to the data" to finer granularity and deeper structural level. The ultimate form is almost within sight: every small cluster of numbers paired with a numerical system tailored specifically for it.
+
+2. *The constraint shifts from "accuracy" to "adaptation at zero overhead."* Early work competed on who dropped fewer accuracy points. But after NVFP4, accuracy loss is already at the 1% level, and the competitive axis has changed—it is now "can you squeeze out a bit more adaptivity *without adding any storage or barely any hardware?*" MixFP4's most impressive contribution is not its formats per se, but two zero-cost engineering strokes: "commandeer the wasted sign bit of the scale" and "decode both formats into the same E2M2 data path." *True innovation increasingly happens in "free lunches"—in bits that others wasted and data paths that already exist.*
+
+3. *The decade-old question of "FP or INT" is answered "neither—it depends."* The deepest lesson this river teaches—revealed by QuaRot and delivered by MixFP4—is that FP and INT have no permanent winner, because the optimal choice *depends on what you have done to the data* (whether or not you have rotated it). Once you can cheaply switch between them per block, the argument dissolves on its own.
+
+Where is the field most likely to go next? Merging "rotation" and "per-block format selection" from two independent sequential steps into a single jointly optimized whole—since rotation determines which format should be chosen, the rotation itself should be designed with the subsequent per-block format selection in mind.
+
+* Lessons for Research Practice
+
+The most practical research lessons from reading this evolutionary line:
+
+1. *Fix your gaze on the constant the previous authors "didn't dare touch."* NVFP4 optimized the scale to the limit while silently assuming "there can be only one codebook." MixFP4's opening was to question that assumption everyone had taken for granted. Behind every successful paper is the question "why does this have to be fixed?" Takeaway: *next time you read a paper, specifically hunt for the design choices the authors quietly locked down without explaining why—those are often the entry points for the next paper.*
+
+2. *Constraints are the source of creativity.* MixFP4's "zero extra storage" is not an afterthought marketing point; from the start the team treated "not a single bit may be added" as a hard constraint, and that constraint produced the "commandeer the wasted sign bit" solution. Takeaway: *instead of asking "what can I add," first ask "what can I still do if I am forbidden to add even one bit?"—hard constraints often force the most elegant solutions.*
+
+3. *Treat other people's "negative findings" as your own "founding evidence."* QuaRot's observation that "rotation changes which format should be preferred" was merely a side-effect note to that paper; MixFP4 made that observation the fulcrum of an entire paper. Takeaway: *as you read, pay attention to "strange phenomena" and "side effects" that are mentioned in passing—what others dismiss as noise may be precisely the signal your paper needs.*

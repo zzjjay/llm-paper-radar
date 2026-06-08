@@ -1,0 +1,237 @@
+#+title:      DFlare: Scaling Up Draft Capacity for Block Diffusion Speculative Decoding
+#+date:       [2026-06-08 Mon 02:12]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T021253-en
+#+source:     https://arxiv.org/abs/2606.02091
+#+authors:    Jiebin Zhang, Zhenghan Yu, Song Liu, Eugene J. Yu, Zheng Li, Dawei Zhu, Jiangshan Duo, Weimin Xiong, Yifan Song, Guanghua Yu, Jianchen Zhu, Sujian Li
+#+venue:      arXiv preprint 2026 (Peking University & Tencent)
+
+* The River of Problems
+
+One sentence: *Why does a large language model output tokens so agonizingly one by one — and can we make it spit out a whole string at once while guaranteeing the result is identical to the original?*
+
+Where is the difficulty? LLM text generation is "autoregressive" — token K cannot start until token K-1 has finished. Every single token requires loading billions of parameters from GPU memory through the compute units. One trip, one token — deeply wasteful. So the idea arose: find a cheap, rough small model to "draft" a string of tokens first, then let the large model "grade" the whole string in one pass — accepted drafts are free gains, rejected ones get discarded and restarted. That is the origin of speculative decoding.
+
+But the river has run into new bottlenecks at every bend. The first bottleneck was "the small model drafts too slowly" (it also generates one token at a time); then "the small model drafts too inaccurately" (the large model rejects half the drafts); then someone made the small model "draft an entire block in parallel at once," only to hit the bottleneck of "that parallel-drafting model is either too weak or too large."
+
+The current terminus of this river is a counterintuitive finding from DFlare: the approach prior works used to make small models "draft more accurately" had a bottleneck nobody had punctured — *the target model's knowledge was squeezed through a narrow pipe into every layer of the draft model, so no matter how many layers were added, none of it helped*. What DFlare does is flare that narrow pipe open into a bell mouth — which is exactly where the name D-*Flare* comes from.
+
+* Source Map
+
+#+begin_example
+[2023] Speculative Decoding (Leviathan / Chen et al.)
+  |  Problem: LLMs are autoregressive; generating K tokens requires K serial passes — too slow
+  |  Solution: Small model drafts a string; large model verifies in parallel;
+  |            rejection sampling guarantees the output distribution is unchanged
+  |  Gap left: That "small model" is itself autoregressive — drafting is also serial
+  v
+[2024] EAGLE (Li et al.)
+  |  Problem: Drafting from scratch is hard; drafting is still serial
+  |  Solution: Predict not at the token level but at the feature level of
+  |            the target's penultimate layer; feed the target's top-layer
+  |            features as input to the draft model
+  |  Gaps left: ① Drafting is still autoregressive (serial); speed ceiling ~2-3x
+  |             ② Target features only serve as "input"; diluted as draft model deepens
+  v
+[2025] Block Diffusion / BD3-LM (Arriola et al.)   <== Paradigm enabler
+  |  Problem: Pure diffusion only generates fixed-length sequences with worse likelihood;
+  |            pure autoregressive is serial-only
+  |  Solution: Segment sequence into blocks; within each block use diffusion for
+  |            one-shot parallel denoising; between blocks stay autoregressive
+  |  Contribution: Provides a viable model paradigm for "draft a whole block in parallel"
+  v
+[2025] SpecDiff / DiffuSpec (Sandler / Li et al.)
+  |  Problem: Why must drafting be serial? Let a diffusion model draft an entire block in parallel
+  |  Solution: Use a pretrained diffusion LLM (dLLM) directly as the drafter
+  |  Gap left: That drafter is a 7B heavyweight — huge memory and latency overhead
+  v
+[2026] DFlash (Chen et al.)
+  |  Problem: The drafter shouldn't be this heavy; and "how to feed target knowledge" isn't right yet
+  |  Solution: Lightweight block-diffusion drafter + fuse hidden states from several target
+  |            layers into one compact representation; inject via KV into every draft layer
+  |            (no longer just an input to the first layer)
+  |  Gap left: All draft layers share the exact same fused feature, extracted from only
+  |            a few (5) target layers — every layer gets identical input, cannot
+  |            specialize, deeper layers saturate
+  v
+[2026] DFlare (this paper, Zhang et al.)  <=== Target paper
+     Insight: The pipe carrying target-model knowledge into the draft model is too narrow.
+     Solution: Layer-wise adaptive fusion — each draft layer learns its own weights,
+               selecting and combining from more (9 vs 5) target layers;
+               plus separate KV projections for target knowledge and draft hidden states.
+               Pipe flares open -> draft model can finally get better the deeper it goes.
+#+end_example
+
+Credibility notes: The chain Leviathan/Chen → EAGLE → Block Diffusion → SpecDiff/DiffuSpec → DFlash → DFlare is *explicitly cited and benchmarked* in the paper. DFlash (Chen et al., 2026) is DFlare's *sole direct baseline and improvement target* — the entire Preliminaries and Method sections are structured as "here is what DFlash does, here is where we differ." Block Diffusion (Arriola et al., 2025) is the explicitly named source of the block-diffusion paradigm. EAGLE, Medusa, and Leviathan are explicitly cited in the Related Work section as the speculative-decoding lineage. SpecDiff/DiffuSpec are explicitly identified as the predecessors of the "use a diffusion LLM as drafter" approach (DFlash criticized them for having a "too-heavy drafter"; DFlare inherits DFlash's lightweight path).
+
+* Evolutionary Narrative
+
+From oldest to the present paper. Each section opens not with "what this paper is" but with "what flaw it spotted in its predecessor" — letting the flaws drive the story.
+
+** 2023 | Speculative Decoding: Let the Slow Student Answer First, Teacher Grades
+
+*** What flaw it spotted
+
+LLM text generation is painfully slow, and the root cause is autoregression: token K must wait for token K-1 to finish. Every token requires a full pass loading the model's billions of parameters from memory — one expensive trip, one token. Compute is wasted on "data movement" rather than "computation."
+
+*** Its solution
+
+A clever division of labor: recruit a small, fast "draft model" to speculatively predict the next several tokens (say, 5); then feed those 5 tokens to the large model together, letting it *verify all 5 positions in a single forward pass*. The large model scans left to right: it accepts every token that matches its own judgment and stops at the first mismatch, discarding everything after. A modified rejection-sampling scheme provides a mathematical guarantee that *the final output distribution is identical to what the large model would have produced by itself, one token at a time*. Analogy: a mediocre student blurts out the full answer; the teacher scans it, ticks the correct parts and moves on, only taking over where things go wrong. The more the student gets right, the further the teacher leaps.
+
+*** Why it works (and what new gap it opens)
+
+It works because it quietly replaces "serial generation" with "parallel verification" — verification is naturally parallelizable, generation is naturally serial. But it leaves a glaring gap: *the draft model is itself autoregressive*. To draft 5 tokens it still plods through 5 serial steps. The serial cost of drafting becomes the new bottleneck. Everything that follows is a fight against "drafting is too slow and too inaccurate."
+
+** 2024 | EAGLE: Don't Predict Tokens — Predict Features
+
+*** What flaw it spotted
+
+EAGLE focused on two weaknesses in the draft model. First, *predicting tokens from scratch is hard* — an independent small model guessing what the large model will say next has low hit rates; many rejected drafts mean wasted compute. Second, drafting is still *serial*, capping speed.
+
+*** Its solution
+
+Two key pivots. First, *move the prediction battlefield from tokens to features*: EAGLE does not directly predict the next token; instead it autoregressively predicts the *feature vectors at the target model's penultimate layer*, then uses the target model's own output head to translate features into tokens. The insight: "autoregression at the feature level is smoother and easier to predict than at the token level." Second, to eliminate ambiguity from "one feature can correspond to multiple tokens," EAGLE *feeds back the actually sampled token* from the previous step, pinning down the direction. It also feeds the target model's *top-layer features as input* to the draft model, giving it a glimpse of the target's judgment.
+
+*** Why it works (and what new gap it opens)
+
+It works because it is the first systematic use of "the target model's own internal representations" to coach the draft model — the theme of "letting target knowledge flow into the draft model" becomes the main thread for everything that follows. But EAGLE buries two gaps that later work inherits: ① *Drafting is still autoregressive* — drafting N tokens still takes N serial steps; measured speed ceiling is around 2-3×. ② *The target model's features only serve as input to the draft model's first layer* — once the draft model is deepened, this signal fades through successive layers, and additional depth yields rapidly diminishing returns. The first gap forces out "diffusion parallel drafting"; the second forces out "KV injection"; both eventually converge at DFlash and DFlare.
+
+** 2025 | Block Diffusion (BD3-LM): Build the Machine That Outputs a Whole Block at Once
+
+*** What flaw it spotted
+
+To break EAGLE's first gap (serial drafting), you need a model that "generates an entire block of tokens in parallel in one shot." Neither existing option works: pure diffusion language models can denoise in parallel but only generate *fixed-length* text and lag behind autoregressive models in language-modeling likelihood; pure autoregressive models have better quality but are serial-only. Each side is missing something.
+
+*** Its solution
+
+BD3-LM creates a hybrid: *segment a sequence into blocks, generate within each block via diffusion in parallel, and maintain autoregression between blocks*. Block size is a dial — set to 1, it degenerates to pure autoregressive; set to the full sequence, it degenerates to pure diffusion. The middle range retains autoregression's quality and variable-length capability (with KV caching) while capturing intra-block parallel speed. An efficient training algorithm keeps the training cost within 2× that of standard diffusion training.
+
+*** Why it works (and what new gap it opens)
+
+BD3-LM is not designed for speculative decoding, but it *builds the critical machine*: a language model that can "emit an entire block of tokens in parallel in a single forward pass." This is exactly the drafter form that speculative decoding has been dreaming of — drafting cost nearly decoupled from block size. It hands the next paper a key: now that we have a block diffusion machine, why not use it as the speculative-decoding drafter?
+
+** 2025 | SpecDiff / DiffuSpec: Use a Diffusion LLM as the Drafter
+
+*** What flaw it spotted
+
+Building on the previous step: EAGLE-style "draft model predicts one token at a time serially" is too slow. Now that block diffusion models can emit a whole block in parallel, *stop making the drafter serial* — use a diffusion model to draft.
+
+*** Its solution
+
+Take a *pretrained diffusion language model* whole and use it as the drafter. One forward pass yields a full block of candidate tokens in parallel; the large model verifies them in parallel. DiffuSpec even achieves training-free plug-and-play, and designs a "causal consistency path search" to convert diffusion's bidirectional output into left-to-right sequences that the autoregressive verifier can accept, along with an adaptive draft-length controller. SpecDiff reports up to 7.2× end-to-end speedup.
+
+*** Why it works (and what new gap it opens)
+
+It does plug the "serial drafting" gap — drafts are now produced in one parallel shot. But it overcorrects: *the diffusion drafter is a 7B heavyweight*. The entire point of speculative decoding is that "drafting must be fast and light"; now the drafter itself is heavy and memory-hungry, and every run is costly. This forces DFlash's counter-question: why does the drafter have to be this large? Can we have a *lightweight* block-diffusion drafter and recover the quality another way?
+
+** 2026 | DFlash: Lightweight Block-Diffusion Drafter + Inject Target Knowledge Into Every Layer
+
+*** What flaw it spotted
+
+DFlash simultaneously addresses two gaps. One from SpecDiff: "drafter too heavy" — it wants a lightweight block-diffusion drafter. One from EAGLE: "target knowledge only serves as input, diluted as depth increases" — a lightweight drafter is already weak; if the target knowledge also fades through successive layers, the drafter will never be accurate. The core belief in one sentence: *"the target knows best"* — what matters is how to *fully and persistently* channel the target model's knowledge into the draft model.
+
+*** Its solution
+
+Two prongs. First, *replace the drafter with a lightweight block-diffusion model*: one forward pass emits an entire block of draft tokens in parallel, fast and compact, with shared embeddings and output head with the target model to align representation spaces. Second, and most critically — *KV injection*: during target-model prefill, extract hidden states from a *fixed set of layers* (e.g., 5 layers at various depths), *concatenate them and pass through a linear layer to fuse into one compact "target context feature"*; then insert this feature into the Key and Value projections of *every draft layer*, storing it in the KV cache for repeated reuse. Target knowledge is no longer "fed into layer one and left to fade" — it is *continuously injected at every layer*. With this mechanism, draft model acceptance length for the first time grows reliably with the number of draft layers.
+
+*** Why it works (and what new gap it opens)
+
+It works because it upgrades "target knowledge injection" from "input-level" to "KV-level, every-layer" — information no longer dilutes, and depth finally has leverage. It becomes the new state of the art. But it buries a subtle gap that forms the entire foundation of DFlare's argument: *all draft layers are forced to share the same single fused feature, and that feature is extracted from only a few layers (5), compressed into one*. This means every draft layer receives *identical* target knowledge. Yet different layers of a model should specialize (shallow layers handle syntax, deep layers handle semantics); forcing them to receive identical inputs prevents any differentiation. The result: *deepening the draft model is useless — extra layers have nothing new to do, and depth saturates fast*. A narrow, one-size-fits-all pipe.
+
+** 2026 | DFlare: Flare That Narrow Pipe Into a Bell Mouth
+
+*** What flaw it spotted
+
+DFlare decomposes DFlash's bottleneck into two *tightly coupled* problems (the paper emphasizes: "you must fix both together"):
+
+1. *Knowledge injection too narrow*: DFlash extracts target knowledge from only a few layers (5), fuses it into *one* representation, and feeds it to every draft layer. The source is narrow, and it is one-size-fits-all.
+2. *Depth scaling saturates*: every layer receives identical input, so added layers have "nothing new" to contribute and become useless. The paper states the causal link plainly — *precisely because every layer's input is the same, deepening saturates; to make deepening useful, each layer's input must first differ*.
+
+*** Its solution
+
+Three techniques, together "flaring the pipe open" (paper Figure 2):
+
+- =Adaptive layer-wise fusion= (core): Instead of concatenating target layers through a single linear projection to produce one shared feature, assign each draft layer i its own set of *learnable fusion weights* over T target layers (DFlare uses 9, DFlash uses 5). After a softmax normalization, each draft layer computes its own dedicated fused feature f^(i). After training the weights are frozen and can be precomputed; at inference time this reduces to a scalar weighted sum over 9 target hidden states — essentially zero extra latency, and only D×T scalar parameters (e.g., 63) per layer. In one sentence: *every draft layer gets a view of the target model's knowledge customized for itself*.
+
+- =Heterogeneous KV projections=: In DFlash, the draft model's own hidden states and the injected target features *share the same KV projection matrices*. But these two streams are qualitatively different — the draft hidden states carry evolving noise predictions from the diffusion process, while the target features carry the target model's semantic knowledge. Forcing them through the same projection conflates two distinct representation spaces. DFlare gives each stream *its own independent KV projection*, letting both breathe freely.
+
+- =Progressive position-weighted loss=: Early positions in the draft block are critical — if they are wrong, everything after is discarded. DFlash uses a *fixed* decay coefficient γ to concentrate weight on early positions — those positions learn quickly, but later (harder) positions are chronically under-optimized. DFlare replaces this with a *linear warmup*: early in training γ is small, focusing on the easier early positions; as training proceeds γ grows, gradually spreading weight toward the harder later positions. Like a curriculum — easy first, hard later — so that by the end of training every position has been thoroughly optimized.
+
+Complementarily, because model capacity increases, training data is scaled from 800K up to 2.4M samples to fully feed this deeper, more expressive draft model.
+
+*** Why it works (and what gaps remain)
+
+It works because it simultaneously unties DFlash's coupled knot: *make each layer's input different* (layer-wise adaptive fusion) → added layers finally have "something new" to learn → *depth scaling no longer saturates*. Ablations (Table 2) confirm: removing the softmax normalization causes the steepest drop (showing that constraining fusion weights is key to stability); removing heterogeneous KV projections or the progressive loss each cause their own drops; simply adding a linear layer after fusion without per-layer differentiation provides no benefit — proving the gains come from "per-layer differentiation" itself, not "stacking more computation." Final results on Qwen3-4B / 8B / GPT-OSS-20B: mean accepted length is 15.5% / 14.7% / 5.8% higher than DFlash, with end-to-end speedups of 5.52× / 5.46× / 3.91×.
+
+Remaining gaps (the paper acknowledges): ① For *larger* target models (GPT-OSS-20B), the absolute accepted length for both DFlash and DFlare drops significantly below Qwen3 — the representation gap between draft and target model widens with scale; DFlare narrows it but does not close it. ② Block size is currently fixed (16); adaptive block sizing is an open problem left unsolved from DFlash through DFlare. ③ The number of fused target layers T still improves when raised to 9, but the paper does not probe the upper bound of "how many is enough."
+
+* Frontier Extensions
+
+As of now (June 2026), DFlare is the latest step on this branch — it appeared only in early June 2026. The paper already plants the seeds for the most likely next moves:
+
+- *Close the representation gap, not just narrow it*: DFlare's accepted length drops noticeably on the 20B target model, exposing the fundamental tension of "draft model too small to track the large model." The natural next step is either to make layer-wise fusion smarter at adapting to large target models, or to redesign the draft architecture specifically to bridge this gap.
+- *Dynamic block size*: From DFlash to DFlare, block size has been fixed at 16. But easy positions (code indentation, fixed templates) can afford a large drafting block, while hard positions should use smaller ones. Making block size adaptive has been an open question across two generations of this line.
+- *Widening the fusion "source"*: DFlare shows that increasing target layers from 5 to 9 yields consistent gains (Figure 3 right), suggesting the bell mouth is not yet fully open. The next step could be fusing *all* target layers, or even target features across time steps, to open the pipe completely.
+
+* One Diagram
+
+#+begin_example
+        What truly changes along this river:
+        Can drafting be parallel -> Is drafting accurate -> Is knowledge fed well enough
+
+  [Phase 1: Make drafting exist at all]
+  2023 Speculative Decoding ... slow student guesses; teacher grades in parallel
+        |  Gap: the draft model is also serial, slow
+        v
+  [Phase 2: Make drafting more accurate (borrow target knowledge)]
+  2024 EAGLE ................... predict at the feature level; top-layer feature as "input"
+        |  Gap 1: drafting still serial (ceiling ~2-3x)
+        |  Gap 2: knowledge only as input, diluted as depth grows
+        |
+        +----[Gap 1: serial]----> [Phase 3: Make drafting parallel]
+        |                         2025 Block Diffusion ... builds the machine that outputs a whole block at once
+        |                                v
+        |                         2025 SpecDiff/DiffuSpec . uses diffusion LLM as drafter (parallel!)
+        |                                |  Gap: drafter is a 7B heavyweight — heavy and memory-hungry
+        |                                v
+        +----[Gap 2: diluted]----> 2026 DFlash ............ lightweight block-diffusion drafter
+                                          + KV injection: target knowledge pushed into "every layer"
+                                          (no longer just input -> depth finally matters)
+                                          |
+                                          |  Gap: all layers share the "same single" fused feature,
+                                          |       extracted from only 5 target layers ->
+                                          |       one-size-fits-all -> deepening saturates
+                                          v
+                                  2026 DFlare (this paper) . layer-wise fusion: each layer picks its own
+                                          target-layer combination (9 vs 5) + heterogeneous KV projections
+                                          + progressive loss
+                                          => "one-size-fits-all narrow pipe" flared into
+                                             "per-layer customized bell mouth"
+                                          => draft model finally gets better the deeper it goes
+
+  Horizontal axis = time (2023 -> 2026)
+  Migration of the central question:
+  Can drafting be parallel -> Is target knowledge fed "broadly enough" and "layer by layer"
+#+end_example
+
+* Insights
+
+Reading through the whole line, the surface story is "speculative decoding drafters getting faster and more accurate." But underneath, three deeper shifts are actually happening:
+
+1. *The bottleneck migrates level by level through "generation — verification — knowledge injection."* At first the bottleneck is "serial generation"; speculative decoding sidesteps it with "parallel verification." Then the bottleneck moves to "the drafter itself is serial"; block diffusion sidesteps it with "intra-block parallelism." Then the bottleneck moves to "how to feed the large model's knowledge to the drafter" — EAGLE feeds it as input, DFlash upgrades to KV injection at every layer, DFlare upgrades further to per-layer customized injection. *Every time one bottleneck is solved, the next bottleneck retreats one level deeper into "how information flows."* In the second half of this river, the protagonist has quietly shifted from "speed" to "the mechanics of knowledge flow."
+
+2. *"Let every component specialize" is the recurring breakthrough.* A striking pattern runs through this entire line: just as quantization research (e.g., MixFP4-style approaches) discovered "you shouldn't lock the entire model into one format," DFlare discovers "you shouldn't feed every draft layer the same knowledge." DFlash compressed target knowledge into "one representation" for all layers — simple, reasonable. DFlare's breakthrough is precisely to question that "one" — *why should different layers receive identical input?* Once each layer is allowed to customize, the suppressed potential of depth is released. Going from "one-size-fits-all" to "per-unit adaptive" is a universal direction of progress in AI systems optimization.
+
+3. *"Treat two coupled problems as one and fix them together" is the sharpest methodological move in this paper.* DFlare does not fix "injection too narrow" and "depth saturation" separately. It first argues they share a root cause, then cures both with "layer-wise fusion" in a single stroke. This narrative is far more powerful than "I fixed two independent bugs." Takeaway: *when making improvements, instead of listing "I solved problems A, B, and C," first ask whether A, B, and C share the same root cause — collapsing multiple symptoms to one source multiplies the persuasive force of the solution.*
+
+Where does this line go next? The most likely direction is merging "draft architecture design" and "target knowledge injection" from two separately optimized concerns into a single co-designed whole — since the injection mechanism determines how deep the drafter can usefully go, the drafter's structure and block size should be designed from the start with "per-layer customized injection" already in mind.
+
+* Takeaways
+
+The most concrete research-practice lessons from this evolutionary line:
+
+1. *Look for the thing a prior author merged together for convenience.* DFlash collapsed multi-layer target knowledge into *one* shared feature for all draft layers — a reasonable simplification. DFlare's entire paper is built on "unmerging that merge." Actionable lesson: *when reading papers, specifically hunt for "merged / shared / reused" decisions the authors made for simplicity — sentences of the form "all X share one Y" almost always hide the entry point for the next paper.*
+
+2. *Treat "adding depth doesn't help" as a signal, not a conclusion.* DFlash observed that "deepening the draft model yields diminishing returns," which could easily be read as "we've hit the ceiling on depth." DFlare instead asks: *is depth actually useless, or have we just not given depth the nourishment it needs?* The answer turns out to be the latter — of course depth is useless if every layer receives the same input. Actionable lesson: *when you encounter a negative result like "adding X has no effect," don't accept it at face value — check whether some prerequisite condition was missing. "No effect" is often "wrong prerequisite" in disguise.*
+
+3. *First prove two problems are coupled; then solve both with one move.* DFlare doesn't separately patch "narrow injection" and "depth saturation." It first establishes they share a common root, then cures both with "layer-wise fusion" in a single intervention. This is far more powerful than "I fixed two independent bugs." Actionable lesson: *when proposing improvements, instead of listing "I solved A, B, and C," first think through whether A, B, C are manifestations of the same root cause — collapsing multiple symptoms to one source multiplies the explanatory and persuasive power of your solution.*

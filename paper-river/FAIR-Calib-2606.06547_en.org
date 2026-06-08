@@ -1,0 +1,224 @@
+#+title:      FAIR-Calib: Frontier-Aware Instability-Reweighted Calibration for Post-Training Quantization of Diffusion Large Language Models
+#+date:       [2026-06-08 Mon 03:50]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T035057-en
+#+source:     https://arxiv.org/abs/2606.06547
+#+authors:    Haoyu Huang, Linlin Yang, Sheng Xu, Boyu Liu, Guodong Guo, Zhongqian Fu, Hang Zhou, Baochang Zhang
+#+venue:      ICML 2026 (poster), PMLR 306
+
+* The Problem River
+
+Quantizing a large model — compressing it to low bit-widths such as 4 bits, to save GPU memory and speed up inference — is a craft that has been refined over several years for conventional autoregressive LLMs (the kind that generate one token at a time, left to right). But when the model is a *diffusion large language model* (dLLM), that well-honed craft stumbles at an unexpected point.
+
+First, how does a dLLM generate text? Rather than writing word by word like GPT, it starts by laying out an entire row of "blanks" (all [MASK] placeholders), then proceeds in many steps: at each step it picks the positions it is most confident about and replaces their [MASK] tokens with real words. The paper calls this act *commitment*. The critical point is: *once committed, a token can never be changed* — it becomes part of the context, and every subsequent step must condition on it, even if the model later "regrets" the choice.
+
+Now quantize it. Quantization inevitably introduces a small numerical error. In an autoregressive model that error merely makes each token's probability a little less precise — limited damage. But in a dLLM, trouble brews: at the moment of commitment, many positions have an agonizingly small gap between the top-1 and top-2 candidate tokens (the paper calls this a *fragile commit state*). A tiny push from quantization noise can flip the ranking — and the wrong token gets locked in permanently. Because commitment is irreversible, this error is *frozen in place* and then amplified step by step, dragging the entire generation off course.
+
+The core problem of this river is therefore: *quantization noise in dLLMs does not merely make numbers less precise — it overturns discrete decisions at irreversible commitment boundaries, and those mistakes cannot be undone.* Two things make this hard. First, all existing PTQ methods were designed under the autoregressive assumption and have no concept of "irreversible commitment." Second, the goal is not "make every position accurate" but rather "make the precarious, once-wrong-forever-wrong boundary positions accurate" — a priority-weighted objective tightly coupled to generation dynamics. This river traces how the field gradually came to understand what makes dLLM decoding special, and what quantization must therefore specifically protect.
+
+* Source Map
+
+#+begin_example
+[2021] Austin et al. - D3PM (Structured Denoising Diffusion in Discrete State Spaces)
+  |
+  | Problem: diffusion models only handle continuous data (images);
+  |          text is discrete — what to do?
+  | Solution: port "add noise / denoise" to discrete categories
+  |           (e.g., progressively replace words with [MASK])
+  v
+[2019] Ghazvininejad et al. - Mask-Predict   /   [2022] Chang et al. - MaskGIT
+  |
+  | Problem: non-autoregressive generation (all at once) yields poor quality
+  | Solution: iterative — start fully masked, each round fill the most
+  |           confident positions, refine repeatedly
+  |           — "batch-commit by confidence" takes shape here
+  v
+[2025] Nie et al. - LLaDA   /   Ye et al. - Dream  (diffusion large language models)
+  |
+  | Problem: can this be scaled to LLM size to replace autoregressive generation?
+  | Solution: initialize a full row of [MASK], run bidirectional attention
+  |           multi-step denoising — but commits are irreversible,
+  |           and multi-step inference is expensive → compression urgently needed
+  |
+  |          ====== The quantization tributary joins here ======
+  |
+[2022] Frantar et al. - GPTQ
+  |  | Problem: how to quantize to low bits without retraining?
+  |  | Solution: second-order layer-wise reconstruction error minimization
+  v  v
+[2023] Xiao - SmoothQuant / [2024] Lin - AWQ / Ashkboos - QuaRot / Sun - FlatQuant
+  |
+  | Problem: in W4A4 joint quantization, activation outliers / distribution
+  |          mismatch are the main bottleneck
+  | Solution: smoothing (SmoothQuant) / rotation (QuaRot) /
+  |           affine flattening (FlatQuant) to normalize distributions
+  |           — all designed under the autoregressive assumption,
+  |             unaware of "irreversible commitment"
+  v
+[2025] Lin et al. - Quantization meets dLLMs  (most direct predecessor)
+  |
+  | Problem: classic low-bit PTQ ported directly to dLLMs degrades
+  |          noticeably on challenging reasoning tasks
+  | Solution: systematic study that surfaces "naïve transfer degrades"
+  |           — diagnosis only; no calibration method targeting irreversible commits
+  v
+[2026] Huang et al. - FAIR-Calib  <<<target paper>>>
+  |
+  | Problem: the root cause of degradation is quantization flipping decisions
+  |          at fragile commit boundaries (write frontiers), locking in amplified errors
+  | Solution: two-stage — first use a full-precision teacher to discover
+  |           a positional prior ("which positions need protecting"),
+  |           then use that prior as weights in layer-wise calibration
+  |           (off-policy; no expensive diffusion rollouts required)
+#+end_example
+
+Note: Austin → Mask-Predict/MaskGIT → LLaDA/Dream is the "discrete diffusion / iterative refinement" intellectual lineage confirmed in the paper's citations (the paper explicitly says dLLMs are "conceptually related to earlier non-left-to-right decoding paradigms"). GPTQ → SmoothQuant/AWQ/QuaRot/FlatQuant is the confirmed PTQ evolution; *FlatQuant is the backbone of FAIR-Calib* (the paper explicitly states "we adopt the same layer-wise learnable affine transformation design as FlatQuant"). Lin et al. 2025 ("Quantization meets dLLMs") is the most direct predecessor — the paper explicitly names it as the work that "systematically transferred classic low-bit PTQ to dLLMs and found that naïve transfer degrades," and FAIR-Calib picks up exactly where that finding left off. The two tributaries converge at the junction of "PTQ meets dLLM."
+
+* Evolutionary Narrative
+
+** 2021 | D3PM: Porting Diffusion from Images to Discrete Text
+
+*** What problem did it see?
+
+Diffusion models had proven very successful on images — the recipe is to add Gaussian noise to data gradually, then learn to denoise step by step. But this mathematics was designed for continuous values (pixel intensities). Text is a discrete symbol system; there is no "add a little noise" operation — you cannot add 0.3 Gaussian noise to the word "cat." How do you port diffusion?
+
+*** Its solution
+
+Redefine "adding noise" over discrete categories. Instead of Gaussian noise, apply a transition matrix that progressively replaces real words with other symbols — most typically a special [MASK] placeholder. "Adding noise" becomes gradually masking a sentence; "denoising" becomes progressively restoring masked positions to real words. The entire process is formalized as a Markov chain over discrete states.
+
+*** Why it worked (and what new pit it dug)
+
+It laid the mathematical foundations for "generating text with diffusion": as long as discrete noising/denoising transitions can be defined, the diffusion framework's variational inference machinery applies. But at this stage it was still a small-scale generative framework, and nobody worried about whether "once a position is fixed during denoising, can it be changed?" — at small scale with simple tasks, mistakes were cheap to redo. The irreversibility of commitment would only become a fatal issue when the scale grew and quantization noise entered the picture.
+
+** 2019/2022 | Mask-Predict & MaskGIT: Fill in the Blanks by Confidence, in Batches
+
+*** What problem did it see?
+
+Non-autoregressive generation (producing an entire sentence all at once, not left-to-right) is fast but poor quality — positions are predicted independently, leading to incoherent, self-contradictory outputs.
+
+*** Its solution
+
+Switch to an iterative approach. In the first round every position is masked; the model guesses all positions but *keeps only those it is most confident about*, resetting the rest to mask. In the next round it conditions on those confirmed tokens and re-predicts the remaining masked positions, again keeping the most confident ones — and so on until all positions are filled. MaskGIT applies the same "unmask in batches by confidence" strategy to image tokens.
+
+*** Why it worked (and what new pit it dug)
+
+The core action of "committing in batches by confidence" crystallized here — fix the most certain tokens first, use them as anchors to stabilize subsequent predictions, and quality improves dramatically over one-shot generation. But it also planted a landmine: *the basis for commitment is "confidence," and whether confidence is high is determined by the probability the model computes at that moment*. If anything can perturb that probability (such as later quantization error), the judgment of "who should be committed" gets corrupted. And the mechanism implicitly assumes "committed = correct" — once committed, a token is treated as reliable context, never revisited.
+
+** 2025 | LLaDA / Dream: Scaling Iterative Infilling to Large Language Models
+
+*** What problem did it see?
+
+Autoregressive LLMs (like GPT) have two innate awkwardnesses: they can only write left to right and cannot naturally fill in the middle; and they are strictly serial — the next token cannot start until the current one is done. Could the iterative denoising approach produce a large model that attends bidirectionally and fills in flexibly?
+
+*** Its solution
+
+Scale the Mask-Predict idea to LLM size. During generation, initialize the answer region as a full row of [MASK], then run bidirectional attention through many denoising steps, at each step converting a batch of positions from mask to real tokens. LLaDA drives commitment by confidence; Dream uses entropy; but the skeleton is the same: multi-step, bidirectional, batch-commit. They demonstrated that dLLMs can approach or match autoregressive models on general tasks.
+
+*** Why it worked (and what new pit it dug)
+
+Bidirectional attention and flexible infilling genuinely addressed the shortcomings of autoregressive decoding. But at LLM scale, two old pits grew into real problems. First, *commitment is irreversible* — across thousands of positions and dozens to hundreds of steps, a single mis-committed token locked into context propagates errors through subsequent steps in a "progressively amplifying" cascade (Figure 1c in the paper measures this empirically). Second, *multi-step refinement with long-range reasoning is very expensive at inference time* — dozens to hundreds of forward passes make deployment painful. The second pit directly created the need for quantization compression — and once quantization arrived, the first pit was detonated.
+
+** 2022–2024 | GPTQ → FlatQuant: Steadily Reducing Quantization Error (But All Within the Autoregressive World)
+
+*** What problem did it see?
+
+This is the other tributary. Quantization aims to compress weights and activations to low bit-widths without retraining and with minimal accuracy loss. GPTQ recognized that "simple rounding" is suboptimal; the right objective is to keep *this layer's output from changing too much*, optimizing quantization layer-by-layer using second-order information.
+
+*** Its solution
+
+At the aggressive W4A4 setting (both weights and activations at 4 bits), the main bottleneck shifted to activation outliers and distribution mismatch. A sequence of methods relayed to "smooth out" distributions before quantization: SmoothQuant migrates activation spikes into weights, AWQ scales by activation importance, QuaRot uses rotation matrices to scatter outliers, FlatQuant learns an invertible affine transform that "flattens" weight/activation distributions. FAIR-Calib's backbone uses exactly FlatQuant's affine flattening transform.
+
+*** Why it worked (and what new pit it dug)
+
+This line refined the "layer-wise reconstruction error" objective to near perfection, achieving excellent results on autoregressive LLMs. But it shares a deep, common hidden assumption: *generation is autoregressive, so mistakes can be self-corrected in subsequent tokens*. Accordingly, these methods only target "numerical fidelity" — making each layer's quantized output track the full-precision output as closely as possible, minimizing average error. Not one method ever asked: "If some decisions in the generation process are irreversible once made, should those positions be treated differently?" This blind spot is exactly why the approach breaks down when it meets dLLMs.
+
+** 2025 | Quantization meets dLLMs: The First to Discover "Naïve Transfer Degrades"
+
+*** What problem did it see?
+
+LLaDA/Dream needed compression, and the existing PTQ methods (the entire chain above) were mature and ready to use. The natural move was to port them over directly. Lin et al. did this systematically, and found: *naïve transfer of classic low-bit PTQ to dLLMs causes noticeable degradation on challenging reasoning tasks*. Same recipe, different model — and it stopped working.
+
+*** Its solution
+
+The contribution is primarily "diagnosis": a systematic sweep establishing "naïve transfer degrades" as an empirical fact and placing it squarely on the table, informing the community that dLLM quantization is not a straightforward extension of autoregressive PTQ.
+
+*** Why it worked (and what new pit it dug)
+
+It was the first work to explicitly frame "dLLM quantization is an independent hard problem," pointing the way for everyone who followed. But it stopped at "finding the problem" — it tells you naïve transfer fails without clearly identifying *why*, and without providing a targeted calibration remedy. The mechanism behind the degradation (exactly which positions, at what moments, for what reason) remained a black box. Opening that black box and delivering a solution is precisely what FAIR-Calib set out to do.
+
+** 2026 | FAIR-Calib: Finding the Root Cause — Protecting the Irreversible Commitment Frontier
+
+*** What problem did it see?
+
+FAIR-Calib traces the "degradation" found by Lin et al. to a precise mechanism, captured in one sentence: *commitment ≠ stabilization*. It defines a quantity called *stability lag*: after a position has been irreversibly committed, how many more diffusion steps does it take before the model's top-1 prediction for that position truly stops changing? Empirical measurement reveals a heavy long tail — meaning a large fraction of positions, even after being locked in, are still "wavering"; the model's internal state says "I may have chosen wrong." These are the *fragile commit states*: the gap between the top-1 and top-2 candidate probabilities is vanishingly small. Quantization noise gives a gentle nudge and the ranking flips; commitment is irreversible; the error is frozen and amplified across steps. Worse, standard PTQ calibration *increases* this instability (Figure 1b: the tail after calibration is heavier than full precision). This explains why porting the old method directly causes degradation.
+
+*** Its solution
+
+Since the problem is "the positions that need the most protection are those at fragile, irreversible commitment frontiers," the response is two targeted stages:
+
+- *Stage 1 · Teacher Probing*: Use the full-precision model as a "teacher" and run it under a random commitment strategy for several denoising passes, accumulating a *positional prior w* — identifying which positions are both on an irreversible commitment frontier (frontier-hit) and ones the teacher itself is uncertain about (masked-stage reliability, gated by entropy/probability/margin). Both signals are added and integrated over time steps. The random commitment strategy (rather than a fixed one) is used to obtain a structural prior independent of any specific inference strategy, enabling reuse across corpora. The paper also demonstrates empirically that w is primarily determined by model architecture, with cross-corpus rankings (GSM8K-CoT vs. WikiText2) highly consistent — so probing once yields a reusable prior.
+
+- *Stage 2 · Static Weighted Layer-wise Calibration*: Use w as weights in a standard teacher-forcing layer-wise calibration — feed all real tokens (no masking), and align each quantized layer's hidden states to the full-precision teacher's hidden states, but *weighted by w*, prioritizing reduction of error at fragile frontier positions. A key advantage: this is *off-policy* — no expensive multi-step diffusion rollouts are needed, and calibration cost is on par with standard layer-wise PTQ.
+
+The paper also provides a theoretical argument showing that this "time × position weighted hidden-state MSE" is a principled upper-bound proxy for the KL divergence between the full-precision and quantized models' final output distributions (trajectory KL → step-wise KL → nonzero only at commitment positions → token KL upper-bounded by squared logit error → further upper-bounded by weighted hidden-state MSE). In other words, "why align hidden states at all, and why weight them" has a theoretical grounding, not just intuition.
+
+*** Why it worked (and what new pit it dug)
+
+Intuitively, it gets one thing right: *decoupling "what to protect" from "how to calibrate."* Which positions are fragile is a relatively stable property determined by model architecture and decoding dynamics, so it can be estimated once with cheap random probing. The actual calibration uses clean real tokens and standard layer-wise MSE — cheap and stable. The two are stitched together by the weight w. Empirically, on LLaDA and Dream across all model sizes under W4A4, FAIR-Calib consistently outperforms RTN/QuaRot/FlatQuant in average accuracy; decision flips at commit steps drop from 2.9 to 1.9; and error amplification caused by false commits is suppressed.
+
+New pit dug: the prior w is *static* — probed once, then reused unchanged throughout calibration. The paper itself acknowledges that different models use different commitment strategies at inference time (Dream uses entropy, LLaDA uses confidence), and there is a "strategy shift" term between the static prior and the real inference strategy that requires additional handling (relegated to the appendix). In other words, "which positions are fragile" may itself need to vary dynamically with inference state rather than being fixed as a single static weight curve.
+
+* Frontier Extensions
+
+As of this writing (June 2026), FAIR-Calib is the latest development in the "dLLM-specific PTQ" line, with only Lin et al. 2025 as its one explicit same-topic predecessor. The river's mouth is here.
+
+The only thread in the paper that faintly points "forward" is its citation of Shi & Titsias (2025, "Demystifying diffusion objectives: Reweighted losses are better variational bounds") — the theoretical line that "reweighted losses are tighter variational lower bounds." FAIR-Calib's core is itself a *reweighted* calibration objective, and the two are spiritually resonant. This hints that compression of dLLMs and their training/sampling objectives may eventually be unified under a single "reweighted variational" framework. This is a conceptual connection only (the paper does not develop it further), not a confirmed next step.
+
+Several directions can be reasonably anticipated (speculative): replacing the static prior with a *dynamically computed* fragility estimate at inference time, directly addressing the "strategy shift" term currently relegated to the appendix; extending the "protect irreversible commitments" idea from quantization to dLLM pruning, distillation, and KV-cache compression; and conversely, using the "fragile commit frontier" diagnostic to improve dLLM *sampling strategies* themselves — since we now know which commitments are fragile, the sampler could be more cautious about committing those positions early.
+
+* One Diagram
+
+#+begin_example
+            What this river is really asking: "What should quantization protect?"
+
+  Evolution of understanding about what to protect ──────────────────────────>
+
+  [Autoregressive PTQ world]                         [dLLM world]
+  GPTQ/SmoothQuant/QuaRot/FlatQuant                  LLaDA / Dream
+  Protect: "layer-wise numerical fidelity"            New mechanism: irreversible
+  Assume: errors self-correct in later tokens         commits + multi-step refinement
+        |                                                       |
+        |  Port methods directly                                | needs compression
+        |                                                       v
+        +──────────────> Lin 2025: "porting degrades!" (diagnosis only; root cause unknown)
+                                  |
+                                  | What is the root cause?
+                                  v
+                    FAIR-Calib 2026: root cause = quantization flips decisions
+                                     at fragile commit frontiers, locking in amplified errors
+                                  |
+                  ┌───────────────┴───────────────┐
+           Stage 1: discover "what to protect"   Stage 2: "how to calibrate"
+           full-precision teacher random probing  real tokens + layer-wise weighted MSE
+           → positional prior w                  → off-policy, no diffusion rollouts
+           (frontier-hit + reliability gate)      (theory: weighted MSE upper-bounds output KL)
+
+  Core insight: protect "numbers" ──────────> protect "irreversible discrete decisions
+                                              (and their time × position distribution)"
+#+end_example
+
+* Insight
+
+On the surface this river traces "iterative improvements to quantization methods." Underneath, what is really happening is *a shift in understanding of what to protect — from continuous fidelity to discrete decision fidelity*. The entire generation of autoregressive PTQ researchers unconsciously treated models as continuous functions: smaller error = better result, so they relentlessly minimized average numerical error. But dLLMs reveal a sharper truth: *when a system contains discrete decisions that are irreversible once made, average error is a misleading metric*. You can make 99% of positions perfectly accurate, yet have the entire output ruined because 1% of fragile commitments were flipped, locked in, and amplified. What matters is not "how accurate on average" but "how accurate at the knife-edge positions where a mistake cannot be undone."
+
+At a deeper level, the methodology FAIR-Calib offers is elegant: *decouple "importance" from "optimization."* It does not invent an expensive, end-to-end irreversibility-aware calibration process. Instead it first extracts, via cheap probing, the structural knowledge of "which positions matter" (and proves this knowledge is cross-corpus stable and reusable), then feeds that knowledge as weights into a standard, cheap layer-wise optimizer. This is a "understand the world first, then change it" division of labor — when the hard part of a problem is "identifying the critical points" rather than "the optimization itself," this decoupling is typically cheaper and more stable than brute-force end-to-end approaches.
+
+Where will things go next? I would bet on "static prior → dynamic prior." FAIR-Calib itself acknowledges the vulnerability: the fragility prior is fixed, while real inference commitment strategies are dynamic. Since "which commitments are fragile" is fundamentally a function of the decoding state, the natural next step is to move this judgment from "probe once before calibration" to "estimate in real time during inference," directly absorbing the "strategy shift" term that was tucked away in the appendix.
+
+* Takeaways
+
+The biggest methodological lesson from this river about how to find problems is: *when a mature method suddenly stops working in a new setting, do not rush to tune hyperparameters — first find which structural assumption that the old setting satisfied has been violated in the new one*. Lin 2025 observed "porting degrades," but stopped at the phenomenon; FAIR-Calib's entire value comes from asking one additional "why" and pinpointing the root cause as "irreversible commitment" — a structural feature unique to dLLMs that autoregressive PTQ implicitly assumes does not exist. *Phenomena are observable by anyone; root causes are what is worth having.*
+
+A second lesson is about metrics: *when your system contains irreversible discrete decisions, stop using "average error" as your north star*. Explicitly characterize discrete events such as "decision flip," "error lockdown," and "error amplification," and attack them directly. The diagnostic quantities FAIR-Calib constructs — stability lag, commit-step flips, false-commit amplification — are themselves contributions. *Knowing how to measure what matters is often more valuable than knowing how to optimize.*
+
+The practical upshot: when compressing or accelerating any system with irreversible decisions — not just dLLMs, but also speculative decoding accept/reject, agent tool calls, retrieval top-k selection — you can apply this same two-stage playbook. First, use a cheap "teacher" probe to identify "which decisions are both critical and fragile, and verify that this judgment is stable across data and reusable." Then feed that knowledge as weights into whatever cheap per-layer optimization objective you are already using, concentrating the limited "accuracy budget" on the positions where mistakes truly get locked in and propagated, rather than spreading it uniformly across all positions.

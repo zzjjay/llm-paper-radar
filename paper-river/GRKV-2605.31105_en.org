@@ -1,0 +1,282 @@
+#+title:      GRKV: Global Regression for Training-Free KV Cache Compression in Long-Context LLMs
+#+date:       [2026-06-08 Mon 01:07]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T010705-en
+#+source:     https://arxiv.org/abs/2605.31105
+#+authors:    Junjie Peng, You Wu, Haoyi Wu, Jialong Han, Xiaohua Xie, Kewei Tu, Jianhuang Lai
+#+venue:      arXiv preprint (cs.CL), 2026-05
+
+* The Problem River
+
+One sentence: when a large model reads a novel-length document, it must hold every sentence it has read in GPU memory — the longer it reads, the more memory it consumes, until the buffer bursts. Can we make it "remember the essentials, forget the noise" without losing intelligence?
+
+The headwaters of this river are a very physical constraint. Each time a Transformer generates a new token, it must look back at the Keys and Values of every preceding token — that collection is the KV cache. Its size grows linearly with context length: double the context, double the memory. A 30B model, batch size 128, sequence length 1024, already burns roughly 180 GB just on the KV cache — more than the model weights themselves.
+
+The difficulty lies in three tensions pulling against one another:
+
+1. *Cannot keep everything* — keeping everything means linear explosion; long-context inference simply cannot run.
+2. *Cannot discard carelessly* — attention is irreversible: a token that looks unimportant today might be exactly what tomorrow's query needs; once dropped, the information is permanently gone, and the model begins to hallucinate with great confidence.
+3. *Cannot retrain* — the model is already trained; the ideal compression method should be plug-and-play (training-free), deployable without any retraining.
+
+Generation after generation has answered different versions of the same question: "*Given a fixed memory budget, how do we decide what to keep, what to drop, and how to drop it, so that model performance degrades as little as possible?*" This river flows from "keep by position" to "drop by importance" to "merge before dropping" to, finally, GRKV's "global-regression-based merging."
+
+* Source Map
+
+#+begin_example
+[2023.06] H2O (Zhang et al.)            [2023.09] StreamingLLM (Xiao et al.)
+  Drop by importance: keep "Heavy        Keep by position: a few opening
+  Hitters" with highest cumulative       "attention sinks" + a recent window
+  attention scores
+       \                                      /
+        \   Two parallel founding lines:                    /
+        \   both discover "attention is sparse"             /
+         \  one pursues "dynamic importance",               /
+          \ the other pursues "static position"             /
+          v                                  v
+        +------------------------------------------+
+        | Problem: H2O selects scattered tokens,   |
+        |   splitting a coherent semantic span      |
+        |   (phone number / name) in half           |
+        +------------------------------------------+
+                          |
+                          v
+[2024.04] SnapKV (Li et al.)
+  | Solution: use the prompt's trailing "observation window" for
+  |   query-aware voting; then pool high-score anchors to retain
+  |   entire surrounding spans --> span-based retention
+  v
+[2024.06] PyramidKV (Cai et al.)
+  | Problem: SnapKV allocates the same budget to every layer — wasteful
+  | Solution: give more to lower layers, less to higher layers,
+  |   pyramid-style per-layer allocation
+  v
+        +------------------------------------------+
+        | New turning point: dropped tokens still  |
+        |   carry information; better to "merge"   |
+        |   them into retained tokens than discard |
+        +------------------------------------------+
+                          |
+        +----------------+----------------+----------------+
+        v                v                v                v
+[2024] CaM        [2024] KVMerger   [2025] D2O        [2025] AsymKV
+Attention-sampled  Adjacent key      Layer + token     Keys homogeneous /
+merge into "local" similarity        level: recall     values heterogeneous;
+tokens             clustering into   then merge        local pairwise merge
+                   pseudo-tokens                       of adjacent pairs
+        \                \                |                /
+         \  Shared flaw: all use "local heuristics",      /
+          \ funneling evicted tokens into a handful of   /
+           \ span-boundary carrier tokens --> over-merge /
+           v                                            v
+        +------------------------------------------+
+        | Problem: carrier tokens overloaded,      |
+        |   original semantics blurred;            |
+        |   and these methods were designed for    |
+        |   old-style token retention — they do    |
+        |   not adapt well to modern span-based    |
+        |   retention                              |
+        +------------------------------------------+
+                          |
+                          v
+[2026.05] GRKV (Peng et al.)  <-- this paper
+  Solution: frame "compressed attention output ≈ full attention output"
+    as a global optimization objective; use ridge regression to spread
+    information across ALL retained tokens as carriers; regularization
+    prevents blurring. First global merging method designed specifically
+    for span-based retention.
+#+end_example
+
+Source notes: The critical chain H2O→SnapKV→PyramidKV→{CaM, KVMerger, D2O, AsymKV}→GRKV comes from explicit statements in GRKV's introduction and is a *confirmed* relationship. StreamingLLM and H2O are *nearly contemporaneous parallel works* (H2O is three months earlier); they do not directly critique each other, but all subsequent work cites them together as the two founding baselines — a judgment made after consulting the original papers, not an assertion of GRKV itself.
+
+One honest factual correction: GRKV cites AsymKV as "Cui and Xu, 2026," but AsymKV (*Homogeneous Keys, Heterogeneous Values*, arXiv:2506.05410) was published in *2025 at NeurIPS 2025*. This analysis uses the actual year.
+
+* Evolutionary Narrative
+
+** 2023 | H2O & StreamingLLM: The Same Discovery, Two Ways of Living with It
+
+*** What Problem They Saw
+
+The most naive approach is to keep the entire KV cache — but as computed above, that means linear explosion, and long-text inference simply cannot run. The first patch was a "sliding window": keep only the most recent N tokens. StreamingLLM discovered that this causes *catastrophic collapse*: once the context exceeds the window and the very first tokens get pushed out, perplexity explodes instantly.
+
+Why? Because softmax forces attention weights to sum to 1, and the model has learned to dump all its "surplus, nowhere-to-go" attention onto the very first tokens — those tokens are visible to every subsequent position, making them a natural pressure-relief valve. Remove that valve and the entire attention distribution destabilizes.
+
+H2O saw the other side: attention is highly concentrated, and a small cluster of tokens (it calls them "Heavy Hitters") captures the vast majority of attention mass; remove them and the model immediately becomes incoherent.
+
+*** Their Solutions
+
+The two papers gave answers that are *philosophically opposite*, and this is the river's original fork:
+
+- *StreamingLLM — static retention by position.* Always keep the first few tokens (it discovers that 4 "attention sinks" suffice), plus a sliding window of recent tokens. Which tokens are selected depends entirely on position, not content.
+- *H2O — dynamic eviction by importance.* Split the budget in two: half for the most recent tokens, half for the tokens with the highest cumulative attention scores (the Heavy Hitters). It models eviction as a dynamic submodular optimization problem and proves that a greedy algorithm is near-optimal.
+
+The relationship between the two can be understood this way: take StreamingLLM's "keep opening tokens + keep recent tokens," replace "keep opening tokens" with "keep the highest cumulative-attention tokens," and you roughly arrive at H2O. One bets on "positional stability," the other bets on "measurable importance."
+
+*** Why It Works (and Where New Pitfalls Are Buried)
+
+Together, the two papers established an empirical fact — attention is sparse and compressible — which is the bedrock of the entire river. But H2O buried a critical pitfall: it scores *individual tokens in isolation*. For a coherent semantic span (a phone number, a person's name, a quoted sentence), attention typically concentrates on only the *first few tokens* of that span. H2O retains those leading tokens and discards the continuation as low-scoring — *severing a complete span in the middle*.
+
+The consequence is concrete: during decoding the model "copies the country code of a phone number, then makes up the remaining digits." Keeping half the span is as good as keeping none. This "span torn apart" pitfall is precisely the starting point for the next paper, SnapKV.
+
+** 2024.04 | SnapKV: Don't Select by Token — Select by Span
+
+*** What Problem It Saw
+
+SnapKV fixed its sights on H2O's two weak spots. The first is the *span fragmentation* described above: retaining only the scattered top-attention tokens "keeps only fragments of detail, discarding the integrity of information." The second is that H2O's scoring is *query-agnostic* — it uses cumulative attention averaged over all queries, a flat score that has nothing to do with the current question. But which tokens matter is a function of the instruction/question at hand.
+
+*** Its Solution
+
+SnapKV has a beautiful observation: "the model already knows what you are looking for before you finish asking." The procedure is two steps:
+
+1. *Observation window (query-aware):* Take a short trailing segment of the prompt (e.g., 16–32 tokens) as an "observation window," use its queries to attend over all preceding keys, accumulate the attention weights as votes, and score every preceding position. The rationale: the attention pattern of this trailing window is *highly consistent* with the attention pattern the model will exhibit when it actually starts generating. The prompt therefore leaks "which positions will matter later."
+2. *Pooling to preserve spans:* After voting, instead of picking scattered top-k positions, apply a one-dimensional *max-pooling* along the sequence axis (kernel size 5–7), so that each high-score anchor *drags along its neighboring tokens* into the retained set. What remains is a collection of contiguous "span clusters," not isolated spikes.
+
+Continuous transformation from H2O to SnapKV: replace "cumulative attention scoring" with "trailing-window voting" (from query-agnostic to query-aware), then apply pooling over the selection result (from token-level to span-level) — and you have SnapKV.
+
+*** Why It Works (and Where New Pitfalls Are Buried)
+
+Pooling forces "the entire neighboring span to move together," so phone numbers are no longer severed — which is why SnapKV achieves the largest gains on retrieval tasks, with a budget of 1024 outperforming H2O at a budget of 4096. From this point on, *span-based retention* became the modern mainstream.
+
+(An honest note: the original SnapKV paper does not use the phrase "span-based retention." It speaks of "clustering / pooling / retaining neighboring tokens." "Span-based retention" is a *retrospective label* applied by later papers — including GRKV — to this pooling mechanism. It is a fair characterization, but not SnapKV's own terminology.)
+
+The pitfall it leaves: SnapKV allocates *equally sized* cache budgets to every layer. That is the point PyramidKV will press.
+
+** 2024.06 | PyramidKV: Per-Layer Cache Allocation Should Not Be One-Size-Fits-All
+
+*** What Problem It Saw
+
+SnapKV (and H2O, StreamingLLM) give *identical budgets* to all layers. After analyzing attention patterns, PyramidKV found that attention behavior *differs across layers* — lower layers attend broadly and diffusely, middle layers gradually focus on specific context, and higher layers concentrate intensely on a very small number of key tokens (the "large activations / attention sinks"). A uniform budget wastes resources in some layers while starving others.
+
+*** Its Solution
+
+PyramidKV names this observation "Pyramidal Information Funneling" and addresses it in two steps:
+
+1. *Unequal per-layer allocation (the new contribution):* Fix the total budget but *give more to lower layers and progressively less to higher layers*, forming a pyramid. The authors claim this is the first compression method with different cache sizes per layer.
+2. *Reuse SnapKV within each layer:* Inside each layer the same SnapKV mechanism is applied (keep a recent window + select preceding positions by attention score).
+
+Transformation view: hold SnapKV's within-layer selection constant, and replace "equal budget per layer" with "pyramid budget" — that is PyramidKV.
+
+*** Why It Works (and Where New Pitfalls Are Buried)
+
+It can approach full-cache performance with roughly 12% of the cache, and in extreme cases (0.7% cache) outperforms the baseline by 20 points on certain tasks. But its pyramid shape is a *manually set, fixed monotone decay* that need not be optimal — later works such as Ada-KV and ZigZagKV shift toward error/variance-driven adaptive allocation. Ada-KV (head-wise allocation) and CriticalKV (perturbation-constrained) are refinements of this branch, and are also among the span-based eviction backbones that GRKV is compatible with and tests against.
+
+The bigger turning point, however, comes from a different direction: up to this point, every method's fundamental action is to *drop* tokens. The next generation begins asking: are the dropped tokens truly useless?
+
+** 2024–2025 | CaM / KVMerger / D2O / AsymKV: Don't Drop — "Merge" Them In
+
+*** What Problem They Saw
+
+This generation shares a single insight, aimed at the fundamental flaw of all eviction-based methods (H2O, SnapKV, …): *eviction is permanent deletion*. A token with a low score now may be critical for a future query; once deleted, the information is gone forever. The higher the compression ratio, the worse the output perturbation, context loss, and hallucinations. CaM states it plainly: "Eviction based on attention scores, no matter how you select, inevitably causes output perturbation."
+
+So the core action shifts from "drop" to "fold": evicted tokens still carry information — *fold them into the retained tokens* rather than discarding them outright.
+
+*** Their Solutions (Four Ways to "Merge")
+
+- *CaM* (ICML 2024): Tokens about to be evicted are sampled with weights proportional to their attention salience and *merged into locally retained / recent tokens*. Plug-and-play on top of H2O/StreamingLLM.
+- *KVMerger* (2024): Observes that *adjacent keys in a sequence have very high cosine similarity*, then greedily clusters adjacent keys whose similarity exceeds a threshold into "merge sets," and compresses each cluster into a single "pseudo-token" using Gaussian-kernel-weighted averaging.
+- *D2O* (ICLR 2025): Two-level. Layer level — allocate dynamically by attention density (shallower layers are denser, get more). Token level — maintain a similarity threshold to "recall" previously discarded tokens and decide whether to merge them into a similar retained token.
+- *AsymKV* (NeurIPS 2025): Observes that *adjacent keys are homogeneous while adjacent values are heterogeneous*. For adjacent positions (m, m+1) it performs local merging: keys are combined into an optimal vector via a Newton-step-like update; values, once keys are forced equal, are simply *summed* (with a census vector C to correct the softmax denominator). The core intuition is "transfer the information loss from the heterogeneous values onto the homogeneous keys."
+
+*** Why It Works (and Where New Pitfalls Are Buried)
+
+Merging does preserve more information than hard eviction. But GRKV pinpoints the *shared structural flaw* of this generation: they all rely on *local heuristics* — CaM funnels into "local" tokens, KVMerger/AsymKV merge "adjacent" tokens, D2O recalls into "similar retained" tokens. Under modern span-based retention, the retained tokens are mostly span boundaries, so large numbers of evicted tokens get funneled like a funnel into *a handful of "span-boundary carrier tokens"*.
+
+The consequence of overloading carriers is *over-merging*: cramming too much into one token blurs and even erases its original semantics. GRKV's case-by-case diagnosis:
+
+- CaM "occasionally helps but frequently lowers the average score" — unstable gains.
+- KVMerger "concentrates merging near span boundaries" — because it clusters by adjacency.
+- D2O "frequently degrades under span-based retention," over-merging on retrieval tasks.
+- AsymKV "hurts performance and incurs high overhead": it is incompatible with FlashAttention-2 (the census vector rewrites the softmax denominator, making it a non-standard attention computation — confirmed from the original paper), and GRKV reports roughly 15× latency at 16K (*this specific multiplier is GRKV's own measurement; the AsymKV paper does not provide it — noted as consistent with inference, not independently verified*).
+
+At a deeper level, most of these merging methods were designed for *old-style token-level retention* and do not adapt well to modern span-based retention. This is where GRKV begins: too few carriers (only boundaries), too local a merge (only neighbors), and no unified objective (no one directly optimizes "how far does the compressed output deviate from the full output").
+
+* Frontier Extension
+
+** 2026.05 | GRKV: Turn Merging into a Global Optimization Problem
+
+*** What Problem It Sees
+
+Continuing from above: the three sins of prior merging methods — the carrier pool is too small (information crowded into a handful of boundary tokens), the rules are too local (heuristic, looking only at adjacent or locally similar tokens), and there is no unified objective (no one directly optimizes "how much does the compressed output actually deviate from the full cache output").
+
+*** Its Solution
+
+GRKV *explicitly writes down a global optimization problem*: make the attention output computed from the compressed cache as close as possible to the attention output computed from the full cache, minimizing the discrepancy between the two. This is the first merging method that treats "the difference between compressed and full attention output" as a *principled objective function*.
+
+The specific mechanism uses *ridge regression* (regularized least squares) to solve the merge:
+
+1. *All retained tokens serve as carriers* (not just boundaries), instantly expanding the carrier pool and addressing over-merging at the root.
+2. The *ridge regularization term* prevents information from over-smoothing and prevents carriers from being blurred.
+3. Alternating updates: a closed-form update for values + a linearized update for keys, with a "proxy query window" approximating future unknown queries (an idea that conceptually inherits SnapKV's observation-window insight).
+
+Transformation view: take KVMerger's "adjacent key clustering and merging," replace it with "a globally regularized regression fit over all retained tokens," and replace "local Gaussian-kernel weights" with "globally optimal weights given by the ridge regression closed-form solution" — and you cross from local heuristics to GRKV's global regression.
+
+*** Why It Works (and Where New Pitfalls Are Buried)
+
+Across 16 LongBench tasks and 13 RULER tasks, paired with span-based eviction, GRKV claims to be the *only merging method that consistently improves performance*, with minimal overhead. Models tested include Mistral-7B-Instruct-v0.3, Llama-3.1-8B-Instruct, and Qwen3-14B.
+
+As of this writing (2026-05), this is the latest advance on this line. Foreseeable new pitfalls: ridge regression is closed-form but still requires solving a linear system; whether the computational and numerical stability of global merging holds under very long contexts (128K+) with "minimal overhead" remains unresolved; and whether the "proxy query window" approximation is adequate for multi-hop reasoning tasks — where future queries diverge substantially from the trailing prompt — is also an open question.
+
+* One Diagram
+
+#+begin_example
+        KV Cache Compression: from "Drop" to "Merge," from "Local" to "Global"
+
+Time ->  2023            2024              2025               2026
+        ------------------------------------------------------------------
+Action
+Dimension
+        |
+ Keep   | [Naive] Linear explosion, inference cannot run
+ All    |    |
+ Static | StreamingLLM ----. Static: keep opening sinks + recent window
+ Keep   |                   \           (fast, but loses the middle)
+ by Pos |                    \
+        |                    > Both discover "attention is sparse"
+ Dynamic| H2O --------------'  Dynamic: keep heavy-hitter tokens
+ Evict  |   |  Pitfall: token-level scoring tears apart coherent spans
+ by     |   v
+ Imp.   | SnapKV: trailing-window voting (query-aware) + pooling (span-based)
+        |   |  Pitfall: equal budget per layer
+        |   v
+        | PyramidKV: pyramid per-layer allocation (more low / less high)
+        |   |  -> Ada-KV / CriticalKV further refine allocation
+        |   v
+        | ======= Paradigm shift: evicted tokens still carry info → merge =======
+ Merge  |   CaM(sample→local)  KVMerger(adj.cluster)  D2O(recall)  AsymKV(pairwise)
+ (local)|        \________________ Shared pitfall ________________/
+        |          Local heuristics → funnel into few span-boundary carriers
+        |          → over-merging / semantic blurring
+        |          Designed for old token-level retention; ill-suited to spans
+        |   v
+ Merge  | GRKV: global regression. Objective = compressed output ≈ full output;
+ (global)|      ridge regression spreads info across ALL retained tokens;
+        |      regularization prevents blurring.
+        |      First global merging method designed for span-based retention.
+        ------------------------------------------------------------------
+Cognitive arc: "which tokens matter" (position vs. importance)
+  → "keep spans intact" → "how much per layer" (allocation)
+  → "salvage what was dropped" (merging)
+  → "merge without blurring" (global optimization + enlarged carrier pool)
+#+end_example
+
+* Insights
+
+Reading the full line of development, the surface is technical iteration but the substrate is *three shifts in cognitive center of gravity*:
+
+1. *From "which token matters" to "which span is intact."* H2O asks "which points to keep"; SnapKV reframes the question as "which segments to keep." Once you accept that information exists in *spans* rather than in points, scoring tokens individually is the wrong starting point. This is a shift from atomism to structuralism.
+
+2. *From "deletion" to "conservation."* Eviction methods assume "low score = useless = delete"; merging methods reject that equivalence and insist on information conservation — what is useless is not the token, but its *current storage format*. The question shifts from "keep or drop" to "how to fold what would be dropped into what is kept." This is a shift from discrete selection to continuous redistribution.
+
+3. *From "heuristic" to "objective function."* CaM / KVMerger / D2O / AsymKV all design merging rules by intuition. GRKV's real breakthrough is not ridge regression as a tool — it is that GRKV is *the first to dare to write down "what exactly am I minimizing"*: the discrepancy between compressed and full attention output. Once the objective is explicit, how large the carrier pool should be and how weights should be distributed become things you solve rather than things you guess. This is a shift from engineering trick to optimization problem.
+
+There is also a quiet undercurrent worth noting: *infrastructure retroactively defines which algorithms survive*. AsymKV was ruled out as "too expensive" because it is incompatible with FlashAttention-2 — a mathematically elegant method loses to the engineering reality of "can it run on modern attention kernels." GRKV repeatedly emphasizes "minimal overhead / compatible with FlashAttention," signaling that this river now competes not only on accuracy degradation but also on *compatibility with the existing inference stack*.
+
+Where is the next step most likely to go? Now that an objective function has been established by GRKV, the probable directions are: (a) replace the "proxy query window" approximation with a more reliable estimate of future queries; (b) move global regression from fully training-free toward "lightweight calibration," using a tiny amount of data to sharpen the merging matrix; (c) unify merging with quantization (another compression tributary) under the same objective function.
+
+* Takeaways
+
+For "how to do research, how to find problems," this river offers several immediately actionable lessons:
+
+- *When everyone in a field is tuning the same class of tricks, step back and find the objective function nobody has written down.* GRKV's decisive move is not a cleverer heuristic — it is making the tacit shared goal explicit. This means: in any direction drowning in heuristics, ask "what exactly are we minimizing," and that question alone will often open a new paper.
+- *Don't just stare at "what to drop" — interrogate the action itself.* The shift from eviction to merging replaces the default action "delete" with "redistribute." This means: given any field, first list "the default action everyone is taking," then ask "is this action itself the root of the problem."
+- *The previous generation's "solution" is the next generation's problem list.* Every paper's pitfalls — SnapKV's equal-budget assumption, merging methods' carrier overload — translate precisely into the entry point for the next paper. This means: when reading, deliberately collect "limitations / future work" sections; they are the cheapest source of research topics.
+- *Verify that your algorithm fits the infrastructure before committing to it.* The lesson of AsymKV. This means: before starting, ask "can this run on FlashAttention / vLLM"; compatibility is a design constraint, not a finishing touch.

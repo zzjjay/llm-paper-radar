@@ -1,0 +1,293 @@
+#+title:      BudgetDraft: Acceptance-Aware Multi-View Training for Sparse-KV Speculative Decoding
+#+date:       [2026-06-08 Mon 01:13]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T011307-en
+#+source:     https://arxiv.org/abs/2606.00144
+#+authors:    Liang He, Jingbo Wen, Qishi Zhan, Yixiong Chen, Kangning Cui, Qizhen Lan, Xilu Wang
+#+venue:      arXiv 2606.00144 (cs.LG / cs.AI), May 2026
+
+* The Problem River
+
+Large language models generate text one token at a time, and the root of their slowness is not "slow computation" — it is "slow data movement." Every token emitted requires hauling the entire model's weights from GPU memory into the compute cores. The arithmetic units sit largely idle; everything stalls on the memory bus. This is the *memory-bandwidth-bound* regime.
+
+*Speculative decoding* exploits exactly this slack: a cheap "drafter" guesses the next K tokens, and a "verifier" (the large model) checks all K in a single parallel pass. Because the weights are fetched only once regardless, verifying several tokens in parallel costs almost nothing extra — every accepted token is essentially free. Over three years this idea has driven drafters to become ever cheaper and more accurate.
+
+But there is a hidden premise: *the bottleneck is weight movement*. Once context grows long (4K, 8K, 16K tokens), the story flips — the bottleneck migrates from weight movement to KV cache movement. As context lengthens, the KV cache balloons, and every decoding step must re-fetch the whole thing. The drafter itself now carries a massive KV cache and slows down just as much.
+
+This creates a dilemma. To be fast, the drafter wants a *sparse KV cache* (retaining only a subset of tokens). But a sparse drafter sees a different context than the full-cache verifier, so its guesses diverge — *acceptance rates collapse*. Worse, the KV budget available to the drafter at serving time is not a fixed constant; it fluctuates with memory pressure. A drafter tuned for one fixed budget becomes brittle the moment that budget changes.
+
+BudgetDraft attacks precisely this final obstacle: *how to keep a sparse drafter's acceptance rate stable when the KV budget can change at any moment and contexts are long*.
+
+* Source Map
+
+#+begin_example
+                  [ The Speculative-Decoding River ]
+
+[2023] Leviathan / Chen - Speculative Decoding
+  |
+  | Problem: Autoregressive one token at a time; weights fetched
+  |          every step; compute sits idle
+  | Solution: Small drafter guesses K tokens; large model verifies
+  |           all K in parallel; modified rejection sampling
+  |           guarantees output distribution matches the original
+  |           model exactly (lossless)
+  v
+[2024] Medusa (Cai et al.)
+  |
+  | Problem: Maintaining a separate draft model is hard to train,
+  |          align, and deploy
+  | Solution: No second model — attach lightweight "heads" to the
+  |           backbone + tree attention to verify multiple candidates
+  |           in one forward pass
+  v
+[2024-26] EAGLE 1/2/3 (Li et al.)
+  |
+  | Problem: Predicting at the token level is hard; heads are
+  |          independent of each other
+  | Solution: Autoregress at the *feature level*, map back to tokens;
+  |           dynamic draft trees; multi-layer feature fusion.
+  |           But all evaluated under ~2K short context + full cache
+  v
+  :                      [ The Sparse-KV Cache River ]
+  :         [2023] StreamingLLM / H2O - KV cache too large for long ctx
+  :           | Solution: Attention is sparse; evict unimportant tokens
+  :           |           (sink + sliding window / heavy hitters)
+  :           v
+  :         [2024] SnapKV / Quest - keep what the future needs /
+  :           |    don't evict at all; select pages per query
+  :           v
+  +<<<<<<<<<<< Both rivers converge at "long-context speculative decoding" >>>>>>>>>>>+
+  v
+[2024] TriForce (Sun et al.)
+  |
+  | Problem: In long contexts the bottleneck is KV, not weights;
+  |          standard SD provides no benefit
+  | Solution: Hierarchical — use a retrieved subset (~3%) of a full
+  |           cache as a self-draft; lossless but adds components,
+  |           making the inference pipeline more complex
+  v
+[2025] MagicDec / LongSpec
+  |
+  | Problem: TriForce is too heavy; drafters either use a fixed window
+  |          that drops distant tokens, or require dedicated training
+  | Solution: MagicDec uses a fixed sparse window cache as the draft;
+  |           LongSpec trains a drafter with a sliding-window self-
+  |           attention + cross-attention that reuses the verifier's
+  |           full KV
+  v
+[2026] BudgetDraft (He et al.) ← this paper
+  |
+  | Problem: All prior drafters are tuned for *one fixed budget*;
+  |          sparse/full mismatch grows with context length;
+  |          changing the budget causes collapse
+  | Solution: During training, expose the drafter to *multiple*
+  |           sampled KV budgets (multi-view); every sparse view
+  |           is aligned to the *same* full-cache teacher target
+  |           → a budget-robust drafter
+#+end_example
+
+Note: Speculative decoding (Leviathan→Medusa→EAGLE) and sparse KV (StreamingLLM→Quest) were originally independent rivers solving separate problems. They were forced to converge at "long-context speculative decoding" (starting with TriForce), because long contexts simultaneously expose both pain points. BudgetDraft stands downstream of that confluence. In its citations, BudgetDraft explicitly critiques the EAGLE line (short context / full cache), fixed-budget eviction methods, and TriForce's structural complexity — those relationships are confirmed. Its relationship to LongSpec is inferred as "same problem, different solution" from the same period.
+
+* Evolutionary Narrative
+
+** 2023 | Speculative Decoding: Trading Idle Compute for Lower Latency
+
+*** What Problem It Saw
+
+Large-model generation is strictly serial: to emit token 100, you must first emit tokens 1 through 99, one by one. Each step requires fetching the entire set of model weights from GPU memory. The trouble is that one memory fetch takes far longer than the tiny matrix multiply it feeds. GPU arithmetic units sit mostly idle, waiting on memory.
+
+*** Its Solution
+
+Leviathan and Chen (two groups, nearly simultaneous and independent) converged on the same idea: recruit a small, fast *draft model* to autoregressively guess γ tokens ahead, then let the large model score all γ guesses *in a single parallel pass*. The key insight is that *scoring K tokens in parallel takes almost the same wall-clock time as scoring 1* — the weights are fetched only once, and the extra arithmetic is essentially free in a memory-bound setting.
+
+Acceptance follows a *modified rejection-sampling* rule: if the drafter assigns probability q and the verifier assigns p to a token — accept outright when q ≤ p; otherwise reject with probability 1 − p/q and resample. This rule has a mathematical guarantee: the final output distribution is *identical* to what the large model would produce sampling token by token. The method is *lossless* — zero quality degradation.
+
+*** Why It Works (and What New Trap It Left)
+
+It decouples latency from total arithmetic: spending more arithmetic (on rejected draft tokens) buys a large reduction in wall-clock time. On memory-bound hardware this trade is reliably profitable.
+
+But it left a practical trap: *you need a separate small draft model*. That model must be well-aligned with the large model (otherwise acceptance rates are low), small enough to draft quickly, and trained and deployed independently. A good drafter is itself a non-trivial engineering burden.
+
+** 2024 | Medusa: No Second Model
+
+*** What Problem It Saw
+
+Medusa targeted the previous generation's sore spot: that *separate draft model* is expensive to maintain. Pre-training an aligned small model can cost hundreds of GPU-hours; there is an inherent distribution gap between it and the large model, which depresses acceptance rates; serving two models simultaneously is an operational headache, especially in distributed settings.
+
+*** Its Solution
+
+Drop the second model entirely — attach several lightweight "decoding heads" (Medusa heads) directly to the *same backbone*. Each head is a single feed-forward layer with a residual, reading the backbone's final hidden state and predicting position t+2, t+3, … in parallel. Because these heads share the backbone and are trained jointly, their predictions are naturally aligned with the original model — no distribution gap, no separate training, no dual-model deployment.
+
+Paired with *tree attention*: each head proposes multiple candidates; a tree-shaped attention mask lets all candidates be verified in a single forward pass (each token attending only to its ancestors), checking multiple paths simultaneously without inflating batch size.
+
+*** Why It Works (and What New Trap It Left)
+
+It demotes the drafter from "another model" to "a few small heads on the backbone," which is far cleaner engineering.
+
+But those heads *each independently predict a different position* — they share no information with each other, and draft tokens are never fed back in. This ignores the sequential dependencies among draft tokens, and that independence caps the acceptance rate ceiling.
+
+** 2024–26 | EAGLE Series: Draft at the Feature Level, Not the Token Level
+
+*** What Problem It Saw
+
+EAGLE targeted Medusa's two weaknesses: predicting at the *token level* is hard (tokens are a discrete, low-information projection of language, and small models struggle to predict them well), and Medusa's multi-head design keeps each head in isolation.
+
+*** Its Solution
+
+Switch to autoregression at the *feature level* — the hidden state at the second-to-last layer, before the LM head. The intuition is that the feature sequence is smoother and more regular than the token sequence, making extrapolation easier. EAGLE-1 also identified a "feature uncertainty" issue — what a feature evolves into depends on which token was actually sampled, so the sampled token is fed back in to disambiguate. EAGLE-2 replaced the fixed draft tree with one that grows *dynamically based on context*. EAGLE-3 dropped the feature-prediction constraint entirely, fused features across multiple layers, and unlocked a scaling law where more data yields faster drafting.
+
+*** Why It Works (and What New Trap It Left)
+
+This line pushed drafter accuracy to new heights and became the de facto standard for short-context speculative decoding.
+
+But the entire line shares a silent assumption: *all evaluation and training assumes ~2K short context with a full KV cache*. The drafter is assumed to see the complete context. Once context grows long and memory forces the drafter to use a sparse KV cache, the EAGLE series has never addressed the "sparse drafter vs. full verifier" mismatch that results. That is exactly the thread BudgetDraft picks up.
+
+** 2023–24 | The Other River: Sparse KV Caches for Long-Context Efficiency
+
+*** What Problem It Saw
+
+This river had nothing to do with speculative decoding; it was solving a different problem: in long contexts, the KV cache grows larger than the model weights themselves, consuming memory and slowing every decoding step because the entire cache must be re-fetched.
+
+*** Its Solution
+
+Two philosophies emerged. The first is *eviction*: permanently discard unimportant tokens. StreamingLLM observed that the first few tokens always receive high attention (attention sinks), so it retains only sinks plus a recent sliding window. H2O retains the "heavy hitters" with the highest cumulative attention scores. The second is *selection*: Quest does not evict anything, but pages the cache and reads only the most relevant pages per query step — because which tokens matter is query-dependent and cannot be decided in advance. SnapKV sits between the two, using the window at the end of prefill to predict which prompt tokens will be needed later.
+
+*** Why It Works (and What New Trap It Left)
+
+Each approach demonstrated that in long contexts *attending to a small fraction of tokens is sufficient* — attention is already sparse in practice.
+
+But the eviction branch left a fundamental risk: *the discarded budget is fixed, and what is evicted cannot be recovered*. A sparse policy tuned for one fixed budget fails when the budget changes, or when the answer happens to depend on a token that was evicted. Remember this "fixed-budget brittleness" — it resurfaces as the central villain after the two rivers merge.
+
+** 2024 | TriForce: Two Rivers Merge, at the Cost of Complexity
+
+*** What Problem It Saw
+
+TriForce was the first to work out the accounting clearly: *in long contexts, the bottleneck is the KV cache, not the weights*. This means the standard speculative decoding argument — "a small drafter saves weight-fetching costs" — breaks down entirely. The large model's per-token cost is now dominated by KV, and the drafter itself, burdened with a long-context KV cache, is slowed down just as much.
+
+*** Its Solution
+
+*Hierarchical* speculative decoding. Rather than compressing or evicting, it retains the *complete* KV cache but at each step *retrieves* a subset of roughly 3% of the most important tokens, using that sparse subset as a "self-draft" (with the large model's own weights, so the draft is highly faithful). That intermediate draft is then re-drafted by a tiny model (with a StreamingLLM cache) to hide its own weight-fetching cost. Final verification still uses the full cache, so the method is lossless.
+
+*** Why It Works (and What New Trap It Left)
+
+Because attention is sparse, the retrieved minority of important tokens dominates the attention computation almost entirely, so the draft approximates the full-cache output closely enough to sustain acceptance rates above 0.9.
+
+The cost is *exploding system complexity*: two models, three caches, retrieval logic, and extensive hyperparameter tuning. BudgetDraft later explicitly criticizes it for "adding extra components beyond the standard drafter–verifier pipeline, raising inference-time complexity."
+
+** 2025 | MagicDec / LongSpec: Fixed Window, or Dedicated Training
+
+*** What Problem It Saw
+
+TriForce is too heavy. Two groups simplified from opposite ends. MagicDec overturned an old assumption — "speculative decoding only helps at small batch sizes": its bottleneck analysis showed that in long-context, large-batch serving the bottleneck remains KV movement, so SD is actually *more* useful, not less. LongSpec focused on a training-side mismatch: all existing drafters are trained on text shorter than 4K, and they degrade badly when context grows.
+
+*** Its Solution
+
+MagicDec: give the drafter a *fixed-size sparse window* (StreamingLLM-style sliding window plus sinks), keeping the drafter's KV at constant size — far cheaper than the verifier. Since weights are no longer the bottleneck, the drafter can even be the verifier itself with a shrunk KV window. LongSpec: *train* a dedicated drafter — its self-attention uses a sliding window (constant KV), augmented by a *cross-attention* module that directly reuses the verifier's full KV, letting the drafter "see" the full context without storing it.
+
+*** Why It Works (and What New Trap It Left)
+
+MagicDec requires no training and is plug-and-play. LongSpec directly attacks the mismatch rather than tolerating it.
+
+But each leaves a trap. MagicDec's fixed window drops acceptance rate when the answer depends on distant tokens. LongSpec requires *a dedicated drafter trained for each verifier*, and — crucially — it is trained for *one specific setting*. The moment the KV budget changes at serving time (tightened under memory pressure, relaxed under light load), the drafter tuned for that fixed setting runs into the same old problem: *sparse/full mismatch grows with context length, and changing the budget causes collapse*.
+
+** 2026 | BudgetDraft: Don't Bet on One Budget — Train Across All of Them
+
+*** What Problem It Saw
+
+BudgetDraft makes explicit the shared assumption hidden in all prior trained long-context drafters: *they are all tuned for a single fixed sparse setting (a fixed budget)*. In practice, KV budgets are decided at serving time and can change. Two concrete observations ground this:
+
+1. *Sparse/full mismatch grows with context length.* In short contexts a sparse drafter and a full-cache verifier see roughly the same information, so acceptance rates hold. As context lengthens, the information missed by the sparse cache accumulates and the two diverge progressively — acceptance rates fall more and more sharply.
+2. *A drafter tuned for one budget collapses when the budget changes* — exactly the "fixed-budget brittleness" left by the sparse KV river, now reappearing in the speculative decoding setting.
+
+*** Its Solution
+
+*Multi-view sparse training*. Rather than fixing one budget at training time, *sample multiple KV budgets* so that the drafter sees the same data simultaneously through "budget 64," "budget 128," "budget 256," and so on. Then — the critical move — *every sparse view is aligned to the same full-cache teacher target* (acceptance-aware: the target is what the verifier would accept, not a generic distillation objective).
+
+In plain terms: instead of training a specialist that is very accurate under one specific budget, train a generalist that is reliably good under any budget — by exposing it to all budget levels during training and anchoring every sparse view to the same full-cache ground truth. At inference time there are no extra components; it is a standard drafter, but *budget-robust*.
+
+*** Why It Works (and What New Traps It Left)
+
+Replacing a "fixed-budget specialist" with a "cross-budget generalist" is essentially *absorbing deployment-time budget uncertainty into the training distribution*. A shared full-cache teacher acts as the anchor, preventing different sparse views from drifting in separate directions. The paper reports end-to-end speedups relative to autoregressive (AR) decoding of up to 6.55×, 4.46×, and 2.10× at 4K, 8K, and 16K context lengths on PG-19 / LongBench / LWM. Note that the speedup declines as context grows — confirming that the mismatch-grows-with-length dynamic is real and only partially contained, not eliminated.
+
+New traps left behind:
+
+1. *Speedup falls to 2.10× at 16K.* Multi-view training alleviates the mismatch but does not eliminate it — there is an upper bound on how well a sparse drafter can approximate a full-cache verifier at extreme lengths. The truly long regime (128K+) remains untouched.
+2. *Training cost traded for deployment flexibility.* Multi-view training is more expensive because it runs across multiple budgets simultaneously; the bet is that "one multi-view training run < training a separate model per budget," which only pays off when the number of distinct budgets is large.
+3. *The full-cache teacher must be available at training time.* If the verifier is large enough that its full KV cache is itself infeasible to hold during training, the shared-teacher-target premise begins to crack.
+
+* Frontier Extensions
+
+As of late May 2026, BudgetDraft is the most recent publicly available method on the "long-context + budget-robust speculative decoding" line. Predictable next directions:
+
+1. *Convergence with the selection branch.* BudgetDraft solves "make the drafter robust across budgets"; Quest-style query-aware dynamic selection solves "which pages to read at each step." These are orthogonal — a robust drafter paired with a dynamic selector should be composable in principle.
+2. *Truly long contexts (128K+).* The speedup has already dropped to 2.10× at 16K; real long-document or long-reasoning settings are not yet covered by this training approach. Mismatch will be even more severe at extreme lengths, and the fix may require more than multi-view training — perhaps a combination of structural cross-attention (the LongSpec route) with multi-view objectives.
+3. *Refinement of the acceptance-aware target.* Currently the alignment target is the "full-cache teacher." But acceptance itself depends on the verifier's sampling temperature and the shape of the draft tree — folding those into the training objective could further lift acceptance rates.
+4. *Joint optimization of budget scheduling.* BudgetDraft makes the drafter robust to any given budget, but the scheduling decision of *how much budget to allocate* remains exogenous. Jointly optimizing "how much budget to grant at each step" with "how the drafter uses that budget" may be the next hop.
+
+* The Full Picture in One Diagram
+
+#+begin_example
+   How Two Rivers Merge into BudgetDraft
+
+  Speculative Decoding River                Sparse KV Cache River
+  (make drafter cheap and accurate)         (make long context affordable)
+  ----------------------------------        --------------------------
+  2023 Spec Decode                          2023 StreamingLLM / H2O
+       Small model guesses + parallel            Evict tokens (fixed budget
+       verify (lossless)                          → brittle)
+       ↓ but must maintain 2nd model              ↓
+  2024 Medusa                               2024 SnapKV / Quest
+       Heads on backbone, no 2nd model           No eviction; select by query
+       ↓ but heads are independent               (selection)
+  2024-26 EAGLE 1/2/3                            ↓
+       Feature-level drafting, accurate      "Which token matters depends
+       ↓ but only at 2K short + full cache    on current query and budget"
+
+        \                                        /
+         \        Long context simultaneously   /
+          \    exposes both pain points,        /
+           \   forcing the two rivers to merge /
+            v                                 v
+  ===================================================
+   2024 TriForce  KV is the bottleneck, not weights; retrieval
+                  subset as self-draft; lossless but 2 models +
+                  3 caches — too complex
+   2025 MagicDec  Fixed sparse window (drops distant answers)
+        LongSpec  Train cross-attention drafter (but for one fixed setting)
+  ===================================================
+                          |
+                          | Shared hidden flaw: all tuned for one fixed budget;
+                          |   sparse/full mismatch grows with context length;
+                          |   changing the budget at serving time causes collapse
+                          v
+   2026 BudgetDraft  Train across *multiple* sampled budgets (multi-view);
+                     each sparse view aligned to the *same* full-cache teacher
+                     → budget-robust; zero extra inference-time components
+
+   Speedups: 4K 6.55× → 8K 4.46× → 16K 2.10×
+             (declining with context = mismatch persists, only suppressed)
+#+end_example
+
+* Insight
+
+Reading through this entire line, what is actually shifting is not "drafters becoming more accurate" — it is that *the "field of view" the drafter is assumed to have keeps contracting, and successive methods compensate for that contraction*.
+
+In the beginning, speculative decoding assumed the drafter had access to the full context (short context, full KV cache — the comfortable zone of the EAGLE series). When long contexts arrived, memory pressure shrank the drafter's view to a sparse fragment — and for the first time a gap opened between what the drafter sees and what the verifier sees. TriForce used retrieval to make the sparse view as faithful as possible; LongSpec used cross-attention to let the drafter peer into the verifier's full view without storing it. Both approaches are *trying to bridge the same view gap*.
+
+BudgetDraft's difference is this: all prior methods assumed *the size of the gap is fixed* (a fixed budget = a fixed field of view), so aligning to that one fixed view sufficed. BudgetDraft recognized that *the gap size itself is variable* (the budget shifts at serving time), so aligning to "one view" is insufficient — you must align to "a whole family of views." It upgrades the problem from "approximate one sparse view well" to "be robust across an entire family of sparse views."
+
+Behind this lies a more general pattern: *when a method is highly sensitive to a hyperparameter — here the KV budget — and collapses when that hyperparameter changes, the remedy is often not to find the optimal value but to sample that hyperparameter as a random variable during training*. Letting training absorb deployment-time uncertainty tends to dissolve brittleness. This is a shift from "optimize for a point" to "optimize for a distribution."
+
+Where does the line go next? My bet is that the bottleneck will migrate from "the drafter's view" back to "the verifier's cost." BudgetDraft still assumes a full-cache teacher is available and a full-cache verifier is feasible. Once context grows long enough that even the verifier's full cache is infeasible (128K+), this line will have to reconverge — this time because *the verifier also needs to be sparse*, and the double mismatch of "sparse drafter vs. sparse verifier" will be the next problem for a future BudgetDraft to solve.
+
+* Takeaways
+
+1. *Sensitivity to a hyperparameter is usually a symptom of "training distribution too narrow," not "hyperparameter not yet tuned to its optimum."* BudgetDraft's core move — turning the KV budget from a "fixed value" into "a random variable sampled during training" — is a pattern transferable to many settings. Does your method collapse when you change batch size, sequence length, or quantization bit-width? Before training a separate version for every value, try sampling all those values during training.
+
+2. *Watch where two independent rivers are forced to merge — that confluence is where new problems are born.* Speculative decoding and sparse KV ran independently for years. It was the external pressure of long contexts that slammed them together, creating the entirely new problem of "sparse/full mismatch." When looking for new research directions, focus on the seams where two previously unrelated fields are forced to collide because of some new deployment condition.
+
+3. *Lossless and robust are two different objectives — do not conflate them.* TriForce pursues *losslessness* (output distribution exactly matches full-cache decoding), at the cost of system complexity. BudgetDraft pursues *robustness* (acceptable quality under any budget), at the cost of more expensive training. Decide which your setting actually needs — their engineering trade-offs are completely different.
+
+4. *A speedup that declines with context length is itself an honest signal.* BudgetDraft does not hide that only 2.10× remains at 16K. When a method's gains decay precisely in the extreme regime it was designed to address, that decay curve is a research roadmap — it marks exactly where the next paper should begin.
+
+Practical implication: take any model you have that is sensitive to some deployment hyperparameter, replace the fixed hyperparameter with multi-view sampling plus a shared-teacher alignment objective at training time, and you will often trade one more expensive training run for a deployed model that no longer needs to be re-tuned for every new hyperparameter value.

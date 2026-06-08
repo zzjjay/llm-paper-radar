@@ -1,0 +1,310 @@
+#+title:      GPTQ-intrinsic LoRA: A Near-optimal Algorithm for Low-precision Quantization with Low-rank Adaptation
+#+date:       [2026-06-08 Mon 01:46]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T014610-en
+#+source:     https://arxiv.org/abs/2606.01412
+#+authors:    Shihao Zhang, Rayan Saab
+#+venue:      arXiv preprint 2026 (cs.LG / cs.IT)
+
+* The Problem River
+
+In one sentence: *Can a large model with billions of parameters be decomposed into "a pile of low-precision integers" plus "a small handful of high-precision low-rank corrections," such that the two together nearly equal the original?*
+
+Why has this question persisted across generations? Because it sits precisely at the intersection of two cheap and complementary compression techniques.
+
+Low-precision quantization (compressing each weight from 16 bits down to 4, 3, or even 2 bits) achieves the most aggressive savings, but push it too hard and the model starts to hallucinate. Low-rank decomposition (approximating a large matrix with the product of two tall-and-thin matrices L and R) loses almost no accuracy, but used alone it saves very little — the weight matrices of large models are not intrinsically low-rank.
+
+So someone thought: *add them together*. Let the low-precision Q carry the bulk of the load, and use a small low-rank LR to absorb the error Q couldn't handle: W ≈ Q + LR. Conceptually clean — but the real problem hides inside "how to absorb": 
+
+- Should Q and LR be determined jointly, or should Q be fixed first and LR patched in afterward?
+- What criterion guides the correction — minimizing the difference in the weights themselves, or minimizing the difference in *output* for that layer?
+- Most critically — *what is the theoretical limit of this Q+LR decomposition?* For a decade, everyone relied on empirical heuristics. No one had ever given a lower bound, and no one had proved that any algorithm was near-optimal.
+
+This river flows from "how to prune a single weight" all the way to "how to decompose an entire matrix into low-precision plus low-rank, and prove you did it as well as possible." Below we dig to the source, then trace the current forward.
+
+* Source Map
+
+#+begin_example
+[1990] LeCun et al. - OBD (Optimal Brain Damage)
+  |
+  | Problem: want to slim a network, but "delete the smallest weights" is simply wrong
+  | Solution: use second-order information (diagonal Hessian) to score each weight's
+  |           "importance"; delete the unimportant ones
+  v
+[1993] Hassibi et al. - OBS (Optimal Brain Surgeon)
+  |
+  | Problem: OBD only looks at the diagonal, discarding correlations between weights;
+  |          after deletion, the remaining weights are left untouched
+  | Solution: use the full inverse Hessian; when one weight is deleted,
+  |           redistribute the error to all other weights via a closed-form update
+  v
+[2022] Frantar et al. - OBQ (Optimal Brain Quantization)
+  |
+  | Problem: OBS only knows how to "set to zero," but quantization means
+  |          "move to the nearest grid point," not deletion
+  | Solution: replace the OBS constraint target from "zero" to "round to grid point";
+  |           quantization becomes a generalization of pruning
+  v
+[2022] Frantar et al. - GPTQ
+  |
+  | Problem: OBQ uses a separate greedy ordering per row, O(d^3) per row —
+  |          unusably slow on LLMs
+  | Solution: all rows share one fixed column order + lazy batch updates +
+  |           Cholesky; orders-of-magnitude faster
+  |
+  |    (a second tributary joins here)
+  |
+[2021] Hu et al. - LoRA ----+
+  | low-rank increment W+LR  |
+  v                          |
+[2023] Dettmers - QLoRA <---+
+  | 4-bit base + LoRA adapter, but Q is bare quantization, LR zero-initialized — absorbs nothing
+  v
+[2023] Li et al. - LoftQ
+  | Don't waste the zero-initialized adapter: alternate "quantize residual + SVD residual"
+  | so that Q+LR ≈ W from step 0
+  v
+[2023] Guo et al. - LQ-LoRA
+  | Same joint decomposition, but with Fisher-weighted (data-aware) objective + mixed precision
+  v
+[2024] Liu / Zhang et al. - EoRA / QERA
+  | Change strategy: fix Q first, then compute a separate "data-aware low-rank correction"
+  | QERA proves: minimizing weight error ≠ minimizing output error;
+  | gives a closed-form output-optimal solution
+  v
+[2026] Zhang & Saab - GPTQ-intrinsic LoRA  ★ this paper ★
+  | Problem: prior work either "quantize then correct" (suboptimal) or joint but untheorized;
+  |          no lower bound existed anywhere in this line
+  | Solution: fold the low-rank correction *into* the GPTQ pass (augmented Hessian),
+  |           training-free; provide the first information-theoretic lower bound,
+  |           prove near-optimality; add Bid-Up monotone refinement
+#+end_example
+
+Note: the OBD→OBS→OBQ→GPTQ backbone is a confirmed direct citation chain (stated explicitly in the GPTQ paper). LoRA→QLoRA→LoftQ→LQ-LoRA→EoRA/QERA is the W≈Q+LR tributary, which this paper explicitly lists as comparison and critique targets. The two tributaries converge in this paper.
+
+* The Evolutionary Narrative
+
+The entire river is really *the same problem posed twice*. The first half (OBD through GPTQ) asks: "When processing weights one by one, how do you propagate the error back?" The second half (LoRA through QERA) asks: "Can that correction be captured all at once by a low-rank matrix?" This paper welds the two questions into a single statement.
+
+** 1990 | OBD: Use Second-Order Information to Decide What to Remove
+
+*** What problem it saw
+
+The most naive idea for slimming a network is "delete the weights with the smallest absolute values — they're small, so they can't matter much." But this is wrong. A small-valued weight need not be unimportant for model output; conversely, a large weight may be entirely dispensable. Using magnitude as a proxy for importance leads to deleting the wrong things.
+
+*** Its solution
+
+Perform a Taylor expansion around the trained minimum. Because the gradient is approximately zero at the minimum, the increase in loss caused by removing a weight is dominated by the second-order term, approximately ½·H_ii·w_i². This quantity is called "saliency." Delete weights in ascending order of saliency — deleting what is truly unimportant, not what is numerically small.
+
+*** Why it works (and where it buries a new problem)
+
+Second-order information is far smarter than magnitude. But OBD took a major shortcut: it assumes the Hessian is *diagonal* — that is, it assumes weights have no effect on each other. And after deletion it does nothing to adjust the remaining weights. These two points are exactly the windows the next paper breaks open.
+
+** 1993 | OBS: Remove One, Compensate All
+
+*** What problem it saw
+
+OBD's diagonal assumption discards all correlations between weights — but in reality weights are coupled; moving one perturbs many others. Worse, after a weight is deleted, the remaining weights stay put and no one fills the resulting hole. The error simply accumulates.
+
+*** Its solution
+
+Use the *full* inverse Hessian (not just the diagonal), which encodes pairwise coupling between all weights. When a weight is deleted, instead of simply zeroing it out, a closed-form update redistributes the deletion's error *back to all other weights*: whichever weight incurs the smallest deletion cost (minimum w_p² / [H⁻¹]_pp) is removed; then the remaining weights are compensated by δ = −(w_p/[H⁻¹]_pp) times the corresponding column of H⁻¹.
+
+*** Why it works (and where it buries a new problem)
+
+"Remove one, compensate all" is the soul of every method that comes after it in this river — *errors are not allowed to vanish; they must be transferred to wherever the model still has freedom*. But OBS can only do one thing: set a weight to zero. What we actually want is not deletion but *quantization* — moving a weight to the nearest grid point. That one-word difference is left for the next paper to fill.
+
+** 2022 | OBQ: Replace "Set to Zero" with "Round to Grid"
+
+*** What problem it saw
+
+OBS's full machinery (inverse Hessian + error compensation) is elegant, but its constraint is hardcoded as "make this weight exactly zero." Quantization is not zeroing — it moves a weight to the nearest quantization grid point (e.g., the closest of 16 levels in 4-bit). OBS cannot be applied directly.
+
+*** Its solution
+
+Change exactly one thing: replace the OBS constraint target from "−w_p (zero out)" with "quant(w_p) − w_p (move to grid)." The same Lagrangian derivation follows unchanged — pruning becomes a special case of quantization (where the grid point happens to be zero). The resulting algorithm: at each step, greedily select the weight with the smallest current quantization cost, round it to its grid point, compensate the error to all *not-yet-quantized* weights, and repeat to completion. Combined with the ExactOBS engineering trick (per-row decomposition, H = 2XXᵀ, in-place single-row Hessian inverse deletion), this reduces the original Θ(d⁴) complexity of OBS to O(d_row·d_col³), making it feasible on moderately sized CNNs.
+
+*** Why it works (and where it buries a new problem)
+
+This is the first time "per-weight optimal compensation" is formally brought into quantization. But that d_col³ factor still looms overhead: because *each row follows its own greedy order*, each row must maintain its own evolving copy of the inverse Hessian. Applied to LLMs with billions of parameters, this cubic factor is prohibitively slow.
+
+** 2022 | GPTQ: Make All Rows Share One Order
+
+*** What problem it saw
+
+OBQ invests heavily in finding the "optimal greedy order per row." But the authors observe that for large, over-parameterized layers, this per-row greedy ordering *brings little benefit*, yet pays the cubic inverse-Hessian cost once per row. That is a pure losing trade.
+
+*** Its solution
+
+Three cuts. First cut: since H = 2XXᵀ depends only on the *input* and not on the weights, it is identical for all output rows — so let all rows *share one fixed column order* (e.g., left to right). The inverse Hessian is updated once per column, not once per weight, immediately eliminating the min{d_row, d_col} factor. Second cut: lazy batch updates — process 128 columns at a time, saturating memory bandwidth; empirically another ~10× speedup. Third cut: precompute the needed portions of the inverse Hessian via Cholesky decomposition, avoiding repeated Gaussian elimination that turns the matrix indefinite and causes weight blow-ups. Together, the three cuts are orders of magnitude faster, enabling 3–4 bit quantization of 175B models.
+
+*** Why it works (and where it buries a new problem)
+
+GPTQ is the terminus of the river's first half: per-layer objective ‖XW − XŴ‖²_F, Hessian = 2XXᵀ, closed-form compensation — clean, fast, scalable. But it has one constitutional limitation: it outputs only *pure low-precision* Q. Compressed to 2–3 bits, Q alone cannot hold up and errors grow large enough to break the model. This is where the other tributary enters — can we hang a small low-rank matrix alongside Q to absorb what Q cannot?
+
+** 2021 | LoRA: Changes to a Large Matrix Are Intrinsically Low-Rank
+
+*** What problem it saw
+
+Fine-tuning a large model requires updating all its parameters; every downstream task demands a full-size copy of the model. For a 175B model like GPT-3, storage and deployment alone are prohibitively expensive.
+
+*** Its solution
+
+Freeze the original weights W and learn only a *low-rank increment*: W_eff = W + BA, where B and A are two tall-and-thin matrices with rank r much smaller than the dimensions. Only A and B are trained (B is zero-initialized, so the increment is zero at the start). At deployment, BA can be merged back into W with no additional inference latency. The underlying assumption: the *change* ΔW induced by fine-tuning has intrinsically low rank and can be captured by a rank-r factorization.
+
+*** Why it works (and where it buries a new problem)
+
+"Changes to weights are low-rank" — this insight hands the river's second half a brand-new component: the *low-rank matrix LR*. But LoRA itself does not touch quantization; W remains full-precision. Combining it with quantization is the next paper's job.
+
+** 2023 | QLoRA: Compress the Frozen Base to 4 Bits
+
+*** What problem it saw
+
+LoRA reduces *trainable parameters*, but the frozen 16-bit base model still has to fit entirely in GPU memory during fine-tuning. A 65B model's base weights alone exceed the capacity of a single card. The wall is not trainable parameters — it is memory.
+
+*** Its solution
+
+Store the frozen base W as 4-bit Q, and attach a 16-bit LoRA adapter on top: W_eff = dequant(Q) + BA. Combined with the NF4 data type, double quantization, and a paged optimizer, a 65B model fits on a single 48 GB GPU for fine-tuning.
+
+*** Why it works (and where it buries a new problem)
+
+This is the *first time* in the river that W is decomposed into the form "low-precision Q + low-rank LR." But the decomposition is crude: Q is obtained by bare quantization of W, and LR (the adapter) is zero-initialized — meaning *at the very first moment of fine-tuning, LR contributes nothing*, and the effective weights are purely the quantized Q, off from the true W by the full quantization error. At low bit-widths, this initial gap is alarmingly large.
+
+** 2023 | LoftQ: Don't Let a Zero-Initialized Adapter Go to Waste
+
+*** What problem it saw
+
+QLoRA inherits LoRA's zero initialization: BA starts at 0. So at the start of training, the effective weight is purely dequant(Q), differing from the true W by the full quantization error. At 2–3 bit precision, this starting-point gap is large enough to prevent fine-tuning from converging.
+
+*** Its solution
+
+Since the adapter will eventually learn anyway, why start it from zero? Let it *absorb the quantization error from step 0*, so that Q + BA ≈ W holds immediately. The procedure alternates two steps: (a) quantize the residual W − BA to get Q; (b) apply SVD to the residual W − Q and take the top-r singular components as B and A. A few iterations (T=1 already helps) suffice.
+
+*** Why it works (and where it buries a new problem)
+
+This is the first time in the river that LR *explicitly compensates for quantization error*, rather than only adapting to a downstream task. Moreover, Q and LR are determined *jointly* (via alternating optimization). But LoftQ's SVD operates on *bare weight residuals* — treating every weight entry as equally important. In reality, some directions affect model output far more than others, and some directions are never activated by real inputs. Treating all entries equally wastes rank.
+
+** 2023 | LQ-LoRA: Add Data Awareness and Mixed Precision to the Decomposition
+
+*** What problem it saw
+
+LoftQ has two soft spots: (a) every matrix uses the same bit-width, but under a fixed memory budget, not all weights deserve the same precision; (b) plain SVD treats every weight entry as equally important — wrong, because some directions affect the loss far more than others.
+
+*** Its solution
+
+The same "quantize residual + SVD residual" alternating decomposition, with two upgrades: (1) use integer linear programming to assign bit-widths and block sizes to each matrix so as to meet a target *average* bit-rate (e.g., 2.75 bpp); (2) weight the reconstruction objective using Fisher information estimated from calibration data, so the decomposition prioritizes preserving the entries most influential to the loss.
+
+*** Why it works (and where it buries a new problem)
+
+This is the turning point where the river shifts from "data-agnostic" to "data-aware" — for the first time, data statistics are incorporated into the decomposition. But like LoftQ, it still relies on *joint/alternating* decomposition, with Q and LR entangled in repeated iterations, and the alternating procedure has no theoretical guarantee of progress toward optimality.
+
+** 2024 | EoRA / QERA: Fix Q First, Then Apply a Single Targeted Correction
+
+*** What problem it saw
+
+Previous methods (LoftQ, LQ-LoRA) entangle Q and LR in alternating optimization — slow and tied to a specific quantizer. Moreover, the "data awareness" everyone was using was hand-crafted and heuristic (weighting by activation magnitudes), and *nobody had proved this was correct*. QERA makes a further counterintuitive discovery: minimizing *per-layer weight* error — the standard approach — does *not* minimize *model output* error. The entire field had been using an unjustified heuristic.
+
+*** Its solution
+
+Change strategy: decouple into a *sequential* two-step procedure. First, fix Q using any off-the-shelf quantizer. Then compute a single data-aware low-rank correction LR ≈ W − Q. EoRA projects the error into the *input activation feature space*, using eigenvalues as importance weights for SVD — focusing rank on the error directions that inputs actually excite. Training-free, done in minutes. QERA derives the *closed-form* optimal solution: whiten the quantization error using the square root of the input autocorrelation R_XX, then perform SVD; set A = (R_XX^½)⁻¹U and B = ΣV. This is proved to be the optimal low-rank correction for minimizing *layer output* error.
+
+*** Why it works (and where it buries a new problem)
+
+"Fix Q first, then correct with LR" decouples the correction from the quantization format — it can be attached after GPTQ, pruning, 2:4 sparsity, or anything else; cheap and general. QERA also, for the first time, elevates "one should use the output-error criterion with Hessian-style R_XX weighting" to the status of a theorem. But there is a structural suboptimality: *Q is fixed without knowledge that LR will be added later*. Locking Q down first and patching with LR afterward forces Q to absorb the full error alone; LR can only scavenge what remains. If Q had been determined with LR in mind, it could have been different. Puncturing exactly this point is the job of the present paper.
+
+** 2026 | GPTQ-intrinsic LoRA: Fold the Low-Rank Correction into the Quantization Pass
+
+*** What problem it saw
+
+This paper maps all prior methods onto a single diagram and identifies two classes of failure:
+
+- *Sequential camp* (EoRA, QERA, CALDERA, CLoQ): fix Q first, then correct with LR. The problem: Q is fixed without awareness of LR — structurally suboptimal.
+- *Joint camp* (LoftQ, LQ-LoRA, ApiQ): optimize Q and LR together. LoftQ/LQ-LoRA's alternating procedure has no theoretical guarantee; ApiQ uses backpropagation for joint training, which is expensive and still lacks comparable theory.
+
+The largest gap is this: *across a decade and this entire line of work, no one had ever given an information-theoretic lower bound for the W≈Q+LR problem, and no one had proved that any algorithm was near-optimal.* Everything was empirical.
+
+*** Its solution
+
+Two levels.
+
+On the theory side, the paper provides the *first information-theoretic lower bound*. A warm-up result is itself counterintuitive: even restricting to "rank-one plus integer matrix," the representable set of matrices is *dense* — meaning without further constraints the problem is trivial. This motivates constraints on finite alphabet / bounded amplitude (Definition 3.3), under which a worst-case lower bound is derived and converted into per-layer error.
+
+On the algorithm side, the key move is to *fold the low-rank correction into the GPTQ pass* rather than appending it afterward. Choose L = V_r (the top-r right singular vectors of the input X) as a "feature extraction factor," then run GPTQ on an *augmented Hessian*:
+
+#+begin_example
+       [  H        H·V_r     ]
+  ℍ =  [                     ]
+       [ V_rᵀ·H   V_rᵀ·H·V_r ]
+#+end_example
+
+R is then the "error absorption factor" naturally solved out by GPTQ. The entire procedure is *gradient-free and requires no explicit SVD*. Theoretically, it replaces GPTQ's original dependence on ‖X‖²_F with rank-r residual ‖X − X_r‖²_F — that is, the upper bound on quantization error shrinks from "total energy" to "energy not captured by the low-rank basis." This upper bound is proved to differ from the lower bound by *only a constant factor*, establishing near-optimality.
+
+Finally, a Bid-Up step is added: coordinate-wise refinement on fixed grid points, alternating with the optimal low-rank correction (OLrC). It guarantees that one full refinement pass *cannot increase* the per-layer reconstruction error, only decrease it — imposing a monotone lock on an alternating procedure that would otherwise have no monotonicity guarantee.
+
+*** Why it works (and where it buries a new problem)
+
+The elegance lies not in inventing new machinery, but in recognizing something already present: *GPTQ's "column-by-column quantization + error compensation" mechanism can naturally solve for the low-rank component at the same time* — simply by augmenting the Hessian. "Jointly optimizing Q and LR" no longer requires additional backpropagation or alternating loops; it is intrinsic to a single GPTQ pass (which is precisely the meaning of "intrinsic" in the name). And for the first time, this line of work has the theoretical backbone to say "this is as good as it gets" — lower bound, upper bound, and near-optimality certificate, all three in hand.
+
+Remaining open problems: the lower bound is *worst-case*; real weights have much more benign structure, so how close one can actually get to the bound in practice remains open. The constraints introduced to make the theory work (finite alphabet, bounded amplitude) are also specific choices — whether the story changes under a different constraint regime is unknown.
+
+* Frontier Extensions
+
+As of this writing (June 2026), this is the most recent work in this line — and the first to lift the "Q+LR decomposition" from a collection of empirical heuristics into a *lower-bounded, near-optimal* theoretical framework. It has just nailed down two things: (1) where the information-theoretic limit of this problem lies; and (2) that a training-free GPTQ variant can approach that limit.
+
+Likely next steps:
+
+- Tighten the worst-case lower bound into a *data-dependent* lower bound (real weight spectra decay rapidly, making worst-case bounds overly pessimistic).
+- Extend the "fold into one pass" idea to *mixed precision* (connecting to LQ-LoRA's ILP budget line) and *non-uniform grids*.
+- Validate on more aggressive bit-regimes (sub-2 bits) and more modalities how much additional gain Bid-Up's monotone refinement can harvest.
+
+The relationships within this line are confirmed (this paper explicitly critiques EoRA/QERA/LoftQ/LQ-LoRA and uses GPTQ as its backbone); the "where next" directions are projections based on evolutionary trends, not assertions made in the paper.
+
+* One Diagram
+
+#+begin_example
+  Problem: W ≈ Q (low-precision) + LR (low-rank). How to decompose optimally?
+
+  Axis 1: How error is handled    Axis 2: Relationship of Q and LR    Axis 3: Theory?
+  --------------------------      --------------------------------     ---------------
+  OBD   delete and walk away      (LR does not exist yet)             2nd-order saliency
+  OBS   delete one, fix all       |                                   closed-form optimal (1-step)
+  OBQ   round one, fix all        |                                   OBS generalized to quantization
+  GPTQ  column-wise fix, shared   | pure Q, no LR                    per-layer objective, scalable
+        order for all rows        |
+                                  |
+  LoRA  ---introduce low-rank----+ W + LR (adaptation only)          empirical
+  QLoRA Q = bare quantization    | Q fixed first, LR zero-init       empirical
+  LoftQ LR absorbs quant error   | joint/alternating, data-agnostic  no convergence guarantee
+  LQ-LoRA same + mixed precision | joint/alternating, data-aware     no convergence guarantee
+  EoRA  fix Q then one correction| sequential, data-aware (act. spectrum) training-free heuristic
+  QERA  fix Q then one correction| sequential, data-aware (R_XX^½)   output-optimal closed form
+  ================================================================== this paper ==
+  GPTQ-intrinsic LoRA
+        fold LR into GPTQ pass   | intrinsically joint: augmented    first lower bound +
+        (gradient-free, no SVD)  | Hessian solves Q and R together   near-optimal upper bound
+                                 |                                  + Bid-Up monotone refinement
+
+  Trend:  delete→fix→quant-fix ==> pure low-precision ==> +post-hoc low-rank ==> +intrinsic low-rank
+          empirical =============================================> lower bound + near-optimality
+          data-agnostic =========================================> data-aware (Hessian)
+#+end_example
+
+* Insights
+
+Reading the full river, the surface story is "each generation of quantization is more accurate than the last." But underneath, three deeper cognitive shifts are actually taking place:
+
+1. *From "discard the error" to "errors must not disappear."* OBD deletes and moves on. OBS establishes the rule from the outset: errors cannot vanish into thin air; they must be transferred to wherever the model still has degrees of freedom. Every method afterward in this river — GPTQ's column-wise compensation, LoftQ's LR absorption, QERA's closed-form correction, this paper's augmented Hessian — is a different carrier of the same sentence: *move the error into a cheaper container*. The low-rank matrix LR is simply yet another, cleverer container.
+
+2. *From "two separate steps" to "recognizing it was always one step."* The sequential camp fixes Q then patches LR; the joint camp adds an alternating loop or backpropagation. The most beautiful insight of this paper is that *you don't need a second step, and you don't need extra loops* — GPTQ's column-wise compensation machine, fed an augmented Hessian, naturally solves for Q and LR simultaneously. Many "two-step" suboptimalities trace back to not seeing that the two steps are two faces of the same optimization problem.
+
+3. *From "it runs" to "prove this is optimal."* This line advanced empirically for over a decade, each generation claiming "my method is more accurate," yet no one could say "how far are we from the theoretical limit?" This paper puts the information-theoretic lower bound on the table — a hallmark of a field transitioning from engineering to science: no longer asking "can we do better?" but asking "what is the best possible, and how far am I from it?"
+
+* Takeaways
+
+This river offers three directly actionable lessons for how to do research and find problems:
+
+1. *When you find yourself doing "one thing in two steps," stop and ask: are these two steps the same optimization problem?* The core innovation here is not a new algorithm but recognizing that "first quantize, then correct with low rank" can be folded into a single pass — augmenting the Hessian turns joint optimization into GPTQ's intrinsic behavior. This means: the "first A then B" pipelines you encounter may well conceal a unified formulation that solves A and B simultaneously, and usually more optimally.
+
+2. *When a field is full of empirical heuristics, the biggest gap is usually a "lower bound," not a "better method."* Everyone else is racing to "my method is more accurate." This paper asks "how good can this problem theoretically get?" When looking for problems to work on, rather than squeezing into the crowded "a little more accurate" lane, go plug the missing theoretical foundation — it sets the ruler for the entire line all at once. Concretely: in a mature but theory-light direction, you can make a contribution that stands above incremental work simply by providing the first lower bound or optimality proof.
+
+3. *Reusing an existing machine has more leverage than building a new one.* GPTQ's column-wise compensation framework already existed; this paper did not rewrite it, only fed it an augmented Hessian, and in doing so got low-rank compensation for free — along with a gradient-free, SVD-free implementation. The lesson: when you want to add a new capability, first ask "can the existing mature pipeline handle it by simply changing its input or objective?" That path is usually both faster and more stable than building from scratch.

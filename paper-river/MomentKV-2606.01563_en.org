@@ -1,0 +1,223 @@
+#+title:      MomentKV: Closing the Directional Gap in KV Cache Eviction for Long-Context Inference
+#+date:       [2026-06-08 Mon 01:56]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T015617-en
+#+source:     https://arxiv.org/abs/2606.01563
+#+authors:    Yu Li, Binxu Li, Tian Lan
+#+venue:      arXiv 2026 (cs.LG)
+
+* The River of the Problem
+
+When a large language model is asked to read a long document, an entire book, or dozens of turns of dialogue, it must "hold in memory" every token it has processed — that memory is the KV cache. The trouble is simple: the longer the context, the larger the cache grows, until GPU memory bursts at the seams.
+
+A natural idea follows: if you cannot remember everything, throw some away. Keep only the "important" tokens and discard the "unimportant" ones. For seven years this line of work has kept asking the same two questions —
+
+*Which tokens should be discarded? And how much does the model's output degrade after discarding them?*
+
+The second question is where the real difficulty lies. For the first six years everyone tacitly assumed: as long as the discarded tokens were ones "nobody was attending to anyway" (low attention weight), removing them was harmless. The assumption sounded self-evident — yet nobody seriously checked whether it was actually true. MomentKV is the story of overturning that assumption.
+
+* The Source Map
+
+#+begin_example
+[2023.09] StreamingLLM (Xiao et al.)
+  |
+  | Problem: keeping only a recent window causes collapse on long text
+  | Finding: the first few tokens act as "attention sinks" and must be kept
+  | Solution: keep the initial tokens + sliding window = arbitrarily long context
+  v
+[2023.06] H2O (Zhang et al.)   (roughly contemporaneous with StreamingLLM)
+  |
+  | Problem: "keep head + keep tail" is too rigid; truly important middle tokens
+  |          get wrongly evicted
+  | Solution: dynamically select Heavy Hitters by cumulative attention score
+  v
+[2024.04] SnapKV (Li et al.)
+  |
+  | Problem: H2O scores tokens during decoding, but long prompts already OOM
+  |          before generation even begins
+  | Solution: use an "observation window" at the prompt's end; select once before
+  |           generation and apply pooling to preserve local context
+  v
+[2024.07] Ada-KV (Feng et al.)
+  |
+  | Problem: every method gives every attention head the same budget, but heads
+  |          have very different attention profiles
+  | Solution: bound the eviction error analytically; allocate budget per-head
+  |           adaptively
+  v
+[2026.06] MomentKV (Li, Li, Lan)   <- target paper
+  |
+  | Problem: all prior work minimises evicted mass, but the real culprit is
+  |          direction
+  | Finding: kept and evicted outputs are nearly orthogonal (cos ≈ 0.10, ~84°)
+  | Solution: retain a compact moment-statistic sketch of the evicted set;
+  |           closed-form correction at inference time
+  v
+[?] As of now, this is the frontier of the line
+#+end_example
+
+Relationship note: StreamingLLM and H2O appeared nearly simultaneously and cite each other; they are ordered here by the logic of "from rigid positional rules to dynamic content scoring." SnapKV→Ada-KV→MomentKV is a confirmed direct lineage (MomentKV is implemented on top of Ada-KV and inherits SnapKV's prefill protocol). H2O serves as the primary target for MomentKV's directional argument throughout the paper.
+
+* The Evolutionary Narrative
+
+** 2023 | StreamingLLM: Long Text Causes Collapse — and the Culprit Is the First Few Tokens
+
+*** What Problem It Saw
+
+The simplest way to save memory is a sliding window — keep only the most recent N tokens and discard the rest. Intuitively this seems fine: humans mostly attend to the last few sentences of a conversation anyway. But once the text length exceeds the window size, output quality collapses catastrophically into incoherence. Strangely, the collapse happens at precisely the moment the very first tokens get pushed out of the window.
+
+*** Its Solution
+
+The authors examined the attention maps and discovered a peculiar pattern: regardless of what the sentence was about, the first three or four tokens always attracted a disproportionate share of attention — even when they were semantically vacuous (such as a bare "the"). They called this phenomenon *attention sinks*.
+
+Why does it happen? Because softmax forces all attention scores to sum to 1. When the model has nothing in particular it wants to attend to, that probability mass has to land somewhere, and it floods into the initial tokens, which are visible from every position. Remove the sink (delete the initial tokens) and the attention distribution over everything else instantly distorts — causing the observed collapse.
+
+The fix is therefore almost comically simple: *always keep the first 4 tokens, plus a sliding window*. With this, Llama can stably generate 4 million tokens.
+
+*** Why It Works (and What Pit It Leaves)
+
+It works because it preserves the *shape* of the attention distribution. But the selection rule is purely *positional* — it recognises only "beginning" and "recent," completely ignoring content. If a genuinely critical fact is buried in the middle (say, a contract amount on page 5), it is neither at the start nor in the recent window, so it gets deleted regardless.
+
+The next paper targeted exactly this pit: can selection be based on *importance* rather than position?
+
+** 2023 | H2O: Forget Position — Keep Whoever Gets Attended to Most
+
+*** What Problem It Saw
+
+StreamingLLM issues passes by seat number — front row and back row stay, the middle is cleared. But what makes a token important has never been its position; it is whether *subsequent tokens actually look at it*.
+
+*** Its Solution
+
+H2O's observation is that attention scores follow a power-law distribution — a tiny fraction of tokens absorbs the vast majority of attention. These tokens are called *Heavy Hitters*.
+
+You can think of H2O as a continuous deformation of StreamingLLM: remove the rigid "keep head + keep tail" rule and replace it with a dynamic scorer — *each token accumulates a running total of attention received, and at every step only the highest-scoring tokens plus the most recent tokens are retained*. A positional rule becomes a content-based score.
+
+*** Why It Works (and What Pit It Leaves)
+
+It works because it genuinely rescues the critical middle tokens; 20% of the cache budget suffices to hold quality.
+
+But there is a structural awkwardness: cumulative scores can only be accumulated *during token-by-token generation*. Yet in practice, what first exhausts memory is the input prompt — tens of thousands of tokens that exist before any generation has begun. H2O's mechanism only kicks in during the decoding phase; it cannot reach the explosion happening at the prompt stage.
+
+** 2024 | SnapKV: Before a Single Token Is Generated, the Model Already Knows What It Will Look At
+
+*** What Problem It Saw
+
+H2O accumulates scores while generating. SnapKV asked an earlier question: waiting until generation to select is too late — can the selection be done *all at once before generation begins*?
+
+*** Its Solution
+
+The key finding: taking the *last short segment* of the prompt (an "observation window" of roughly 32 tokens) and examining its attention over the preceding context predicts, with high accuracy, which tokens the model will repeatedly attend to during subsequent generation. Before the model utters a single word, it has already revealed what it is looking for.
+
+SnapKV therefore transforms H2O into a *one-shot prefill* operation: score the entire prompt using the observation window, compress the prompt to a fixed size on the spot, and leave it unchanged throughout generation. A crucial detail is added: selecting only isolated top-scoring tokens causes "broken context" (like keeping only an area code while the rest of the phone number is discarded, forcing the model to confabulate). Accordingly, *pooling* is applied to preserve contiguous local context.
+
+*** Why It Works (and What Pit It Leaves)
+
+On 16K inputs: 8.2× memory reduction, 3.6× speedup, virtually no quality loss. SnapKV became the standard substrate for all subsequent methods.
+
+But SnapKV — and every predecessor — silently assumed one thing: *every attention head within a layer receives the same budget*. The next paper found this to be a costly egalitarianism.
+
+** 2024 | Ada-KV: Heads Have Different Personalities — Why Should They All Get the Same Budget?
+
+*** What Problem It Saw
+
+Ada-KV measured the personality of every attention head and found enormous variance: some heads are "focused," fixating on just two or three tokens; others are "diffuse," spreading attention broadly. Giving a focused head a large budget wastes it; giving a diffuse head a tiny budget is disastrous. Yet SnapKV treats all heads identically.
+
+*** Its Solution
+
+Ada-KV was the first to express "how much is lost by eviction" as *computable mathematics*: define the eviction loss as the L1 distance between attention outputs before and after eviction, then derive a provable *upper bound ε* on it (Theorem 3.1).
+
+With this ruler in hand, budget allocation is no longer guesswork: distribute a fixed total budget *adaptively across heads* — more to diffuse heads, less to focused ones — and *prove* that the resulting loss bound is no worse than uniform allocation. It is a plug-in module; attached to SnapKV it becomes Ada-SnapKV.
+
+*** Why It Works (and What Pit It Leaves)
+
+For the first time, the entire line of work has a theoretical form for its optimisation objective. But notice precisely what is being optimised — *L1 distance, i.e., how large the evicted attention mass is*. By this point, everyone on the line shares an identical belief: **minimise the mass of the evicted portion, and the output is preserved.** Seven years, and nobody questioned this.
+
+MomentKV is about to flip the table.
+
+** 2026 | MomentKV: You Have Been Compressing the Wrong Thing — the Culprit Is Not "How Much" but "Which Direction"
+
+*** What Problem It Saw
+
+MomentKV decomposes the full attention output into two parts: *the kept part* and *the evicted part*, each weighted by its attention mass. The eviction error therefore factors into two terms multiplied together: a *scalar* (how large is the evicted mass) × a *vector* (how different in direction are the two parts).
+
+All prior work — H2O, SnapKV, Ada-KV — had been driving down that scalar. MomentKV measured the vector and found an alarming number: *the kept output and the evicted output are nearly orthogonal, with cos θ ≈ 0.10, corresponding to roughly 84 degrees*.
+
+The more orthogonal two vectors are, the more any residual scalar is *amplified* into a large output deviation. In other words: even if you compress the evicted mass down to a tiny sliver, because the direction is nearly perpendicular, that sliver is enough to "steer" the output into the ditch.
+
+More damaging still: the authors show that the two factors work *against each other*. *The better your selection, the smaller the evicted mass — but the wider the directional gap becomes*. So exerting ever more effort on "selecting better" yields diminishing returns — which explains why progress on this line has become increasingly hard to squeeze out.
+
+*** Its Solution
+
+Since the evicted portion cannot simply be pretended away, the answer is: *don't truly discard it — retain an extremely compact sketch of it, then closed-form correct for that missing slice at inference time*.
+
+This sketch is called *moment statistics*; one per head, with size independent of context length:
+- A count n_e (how many tokens were evicted)
+- The mean of keys k̄
+- The mean of values v̄
+- The value–key covariance S̃
+
+Every time a token is evicted, four simple accumulators (a rank-one update to the covariance) "dissolve" it into the sketch — *the evicted tokens themselves are never stored and never revisited*; total overhead per head is O(d²).
+
+The sketch serves two mutually reinforcing purposes:
+1. *Guide the selection of what to evict*: for each kept token, compute a "moment residual" — how well its value can be predicted by the affine model encoded in the sketch. Tokens that are already well-captured by the sketch are evicted first. This way the evicted set is *geometrically regular*, making the sketch accurate.
+2. *Closed-form compensation at inference time*: re-align the logits around the mean key of the evicted set, apply a first-order Taylor expansion exp(δ) ≈ 1 + δ, yielding
+
+   f̂_e(q) = v̄ + (1/(n_e·√d)) · S̃ · q
+
+   The first term recovers the "mean direction of the evicted portion"; the second term is a *query-adaptive correction* that captures exactly the variation along the orthogonal direction. The error is only O(σ²).
+
+*** Why It Works (and What Pit It Leaves)
+
+It works because, for the first time, the method directly addresses the *direction* factor that had been ignored for seven years — not by trying to shrink the orthogonal gap (prior work showed that gap only widens as selection improves, so that road is blocked), but by *approximately computing the output on the far side of the gap and adding it back*. Selection and compensation form a mutually reinforcing loop: regular eviction → more accurate sketch → more accurate compensation → licence to evict more aggressively. This is why MomentKV wins by the largest margin at the *most aggressive* low-budget settings.
+
+The remaining gap: the approximation rests on a first-order Taylor expansion plus the assumption that the evicted set has reasonably low variance (error O(σ²)). When the evicted set is highly multi-modal and a single mean-plus-covariance sketch is insufficient, is the first-order correction still adequate? That is the opening left for the next paper.
+
+* Frontier Extensions
+
+MomentKV was published in June 2026, making it too recent for any confirmed follow-up critiques or improvements to have been identified — *as of now, this is the latest advance on this line*.
+
+Two plausible directions for future progress (speculative, not confirmed citations):
+- *Higher-order moments / mixture sketches*: when a single first-order sketch (mean + covariance) cannot capture a multi-modal evicted set, the natural extension is to fit "multiple sketches" (analogous to clustering) or introduce higher-order moments.
+- *Direction geometry feeding back into training*: "kept and evicted outputs are nearly orthogonal" is a finding about the internal geometry of the model, and could be used during pretraining or fine-tuning to encourage attention outputs to be intrinsically "more compressible," rather than only patching things up at inference time.
+
+* One Diagram to Understand It All
+
+#+begin_example
+              What has this line actually been compressing?
+  Compression Axis
+   ^
+   |  [Position]     [Content mass] .............................  [Direction]
+   |      |                |                                           |
+   |      |                |                                           |
+2023 StreamingLLM   2023 H2O ---- 2024 SnapKV ---- 2024 Ada-KV   2026 MomentKV
+   |   Keep head +     Cumulative      Select once     Per-head        error = mass x direction
+   |   sliding win     attention       before gen +    adaptive        direction ≈ orthogonal
+   |   (pure pos.)     → Heavy Hitter  pooling         budget (bound)  (cos 0.1)
+   |      |                |                |              |               |
+   |   Selection:         Position --> content score --> how to allocate   evicted part
+   |                                                    (all minimise      also recovered
+   |                                                     mass)            (closed-form moments)
+   +-------------------------------------------------------------------> Time
+
+   In one sentence: the first four generations answered "what to evict" (minimise evicted mass);
+                    MomentKV asks instead "how to compensate after eviction"
+                    (because minimising mass cannot fix the direction).
+#+end_example
+
+* Insight
+
+On the surface, this line is a technical progression about "how to save KV cache memory." Underneath, it is a *shift in the object being reasoned about*:
+
+- The progress of the first four generations (StreamingLLM → H2O → SnapKV → Ada-KV) was entirely in the single act of *selection* — from positional selection, to score-based selection, to pre-generation selection, to per-head budget-allocated selection. They share one underlying belief: *evicted tokens simply do not exist* (softmax renormalises over the kept tokens). Every effort was directed at making "the part treated as nonexistent" as small as possible.
+
+- MomentKV's fundamental shift is: *it no longer pretends the evicted tokens do not exist*. It discovers that "small mass" and "small influence" are not the same thing in high dimensions — because the two output vectors are nearly orthogonal, even tiny mass can steer direction sharply off course. The question therefore changes from *"how to minimise the evicted portion"* to *"for the slice that was evicted, how to closed-form recover it from a minimal sketch"*.
+
+This is a paradigm shift from *"discard more intelligently"* to *"discard + cheaply account for and compensate."* Ada-KV's move of casting the error as mathematics — exposing the mass × direction product structure — handed MomentKV exactly the knife it needed to flip the table: it proved that the factor everyone had been pushing (mass) and the neglected factor (direction) work against each other, so pressing harder on the old path yields only diminishing returns.
+
+Where the line most likely goes next: when a single mean-plus-covariance sketch is insufficient for a multi-modal distribution, move toward "mixture sketches / higher-order moments"; and conversely, carry the "output direction geometry" perspective back into the training phase so that models are intrinsically easier to compress.
+
+* Takeaway
+
+True breakthroughs rarely come from "optimising the metric everyone is already optimising by another 5%." They come from *going back and questioning a premise that everyone accepted without verification*. For seven years on this line, "small mass = small influence" was treated as self-evident, and nobody measured the *direction* of the evicted output. The first thing MomentKV did was not invent a new algorithm — it *took a ruler to an angle nobody had measured* (cos ≈ 0.10). One number falsified the optimisation target of the entire line.
+
+The practical lesson: when doing research, rather than asking "how do I squeeze this metric a little further," ask first *"is the quantity everyone agrees to optimise actually the quantity that determines the outcome?"* Express the error explicitly as a product of factors (as Ada-KV did by writing it as mathematics), then *measure each factor individually*. The neglected factor is almost always where the next paper is hiding.

@@ -1,0 +1,213 @@
+#+title:      Recover-LoRA for Aggressive Quantization: Reclaiming Accuracy in 2-Bit Language Models via Low-Rank Adaptation with Knowledge Distillation on Synthetic Data
+#+date:       [2026-06-08 Mon 02:58]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T025825-en
+#+source:     https://arxiv.org/abs/2606.04238
+#+authors:    Devleena Das, Rajeev Patwari, Elliott Delaye, Ashish Sirasao (AMD)
+#+venue:      arXiv preprint, 2026-06
+
+* The River of the Problem
+
+A 20-billion-parameter model whose weights are originally stored in 16 bits each. Can you compress them down to just 2 bits each — saving 8× memory, boosting throughput by several times — while keeping the model from going stupid?
+
+The difficulty lies in a straightforward contradiction: fewer bits means coarser representable values. 16 bits can distinguish tens of thousands of steps; 2 bits leaves only 4. Force a continuously undulating weight landscape into 4 steps, and information gets crushed — along with the model's "judgment."
+
+So from the start this river splits into two currents. One keeps asking: *how do you compress harder without losing accuracy*; the other asks: *can you recover the accuracy that was lost after the fact*. This paper, Recover-LoRA, stands at the confluence — it does not compete on how aggressively it can compress; it specializes in picking up the precision the first current drops on the floor.
+
+* The Source Map
+
+#+begin_example
+[2022] GPTQ - One-shot 4-bit weight quantization
+  |
+  | Problem: 8-bit quantization is mature, but going lower collapses. Can we
+  |          compress to 4-bit in one shot without retraining?
+  | Solution: Use second-order information (Hessian) to quantize column by
+  |           column, patching remaining weights as each column is compressed
+  v
+[2023] AWQ - Activation-aware weight quantization
+  |
+  | Problem: GPTQ treats all weights equally, but ~1% of weights are actually
+  |          the critical bottleneck
+  | Solution: Inspect activation distributions to find "bottleneck" weights,
+  |           then scale up their channels for protection
+  v
+[2024] QuIP# / AQLM - 2-bit that is truly usable for the first time
+  |
+  | Problem: AWQ/GPTQ still collapse below 3-bit; 2-bit has always been
+  |          a forbidden zone
+  | Solution: Incoherence transform + lattice/learned codebooks; map weights
+  |           into high-dimensional lattices, squeezing out 2-bit
+  |           (cost: requires custom CUDA kernels, hard to slot into existing
+  |           deployment pipelines)
+  v
+[2023] LLM-QAT - Data-free quantization-aware training   <--- second tributary joins
+  |
+  | Problem: PTQ inevitably collapses at low bits; but QAT needs training
+  |          data, which is unavailable or non-public for large models
+  | Solution: Let the model "dream" and generate synthetic data, then use
+  |           distillation for quantization-aware training
+  |           (cost: updates all parameters, cost approaches pretraining)
+  v
+[2025] Recover-LoRA (original, EMNLP) - Data-free accuracy rescue
+  |
+  | Problem: Full QAT is too expensive; accuracy loss is not only caused by
+  |          quantization (serialization errors also corrupt weights)
+  | Solution: Train only a small LoRA patch + logit distillation + synthetic
+  |           data, realigning the degraded model back to the original
+  |           (validated on serialization corruption, not true aggressive
+  |           quantization; uses OLoRA initialization, 90–120k samples)
+  v
+[2026] Recover-LoRA for Aggressive Quantization (this paper) - Rescuing true 2-bit
+  |
+  | Problem: Original only validated on "simulated corruption"; does it work
+  |          for real 2-bit PTQ? OLoRA backfires on quantized weights
+  | Solution: Compress only the MLP gate/up two layers to 2-bit (mixed
+  |           precision), then rescue with standard LoRA, only 10k samples
+#+end_example
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Making One-Shot 4-Bit Quantization Truly Usable for the First Time
+
+*** What Problem It Saw
+
+Before GPTQ, the widely accepted safety line was 8-bit — compress to 8 bits and the model largely holds its scores. But saving only half the memory was nowhere near enough. The moment anyone tried to go further to 4-bit, the approach of the day (simply rounding each value to the nearest step) started producing clearly visible accuracy drops. Worse, at that time quantizing a 175-billion-parameter GPT using the then state-of-the-art per-weight method (OBQ) would take roughly half a year of compute. Slow and lossy, 4-bit was effectively unusable in practice.
+
+*** Its Solution
+
+The core intuition behind GPTQ is: "Quantizing one weight introduces an error — so let the remaining unquantized weights shift slightly to absorb that error." It processes the weight matrix column by column; after compressing each column it uses second-order information (the Hessian, which describes how the error changes with respect to the weights) to fine-tune the remaining uncompressed columns, compensating for the loss just incurred. Two engineering accelerations are added on top: a fixed quantization order (it turns out that, for large models, the order of columns matters little) and lazy batch updates (accumulate a batch of columns before issuing GPU updates). The result — 175 billion parameters compressed on four GPUs in a few hours, with near-lossless 4-bit quality.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it does not treat quantization as "independently chopping each number," but as a global optimization of "keep the whole layer's output unchanged" — errors are caught by other weights in the same layer. But its compensation capacity has a ceiling: below 3-bit, each weight has so few steps that no amount of adjustment in the remaining weights can compensate. GPTQ itself acknowledges that 2-bit/ternary territory yields only "barely acceptable" accuracy. The pitfall is buried here: *it treats all weights as equal* — but are they really?
+
+** 2023 | AWQ: It Turns Out 1% of Weights Are the Critical Bottleneck
+
+*** What Problem It Saw
+
+AWQ zeroed in on a blind spot shared by GPTQ and similar methods: they compress all weights in a layer with equal aggressiveness. But AWQ finds that roughly only 0.1%–1% of weights are "bottlenecks" — if that tiny fraction gets corrupted by compression, accuracy collapses; the remaining 99% barely matter whether they are compressed or not. Even more counterintuitive: *how to find this critical fraction — you cannot look at the weights themselves, you must look at the activations*. Weights whose corresponding input activations have large magnitudes are the important ones.
+
+*** Its Solution
+
+The most naive idea is to keep that 1% bottleneck in 16-bit and compress the rest to 4-bit. But mixed-precision formats like this are hardware-unfriendly (mismatched data types slow inference). AWQ uses an equivalent trick instead: since quantization error is proportional to weight magnitude, before quantizing, scale up the bottleneck channels globally, then scale back down after quantization — mathematically equivalent, but the bottleneck weights are now larger relative to the quantization step size, so the relative error from rounding shrinks. No backpropagation or weight reconstruction is needed throughout, so there is no overfitting to the calibration set; the method remains stable across different domains and multimodal settings.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because it concentrates the limited "precision budget" where it matters most — protecting the few bottleneck weights, which at minimal cost holds the whole model together. But AWQ is ultimately still operating in the 4-bit regime, optimizing "lose as little as possible within 4-bit." To push to an extreme like 2-bit, there simply are not enough steps to begin with, and "protect bottlenecks + scale up/down" cannot save it. Crossing the 2-bit barrier requires an entirely different representation strategy.
+
+** 2024 | QuIP# / AQLM: The 2-Bit Forbidden Zone Is Broken for the First Time
+
+*** What Problem It Saw
+
+GPTQ and AWQ both hit the same shared ceiling: collapse below 3-bit. Their commonality is "map each weight independently to a scalar step" — one weight to one number. The QuIP line of work sees through this limitation: the problem is that weights contain "outliers" and "important directions that happen to align with coordinate axes," making quantization especially hard.
+
+*** Its Solution
+
+Two approaches, converging on the same idea. QuIP# first applies an *incoherence transform* (random Hadamard transform) — it "shuffles" the weight matrix to make it isotropic and free of prominent outliers, amounting to principled outlier elimination; then instead of mapping one weight to one number, it maps *a group of weights jointly to a point in a high-dimensional lattice* (E8 lattice codebook), exploiting the approximately spherical Gaussian structure of the shuffled weights for optimal packing. AQLM takes a different route: the codebook is not fixed but *learned* (additive quantization + learnable codebooks). Both then use lightweight fine-tuning to pull accuracy toward QAT levels. The result — 2-bit yields genuinely usable accuracy for the first time; QuIP# even became the first method where "3-bit is a better deal than 4-bit."
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because these methods break out of the "one weight, one step" box, switching to "a group of weights sharing one high-dimensional codeword," dramatically increasing representational capacity. But the pitfall is very practical: these methods all depend on *custom kernels* (custom CUDA code to decode codebooks), which cannot easily be slotted into existing deployment pipelines; AQLM's learned codebook is too large to fit in the GPU's L1 cache, slowing inference. In other words, the 2-bit accuracy is there, but "can it actually be deployed easily in production?" becomes the new problem. This leaves room for the "after-the-fact rescue" tributary — rather than switching to an entirely different quantization system, can we use simple quantization plus cheap post-hoc patching?
+
+** 2023 | LLM-QAT: Let the Model Dream and Generate Its Own Training Data
+
+*** What Problem It Saw
+
+We step back slightly in time here, because the methodological backbone of this paper comes from another tributary. PTQ (post-training quantization, no retraining) inevitably collapses at low bits; the most thorough fix is QAT (quantization-aware training) — simulate quantization noise during training so the model learns to work under "compressed" conditions. But QAT has a fatal weakness for large models: *it requires training data*, and the original pretraining corpora for large models are often unavailable or non-public. Without data, QAT cannot proceed.
+
+*** Its Solution
+
+LLM-QAT's elegant trick is *letting the model generate its own data*: take the pretrained model, start from an initial token, and sample one token at a time to generate the next (sampling from the softmax distribution to avoid repetitive outputs), use the resulting sentences as inputs, then use the original model (teacher) output as soft labels to distill the quantized student model. The entire process touches no real data whatsoever — purely the model "dreaming" — hence "data-free."
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because data the model generates itself naturally fits the model's own output distribution, preserving the original behavior better than arbitrarily sourced corpora. This "synthetic data + logit distillation" recipe is used throughout the entire downstream tributary. But LLM-QAT itself carries a heavy burden: it *updates all parameters* and must simulate quantization on every forward pass, with costs approaching a full pretraining run and requiring pretraining-scale infrastructure. For someone who just wants to "rescue an already-quantized model," this is far too expensive.
+
+** 2025 | Recover-LoRA (Original): Skip Full Retraining — Just Apply a Small LoRA Patch
+
+*** What Problem It Saw
+
+The original Recover-LoRA identified two things. First, full QAT is too expensive — there is no need to touch all parameters just to recover a bit of accuracy. Second, and more novel: *accuracy loss is not exclusively caused by quantization*. Between the time a model is trained and the time it is actually deployed, it passes through format conversion, dtype conversion, export, serialization… any one of these steps going wrong (e.g., improper weight serialization) can cause functional degradation. Nearly all "accuracy recovery" work in the field has been fixated on quantization, while these miscellaneous degradation sources go unaddressed.
+
+*** Its Solution
+
+Take the LLM-QAT "synthetic data + logit distillation" recipe, but *no longer update the entire model* — instead train LoRA low-rank patches only on selected layers (the original chose K/V or attention+MLP), realigning the degraded model's logits back to a full-precision reference model. LoRA was originally designed for task fine-tuning with labeled data; the original Recover-LoRA was the first to apply it to "accuracy rescue." Initialization uses OLoRA (SVD-based), requires 90–120k synthetic samples, and achieves 5%–17% accuracy recovery on serialization-corrupted models, surpassing LLM-QAT and targeted LoRA fine-tuning.
+
+*** Why It Works (and What Pitfall It Buries)
+
+It works because "degradation" is fundamentally a small shift, and fitting that shift with a low-rank patch is highly parameter-efficient, while synthetic data removes any dependence on real data. But the original paper left one explicitly open item: its validation scenario is *artificially simulated weight perturbations (serialization errors)*, not true aggressive PTQ quantization. Is simulated corruption and real 2-bit quantization corruption actually the same thing? Does OLoRA initialization still work on genuinely quantized weights? The original left these unanswered — which is exactly where this paper begins.
+
+** 2026 | Recover-LoRA for Aggressive Quantization (This Paper): Applying the Rescue to True 2-Bit
+
+*** What Problem It Saw
+
+This paper directly picks up where the original left off: pushing Recover-LoRA from "simulated corruption" to *real 2-bit PTQ*. But getting started immediately reveals a new problem — the original's OLoRA (SVD) initialization, when applied to already-quantized weights, actually backfires and drags accuracy lower. There is also a deployment-side accounting problem: compressing the entire model to 2-bit collapses accuracy too severely, yet compressing only a small part saves too little. Which layers should be compressed to save substantially while keeping the damage within a controllable range?
+
+*** Its Solution
+
+Two judgments combine into the method. First, *mixed-precision GateUp*: roofline analysis shows that the MLP gate and up projections account for the bulk of parameters and are the bandwidth bottleneck during decoding, so *only these two layers are compressed to 2-bit (W2)*, with all other layers kept at higher precision. This captures most of the throughput benefit (7.5%–23.3% TPS improvement over uniform W4) while confining the error to a predictable subset of layers. But sensitivity analysis also shows that MLP projections are precisely the most quantization-sensitive components — so they must be paired with rescue. Second, the rescue step retains synthetic data + logit distillation, but *switches to standard LoRA initialization* (because OLoRA degrades on quantized weights), and cuts the sample count from 90–120k down to *just 10k*. On Qwen3-4B, 9 out of 12 benchmarks recover 80%–95% of accuracy; synthetic data performs on par with manually annotated data and generalizes to out-of-distribution tasks.
+
+*** Why It Works (and What Pitfall It Remains)
+
+It works because it gives "compress" and "patch" clearly separate jobs: the compression step need not be elegant (use the simplest 2-bit + layer selection), intentionally concentrating precision loss into a small, known set of layers; the patching step then uses the cheapest possible LoRA patches aimed precisely at those layers. This is a "first manufacture a predictable injury, then surgically repair it" philosophy. The remaining gaps are also clear: this is currently a single-point case study on Qwen3-4B; 3 of the 12 benchmarks are not recovered; why OLoRA fails on quantized weights and why exactly these 3 tasks cannot be rescued remain mechanistically unexplained.
+
+* Frontier Extensions
+
+As of now (June 2026), this paper is itself the latest development on the "after-the-fact rescue" tributary — a direct extension of the EMNLP 2025 original Recover-LoRA, published only days ago, with no follow-up critiques or improvements yet in sight.
+
+The established relationships are clear: this paper explicitly identifies the original Recover-LoRA (arXiv:2510.08600) as what it extends, LLM-QAT as the source of its synthetic data idea, and GPTQ/AWQ/QuIP#/AQLM as the quantization method spectrum against which it positions itself. Directions that can reasonably be anticipated but are not yet confirmed: the next steps are either to extend this mixed-precision + rescue approach to more model families and larger scales (this paper only covers a single 4B data point), or to investigate what exactly is blocking the 3 unrecovered tasks.
+
+* Understanding It All in One Picture
+
+#+begin_example
+              "How do you compress LLM weights to the extreme without making them dumb?"
+
+  Push compression harder ──────────────────────────────►  Recover accuracy after the fact
+  (PTQ: no retraining, compress the numbers)               (Training-side: claw back the lost score)
+
+  2022 GPTQ          2023 AWQ          2024 QuIP#/AQLM     2023 LLM-QAT
+  Second-order        Protect 1%        High-dim             Synthetic data
+  compensation        bottleneck        codebooks            + distillation
+  4-bit usable        (found via        True 2-bit           (Full QAT, expensive)
+                      activations)
+     |                |                |                    |
+     | Collapses      | Still stuck    | Needs custom       | Updates all params
+     | below 4-bit    | at 4-bit       | kernels,           | Cost ≈ pretraining
+     |                | regime         | hard to deploy     |
+     v                v                v                    v
+  ........................................................  2025 Recover-LoRA (original)
+                                                            Train only LoRA patch + synthetic data
+                                                            (validated on "simulated corruption")
+                                                                  |
+                                                                  | Not validated on true quantization
+                                                                  | OLoRA backfires on quantized weights
+                                                                  v
+                                                       2026 This paper: Recover-LoRA for Aggressive Quantization
+                                                       Mixed-precision GateUp (only gate/up compressed to 2-bit)
+                                                       + standard LoRA rescue, only 10k samples
+                                                       = First manufacture predictable damage, then surgically repair
+
+  Timeline ──►  2022 ──── 2023 ──── 2024 ──── 2025 ──── 2026
+  Conceptual:   Global     Target    Change     Post-hoc   Division of labor
+  dimension:    compen- →  key    →  the     →  rescue  →  (rough compress +
+                sation     weights   repre-                  precise patch)
+                                     sentation
+#+end_example
+
+* Insight
+
+On the surface this line of work is a technical iteration of "compress to ever fewer bits," but underneath it is actually a *reallocation of responsibility*.
+
+In the early days (GPTQ → AWQ → QuIP#/AQLM), all the pressure was on the single "quantization" step: researchers devised ever more elaborate ways to make that one step both aggressive and accurate — compensation, bottleneck protection, codebook substitution — growing more sophisticated but also more complex and more dependent on specialized hardware. At the 2-bit extreme, the marginal returns of "make quantization perfect in one step" kept shrinking while the engineering cost kept rising.
+
+The conceptual shift in the Recover-LoRA line is: *stop expecting quantization to be done perfectly in one step.* Split "compress" and "patch" into two separate concerns — the compression step can be crude, can deliberately target only a few layers, can accept predictable damage; true accuracy is recovered by an independent, cheap, data-free "rescue" step after the fact. This effectively moves the goal of "losslessness" from being "an intrinsic property of the quantization algorithm" to being "an end-to-end outcome of a pipeline."
+
+Following this logic, the most likely next direction is: the rescue step increasingly becomes a standardized "after-sales process" — regardless of whether the degradation was caused by quantization, pruning, or format conversion, it all gets handed to the same LoRA rescue routine to realign back to the reference model. The source of degradation gets abstracted away; what remains is a single unified problem: "the offset between a target model and a reference model."
+
+* Takeaways
+
+For thinking about "how to do research and how to find problems," this line of work offers a very practical paradigm: *when a goal (lossless compression) becomes progressively harder to advance within a single step, splitting it into "manufacture controlled damage + cheap repair" two stages is often more cost-effective than grinding away at the single step.*
+
+The original Recover-LoRA also demonstrates a nose for finding problems: when everyone in the world is staring at "accuracy loss caused by quantization," it asked "is quantization the only source of accuracy loss?" — and discovered that deployment-side steps like serialization can equally corrupt a model, opening up the larger aperture of "universal degradation rescue." Finding new problems sometimes means not drilling deeper in the same direction, but dismantling a premise everyone else takes for granted ("degradation = quantization") and looking at what is inside.
+
+The practical landing point: when doing model deployment, you no longer need to chase a quantization algorithm that is perfectly lossless on its own — you can *boldly apply the simplest low-bit quantization, and even go hard on only a subset of layers*, pocket the throughput gains first, then use a LoRA rescue step with just 10k synthetic samples and near-zero cost to recover the accuracy. Treat "losslessness" as the output of a pipeline, not as a prerequisite for the quantization step itself.

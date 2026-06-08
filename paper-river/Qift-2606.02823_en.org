@@ -1,0 +1,185 @@
+#+title:      Qift: Shift-Friendly No-Zero W2 Post-Training Quantization for Rotated W2A4/KV4 LLM Inference
+#+date:       [2026-06-08 Mon 02:33]
+#+filetags:   :paper:river:en:
+#+identifier: 20260608T023341-en
+#+source:     https://arxiv.org/abs/2606.02823
+#+authors:    Chi-Wei Huang, Chia-Chi Tsai (National Cheng Kung University)
+#+venue:      arXiv preprint, 2026-06
+
+* The Problem River
+
+One sentence: when you only have 4 values to represent a weight (2-bit), where should those 4 values go?
+
+Large models during decoding are "memory-bandwidth-bound" — the bottleneck is not computation but hauling weights and KV cache out of GPU memory. Bit-width of weights therefore directly determines throughput. 4-bit (W4A4) is nearly lossless; 3-bit is usable; but pushing down to 2-bit (W2A4) — an 8× compression over FP16 — frequently causes the model to collapse entirely.
+
+The crux of the difficulty: 4-bit has 16 levels, 2-bit has only 4. Spending one of 16 levels on "0" is harmless; spending one of 4 levels on 0 throws away 25% of representational capacity. Yet the standard level set everyone uses, {-2, -1, 0, +1}, pins exactly one level at zero — inherited wholesale from 8-bit/4-bit integer quantization, never designed for "2-bit post-rotation weights." Generation after generation has tweaked other components (rotation, compensation, codebooks) while leaving those 4 point positions untouched.
+
+* Source Map
+
+#+begin_example
+[Root] Symmetric integer quantizer SYM-INT  {-2, -1, 0, +1}
+  |   Level set inherited from 8/4-bit; mid-tread style; one level pinned at 0
+  |
+  | Problem: given fixed levels, how do you minimize quantization error?
+  v
+[2022] GPTQ  -  Hessian-approximate column-wise compensation
+  |   Only "patches" error for a given level set; does not decide where levels go
+  |
+  | Problem: outlier channels in weights collapse under low-bit quantization
+  v
+[2024] QuaRot  -  Hadamard rotation, outlier-free 4-bit
+  |   Spreads per-channel outlier energy; distribution becomes more Gaussian;
+  |   W4A4 is nearly lossless.
+  |   (SpinQuant follows the same rotation line: learns the rotation matrix)
+  |
+  | Problem: rotation fixes the distribution, but the 4 levels stay legacy;
+  |          pushing to W2A4 still collapses
+  v
+[2025] RCP (Rotate, Clip, Partition)  -  learns non-uniform W2 levels (QAT)
+  |   First work to run W2A4KV4: rotation + clipping + learnable direct partition
+  |   (NF4/Lloyd-Max provide theoretical reference for "distribution-matched levels")
+  |
+  | Problem: requires training, learning codebooks, complexity;
+  |          can we just place the 4 points correctly without any training?
+  v
+[2026] Qift  <--- this paper
+        Rotated weights are near-zero-centered + Gaussianized
+        => fixed no-zero levels {+/-0.5, +/-1.5}
+        Training-free, codebook-free, zero-point-free;
+        a drop-in replacement for the standard level set
+#+end_example
+
+Note: the direct targets of criticism/comparison in this paper are "the inherited SYM-INT levels" and "RCP's learnable route." QuaRot/SpinQuant are the rotation pipelines it reuses (complementary, not targets of criticism). NF4 (QLoRA) and Lloyd-Max are the theoretical references it cites for "distribution-matched level placement." All these citation relationships are explicitly attributed in the paper's Related Work section.
+
+* Evolutionary Narrative
+
+** Root | SYM-INT: Round weights to {-2, -1, 0, +1}
+
+*** What problem it saw
+
+The most basic requirement: pack a 16-bit float weight into 2 bits. The most natural approach is to follow the integer-quantization playbook — pick a per-channel scale s, divide the weight by s, round, and clamp to 4 integer codes. At 2-bit those 4 codes are {-2, -1, 0, +1}; multiply back by s and you get 4 reconstruction levels.
+
+*** Its solution
+
+A symmetric integer grid: simple, regular, and hardware-friendly. Key feature: it is "mid-tread" — 0 is a genuine reconstruction level, placed at the center. With 8-bit (256 levels) this is completely fine.
+
+*** Why it worked — and where the buried trap was
+
+When levels are plentiful, one zero level costs almost nothing no matter where it sits. The trap was buried here: this grid was carried over unchanged into 2-bit. But with only 4 levels, pinning one of them at 0 is a weighty decision, not a neutral default. Every subsequent work inherited this silently without questioning it — until rotation fundamentally changed the weight distribution and exposed that "pinned-at-0" as a fatal flaw.
+
+** 2022 | GPTQ: Compensate the error given fixed levels
+
+*** What problem it saw
+
+Rounding each weight independently (RTN) generates per-weight errors that accumulate across an entire layer, biasing the final output. GPTQ observed that errors should not be independent: later weights should "compensate" for the bias already introduced by earlier quantized weights.
+
+*** Its solution
+
+Estimate a Hessian (approximately) from calibration data, quantize column by column, and after each column is quantized, propagate the error it introduced — weighted by the Hessian — onto the remaining unquantized columns. GPTAQ is its upgrade, adding activation-aware asymmetric calibration.
+
+*** Why it worked — and where the buried trap was
+
+GPTQ pushes reconstruction error, for a given set of levels, very close to the floor; it became the standard compensation component for low-bit quantization. But Qift identifies its blind spot: GPTQ performs optimal compensation over whatever 4 levels you hand it — *it never questions whether those 4 levels are in the right place to begin with*. If the level positions are wrong (e.g., one is wasted at 0), no amount of clever compensation can recover the loss. The paper offers a stark piece of evidence: under pure W2A4, LLaMA-3.1-8B with standard levels + GPTQ collapses to 3005 PPL — compensation fully engaged, yet unable to rescue a wrong level set.
+
+** 2024 | QuaRot: Rotate away the outliers
+
+*** What problem it saw
+
+A small number of "outlier channels" in weights and activations have absurdly large magnitudes. Under low-bit quantization the scale factor is pulled up by these large values, squeezing all the normal values into very few levels and destroying precision. GPTQ-style compensation treats the symptom; the outliers remain.
+
+*** Its solution
+
+Apply a Hadamard matrix as an orthogonal rotation to both weights and activations. The rotation does not change the network's mathematical output (computational invariance), but it "spreads" energy concentrated in individual outlier channels across all dimensions. Result: the distribution's tails flatten and the overall shape becomes more Gaussian. SpinQuant extends the same line by learning the rotation matrix rather than using a fixed Hadamard. W4A4 under this rotation pipeline is nearly lossless.
+
+*** Why it worked — and where the buried trap was
+
+Rotation improved the "source distribution" — this is the foundation on which Qift's entire argument rests. But QuaRot changed the distribution without touching the quantizer: after rotation those 4 scalar levels are still {-2, -1, 0, +1}, inherited from SYM-INT. A subtle mismatch then emerges: you laboriously rotate the distribution into a near-zero-centered Gaussian, yet still quantize it with a grid that "pins a level at 0." At 4-bit, the level abundance masks this mismatch; pushed to W2A4, the mismatch amplifies into a collapse. The next work must directly answer: after rotation, exactly where should those 4 points go?
+
+** 2025 | RCP: Just learn the levels
+
+*** What problem it saw
+
+RCP (Rotate, Clip, Partition) and Qift share the same target — W2A4KV4. Its diagnosis is precisely the mismatch described above: using uniform integer levels after rotation is insufficient. Its judgment: since the post-rotation weight distribution is non-uniform, the levels should also be non-uniform, and ideally the model should learn the optimal non-uniform partition itself.
+
+*** Its solution
+
+Rotation + rotation-aware clipping + "Learnable Direct Partition" (LDP): introduce learnable parameters, train them together with the weights, and directly learn non-uniform quantization intervals. It was the first work to truly run W2A4KV4 (LLaMA-2-7B with only 2.84 PPL degradation), and it includes a GPU kernel supporting non-uniform W2.
+
+*** Why it worked — and where the buried trap was
+
+Adapting levels to the distribution is naturally better than a fixed uniform grid. But the cost is: quantization-aware training (QAT) is required, codebook/partition parameters must be learned, and rotation makes weights more sensitive to hyperparameters and harder to tune. This leaves a very specific opening for Qift: *does training really have to happen?* If the post-rotation distribution has a simple, predictable shape, maybe you don't need to learn anything — just write down 4 correctly-placed points and call it done.
+
+** 2026 | Qift: The rotation makes the distribution Gaussian, so don't waste a level on 0
+
+*** What problem it saw
+
+Qift fills in the step everyone before it skipped: it actually measures what post-rotation weights look like. The finding has two parts — (1) pre-trained weights are already nearly zero-centered; and (2) Hadamard rotation mainly makes the "standardized shape" more Gaussian (across 224 linear modules, excess kurtosis drops 99%, Q-Q error drops 99%), while *barely changing the zero-centeredness*. 
+
+In other words: post-rotation weights = a near-zero-centered, light-tailed, Gaussian-like source. For such a source, classical Lloyd-Max scalar quantization theory has long given the answer — the 4 optimal levels should be "two inner points near 0 and two outer points in the tails," *with none at 0*. Standard SYM-INT does the opposite: it pins one level exactly at 0, leaving a gap precisely where the density is highest.
+
+*** Its solution
+
+Continuously deform SYM-INT into Qift: remove the level pinned at 0, redistribute the remaining points according to Gaussian density, and you get the primary level set *MNZ (mirror no-zero) = {-1.5, -0.5, +0.5, +1.5}* — two inner points ±0.5 cover the dense center, two outer points ±1.5 handle the tails. There is also a power-of-two variant *PoT-MNZ = {-4, -1, +1, +4}* to enable "shift-based decoding" in hardware.
+
+The key is restraint: levels are globally fixed, shared across all layers, standard per-channel scale is retained, no codebook is learned, no grouping, no zero-point stored. It is therefore a "training-free, drop-in replacement" component, not a new quantizer. The paper further identifies the true design knob as the "inner/outer level ratio r" — useful grids all fall in the band r ≈ 0.25–0.33 (MNZ, Lloyd, NF2, and PoT-MNZ all lie inside; Far-MNZ {±1, ±2}, which places inner points too far out, lies outside and is ineffective).
+
+*** Why it worked — and where buried traps remain
+
+The intuition: first rotate the distribution into a known shape (Gaussian); once the shape is known, the optimal levels become a table-lookup problem — no learning needed. The evidence chain is clean: under pure W2A4, LLaMA-2-7B PPL drops from SYM-INT's 53.8 (with GPTQ) to MNZ's 20.3; LLaMA-3.1-8B drops from the catastrophic 3005 PPL to 34.4. Ablations confirm the gain comes from "getting the inner/outer ratio right," not from "removing zero" per se.
+
+Remaining traps: (1) r is treated as a hand-selected constant within a good band rather than truly optimized, with no co-design against KV cache level placement; (2) the rotation pipeline (QuaRot-style Hadamard) is a prerequisite — without rotation the no-zero grid may not hold up; (3) even so, L=16 mixed-precision only closes about half the gap to W3A4 — the physical ceiling of 2-bit is still there.
+
+* Frontier Extensions
+
+As of now (June 2026), Qift is the latest paper on the "post-rotation 2-bit level-set design" line. No public follow-up critiques or improvements have appeared yet.
+
+Likely next steps (speculation, not conclusions already in the paper):
+- Turn the inner/outer ratio r from "hand-selected within a good band" into "searchable/learnable" while remaining training-free;
+- Apply the same "source-aware level design" philosophy from weights to KV cache 4-bit levels;
+- Converge with RCP's learnable route — use Qift's fixed grid as initialization, then lightweight fine-tune, balancing "training-free" against "adaptive."
+
+* One-Figure Summary
+
+#+begin_example
+  Dimension \ Time  2022         2024          2025           2026
+  ------------------+-----------+-------------+--------------+---------------
+  What is changed   | Compensate  Rotate dist.  Learn levels   Reposition levels
+                    | GPTQ        QuaRot/Spin   RCP            Qift
+  ------------------+-----------+-------------+--------------+---------------
+  Attitude toward   | Unchanged   Unchanged     Learned (QAT)  Fixed, relocated
+  the 4 levels      | (inherited) (inherited)   non-uniform    no-zero {+-.5,+-1.5}
+  ------------------+-----------+-------------+--------------+---------------
+  Requires training?| No (calib.) No (calib.)   Yes (QAT)     No (training-free)
+  ------------------+-----------+-------------+--------------+---------------
+  W2A4 result       | Collapse    Still collapse Works          Works, training-free
+                    | 3005 PPL   (level mismatch) complex      53.8->20.3
+
+  Main thread: the "source distribution" kept improving (rotation), but the
+  "4 levels" never caught up ---- RCP chased with "learning," Qift realized
+  the post-rotation distribution is already Gaussian and simply "looked up the answer."
+  Cognitive shift: quantization error is not just a bit-width problem; it is a
+  geometric problem of where the reconstruction levels are placed.
+#+end_example
+
+* Insights
+
+On the surface this line of work is "W2 quantization keeps getting better." What is actually happening underneath is a *shift in attribution*:
+
+- Early on, everyone assumed "2-bit collapses because there are too few bits" — so they added compensation (GPTQ), changed the distribution (QuaRot), added bits (mixed precision).
+- Qift flips the attribution: inside a rotation pipeline, the primary reason for collapse is not bit-width but *the 4 reconstruction levels being placed in the wrong positions*. Same 2 bits, just swap {-2, -1, 0, +1} for {-1.5, -0.5, +0.5, +1.5}, and PPL drops from 53.8 to 20.3 — not a single extra bit spent.
+
+At a deeper level, this is the "first standardize the distribution, then the problem degenerates into a table lookup" mindset. QuaRot rotated weights toward near-Gaussian originally to handle outliers; Qift discovered that this simultaneously transformed "what levels to use" from an unknown optimization problem into a classical Lloyd-Max solution under a known distribution. *A byproduct of the previous step became the foundation of the next.* This is also why Qift can be training-free — the distribution is known, so the optimal solution is already on the shelf.
+
+Another counter-intuitive point: "removing the zero level" is not itself the key — "getting the inner/outer ratio right (r ≈ 0.25–0.33)" is. Far-MNZ also removes zero yet fails, because the inner points are placed too far out. The lesson: when you find that a simple change works, the variable actually doing the work is often not the one you noticed first.
+
+* Takeaways
+
+On "how to do research":
+
+1. *Go dig up the oldest default.* Everyone in this line kept modifying new components (compensation, rotation, codebooks), while those 4 levels — inherited from 8-bit and never questioned — remained an "ancestral default." The biggest gaps tend to hide where "nobody thought to change it" — especially when an upstream change (rotation) has quietly invalidated the premise, making the old downstream default entirely stale.
+
+2. *Measure first, then design.* Qift's entire confidence rests on one plain empirical act: it actually measured post-rotation weight kurtosis, skewness, and zero-centeredness (224 modules, 32 layers). The fact — measured, not assumed — that "post-rotation weights are near-zero-centered Gaussian" directly dictated where the levels should go. Others skipped this step and therefore had to use learning to approximate an answer that could have been directly computed.
+
+3. *A simple training-free solution is the best challenge to a complex one.* RCP uses QAT to learn non-uniform levels; Qift uses a set of hard-coded constants to approach similar results. When a field starts piling on training, codebooks, and parameters, asking "does this distribution actually have simple structure so I don't need to learn anything?" often yields a solution that is both cheap and deployable.
+
+The practical bottom line: whenever you are doing any task of "compressing continuous values into a small set of discrete levels" (not just weight quantization — also binning, sampling, codebook design), the first step should not be "bring in a stronger learner." It should be "standardize the distribution first, measure its shape clearly, then look up where the optimal levels should go." Getting the placement right is often worth more than increasing the budget.
