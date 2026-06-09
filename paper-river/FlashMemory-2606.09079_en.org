@@ -1,0 +1,275 @@
+#+title:      FlashMemory-DeepSeek-V4: Lightning Index Ultra-Long Context via Lookahead Sparse Attention
+#+date:       [2026-06-09 Tue 00:05]
+#+filetags:   :paper:river:en:
+#+identifier: 20260609T000556-en
+#+source:     https://arxiv.org/abs/2606.09079
+#+authors:    Yan Wang, Qifan Zhang, Jiachen Yu, Tian Liang, Dongyang Ma, Xiang Hu, Zibo Lin, Chunyang Li, Zhichao Wang, Jia Li, Yujiu Yang, Haitao Mi, Dong Yu
+#+venue:      arXiv 2606.09079 (cs.LG), Tencent AI Lab Technical Report, Jun 2026
+
+* The River of the Problem
+
+When running inference on a long-context LLM, the most expensive thing is not compute — it is the KV cache sitting in GPU memory. Ask the model to read a 500K-token document, and it must keep all 500K tokens' Keys and Values pinned in GPU memory, because the next generated word might need to look back at any one of them. Every time the sequence doubles in length, the cache doubles too — on an 8-GPU H20 server, the KV cache alone can consume dozens of gigabytes, heavier than the model weights themselves.
+
+The entire research thread, spanning seven or eight years, has been wrestling with this *linear growth*. But the angle of attack has kept shifting, and the direction of that shift is telling:
+
+- At first, people thought: "store each token more compactly" (compression);
+- Then: "attend to fewer tokens during computation" (sparsity);
+- Then: "only compute the truly important ones" (trainable sparsity);
+- And in this paper, the question is asked anew: *why, when decoding the current token, must the entire history live in GPU memory?*
+
+The sharpest contribution of this paper (FlashMemory-DeepSeek-V4, method: Lookahead Sparse Attention, LSA) is a single empirical observation it amplifies: *in real requests exceeding 64K context, over 90% can be answered correctly using only the last 8K tokens*. In other words, the vast majority of GPU memory is pinned to "history that is simply not needed right now." So — can the history be moved to CPU, and *predictively* fetched back on demand?
+
+This quietly transforms an "attention-mechanism problem" into a "retrieval-system problem."
+
+* The Source Map
+
+#+begin_example
+[2024-05] DeepSeek-V2 - MLA (Multi-head Latent Attention)
+  |
+  | Problem seen: MHA must cache 2*n_h*d_h KV elements per token — too large;
+  |               MQA/GQA reduce head count to save memory but hurt quality.
+  | Solution: Don't ask "how many heads to cut" — ask "why store full-rank KV."
+  |           Jointly compress each token's K and V into a low-rank latent
+  |           vector c (dim d_c << n_h·d_h); cache only this latent.
+  |           (KV cache reduced by 93%)
+  v
+[2023-2024] Eviction line: H2O / StreamingLLM etc. (side branch, training-free)
+  |
+  | Problem seen: Compression still keeps every token. Can we just drop some?
+  | Solution: Permanently evict tokens by importance (H2O: cumulative attention)
+  |           or position (StreamingLLM: sink + recent window).
+  | Holes left: Permanent eviction = information gone forever; global tasks break.
+  |             Also a post-hoc heuristic bolted on after training — the model
+  |             never learned to work under sparsity.
+  v
+[2025-02] DeepSeek NSA - Native Sparse Attention
+  |
+  | Problem seen: Post-hoc sparsity means the model trained on dense attention
+  |               but is deployed sparse — distribution mismatch, no quality
+  |               guarantee. Also, many sparse implementations don't actually
+  |               run fast on GPU due to non-contiguous memory access.
+  | Solution: Make sparsity natively trainable end-to-end — three parallel
+  |           branches (coarse-grained compression + fine-grained block
+  |           selection + sliding window), pretrained from scratch, block
+  |           selection hardware-aligned.
+  v
+[2025-09] DeepSeek-V3.2 - DSA (DeepSeek Sparse Attention)
+  |
+  | Problem seen: NSA requires pretraining from scratch — too expensive.
+  |               Can we graft sparsity onto an existing model via continued training?
+  | Solution: A tiny FP8 "Lightning Indexer" scores relevance of every history
+  |           token for each query, then top-k (k=2048) selects tokens, reducing
+  |           attention complexity from O(L^2) to O(Lk). The indexer is trained
+  |           via self-distillation alongside the main trunk.
+  v
+[2026-06] FlashMemory-DeepSeek-V4 - LSA (this paper)
+  |
+  | Problem seen: DSA made "whom to attend to" sparse, but *all KV still lives
+  |               in GPU memory*. When decoding the current token, 90% of history
+  |               is never touched, yet wastes GPU memory.
+  | Solution: Repurpose the indexer from an "in-model scorer" into a standalone
+  |           retrieval system (Memory Indexer). All KV moves to a CPU cold pool;
+  |           every τ=64 steps, the indexer *predicts* which chunks will be needed
+  |           in the coming window and prefetches only those to GPU.
+  |           The indexer is trained independently as a dual-tower retrieval model
+  |           (BCE loss); the main trunk never touches GPU during training.
+#+end_example
+
+Notes (honesty labels):
+- *Verifiable parts*: MLA (arXiv:2405.04434), StreamingLLM (arXiv:2309.17453)/H2O, NSA (arXiv:2502.11089, ACL 2025 Best Paper), DSA/DeepSeek-V3.2 (2025-09) are all publicly verifiable works; the evolutionary relationships among them are explicitly stated in the paper.
+- *Parts that cannot be independently verified*: This paper (2606.09079) and the "DeepSeek-V4" base model it depends on cannot be independently confirmed as real at the time of writing (dated 2026-06, and the paper notes the project has been suspended due to organizational changes). The narrative below follows the paper's own account; its stated inheritance from DSA / MLA is clearly written out and consistent with the verified chain above.
+
+* The Evolutionary Narrative
+
+** 2024 | MLA: Don't Ask "How Many Heads to Cut" — Ask "Why Store Full-Rank KV"
+
+*** What problem it saw
+
+During inference, standard multi-head attention (MHA) requires caching every head's Key and Value for every token — the next token's query must dot-product against all historical Ks. As sequences grow longer, this cache explodes linearly.
+
+Prior work (MQA, GQA) took the angle of "share K/V across multiple heads," storing fewer copies. But sharing is lossy: heads originally each attend to their own positions; forcing them to merge degrades quality. This is a path of trading quality for memory.
+
+*** Its solution
+
+DeepSeek stepped back and asked a different question: *why do we need to store complete, high-dimensional K and V at all?*
+
+MLA jointly projects each token's K and V into a single low-dimensional latent vector c (dimension d_c much smaller than n_h·d_h), caching *only this latent*. When needed, the up-projection matrices reconstruct K and V. Combined with "weight absorption" (the up-projection can be pre-fused into the Q projection and output projection), reconstruction costs nearly nothing extra.
+
+*** Why it works — and where it digs a new hole
+
+Low-rank compression captures a real fact: the genuinely useful information dimensions in K/V are far fewer than their nominal dimensionality. Compressing to a latent loses little, and with a tighter representation the measured quality actually slightly exceeds MHA — while KV cache drops by 93% and throughput grows to 5.76×.
+
+But notice: MLA changes *how large each token's storage is* — it lowers the slope without changing the fact that *every token still gets stored*. The cache remains O(L). Read 500K tokens and you still have 500K (smaller) latents pinned to GPU. MLA pushed the linear-growth wall further away; it didn't knock it down.
+
+** 2023-2024 | The Eviction Line (H2O / StreamingLLM): Just Drop Tokens — But They Don't Come Back
+
+*** What problem it saw
+
+If storing every token is too expensive, the most direct instinct is: *don't store all of them — drop some*.
+
+*** Its solution
+
+Two philosophies. H2O looks at content: maintain a cumulative attention score per token, keep only the "heavy hitters" that are repeatedly attended to. StreamingLLM looks at position: it discovers that the very first few tokens are always heavily attended to ("attention sink," a positional artifact induced by softmax normalization), so it keeps the sink tokens plus a recent sliding window, dropping everything in between.
+
+*** Why it works — and where it digs a new hole
+
+These methods are cheap, training-free, and plug-and-play; in streaming dialogue they can hold memory to a constant.
+
+But they leave a large hole that this paper will directly inherit: *permanent eviction*. Once a token is dropped, its information is gone forever. For global tasks like "read a contract at the beginning, verify a clause at the end," the evicted middle tokens are exactly where the answer lives. And since this is a post-hoc heuristic applied after training, the model never learned to work under sparsity — it is forcibly clamped sparse.
+
+These two holes — "dropped tokens can't come back" and "the model never learned sparsity" — are each picked up by the two papers that follow.
+
+** 2025-02 | NSA: Make Sparsity Natively Trainable, Not Bolted On After the Fact
+
+*** What problem it saw
+
+The eviction line's sparsity is hard-imposed at inference time: the model trained on dense full attention but is deployed sparse — a distribution mismatch with no quality guarantee. NSA also points out a second issue: many sparse methods theoretically save FLOPs but don't actually run faster on GPU because of non-contiguous memory access patterns.
+
+*** Its solution
+
+Make sparsity an *inherent, end-to-end trainable* part of the model. Each query runs through three parallel branches:
+
+1. *Coarse-grained compression*: compress groups of tokens into summaries to see the global outline;
+2. *Fine-grained selection*: compute importance scores and select the most relevant tokens in *blocks*;
+3. *Sliding window*: preserve local context.
+
+The key insight is "block selection" — not picking token by token, but selecting spatially contiguous blocks, because modern GPUs deliver far higher throughput for contiguous memory access (hardware alignment). The entire mechanism is present from pretraining; the model learns from the start to work under sparsity.
+
+*** Why it works — and where it digs a new hole
+
+"Natively trainable" fills the eviction line's hole of "the model never learned sparsity": on a 27B model, NSA's loss is even slightly lower than full attention, with end-to-end speedups in forward pass, backward pass, and decoding on 64K sequences. It proves that sparsity need not trade quality.
+
+The new hole is its *weight*: NSA is a *pretraining-time architecture*, trained jointly with the main trunk from scratch. If you want to add sparsity to an existing well-trained model, NSA can't help — you must retrain from scratch at enormous cost.
+
+** 2025-09 | DSA: Continued-Train a "Lightning Indexer" onto an Existing Model
+
+*** What problem it saw
+
+NSA is too heavy, requiring pretraining from scratch. DeepSeek-V3.2 wanted to take the existing V3.1 and *continue-train* it to gain sparsity.
+
+*** Its solution
+
+DSA splits into two components:
+
+1. *Lightning Indexer*: a lightweight FP8 scorer that rapidly computes relevance scores for all history tokens given each query;
+2. *Top-k token selector*: retains only the k highest-scoring tokens (k=2048 in the open release), masking the rest in the attention computation.
+
+Complexity drops from O(L²) to O(Lk). The indexer is trained end-to-end alongside the main trunk via self-distillation, as the sole architectural change when continued-training from V3.1. This is the first point in the line where a dedicated "lightweight token-selection module" appears.
+
+*** Why it works — and where it digs a new hole
+
+Delegating "which tokens to attend to" to a cheap indexer avoids pretraining from scratch (far lighter than NSA) while preserving quality (virtually no quality drop at 128K; long-context API cost halved).
+
+But it leaves the hole this paper will pry open: *DSA made "whom to compute" sparse, yet all KV still lives on GPU*. The indexer only decides which tokens participate in the dot-product; the K/V of masked-out tokens still occupies GPU memory. DSA saves *compute*, not *memory residency*. At decoding step 500K, the current token may only depend on the last 8K tokens, yet the KV of the preceding 492K tokens sits in GPU memory doing nothing.
+
+Furthermore, the indexer is *trained together with the hundred-billion-parameter trunk* — tuning it means loading the entire behemoth onto GPU, making research iteration extremely slow.
+
+** 2026-06 | LSA: Repurpose the Indexer from "Scorer" to "Retrieval System"
+
+*** What problem it saw
+
+This paper first quantifies DSA's hole into a striking single sentence: *over 90% of long-context requests can be answered correctly using only the last 8K tokens*. That means the vast majority of GPU memory is pinned to "history that is completely unused at this moment" — decoding the current token is *independent* of most of its history.
+
+It simultaneously names the opposite problem: that remaining 10% of tasks that genuinely require global synthesis will completely collapse under a pure sliding window (keeping only recent context). The contradiction is forced into the open: *support deep global reasoning without paying full GPU memory tax at every local decoding step*. DSA doesn't resolve this — its KV still fully resides on GPU.
+
+*** Its solution
+
+Take DSA's Lightning Indexer and *repurpose it in place into a standalone retrieval system*, called the Memory Indexer. Three key transformations continuously shift "in-model scoring" into "retrieval recall":
+
+1. *KV sinks to a CPU cold pool.* Historical compressed KV (reusing V4's 128:1 high-compression HCA chunks) no longer resides on GPU; it moves to CPU. GPU retains only the sliding window plus whichever chunks are currently recalled.
+2. *Predictive lookahead recall.* Rather than selecting at every step, it triggers every τ=64 steps: the indexer takes the hidden states of the current query and *predicts which historical chunks will be needed over the upcoming 64-step window*, prefetching only those from CPU to GPU ahead of time. "Passively attending to all history" becomes "actively predicting future need."
+3. *Sigmoid + threshold replaces top-k.* DSA uses ReLU scoring + fixed top-k; LSA replaces the final activation with Sigmoid, mapping scores to (0,1), then uses a threshold (≥0.5) to recall a *dynamically sized* set of chunks — more when needed, fewer when not, rather than a rigid fixed-k.
+
+The most elegant piece is *training decoupling*. Since the historical compressed index keys K^IComp are precomputed and frozen at training time, the indexer reduces to a standard *dual-tower retrieval model* query encoder — only a few low-rank projection matrices (W^DQ, W^IUQ, W^w) need to be trained, using precomputed hidden states and labels, optimized under a retrieval objective (BCE / Focal Loss, 3:1 negative sampling). *The hundred-billion-parameter trunk never touches GPU.* Result: the entire indexer converges on *a single H20 GPU in one hour*; roughly 500 configuration searches can complete on 8 GPUs within one week.
+
+How are labels generated? With care: run offline on the frozen trunk, then for each token in the future window, at each layer, apply three-step denoising — "Softmax normalization → top-p(0.6) threshold → cross-layer majority voting (≥3 layers consensus)" — to distill the "gold-standard" recall set. This is necessary to remove the nearly ten thousand noisy positive samples that hard top-k selection introduces.
+
+Final production configuration: place independent indexers at layers 10, 12, and 20 (Pareto-optimal sweet spots found by sweeping), and at inference time take the *union (OR routing)* across the three layers — any layer scoring ≥0.5 triggers recall, forming a robust recall safety net.
+
+*** Why it works — and where it digs new holes
+
+The core shift: this line moves entirely from "working inside the attention mechanism" to *working as a retrieval system*. LSA calls itself an "attention denoiser" — it doesn't just save memory, it keeps thousands of irrelevant historical chunks off the GPU entirely, which incidentally reduces hallucination. Empirical results: on average only 13.5% of full KV memory is used (86.5% reduction), while downstream accuracy *slightly increases* by 0.6 percentage points; at 500K scale, memory drops 90%. "Less is more."
+
+But the paper (in its Limitations section, admirably candid) lays out several new holes, each pointing to the next step:
+
+1. *Context-free tasks can't compress to constant memory.* The expectation was that Sigmoid gating would naturally recall near-zero chunks for queries not dependent on history, achieving O(1) memory. In practice, Sigmoid gates leak slight background false positives at very long sequences — from 125K to 500K, the physical chunk footprint actually expands ~2.5×.
+2. *Dense global memory tasks break (MRCR failure).* On MRCR, which genuinely requires drawing on large amounts of history, accuracy plunges from 76% to 48%. Oracle experiments show that even supplying 50% of the true gold-standard chunks still leaves accuracy ~2% below full attention — the architecture structurally cannot handle "dense global dependencies."
+3. *Frozen keys + shallow interaction.* To save compute, the historical compressed keys K^IComp are frozen throughout, never fine-tuned; the indexer relies only on coarse 64-step dot-product similarity without ColBERT-style *late-interaction* token-level cross-matching, unable to resolve complex dense retrieval patterns.
+4. *Decoupled training ignores autoregressive drift.* The indexer and trunk are not jointly optimized; static pseudo-labels are used without modeling the distribution drift that occurs during online decoding.
+5. *Length generalization ceiling.* The expectation was that point-to-point chunk matching would generalize from shorter training lengths to 1M+; in practice safe extrapolation is limited to *2× the training length*, beyond which performance degrades toward near-random selection (positional encoding OOD). The final model therefore only claims to support up to 512K.
+
+* Frontier Extensions
+
+As of June 2026, LSA / "treating the indexer as a retrieval system" represents the latest publicly available development along this line, and the project itself has (per the paper) been suspended due to organizational changes. The paper lays out the subsequent roadmap quite explicitly — it is essentially a plan to fill each of the five holes above:
+
+1. *Late-interaction indexer*: replace the current 64-step coarse dot-product with ColBERT-style token-level cross-matching to handle dense retrieval cases like MRCR (addressing holes 2 and 3).
+2. *End-to-end joint optimization*: jointly train the indexer with the main trunk to model autoregressive drift and move beyond static pseudo-labels (addressing hole 4).
+3. *Positional encoding length extrapolation*: resolve OOD position embeddings and break through the 2× training-length ceiling (addressing hole 5).
+4. *Constant-memory gating*: make context-free queries truly recall near-zero chunks, achieving an O(1) memory floor (addressing hole 1).
+
+The larger open question is: once "treating KV as externally retrievable storage" is an established framework, will it compose with the orthogonal compression axis (MLA low-rank latent) and quantization axis (FP8 KV)? The paper already stacks HCA 128:1 compression with LSA retrieval, but a system stacking all three axes remains unbuilt.
+
+* A Single Diagram
+
+#+begin_example
+              What is saved                     Where KV lives    Granularity of selection
+              =============                     ==============    ========================
+
+2024  MLA          Per-token storage size         All on GPU        No selection (keep all, compress smaller)
+                   (low-rank latent, lower slope)
+
+2023  H2O/         Which tokens to keep           GPU (survivors)   Permanent eviction (no return)
+2024  StreamingLLM (heuristic, training-free)
+
+2025  NSA          Whom to compute                All on GPU        Block selection (learned during pretraining)
+                   (natively trainable)
+                   compression+selection+window
+
+2025  DSA          Whom to compute                *All on GPU*      top-k tokens (k=2048)
+                   (lightweight indexer,           ↑ compute is sparse
+                   continued training)               memory unchanged
+                   O(L^2)->O(Lk)
+
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                  (All four prior generations keep KV on GPU — just store smaller / compute less)
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2026  LSA          *Whether KV lives on GPU*       KV sinks to CPU   Sigmoid + threshold
+      (this paper) Predictive recall every τ=64   GPU holds only    (dynamic count, retrieval recall)
+                   Indexer = standalone dual-tower recalled chunks
+                   retrieval model; trunk never
+                   touches GPU; trains in 1 H20-hour
+
+
+Key insight: The implicit constraint shared by all four prior generations is
+             "history must reside in GPU memory."
+             LSA breaks it — since 90% of steps don't use history,
+             move history to CPU and "retrieve" it when needed.
+             Attention problem → retrieval problem.
+#+end_example
+
+* Insights
+
+Reading through this line, the surface story is "KV keeps getting cheaper," but what is actually happening underneath is that *the problem is reclassified three times*:
+
+- *MLA era*: This is a "representation" problem — KV is too large, so compress it smaller. The axis is *bytes per token*.
+- *NSA / DSA era*: This is a "computation" problem — attention is sparse, so only compute the important parts. The axis is *number of tokens participating in dot-product*.
+- *LSA era*: This is a "systems / retrieval" problem — history isn't needed right now, so don't put it on GPU; fetch it when needed. The axis is *what must reside in fast storage*.
+
+Each jump is not a further depression of the previous generation's curve — it is *a change in the quantity being optimized*. MLA, while compressing bytes, assumed "every token must be on GPU." DSA, while reducing computation, still assumed "KV must be on GPU." LSA's lever is precisely to take that *constraint assumed by everyone and questioned by no one* — "history must reside in GPU memory" — and break it. It doesn't even invent a new scorer; it simply *reframes* DSA's existing Lightning Indexer as the query encoder of a retrieval system. Once the framing changes, the entire mature retrieval engineering toolkit (dual-tower, BCE, negative sampling, decoupled training) becomes instantly applicable — which is the real reason it can "train to convergence in one GPU hour on a single card."
+
+The underlying pattern is strikingly consistent with the eviction line: *when a field's improvement curve starts flattening, it is often not because everyone is approaching the optimum, but because everyone shares the same implicit constraint*. What breaks the ceiling is not a more refined algorithm — it is *identifying and removing that constraint*. MLA→DSA removed "full-rank storage" and "dense computation"; LSA removes "GPU residency."
+
+What is the next implicit constraint waiting to be removed? My guess is *"KV is passive storage that can only be retrieved."* Today, historical chunks, once compressed, are frozen — they can be queried but not rewritten, not merged (the paper's hole 3 is precisely the frozen keys). If someday someone enables the cold-pool history to *be rewritten online, aggregated into higher-level summaries* (the way the brain consolidates short-term memory into long-term memory), then KV cache transforms from "storage" into "evolvable memory" — and that would likely be another reclassification jump. The word "Memory" in the paper's title, and the "infinite long-context" that was being aimed for before the project was suspended, are probably betting on exactly that direction.
+
+* Takeaways
+
+1. *To find a breakthrough, first list "what quantity everyone is optimizing," then ask "what fixed constraint does that quantity take for granted."* Across five generations, this line optimized three different quantities (bytes → token count → residency set), and each jump came from questioning the constant that the previous generation left unquestioned. MLA never touched "GPU residency." DSA didn't either. LSA did — which means: *the dimension that the previous generation saved on is precisely the one that defines what it never dared to move, and that is where the next lever lives*.
+
+2. *The most valuable innovations are often "reframing an existing component," not inventing a new one.* LSA builds no new scorer; it *reclassifies* DSA's Lightning Indexer as the query tower of a retrieval system. Once the classification changes, the entire mature retrieval engineering stack (dual-tower, BCE, negative sampling, decoupled training) becomes instantly available — and that is the real reason it can train to convergence on a single card in one hour.
+
+3. *The gains from decoupling go far beyond cost savings.* Detaching the indexer from the main trunk ostensibly saves memory (the hundred-billion-parameter trunk never touches GPU), but what is actually gained is *research velocity* — 500 configuration runs in one week. When a submodule can iterate independently of a behemoth, the order-of-magnitude improvement in iteration speed is itself a capability. "Find the part of the system that can be decoupled and trained independently" is an underrated lever.
+
+4. *Writing limitations as a roadmap is more valuable than hiding them.* What is most worth learning from this paper is not LSA itself, but the honesty of its Limitations section: MRCR collapsing to 48%, memory failing to compress to a constant, the 2× length ceiling — each accompanied by oracle experiments that pinpoint the root cause, converting them directly into a construction plan for the next step. Given that results were cut short by resource constraints and project suspension, clearly explaining "what doesn't work and why" gives this half-finished work lasting value for the community.
+
+This means you can: *take any system "saving resources via compression or sparsity" and ask — does the thing being saved still need to sit in the most expensive layer of storage?* If the answer is "most of it is unused yet still occupies that layer," then moving it out and retrieving it on demand will almost always yield the next order of magnitude.

@@ -1,0 +1,274 @@
+#+title:      Beyond FLOPs: Benchmarking Real Inference Acceleration of LLM Pruning under a GEMM-Centric Taxonomy
+#+date:       [2026-06-09 Tue 00:14]
+#+filetags:   :paper:river:en:
+#+identifier: 20260609T001423-en
+#+source:     https://arxiv.org/abs/2606.09080
+#+authors:    Haozhe Hu, Hao Wu, Anhao Zhao, Longwei Ding, Peiran Yin, Yunpu Ma, Xiaoyu Shen
+#+venue:      arXiv 2026 (cs.LG)
+
+* The River of the Problem
+
+A deceptively simple question: if you prune away half a large model's computation, does it actually run twice as fast?
+
+The answer — more often than not — is no. A paper reports "50% FLOPs reduction," yet when you check a stopwatch against the wall clock, it barely moves. That embarrassment is what has been pushing this research thread forward: from "how do we prune accurately," to "why doesn't the hardware go faster after pruning," to this paper, which simply lines up every pruning method on the same stage and times them all for real.
+
+Why is this hard? Because "doing less arithmetic" and "running faster" are separated by an entire layer of hardware. A GPU does not bill you by how many numbers you deleted — it bills you by whether the work can be laid out as large regular matrix multiplications, whether memory accesses are sequential, and whether the computation graph needs to be restructured on the fly. The computation you pruned away might be exactly the part the GPU never cared about; the bookkeeping logic you added to decide what to skip can itself become new overhead. So generation after generation of researchers have not been competing over who deletes the most — they keep rediscovering that "what I thought I saved, the hardware refuses to honor."
+
+* The Source Map
+
+#+begin_example
+[2023] SparseGPT — Prune large models to 50% sparsity in one shot, no retraining
+  |
+  | Problem: Old "prune by magnitude + retrain" collapses on large models;
+  |          retraining is prohibitively expensive
+  | Solution: Reframe pruning as a regression — after removing weights,
+  |           immediately compensate the remaining ones
+  v
+[2023] Wanda — Same effect, but cheap enough to need only one forward pass
+  |
+  | Problem: SparseGPT's second-order compensation is too heavy, ~300× slower
+  | Solution: Importance = weight magnitude × input activation magnitude;
+  |           prune and walk away, no compensation needed
+  |
+  | (New trap: the resulting "messy sparsity" doesn't accelerate on GPU)
+  v
+[2023] LLM-Pruner — Don't delete individual weights; delete whole structures (heads/neurons)
+  |
+  | Problem: Unstructured sparsity yields no real speedup on hardware
+  | Solution: Use gradients to remove entire structural groups so the matrix
+  |           genuinely shrinks — but retraining is needed to recover quality
+  v
+[2024] SliceGPT — Remove whole rows and columns, cutting the "width" down
+  |
+  | Problem: Structural pruning breaks dimensional consistency,
+  |          producing a misshapen network
+  | Solution: Apply an orthogonal rotation that leaves outputs unchanged,
+  |           then slice off rows/columns cleanly
+  v
+[2024] ShortGPT — Just remove entire layers
+  |
+  | Problem: Width reduction (SliceGPT/LLM-Pruner) drops quality a lot
+  |          and delivers modest speedup
+  | Solution: Many layers are redundant — measure how similar a layer's
+  |           input and output are, and delete the similar ones
+  v
+[2024] Mixture-of-Depths / [2025] SkipGPT — Let each token decide which layers to skip
+  |
+  | Problem: Static layer deletion treats every token the same;
+  |          simple and hard tokens get identical compute budgets
+  | Solution: Add a router; tokens traverse layers on demand —
+  |           hard tokens compute more, easy tokens compute less
+  |
+  | (New trap: dynamic decisions require masks, routing, scatter/gather —
+  |  lots of non-GEMM overhead)
+  v
+[2026] Beyond FLOPs (this paper) — Put everything on the same stage and time real speed
+  |
+  | Problem: Every paper claims "X% FLOPs saved," but no one has compared
+  |          real speedups on identical hardware with an identical framework
+  | Solution: Re-classify all methods along the M/N/K dimensions of matrix
+  |           multiplication; measure end-to-end latency uniformly
+#+end_example
+
+Note: The citation and critique relationships above — SparseGPT→Wanda, width (SliceGPT/LLM-Pruner) ↔ depth (ShortGPT), MoD→SkipGPT — are all stated explicitly in the paper. This paper cites every method in the chain (SparseGPT, Wanda, LLM-Pruner, SliceGPT, ShortGPT, FLAP, MoD, SkipGPT, SeerAttention, etc.) and re-categorizes them — this has been verified.
+
+* The Evolutionary Narrative
+
+** 2023 | SparseGPT: First to Prune a Billion-Parameter Model to Half in One Shot Without Collapse
+
+*** What Problem It Saw
+
+Pruning had a mature recipe in the era of small models: rank weights by absolute magnitude, delete the near-zero ones, then retrain to recover accuracy. This worked well enough to halve small vision models without issue.
+
+But applied to large language models, two things broke simultaneously. First, "prune by magnitude" simply does not work at scale — prune beyond 30% and the model collapses, because some numerically small weights in large models are in fact critically important (Wanda would later explain why). Second, even if you wanted to recover via retraining, retraining a model with tens or hundreds of billions of parameters is too expensive for anyone to do.
+
+*** Its Solution
+
+SparseGPT switched gears: forget retraining — compensate on the spot as you prune.
+
+Think of it like rearranging an intricate domino arrangement. You need to remove half the dominoes while keeping the overall shape roughly intact. The brute-force approach is to remove half and then re-set everything from scratch (retraining). SparseGPT's approach: each time you remove one piece, immediately nudge the neighboring pieces to compensate for the gap. Delete and compensate as you go, and when you're done the arrangement looks almost unchanged. Mathematically, this reformulates pruning as a regression problem — after removing a weight, re-fit the remaining weights locally.
+
+*** Why It Worked (and What New Trap It Buried)
+
+It works because it acknowledges a truth: removing one weight is not an isolated act — it ripples outward. Local repair at the moment of deletion is far cheaper than a global retraining pass afterward. OPT-175B could be pruned to 50–60% sparsity with almost no perplexity increase.
+
+But it buried a trap that would haunt the entire river: the sparsity it produces is *unstructured* — holes scattered randomly throughout the weight matrices. GPUs love large regular matrix multiplications; randomly punching holes in a matrix means the GPU still has to process the full matrix. So SparseGPT eliminated 60% of the arithmetic on paper while the wall clock barely moved. The ghost of "less computation ≠ faster runtime" was born here and would follow the whole research line.
+
+** 2023 | Wanda: Cut SparseGPT Down to a Single Forward Pass
+
+*** What Problem It Saw
+
+Wanda stared at SparseGPT's "on-the-spot compensation" step: that compensation requires second-order information (something like the inverse Hessian), which is extremely heavy. Wanda asked — is all that effort actually necessary? Do the remaining weights really need to be adjusted after pruning?
+
+*** Its Solution
+
+Wanda's insight is beautifully simple. The classical criterion for "which weight is unimportant" only looks at the weight itself. But large models have a phenomenon: certain input features take on enormously large activation values. A weight that looks small by itself may have a substantial real contribution if it multiplies a massive input activation.
+
+So Wanda rewrites the importance criterion in one sentence: Importance = weight magnitude × corresponding input activation magnitude. That's it. Run one forward pass, record the activations at each position, multiply, rank, delete the smallest — and don't bother compensating afterward.
+
+*** Why It Worked (and What New Trap It Buried)
+
+It is about 300× faster than SparseGPT, yet matches its quality closely. This in turn reveals something deep: large models genuinely contain "naturally sparse" sub-networks; you do not need to re-fit the surviving weights to approximate a pruned model — that sub-network was already there.
+
+But Wanda did nothing to fix the core trap — it still produces unstructured holes, and the GPU still cannot go faster. It only pushed "how to select what to prune" to the extreme of cheapness. The real acceleration problem remained exactly where it was. This forced the next generation to take a completely different direction: stop deleting scattered weights; go delete whole structural blocks.
+
+** 2023 | LLM-Pruner: Don't Delete Scattered Weights — Delete Whole Structural Groups
+
+*** What Problem It Saw
+
+SparseGPT and Wanda had taken "selecting weights to prune" as far as it could go, but hardware simply would not honor unstructured sparsity. LLM-Pruner changed tracks entirely: what if instead of deleting individual isolated weights, we delete an entire attention head or an entire group of neurons? Then the matrix dimensions genuinely shrink, the GPU receives a legitimately smaller matrix with no holes to route around.
+
+*** Its Solution
+
+LLM-Pruner uses gradient information to identify which "structural groups" contribute least to the model, then removes the entire group — for example, one 128-dimensional attention head at a time. After pruning, the model's size is reduced in a concrete, measurable way. It then applies a lightweight recovery phase (LoRA fine-tuning) to bring accuracy back.
+
+*** Why It Worked (and What New Trap It Buried)
+
+This is a key paradigm shift: from "punching holes in a matrix" to "making the matrix smaller." The latter is what actually makes the GPU run faster.
+
+Two new traps appeared. First, removing whole blocks is coarser than removing individual elements — more accuracy is lost — so LLM-Pruner cannot avoid that recovery training phase, which re-introduces some of the "expensive" problem. Second, and more subtly: choosing which head or neuron group to remove cascades through the entire network's dimensional consistency. Remove a group of outputs from one layer and the next layer's input dimension must change accordingly — otherwise you get a network with mismatched dimensions that cannot be run directly. How to prune cleanly without breaking dimensional consistency? That is exactly what the next paper solves.
+
+** 2024 | SliceGPT: Rotate First, Then Cut Clean
+
+*** What Problem It Saw
+
+LLM-Pruner's structural pruning breaks dimensional consistency. SliceGPT wanted something cleaner: remove entire rows and columns so the matrix narrows uniformly, and place those cuts precisely where the "unimportant directions" are — not forced deletions.
+
+*** Its Solution
+
+SliceGPT invokes a theoretical tool called "computational invariance." The key observation is that the normalization layer (RMSNorm) between two modules in a Transformer has a remarkable property: you can multiply the weight matrices by an orthogonal rotation (i.e., rotate the entire feature space) and the model's output does not change at all.
+
+What use is that? The rotation itself changes nothing, but after rotating, the "unimportant directions" get concentrated into a corner. Now you slice off that corner along rows and columns, and the loss is minimized. It is like gathering all the useless clutter in a room into one corner, then knocking down that entire wall — the main structure is untouched. After slicing, the embedding dimension of each matrix is genuinely smaller, and the signals passing between modules are smaller too.
+
+*** Why It Worked (and What New Trap It Buried)
+
+It achieves real dense acceleration on GPU — 25% slicing yields 16–17% speedup on an RTX 6000. The word "dense" matters: after slicing you still have a regular, hole-free matrix, so the speedup is real. That is the fundamental difference from SparseGPT/Wanda.
+
+But the limits are clear: the ceiling on width reduction is modest, around 16% speedup; and cutting width hurts language modeling more than other tasks because it compresses the representational bandwidth of every layer. More critically, it was quickly noticed — if cutting width is laborious and yields limited returns, why not just cut entire layers?
+
+** 2024 | ShortGPT: It Turns Out Many Layers Are Simply Redundant
+
+*** What Problem It Saw
+
+ShortGPT directly challenged the entire "cut width" family — SliceGPT, LLM-Pruner, and their kin. Its observation is bold: large models are far more redundant in depth than you might expect. Many layers can be deleted with almost no effect on the model.
+
+*** Its Solution
+
+It defines a simple metric called Block Influence: compare how similar a layer's input and output are. If a layer's input and output are nearly identical, that layer did almost nothing — it is redundant, so remove it. Rank layers by this score from lowest to highest and prune accordingly. It is almost embarrassingly simple.
+
+Why is deleting whole layers more effective than cutting width? Because depth is sequential — layer 1 must finish before layer 2 can begin. Removing an entire layer means pulling one stage directly out of this serial pipeline, and the wall clock immediately shortens. Cutting width only makes each stage's matrix a bit smaller, so the savings are less direct.
+
+*** Why It Worked (and What New Trap It Buried)
+
+The numbers are convincing: on Llama2-13B, removing roughly one quarter of the layers retains 91.6% of performance, while at the same compression ratio LLM-Pruner retains only 70.7% and SliceGPT only 63.2%. In short — depth is more redundant than width; cutting depth is more profitable. This became a key cognitive reversal in the river.
+
+But ShortGPT deletes layers statically: the same layers are gone for every token. A simple token (say, punctuation) and a token requiring deep reasoning — why should they traverse the same number of layers? That one-size-fits-all waste is where the next paper begins.
+
+** 2024–2025 | Mixture-of-Depths / SkipGPT: Let Each Token Choose Its Own Layers
+
+*** What Problem It Saw
+
+ShortGPT's removed layers are permanently closed to all tokens. But Transformers spread compute uniformly across every token by default, which was never sensible — some tokens are hard, some are trivially easy. Static layer deletion cannot adapt to individual tokens.
+
+*** Its Solution
+
+Mixture-of-Depths borrows the routing idea from Mixture-of-Experts (MoE) but uses only one expert per layer: at each layer, a router scores every token; high-scoring tokens enter the layer for normal computation, while low-scoring tokens bypass it via the residual connection. Each layer admits only the top-k tokens, with k fixed in advance, so the computation graph remains static and tensor shapes are known — this is its cleverness relative to other conditional-computation approaches. SkipGPT further adapts this framework to the pruning setting, skipping layers dynamically based on per-token awareness.
+
+In practice, hard tokens naturally pass through more layers; easy tokens exit early. For the same FLOPs budget, quality improves and sampling can be faster.
+
+*** Why It Worked (and What New Trap It Buried)
+
+It transforms pruning from a static, once-and-done operation into a runtime decision that flows with the input. Quality is well preserved because compute is spent where it matters.
+
+But it summoned an old adversary: overhead. Dynamic decisions mean computing masks at every step, determining which tokens follow which path, and re-gathering scattered data according to the routing. None of that is matrix multiplication, yet all of it takes real time — especially in the token-by-token decode phase, where the paper measures non-GEMM overhead rising by 60%–287%, consuming much of the computation that was supposedly saved. Once again: "less arithmetic ≠ faster runtime."
+
+** 2026 | Beyond FLOPs (This Paper): Put Everyone on the Same Stage and Time Real Speed
+
+*** What Problem It Saw
+
+By this point the river holds seven or eight stylistically distinct pruning methods: weight deletion, width cutting, layer deletion, dynamic layer skipping, sparse attention, and more. Every paper claims "X% FLOPs saved" or "Y× speedup."
+
+The paper diagnoses the problem sharply: these numbers cannot be compared. Some report FLOPs (SliceGPT, MaskLLM, MoD, DobiSVD all default to this theoretical proxy); some use different model families; some rely on specialized hardware optimizations. More fundamentally, FLOPs as a metric is intrinsically misleading — it counts arithmetic operations, but real speed also depends on how memory is read, whether the computation graph must be restructured, and how much non-GEMM bookkeeping is involved. The entire field drifted into a fog of "saved a lot on paper, machine barely faster," with no clear answer about which pruning approach is actually worth using on real hardware.
+
+*** Its Solution
+
+The paper's core move is to change the coordinate system: stop classifying methods by "what structure was deleted" (layers? heads? weights?) and instead classify by the three logical dimensions of a matrix multiplication — M, N, and K.
+
+The intuition is this. Almost all computation on a GPU takes the form of matrix multiplication O = A × Wᵀ, which has three dimensions: M (the token-count edge), N (the output-feature edge), and K (the input-feature / summation edge). Any pruning method, regardless of what it claims to delete, ultimately reduces one of these three edges:
+
+- Delete layers, skip tokens → reduce M (fewer rows to compute)
+- Delete heads, cut width → reduce N (fewer columns; this propagates into K for the next layer)
+- Low-rank decomposition, semi-structured sparsity → reduce K (the summation edge)
+
+The power of this coordinate system is that it translates the superficially diverse vocabulary of "what was deleted" into the hardware-native language of "which edge of the GPU's workload was actually shortened." Once translated, all methods can for the first time be placed on equal footing inside a unified benchmarking framework, timed end-to-end on the same card (RTX Pro 6000) with the same kernels.
+
+*** What It Measured (and Its Conclusions for the Whole River)
+
+The conclusions are clean and they echo ShortGPT's "depth is more valuable" reversal — but now backed by real wall-clock time:
+
+- *Static M reduction (i.e., static layer deletion, e.g. ShortGPT/Shortened-LLaMA) is the strongest speed anchor in current practice.* It tracks closest to the theoretical speedup ceiling and delivers consistent acceleration across scenarios. At 12.5% sparsity it sacrifices only 2.85% quality to achieve 1.12× speedup. The reason is precisely that deleting layers removes coarse-grained chunks of the serial execution path with no fragmented overhead.
+- *As tolerable quality loss increases, the optimal frontier shifts:* at low loss (0–4%) choose static layer deletion; at moderate loss (5–16%) dynamic layer skipping (MoD-style) becomes more cost-effective; at higher loss (17–26%) static width reduction finally becomes competitive.
+- *K reduction (low-rank, semi-structured sparsity — the heirs of SparseGPT/Wanda) and dynamic NK reduction are mostly off the Pareto frontier* — either their real speedups are weak, or their quality degradation is too large. The "unstructured sparsity doesn't accelerate on GPU" trap from the SparseGPT era is here quantified conclusively: these methods land furthest from their theoretical upper bounds, dragged down by both non-GEMM overhead and sparse kernel inefficiency.
+- *The gap between theory and reality comes from two sources:* pruned matrix multiplications themselves not reaching theoretical efficiency, and the non-GEMM bookkeeping each method introduces (dynamic routing masks, extra kernel launches for low-rank factors, residuals from cross-layer projections). This gap is especially damaging in the decode phase.
+
+* Frontier Extensions
+
+This paper is itself the current "closing chapter" of the river — it proposes no new pruning method but instead draws a unified, real-speed map of the entire field. As of now, it is the most recent "referee-style" advance on this line.
+
+It also points to several directions not yet fully exploited: dynamic M reduction (per-token routing, the MoD/SkipGPT line) is the most promising "quality-aware" direction, but the non-GEMM overhead in the decode phase remains unsolved; static N reduction (fine-grained width pruning such as FLAP) has an attractive quality curve but the vast search space has prevented existing methods from fully extracting its advantage; dynamic NK reduction (sparse attention, e.g., SeerAttention/BLASST) only pays off in very long-context settings. In other words, this map still has several "theoretically should be faster, not there yet in practice" territories waiting to be filled — and the paper has packaged its framework (PruningInferSim) as a plug-and-play tool so new methods can immediately measure their real end-to-end latency.
+
+* One Diagram to See It All
+
+#+begin_example
+            The Pruning River: from "Accurate Deletion" to "Actually Faster"
+            ==================================================================
+
+Time ──────────────────────────────────────────────────────────────────────>
+        2023        2023       2023       2024       2024      24-25      2026
+
+How the focus shifted:
+  How to pick what to prune ──> How to prune so hardware agrees ──> Per-token? ─> Who's really fast?
+
+  SparseGPT    Wanda     LLM-Pruner  SliceGPT  ShortGPT    MoD/     Beyond
+  (compensate) (1 fwd)   (structure)  (rotate   (delete      SkipGPT  FLOPs
+      |           |           |        & slice)   layers)       |       |
+  Punch holes: Punch holes  Shrink      Cut       Cut         Dynamic  Unified
+  paper saves  but ultra-   matrix,     width,    depth,      layer    coords
+  hardware     cheap        needs       dense     most        skip,    M/N/K;
+  doesn't                   retrain     accel     efficient   quality  real
+                                        16% cap   91% retain  good     timing
+      |                         |          |          |          |       |
+  Cut-K holes ─────────+   Cut-N width─+  Cut-M depth─+─ Dynamic M/NK  |
+  (GPU ignores)              (→ next K)   (serial path) (non-GEMM cost) v
+                                                                Conclusion:
+                                                                Static cut-M
+                                                                (layer delete)
+                                                                is the real
+                                                                speed anchor;
+                                                                FLOPs lie;
+                                                                M/N/K + wall
+                                                                clock do not
+
+The ghost haunting the whole river: "less arithmetic ≠ faster runtime"
+  SparseGPT first runs into it (random holes, GPU ignores them)
+  -> Each generation finds a different way around it (shrink / delete layers / route dynamically)
+  -> This paper finally attaches a calibrated scale (GEMM three dimensions + end-to-end measurement)
+#+end_example
+
+* Insight
+
+Connecting the whole river, the surface story is "pruning methods grow ever more sophisticated," but what is truly changing underneath is *the steady descent of the evaluation criterion toward hardware reality*:
+
+The ruler measuring "how much was saved" dropped steadily from the most abstract toward the most concrete. Early on it was *parameter count / FLOPs* (pure mathematics, furthest from hardware) → then the community realized you also need to ask *is the sparsity structured?* (starting to accommodate GPU preferences) → then *is depth or width being cut?* (starting to care about the serial execution path) → finally this paper nails the ruler to *the M/N/K edges of matrix multiplication plus real wall-clock time* (closest to the silicon).
+
+Underneath this progression is a maturing of understanding: the field early on assumed "algorithm and hardware can be thought about separately — I handle accurate pruning; speedup is the hardware's job." The entire history of this river is the story of that assumption failing again and again. SparseGPT was the most accurate pruner and the worst at actually running fast. The M/N/K coordinate system is at once a surrender and an elevation — it concedes that "what to delete," the algorithmic question, is meaningless divorced from "how the GPU computes," the hardware question, and so rewrites the entire taxonomy in hardware's own language.
+
+Where does the next step go? Most likely toward "quality-aware dynamic M reduction" — the MoD/SkipGPT line — but only once the non-GEMM overhead of dynamic routing in the decode phase is eliminated. This paper has already named it "most promising, overhead unsolved." Whoever manages to make dynamic layer skipping carry nearly zero extra cost during token-by-token generation will push this river forward by a large stride.
+
+* Takeaways
+
+The biggest lesson this river offers for doing research is: *when every player in a field is optimizing the same metric, questioning the metric itself is usually worth more than pushing that metric to a new record.*
+
+For three full years, the community competed over who could reduce FLOPs the most. This paper did not invent a tenth pruning method to win that competition. Instead it stepped back and asked "does this number actually measure what we really want?" — then built a more honest ruler. As a result, it need not defeat any single method; it redefined the entire leaderboard by changing the leaderboard's columns.
+
+The practical implication: the next time you encounter a field where everyone is optimizing a proxy metric, resist the urge to join the arms race immediately. First trace the chain — *how large is the gap between this proxy and what we ultimately care about, and exactly where does the gap come from?* If the gap is large and no one has systematically measured it, the work of "building a better ruler and a unified benchmark" is typically the highest-return, least-attempted contribution available. This paper also released its ruler as an open-source plug-and-play framework — that is the second layer of cleverness: make your standard the default tool others use to evaluate their own work, and your influence compounds inside every subsequent paper.

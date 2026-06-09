@@ -1,0 +1,249 @@
+#+title:      End-to-End Context Compression at Scale
+#+date:       [2026-06-09 Tue 00:31]
+#+filetags:   :paper:river:en:
+#+identifier: 20260609T003114-en
+#+source:     https://arxiv.org/abs/2606.09659
+#+authors:    Ang Li, Sean McLeish, Haozhe Chen, Nimit Kalra, ..., Tom Goldstein, Sanae Lotfi, Micah Goldblum, Pavel Izmailov
+#+venue:      arXiv 2606.09659 (cs.CL / cs.AI / cs.LG), Jun 2026
+
+* The Problem River
+
+Getting a large model to read an entire book, a codebase, or a medical record and then answer arbitrary questions runs into a very physical wall today: in principle, every token the model generates may need to attend back to any earlier token, so it must keep the Key and Value tensors of every past token in GPU memory. This KV cache grows *linearly* with context length. At hundreds of thousands of tokens it outweighs the model weights themselves, and every decoding step requires streaming the entire cache across HBM — long-context inference is therefore not *compute-bound* but *bandwidth-bound*, throttled by memory bandwidth.
+
+The entire research thread is wrestling with the same basic intuition: *most of those hundreds-of-thousands of history tokens are irrelevant at any given moment — can we store and stream less?* The hard part is not "compress"; it is "compress and still be useful." Over the past few years, two rival lines of attack have diverged:
+
+- *Post-hoc subtraction*: build the full cache faithfully, then drop unimportant entries by some rule (H2O, SnapKV, KVzip, …). Fast, no retraining needed, but with a hard ceiling — quality collapses beyond ~2× compression, and many methods produce a cache tailored to a specific query, making it useless for different questions.
+- *Up-front re-representation*: train a small model to compress a long text into a handful of "soft tokens" (continuous vectors) that the large model reads directly instead of the raw text (Gist, AutoCompressor, ICAE, REFRAG, …). In principle this can compress far more aggressively, but it has always had an awkward record: it either degrades the base model's general capabilities or works only in a narrow domain, and *has never beaten the first line on information-dense long-context benchmarks*.
+
+The claim of this paper (LCLM, Latent Context Language Model) involves almost no new gadget, yet lands like a provocation: the second line has never won not because the approach is wrong, *but because nobody has ever scaled it up seriously*. Joint end-to-end pretraining of a 0.6B encoder and a 4B decoder on 350B+ tokens makes the soft-token approach surpass the accuracy-efficiency frontier of KV cache compression on hard benchmarks like RULER and LongBench for the first time — and it is natively compatible with vLLM / SGLang.
+
+The question is posed again from the beginning: *Are we "deleting" history, or "rewriting" it? Has deletion always lost to rewriting only because rewriting has never been given enough training budget?*
+
+* Provenance Map
+
+#+begin_example
+                    [Root problem] KV cache grows linearly with context length;
+                    decoding is bottlenecked by memory bandwidth
+                    (KVQuant 2024: cache is the #1 memory consumer in long-context,
+                    and bandwidth-bound)
+                    (Lost-in-the-Middle 2024: middle tokens are barely used anyway
+                    -> they should be dropped)
+                              |
+              +---------------+----------------+
+              |                                |
+     Line A: Post-hoc cache deletion    Line B: Up-front re-representation (soft tokens)
+              |                                |
+  [2023-06] H2O Heavy-Hitter         [2021] Prefix-Tuning
+   | Method: keep high-cumulative-     | Origin of soft tokens: freeze the large
+   |   attention "heavy hitters"       |   model, train only a small set of
+   |   + a recency window              |   learnable continuous prefix vectors
+   v                                   v
+  [2024-04] SnapKV                    [2023-04] Gist Tokens
+   | Improvement: use end-of-prompt    | Improvement: prefix is no longer a
+   |   query tokens to vote on         |   "fixed per-task vector"; it is now
+   |   context; compress once at       |   "computed on-the-fly from the specific
+   |   prefill time                    |   prompt"
+   | Pitfall: cache is query-bound;    | Pitfall: only compresses short
+   |   breaks on different queries     |   instructions, not long documents
+   |   / multi-turn                    v
+   v                                  [2023-05] AutoCompressor
+  [2025-05] KVzip                      | Improvement: segment + recurse; rolls a
+   | Improvement: score by "can the    |   long document into summary vectors
+   |   model reconstruct the text",    |   -> long context now compressible
+   |   query-agnostic, compress        | Pitfall: recursion = high latency;
+   |   once, reuse everywhere          |   summaries can only go in the prefix
+   | Pitfall: only compresses the      v
+   |   "budget dimension", not the    [2023-07] ICAE Auto-Encoder
+   |   "length dimension"; scoring     | Improvement: adds a "reconstruct the
+   |   costs 2-3x extra prefill time   |   original text" objective; LoRA encoder
+   v                                   |   + frozen decoder; more faithful
+  [2025-06] Cartridges                 v
+   | Improvement: train the cache     [2024-02] CEPE / [2025-09] REFRAG
+   |   offline (self-study +           | Improvement: lightweight encoder,
+   |   context distillation)           |   chunk-parallel + frozen decoder;
+   | Pitfall: every corpus requires    |   REFRAG adds a projection layer that
+   |   GPU-hours of gradient training  |   compresses each chunk to 1 vector,
+              |                        |   inline injection + RL to select which
+              |                        |   chunks to expand
+              |                        | Pitfall: only ~20B tokens of training;
+              |                        |   still uses old "first-half compressed /
+              |                        |   second-half trainable" format; general
+              |                        |   capability unverified
+              |                                |
+              +---------------+----------------+
+                              |
+                    [2026-06] LCLM (this paper)
+                    Scales up Line B end-to-end: 0.6B encoder + 4B decoder,
+                    joint training on 350B+ tokens, compression ratios 1:4/1:8/1:16,
+                    retains standard KV cache structure -> first time Line B surpasses
+                    Line A's accuracy-efficiency frontier on hard benchmarks,
+                    and compatible with vLLM/SGLang
+#+end_example
+
+Note: Lines A and B meet head-on at LCLM for the first time — LCLM uses Line B's method and treats every Line A method as a baseline. The internal citation relationships within each line are confirmed. REFRAG explicitly names CEPE as a target. Whether REFRAG explicitly criticizes ICAE is *unconfirmed*; it targets the general class of "prefix-only / recursive / non-compressing" encoder-decoder schemes.
+
+* Evolutionary Narrative
+
+We explain the root problem first, then trace the two lines, and finally show them converging at LCLM.
+
+** Root Problem | Why Long-Context Inference Is "Bandwidth-Bound," Not "Compute-Bound"
+
+To understand what every method downstream is fighting against, we first need to see exactly where the KV cache gets stuck. During Transformer decoding, to avoid recomputing the full prefix, every past token's Key and Value are cached. Cache size = sequence length × batch × layers × heads — it scales *linearly* with context. KVQuant (Hooper 2024) states the key insight plainly: at one million tokens the cache is the single largest consumer of GPU memory, exceeding the weights themselves; and every decode step streams the entire cache over HBM — *this is a bandwidth bottleneck, independent of batch size or sequence length*. That is where "bandwidth-bound" comes from.
+
+Lost-in-the-Middle (Liu 2024) delivers a second blow: even when memory is not the issue, models' utilization of long contexts is U-shaped — they remember the beginning and end clearly, while the middle is essentially invisible. Together these two observations set the premise for the entire river: the cache is large, bandwidth-bound, and non-uniformly useful. *So compress it.* The only remaining question is how to compress without losing accuracy — and that is where the two lines diverge.
+
+** 2023-06 | H2O: Making "Cache Deletion" Viable for the First Time
+
+*What problem it saw*: The most naive approach is to keep the full cache, at which point linear explosion and OOM follow. H2O's observation is that attention distributions are extremely sparse: cumulatively, a small number of tokens ("heavy hitters") absorb the vast majority of attention weight, and the rest are wasted memory.
+
+*Its solution*: Assign each token a cumulative attention score; keep only the high-scoring heavy hitters plus a recency window (for local coherence); greedily evict the rest during decoding. Roughly 20% of the cache can match the quality of the full cache.
+
+*Why it works and what pitfalls it buries*: The sparsity is real, so deletion is feasible. But greedy permanent eviction means a token that seems unimportant now but becomes critical later is gone for good; and cumulative scores naturally favor long-lived older tokens. The deeper pitfall: H2O's importance criterion is a *static heuristic*, completely independent of what question is being answered. The next paper zeroes in on exactly that.
+
+** 2024-04 | SnapKV: Deleting Based on the Actual Query
+
+*What problem it saw*: Fixed importance strategies like H2O have a hard flaw — which tokens matter depends on the instruction. For the same passage, "What is the protagonist's name?" and "How does it end?" call for entirely different tokens to be retained. Using a single offline-fixed ruler for all questions will inevitably fail some of them.
+
+*Its solution*: Take a small window of query tokens at the end of the prompt (default: 16) as an "observation window"; let their attention votes over the preceding context; each head independently selects its own important positions; then apply a max-pool along the sequence so that selected tokens bring their neighbors along, preserving local continuity. This is a one-shot compression at prefill time, requiring no retraining.
+
+*Why it works and what pitfalls it buries*: Voting with real query tokens beats blind selection. But the cost is that the resulting cache is *tailored to this specific query*. Change the question or enter multi-turn dialogue and the cache is stale (KVzip later reports that on multi-query settings, methods like this collapse even with 90% budget retained). "Query binding" becomes the new target.
+
+** 2025-05 | KVzip: Compress Once, Use Everywhere
+
+*What problem it saw*: In practice, the same context (a codebase, a document) serves thousands of different questions. A query-dependent cache like SnapKV cannot be reused — you cannot compress once per question. What is needed is a *query-agnostic cache: compress once, use everywhere*.
+
+*Its solution*: Replace the scoring signal. Instead of asking "is this token important to the current query?" it asks "is this token important for *reconstructing the original text*?" — a self-supervised signal (prompt the model to "repeat the preceding context") that identifies which KVs, if removed, prevent the model from reconstructing the original. This signal is query-independent, so one compression pass serves all subsequent queries. Reported results: 3–4× compression, ~2× decode speedup, negligible quality loss.
+
+*Why it works and what pitfalls it buries*: Decoupling importance from the query solves reusability. But two pitfalls emerge: first, it only compresses the *budget dimension* (how many KVs to keep per position), *not the length dimension* — the sequence is still as long as ever, and the FlashAttention query×key compute cost is not reduced; second, the reconstruction-scoring pass itself requires an extra forward, adding 2–3× prefill time. Deletion has gotten smarter, but the "build the full cache first, then delete" paradigm's intrinsic cost remains.
+
+** 2025-06 | Cartridges: Skip Deletion Altogether — Train the Cache Directly
+
+*What problem it saw*: Every post-hoc deletion method hits the same wall: on hard long-context tasks, quality collapses rapidly beyond ~2× compression. If a large corpus (128K context, ~84 GB cache for a 70B model) will be queried thousands of times, it is cheaper to amortize the cost offline rather than build-and-delete every time.
+
+*Its solution*: Freeze the model and *train* a compact KV cache (a "Cartridge") to represent the corpus. The training procedure is called self-study: first let the model generate synthetic QA pairs about the corpus; then train the cache with a context-distillation objective (direct next-token training on the corpus leads to rote memorization and poor results). Reported: ~38× memory savings, ~26× throughput improvement, costs amortized across all queries that hit that corpus.
+
+*Why it works and what pitfalls it buries*: Turning compression from a single forward pass into an optimization loop dramatically raises the compression-ratio ceiling. But the pitfall is direct — every corpus requires *gradient training*, GPU-hours of offline compute (subsequent Attention Matching calls this "prohibitively expensive"). Line A has slid from "real-time deletion" to "offline training," leaving it just one layer away from Line B: *if you are already training, why not train a single universal compressor rather than a separate cache per corpus?*
+
+— Line A ends here. Its trajectory: delete → delete more accurately → delete agnostically → just train. It terminates at a compression ceiling and an uncomfortable question about training cost. Now we turn to Line B, which started training from the very beginning.
+
+** 2021 | Prefix-Tuning: The Origin of Soft Tokens
+
+*What problem it saw*: Full fine-tuning a large model for every task means storing a complete model copy per task — increasingly unsustainable as models grow. Meanwhile, discrete hand-crafted prompts are hard to optimize and limited by the vocabulary.
+
+*Its solution*: Freeze the entire large model; prepend a small set of *trainable continuous vectors* (virtual tokens / prefix) to the input, allowing subsequent tokens to attend to them. Only these vectors are trained and stored per task. This is the origin of "soft tokens" — carrying information in continuous vectors rather than discrete words.
+
+*Why it works and what pitfalls it buries*: Continuous vectors are more expressive than discrete vocabulary entries and are directly gradient-optimizable. But at this point the prefix is a *fixed set of vectors learned once per task*, independent of the specific input content. It is not yet a "compressor" — it compresses tasks, not contexts.
+
+** 2023-04 | Gist Tokens: From "Fixed Per-Task Prefix" to "Computed On-the-Fly from the Input"
+
+*What problem it saw*: Prefix-Tuning's prefix is frozen per task. But in real deployments the waste is different: the same long prompt (instructions) must be re-encoded from scratch on every call. Can this prompt be compressed *on-the-fly* into a few tokens, cached, and reused?
+
+*Its solution*: Gisting — modify only the attention mask so that tokens after the gist tokens cannot attend to the original prompt, forcing the gist tokens to absorb all of the prompt's information. These few gist tokens are cached and reused across calls. Reported: up to 26× prompt compression, ~40% FLOPs reduction, almost no added training cost.
+
+*Why it works and what pitfalls it buries*: The shift from "one fixed prefix per task" to "soft tokens predicted by looking at the specific input" is qualitative — the compressor now *reads content* for the first time. But Gist still compresses *short instructions*; long documents do not fit in its window.
+
+** 2023-05 | AutoCompressor: Pushing Compression from Short Instructions to Long Documents
+
+*What problem it saw*: Gist only compresses short prompts. But what actually consumes memory is long documents. How can "compress to soft tokens on the fly" be applied to contexts of thousands or tens of thousands of tokens?
+
+*Its solution*: Segment + recurse. Split the long document into chunks, compress each into summary vectors, then accumulate prior summary vectors and feed them alongside the next chunk — rolling arbitrarily long input into a handful of summary vectors (e.g., 6144 tokens → ~150). Trained without supervision.
+
+*Why it works and what pitfalls it buries*: Recursion breaks the single-window length limit, enabling genuine long-context compression for the first time. But recursion means serial execution, so latency is high when summaries are not cached; and summary vectors can only occupy the prefix position, locking the usage into "prefix-only" mode (REFRAG later identifies exactly this as a flaw). Furthermore, the training objective is primarily next-segment language modeling with no explicit constraint on faithful reconstruction of the original text.
+
+** 2023-07 | ICAE: Adding a Hard "Must Be Reconstructable" Constraint to Compression
+
+*What problem it saw*: AutoCompressor learns summaries via a language-modeling objective, but there is no guarantee that the resulting vectors *faithfully* encode the original text — they might drop details or hallucinate.
+
+*Its solution*: An autoencoder framework. Adapt the large model with LoRA to serve as an encoder; compress the context plus a set of learnable memory tokens into memory slots; then use a *frozen copy of the target large model* as the decoder that reads those slots. The training objective explicitly includes an *autoencoding reconstruction* term — the slots must enable the decoder to reconstruct the original text. The paper finds this reconstruction pretraining "critical" for significantly reducing hallucination. ~1% extra parameters achieve 4× compression.
+
+*Why it works and what pitfalls it buries*: The encoder/decoder division of labor plus the reconstruction constraint gives soft tokens a faithfulness guarantee for the first time, and establishes the skeleton that all subsequent encoder-decoder compressors follow. But it is non-recursive (length limited) and still small-scale with narrow training.
+
+** 2024-02 / 2025-09 | CEPE and REFRAG: Lighter Encoders, but Still the Old Format
+
+*What problem they saw*: Methods like ICAE are either non-recursive (can't compress very long inputs) or trained at small scale with narrow applicability. Can a *lightweight encoder* chunk-parallel-encode the context and pair with a frozen decoder — fast and scalable to long contexts?
+
+*Their solutions*: CEPE — a small encoder processes the context in parallel chunks; a frozen decoder reads via newly added *cross-attention* layers (in the lineage of FiD / parallel windows). REFRAG goes further — the encoder compresses each fixed-length chunk (e.g., 16 tokens) into *one* embedding, projected into the decoder's token embedding space and fed *inline* (no change to decoder architecture); a RL policy then selects which few chunks to expand back into full tokens. REFRAG reports up to 30× TTFT speedup.
+
+*Why they work and what pitfalls they leave*: REFRAG explicitly names CEPE as a target: CEPE places everything in the prefix, breaking the causal structure (unsuitable for multi-turn / summarization) and *does not actually reduce token count*, so latency does not truly decrease. REFRAG compresses genuinely, can insert at arbitrary positions, and allows precomputed chunk embeddings to be reused. But REFRAG itself leaves a pitfall that is exactly LCLM's starting point: it was only trained on ~20B tokens, still uses the old "first-half compressed / second-half trainable" format, and *whether general capability is preserved has never been verified on information-dense long-context benchmarks*.
+
+** 2026-06 | LCLM: Feed the Soft-Token Line Until It's Full — Win Against Cache Deletion for the First Time
+
+*What problem it saw*: Placing both lines side by side — Line A (cache deletion) has reached "offline training" with Cartridges but is stuck at a ~2× compression ceiling and per-corpus retraining; Line B (soft tokens) has a solid architecture from Gist through REFRAG, but *nobody has ever trained it seriously at scale*: few training tokens (REFRAG ~20B), narrow format, encoder and decoder never truly jointly optimized end-to-end. LCLM's diagnosis: soft tokens have always lost to cache deletion *not because the mechanism is wrong, but because training budget has always been insufficient and optimization has never been truly end-to-end*.
+
+*Its solution*: Take the encoder-decoder skeleton established by ICAE and *scale it up, end-to-end*. A 0.6B encoder + 4B decoder, both initialized from pretrained models, then *jointly continued-pretrained end-to-end on 350B+ tokens*, at compression ratios 1:4 / 1:8 / 1:16. Text is wrapped in `<|memory_start|>` / `<|memory_end|>` tokens; the encoder pools each window into hidden vectors; an adapter projects them into the decoder's embedding space; the decoder reads them as ordinary inputs — *retaining the standard KV cache structure*, so vLLM / SGLang work out of the box. An accompanying architecture search validates each design decision that earlier papers made by intuition:
+  - An *MLP-only adapter* achieves lower pretraining loss at lower compute than an attention-based adapter — directly *overturning GMSA (Tang 2025)*.
+  - Encoder window size swept over {16, 256, 1024}: the gain from 16→256 is large; default is W=1024.
+  - Causal masking consistently outperforms non-causal; pooling strategy depends on compression ratio (mean pooling for 16×).
+  - Format: abandons "first-half compressed / second-half trainable" in favor of an *interleaved compressed/uncompressed format*, so the decoder conditions on latent context at many positions rather than only the prefix — directly addressing the prefix limitation of AutoCompressor and REFRAG.
+
+*Why it works and what pitfalls remain*: All baselines are Line A methods (Expected Attention, Attention Matching, KVzip, FastKVzip, SnapKV — same Qwen3-4B decoder throughout). On RULER / LongBench / LongHealth, LCLM pushes soft tokens to a *new accuracy-efficiency frontier* for the first time: deletion-based methods, because they "build the full cache first then delete," see almost no change in compression time as the compression ratio increases (vertical lines on the plot), and OOM at 512K–1M tokens; LCLM's peak memory is far lower and continues to scale up. The real cost is also honest — 350B+ tokens of continued pretraining is a one-time heavy investment; handling extremely long inputs in the encoder and the limit of pushing compression ratios even further are open problems.
+
+* Frontier Extensions
+
+LCLM was submitted on 2026-06-08; there are currently *no confirmed works that cite it*. However, several concurrent papers push this problem from different angles simultaneously (all are verified real arXiv papers; they are *contemporaneous* with LCLM, not mutually citing):
+
+- *Meta-Soft* (2026-05, arXiv:2605.22337): dynamically synthesizes input-adaptive soft tokens from a learnable orthogonal "meta-token bank," redistributing the information of evicted tokens back via attention flow rather than hard deletion. Still "introducing soft tokens within the cache-deletion framework," not a full end-to-end re-representation approach.
+- *KV Packet* (2026-04, arXiv:2604.13226): wraps trainable soft-token adapters (Header/Trailer) around frozen precomputed document KV caches; uses self-distillation so multiple caches can be directly concatenated and reused without recomputation. The goal is cache reuse rather than extreme compression — the closest "soft-token adapter" cousin to LCLM.
+- *REFRAG* (2025-09, arXiv:2509.01092, Meta): the direct predecessor LCLM responds to. LCLM's "scale up + end-to-end" is almost a direct answer to REFRAG's "only 20B tokens, old format."
+
+As of now, LCLM is both the most recent and the first result to cross the frontier on the line of "scaling soft-token compression end-to-end to challenge cache deletion."
+
+* One Diagram
+
+#+begin_example
+       Core tension in long-context inference: cache is large, bandwidth-bound,
+       and non-uniformly useful
+                                          |
+   Cognitive dimension ----------------------------------------------------------------->
+   "Can importance be fixed offline"  "Reusable?"  "Delete or train?"  "Delete vs. re-represent?"
+
+  Line A — Cache Deletion:
+   H2O ----------> SnapKV --------> KVzip --------> Cartridges
+   Static heuristic  Query-aware     Reconstruction   Train cache offline
+   (importance fixed) (query-bound,   scoring,         (high ratio, but
+                       not reusable)  query-agnostic,   retrain per corpus)
+                                      reusable but only           \
+                                      compresses budget dim         \  ~2x ceiling;
+                                                                     v hits "train or not?"
+  Line B — Soft Tokens:                                        [ LCLM 2026-06 ]
+   Prefix-Tuning -> Gist -------> AutoCompressor -> ICAE -> CEPE/REFRAG
+   Fixed per-task    On-the-fly    Recurse over      Add      Lightweight encoder
+   prefix            short instr.  long docs         recon.   + frozen decoder
+   (compresses task) (short only)  (long, prefix+    constr.  (truly compresses,
+                                   serial)           small-   but only 20B +
+                                                     scale)   old format)
+                                                            ^
+                                                           /   End-to-end + 350B tokens
+                                                          /
+   Two lines converge at LCLM: uses Line B's method (re-representation),
+   treats all Line A methods as baselines, and for the first time surpasses
+   the accuracy-efficiency frontier on hard benchmarks, while retaining
+   standard KV structure -> runs on vLLM/SGLang
+
+   Running thread: delete -> delete accurately -> delete agnostically -> just train ┐
+                                                                                    ├-> "Rather than
+             compress tasks -> compress short -> compress long -> compress faithfully ┘  training a cache
+                                                                                        per corpus, train
+                                                                                        one universal
+                                                                                        compressor end-to-end"
+                                                                  = from "deleting history" to
+                                                                    "rewriting history" — and feeding it enough
+#+end_example
+
+* Insights
+
+On the surface this river is about "compressing KV caches ever more aggressively." Underneath, what is actually happening is *three cognitive turns*:
+
+1. *From "deleting" to "rewriting."* Line A's implicit belief is that history is a fixed fact, and all we can do is choose which entries to keep and which to discard (binary retain/drop in discrete token space). Line B's belief is that history can be *re-encoded* into a more compact representation (continuous soft tokens). Deletion has a hard information-theoretic ceiling — once a discrete token is dropped, the exact literal content and structure are gone forever. Rewriting has no such ceiling, because it reallocates information in continuous space. LCLM's victory is fundamentally a victory of *rewriting* over *deletion*.
+
+2. *From "designing criteria" to "feeding training budget."* Every early paper invented a cleverer importance criterion (cumulative attention → query voting → reconstruction scoring). But Cartridges and LCLM both say the same thing: rather than hand-designing what to keep, let the model *learn* what to compress. The contest over criteria ultimately gives way to a contest over training budget. The most counterintuitive aspect of LCLM is that it proposes almost no new mechanism — its argument is "the prior mechanisms are not wrong; they just have not been fed enough." In a field obsessed with inventing new structures, that is a restrained and often more correct judgment.
+
+3. *From "research demo" to "production-engine compatible."* KVzip and Cartridges excel on compression ratio but struggle to deploy (non-uniform eviction, no one has implemented the special kernels, per-corpus retraining). LCLM repeatedly emphasizes "retains standard KV structure, vLLM/SGLang work immediately" — signaling that this line has moved from "benchmark climbing" into "must be digestible by existing inference stacks." Deployability has itself become a first-class constraint.
+
+Where the next steps most likely lead: (a) scaling the encoder too, or making compression ratio adaptive to content (compress information-dense regions less, information-sparse regions more aggressively); (b) fusing soft tokens with RAG / agent memory — a compressed latent context is naturally a storable, retrievable "memory entry"; (c) once end-to-end is validated as effective, it will loop back to challenge pretraining itself — why not teach the model to read latent contexts during pretraining rather than via continued training afterward?
+
+* Takeaways
+
+The biggest lesson this river offers for *how to do research* is: *when a direction is "superior in principle but has always lost in practice," do not rush to abandon it — first ask "has it ever been taken seriously at scale?"* Soft-token compression has existed since 2021. For five years the community assumed it "had inadequate quality" and kept making incremental improvements on the cache-deletion line instead. LCLM invented nothing new; it simply took an old idea and, for the first time, fed it to the 350B-token scale with genuine end-to-end optimization — and the frontier moved. Many "this approach doesn't work" conclusions are really "this approach hasn't been pushed far enough."
+
+The practical landing point is "deployability": this means that when evaluating a failing older method, you can split its failure reasons into *mechanism is wrong* versus *insufficient scale/training* — the former warrants abandonment, the latter may simply mean the timing was not right. Concretely, if you are choosing a compression scheme for a long-context system — need deployability, compatibility with existing inference engines, and compress-once-use-everywhere — the "re-representation + standard KV structure" line exemplified by LCLM is a better bet than "post-hoc non-uniform cache deletion." But if you have a single static corpus that will be queried repeatedly and you can afford the training cost, Cartridges-style offline training still holds the highest compression-ratio ceiling.
