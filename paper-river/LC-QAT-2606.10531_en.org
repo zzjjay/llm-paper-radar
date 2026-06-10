@@ -1,0 +1,231 @@
+#+title:      LC-QAT: Data-Efficient 2-Bit QAT for LLMs via Linear-Constrained Vector Quantization
+#+date:       [2026-06-10 Wed 00:15]
+#+filetags:   :paper:river:en:
+#+identifier: 20260610T001530-en
+#+source:     https://arxiv.org/abs/2606.10531
+#+authors:    Haoyu Wang, Xingyu Yu, Haiyan Zhao, Fengxiang Wang, Xu Han
+#+venue:      ICML 2026 (arXiv preprint, 2026-06)
+
+* The River of the Problem
+
+In one sentence: *We want to compress every weight of a large model from 16 bits down to 2 bits — one-eighth the original — without making it stupid, and without retraining it on trillions of tokens to do so. This river is about breaking the deadlock between "compress aggressively" and "train cheaply."*
+
+Why is it hard? A weight stored in 16-bit floating point can take on tens of thousands of distinct values. Compressed to 2 bits, each weight has only *four* possible values. It's like redrawing a full-color photograph using only four colors — the information collapses catastrophically.
+
+Up to 4 bits, there's a convenient shortcut called *PTQ* (Post-Training Quantization): once the model is trained, grab a small batch of calibration data, round each weight to the nearest grid point, finish in a few hours, and precision barely suffers. But this breaks down at 2 bits — the grid is so coarse that the rounding error is large enough to make the model incoherent.
+
+That leaves only *QAT* (Quantization-Aware Training): let the model "know" during training that it will eventually be compressed, so it learns to adapt in advance. The problem is that QAT is expensive — traditional approaches (e.g., BitNet) require retraining from scratch on *4 trillion tokens*.
+
+So everyone on this river is stuck in the same triangle: *2-bit precision, training cost, and gradient-based end-to-end trainability.* Whoever can claim all three wins. The river also splits into two tributaries — one says "use scalars, compress one weight to one number," the other says "use vectors, pack a group of weights together" — each with its own fatal flaw. LC-QAT aims to stitch their strengths together.
+
+* The Source Map
+
+This river has two tributaries. *Scalar branch (SQ)*: each weight is compressed individually to a single number — simple, gradient-trainable, but information collapses too badly at 2 bits. *Vector branch (VQ)*: a group of weights is packed together and looked up in a "codebook" as a single unit — more bit-efficient, but the lookup operation is non-differentiable and blocks end-to-end training. LC-QAT stands at the confluence of both, using a "linear constraint" to turn the codebook lookup into a differentiable multiplication.
+
+#+begin_example
+        [Scalar Branch SQ]                        [Vector Branch VQ]
+
+[2022] GPTQ - Post-training quantization, second-order error compensation
+  |  Works at 4 bits; collapses at 2 bits
+  |
+  +----------------------------------> [2023] QuIP - adds "incoherence processing"
+  |   Rotates weights to scatter them;          |  But still scalar rounding;
+  |   2-bit first becomes feasible              |  misses the "spherical" weight distribution
+  |                                             v
+  |                                  [2024] QuIP# - E8 lattice codebook + Hadamard
+  |                                             |  Fixed lattice, quantize groups jointly
+  |                                             |  But lattice is non-differentiable; requires lookup
+  v                                             v
+[2023] LLM-QAT - Quantization-aware training  [2024] AQLM - Learned additive codebook
+  |  Model generates its own data (data-free)  |  Data-adaptive > fixed lattice
+  |  But end-to-end QAT is prohibitively costly|  But codebook is still a discrete lookup
+  v                                             v
+[2024] EfficientQAT - Block-wise training     [2024] PV-Tuning - Coordinate descent to fine-tune codes
+  |  saves memory; 2-bit 70B in 41h on 1 GPU  |  Bypasses STE, but needs beam search
+  v                                             |  Updates are slow, asynchronous, saturates quickly
+[2025] ParetoQ - Unified framework across bits|
+  |  Finds 2 bits is the sweet spot;           |
+  |  identifies a "representation discontinuity"|
+  |  between 2 and 3 bits                      |
+  v                                             |
+[2024/25] BitNet b1.58 - Ternary {-1,0,1}     |
+  |  Train from scratch on 4T tokens;          |
+  |  cannot reuse pretrained models            |
+  |                                             |
+  +--------------------+------------------------+
+                       |
+              Pain points from both branches:
+              SQ: 2-bit initialization is too poor -> needs massive data to recover
+              VQ: lookup is non-differentiable / STE is inaccurate -> blocks end-to-end training
+                       |
+                       v
+        [2026] LC-QAT - Linear-Constrained Vector Quantization
+          Codeword c = A·z + B,  z is a discrete integer vector
+          Lookup becomes "round + linear projection" — fully differentiable
+          Strong PTQ initialization + small-data QAT
+#+end_example
+
+Note: arrows indicate the direction of problem evolution, not strict citation relationships. AQLM (2024-01) actually predates QuIP# (2024-02); they are parallel competitors — "learned codebook vs. fixed lattice" — not a sequential improvement. This distinction is clarified below.
+
+* The Evolutionary Narrative
+
+** 2022 | GPTQ: Upgrading "round each weight independently" to "compress-and-compensate"
+
+*** What problem did it see
+
+The most naive quantization is RTN — round every weight independently to the nearest grid point. The problem: it treats each weight as an island, completely ignoring interactions between weights. When one weight is rounded up, the error it should have shared with its neighbors goes unaddressed and accumulates. At low bit-widths, RTN simply collapses.
+
+*** Its solution
+
+It borrows an older idea (Optimal Brain Quantization): when compressing one weight, simultaneously *distribute the error it introduces to the remaining uncompressed weights* — letting them make small adjustments to absorb it. This relies on second-order information (the inverse Hessian). GPTQ's contribution was reducing the cost of this procedure from "computationally intractable" to 4 GPU-hours for a 175B model — achieved via fixed column ordering, batch updates, and Cholesky-based numerical stabilization.
+
+*** Why it works (and what new pitfall it buries)
+
+Compress-and-compensate prevents errors from accumulating in isolation; at 4 bits, precision is nearly lossless. But it is fundamentally still *scalar rounding* — at 2 bits, the grid is so coarse that compensation can't keep up. And it has no mechanism for "outlier weights": a handful of unusually large weights aligned with coordinate axes will produce explosive quantization error. This is exactly the sore spot the next paper targets.
+
+** 2023 | QuIP: Rotate the weights before quantizing to "scatter" them
+
+*** What problem did it see
+
+QuIP zeroed in on GPTQ's fatal flaw: no mechanism for outliers or "important directions concentrated along coordinate axes." These are the root cause of 2-bit collapse.
+
+*** Its solution
+
+"Incoherence processing." Before quantizing, multiply both the weight matrix and the Hessian by random orthogonal matrices — effectively *randomly rotating the entire weight space* so that the outlier values, previously bunched along coordinate axes, are scattered into a uniform, well-behaved distribution. Quantize, then rotate back. It also provides the first theoretical guarantee for LLM quantization: proof that "incoherence" is precisely the property that controls quantization error.
+
+*** Why it works (and what new pitfall it buries)
+
+After rotation and scattering, no direction stands out, and 2-bit quantization *becomes feasible for the first time*. QuIP also subsumes GPTQ as a special case within its framework. But its rotation uses random orthogonal matrices — *slow, and theoretically suboptimal* — and after scattering, it still applies *per-coordinate scalar rounding*, missing the insight that the scattered weights now form a "spherical" distribution that is better compressed as a group.
+
+** 2024 | QuIP#: Pack spherical weights jointly onto an E8 lattice
+
+*** What problem did it see
+
+QuIP left two gaps: the rotation matrix is slow, and it still performs scalar quantization, failing to exploit the joint structure of the scattered weights.
+
+*** Its solution
+
+Three moves. First, replace random orthogonal rotations with *randomized Hadamard transforms* — faster, theoretically superior, yielding weights that approximate a Gaussian sphere. Second, since the weights are spherically distributed in 8D, use an *E8 lattice codebook*: treat every 8 weights as a single point and quantize it to the nearest E8 lattice point — the densest sphere packing in 8 dimensions, strictly better than independent rounding. Third, add calibration-data fine-tuning to recover precision.
+
+*** Why it works (and what new pitfall it buries)
+
+Upgrading from "compress each weight individually" to "compress a group jointly" — crossing the line from scalar into *vector quantization* — captures the joint structure of weights and gains another tier of precision. But E8 is a *fixed* lattice — it treats all models and all layers identically and does not adapt to your data. Moreover, "group compression" means inference requires a *codebook lookup*: given a group of weights, find the nearest lattice point. This lookup is non-differentiable, and end-to-end training is blocked. These two gaps — fixed vs. adaptive, and non-differentiable lookup — respectively give rise to AQLM and, ultimately, LC-QAT.
+
+** 2024 | AQLM: Don't use a fixed lattice — learn the codebook from data
+
+*** What problem did it see
+
+(Note: AQLM 2024-01 slightly predates QuIP# 2024-02; they are parallel competitors, not sequential improvements.) AQLM targets the "fixed codebook" philosophy itself: QuIP/QuIP# smooth the weights via rotation and map them onto a lattice that was *designed in advance*, engineered for the worst case rather than tailored to your data.
+
+*** Its solution
+
+It imports "additive quantization" from the information-retrieval literature: represent each group of weights as the *sum of one vector drawn from each of several codebooks*; and rather than fixing those codebooks, *learn them jointly from calibration data across an entire Transformer block*. Beam search finds the optimal combination of codes. The bet: a data-adaptive learned codebook outperforms a fixed worst-case lattice.
+
+*** Why it works (and what new pitfall it buries)
+
+Learned codebooks fit the actual data distribution, improving precision at 2–3 bits and even making rotation optional. But however clever the codebook, it remains a *discrete lookup table* — the forward pass selects an index into the codebook, which is still non-differentiable. Training a post-quantization model requires STE (Straight-Through Estimator) as an approximate gradient — and STE is itself a major pitfall.
+
+** 2024 | PV-Tuning: Bypass the "unreliable STE" during fine-tuning
+
+*** What problem did it see
+
+QuIP# and AQLM both add a fine-tuning step after quantization to recover precision, and that step almost universally relies on *STE*. STE's flaw: quantization is a staircase function whose true gradient is nearly everywhere zero. STE simply *pretends the quantizer is an identity function* and passes gradients straight through. But that gradient has nothing to do with the actual forward computation — it's a stand-in. PV-Tuning observes that at ultra-low bit-widths, STE "improves things initially, then stalls and oscillates," because the full-precision buffer it maintains drifts away from the optimum as accumulated updates compound.
+
+*** Its solution
+
+Split the parameters into two groups updated in alternation (coordinate descent): *continuous parameters* (codebooks, scales) are updated normally via backpropagation; *discrete parameters* (code assignments) are updated within a small weight subspace using the *true objective gradient*, not STE's stand-in. This comes with convergence guarantees and produces the first Pareto-optimal 2-bit Llama-2.
+
+*** Why it works (and what new pitfall it buries)
+
+It does sidestep STE's inaccuracy. But the cost is that the discrete updates rely on *expensive coordinate descent / beam search* — LC-QAT later criticizes it for "inefficient and asynchronous parameter updates" that cause it to "saturate quickly." The root problem remains unsolved: as long as the codebook is a discrete lookup, you are forever patching around non-differentiability. The real way out is to make the lookup operation itself differentiable.
+
+** 2026 | LC-QAT: Use one linear constraint to turn "lookup" into "differentiable multiplication"
+
+*** What problem did it see
+
+LC-QAT targets the fatal flaws in both tributaries simultaneously: the scalar branch (BitNet / LLM-QAT / EfficientQAT / ParetoQ) suffers at 2 bits because "initialization is too poor and massive data is needed to recover"; the vector branch (AQLM / QuIP#) suffers because "lookup is non-differentiable and end-to-end training is blocked" — even end-to-end VQ approaches like PV-Tuning saturate quickly due to asynchronous updates. What it wants: VQ's bit-efficiency + SQ's end-to-end trainability + PTQ's strong initialization.
+
+*** Its solution
+
+The core idea is to impose a *linear constraint* on the codebook. In ordinary VQ, codewords are an arbitrary discrete table; LC-QAT requires every codeword to be generated by an affine mapping:
+
+#+begin_example
+        c  =  A · z  +  B
+
+   z : discrete quaternary vector, z ∈ {0,1,2,3}^d   (d=4)
+   A : d×d floating-point matrix   B : d-dimensional floating-point bias   (shared within one weight matrix)
+#+end_example
+
+The elegance of this trick: to find the codeword corresponding to a group of weights, there is no need to "search the codebook for the nearest neighbor" — just *round and clip* the weights to obtain the discrete vector z, then apply one linear projection (multiply by A, add B). All codewords lie in the same affine subspace defined by A and B, implicitly representing 4^d codewords *without storing an explicit table*. The forward computation can be rearranged as Y = Σ(X·A)·z^T + Σ(X·B)·1^T, directly reusing integer matrix-multiply kernels optimized for scalar quantization. For gradients, it uses *DGE* (Differentiable Gradient Estimator) in place of STE: the forward pass keeps hard quantization, while the backward pass uses a smooth approximation of the quantizer — a much better match to the true shape than STE's "pretend it's an identity." At d=4, only 20 extra parameters per weight matrix are introduced.
+
+*** Why it works (and what pitfalls remain)
+
+The "linear constraint" dissolves VQ's biggest obstacle — the non-differentiable lookup — by turning it into rounding plus a linear projection, which is fully differentiable. For the first time, VQ can be trained end-to-end as cleanly as SQ, while retaining the bit-efficiency advantage of group packing. Moreover, the affine structure naturally provides a strong PTQ initialization, so only *a small amount of data* is needed for QAT — no need to burn 4T tokens like BitNet. Trade-offs / limitations: A and B define an affine (linear) subspace, which is less expressive than a fully free codebook — the bet is that "quaternary discrete vectors + one linear layer" is sufficient coverage of the weight distribution, and d is kept small (=4) to limit overhead. Whether this linear constraint holds up under more extreme scenarios is a question left for future work.
+
+* Frontier Extensions
+
+As of now (2026-06), LC-QAT is the latest advance on the "2-bit, end-to-end trainable, data-efficient" frontier, just accepted at ICML 2026. It is the first to bridge the long-standing divide between the two tributaries — the trainability of scalar quantization and the high compression ratio of vector quantization — using a single linear constraint.
+
+Plausible follow-on directions (speculative, not confirmed papers): extending the affine constraint c=Az+B to piecewise or shallow nonlinear constraints, expanding expressiveness without sacrificing differentiability; or generalizing this "structured-constraint codebook" from weights to KV cache and activation quantization.
+
+* One Figure to Understand It All
+
+#+begin_example
+  Compression axis
+    ^
+    |  Scalar (per-weight)         Vector (per-group)
+    |  ----------                  ----------
+4bit|  GPTQ ----------------+      (PTQ is sufficient)
+    |  Compress + compensate |
+    |  [Flaw] collapses at 2bit   |
+    |                        v
+2bit|  QuIP -> rotate to scatter outliers
+    |    |  [Flaw] still scalar + slow rotation
+    |    v
+    |  QuIP# -> Hadamard + E8 lattice ==> crosses into "vector quantization"
+    |    |  [Flaw] fixed lattice / lookup is non-differentiable
+    |    +-------------------+--------------------+
+    |   (fixed vs. adaptive)       (non-differentiable lookup)
+    |        v                                    |
+    |     AQLM -> learned codebook                |
+    |        |  [Flaw] codebook still discrete; training relies on STE
+    |        v                                    |
+    |     PV-Tuning -> coordinate descent to bypass STE
+    |        |  [Flaw] beam search is slow / async / saturates
+    |        |                                    |
+    |  Scalar QAT line (other branch):            |
+    |   LLM-QAT (self-generated data) -> EfficientQAT (block-wise to save memory)
+    |     -> ParetoQ (2 bits is the sweet spot) -> BitNet (train from scratch on 4T tokens)
+    |        |  [Flaw] 2-bit init is poor; massive data required
+    |        +------------------+-----------------+
+    |                           v
+    |              ============================
+2bit|              LC-QAT (2026)
+    |              c = A·z + B
+    |              lookup -> round + linear projection (differentiable)
+    |              strong PTQ init + small-data QAT
+    |              SQ trainability (X) VQ high compression
+    |              ============================
+    +------------------------------------------------> Time
+      2022    2023        2024              2026
+#+end_example
+
+* Insights
+
+Reading the whole river end-to-end, a recurring theme emerges: *every generation of progress is about moving the "discrete, non-differentiable, requires an approximate patch" step one inch closer to "continuous, differentiable, directly optimizable."*
+
+- GPTQ turns isolated rounding into globally compensated optimization;
+- QuIP/QuIP# rotate the "hard-to-compress outlier distribution" into an "easy-to-compress spherical distribution" — reshaping the problem itself rather than brute-forcing it;
+- AQLM replaces a "lattice fixed for the worst case" with a "codebook learned for your data" — from static to adaptive;
+- PV-Tuning recognizes that STE's approximation is the bottleneck and starts attacking the gradient directly;
+- LC-QAT takes the final step: rather than endlessly patching around "non-differentiable lookup," impose one linear constraint so that the lookup operation is *differentiable from the ground up*.
+
+At a deeper level, this is the century-long reconciliation of the *scalar vs. vector* split. Scalar quantization is simple and trainable, but at 2 bits the information collapses too severely; vector quantization is bit-efficient, but the lookup operation locks it into non-differentiability. For a decade, the field was forced to choose one or the other. LC-QAT's insight is that a constraint can be a bridge — by requiring "codewords must be generated by a linear map," vector quantization retains the compression savings of group packing while reclaiming the differentiability of scalar quantization. *A constraint is not a restriction; a constraint is the interface that lets two worlds communicate.*
+
+Where things are most likely to go next: the affine constraint (one linear layer) will probably be generalized to more expressive yet still differentiable structures (piecewise linear, shallow nonlinear, learnable discrete group size d); simultaneously, the idea of "using structured constraints to buy differentiability" will spread from weights to KV cache and activation quantization.
+
+* Takeaways
+
+The biggest research-process lesson from this river: *when two lines of work have long been at odds, each with its own fatal flaw, the real breakthrough rarely comes from picking one side or naively combining both — it comes from finding a "constraint / interface" that lets the advantages of both coexist simultaneously.* LC-QAT didn't invent a new quantization paradigm; it simply asked a smarter question — "Can we add a constraint to the codebook so that lookup becomes multiplication?" — and that one constraint reconciled the longstanding enemies of "bit efficiency" and "end-to-end trainability."
+
+The practical takeaway: when you are stuck in a "can't have both" binary choice, don't rush to make trade-offs. Instead, fix your attention on the *specific mechanism* that forces the binary choice in the first place (here: "discrete lookup is non-differentiable"), and look for a structured constraint that dismantles that mechanism. Once the mechanism gives way, two goals that seemed irreconcilable may suddenly be able to coexist.

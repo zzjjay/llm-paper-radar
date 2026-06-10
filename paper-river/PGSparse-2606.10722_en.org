@@ -1,0 +1,286 @@
+#+title:      Continual LLM Upcycling: A Predictor-Gated Bank-Wise Sparsity Training Recipe for Dense-to-Sparse LLMs
+#+date:       [2026-06-10 Wed 00:22]
+#+filetags:   :paper:river:en:
+#+identifier: 20260610T002248-en
+#+source:     https://arxiv.org/abs/2606.10722
+#+authors:    Ruixuan Huang, Jinyuan Shi, Hantao Huang, Yifan Huang, Ziyi Guan, Hao Zeng, Ian En-Hsu Yen, Minghui Yu
+#+venue:      arXiv preprint, 2026
+
+* The River of the Problem
+
+Every time a large model generates a single token, it runs the entire feed-forward network (FFN) from top to bottom. Yet we have long known that for any given token, the vast majority of neurons in the FFN are doing absolutely nothing. So why can't we just compute "the part that is actually working"?
+
+The idea sounds simple, but this road has been under construction for nearly a decade without a clear winner. The bottleneck is not "which neurons are idle" — people discovered that early on. The real deadlock is *timing*: to skip certain channels you first need to know which ones to skip, but in a standard FFN the very signal that tells you "which channels matter" only becomes available after the entire FFN has been computed. By the time you have the answer, the work is done and nothing has been saved.
+
+Generation after generation has wrestled with this "timing paradox": some patch things up after the fact, some retrain with a new architecture, some simply split the FFN into a pool of experts. This paper (which we call *PGSparse*) gives a direct answer — before the FFN backbone even starts, a tiny predictor determines which channels to keep, and this capability is learned through continual training rather than bolted on afterward.
+
+* Source Map
+
+#+begin_example
+[2017] Vaswani et al. - Attention Is All You Need
+  |
+  | Problem: FFN accounts for two-thirds of each layer's parameters and
+  |          compute, yet applies the same dense transformation to every token.
+  | Solution: Fix the FFN form (two linear layers + nonlinearity);
+  |           it becomes the target for all subsequent "save compute" work.
+  v
+[2020] Shazeer - GLU Variants (SwiGLU)
+  |
+  | Problem: ReLU FFN quality hits a ceiling.
+  | Solution: Switch to a gated structure (gate/up/down three matrices);
+  |           higher quality — but FFN becomes larger and more expensive.
+  v
+  +--------------------------+--------------------------+
+  | Route A: split FFN into  | Route B: pick channels   |
+  | experts                  | inside the FFN           |
+  v                          v
+[2020] GShard (top-2 MoE)    [2021] MoEfication
+  |                          | Split an existing dense FFN into "experts"
+  |                          | without retraining.
+  v                          |
+[2021] Switch (top-1 MoE)    [2023] DejaVu - contextual sparsity
+  |                          | Finding: each token activates only a tiny
+  | Simplify routing to top-1|   subset of neurons; predict them with a
+  |                          |   small predictor -> skip the rest.
+  v                          v
+[2022] Sparse Upcycling      [2024] ShadowLLM
+  | Upgrade a dense          | DejaVu needs one predictor per layer;
+  | checkpoint into MoE      |   signal is weak.
+  |                          | -> Replace with a single global predictor.
+  |                          v
+  |                        [2024] Sirius
+  |                          | Contextual sparsity quietly hurts on
+  |                          |   reasoning tasks.
+  |                          | -> Call the dense model occasionally to correct.
+  |                          v
+  |                        [2025] MoC / Spark
+  |                          | Build sparsity into pretraining, not post-hoc.
+  |                          | But still rely on native gating or changed arch.
+  +------------+-------------+
+               v
+        [2026] PGSparse (this paper)
+        Wants "learned during training" (like upcycling) AND "channel-level"
+        (like MoC), with the key twist that the predictor produces the sparse
+        mask BEFORE the FFN backbone runs.
+
+  Note: The convergence of Route A (MoE) and Route B (channel sparsity) is
+        the paper's core motivation — it wants MoE's "training-time
+        intervention" without MoE's expert pool and all-to-all communication.
+#+end_example
+
+* Evolutionary Narrative
+
+** 2017 | Transformer FFN: Setting the Target for Everyone Who Followed
+
+*** What problem did it see?
+
+This is the starting point; there is no predecessor to critique. But it planted the seed of every subsequent problem: each Transformer block contains a feed-forward network with a blunt structure — one linear layer that expands the dimension by 4×, a nonlinearity, then a projection back down.
+
+*** Its solution
+
+Exactly that direct: `max(0, xW1)W2`. Two fully-connected layers with a ReLU in between.
+
+*** Why it worked (and what new pit it dug)
+
+It worked because it was simple and could learn — FFNs were later found to be where models "store knowledge." But the pit was also there: the FFN accounts for roughly two-thirds of each layer's parameters and the lion's share of per-token compute, and it applies *exactly the same* dense transformation to every token. A punctuation mark and a critical content word receive the same amount of computation. This "equal-treatment" waste is the fat that everyone for the next decade tried to cut away.
+
+** 2020 | SwiGLU: Making the FFN More Powerful — and More Expensive
+
+*** What problem did it see?
+
+The ReLU FFN's quality had peaked. Shazeer wondered whether the FFN could have its own "gate" to decide how much information to let through.
+
+*** Its solution
+
+Reshape the FFN into a gated structure: two parallel linear projections, one passing through an activation function as the "gate," the other carrying "content" (up), element-wise multiplied together, then projected down. Three matrices instead of two.
+
+*** Why it worked (and what new pit it dug)
+
+Gating lets the model control information flow more finely; quality improved noticeably, which is why LLaMA, Mistral, and Qwen all adopted it. The cost is a larger, more activation-heavy FFN — the fat got fatter. More subtly, the gate's output naturally carries information about "which channels matter" — a signal that several later sparsity methods would lock onto. Remember this; it is central to the timing paradox that follows.
+
+** 2020–2021 | GShard / Switch: Route A — Just Split the FFN into Experts
+
+*** What problem did it see?
+
+If the FFN is so large, and each token uses only a fraction of it, why route every token through the same FFN?
+
+*** Its solution
+
+Mixture of Experts (MoE): replicate one FFN into N "experts," add a router, and send each token to only one or two experts. GShard uses top-2 (each token selects 2 experts); Switch simplifies further to top-1 (select only 1) and adds a load-balancing loss to prevent uneven expert utilization.
+
+*** Why it worked (and what new pit it dug)
+
+Parameter counts can balloon to trillions while per-token compute stays nearly constant — that is the magic. Switch's advance over GShard is simply "daring to pick just one": it argues top-1 is already sufficient and saves routing and communication overhead. But MoE left a pile of new headaches: an independent expert parameter pool, expert-level routing, load-balancing pain, and cross-device all-to-all communication. These engineering burdens are exactly what PGSparse later tries to route around.
+
+** 2022 | Sparse Upcycling: Don't Train MoE from Scratch — "Upgrade" a Dense Model
+
+*** What problem did it see?
+
+MoE is efficient at inference, but *training from scratch* is expensive and data-hungry. Meanwhile, you already have a trained dense model — that sunk cost shouldn't be wasted.
+
+*** Its solution
+
+"Model surgery": take an existing dense checkpoint, copy each FFN into N experts, add a randomly initialized router, then continue training.
+
+*** Why it worked (and what new pit it dug)
+
+It surpasses the dense model and beats from-scratch MoE at roughly half the pretraining compute. The key contribution is a principle: *dense → sparse can be accomplished through continued training, not a rebuild from scratch*. This is the direct ancestor of PGSparse's "dense-to-sparse continual training" framework. But the result is still MoE; the expert pool and communication burdens are all still there.
+
+** 2021 | MoEfication: Route B's Other Opening — the FFN Is Already a Hidden MoE
+
+*** What problem did it see?
+
+Contemporary with Sparse Upcycling but working in the opposite direction: Zhang et al. found that in an ordinary dense FFN, most inputs activate only a small cluster of neurons. So the FFN is *already* a mixture of experts in spirit — nobody is just using it that way.
+
+*** Its solution
+
+Cluster the neurons of an existing FFN by "function" into several experts, then learn a router to select among them — *without changing any parameters*. Using 10–30% of the FFN parameters preserves 95%+ of performance.
+
+*** Why it worked (and what new pit it dug)
+
+MoEfication and Sparse Upcycling are complementary mirror images: one is "dense downcycling into MoE," the other is "dense upcycling into MoE." But MoEfication was designed for ReLU FFNs and does not translate well to modern SwiGLU gated structures — because SwiGLU lacks the natural "hard zero" sparsity of ReLU. This problem of "sparsity disappearing on modern architectures" recurs throughout the papers that follow.
+
+** 2023 | DejaVu: Contextual Sparsity — Sparsity Varies with Input and Can Be Predicted
+
+*** What problem did it see?
+
+Prior pruning was either static (cutting the same channels for all inputs), required retraining, or produced no real speedup. DejaVu saw a deeper truth: which neurons to activate *varies with the current context*.
+
+*** Its solution
+
+Train a small predictor per layer to predict in advance which attention heads and MLP neurons this token will need, then compute only those. Paired with asynchronous lookahead and hardware-aware kernels, it achieves 2×+ speedup on OPT-175B with almost no quality loss.
+
+*** Why it worked (and what new pit it dug)
+
+The concept of "contextual sparsity" is a genuine breakthrough — it turns sparsity from "pruning a model" into "on-demand invocation." But it left two large pits for the next three papers to fill: (1) one predictor per layer, with signal based on activation magnitude, is relatively weak; (2) it is fundamentally a *post-hoc* (training-free) overlay. More critically, if the mask comes from the native FFN activations, that signal *arrives too late* — by the time you compute the native activations, the backbone's gate and up projections are already done. This "timing" problem is PGSparse's central challenge.
+
+** 2024 | ShadowLLM: One Global Predictor to Replace DejaVu's Many
+
+*** What problem did it see?
+
+Aimed directly at DejaVu: one predictor per layer is too heavy, and using "activation magnitude" to judge importance is a weak signal.
+
+*** Its solution
+
+Replace DejaVu's per-layer predictors with a *single global predictor at the model's input*, which shadows the entire model like an oracle, trained with a better (gradient-based rather than magnitude-based) importance criterion.
+
+*** Why it worked (and what new pit it dug)
+
+End-to-end accuracy improved by more than 15% at equal sparsity, and inference became faster. The entire gain comes from shifting the predictor from "scattered and weak-signal" to "unified and strong-signal." Yet it still lives inside DejaVu's framework — sparsity remains a post-hoc addition to an already-trained dense model.
+
+** 2024 | Sirius: Contextual Sparsity Is Quietly Losing Quality — Someone Must Correct It
+
+*** What problem did it see?
+
+Sirius punctured an emperor's-new-clothes situation: contextual sparsity looks lossless on "reading comprehension" tasks but actually degrades significantly on *reasoning, deduction, and knowledge* tasks — and the better the model, the steeper the drop.
+
+*** Its solution
+
+Don't replace the predictor; add a correction step: let the cheap sparse model run as usual, and occasionally invoke the full dense model to rewrite the KV cache, patching only the tokens where the sparse model was "least confident."
+
+*** Why it worked (and what new pit it dug)
+
+It recovers near-dense quality at roughly 18% sparsity overhead. Its contribution is honestly exposing that "training-free contextual sparsity is brittle on complex generation tasks" — PGSparse cites exactly this point as the justification for "sparsity must be placed inside training, not added afterward."
+
+** 2025 | MoC / Spark: Build Sparsity into Pretraining
+
+*** What problem did it see?
+
+All the preceding work (the DejaVu family) pastes sparsity onto dense models after the fact, using heuristic dynamic thresholds, with unstable quality. MoC and Spark both ask: can we make the model *born sparse* from the start?
+
+*** Their solutions
+
+- *MoC (Mixture-of-Channels)*: During pretraining, apply top-k so each token activates only the most relevant channels, and "which channels" is decided directly by SwiGLU's *native gate output*.
+- *Spark*: Use "statistical top-k" (linear time, no sorting) for hardware-friendly sparsity; the predictor is built by *reusing existing parameters*, adding no new ones; single-stage training.
+
+*** Why they worked (and what new pits they dug)
+
+They moved the battlefront from "post-hoc" to "training time," achieving more stable quality. But each left a gap that this paper targets: MoC's sparsity decision comes from the native gate output — *the gate projection must be computed first before you know which channels to keep*, leaving the timing paradox unsolved; Spark's predictor is an artifact of its reparameterized internals and *cannot be directly attached to an existing SwiGLU model*. This is the stage PGSparse steps onto.
+
+** 2026 | PGSparse: Let the Predictor Speak Before the FFN Backbone Starts
+
+*** What problem did it see?
+
+Gathering all the threads into one sentence: for channel sparsity to produce *real hardware savings*, the sparse mask must be available *before* the FFN backbone's channel computations are "materialized."
+
+- DejaVu/MoC rely on native activations or the native gate → signal arrives too late; the heavy gate/up projections cannot be saved;
+- Sirius → proves that training-free sparsity is too brittle; sparsity must be part of training;
+- Spark → changed the architecture; cannot be applied directly to an existing SwiGLU;
+- Sparse Upcycling → gave the "continual training upcycling" paradigm, but the product is MoE with all its communication baggage.
+
+PGSparse wants: to learn sparsity through continual training like upcycling; to stay at channel granularity like MoC (no expert pool, no all-to-all); but to place the predictor *before the backbone path*.
+
+*** Its solution
+
+On top of the Qwen2.5-8B dense backbone, continued training at 32K context attaches a *low-rank predictor* to each SwiGLU FFN: it maps each token's hidden state to scores over the FFN's intermediate channels, producing routing logits *before the FFN backbone runs*. A fixed *bank-wise top-k* rule then applies — the intermediate dimension (14336) is divided into 224 banks of 64 channels each; only 16 channels per bank are retained, yielding 4× sparsity. During training, the forward pass executes "hard sparsity," and the backward pass uses a "soft surrogate" to propagate gradients.
+
+*** Why it works (and what new pits it digs)
+
+The low-rank predictor is tiny yet delivers the mask before the backbone starts, so gate and up projections truly compute only 1/4 of channels — the timing paradox is broken. Bank-wise top-k ensures that sparsity is *structured* (always 16/64 per bank), which is hardware-friendly, unlike free top-k whose activated-channel distribution is erratic.
+
+A new problem surfaces: the authors discover a *layer-local long-context failure* — on the RULER-CWE task (extracting frequent words from long text), the model hits a sharp "cliff" at 12K–16K tokens. Their fix is a *single-layer repair* (layer-7 repair / dense fallback): at layer 7, bypass the sparse predictor and substitute calibrated dense activations for the sparse ones, rescuing the affected length range. This "globally sparse, open the back door in one layer" patch is itself a phenomenon worth pursuing further.
+
+* Frontier Extensions
+
+As of now (June 2026), PGSparse is the latest advance on this "predictor-first + continual training upcycling + channel-level structured sparsity" line, with no publicly available follow-up papers that directly critique or improve upon it.
+
+Two plausible extension directions (speculative, not confirmed citations):
+- *Generalizing the repair*: The single-layer dense fallback is a "patch" discovery. If someone can explain why it is specifically layer 7 that fails, and why long contexts collapse at a particular layer, a more principled theory of "which layers should never be sparse" might emerge.
+- *Adaptive bank granularity*: The fixed 16/64 is a hard constraint. Follow-up work may allow the per-bank retention count to vary by layer and task, finding a finer balance between hardware friendliness and quality.
+
+* One Diagram
+
+#+begin_example
+          Where is the sparsity decision made? Who makes it? Training-time or post-hoc?
+
+Time -->  2017      2020        2021-22         2023-24            2025          2026
+        ----------------------------------------------------------------------------------
+Target  Dense FFN  SwiGLU       (FFN becomes the universally recognized compute fat)
+        one-size   gated but
+        -fits-all  more costly
+
+Route A ........GShard/Switch...Sparse Upcycling................................
+Split           Split FFN       Continue training                (Burden: expert pool +
+experts         into N experts  dense checkpoint -> MoE          all-to-all comm)
+                top-2->top-1
+
+Route B ...........................MoEfication...DejaVu...ShadowLLM...MoC/Spark...PGSparse
+Pick            Dense FFN is    Contextual    Single    Sparsity     Predictor
+channels        already a       sparsity      global    built into   runs before
+                hidden MoE      can be        predictor pretraining  backbone
+                (ReLU)          predicted               but gate              + bank top-k
+                                          Sirius:       must run first  (16/64, 4x)
+                                          post-hoc                     + continual
+                                          sparsity                       upcycling
+                                          brittle on
+                                          reasoning tasks
+
+Mask timing    post-hoc --------------------------------> training-time ----> before backbone
+              (too late; main costs unsaved)            (more stable)    (truly saves compute)
+
+                              PGSparse = Route A's "training-time upcycling"
+                                       + Route B's "channel-level granularity"
+                                       + unique "predictor-first" timing
+#+end_example
+
+* Insight
+
+On the surface this line tells the story of "iterative technical improvements in sparsity methods." What is truly shifting underneath is that *the location of the sparsity decision keeps moving earlier*.
+
+- At first (DejaVu), sparsity was a *post-hoc* action: train the model, then bolt on a predictor to guess where compute can be saved.
+- In the middle (MoC/Spark), the frontier moved to *training time*: let the model be born sparse.
+- With PGSparse, it moves earlier still — *inside a single forward pass*: before the FFN backbone acts, an independent small predictor has already spoken.
+
+Why is this "forward shift" the main thread? Because for sparsity to cash out as real hardware acceleration, the only hard constraint is *causal ordering* — you cannot skip a computation whose fate you have not yet decided. Every seemingly well-designed attempt that failed can be traced back to "the decision arrived too late." DejaVu using native activations, MoC using the native gate — both stumbled on this. PGSparse's core insight is almost embarrassingly obvious: *to skip it, you must decide before it runs*. The hard part is not the idea; it is getting a "predictor-first" low-rank module to learn, through continual training, to be as accurate as the native signal it replaces.
+
+A second hidden thread is *the convergence of the MoE route and the channel-sparsity route*. For a decade these two lines ran independently — one pushing toward "more experts plus communication," the other toward "selecting channels inside the FFN." PGSparse is in effect trying to absorb MoE's benefits (training-time intervention, upgradeable from a dense model) while discarding its burdens (expert pool, all-to-all). This suggests that in the future "sparsity" may no longer be divided into MoE vs. non-MoE, but unified into a continuum of "at what granularity and at what timing to perform conditional computation."
+
+Where is the most likely next step? The layer-7 single-layer repair is an honest but glaring crack — it reveals that the assumption of "uniform sparsity across the whole model" is itself flawed; certain layers (especially those involved in long-context processing) are intrinsically unsuitable for sparsity. The next valuable paper will likely explain *why sparsity feasibility is itself heterogeneous across layers and tasks*, turning "patching" into "allocating a sparsity budget per layer."
+
+* Takeaway
+
+For "how to do research and how to find problems," this line offers a razor-sharp prompt: *when many clever methods all fail, look for the hidden constraint they share*.
+
+The idea of contextual sparsity existed by 2023; the years that followed saw repeated pivots on "should the predictor be global," "should it be in pretraining," "is quality stable." But what was actually blocking everyone was an unspoken physical constraint — *the decision must precede the computation*. PGSparse's contribution is not inventing a new concept; it is *explicitly stating that constraint as a design target* ("the mask must be available before the backbone materializes"), and then deriving every design choice from that single requirement.
+
+The practical implication: next time you see a field where "many methods each improve something but nothing truly breaks through," don't rush to add one more improvement. First ask — *are they all violating the same unspoken constraint?* Finding that constraint and making it a first-principles design target is usually more valuable than tuning yet another predictor variant. The same applies in engineering: if you have a trained dense SwiGLU model on hand, this line of work tells you *there is no need to retrain from scratch or redesign the architecture* — a low-rank "predictor-first" module combined with continual training can upgrade it into a sparse model that genuinely saves hardware compute, provided you honor the one red line: the decision must come before the computation.

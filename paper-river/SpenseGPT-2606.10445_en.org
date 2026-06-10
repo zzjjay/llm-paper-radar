@@ -1,0 +1,250 @@
+#+title:      SpenseGPT: Practical One-shot Pruning Enabling Sparse and Dense GEMMs for LLM Inference
+#+date:       [2026-06-10 Wed 00:05]
+#+filetags:   :paper:river:en:
+#+identifier: 20260610T000534-en
+#+source:     https://arxiv.org/abs/2606.10445
+#+authors:    Jaeseong Lee, Seung-won Hwang, Samyam Rajbhandari
+#+venue:      arXiv preprint, 2026-06 (Snowflake AI Research / Seoul National University)
+
+* The River of the Problem
+
+In a sentence: *We want large models to run faster by zeroing out half of the weights and letting hardware skip those zeros — but hardware only recognizes one rigid format, "exactly two out of every four," and forcing models into that format degrades accuracy. The tension this river must resolve is the tug-of-war between hardware's rigidity and the precision loss it causes.*
+
+Why is this hard? Modern GPUs (NVIDIA Ampere, B200, and chips from AMD and Meta) provide a dedicated fast lane for sparse computation: if a weight matrix satisfies the *2:4* format — exactly two zeros and two non-zeros in every group of four consecutive weights — hardware can skip those zeros and, in theory, deliver 2× speedup.
+
+But that fast lane has a harsh entry requirement: *exactly 50%* sparsity, no more, no less. The problem is that not every layer or weight block in a large model "wants" to lose half its values. Some blocks can absorb a 50% cut with no trouble; others collapse entirely. Force-fitting 50% everywhere, and on hard tasks like mathematical reasoning (AIME), accuracy can plummet from 76 points to single digits.
+
+So practitioners have been wedged in the same gap for generations: *either accommodate the hardware's rigid format and sacrifice accuracy, or relax the format and lose access to the hardware fast lane.* Whoever can do both — free the format while keeping the hardware acceleration — wins.
+
+* The Source Map
+
+This river has two tributaries: one is "*how to decide which weights to prune*" (pruning algorithms), and the other is "*does hardware recognize the result*" (sparse formats). SpenseGPT stands at the confluence of both.
+
+#+begin_example
+              [Algorithm Tributary]                    [Format Tributary]
+
+[1992] Hassibi & Stork - Optimal Brain Surgeon (OBS)
+  |  Use second-order information (Hessian) to decide what to prune
+  |  and compensate the remaining weights for the error.
+  |  Problem: computing the Hessian inverse for the whole network
+  |           explodes as model size grows.
+  v
+[2021] ......................................  Mishra et al. - 2:4 Sparsity (NVIDIA Ampere)
+  |                                             |  Hardware fast lane: zero two of every four,
+  |                                             |  theoretical 2x speedup.
+  |                                             |  Requirement: exactly 50%, no more, no less.
+  v                                             |
+[2023] Frantar & Alistarh - SparseGPT          |
+  |  Scale OBS to billion-parameter models:     |
+  |  layer-wise reconstruction, column-by-col.  |
+  |  Can produce 2:4 directly, but accuracy     |
+  |  is constrained by the hard 50% deadline.   |
+  v                                             |
+[2024] Sun et al. - Wanda                       |
+  |  Even simpler: importance = |weight| x |activation|  |
+  |  No Hessian inverse, no weight updates.     |
+  |                                             v
+  |                          [2025] Hourri et al. - PATCH (tile-level mixing)
+  |                            |  Block-wise: some tiles go dense, some go sparse.
+  |                            |  Cost: requires a custom Triton compiler,
+  |                            |        Ampere only.
+  |                            v
+  |                          [2026] Shao et al. - SlideSparse
+  |                            |  (2n-2):2n is equivalent to 2:4; input activations
+  |                            |  are expanded to compensate.
+  |                            |  Cost: activation inflation -> only 1.04x on B200.
+  |                            |
+  +------------------+---------+
+                     v
+        [2026] Lee, Hwang, Rajbhandari - SpenseGPT  <- this paper
+          Split the matrix into one contiguous dense block + one 2:4 sparse block.
+          Use off-the-shelf cuSPARSELt + cuBLAS directly.
+          No custom compiler, no activation inflation -> genuine 1.2x on B200.
+          (SparseGPT / Wanda from the algorithm tributary select which rows go dense.)
+#+end_example
+
+Note: all citation relationships come from explicit statements in this paper's Related Work and reference list. "Algorithm tributary → SpenseGPT" is the paper's own description (SpenseGPT uses SparseGPT for pruning; SpenseGPT+ is inspired by Wanda). OBS and 2:4 hardware are the respective source heads of the two tributaries.
+
+* The Evolutionary Narrative
+
+** 1992 | OBS (Optimal Brain Surgeon): Don't prune blindly — use second-order information
+
+*** What problem did it see?
+
+At the time, pruning meant "drop weights that are close to zero — small value, should be harmless to remove." But this ignores the fact that weights are coupled to each other. A seemingly tiny weight might be quietly propping up some critical output. Delete it outright, and the error propagates and amplifies through the network.
+
+*** Its solution
+
+OBS introduced a smarter criterion. Instead of asking "how big is this weight?", it asks "if I remove this weight, how much does the total loss increase?" It uses the *second-order derivative (Hessian)* to answer: removing weight w_m causes an error of approximately w_m^2 / [H^{-1}]_{mm}.
+
+Even more elegantly, it not only tells you "which weight to remove for the least damage" but also "after removal, how to fine-tune the remaining weights to compensate" — along the direction δ_m = -w_m / [H^{-1}]_{mm} the error is absorbed. Remove one, compensate immediately; the loss barely moves.
+
+*** Why it works (and where it buried a new problem)
+
+Intuitively, the Hessian encodes inter-weight coupling, so OBS can see relationships that a magnitude criterion misses. It works — but it buried a fatal flaw: *computing the Hessian inverse is O(n^2) to O(n^3) in the number of parameters.* On the small networks of 1992 that was fine; for billion-parameter models the matrix cannot be computed or even stored. That flaw went unfilled for nearly thirty years.
+
+** 2021 | 2:4 Sparsity (Mishra et al., NVIDIA Ampere): Hardware opens a fast lane for sparsity, but the toll is steep
+
+*** What problem did it see?
+
+Even if you cleverly prune half the weights, a conventional GPU won't get faster — it still multiplies those zeros in. The "theoretically saved computation" from sparsity never translates into actually running faster. Real speed requires hardware cooperation: hardware must know where the zeros are and actively skip them.
+
+*** Its solution
+
+NVIDIA built "sparse tensor cores" into the Ampere architecture. To keep the hardware circuits simple and efficient, it mandated an extremely regular format: *2:4* — exactly two zeros and two non-zeros in every group of four consecutive weights. Hardware needs only a few bits to record "which two of the four are non-zero," enabling compressed storage and skipped computation, yielding up to 2× speedup.
+
+*** Why it works (and where it buried a new problem)
+
+Regularity = efficiency; hardware loves regularity. But regularity also means *rigidity*: exactly 50% sparsity, mandatory. Some weight blocks in a model can afford to lose half; others cannot — hardware doesn't care, it applies 50% universally. This directly pits "the format hardware wants" against "the accuracy the model needs." That tension became the central battleground for every paper that followed.
+
+** 2023 | SparseGPT (Frantar & Alistarh): Rescuing OBS and scaling it to billion-parameter models
+
+*** What problem did it see?
+
+OBS was theoretically correct but computationally impossible at scale; 2:4 hardware was fast but needed someone to compress a model into 2:4 format without losing too much accuracy. Existing methods to prune large models to 50% were either too crude (magnitude pruning, accuracy collapses) or required retraining (prohibitive cost). A "one-shot, no-retraining, high-accuracy" method was missing.
+
+*** Its solution
+
+SparseGPT made two key moves that transformed OBS from "theoretically sound but uncomputable" into "engineering-feasible":
+
+First, *divide and conquer*. Rather than computing the Hessian for the whole network, it prunes one layer at a time, solving a single objective per layer: minimize the reconstruction error of that layer's output XW^T. The layer-local Hessian is H = X^T X, a manageable size.
+
+Second, *column-by-column processing with a shared Hessian inverse*. It sweeps left to right, pruning one column at a time: once a column is handled it is frozen, and the error it caused is "pushed forward" to compensate the remaining columns on the right. This left-to-right ordering lets all rows share a single Hessian inverse, avoiding a separate inverse per row. For 2:4, it applies the OBS criterion within each group of four to pick the two entries to zero out.
+
+*** Why it works (and where it buried a new problem)
+
+A single forward pass, no retraining, large models pruned to 50% — a genuine breakthrough in 2023. But it obediently honored the 2:4 hard limit at 50% — and that limit itself is toxic. On easy tasks accuracy holds; on hard tasks like mathematical reasoning, forcing 50% pruning still causes a noticeable drop (this paper's Table 2: Seed-OSS-36B drops from 73.86 to 65.18). The hole is still there: *50% is too rigid.*
+
+** 2024 | Wanda (Sun et al.): Drop even the Hessian inverse — simplicity taken to the extreme
+
+*** What problem did it see?
+
+SparseGPT managed to scale OBS down, but it still needed to invert the Hessian and update weights — still heavyweight in engineering terms. Wanda asked: does determining how important a weight is really need all that complexity?
+
+*** Its solution
+
+Wanda reduces importance to a single minimal formula: *S_ij = |weight| × ||corresponding input activation||*. A weight's importance is just how large it is, multiplied by how strong the input signal it sees is. No Hessian inverse, no weight updates whatsoever — prune and leave.
+
+The intuition: from a reconstruction-error perspective, zeroing W_ij shifts the output by an amount proportional to W_ij × X_{:,j}, so |W_ij|·||X_{:,j}|| is a cheap yet effective importance estimate.
+
+*** Why it works (and where it buried a new problem)
+
+Wanda showed that "activation-aware × weight magnitude" is a surprisingly powerful lightweight signal. Its real legacy is not yet another pruner but *an importance score that can be computed independently for each weight, without reference to other weights* — a property that suits this paper perfectly (SpenseGPT+'s dense-block selection uses a Wanda-style score). However, Wanda still lives under the 2:4 50% ceiling and never touches the root problem of format rigidity.
+
+** 2025–2026 | PATCH & SlideSparse: The first attempts to break the 50% constraint, but both are impractical
+
+*** What problem did they see?
+
+Everyone before had silently accepted the 2:4 50% hard limit. PATCH and SlideSparse were the first to challenge it head-on: could sparsity become more flexible — say 37.5% or 25% — while retaining hardware acceleration?
+
+*** Their solutions
+
+- *PATCH (Hourri et al., 2025)*: tile-level mixing. Split the matrix into small tiles; some tiles go through dense GEMM, others through sparse GEMM, assembling a total sparsity more flexible than 50%.
+- *SlideSparse (Shao et al., 2026)*: mathematical transform. It observes that any (2n-2):2n sparsity pattern is equivalent to 2:4 — e.g., {a1,a2,a3,a4,0,0} can be rearranged as {a1,a2,0,0,a3,a4,0,0} and compressed with the standard library. The cost is that input activations must be inflated by (2n-2)/n at runtime to match.
+
+*** Why they work (and where they buried new problems)
+
+The direction was right — they broke the 50% lock. But both are impractical, each stumbling on its own pitfall:
+
+- PATCH requires *a custom Triton compiler*, and its implementation only supports Ampere; newer cards like the B200 cannot use it. In other words, it cannot directly leverage existing high-performance libraries.
+- SlideSparse requires *inflating the input activations*, and at large batch sizes (large M) that inflation eats away the gains from sparsity — end-to-end on B200 it is only *1.04×* faster, essentially no gain.
+
+So at this point the contradiction sharpens: *loosening the format is possible, but you either need to change the compiler or inflate the activations — both paths prevent real end-to-end speedup.*
+
+** 2026 | SpenseGPT (this paper): One clean cut — half contiguous dense, half 2:4 sparse
+
+*** What problem did it see?
+
+It identified the common root cause of PATCH and SlideSparse: in pursuit of flexibility, both introduced things not natively supported by hardware or libraries (custom compilers, activation inflation), and the resulting overhead consumed the acceleration gains. This paper's insight is: *flexibility does not have to come from clever tricks — it can come from a cut so simple it seems almost naive.*
+
+*** Its solution
+
+The Spense format: split a weight matrix along one dimension into *two contiguous regions* — one region (p%) stays dense, the other (100-p%) is pruned to standard 2:4 sparse.
+
+The key word is "contiguous": because both regions are individually regular, the dense block feeds directly into cuBLAS/cuBLASLt, and the sparse block feeds directly into cuSPARSELt/hipSPARSELt — *all off-the-shelf, highly optimized libraries, no compiler, no activation inflation.* Total effective sparsity can be 37.5%, 25%, or any value, determined by the dense fraction. Two implementation variants: output-split (split along the output dimension, for W_up/W_gate) and input-split (split along the input dimension with accumulation, for W_down).
+
+The second key finding: *which rows or columns become the dense block matters enormously* — with the same dense fraction, a bad selection causes AIME to drop from 76.67 to 8.89. The paper exploits a property of GLU MLPs (that the indexing of intermediate dimensions can be arbitrarily permuted without changing the output) to reorder the chosen dense indices into a contiguous block. Two strategies for choosing them:
+
+- *SpenseGPT*: the simplest possible — keep the final contiguous p% of indices as dense and apply SparseGPT to the rest. Why "final"? Because SparseGPT processes columns left to right and uses right-side columns as an error-compensation buffer; placing dense columns on the right lets them serve as that buffer. Surprisingly simple, yet effective.
+- *SpenseGPT+*: more accurate — uses a Wanda-style, independently computable reconstruction-loss score (combining weight magnitude, activations, and normalization across the gate/up/down projections) to identify the indices whose removal would be most costly, and keeps those dense.
+
+*** Why it works (and where it leaves open problems)
+
+It works because it does not invent new hardware primitives; instead it *hides flexibility inside "contiguous splitting + index permutation,"* letting an existing dense library and an existing sparse library each do their own job with zero extra overhead. The result: end-to-end decoding throughput on B200 + FP8 genuinely reaches *1.2×* (vs. SlideSparse's 1.04×), while at 25% sparsity accuracy nearly matches the dense baseline (Seed-OSS-36B: 73.12 vs. 73.86). The paper claims this is the first method to achieve real end-to-end decoding speedup using sparse tensor cores on next-generation hardware like the B200 without accuracy loss.
+
+Remaining open problems (the paper's own Limitations section): the speedup depends on the efficiency of the underlying sparse/dense libraries, so results vary with hardware, backend, and precision; SpenseGPT+ depends on calibration data, and if the deployment distribution differs substantially from the calibration distribution, the selected dense indices may no longer be optimal.
+
+* Frontier Extensions
+
+This is a June 2026 preprint at the leading edge of this river; no public follow-up papers critiquing or improving it exist yet. But concurrent work sketches the directions ahead:
+
+- *Sun & Sakuma (2026), Learning Semi-Structured Sparsity via Shared and Context-Aware Hypernetwork*: uses a hypernetwork to learn semi-structured sparsity masks, representing the path of "learned, context-adaptive sparsity patterns" — a counterpoint to SpenseGPT's "one-shot, rule-based splitting."
+- The paper's own named open direction: *more robust or task-adaptive dense-index selection.* SpenseGPT+ has already established that "which indices stay dense matters," but its scoring is still one-shot and static; the natural next step is making the dense region's selection dynamic, adapting to the task or input distribution.
+
+Honest note: the above represents concurrent/related work and the authors' own stated future directions, *not confirmed follow-up papers critiquing SpenseGPT* — as of now, this is the current state of the art on this line.
+
+* The Full Picture in One Diagram
+
+#+begin_example
+  Solution Dimension
+    ^
+    |
+ F  |                                          [SpenseGPT 2026]
+ o  |                                  Contiguous split: dense block + 2:4 block
+ r  |                            (off-the-shelf libraries, zero overhead,
+ m  |                             genuine 1.2x on B200)
+ a  |                                  ^         ^
+ t  |                                 /           \  algorithm tributary selects dense
+    |              [PATCH'25]--------+             +--------[SlideSparse'26]
+ F  |          tile mixing, needs compiler          (2n-2):2n, inflate activations
+ l  |          (Ampere only)                        (B200: only 1.04x)
+ e  |                  ^                                   ^
+ x  |                  |  First to break 50%, but both impractical  |
+    +- - - - - - - - - + - - - - - - - - - - - - - - - - - + - - - - - -
+ 50%|        [2:4 hardware Mishra'21]  rigid but fast (2x), exactly 50% required
+ H  |                  ^
+ a  |                  | Who can prune a model to 2:4 without losing accuracy?
+ r  |        [SparseGPT'23] layer-wise reconstruction + column-by-column OBS
+ d  |                  ^                  \
+ L  |                  | Hessian unscalable \ inspires scoring
+ i  |        [OBS 1992] 2nd-order criterion  [Wanda'24] |w|x|act|, minimal
+ n  |         + error compensation           (SpenseGPT+ uses it to select dense)
+ e  |
+    +-------------------------------------------------------------> Time
+       1992        2021      2023    2024        2025      2026
+
+  Reading guide: higher on the vertical axis = greater freedom from the rigid 50% format.
+  The lower half (below the hard line) is the "algorithm tributary" —
+    everyone trying to prune more accurately within the 50% cage.
+  The upper half is the "format tributary" — people starting to crack that wall.
+  SpenseGPT sits at the top-right: it breaks the wall (flexible format),
+    borrows the algorithm tributary's pruners to select dense blocks,
+    and requires no new hardware primitives whatsoever.
+#+end_example
+
+* Insights
+
+Reading the full river, the surface story is "pruning gets more accurate, sparsity gets more flexible." But the deeper cognitive shift underneath is this:
+
+*From "forcing the model to conform to hardware" to "rearranging the constraints without touching the hardware."*
+
+All early efforts (OBS → SparseGPT → Wanda) carried the implicit premise: "hardware demands 50%, so let's find ways to prune models to 50% as accurately as possible" — humans accommodating the machine. The first wave of format liberators (PATCH/SlideSparse) tried to reverse this by "getting hardware to accept a new format," which forced them to modify compilers and data flows — and the overhead of *touching the hardware interface* turned out to cost more than the compute saved.
+
+SpenseGPT's genuine cleverness is that it neither accommodates the hardware nor modifies it. It found a third path: *translating "flexible sparsity" into "two individually regular regions,"* letting two existing library stacks cooperate without any modification. In other words, it reformulated the problem from "invent a new primitive" to "compose existing primitives."
+
+This reflects a recurring engineering truth: *in a domain with a strong existing ecosystem of highly optimized libraries, a naive solution that reuses the ecosystem almost always beats an ingenious solution that requires new infrastructure.* SlideSparse is mathematically more elegant; PATCH is more general in principle — but Spense wins end-to-end because it plugs directly into cuSPARSELt and cuBLAS.
+
+Where is this most likely to go next? Two directions: (1) the dense/sparse split shifts from "static, one-shot" to "task- or input-adaptive" (SpenseGPT+ opens that door but is still static); (2) the same idea of "contiguous splits that reuse existing libraries" gets carried over to other hardware constraints — not just 2:4, but quantization, MoE routing, and any other setting where "hardware wants regularity, models want flexibility."
+
+* Takeaways
+
+The practical lesson this river offers for how to do research and find problems lands in a very concrete place:
+
+*Before inventing something new, ask: "Can I use a dumber split to translate the problem into a shape that existing tools can already eat?"*
+
+The most clever paper in this entire river (SpenseGPT) uses the most naive technique — split into two blocks, permute indices, call two existing libraries. It wins not because its algorithm is deeper, but because it accurately diagnosed why the previous format-liberators "broke the format yet still got no real speedup" (answer: they touched the hardware interface) and then sidestepped that cost.
+
+Practically, this means you can:
+- When reading a paper that claims to be "theoretically superior," first ask whether *it introduces anything requiring new infrastructure* (a new compiler, a new data layout, a new hardware primitive) — that is often the root cause of why it underperforms in real systems, and your opportunity.
+- In your own problems, when you face the tension of "hardware/library wants regularity, but your needs are flexible," try SpenseGPT's playbook: *decompose the flexible requirement into several individually regular sub-problems*, each of which hits a different already-maximally-optimized existing tool.
+- Read papers backwards: start from "who is this critiquing, and what does it say the prior work got wrong in practice?" — that gets you to the real pain point of a line of work faster than reading the abstract straight through.

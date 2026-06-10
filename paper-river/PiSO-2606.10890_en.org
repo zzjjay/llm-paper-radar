@@ -1,0 +1,209 @@
+#+title:      Optimal Post-Training Quantization Scales and Where to Find Them
+#+date:       [2026-06-10 Wed 00:27]
+#+filetags:   :paper:river:en:
+#+identifier: 20260610T002747-en
+#+source:     https://arxiv.org/abs/2606.10890
+#+authors:    Juan Amboage, Pablo Monteagudo-Lago, Ian Colbert, Giuseppe Franco, Nicholas Fraser
+#+venue:      arXiv preprint (2026-06)
+
+* The Problem River
+
+In a nutshell: *To compress a large model's weights to low bit-width, you first need a "ruler" — the tick spacing of that ruler (the scale factor) determines how coarse the quantization grid is. For a decade, everyone has used a lazy shortcut to set the scale: align the largest weight to the outermost tick. This paper asks — does an "optimal" way to draw this ruler actually exist? Can it be computed rather than guessed?*
+
+Why is this hard, and why has no one tackled it head-on?
+
+Quantization is really two things tangled together: *first, setting the scale* (how large each tick interval is), and *second, assigning rounding* (which grid point each weight snaps to). The two are coupled — change the scale, and every weight's grid assignment shifts with it. Over the years, the field settled into a tacit division of labor: *set the scale with the dumbest possible heuristic (absmax — push the largest absolute value to the boundary), then pour all the effort into "how to recover the rounding error"* (which is exactly what the GPTQ line of work does).
+
+This division has a hole nobody has poked through: *absmax never looks at the data.* It only considers how large the weights are, completely ignoring how much those weights, once multiplied through, will have their errors amplified by the input activations at the layer output. Two weights of equal magnitude can have wildly different contributions to the final error depending on how active the corresponding activations are — absmax treats them identically.
+
+Worse still, all these methods *implicitly cap the scale at absmax* — the ruler can never be longer than the largest weight. This is an unverified convention that everyone inherited. What if the optimal scale is actually larger than absmax? Nobody knows, because nobody went looking.
+
+So the true question this river is asking is: *Under the assumption that rounding is nearest-integer (RTN), given calibration data, does a provably optimal scale exist and can it be computed exactly?* If so, the foundation of a decade's worth of "fix the scale carelessly, then patch the rounding error" work develops a crack.
+
+* Source Map
+
+This river has two tributaries twisted together. *The rounding tributary*: starting from the classical Optimal Brain Surgeon, progressively refining the idea of "quantize one weight, redistribute its error to neighbors" until it can run on 175B models (GPTQ → CDQuant). *The scale tributary*: starting from the absmax heuristic, with attempts to make rounding adaptive (AdaRound) and to optimize scale and rounding jointly via coordinate descent (COMQ / Beacon). PiSO stands at the confluence of both, and for the first time treats "scale" as a standalone quantity whose globally optimal value can be solved for exactly.
+
+#+begin_example
+        [Rounding Tributary]                    [Scale Tributary]
+
+[1993] Optimal Brain Surgeon
+  |  Use second-order information (Hessian) to decide which weight to remove
+  |  and how to redistribute the error to the remaining weights
+  v
+[2022] OBQ - Apply OBS thinking to "quantization"  [2020] AdaRound - "Round up or round down?"
+  |  Error from quantizing one weight                |  Shows that round-to-nearest is not optimal
+  |  is redistributed to unquantized weights         |  Learns soft rounding to approximate optimal up/down
+  |  But O(d^3) — cannot run on large models         |  But it moves rounding, not scale
+  v                                                  |
+[2022] GPTQ - Make OBQ run on 175B                  |
+  |  Fixed column order + batched updates            |
+  |  + Cholesky for numerical stability              |
+  |  4 GPU-hours to quantize 175B                    |
+  |  But: scale is fixed up front (absmax),          |
+  |       frozen throughout                          |
+  v                                                  v
+[2024] CDQuant - Greedy coordinate descent      [2024] COMQ / [2026] Beacon
+  |  GPTQ sweeps each column once, often         |  Treat scale and rounding as coordinates,
+  |  getting stuck in suboptima                  |  alternately optimize, each step has closed form
+  |  CDQuant repeatedly picks the coordinate    |  But: the problem is NP-hard;
+  |  with the largest per-step gain              |  iteration only guarantees "error non-increase",
+  |  Also extended to group-wise                 |  no global optimality guarantee;
+  |  But: still inherits absmax upper bound +   |  channel-wise only
+  |       coarse discrete grid search           |
+  |                                              |
+  +--------------------+------------------------+
+                       |
+              Shared blind spot of both tributaries:
+              Scale is either data-free (absmax),
+              or hard-capped at absmax as an upper bound,
+              or only chased via iteration with no global guarantee
+                       |
+                       v
+        [2026] PiSO - Solve for the globally optimal scale
+          Key observation: grid assignment as a function of scale is piecewise constant
+          -> The entire real line can be cut into finitely many intervals
+          -> Within each interval, the error has a closed-form minimum
+          Sweep all intervals = obtain the globally optimal scale
+          Then interleave with GPTQ-style error compensation
+#+end_example
+
+Note: arrows indicate "problem evolution" direction, not strictly citation order. AdaRound (2020) belongs to the vision quantization era; PiSO cites it as a contrast case of "moving rounding without moving scale," not as a direct predecessor. COMQ (2024, vision) → Beacon (2026, LLM) is the same idea scaled to different regimes. These relationships are organized from PiSO's introduction and related work; some categorizations reflect problem-level grouping rather than explicit critique chains stated by the authors.
+
+* Evolutionary Narrative
+
+** 1993/2022 | OBS → OBQ: "Quantize one weight, don't let it bear the error alone"
+
+*** What problem it saw
+
+The most naive form of quantization is RTN — each weight is handled independently, rounded to the nearest grid point. The problem is that it treats every weight as an island: the error introduced when one weight is rounded up should be shared among its neighbors, but instead nobody absorbs it and it accumulates.
+
+*** Its solution
+
+Borrowed from the classic Optimal Brain Surgeon: that work used second-order information (the inverse Hessian) to decide which weight to prune and how to redistribute the loss to the remaining weights. OBQ transplants this to quantization — when one weight is quantized, its induced error is *redistributed to the weights not yet quantized*, letting them fine-tune to compensate.
+
+*** Why it works (and where the next pit is buried)
+
+Because it finally acknowledges that "weights interact with each other." But OBQ requires repeated computation of the inverse Hessian, at cost O(d^3), completely infeasible for billion-parameter models. The pit: the idea is right, but it does not scale.
+
+** 2022 | GPTQ: Making "error compensation" run on large models for the first time
+
+*** What problem it saw
+
+OBQ is too slow. Quantizing a 175B model with OBQ would take forever.
+
+*** Its solution
+
+GPTQ re-engineers OBQ with three practical changes: *fix the column processing order* (no longer re-selecting the optimal column at each step), *batch the updates*, and *use Cholesky decomposition for numerical stability*. This reduces the cost of error compensation from intractable to 4 GPU-hours for 175B models.
+
+*** Why it works (and where the next pit is buried)
+
+It made "quantize-and-compensate" the de facto standard for low-bit quantization. But it buried this river's largest pit: *GPTQ operates on a quantization grid that is fixed in advance — the scale is chosen with absmax before compensation begins and frozen throughout*. All of its ingenuity goes into "how to fix rounding," while it implicitly assumes "how to set the scale" is already a solved detail. Every method that followed accepted this assumption.
+
+** 2024 | CDQuant: GPTQ sweeps once — not enough
+
+*** What problem it saw
+
+GPTQ processes each coordinate exactly once in a fixed column order. This "single-pass" approach often gets stuck in suboptimal solutions — some weights could save a lot of error if adjusted again, but they never get another turn.
+
+*** Its solution
+
+Switch to *greedy coordinate descent*: in each round, pick the coordinate with the largest per-step gain and update it, then repeat — rather than adhering to a fixed order. Also extended to group-wise quantization (a group of weights shares one scale).
+
+*** Why it works (and where the next pit is buried)
+
+Greedy descent approximates the minimum layer reconstruction error more closely than a single pass, and it can serve as a drop-in replacement for GPTQ. But it has two pits that PiSO zeroes in on: *first, it still inherits absmax as the scale upper bound* — it decoupled scale from rounding but never dared to break through the absmax ceiling; *second, its group-wise extension treats each group as an independent discrete grid search*, which is coarse-grained and *ignores cross-group interactions mediated by activations*.
+
+** 2024/2026 | COMQ → Beacon: Treat the scale as a variable to optimize directly
+
+*** What problem it saw
+
+In all the preceding methods, scale is always a "supporting actor" — either frozen by absmax or decoupled but still capped below absmax. Why not put scale and rounding in the same optimization problem and tune both?
+
+*** Its solution
+
+Treat *scale factors and rounding assignments as coordinates*, perform coordinate descent, solve for each coordinate in closed form per step, and alternate updates repeatedly. COMQ validated this on vision Transformers; Beacon extended it to LLMs.
+
+*** Why it works (and where the next pit is buried)
+
+It does bring scale into a data-driven optimization. But it collides with the hardest rock in this river: *joint optimization of scale and rounding is fundamentally NP-hard*. Coordinate descent can only guarantee "error does not increase"; *it provides no global optimality guarantee* — the scale you get may be far from the true optimum, and you have no way of knowing by how much. Moreover it is limited to channel-wise quantization and cannot handle cross-group coupling in group-wise settings.
+
+** 2026 | PiSO: It turns out the "optimal scale" can be computed exactly
+
+*** What problem it saw
+
+PiSO distills everyone's blind spot into one sentence: *People either set the scale without data (absmax ignores the fact that activations amplify errors differently for different weights), or they lock the scale below absmax as an upper bound (an unverified convention), or they use iteration with no global guarantee to grope toward a solution (COMQ/Beacon's NP-hard predicament).* Not one of them directly answered the question: does an optimal scale exist, and can it be computed?
+
+*** Its solution
+
+PiSO seizes a structural fact everyone overlooked: *under RTN rounding, the assignment of each weight to a grid point — viewed as a function of the scale — is piecewise constant.* That is, as you continuously slide the scale, the vast majority of weights stay in their current grid cell; they only "jump" one cell at certain critical threshold values.
+
+Following this observation: since the assignment is piecewise constant, *the entire real line can be cut into finitely many intervals, and within each interval the quantization error as a function of scale is a clean expression with a closed-form minimum*. So finding the globally optimal scale reduces to something a brute-force approach gets right — *sweep all intervals, compute the closed-form minimum for each, and pick the global minimum*. Cost: O(D^2|G|) per channel. This is "where the optimal scale is hiding" — inside the segments between these piecewise breakpoints — and nobody went looking because nobody sliced the real line this way.
+
+Next comes the interleaving with error compensation. There is a tension: GPTQ *displaces weights from their nearest grid points*, which violates the RTN assumption that PiSO relies on. PiSO offers three stitching strategies: *decoupled* (optimize all scales first, then compensate), *layer-wise interleaving* (re-optimize each layer's scales before compensating that layer), and *group-wise interleaving* (re-optimize each group's scale so it tracks the weights that have already absorbed error-redistribution updates from earlier groups). The group-wise extension falls back on a heuristic.
+
+*** Why it works (and where the next pit is buried)
+
+It works because it takes a sub-problem that everyone treated as NP-hard (under the RTN restriction) and proves it is exactly solvable. Along the way it breaks the absmax upper-bound convention — the optimal scale genuinely can lie beyond absmax. Experimentally, across Llama and Qwen at various sizes and bit-widths, both perplexity and zero-shot accuracy improve consistently, and *the gains grow larger as bit-width narrows* — precisely confirming that "a wrong scale costs the most at low bit-width."
+
+Remaining pits: the "provably optimal" claim is strictly tied to the *RTN assumption*; once mixed with GPTQ-style compensation that moves weights around, optimality can only be approximately maintained through interleaving. The group-wise extension also reverts to a heuristic, and cross-group coupling is not handled with the same closed-form optimality as the channel-wise case.
+
+* Frontier Extensions
+
+As of now (2026-06), PiSO is the latest development on the "scale optimization" line, and no public follow-up critiques have appeared yet. But the problems it opens up are almost written on its face:
+
+- *Making group-wise exact*: channel-wise achieves a closed-form global optimum, but group-wise falls back to a heuristic. Extending the piecewise-constant structure to group-wise settings with cross-group coupling is the most direct baton to pick up.
+- *Breaking out of RTN*: PiSO's optimality rests on "rounding = round-to-nearest." Once you allow weights to be actively displaced as in GPTQ/CDQuant, does the "piecewise closed-form optimum" still hold? This is the key leap toward truly merging the scale and rounding tributaries.
+- *Stacking with rotation / incoherence processing (QuaRot, SpinQuant)*: those methods reshape the weight distribution itself; how PiSO's optimal scale behaves in the rotated space is worth examining.
+
+* One Figure to Understand It All
+
+#+begin_example
+  Dimension       absmax/RTN       GPTQ line        COMQ/Beacon      PiSO (2026)
+                  (classical)      (2022-24)        (2024-26)
+  ---------------------------------------------------------------------------
+  How scale      Top the max       Top the max      Coordinate       Piecewise sweep
+  is set         (data-free)       (fixed upfront)  descent iter.    for global optimum
+                                                    (no global guar) (closed form)
+
+  Data used?     No                During comp.     Yes              Yes (correctly)
+
+  Scale ceiling  = absmax          = absmax         ~ near absmax    Can exceed absmax
+
+  Optimality     None              Local optimum    "Error           RTN global optimum
+                                   for rounding     non-increase"    (provable)
+                                                    (NP-hard
+                                                    compromise)
+
+  Main focus     ---               How to fix       Scale + rounding Scale solved alone
+                                   rounding         jointly tuned    then interleaved
+                                                                      with compensation
+  ---------------------------------------------------------------------------
+  One-line evolution:
+    "Scale is a side note, set it casually"
+      --> "Freeze the scale, obsess over rounding"
+        --> "Tune the scale too, but only by guessing"
+          --> "The scale can actually be solved for globally and exactly"
+#+end_example
+
+* Insight
+
+On the surface, this line is "incremental technical progress on quantization accuracy." Underneath, what is actually happening is *the dismantling of a division of labor that was silently accepted for a decade*.
+
+The entire low-bit quantization field was built on an unexamined premise: *scale is a solved detail, rounding is the real battlefield*. All the ingenuity after GPTQ — CDQuant's greedy selection, the many variants of error compensation — was poured into the "rounding" side, because everyone collectively accepted two unwritten rules: "set the scale with absmax, and never go above absmax."
+
+PiSO's real contribution is not the complexity of its algorithm; it is that it *went back and questioned the premise nobody was questioning*. It noticed that the "scale → assignment" mapping is piecewise constant — a purely structural observation that required no new data and no new hardware; it was always there. Because everyone's attention was on rounding, nobody looked down at the scale. Once you do look, a problem that was treated as NP-hard (under the RTN restriction) collapses into "sweep the intervals."
+
+This is a recurring theme in research: *the hardest advances often come not from sharpening the tools in the chosen battlefield, but from discovering that the battlefield itself was chosen wrong.* When everyone is competing on A, the quantity B that was assumed "already solved" often has its global optimum sitting untouched inside it.
+
+Where to go next is almost defined by PiSO's own boundaries: it achieves "provably optimal" under RTN + channel-wise, so *extending that optimality to group-wise (with cross-group coupling) and non-RTN (with weight displacement)* are the two most tension-filled drop points downstream.
+
+* Takeaway
+
+The most direct lesson this evolutionary line offers for "how to find research problems": *look for the step in your field that everyone assumes is already solved and no longer discusses.* The more it is treated as a supporting actor — dismissed with "just use XX heuristic" — the more likely it is harboring an optimum nobody has ever computed.
+
+Practical implications:
+
+- When choosing a research direction, don't just chase the metric everyone is already competing on. *Ask: "Which step in this pipeline is decided by gut feeling, and has never been proven optimal?"* — that step is your opportunity.
+- When confronted with the claim "this is NP-hard, we can only iterate toward an approximation," *first verify that the claim applies to your actual problem.* PiSO's key move was exactly this: joint optimization is indeed NP-hard, but *under the restricted sub-problem of RTN*, the structure changes and the global optimum becomes tractable. A carefully chosen restriction can turn an unsolvable problem into a solvable one.
+- When a quantity is treated as a "free variable to search over iteratively," *first check whether the mapping between that variable and the objective has a piecewise structure.* Piecewise-constant or piecewise-linear mappings often mean that "finite enumeration + closed-form solution per piece" can replace blind iteration — and this pattern works just as well outside of quantization (scheduling, threshold selection, piecewise pricing).

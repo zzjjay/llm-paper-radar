@@ -1,0 +1,227 @@
+#+title:      UniSVQ: 2-bit Unified Scalar-Vector Quantization
+#+date:       [2026-06-10 Wed 00:42]
+#+filetags:   :paper:river:en:
+#+identifier: 20260610T004234-en
+#+source:     https://arxiv.org/abs/2606.10520
+#+authors:    Haoyu Wang, Haiyan Zhao, Xingyu Yu, Zhangyang Yao, Xu Han, Zhiyuan Liu, Maosong Sun
+#+venue:      ICML 2026 (arXiv preprint, 2026-06)
+
+* The Problem River
+
+In one sentence: *We want to compress every weight of a large model from 16 bits down to 2 bits — only four possible values — without letting accuracy collapse, and without sacrificing inference speed afterward. The knot this river tries to cut is the deadlock between "compress hard" and "run fast."*
+
+Why is this hard? The most direct approach to 2-bit compression is *scalar quantization* (SQ): each weight is quantized independently, rounded to the nearest grid point. It is simple, and at inference time it carries almost zero overhead — but at 2 bits the grid is so coarse that a handful of outliers aligned with the coordinate axes cause errors to explode, dropping zero-shot task scores by more than 30 percentage points.
+
+The alternative is *vector quantization* (VQ): a group of weights is packed together and looked up against the nearest entry in a learned "codebook." The codebook can be fitted closely to the data, yielding beautiful accuracy — but the cost hides at inference time. Every decode requires *looking up this codebook*, and once the codebook exceeds the GPU's L1 cache, every lookup must fetch from slow DRAM, dragging matrix multiplication to a halt. The paper puts it squarely: *"This unstructured codebook is the root cause of VQ's computational and memory overhead."* Want a smaller codebook? Either accuracy drops, or the decoding logic grows more complex.
+
+So everyone on this river is stuck in the same triangle: *2-bit accuracy, inference speed, and compression flexibility.* SQ takes speed and loses accuracy; VQ takes accuracy and loses speed. UniSVQ asks: can a single method stand on both sides simultaneously — with VQ's accuracy and SQ's speed?
+
+* Source Map
+
+This river has two tributaries. The *scalar tributary* (SQ): each weight is compressed to one number; at inference time it slots straight into optimized integer-multiply kernels — blazing fast, but at 2 bits the information collapses too badly. The *vector tributary* (VQ): groups are packed and looked up in a codebook, saving bits and recovering accuracy — but the "lookup" operation either slows inference (large codebook) or limits flexibility (small codebook). UniSVQ stands at the confluence, using an "affine transform over an integer lattice" to give the codebook structure, reducing the table lookup to a linear transform that can be pre-absorbed into the activations.
+
+#+begin_example
+        [Scalar tributary SQ]                    [Vector tributary VQ]
+
+[2022] GPTQ - Post-training quantization, second-order error compensation
+  |  RTN rounds each weight in isolation, letting errors accumulate alone
+  |  Compress-and-compensate on the fly; 4 bits works, 2 bits collapses
+  |
+  +---------------------------------> [2023] QuIP - adds "incoherence processing"
+  |   GPTQ ignores outliers/axis alignment   |  Rotate weights to scatter them;
+  |   no theoretical guarantees; 2-bit fails |  2-bit becomes feasible for first time
+  |                                          |  + LDLQ adaptive rounding (subsumes GPTQ)
+  |                                          |  [gap] still scalar rounding per coordinate
+  |                                          v
+  |                              [2024] QuIP# - Hadamard + E8 lattice codebook
+  |                                      |  After scattering, weights are "spherical"
+  |                                      |  Gaussian; compress groups onto E8 lattice
+  |                                      |  (densest sphere packing in 8D) -> enters VQ
+  |                                      |  [gap] fixed lattice; must look up codebook
+  |                                      +------------------+
+  |                                      v                  v
+  |                          [2024] AQLM            [2024] QTIP
+  |                          Learned additive        Trellis coded quantization (TCQ)
+  |                          codebook; data-         Stateless lookup -> stateful decode
+  |                          adaptive > fixed        Codebook size decoupled from dimension
+  |                          lattice                 [gap] decoding requires trellis
+  |                          [gap] still discrete    computation/lookup; logic is complex
+  |                               lookup; slow
+  v                                                       inference
+[Various 2-bit SQ methods] ----+      Pain points of both tributaries:
+  SpinQuant / OSTQuant          |      SQ: 2-bit outlier sensitivity -> accuracy -30%+
+  Fast inference, but 2-bit     |      VQ: unstructured codebook -> large = slow inference,
+  accuracy collapses            |          small = accuracy drop / complex decoding
+                                +----------------+----------------+
+                                                 |
+                                                 v
+                          [2026] UniSVQ - Unified Scalar-Vector Quantization
+                            Codeword = affine transform (A·z + B) over integer lattice
+                            A commutes with linear-layer matrix multiply
+                            -> pre-absorb into activations
+                            -> reuse SQ integer kernels, gain VQ accuracy + SQ speed
+                            Only 20 extra parameters per weight matrix (4x4 + 4)
+#+end_example
+
+Note: arrows show the direction of "problem evolution," not necessarily strict citation relationships. AQLM (2024-01) and QuIP# (2024-02) are parallel competitors — "learned codebook vs. fixed lattice." QTIP and AQLM are contemporaneous successors to QuIP# in different directions (one attacks the "codebook-size vs. dimension" wall, the other attacks "fixed vs. adaptive"); details are clarified below. UniSVQ and the companion paper LC-QAT (2606.10531) from the same group form a pair: LC-QAT takes the QAT route and targets "end-to-end trainability"; UniSVQ takes the PTQ route and targets "inference throughput." Both share the same "linearly constrained codebook" core.
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Upgrading "round each weight" to "compress-and-compensate"
+
+*** What problem it saw
+
+The most naive quantization is RTN — each weight is compressed independently, rounded to the nearest grid point. It treats every weight as an island, ignoring interactions among weights: once a weight is rounded up, the error it introduces has no one to share it with its neighbors, and it accumulates unchecked. At low bit-widths RTN simply collapses.
+
+*** Its solution
+
+Borrow the old idea from Optimal Brain Quantization: when compressing one weight, immediately *spread its induced error across the remaining uncompressed weights*, using second-order information (the inverse Hessian) to let them make small compensating adjustments. GPTQ's contribution was reducing the cost from "astronomically slow" to 4 GPU-hours for a 175B model — fixed column ordering, batch updates, and Cholesky-based numerical stabilization.
+
+*** Why this works (and what new problem it buries)
+
+"Compress-and-compensate" prevents errors from accumulating in isolation; at 4 bits the degradation is nearly zero. But it is still fundamentally *scalar rounding* — at 2 bits the grid is so coarse that compensation cannot keep up. And it is helpless against weight outliers: once a small number of unusually large weights align with a coordinate-axis direction, quantization error explodes. That is the wound the next paper aims to close.
+
+** 2023 | QuIP: Scatter the weights with a random rotation before quantizing
+
+*** What problem it saw
+
+QuIP zeroed in on GPTQ's fatal weakness: no mechanism whatsoever to handle outliers or "important directions aligned with coordinate axes," and no theoretical guarantee. This is the exact cause of 2-bit collapse.
+
+*** Its solution
+
+"Incoherence processing." Before quantizing, multiply the weight matrix and the Hessian simultaneously by a random orthogonal matrix — effectively *randomly rotating* the entire weight space, so that outliers that had been clustered along coordinate axes are scattered into a uniform, well-behaved distribution, then rotated back after quantization. The companion LDLQ is a provably optimal adaptive rounding procedure that also subsumes GPTQ as a special case. This gives the first theoretical guarantee for LLM quantization: incoherence is the key property that controls quantization error.
+
+*** Why this works (and what new problem it buries)
+
+After rotation and scattering, no direction stands out anomalously, making 2-bit quantization *feasible for the first time*. But the rotation uses random orthogonal matrices, which are *slow and not theoretically optimal*; and after scattering it still performs *per-coordinate scalar rounding* — failing to realize that the scattered weights are now "spherically" distributed, and that compressing an entire group together would be more efficient.
+
+** 2024 | QuIP#: Compress spherical weight groups onto the E8 lattice
+
+*** What problem it saw
+
+QuIP left two gaps: the rotation matrix is slow, and it still does scalar quantization, missing the joint structure of the scattered weights.
+
+*** Its solution
+
+Three moves. First, replace the random orthogonal rotation with a *randomized Hadamard transform* (RHT) — faster, theoretically superior, and the scattered weights become approximately spherical Gaussian. Second, since the weights are an 8-dimensional spherical distribution, use an *E8 lattice codebook*: treat every 8 weights as a single point and quantize it onto the E8 lattice (the densest sphere packing in 8D) — compressing the whole group together, which is strictly better than rounding each entry individually. Third, add calibration-data fine-tuning to recover accuracy.
+
+*** Why this works (and what new problem it buries)
+
+Upgrading from "compress one weight at a time" to "compress a group together" (this is the leap from scalar quantization into *vector quantization*) captures the joint structure of the weights and pushes accuracy another level higher. But E8 is a *fixed* lattice — it treats every model and every layer identically and does not adapt to data. And "compressing a group" means you must *look up the codebook* at inference time. These two gaps — fixed vs. adaptive, and the overhead of table lookup itself — separately gave rise to AQLM (attacking the former) and QTIP (attacking the latter), and ultimately to UniSVQ.
+
+** 2024 | AQLM: Replace the fixed lattice with a *learned* codebook
+
+*** What problem it saw
+
+(AQLM, 2024-01, is slightly earlier than QuIP# 2024-02; they are parallel competitors.) AQLM's target is the "fixed codebook" idea itself: QuIP/QuIP# maps weights onto a *predetermined* lattice designed for the worst case, one that does not adapt to the data at hand.
+
+*** Its solution
+
+Transplant "additive quantization" from information retrieval: represent each weight group as the *sum of one vector chosen from each of several codebooks*; these codebooks are not fixed in advance but are *jointly learned on calibration data across an entire Transformer block*, with beam search to find the optimal combination. The bet: a data-adaptive learned codebook beats a worst-case-designed fixed lattice.
+
+*** Why this works (and what new problem it buries)
+
+The learned codebook fits the actual data distribution; accuracy at 2–3 bits improves further. But however clever the codebook, it is still a *learned discrete table* — and the more adaptive and larger it grows, the more likely it is to overflow the cache at inference time. AQLM uses accuracy gains to prove the value of "adaptivity," yet pushes the "codebook overhead" problem — the fundamental ailment of VQ — to a sharper extreme.
+
+** 2024 | QTIP: No stored codebook — derive codewords with stateful decoding
+
+*** What problem it saw
+
+QTIP locked onto the physical ceiling of VQ: the codebook is a *static lookup table* that must fit entirely in the GPU's L1 cache at inference time (and must be replicated 32–64 times to avoid bank conflicts), capping out at roughly 4 KB, corresponding to dimension d ≈ 8. Want to exploit higher dimensionality to compress the "spherical" weight distribution more aggressively? Codebook size grows *exponentially* with dimension, immediately blowing the cache — VQ is pinned to low dimensionality by this "codebook wall."
+
+*** Its solution
+
+*Trellis Coded Quantization* (TCQ). Instead of mapping each weight group to an entry in a static table, use a *stateful decoder* that traverses a trellis to *compute* codewords on the fly — decoupling codebook size from bit rate and dimension. Combined with a hardware-friendly "bitshift trellis" and computation-based random Gaussian codes that require no table at all, this effectively *throws away* the cache-resident codebook entirely. The cost drops from exponential in dimension to *linear*, enabling near-optimal distortion at very high dimensionality while matching QuIP#'s throughput.
+
+*** Why this works (and what new problem it buries)
+
+QTIP is the first method to make "high-dimensional VQ" and "high throughput" non-exclusive — it does not shrink the codebook; it *eliminates* it. But the price is *decoding complexity*: stateful trellis decoding, bitshift operations, and computation-based codes form a specialized mechanism that is a fundamentally different path from the scalar-quantization integer matrix-multiply kernels that industry has already polished to perfection. In other words, QTIP solves "the codebook takes space," but it does not return to the most straightforward path — "directly reuse the existing high-speed SQ kernels."
+
+** 2026 | UniSVQ: Use an affine transform to "fold" the codebook into the activations
+
+*** What problem it saw
+
+UniSVQ simultaneously targets the fatal weakness of both tributaries. The scalar tributary (SpinQuant, OSTQuant, etc.) is blazing fast at inference, but at 2 bits its min-max projection and per-dimension independent processing are defenseless against outliers, and accuracy collapses by more than 30%. The vector tributary (QuIP#, AQLM, QTIP) achieves good accuracy, but at root *that unstructured codebook* either grows large enough to slow inference or forces you onto QTIP's complex codebook-free decoding. What it wants: VQ's accuracy + SQ's speed + a path to directly reuse existing integer kernels.
+
+*** Its solution
+
+The core insight: rather than *eliminating* the codebook (QTIP) or *learning a large one* (AQLM), impose a *linear structural constraint* on the codebook — require every codeword to be an *affine transform* of an integer-coordinate vector:
+
+#+begin_example
+        c  =  A · z  +  B
+
+   z : integer coordinate vector (a point on the integer lattice)
+   A : d x d floating-point matrix   B : d-dim floating-point vector
+       (shared within one weight matrix)
+   d = 4  ->  only 4x4 + 4 = 20 extra numbers stored per weight matrix
+#+end_example
+
+This builds a bridge between SQ and VQ: like VQ it compresses groups and has the flexible shaping matrices A and B; like SQ it has a regular integer-lattice structure. The most critical step — *the linear transform A commutes with the matrix multiplication in the linear layer*. So at inference time there is no need to store or look up a codebook at all: the affine transform is *pre-absorbed into the activation* side, and the weight side reverts to a clean integer lattice, ready to be plugged directly into integer matrix-multiply kernels that have been optimized to perfection for scalar quantization. Storage-wise, a codebook that would have required 2048 bytes is reduced to (4×4+4)×2 = 40 bytes. The pipeline is: randomized Hadamard preprocessing → LDLQ quantization → data-driven block-wise fine-tuning to directly minimize reconstruction error.
+
+*** Why this works (and what gaps remain)
+
+VQ's biggest physical obstacle — the unstructured codebook that occupies cache and requires specialized decoding — is *folded* by a linear constraint into 20 parameters plus one linear transform that can be merged into the activations. UniSVQ is thus the first method to stand on both sides simultaneously: accuracy on par with or exceeding state-of-the-art VQ, and inference throughput matching SQ's integer-kernel speed — the paper reports consistent gains over SOTA 2-bit SQ methods, accuracy approaching leading VQ methods, and superior inference throughput. The cost and limitation: A and B span an affine subspace, which is less expressive than a fully free learned codebook (AQLM) or an extremely high-dimensional trellis (QTIP). The bet is that "integer lattice + one affine layer" is already sufficient to cover the weight distribution after Hadamard scattering; d is also kept small (= 4) to save parameters. Whether this linear constraint can keep holding up for larger models and more extreme bit-widths is the question left for the future.
+
+* Frontier Extensions
+
+As of the time of writing (2026-06), UniSVQ is one of the latest advances on the "2-bit, high accuracy, high throughput" line, just accepted at ICML 2026. It and the companion LC-QAT (2606.10531) from the same group are a twin pair: both share the "linearly constrained codebook c = A·z + B" core, but they attack different directions —
+
+- *LC-QAT*: takes the *QAT* (quantization-aware training) route; the key selling point is that the linear constraint makes "table lookup" differentiable, enabling end-to-end training on limited data;
+- *UniSVQ*: takes the *PTQ* (post-training quantization) route; the key selling point is that the affine transform commutes with the linear layer, allowing the codebook to be folded into the activations and the SQ integer kernels to be reused for *inference throughput*.
+
+One linear constraint, leveraged to buy "trainability" in one paper and "inference speed" in the other — this itself shows how broadly applicable this structural idea is.
+
+Probable future directions (speculative, not yet confirmed papers): extend the affine constraint (one linear layer) to piecewise or shallow nonlinear forms while preserving "commutativity / reusable kernels"; transfer the "structured codebook foldable into activations" idea from weights to KV cache and activation quantization; and merge UniSVQ's PTQ initialization with LC-QAT's QAT fine-tuning into a unified compression pipeline of "strong structured initialization + lightweight fine-tuning."
+
+* The Big Picture
+
+#+begin_example
+  Accuracy
+   ^   High (good)
+   |
+VQ |   AQLM ----learned codebook, data-adaptive----+   QTIP ----TCQ, eliminates codebook----+
+   |   [gap] codebook grows large, overflows cache  |   [gap] decoding logic complex,        |
+path   slow inference                              |        does not reuse SQ kernels        |
+   |   QuIP# --Hadamard + E8 fixed lattice----------+-----enters vector quantization---------+
+   |   [gap] fixed lattice / must look up codebook                                          |
+   |        ^                                                                               |
+   |        | (scalar -> vector)                                                            |
+   |   QuIP --scatter outliers by rotation, 2-bit feasible for first time                  |
+   |   [gap] still scalar rounding + slow rotation                                         |
+   |        ^                                                                               |
+   |   GPTQ --compress-and-compensate, 4-bit works                                         |
+   |   [gap] 2-bit collapses / ignores outliers                                            |
+   |                                                                                       |
+SQ |   SpinQuant / OSTQuant --blazing fast inference (reuses integer kernels)              |
+   |   [gap] 2-bit outlier sensitivity, accuracy -30%+                                    |
+path        |                                                                              |
+   |        +------------------want the best of both worlds---------------------------+
+   |                                          |
+   |                                          v
+   |        ============================================
+   |        UniSVQ (2026)   c = A·z + B
+   |        Codebook -> affine transform (20 params), commutes with linear layer
+   |        -> pre-absorb into activations, reuse SQ integer kernels
+   |        VQ accuracy (X) SQ throughput
+   |        ============================================
+   +-----------------------------------------------------> Time
+     2022   2023      2024                          2026
+        Low <----- Inference throughput -----> High
+#+end_example
+
+* Insight
+
+Reading the whole river as a continuous thread, a recurring motif emerges: *what this river is really migrating is not the number called "accuracy" but where the cost is hidden.* In the early period (GPTQ / QuIP) the cost was accuracy — 2 bits simply could not hold. In the middle period (QuIP# / AQLM) vector quantization bought back accuracy, but the cost transferred to *the codebook itself*: it consumed storage, consumed cache, and slowed inference. So the two late-period paths are both, at root, asking "can the codebook's cost be eliminated?"
+
+- *QTIP's answer is "cancel it"*: compute codewords on the fly with a stateful trellis; no table stored. The price is a complex decoding mechanism incompatible with SQ's kernels.
+- *UniSVQ's answer is "fold it"*: a linear constraint collapses the codebook into 20 parameters plus one affine transform that merges into the activations. The price is narrowing the codebook's degrees of freedom to an affine subspace.
+
+At a deeper level, UniSVQ's insight and that of its twin LC-QAT are the same: *the century-old binary choice between scalar and vector quantization can be dissolved by a single structural constraint.* The reason VQ is slow and hard to train is, at root, "that unstructured codebook." The moment you add the constraint "every codeword must be an affine transform of an integer-lattice point," the codebook immediately acquires two properties that only SQ possesses — it can be folded into the activations (so it is fast) and it can be differentiated (so it can be trained). *Constraint is not restriction; constraint is the interface through which vector quantization can grow back the good properties of scalar quantization.*
+
+Where things go next: the affine constraint (one linear layer) will very likely be generalized to more expressive but still "commutative / kernel-reusable" structures; the idea of "using structural constraints to trade for engineering friendliness" will migrate from weights to KV cache and activation quantization; and the PTQ line (UniSVQ) and the QAT line (LC-QAT) will probably converge into a unified compression pipeline of "strong structured initialization + lightweight fine-tuning."
+
+* Takeaway
+
+The biggest methodological lesson from this river: *when a method's strength and its cost are both locked to the same thing, do not rush to trade off between cost and benefit — first stare at that "thing" itself and ask whether it can be replaced, eliminated, or folded away.* VQ's accuracy and its overhead are both tied to "the codebook." QTIP chose to cancel the codebook; UniSVQ chose to fold it. Two different paths, the same root cause — because neither team treated "the codebook must be a free, unconstrained table" as an axiom.
+
+The practical takeaway: when you are stuck in a "high-quality but too heavy / lightweight but too crude" binary, first identify the *specific structure* that ties quality and weight together simultaneously (here: "the unstructured codebook"), then ask — can you impose a constraint on it that, while preserving quality, restores the engineering properties of the lightweight solution (reuse existing kernels, fold into existing computation, support gradients)? Once that structure is tamed by a constraint, two goals that seemed irreconcilable may suddenly be able to coexist.
