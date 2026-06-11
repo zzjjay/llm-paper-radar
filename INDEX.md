@@ -398,3 +398,5 @@
 - [06-08](digests/2026-06-08.md) — 309 scanned, 6 passed, top: KVarN: Variance-Normalized KV-Cache Quantization M
 
 - [06-09](digests/2026-06-09.md) — 313 scanned, 8 passed, top: SpenseGPT: Practical One-shot Pruning Enabling Spa
+
+- [06-10](digests/2026-06-10.md) — 278 scanned, 1 passed, top: Holding the FP8 Quality Ceiling at 8-Bit Weights a

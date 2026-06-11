@@ -1,0 +1,256 @@
+#+title:      Holding the FP8 Quality Ceiling at 8-Bit Weights and Activations: INT8 and GGUF Post-Training Quantization of Ideogram 4.0 for Consumer GPUs
+#+date:       [2026-06-11 Thu 00:06]
+#+filetags:   :paper:river:en:
+#+identifier: 20260611T000627-en
+#+source:     https://arxiv.org/abs/2606.12280
+#+authors:    Deep Gandhi, Ali Asaria, Tony Salomone
+#+venue:      arXiv preprint (cs.LG), 2026
+
+* The River of Problems
+
+One question: you have a gaming GPU from a few years back (RTX 3090), and you want to run a state-of-the-art text-to-image model with 9.3 billion parameters (Ideogram 4.0). The model is too large to fit in VRAM; compress it and image quality collapses — especially *text rendered in the image*, which turns to illegible gibberish the moment you quantize. What do you do?
+
+On the surface this is a "save VRAM" problem, but dig deeper and it is one continuous thread spanning twenty years: *how do you pack the same intelligence into fewer bits without losing the most precious part of what it can do?*
+
+Where does the difficulty lie? It lies in the gap between "getting the average right" and "getting the critical parts right." You can compress a model to 8 bits or 4 bits and have it look fine overall, with small average error — but inside every model there are a handful of "hot-tempered" values (outliers) whose magnitudes dwarf everything else by tens or hundreds of times. Apply a single ruler to all numbers and you face a dilemma: either the ruler is too coarse to accommodate the giants, or you stretch the scale so far to fit them that the normal values all collapse to the same point. Generation after generation of researchers has fought these same troublemakers — sidestep them, relocate them, or carve out a special lane just for them.
+
+In the text-to-image branch, the problem grows new teeth: text rendered in images is the most fragile capability of all. A slightly blurry face goes unnoticed, but "OPEN" misprinted as "OPEM" is spotted instantly. Quantization kills the model's most valuable skill first.
+
+* The Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem: A few "hot-tempered" outliers cause global collapse when a model
+  |          is compressed to INT8
+  | Solution: Isolate the outlier columns and compute them in high precision;
+  |           compute everything else in INT8
+  v
+[2022] Xiao et al. - SmoothQuant
+  |
+  | Problem: Separating outlier columns is fragmented and hardware-unfriendly
+  | Solution: Migrate the "hot-tempered" outliers from activations into
+  |           weights, making both sides well-behaved
+  v
+[2022-23] GPTQ / AWQ / QLoRA(NF4)  --- a fork: pushing toward 4 bits
+  |
+  | Problem: 8-bit is not frugal enough; can we do 4-bit weight-only?
+  | Solution: Layer-wise calibration / protect salient weights /
+  |           a dedicated NF4 data format
+  |           (NF4 later becomes "the format to beat")
+  v
+[2023] He et al. - PTQD          --- the diffusion-model branch opens
+  |
+  | Problem: Diffusion models denoise step by step; quantization noise
+  |          "snowballs" and accumulates across steps
+  | Solution: Decompose quantization noise into correctable bias +
+  |           absorbable variance
+  v
+[2025] Chen et al. - FP4DiT
+  |
+  | Problem: Activations in diffusion Transformers (DiT) vary with
+  |          tokens/channels, not with timestep
+  | Solution: Replace static calibration tables with per-token dynamic scaling
+  v
+[2026] Gandhi et al. - This paper (Ideogram 4.0 INT8/GGUF)
+  |
+  | Problem: Ampere consumer GPUs have no FP8 tensor cores, so FP8 must be
+  |          decoded back to bf16 at every forward pass (painfully slow);
+  |          NF4 blurs text in generated images
+  | Solution: A convergent W8A8 recipe + dedicated protection of FFN
+  |           down-projection layers + the first OCR evaluation under
+  |           quantization
+
+(Foundation: [2022] DiT - Peebles & Xie | [2022] Flow Matching - Lipman et al.
+ These define Ideogram 4.0's backbone: flow matching + diffusion Transformer)
+#+end_example
+
+* The Evolutionary Narrative
+
+The protagonist of this entire thread has always been those "hot-tempered" outlier values, plus the extra complication that appeared in text-to-image: text is the most fragile capability. We start with the oldest paper.
+
+** 2022 | LLM.int8(): Discovering "a few bad numbers spoil the whole batch"
+
+*** What problem did it see?
+
+Before it, INT8 quantization was considered a solved problem — compress a small model to 8 bits, no trouble. But as models scaled to billions and tens of billions of parameters, something strange appeared: the same method would cause a precision avalanche the moment it was applied, and the model would start hallucinating incoherently.
+
+Dettmers et al. dug into the data and found the culprits: a small cluster of "outlier features." In certain fixed channels, activation magnitudes were tens or hundreds of times larger than in other channels. Imagine measuring the height of a class: everyone is around 1.7 m, then suddenly a 17 m giant walks in. To fit all heights on a single ruler, you have to stretch the scale so far for the giant that everyone at 1.7 m gets crushed into the same point — you can no longer tell who is taller. INT8 has only 256 tick marks; once a few giants claim them, the remaining normal values all round to the same number.
+
+*** Its solution
+
+Since only a few columns are giants, just pull those columns out and handle them separately. LLM.int8() splits matrix multiplication into two parts: the vast majority of "normal columns" are computed with fast INT8 as usual; the few "giant columns" are kept in high precision (16-bit) and computed separately, then the two results are merged. Most of the computation is still cheap; the critical columns are not mistreated.
+
+*** Why it works (and what pitfall it buried)
+
+It works because it honestly acknowledges a fact: error is not uniformly distributed; the problem concentrates in a few places, so only spend resources there. But it buried a pitfall — this hybrid algorithm of "fast lane for most, slow lane for a few" is hardware-unfriendly. GPUs love clean, uniform operations. Extracting a few columns mid-computation, processing them at a different precision, then merging them back is a "fragmented" operation that prevents full throughput. So the next researcher asked: can we avoid splitting things up and make all values well-behaved?
+
+** 2022 | SmoothQuant: Move the "hot temper" from activations into weights
+
+*** What problem did it see?
+
+SmoothQuant fixed its gaze on LLM.int8()'s pitfall: the reason you had to extract outlier columns was that the *activation* side had giants. The weight side was actually quite tame, with a uniform distribution. A matrix multiplication = activations × weights, and all the trouble was on the activation side. So why not spread the trouble around?
+
+*** Its solution
+
+This is the most elegant move in the entire lineage. Matrix multiplication has a mathematical identity: divide a column of the activation by a scalar s, and simultaneously multiply the corresponding row of the weights by s — the result is exactly the same. SmoothQuant exploits this: for channels with "giant activations," divide by a large s to suppress their magnitude; the cost is that the corresponding weight row is scaled up. But because the weights are already tame and have headroom, they can absorb it.
+
+To use a relocation analogy: the activation room is crowded with a few giants, while the weight room is spacious. SmoothQuant does not lock the giants in a separate cell (that is what LLM.int8() did); instead it transfers part of the giants' "height" to the neighboring empty room, so that a normal ruler fits in both rooms. A tunable strength α controls how much is transferred.
+
+*** Why it works (and what pitfall it buried)
+
+It works because, after the transfer, both activations and weights are well-behaved, so the entire matrix multiplication can be run with INT8 cleanly, without splitting. That is the "uniform" computation GPUs love, and throughput can run at full speed. This paper (Ideogram 4.0) directly inherits this technique — it states that SmoothQuant "migrates activation outliers into weights with a tunable strength α."
+
+The remaining pitfall: 8 bits is enough, but some people felt it was not frugal enough. 8-bit only compresses to half the size — could you push harder and go to 4 bits? That spawned a separate branch.
+
+** 2022–23 | GPTQ / AWQ / QLoRA(NF4): Three approaches charging toward 4 bits
+
+*** What problem did they see?
+
+SmoothQuant had made 8-bit respectable, but 8-bit still means the model is half its original size. For those trying to fit a model into a consumer GPU, they wanted to halve it again — 4-bit weight-only quantization (activations stay at high precision). But 4-bit has only 16 tick marks; naive rounding inevitably collapses the model. How do you survive with only 16 tick marks? Three researchers gave three answers.
+
+*** Their solutions
+
+- *GPTQ*: Layer-wise calibration. Instead of blindly rounding, it quantizes weights column by column, observes the error after each column, then fine-tunes the remaining unquantized columns to compensate. Like laying bricks where each one is slightly crooked, so you angle the next brick to compensate. This paper calls it "the calibration backbone for ≤4-bit weights."
+- *AWQ*: Protect important weights. It finds that not all weights are equally important — a small fraction has an outsized effect on the output. So it applies per-channel scaling to protect those important weight channels, guided by the magnitudes of the activations. This paper calls it "orthogonal" to its own approach (the ideas do not conflict and can be combined).
+- *QLoRA's NF4*: Invent a new data format. Standard 4-bit tick marks are uniformly spaced, but neural-network weights roughly follow a normal distribution — dense in the center, sparse at the extremes. NF4 arranges its 16 tick marks according to the normal distribution — dense in the middle, sparse at the edges — so that the tick marks "grow where the data is." This paper sums up the relationship in one sentence: "NF4 defines the format we need to beat."
+
+*** Why they work (and what pitfall they buried)
+
+They all work, but this paper makes a measured observation: *these elaborate calibration methods only genuinely separate from simple rounding at the extreme 4- or 5-bit regime; at 8 bits, even the most naive rounding is sufficient.* That sentence is the basis for this paper's confidence in using a simple recipe at 8 bits.
+
+The more important pitfall is the one NF4 leaves behind: it does compress the model to 4 bits, but *image quality suffers, and the loss is greatest where text is concerned.* That thorn is embedded directly in this paper's motivation. Meanwhile, this entire thread was fought on large language models — switch to diffusion-based text-to-image models and the rules change again.
+
+** 2023 | PTQD: Quantization noise in diffusion models "snowballs"
+
+*** What problem did it see?
+
+All prior methods assumed the model is a "single shot": input goes in, output comes out, and quantization error is absorbed once. Diffusion models are not — they denoise iteratively over dozens of steps, and the output of each step feeds the next. PTQD found that quantization noise introduced at each step accumulates and amplifies along the chain. Small early errors snowball into large ones by the final steps, and the image signal-to-noise ratio collapses.
+
+*** Its solution
+
+PTQD decomposes quantization-induced noise into two parts and treats each differently: the part correlated with the signal, which manifests as a mean shift, is directly subtracted to correct the bias; the uncorrelated part, which manifests as excess variance, is absorbed by adjusting the diffusion process's existing variance schedule to accommodate it. In effect, it works with diffusion models' own mathematical structure to settle quantization noise rather than brute-forcing it.
+
+*** Why it works (and what pitfall it buried)
+
+It was the first to clearly articulate "quantization in diffusion models is a temporally evolving problem, not a static one." This paper cites it mainly as *evidence of speedup*: PTQD's CUTLASS INT8 W8A8 kernel on an RTX 3090 achieved a 2.03× speedup, proving "INT8 can genuinely be fast on Ampere — provided someone writes that fused kernel."
+
+But PTQD targeted the older U-Net convolutional diffusion architecture. When the diffusion backbone switched from convolutions to Transformers (DiT), the character of activations changed again.
+
+** 2025 | FP4DiT: DiT activations vary with token, not with timestep
+
+*** What problem did it see?
+
+The PTQD lineage assumed activation variation was driven mainly by the denoising timestep, so it favored static calibration tables indexed by timestep. FP4DiT made careful measurements on diffusion Transformers and reached a different conclusion: DiT activation distributions vary primarily with *input tokens/patches*, not with the denoising timestep. The static calibration table you built for timesteps is aimed at the wrong source of variation.
+
+*** Its solution
+
+Since activations change in real time with every token, stop relying on a precomputed static table. FP4DiT switches to *online, per-token dynamic quantization* — when each token arrives, compute the scaling factor on the fly from that token's own magnitude. It also finds that the GELU activation function in DiT has a sensitive range that must be protected, so it uses mixed-format floating-point quantization to handle it.
+
+*** Why it works (and what pitfall it buried)
+
+It works because it moved the scaling granularity from "per-timestep" to "per-token," aligning with DiT's true source of variation. This paper directly inherits that judgment — it uses per-token dynamic scaling with the explicit rationale from FP4DiT: "DiT activations are token/channel-dominant rather than timestep-dominant," so "no static calibration table is needed to absorb the timestep dependence."
+
+But FP4DiT targets 4-bit floating-point (W4A6) and assumes hardware that can natively run low-precision floats. Back in reality: an older RTX 3090 has no native FP8 hardware at all. That hands the stage to this paper.
+
+** 2026 | This paper: On consumer Ampere, use INT8 to hold the FP8 quality ceiling
+
+*** What problem did it see?
+
+This paper gathers all the preceding threads into a very concrete practical predicament. Ideogram 4.0 is a 9.3-billion-parameter flow-matching diffusion Transformer driven by a Qwen3-VL-8B encoder. It faces two unavoidable problems:
+
+1. *Ampere GPUs (RTX 3090) have no FP8 tensor cores.* The FP8 checkpoint, which should offer the highest image quality, can only run on this card by "decoding every linear layer back to bf16 before each forward pass" — so slow it takes 172.9 seconds per image. FP8 is not an acceleration path here; it is an ornament.
+2. *NF4, though frugal, blurs text in images* (precisely the thorn left by the GPTQ/NF4 branch).
+
+The gap is clear: what is missing is a native low-precision compute path for Ampere — one that preserves image quality like FP8, saves memory like NF4, and does not blur text.
+
+*** Its solution
+
+Rather than inventing new wheels, it assembles the long-convergent W8A8 recipe and adds two critical ingredients:
+
+- *Inherited components*: SmoothQuant migration (tunable α) + per-token dynamic activations (from FP4DiT's insight) + per-channel weight quantization. At 8 bits the values are already well-behaved, so there is no need for the elaborate calibration that GPTQ/AWQ require only at 4 bits, nor for the rotation tricks of SVDQuant/DiRotQ — and Ideogram's adaLN generates modulation parameters at runtime, making offline rotation infeasible anyway.
+- *New ingredient 1: Protect the FFN down-projection layers.* A layer-wise sensitivity analysis reveals that the quality of the entire model depends overwhelmingly on a handful of feed-forward network "down-projection" layers. Keeping those layers at higher precision stabilizes image quality. This is the paper's most concrete finding.
+- *New ingredient 2: The first per-category OCR evaluation under quantization.* No paper in this entire lineage had ever measured "can the text in the generated image still be read after quantization?" This paper establishes that metric and shows that its INT8 recipe preserves text legibility — directly addressing the NF4 thorn.
+
+*** Why it works (and what pitfall it buried)
+
+The core argument for why it works is: *at 8-bit precision, a simple recipe is sufficient; the hard part is not how clever the algorithm is, but knowing what to protect (FFN down-projection) and which hardware path to use (INT8, not FP8).* The result: INT8 is statistically tied with FP8 on Pick and CLIP metrics, and beats NF4 by 1.9 CLIP points; the GGUF Q4_K variant beats NF4 at the same disk footprint and becomes the Pareto winner on the quality-versus-memory frontier.
+
+The remaining pitfall is stated honestly by the paper itself: INT8 weights currently only *match* FP8 in memory footprint, without reducing it further; real speedup still awaits a "fused INT8 kernel" (the kind PTQD demonstrated could hit 2×). The recipe is ready; the last piece of the puzzle is engineering.
+
+* Frontier Extension
+
+As of now (June 2026), this paper is the most recent advance on the "consumer hardware-aware quantization" thread. Its position is distinctive: not an algorithmic breakthrough, but *a deployment of years of convergent technique onto a hardware reality that the mainstream had overlooked (FP8-less Ampere cards), with a missing metric filled in that everyone else had omitted (OCR fidelity).*
+
+The next step it points to is written in its own limitations section: the *fused INT8 GEMM kernel* that would make INT8 genuinely twice as fast. The recipe has converged; engineering the kernel is what turns "save VRAM" into "save VRAM and run faster," lowering the barrier for consumer hardware to run top-tier text-to-image models one notch further.
+
+* One Diagram to Understand It All
+
+#+begin_example
+         What this thread fights against ----> How to handle "hot-tempered" outliers
+                                               + fragile text rendering
+
+  Bit width   8-bit ============================>     <==== 4-bit extreme zone ====>
+  Direction   |                                              |
+              |  LLM.int8()      SmoothQuant                  GPTQ/AWQ/NF4
+  Large        |  "compute bad     "relocate bad  --fork-->  "three 4-bit approaches"
+  Language     |   values aside"    values to                (NF4: "the format to beat")
+  Models       |   (split, messy)   weights"
+               |                    (uniform, clean)
+  -------------+----------------------------------------------------------------------
+               |                         |                              |
+  Diffusion    |                          |  PTQD: quantization noise    | NF4 blurs text
+  Model        |                          |  snowballs                   | this thorn
+  Branch       |                          |  (diffusion is a temporal    | remains
+               |                          |   evolution problem)         |
+               |                          v                              v
+               |                 FP4DiT: activations vary with token,
+               |                          not timestep -> per-token dynamic scaling
+               |                          |
+               |                          v
+  This paper   |       Ideogram 4.0 INT8/GGUF @ consumer Ampere
+  (2026)       |       = SmoothQuant migration + per-token dynamic
+               |         + [new] protect FFN down-projection
+               |         + [new] first OCR evaluation under quantization
+               |       Conclusion: at 8-bit, the hard part is not algorithm cleverness
+               v       but "knowing what to protect and which hardware path to use"
+                       Holds the FP8 quality ceiling, statistically tied;
+                       beats NF4 by +1.9 CLIP; text stays legible
+
+  Cognitive    sidestep bad values -> spread bad values -> reshape the scale ->
+  evolution:   settle noise along diffusion structure's math ->
+               align with DiT's true variation source ->
+               align with real hardware + real most-fragile capability (text)
+#+end_example
+
+* Insights
+
+Connecting this entire lineage, the surface narrative is "bit-count keeps dropping, algorithms keep getting cleverer," but the underlying cognitive shifts are three leaps:
+
+1. *From "average error" to "critical error."* LLM.int8()'s true contribution was not an algorithm but an observation: error is not uniformly distributed; the problem concentrates in a few outliers. From that point on, the whole thread stopped chasing "compress everything uniformly" and started chasing "get the critical parts right." This paper's protection of FFN down-projection layers is the 2026 echo of that same observation — still the same idea: find the critical few.
+
+2. *From "cleverer is better" to "good enough is good enough; spend the savings on reality."* The early years were an algorithmic arms race (GPTQ, AWQ, various rotations). This paper goes the opposite direction: it openly acknowledges "at 8 bits, naive methods are sufficient; elaborate calibration only matters at 4 bits," then redirects the freed attention toward two neglected real problems — actual hardware (old cards without FP8) and the actual most-fragile capability (text). *This is a kind of maturity: no longer applauding difficulty for its own sake, but asking "where is the bottleneck really?"*
+
+3. *From "task-agnostic general-purpose quantization" to "task-aware capability protection."* The appearance of OCR evaluation is a landmark. Everyone before measured FID and CLIP — aggregate quality scores — and no one asked "has quantization killed the model's most valuable skill (rendering legible text)?" When quantization technology matures enough to land in production products, the evaluation standard must upgrade from "does it look similar?" to "can it still do what matters most?"
+
+Where is the next step most likely to go? The paper has almost nailed it down itself: *fused INT8 kernels.* The technical recipe has converged; the hardware (INT8 cores on Ampere) has always been there; what is missing is the engineering that welds the two together. Once delivered, this thread formally crosses from "save VRAM" to "save VRAM and run fast," and the barrier for consumer hardware to run top-tier text-to-image models will drop another notch.
+
+* Takeaways
+
+The biggest lesson this evolutionary thread offers for "how to do research, how to find problems" is: *when a field's algorithms begin to converge and everyone is competing on the third decimal place of a metric, the real opportunities are usually not in the algorithms at all — they are in three neglected corners: overlooked hardware, unmeasured capabilities, and assumptions everyone accepts as given but no one has actually verified.*
+
+This paper invented no new algorithms yet produced genuinely useful work, entirely through three moves:
+
+- Focus on *hardware the mainstream ignored* (consumer Ampere without FP8) instead of chasing the latest H100.
+- Fill in *the metric everyone missed* (OCR fidelity under quantization), breaking down the vague notion of "image quality" into "which specific capabilities still survive."
+- *Question the default assumption that cleverer is better*, using the statement "naive methods suffice at 8 bits" to redirect effort where it actually cuts.
+
+The implication for your own work: in a mature direction that looks "already solved," you do not need to out-compete the algorithms — find the thing everyone has assumed but never directly measured ("hardware-specific trade-offs are seldom measured directly") and measure it. An honest measurement is often more valuable than yet another clever algorithm.
+
+----
+
+*Relationship annotations (in the interest of honesty)*:
+- Confirmed inheritance/contrast relationships (explicitly stated in this paper's introduction): SmoothQuant, FP4DiT (per-token dynamic scaling), NF4 ("the format to beat"), PTQD (2.03× speedup evidence point), DiT/flow matching (Ideogram 4.0's backbone).
+- More indirect relationships (this paper places them in the background landscape of ≤4-bit weight quantization): GPTQ, AWQ, SVDQuant/DiRotQ.
+- The LLM.int8() → SmoothQuant progression in the source map is completed on the basis of the field's widely recognized evolutionary relationship; this paper does not necessarily recap that history sentence by sentence, but SmoothQuant does address the outlier problem that LLM.int8() uncovered — that connection is established fact.
+- Layers traced: tracing back from this paper, the diffusion branch (PTQD → FP4DiT → this paper) and the quantization main trunk (LLM.int8() → SmoothQuant → 4-bit cluster → this paper) converge in approximately 5–6 layers, reaching close to the field's recent origins.
