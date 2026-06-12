@@ -1,0 +1,342 @@
+#+title:      ReSET: Accurate Latency-Critical NVFP4 Reasoning via Step-Aware Temperature Scaling
+#+date:       [2026-06-12 Fri 00:22]
+#+filetags:   :paper:river:en:
+#+identifier: 20260612T002217-en
+#+source:     https://arxiv.org/abs/2606.13233
+#+authors:    Sihwa Lee, Janghwan Lee, Donghoon Yoo, Jae Gon Kim, Hanyul Ryu, Soojung Ryu, Jungwook Choi
+#+venue:      arXiv preprint, 2026-06
+
+* The River of the Problem
+
+In one sentence: *You compress a reasoning-capable large model to 4 bits so it can fly on Blackwell GPUs, and it starts making arithmetic mistakes — where exactly does it go wrong? Everyone rushes to fix "how accurately the weights are compressed," but ReSET says the real thing that breaks isn't the weights — it's the model's hand trembling at the moment it picks the next token.*
+
+Let's be clear about why this river exists. Large-model reasoning (math problems, code generation, proof verification) now relies on "long chain-of-thought" — the kind seen in DeepSeek-R1 and OpenAI o1, where the model first produces a sprawling reasoning trace, step by step, and only then delivers an answer. This kind of model has two characteristics that drive it into a corner:
+
+First, *it generates extremely long sequences* — thousands of tokens one after another, with every later token depending on every earlier one. Any single symbol in the middle — a digit, an operator, a "therefore" — if wrong, corrupts the entire chain and the final answer crashes directly.
+
+Second, *it is extremely expensive*. Long and slow, a single inference takes a long time. So people want to compress it to 4 bits (NVFP4, the FP4 format natively supported by NVIDIA Blackwell), which theoretically gives 4× the throughput of BF16 and 4× the memory savings.
+
+It sounds perfect. But compress it and trouble starts: *quantization causes reasoning accuracy to drop*. For the past decade, everyone working on quantization has had a single instinctive response to "accuracy drop" — *make the compressed weights more accurate*. Use rotations to smooth out outliers, use GPTQ to compensate errors column by column, use finer block scales to track the dynamic range … the entire tributary of "quantization format + PTQ" has been doing exactly one thing: making *the compressed weight matrix as close as possible to the original*.
+
+But when this path reaches the NVFP4 era, it hits a wall. ReSET cuts through it in one sentence: *minimizing weight error is not the same as recovering reasoning accuracy* (the paper's own words: weight error "does not correlate cleanly with reasoning accuracy"). NVFP4's blocks are already as small as 16 elements; weight error is already tiny, and no amount of further fixing will squeeze out much more. The real lesion isn't in the weights at all —
+
+It's in *sampling*. ReSET makes a key observation: after quantization perturbs the output distribution, the model's hand trembles in two places: ① on those *low-entropy symbol tokens* (digits, operators) that should be rock-solid certainties, it actually samples the wrong token — and this kind of error propagates infectiously down the reasoning chain; ② on those *highly uncertain steps* where it should be more deliberate, it instead *over-concentrates* on a handful of tokens, suppressing the diversity that should be there.
+
+This pushes the river's core problem to an entirely new location: *rather than fixing an error in the weights that can't rescue reasoning, why not fix the model's trembling hand at the very moment of decoding — steadying it where it should be steady, and opening it up where it shouldn't be tunnel-visioning.*
+
+And the tools for "watching whether the model's hand is steady as it picks a token" have long been ready in another river — *entropy* and *temperature*. ReSET's achievement is connecting the "quantization" river and the "temperature sampling" river for the first time toward the same goal.
+
+* Source Map
+
+This river has *two tributaries* that converge at ReSET for the first time around a single objective. One is the explicit thread of "making low-bit floating-point formats more accurate" (perpetually spinning inside weight error); the other is the implicit thread of "how to control the model's next-token selection" (temperature, truncation, entropy). ReSET's insight is that the explicit thread's weight-fixing work can no longer rescue reasoning, and the implicit thread's sampling-control work must be borrowed to do so.
+
+#+begin_example
+  === Tributary A: Low-bit floating-point formats + PTQ (always "fixing weight error") ===
+
+  [2023] Microscaling / MX (Rouhani et al., OCP consortium)
+    |  Problem: per-tensor/per-channel sharing one scale; one outlier ruins a whole region
+    |  Solution: push scale down to "blocks" (block floating point); every 32 elements
+    |            share one scale
+    |  Remaining issue: blocks still too large (32); scale is E8M0 (powers of 2 only),
+    |                   can't tightly track the true maximum within a block
+    v
+  [~2023] MXFP4 (4-bit member of the MX family)
+    |  Problem: how to fit a large dynamic range into 4 bits
+    |  Solution: E2M1 elements (floating-point layout) + block size 32 + E8M0 block scale
+    |  Remaining issue: power-of-2 scale too coarse; one outlier in 32 elements still
+    |                   drags down ~31 neighbors
+    v
+  [2025] NVFP4 (NVIDIA, Blackwell B100/B200)   <== ReSET's hardware foundation
+    |  Problem: MXFP4 blocks too large, scale too coarse, FP4 precision insufficient
+    |  Solution: block 32->16 (finer); scale E8M0->E4M3 (can represent fractions,
+    |            tightly tracks true maximum); plus one FP32 global scale layer.
+    |            Claims ~4x BF16 throughput
+    v
+  [2025-26] 4-over-6 / BRQ / MR-GPTQ / DuQuant ... (a batch of NVFP4/MXFP4 PTQ)
+    |  Problem: how to shave down FP4 quantization error a little further
+    |  Solution: adaptive block scale / block-diagonal rotation to smooth outliers /
+    |            GPTQ-style column-wise error compensation
+    |  Remaining issue: *all still fixing "weight reconstruction error" —
+    |                   ReSET proves it doesn't correlate with reasoning accuracy*
+    |        Also: NVFP4's 16-element small blocks make rotation-based outlier
+    |              smoothing largely ineffective (rotation requires large blocks)
+    |
+    |   (Tributary A has hit its ceiling: weight error is already tiny,
+    |    further fixing can't recover the reasoning accuracy drop)
+    |.........................................................................
+    |
+  === Tributary B: Controlling "next-token selection" (temperature / truncation / entropy) ===
+    |
+  [2020] Nucleus / top-p (Holtzman et al.)
+    |  Problem: greedy decoding repetition-loops; pure sampling is incoherent
+    |           ("unreliable long tail")
+    |  Solution: sample only from the "smallest token set whose cumulative probability
+    |            reaches p" (nucleus), cutting off the long tail
+    |  Remaining issue: temperature ≠ truncation; p is a fixed task-sensitive hyperparameter
+    v
+  [2024] min-p (Nguyen et al.)
+    |  Problem: top-p still collapses at high temperature
+    |  Solution: truncation threshold scales dynamically with "the highest-probability token"
+    |            — the more confident the model, the harder it cuts
+    |  Remaining issue: p_base still a fragile hyperparameter; only uses the mode statistic
+    v
+  [2024] EDT (Zhang et al.) — first to use "entropy" for dynamic temperature adjustment
+    |  Problem: fixed temperature is too rigid regardless of context
+    |  Solution: adjust temperature by *each token's entropy* — high entropy (uncertain)
+    |            → *raise* temperature for diversity
+    |  Remaining issue: ① token-level, fixed policy; ② the intent is backwards —
+    |        for the quantized-reasoning scenario, you actually want to *lower* temperature
+    |        for symbol tokens made falsely uncertain by quantization, not raise it
+    v
+  [2025-06] Beyond the 80/20 Rule (Wang et al., Qwen/Tsinghua)  <== ReSET borrows the "entropy classifier"
+    |  Finding: only a minority of "high-entropy forking tokens" (wait/since/thus)
+    |           drive reasoning; most tokens are low-entropy symbol tokens;
+    |           classify tokens into high/low entropy
+    |  (Original use: RL computes gradients only on high-entropy tokens.
+    |   ReSET transplants this "entropy ruler" to control temperature during decoding)
+    |
+    +-- Supporting evidence: [2025] Quantization Hurts Reasoning? (Liu et al.)
+    |          Empirical finding: quantization damages long chain-of-thought far more
+    |          than short-answer tasks — because errors *accumulate* along the long chain.
+    |          This is exactly the disease ReSET aims to cure.
+    |
+    v
+  ============ The two rivers converge here ============
+                  |
+                  v
+  [2026-06] ReSET (this paper, Lee et al.)  <=== Target paper
+     Insight: Tributary A fixing weights can't save reasoning (weight error ≠ reasoning accuracy);
+              the lesion is in "trembling sampling" — missampling low-entropy symbol tokens
+              propagates infection; high-entropy steps over-concentrate.
+     Solution: Borrow Tributary B's entropy + temperature, but upgrade from token-level
+               entropy to *step-level* (\n\n segmentation); adjust temperature online
+               by "step uncertainty": steady steps get steadier, uncertain steps get
+               diversity restored.
+               Plus a CUDA-core NVFP4 GEMV kernel for small-batch decoding — the first
+               publicly available one — to actually deliver the 4x speed advantage.
+#+end_example
+
+Confidence annotations:
+
+- The format evolution in Tributary A (MX → MXFP4 → NVFP4) is *confirmed* technical fact: block size 32→16, scale E8M0→E4M3 + FP32 global — all are publicly documented NVFP4 specifications. ReSET treats NVFP4 as its *foundation*, not a target of criticism — it does not question the format; it questions the path of "continuing to fix weight error on top of this format."
+- ReSET *explicitly* lists BF16, RTN, BRQ, 4-over-6, and MR-GPTQ as comparison baselines, and explicitly argues that "weight error and reasoning accuracy don't correlate." So "Tributary A's weight-fixing can't save reasoning" is ReSET's own stated claim — confirmed.
+- In Tributary B, *Beyond the 80/20 Rule is explicitly borrowed by ReSET* — its token entropy classification (high-entropy forking vs. low-entropy symbol) is transplanted by ReSET as a temperature control signal. This is confirmed.
+- Nucleus / min-p / EDT form the evolutionary spine of sampling control ("temperature → truncation → entropy-controlled temperature") — this is *confirmed* domain context; but whether "ReSET individually cites EDT/min-p" I can only *infer* from its step-level, entropy-driven positioning without checking the reference list entry by entry. Drawing them as ReSET's predecessors traces the intellectual lineage of "entropy-controlled temperature" — this is a *conjectured lineage*, noted as such.
+- "Quantization Hurts Reasoning?" (Liu et al., 2504.04823) establishes that "quantization harms long-chain reasoning more than short-answer tasks, due to error accumulation" — the very disease ReSET treats. It is *strongly relevant supporting evidence*; it very likely corresponds to the liu2025 citation in ReSET's body, but this is an inference.
+
+* Evolutionary Narrative
+
+The two source streams are told separately below, then we see how they converge at ReSET. Each section opens not with "what this paper is" but with "what flaw in the previous paper it noticed."
+
+** 2023 | Microscaling (MX): Push the "shared scale" from the whole table down to "small blocks"
+
+*** What problem it noticed
+
+To compress weights to very low bit-width, you need a scale (scaling factor) to recover numerical values. The earliest approach shared *one* scale across an entire tensor or an entire column. The problem: weights always contain a few especially large outliers, and the scale must accommodate the largest one — so to handle a single outlier, all the normal values in the whole table get squeezed into a handful of quantization levels. *The wider the range sharing a scale, the more destructive a single outlier.*
+
+*** Its solution
+
+MX (Microscaling, the OCP consortium standard) answers with *block floating point*: stop sharing one scale across an entire table — instead cut elements into small blocks (e.g., 32 elements per block), with *each block storing its own scale*. That way one outlier damages at most its 31 neighbors, no longer affecting the entire tensor.
+
+*** Why it works (and what new pitfalls it buried)
+
+The framework of "making scale granularity finer" held firm — MXFP4 and NVFP4 both follow it. But MX left two pitfalls: ① blocks are still too large (32), and outliers still drag down a whole neighborhood; ② its block scale uses the E8M0 format — 8 bits all exponent, no mantissa — meaning scale *can only be an integer power of 2*. That is far too coarse: the true maximum within a block is rarely exactly a power of 2, so the scale can only "round" to the nearest power of 2, and every ordinary block silently absorbs a systematic rounding error.
+
+** ~2023 | MXFP4: Bring block floating point down to 4 bits
+
+*** What problem it noticed
+
+Having the block floating-point framework isn't enough — you have to actually compress elements to 4 bits. With only 16 codewords, how do you accommodate the many-orders-of-magnitude dynamic range found in large model weights?
+
+*** Its solution
+
+MXFP4 uses *E2M1* (1 sign + 2 exponent + 1 mantissa) floating-point layout — the advantage of floating point is "dense near zero, sparse far out," naturally suited to large dynamic range (representable values roughly {0, 0.5, 1, 1.5, 2, 3, 4, 6}, range ≈ ±6). Paired with 32-element blocks and E8M0 block scale. Amortized cost is approximately 4.25 bits/element.
+
+*** Why it works (and what new pitfalls it buried)
+
+It turned block floating point into a genuinely usable 4-bit format. But it inherited MX's two pitfalls intact: *32-element blocks still too large, E8M0's power-of-2 scale still too coarse*. FP4 has only 16 quantization levels to begin with — the error tolerance is tiny — and these two coarse spots compounded mean quantization error can't be pushed down further. The next step had to address both simultaneously.
+
+** 2025 | NVFP4: Finer blocks, more accurate scale — the hardware foundation of FP4 quantization
+
+*** What problem it noticed
+
+NVFP4 targeted MXFP4's two pitfalls: blocks too large, scale too coarse. It aimed to lift FP4 precision one more notch while maintaining native hardware support.
+
+*** Its solution
+
+Three changes, each aimed squarely at one of MXFP4's pitfalls: ① *Block 32 → 16* — doubles the opportunity to track local dynamic range; one outlier drags down half as many neighbors; ② *Block scale E8M0 → E4M3* — 3 mantissa bits reclaimed, scale goes from "powers of 2 only" to "can represent fractions" (1.5×, 2.5×, …), tightly tracking the true block maximum and eliminating that systematic rounding error (this is the primary driver of error reduction); ③ *An additional FP32 global scale layer* — since E4M3's own range is narrow (±448), an outer global scale lets each block's small scale work cross-tensor. Cost: amortized ~4.5 bits/element (slightly higher than MXFP4's 4.25). On Blackwell, claimed ~4× BF16 throughput (really the compound benefit: NVFP4 ≈ 2× FP8, FP8 ≈ 2× BF16 in tensor-core compute).
+
+*** Why it works (and what new pitfalls it buried)
+
+NVFP4 is the *peak format* of the "fix weight error" path in this river — blocks as fine as 16, scale accurate to fractions, weight quantization error already tiny. But this very "peak" corners the next generation: *weight error is already so small that further fixing squeezes out almost nothing*. And once blocks shrink to 16 elements, the classic technique of "rotating outliers into neighbors" essentially stops working (rotation presupposes large enough blocks). This effectively sentences the "fix weights" path — the next batch of PTQ papers will keep trying, but it's running out of headroom.
+
+** 2025–26 | 4-over-6 / BRQ / MR-GPTQ: Squeezing the last drop from weight error
+
+*** What problem they noticed
+
+With the NVFP4 format locked in, this cohort of PTQ papers all zero in on the same thing's details: *how to push NVFP4/MXFP4 quantization error down just a little further*.
+
+*** Their solutions
+
+Each takes its own angle, but all are fundamentally "fixing weight reconstruction error": *4-over-6* finds a representation gap between 4 and 6 in E2M1, so each block adaptively chooses whether to map its maximum to 6 or to 4, picking whichever gives lower error; *BRQ* (block rotation quantization) finds that global rotation actually inflates the scale for 70% of normal blocks, and switches to block-diagonal rotation aligned with the quantization block size to smooth outliers; *MR-GPTQ* ports GPTQ's column-wise second-order error compensation to FP4, paired with micro-rotation and block scale.
+
+*** Why they work (and what new pitfalls they buried)
+
+They do push weight error down a bit further. But ReSET flips the table: *the "weight reconstruction error" you're fixing has essentially nothing to do with "reasoning accuracy"* ("does not correlate cleanly with reasoning accuracy"). MR-GPTQ itself acknowledges that NVFP4's small blocks "fundamentally defeat traditional outlier-smoothing techniques," and FP4 "is not a drop-in upgrade from INT4." The entire Tributary A has now maxed out the "weight error" metric — yet the reasoning accuracy points are still missing.
+
+Where's the problem? The answer isn't in Tributary A. It's on that other river that controls token selection.
+
+** 2020 | Nucleus / top-p: Don't let the long tail ruin the sentence
+
+*** What problem it noticed
+
+This is one of Tributary B's headwaters. The question it asks: at each step, how should a model pick the next token from the vocabulary? Greedy decoding (always picking the highest-probability token) leads to repetition loops; pure random sampling is incoherent — because the tens of thousands of low-probability "garbage tokens" in the vocabulary collectively hold a non-trivial probability mass, and this "unreliable long tail" always has a chance of being sampled.
+
+*** Its solution
+
+Nucleus (top-p) sampling: at each step, sample only from "the smallest set of tokens whose cumulative probability reaches p" (the nucleus), cutting the long tail off cleanly. When the model is confident the nucleus is small; when it hesitates the nucleus expands — dynamic scaling.
+
+*** Why it works (and what new pitfalls it buried)
+
+It illuminates a key distinction: *adjusting temperature ≠ truncating the long tail*. Temperature only sharpens or flattens the distribution; it can't genuinely cut off the unreliable tail. But top-p itself leaves a pitfall: p is a fixed hyperparameter that is sensitive to different tasks and different temperatures — bad tuning still causes collapse.
+
+** 2024 | min-p & EDT: Truncation follows confidence, temperature follows entropy
+
+*** What problem they noticed
+
+min-p targets: top-p still collapses at high temperature. EDT targets: fixed temperature is too rigid — one temperature shouldn't govern everything.
+
+*** Their solutions
+
+*min-p* ties the truncation threshold to "the current highest-probability token" — the more confident the model (the higher that top probability), the harder it cuts; the flatter the distribution, the more it keeps. *EDT* is the first to use *entropy* to dynamically adjust temperature: when a token's entropy is high (model uncertain), *raise* temperature to seek diversity; low entropy, lower temperature for quality.
+
+*** Why they work (and what new pitfalls they buried)
+
+They let the act of "picking a token" follow the model's real-time state for the first time. But for the "quantized reasoning" scenario ReSET needs to solve, two fatal pitfalls remain: ① both are *token-level, fixed policies* — a single global threshold/formula applied uniformly throughout; ② more critically, EDT's *intent is exactly backwards* — it raises temperature when entropy is high. But in quantized reasoning, the model is being made falsely uncertain by quantization precisely on those *symbol tokens that should be certain*. You need to *lower* temperature there to press them back to the correct answer, not raise it and let them drift further. The idea of "entropy-controlled temperature" is right, but who decides "when to be steady and when to open up" remains unsolved.
+
+** 2025–06 | Beyond the 80/20 Rule: Reasoning is held up by a minority of "high-entropy forks"
+
+*** What problem it noticed
+
+This is the paper whose tool ReSET directly borrows. It was studying RL training but discovered a universal regularity: tokens in a chain-of-thought are *extremely unequal* — the vast majority are low-entropy symbol/connector tokens (the model knows the next one near-automatically), and only a small cluster are *high-entropy "forking tokens"* (wait, since, thus — the kind that truly decide which branch the reasoning takes).
+
+*** Its solution
+
+Classify tokens into high/low entropy (roughly the top 20% high-entropy vs. bottom 80% low-entropy), then compute RL gradients only on that 20% of high-entropy tokens — and this actually performs better than full-gradient training, with significant gains on large models.
+
+*** Why it works (and what new pitfalls it buried)
+
+It gives the entire field a brand-new measuring stick: *a token's entropy marks its role in reasoning* — low-entropy tokens are the workmanlike bolts, high-entropy tokens are the decision-making forks. But it applied this ruler to RL training. The most natural yet unfilled slot is: *can this "entropy ruler" be moved to decoding time, used to decide what temperature each token should receive?* It also implies a problem ReSET will make explicit — *a single token's entropy is actually noisy*; whether it is high or low is largely driven by the overall uncertainty of the *reasoning step* it belongs to, not just by itself alone.
+
+** 2026–06 | ReSET: Two rivers converge — use "step-level entropy" to rescue reasoning during decoding
+
+*** What problem it noticed
+
+ReSET looks simultaneously at the end of both rivers. Tributary A (quantization formats/PTQ) has maxed out: NVFP4 has made weight error tiny, yet continuing to fix weights *can't recover the dropped reasoning points* — because weight error and reasoning accuracy simply don't correlate. So where is the disease? ReSET opens up the quantized model and catches the real culprits: *after quantization perturbs the output distribution, the model's "sampling" develops two opposite problems* —
+
+① On those *low-entropy symbol tokens* (digits, operators) that should be rock-solid certainties, it actually samples the wrong token. And this kind of error is the most toxic: it propagates infectiously down the long chain-of-thought, ultimately causing the final answer to crash (exactly what "Quantization Hurts Reasoning?" measured as "errors accumulate along the long chain").
+
+② On those *highly uncertain steps* where it should deliberate more carefully, it instead *over-concentrates* on a small number of tokens, permanently locking in the loss of diversity that quantization introduced, and tunnel-visioning into a corner.
+
+Tributary B (temperature/entropy), meanwhile, has exactly the right remedy ready: entropy tells you how steady the model is right now; temperature lets you press it to be steadier or open it up on demand. Beyond the 80/20's "entropy classification" ruler is already available off the shelf.
+
+*** Its solution
+
+Transplant Tributary B's "entropy-controlled temperature" to treat Tributary A's disease, but with one critical upgrade — *from token-level to step-level*:
+
+- *Step segmentation*: Split the chain-of-thought into "reasoning steps" at =\n\n= boundaries; one step is a logically coherent group of tokens.
+- *Step entropy*: A step's entropy = the average of token entropies within the step. ReSET's insight: a single token's entropy is noisy and gets "led along" by the overall uncertainty of its surrounding step ("dominated by the uncertainty of the surrounding reasoning step"), making *fixed token-level thresholds unreliable*; *step-level* uncertainty is far more stable.
+- *Step-Aware Temperature (SAT) scaling*: In "confident steps," apply a global threshold τ₀; in "uncertain steps," switch to that step's own relative entropy estimate. Tokens below the threshold (symbol tokens that should be certain) → lower temperature (T_low) to press them back to the correct answer; high-entropy tokens → restore T_high=1.0, *giving back the diversity that quantization erased*. Defaults: T_base=0.6, window w=32, τ₀ set at the 80th percentile of token entropy.
+- *Online estimator (HSE)*: At the start of a step when few tokens have accumulated, use a sliding window (lower variance); once enough tokens accumulate within the step, switch to a within-step running average (lower bias). This is a causal, decoding-time-capable hybrid estimator, adding only ~1.5% overhead per step (~100 μs on Qwen3-32B).
+- *Dedicated CUDA kernel*: All of the above is the accuracy side. But NVFP4's 4× speed advantage simply doesn't materialize in *small-batch autoregressive decoding* — tensor core tiles are fixed at M=128; during decoding you generate one or two tokens at a time (M≤8), leaving only a few rows out of 128 useful, utilization below 1%. "The 4× advantage collapses exactly where you need it most." ReSET writes a *CUDA-core* small-M NVFP4 GEMV kernel (claimed to be the first publicly available one): it reuses weights across multi-token fusion, opens multiple accumulators for ILP, and dequantizes in registers without shared-memory synchronization — actually delivering the 4× speed at decoding time.
+
+This is the origin of the name *ReSET*: *Re*asoning-*S*tep *E*ntropy-based *T*emperature scaling — adjusting temperature by the entropy of reasoning steps. It replaces the dead end of Tributary A ("keep fixing weights") with the live route of "adjust temperature by step uncertainty at the very moment of decoding."
+
+*** Why it works (and what new pitfalls it buried)
+
+It works because it precisely joins two independently evolving rivers for the first time: Tributary A supplies the problem and scenario ("why NVFP4 reasoning breaks" — can't fix weights anymore, the disease is in sampling); Tributary B supplies the ready-made tools of "entropy + temperature" sampling control, plus Beyond the 80/20's "entropy ruler." Previous work either had the problem but lacked the tool (the PTQ camp kept grinding at weights), or had the tool but used it incorrectly (EDT aimed entropy-controlled temperature in the wrong direction and applied it at the token level). ReSET's entire power lies in that one "upgrade by a level" move — aggregating noisy token entropy into stable step entropy, then deciding whether to steady or open up based on that.
+
+Results (per abstract/paper body): reasoning accuracy up to ~2 points higher than NVFP4 baseline; kernel-level up to 2.5× faster than NVFP4 vLLM; end-to-end decoding ~2× faster than BF16. In short: *both recovering reasoning accuracy and actually delivering 4-bit speed.*
+
+Remaining pitfalls: ① Step segmentation relies on =\n\n=, an engineering convention rather than the model's true semantic boundary — models or outputs that don't delimit steps with =\n\n= will yield inaccurate step entropy. ② Its key thresholds (T_base=0.6, τ₀=80th percentile, window 32) are still *fixed hyperparameters* — will step-level suffer the same "hyperparameter sensitivity to task" stumble that min-p/top-p did? ③ It treats "trembling sampling," but on the premise that quantization hasn't broken the model's *capabilities* themselves; at more aggressive compression (below 3 bits) what breaks is more than just sampling, and temperature adjustment can't rescue that. ④ It is *orthogonal* to PTQ "fixing weights" — in principle, "fix weights well + fix sampling well" stacked together could outperform either alone, but the paper's primary argument is that the latter carries the main accuracy recovery.
+
+* Frontier Extensions
+
+As of now (June 2026), ReSET itself is the latest convergence point in this river — it was posted on June 11. Following the fuses it has lit, the most likely next jumps are:
+
+- *Step segmentation moving from "heuristic" to "model-defined"*. Cutting steps at =\n\n= is brittle. The natural next step is: can the model itself mark the boundaries of reasoning steps (e.g., read from attention structure or a lightweight probe), letting "step-level uncertainty" be grounded in true semantic units rather than a newline convention?
+
+- *Turning fixed thresholds into adaptive ones*. T_base, τ₀, and window are all hand-tuned. The entire history of Tributary B (top-p → min-p → EDT) has repeatedly proven "fixed thresholds are sensitive to task." Making these thresholds online-adaptive — or even learning them from the model — is the straightforward next step.
+
+- *"Fix sampling" and "fix weights" merging*. ReSET proves that fixing sampling at decoding time can rescue reasoning; the PTQ camp proves that fixing weights compresses error — the two are orthogonal. The next paper may well jointly optimize both: use a quantization objective that is friendly to sampling (rather than pure weight MSE) for PTQ, then stack ReSET's step-level temperature adjustment on top.
+
+- *Using "step-level uncertainty" as a ruler in other contexts*. Once you can online-stably estimate "how uncertain the model is right now at this step," you can do far more than just adjust temperature — how many candidates to draw for speculative decoding, when to insert a self-verification step, how aggressively to compress the KV cache at this step … all could be orchestrated by "step uncertainty."
+
+* A Diagram
+
+#+begin_example
+        What is truly changing in this river: rescuing points lost to quantization
+        by shifting from "fixing compressed weights" to "fixing sampling during decoding"
+
+  Point-of-leverage for recovering accuracy
+    |
+  [Fix weight error] ........ MX(2023): push scale down to blocks
+    |                                   (one outlier damages fewer neighbors)
+    |                         MXFP4: E2M1 + block32 + E8M0 (power-of-2) scale
+    |                         NVFP4(2025): block 32->16 + fractional scale (E4M3) +
+    |                                      FP32 global scale
+    |                              |          (the "peak format" for weight error)
+    |                         4-6 / BRQ / MR-GPTQ(25-26): adaptive scale /
+    |                              rotation / GPTQ compensation
+    |                              |
+    |                              | ReSET flips the table:
+    |                              | weight error != reasoning accuracy;
+    |                              | this path can't recover the lost points
+    |   ......................................................................
+    |                              |
+  [Fix decoding sampling] ........ top-p(2020): cut the long tail
+    |                                           (temperature != truncation)
+    |                              min-p(2024): truncation follows confidence
+    |                              EDT(2024): adjust temperature by token entropy
+    |                                         (but intent backwards: high entropy -> raise temp)
+    |                              80/20(2025): classify tokens by entropy
+    |                                           (high-entropy forks vs. low-entropy bolts)
+    v                                   |
+                                        v
+      ===== Two rivers converge =====  ReSET(2026): adjust temperature by *step* entropy
+                                       Low-entropy symbol tokens -> lower temp (press to correct)
+                                       High-entropy steps -> restore diversity
+                                       + Small-M CUDA kernel: actually deliver 4-bit 4x speed
+                                         at decoding time
+                                       Results: accuracy +~2pts, kernel 2.5x,
+                                                end-to-end ~2x BF16
+
+  -------------------------------------------------------------------------
+  Horizontal axis = time (2020 -> 2026)
+  Vertical axis   = point-of-leverage for recovering lost accuracy:
+                    fixing weight error after compression -> fixing sampling behavior during decoding
+  Convergence point = Tributary A provides "why NVFP4 reasoning breaks (disease in sampling)";
+                      Tributary B provides "entropy + temperature" tools
+#+end_example
+
+* Insights
+
+Reading the entire line, on the surface it looks like "FP4 quantization gains another 2 points." But underneath, three deeper shifts are actually happening:
+
+1. *Recovering "accuracy lost to quantization" shifts from "fixing weights" to "fixing sampling."* All of Tributary A's progress is essentially "make the compressed weights closer to the original" — finer blocks, more accurate scale, rotation, error compensation. They share one unquestioned premise: *quantization drops accuracy because weights are inaccurate, so fix the weights*. ReSET's breakthrough is not making weights more accurate — it is *replacing the attribution*. It points out that the lesion is not in the static error of the weights but in the model's *dynamic sampling behavior* during decoding: quantization makes the model's hand tremble where it should be certain, and tunnel-vision where it should be diverse. This is a shift from "repairing a compressed artifact" to "repairing a disturbed behavior."
+
+2. *The strongest innovations are often connecting two unrelated rivers.* ReSET invented almost nothing entirely new: NVFP4 is an existing format, entropy-controlled temperature is a path EDT already blazed, token entropy classification is Beyond the 80/20's tool, temperature sampling is a decade-old technique. Its entire power lies in *seeing that these two parallel rivers can be joined* — the quantization river is stuck at "weights can't be fixed further," while the temperature-sampling river happens to hold the tool of "entropy-controlled sampling," exactly capable of treating quantization-induced "trembling sampling." *What is truly scarce is not new components but the vision to see that "A's disease is exactly what B's medicine treats."* And it didn't transplant wholesale — it made one "upgrade by a level" key adaptation (token entropy → step entropy), which is what made the borrowed tool genuinely fit the new context.
+
+3. *The measure of "success" is shifting from "offline metrics" to "end-to-end real gains."* Early work compared who had the lower weight reconstruction error/perplexity. But ReSET steps outside offline metrics twice: on the accuracy side, it distrusts "weight error" as a proxy and looks directly at reasoning accuracy; on the speed side, it distrusts "tensor core peak 4×" as a theoretical ceiling and looks directly at actual throughput in small-batch decoding — finding the 4× collapses to under 1% and writing its own CUDA kernel to recover it. *When a field matures to the point where everyone is grinding marginal improvements on proxy metrics, returning to doggedly measure "what users actually get end-to-end" often reveals a gap that the proxies were hiding — and that gap is often the next paper.*
+
+Where is the most likely next step? Extending ReSET's "step-level uncertainty" online ruler from "only used to adjust temperature" into a "general scheduler for reasoning-time decisions" — directing how many samples to draw for speculative decoding, when to insert self-verification, how hard to compress the KV cache — while freeing step segmentation from the brittle =\n\n= convention and grounding it in the model's true semantic boundaries.
+
+* Takeaways
+
+The most practical lessons this evolutionary line offers for "how to do research":
+
+1. *Zero in on the attribution that the entire field takes for granted and no one has questioned.* Everyone in Tributary A assumed "quantization drops accuracy = weights are inaccurate = fix the weights," and nobody stepped back to ask "are the missing points really caused by the weights?" ReSET's entry point is challenging this collective attribution and relocating the lesion to sampling behavior. The takeaway: *next time you read a stack of papers in a field, don't just see how each one improves on the last — specifically look for the "assumed cause of the disease" they all share. Once that assumption is replaced, the whole field's ceiling is blown open.*
+
+2. *A "ready-made remedy" from a neighboring field is worth more than a "new invention" within your own.* ReSET's core weapons (entropy-controlled temperature, entropy classification) were already mature in the sampling/decoding river — it only transplanted them with a "one-level-up" adaptation. The takeaway: *when a problem in your field hits a dead end, don't rush to invent — go next door and see whether there's a ready-made tool that treats exactly your disease. The greatest leverage is usually at the seam between fields; and the small "upgrade by a level" adaptation you make when transplanting is often the real contribution.*
+
+3. *Don't be fooled by proxy metrics — return to end-to-end.* "Weight reconstruction error" and "tensor core peak throughput" are both convenient proxies, but ReSET twice found the proxy decoupled from real gains (error small but reasoning still drops; compute 4× but decoding collapses to 1%). The takeaway: *when you're making marginal improvements on a proxy metric, stop and run one end-to-end measurement yourself — the crack between the proxy and the real gain is often exactly where the next paper lives.*

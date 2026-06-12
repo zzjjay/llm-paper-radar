@@ -400,3 +400,5 @@
 - [06-09](digests/2026-06-09.md) — 313 scanned, 8 passed, top: SpenseGPT: Practical One-shot Pruning Enabling Spa
 
 - [06-10](digests/2026-06-10.md) — 278 scanned, 1 passed, top: Holding the FP8 Quality Ceiling at 8-Bit Weights a
+
+- [06-11](digests/2026-06-11.md) — 285 scanned, 4 passed, top: ReSET: Accurate Latency-Critical NVFP4 Reasoning v

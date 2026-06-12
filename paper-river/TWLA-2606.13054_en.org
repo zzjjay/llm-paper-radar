@@ -1,0 +1,319 @@
+#+title:      TWLA: Achieving Ternary Weights and Low-Bit Activations for LLMs via Post-Training Quantization
+#+date:       [2026-06-12 Fri 00:12]
+#+filetags:   :paper:river:en:
+#+identifier: 20260612T001226-en
+#+source:     https://arxiv.org/abs/2606.13054
+#+authors:    Zhixiong Zhao, Zukang Xu, Zhixuan Chen, Xing Hu, Zhe Jiang, Dawei Yang
+#+venue:      ICML 2026 (arXiv:2606.13054), 2026-06-11
+
+* The Problem River
+
+Squeezing a large language model into a phone or an edge chip comes down to two blockers: *weights* consume too much memory, and *activations* consume too much bandwidth.
+
+Over the past decade, the first blocker has been compressed ferociously — weights can now be reduced to just three possible values, {-1, 0, +1} (roughly 1.58 bits), nearly the physical floor. But low-precision compression has a peculiar split: weights are down to 1.58 bits, yet activations remain stubbornly stuck at 16 bits. The result is that you save memory but must still ferry a large volume of high-precision activations on every inference pass, and end-to-end speed never really improves.
+
+Why are activations so hard to compress? Because they contain *outliers* — the vast majority of values are well-behaved, but a handful of channels are orders of magnitude larger than the rest. If you divide the quantization grid by the global range, those outliers stretch the bins so wide that the other 99% of normal values all collapse into one or two bins, destroying the information they carried.
+
+Worse, the only successful approach to simultaneously achieving 4-bit activations and ternary weights (BitNet v2) requires *training from scratch* — burning more than ten thousand GPU-hours. For most practitioners, that is effectively out of reach.
+
+The question TWLA sets out to answer is: *Can we skip training entirely and obtain ternary weights + 4-bit activations using only post-training quantization (PTQ)?* Three independent research streams — ternarization, outlier-resistant rotation, and mixed-precision — are forced for the first time to converge at the same junction.
+
+* Source Map
+
+#+begin_example
+[2016] Li et al. - TWN (Ternary Weight Networks)
+  |
+  | Insight: Weights need not be continuous; {-1, 0, +1} is sufficient.
+  | Solution: Fixed threshold + scale factor; ternary weights turn
+  |           multiplications into additions.
+  | Residual gap: Threshold and scale are hand-computed, not learned.
+  v
+[2017] Zhu et al. - TTQ (Trained Ternary Quantization)
+  |
+  | Observed problem: TWN shares one scale for both positive and negative
+  |                   sides — not flexible enough.
+  | Solution: Learn a separate scale factor for each side, updated
+  |           jointly during training.
+  | Residual gap: Still small networks (CNNs); still requires QAT.
+  v
+[2023/24] BitNet / BitNet b1.58 - Ternary weights enter LLMs
+  |
+  | Observed problem: Post-training quantization of LLMs collapses
+  |                   below low bit-widths.
+  | Solution: Train from scratch with ternary weights; keep
+  |           activations at 8 bits.
+  | Residual gap: Requires full training (expensive); activations
+  |               still at 8 bits.
+  |
+  |   ┌───────── Side stream: activation outliers ─────────┐
+  |   |                                                     |
+  |   v                                                     |
+[2024] QuaRot - Rotation to eliminate outliers              |
+  |   | Solution: Hadamard rotation "flattens" activations; |
+  |   |           outliers are dispersed; 4-bit activations |
+  |   |           become feasible.                          |
+  |   v                                                     |
+[2025] BitNet v2 - Ternary weights + 4-bit activations      |
+  |   | Uses online Hadamard to Gaussianize activations.    |
+  |   | But: still QAT, >10^4 GPU-hours. ──────────────────┘
+  |
+  |   ┌───────── Side stream: mixed precision ────────────┐
+  |   v                                                   |
+[2025] ResQ - High precision in a low-rank subspace        |
+  |   | Solution: PCA finds the highest-variance subspace; |
+  |   |           keep that part at 8 bits, compress       |
+  |   |           the rest to 4 bits.                      |
+  |   | But: assumes layer independence; ignores           |
+  |   |      inter-layer coupling. ────────────────────────┘
+  v
+[2025] PT2-LLM - Post-training ternarization (no training required!)
+  |
+  | Observed problem: Ternarization almost always requires QAT;
+  |                   nobody has done it well under PTQ.
+  | Solution: Asymmetric Ternary Quantizer (ATQ) — adds a per-row
+  |           offset; training-free refinement.
+  | Residual gap: Still weight-only; activations remain high-precision.
+  v
+[2026] TWLA  <-- This paper
+  |
+  | Observed problem: The three streams operate in isolation —
+  |   ternarization handles weights, rotation/mixed-precision handle
+  |   activations, and nobody welds them together under PTQ.
+  | Solution: A three-component confluence —
+  |   E2M-ATQ  (extends PT2-LLM's asymmetric ternarization from
+  |             Euclidean initialization to manifold refinement)
+  |   KOTMS    (adapts QuaRot's rotation into a "tri-modal-friendly"
+  |             Kronecker orthogonal transform)
+  |   ILA-AMP  (upgrades ResQ's mixed precision to account for
+  |             inter-layer coupling)
+  | Result: W1.58A4 PTQ, training-free, genuine end-to-end speedup.
+#+end_example
+
+Relationship notes (honestly annotated): TWN → TTQ → BitNet series and QuaRot → BitNet v2 are confirmed citation/critique chains. PT2-LLM is the direct predecessor that TWLA explicitly acknowledges as the source of its initialization design; ResQ is the work TWLA explicitly compares against and surpasses in its mixed-precision component. The framing of "three streams converging in TWLA" is this paper's own narrative, grounded in the fact that each of its three components maps onto one of those streams.
+
+* Evolutionary Narrative
+
+** 2016 | TWN: Weights Need Not Be Continuous
+
+*** What Problem Did It See
+
+Before TWN, researchers had already binarized weights to {-1, +1} (BWN / XNOR-Net). The advantage was that all multiplications collapsed to sign flips — extremely cheap. But binarization had a hard flaw: every weight was forced to "take a position," either +1 or -1, with no option to abstain. Weights that should have been near zero were yanked to ±1, and accuracy suffered badly.
+
+*** Its Solution
+
+TWN added a third value: 0. Weights took values in {-1, 0, +1}. The approach was straightforward — set a threshold, zero out any weight whose absolute value falls below it, and fold the rest to ±α via a single shared scale factor. Both the threshold and α were derived from a closed-form approximation that minimizes the Euclidean quantization error.
+
+*** Why It Worked (and What New Gap It Left)
+
+Adding zero bumps the representational power from two levels to three, while arithmetic remains simple (multiply by 0 = skip; multiply by ±α = add or subtract). On ImageNet, TWN clearly outperformed binary networks.
+
+The gap it left: both sides share *the same* scale α. But weight distributions are often asymmetric — the positive side may be systematically larger. One α cannot serve both sides well.
+
+** 2017 | TTQ: A Separate Learned Scale for Each Side
+
+*** What Problem Did It See
+
+TWN's α was computed, not learned, and it was shared between positive and negative weights. TTQ argued: since we are training anyway, why not let the scale factors *learn*? And why force symmetry?
+
+*** Its Solution
+
+Split one α into two: W_p (positive-side scale) and W_n (negative-side scale), both treated as trainable parameters updated with gradients. The weight set becomes {-W_n, 0, +W_p}.
+
+*** Why It Worked (and What New Gap It Left)
+
+Asymmetric scaling fits the true weight distribution much better. On AlexNet / ImageNet, top-1 error fell below TWN's and even approached full precision. This established a recurring motif that would echo through the entire lineage: *to ternarize well, you must respect asymmetry*.
+
+The gap it left: everything in TTQ depends on training — the scale factors are learned through back-propagation. In the LLM era, retraining can cost millions of dollars, making "can we skip training?" the new survival question. Moreover, TWN/TTQ operated on CNNs three or four orders of magnitude smaller than modern LLMs; the outlier problem had not yet entered the picture.
+
+** 2023–2024 | BitNet / b1.58: Ternary Weights Enter LLMs, but Require Training from Scratch
+
+*** What Problem Did It See
+
+LLM inference is expensive because of weight movement. The most direct saving is post-training quantization (PTQ) — compress after training. But cutting LLMs below 4 bits with PTQ causes collapse: the model was trained with continuous fp16 weights and never "prepared" to be flattened.
+
+*** Its Solution
+
+BitNet followed TTQ's lead — simulate quantization during training (QAT). The forward pass uses quantized weights; the backward pass uses full-precision gradients. BitNet b1.58 pushed further, setting weights to {-1, 0, +1} (≈1.58 bits) with absmean scaling, matching fp16 quality at 7B scale.
+
+*** Why It Worked (and What New Gap It Left)
+
+Training from scratch lets the model actively find solutions that are robust to low precision. b1.58 announced the "1-bit era" and proved that ternary LLMs can genuinely compete.
+
+It left two gaps that become TWLA's exact targets:
+
+1. *Activations remain at 8 bits.* Weights reached 1.58 bits, but activations were untouched — outliers make them harder to compress. End-to-end speed is bottlenecked by activations.
+2. *Training from scratch is required.* It is expensive. Most practitioners cannot afford it.
+
+The first gap spawned the "activation outlier" side stream.
+
+** 2024 | QuaRot: Rotate the Outliers Away
+
+*** What Problem Did It See
+
+Why are activations hard to compress? Because a small number of channels carry anomalously large values (outliers). Earlier approaches singled those channels out and stored them at higher precision (the early form of mixed precision), but that requires complex kernels and breaks regular matrix multiplication.
+
+*** Its Solution
+
+QuaRot took a different angle: instead of isolating outliers, *spread them out*. Apply a random Hadamard rotation matrix to the activations — the mathematical properties of rotation distribute "one huge value" uniformly across all dimensions, instantly flattening the distribution toward Gaussian. Using the computational invariance of matrix products, this rotation is folded into the weights, adding nearly zero overhead at inference time. Once flattened, 4-bit quantization of activations becomes tractable.
+
+*** Why It Worked (and What New Gap It Left)
+
+The intuition: an outlier is "energy concentrated in one direction." Rotation changes the coordinate basis so that energy is spread out — no single dimension stands out, and quantization bins are no longer stretched to breaking point.
+
+The gap it left: QuaRot was designed for ordinary low-bit weights (4-bit), and its rotation aims to produce a *unimodal Gaussian* distribution for activations. But with *ternary* weights the ideal distribution is not unimodal — it is *tri-modal*, corresponding to {-1, 0, +1}. QuaRot's rotation and ternary weights are not a natural fit. This is exactly what TWLA's KOTMS corrects.
+
+** 2025 | BitNet v2: Ternary Weights + 4-bit Activations, but Still QAT
+
+*** What Problem Did It See
+
+BitNet b1.58 still had 8-bit activations. QuaRot had demonstrated that rotation can bring activations down to 4 bits. BitNet v2 combined both: ternary weights together with native 4-bit activations.
+
+*** Its Solution
+
+It introduced the H-BitLinear layer — an online Hadamard transform applied before activation quantization (the same trick as QuaRot), Gaussianizing the sharp activations at attention output projections and FFN down-projections before compressing to 4 bits. Weights remained absmean ternary.
+
+*** Why It Worked (and What New Gap It Left)
+
+This was the first approach to genuinely achieve W1.58A4 without performance collapse, outperforming PTQ baselines such as QuaRot and SpinQuant.
+
+The gap — the one TWLA grips tightly — is that *it is QAT, trained from scratch, consuming more than 10^4 GPU-hours*. BitNet v2 proved that the W1.58A4 target is reachable, but at a cost most people cannot pay. The question sharpened: *Can we achieve the same W1.58A4 with PTQ — no training required?*
+
+** 2025 | ResQ: Keep the Highest-Variance Slice at High Precision
+
+*** What Problem Did It See
+
+This is the representative work from the mixed-precision side stream. QuaRot's rotation flattens outliers, but even a flat distribution still incurs loss at 4 bits. ResQ asked: can we reserve 8 bits for only the "most important" part of activations and use 4 bits for the rest? The key is how to define "most important."
+
+*** Its Solution
+
+Use PCA to identify the low-rank subspace where activation variance is most concentrated (in practice, 1/8 of the dimensions). Coefficients in that subspace are kept at 8 bits; the rest are compressed to 4 bits. A random rotation is also applied within the subspace to suppress residual outliers. The authors proved that this is the optimal mixed-precision allocation in terms of minimizing quantization error.
+
+*** Why It Worked (and What New Gap It Left)
+
+High variance = more information = high sensitivity to quantization. Directing the high-precision budget precisely toward the high-variance subspace is more efficient than distributing it uniformly. Perplexity fell 33% below the strongest baseline, SpinQuant.
+
+The gap it left: ResQ — and nearly all mixed-precision quantization (MPQ) methods — assumes *layer independence*: sensitivity is computed per layer and bit allocation is decided per layer. But activation quantization alters distributions and couples errors across adjacent layers. Quantization error in one layer propagates to the next and amplifies. Looking at layers in isolation underestimates the true cost. This is the hole TWLA's ILA-AMP is designed to fill.
+
+** 2025 | PT2-LLM: Ternarization Finally Freed from Training
+
+*** What Problem Did It See
+
+Returning to the main ternarization stream: since TTQ, ternarization had depended almost entirely on QAT. Under PTQ conditions — no training allowed, only a small calibration dataset — nobody had achieved good ternarization. Two difficulties stood out: (1) no gradient-based parameter refinement is available; (2) ternarization is so extreme that outliers and scattered weights lead to enormous quantization error.
+
+*** Its Solution
+
+It proposed the Asymmetric Ternary Quantizer (ATQ) — echoing TTQ's asymmetry motif, but transposed into the PTQ setting: add a per-row offset to each weight row, because many layers of pretrained models have nonzero, asymmetric means. A two-stage training-free refinement (Iterative Ternary Fitting, ITF, plus Activation-aware Grid Alignment, AGA) then drives down quantization error without any back-propagation.
+
+*** Why It Worked (and What New Gap It Left)
+
+PT2-LLM established a strong baseline for PTQ ternarization and pushed sub-2-bit compression a significant step forward. TWLA explicitly states that its initialization "follows PT2-LLM's design" — making PT2-LLM the most direct shoulder TWLA stands on for the weight side.
+
+The gap it left: PT2-LLM is still *weight-only* — ternary weights, high-precision activations. So the old problem returns: weights are compressed as far as they can go, activations are untouched, and end-to-end speed does not improve.
+
+** 2026 | TWLA: Three Streams, Welded into One PTQ Framework
+
+*** What Problem Did It See
+
+Standing at the confluence and looking back, TWLA observed that the three streams each covered one segment but had never been joined:
+
+- *Ternarization stream* (PT2-LLM): handles weights only; leaves activations untouched.
+- *Rotation stream* (QuaRot / BitNet v2): can compress activations, but the rotation targets a unimodal Gaussian, which is misaligned with the tri-modal ideal of ternary weights; and BitNet v2 requires QAT.
+- *Mixed-precision stream* (ResQ): saves bits, but assumes layer independence and ignores inter-layer error coupling.
+
+Nobody had achieved PTQ + ternary weights + 4-bit activations simultaneously. BitNet v2 reached W1.58A4 but required training; PT2-LLM skipped training but left activations uncompressed. The gap between them was TWLA's target.
+
+*** Its Solution
+
+Three components, each precisely plugging one stream's missing piece:
+
+1. *E2M-ATQ* (Euclidean-to-Manifold Asymmetric Ternary Quantizer). Builds on PT2-LLM's asymmetric ternarization but upgrades pure Euclidean-distance minimization to a two-stage process: "Euclidean initialization" provides a starting point, then "manifold relocation" refines on a more appropriate geometry. The idea is to stop searching for the optimal ternary assignment in flat Euclidean space and instead adjust on the curved manifold that weights actually inhabit.
+
+2. *KOTMS* (Kronecker Orthogonal Tri-Modal Shaping). Builds on QuaRot's rotation but shifts the target from "unimodal Gaussian" to "tri-modal friendly" — since weights must land on {-1, 0, +1}, use a Kronecker-structured orthogonal rotation to actively shape the weight distribution into three peaks that correspond to those three values, while simultaneously suppressing activation outliers. The Kronecker structure keeps the rotation matrix compact and fast.
+
+3. *ILA-AMP* (Inter-Layer-Aware Activation Mixed Precision). Builds on ResQ's mixed precision but punctures the "layer independence" assumption — for the first time it incorporates the *second-order cross-layer interaction cost* into the bit-width allocation. How much disruption does compressing one layer to 4 bits inflict on the next layer? That is computed upfront and factored into the per-layer bit decision.
+
+*** Why It Worked (and What New Gap It Left)
+
+The three components address the three precise gaps in the three streams: manifold refinement makes PTQ ternarization more accurate on the weight side; tri-modal shaping aligns rotation with ternary weights on the activation distribution side; inter-layer coupling corrects the myopia of mixed-precision allocation on the bit-budget side. Together, they deliver W1.58A4 under *training-free* PTQ for the first time. And because activations genuinely reach 4 bits, the speedup is real end-to-end, not merely a reduction in memory footprint.
+
+Remaining gaps (speculative): the Kronecker rotation and the inter-layer second-order cost both require additional calibration computation, which partially erodes PTQ's "cheapness" advantage. Beyond W1.58A4, whether activations can be pushed further toward 2 bits, and how weight and activation bit-widths should be jointly allocated, remain open questions.
+
+* Frontier Extensions
+
+As of June 2026, TWLA has just been accepted to ICML 2026 (posted June 11) and no public follow-up critiques have appeared yet. Several foreseeable directions:
+
+- *Joint weight–activation bit allocation*: This paper handles 1.58-bit weights and 4-bit activations as separate decisions. The natural next step is to bring both into a single allocation framework where weight and activation bit-widths can trade off against each other.
+- *Extending inter-layer coupling from second-order to global*: ILA-AMP only accounts for second-order interactions between adjacent layers. Errors propagate through the entire network; modeling global coupling rather than only nearest-neighbor interactions is the natural extension.
+- *Hardware realization*: The Kronecker orthogonal transform combined with mixed 4/8-bit activation precision will require custom kernels before the theoretical speedup can be converted into real wall-clock time. Engineering that path will be the acid test of TWLA's practical value.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                How Three Streams Merge into TWLA
+
+  Ternarization stream      Rotation/outlier stream    Mixed-precision stream
+  (weights)                 (activation distribution)  (bit budget)
+  ─────────                 ──────────                 ──────────
+  TWN'16
+  (fixed-threshold ternary)
+     |
+  TTQ'17
+  (separate learned scales
+   for +/- → "asymmetry" motif)
+     |
+  BitNet'23/24  ──────────> QuaRot'24
+  (ternary in LLMs,          (Hadamard rotation
+   requires QAT,              flattens outliers,
+   8-bit activations)         target = unimodal Gaussian)
+     |                            |
+     |                        BitNet v2'25 ──────────┐    ResQ'25
+     |                        (W1.58A4 but QAT,      |    (PCA finds high-variance
+     |                         >10^4 GPU-hours)      |     subspace → 8 bits;
+     |                                               |     assumes layer independence)
+  PT2-LLM'25                                         |         |
+  (post-training ternary,                            |         |
+   asymmetric offset,                                |         |
+   training-free! but weight-only)                   |         |
+     |                                               |         |
+     └──────────────────┬────────────────────────────┴─────────┘
+                        v
+              ┌──────────────────┐
+              │   TWLA  (2026)   │  W1.58A4, PTQ, training-free
+              ├──────────────────┤
+              │ E2M-ATQ  ← plugs ternary stream (Euclidean → manifold refinement)   │
+              │ KOTMS    ← plugs rotation stream (unimodal Gaussian → tri-modal)    │
+              │ ILA-AMP  ← plugs mixed-prec stream (layer-independent → inter-layer │
+              │                                      second-order coupling)          │
+              └──────────────────┘
+
+  In one sentence: ternarization only handles weights, rotation only handles
+  activations, mixed precision only handles the bit budget — each in isolation
+  falls short of "training-free W1.58A4"; TWLA plugs the next-step gap in each
+  stream and welds them into a single PTQ framework.
+#+end_example
+
+* Insight
+
+The deepest lesson from tracing this lineage is not "yet another quantization trick" but rather that *the frontier of compression is migrating — first from weights to activations, and now from activations to the interactions between layers*.
+
+- TWN → b1.58: squeezed the *weight* dimension down to ternary, approaching the floor.
+- QuaRot → BitNet v2 → ResQ: the front line advanced to *activations* — once weights were exhausted, the bottleneck naturally shifted to activation outliers.
+- TWLA's ILA-AMP: the front line moves yet another step, to *inter-layer coupling* — when individual layers are compressed as far as they can go, the remaining headroom lives only in how layers influence one another.
+
+This is a textbook "bottleneck migration" pattern: solve one dimension, and the next one surfaces to become the new constraint. The research frontier in compression is moving from "how to quantize a single tensor" toward "how quantization errors jointly propagate through an entire network."
+
+There is also a quieter thread worth marking: *the "asymmetry" motif runs unbroken from TTQ in 2017 through TWLA in 2026*. TTQ found that positive and negative sides needed separate scales. PT2-LLM found that pretrained weight rows have nonzero means and need per-row offsets. TWLA's E2M-ATQ is still called an "Asymmetric Ternary Quantizer." Ten years on, the lesson that "real distributions are not symmetric — don't force a symmetric assumption onto them" keeps being rediscovered. That suggests it is a deep truth, not one paper's minor trick.
+
+Where does the field go next? My bet is "joint": currently, ternary weights, 4-bit activations, and per-layer bit allocation are all optimized separately. Once the three streams have fully converged, the likely next landmark paper will fold "weight bit-width + activation bit-width + inter-layer allocation" into *one* joint optimization objective — much as Chinchilla once folded "model size" and "training data" into a single scaling formula.
+
+* Takeaways
+
+Three concrete lessons from this lineage for how to do research:
+
+1. *Look for confluences, not only unexplored territory.* TWLA invented nothing from whole cloth — ternarization, rotation, and mixed precision were all established prior art. Its contribution was recognizing that "these three streams have never been welded together" and precisely plugging the next-step gap in each one. When a field has several mature but siloed technical lines, joining them is itself high-value work.
+
+2. *Fix your attention on the prerequisite cost of others' methods.* BitNet v2 achieved W1.58A4 and seemed to close the problem. But TWLA seized on its prerequisite cost — "burning >10^4 GPU-hours" — and turned "same goal, eliminate that prerequisite cost" into an entire paper. The next time you see "X has already achieved Y," ask first: at what cost did it achieve Y? Can Y still be achieved without that cost?
+
+3. *Challenge independence assumptions.* ResQ assumed layer independence; TWLA punctured it (inter-layer coupling) and extracted a whole component from the gap. Almost every "process each X separately" method — per-layer, per-channel, per-token — hides an independence assumption underneath. Asking "do these really not influence each other?" is often the seed of the next paper.
+
+For practical application: any pipeline you manage that is "multi-step, each step optimized independently" — CI stages, data pipeline segments, prompt sections — is a candidate for one question: "Are these really decoupled?" They usually are not, and making the coupling explicit is typically where the improvement comes from.
