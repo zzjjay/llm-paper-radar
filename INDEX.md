@@ -402,3 +402,5 @@
 - [06-10](digests/2026-06-10.md) — 278 scanned, 1 passed, top: Holding the FP8 Quality Ceiling at 8-Bit Weights a
 
 - [06-11](digests/2026-06-11.md) — 285 scanned, 4 passed, top: ReSET: Accurate Latency-Critical NVFP4 Reasoning v
+
+- [06-12](digests/2026-06-12.md) — 89 scanned, 0 passed, top: (no papers passed)
