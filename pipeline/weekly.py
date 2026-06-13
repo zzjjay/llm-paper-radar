@@ -25,18 +25,27 @@ def _render_table(
     start_date: datetime,
     end_date: datetime,
     digest_prefix: str,
+    digests_dir: Path,
 ) -> str:
     """Build the compact weekly table. `digest_prefix` is the path to the
     digests/ dir relative to wherever the table will live (`../digests/` for
-    the weekly/ file, `digests/` for the repo-root README)."""
+    the weekly/ file, `digests/` for the repo-root README). `digests_dir` is
+    the on-disk path used to check for an `_en` sibling, so the Why-column can
+    render the symmetric `[zh] · [en]` link like the daily and INDEX tables."""
     body: list[str] = []
     body.append(f"# Weekly Digest · {start_date.date()} → {end_date.date()}\n")
     body.append(f"> Surfaced: {len(sorted_papers)} papers\n")
     body.append("| # | Bucket | Paper | Authors | Date | Why |")
     body.append("|---|--------|-------|---------|------|-----|")
     for i, p in enumerate(sorted_papers, start=1):
-        digest_link = f"{digest_prefix}{digest_date_by_id[p.id]}.md"
-        body.append(_compact_row(i, p, digest_link))
+        date_str = digest_date_by_id[p.id]
+        digest_link = f"{digest_prefix}{date_str}.md"
+        en_link = (
+            f"{digest_prefix}{date_str}_en.md"
+            if (digests_dir / f"{date_str}_en.md").exists()
+            else None
+        )
+        body.append(_compact_row(i, p, digest_link, en_link))
     return "\n".join(body) + "\n"
 
 
@@ -45,7 +54,11 @@ def render_weekly(
     summarized_root: Path,
     out_dir: Path,
     readme_path: Path | None = None,
+    digests_dir: Path | None = None,
 ) -> None:
+    # digests/ sits at the repo root, sibling to weekly/ (out_dir).
+    if digests_dir is None:
+        digests_dir = out_dir.parent / "digests"
     # Track each paper's best score AND the digest date it came from, so the
     # Why-column link points to the correct daily digest file.
     by_id: dict[str, tuple[Paper, str]] = {}
@@ -72,7 +85,12 @@ def render_weekly(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / fname).write_text(
         _render_table(
-            sorted_papers, digest_date_by_id, start_date, end_date, "../digests/"
+            sorted_papers,
+            digest_date_by_id,
+            start_date,
+            end_date,
+            "../digests/",
+            digests_dir,
         )
     )
 
@@ -81,7 +99,12 @@ def render_weekly(
         _splice_weekly_into_readme(
             readme_path,
             _render_table(
-                sorted_papers, digest_date_by_id, start_date, end_date, "digests/"
+                sorted_papers,
+                digest_date_by_id,
+                start_date,
+                end_date,
+                "digests/",
+                digests_dir,
             ),
         )
 
