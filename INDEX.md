@@ -404,3 +404,5 @@
 - [06-11](digests/2026-06-11.md) — 285 scanned, 4 passed, top: ReSET: Accurate Latency-Critical NVFP4 Reasoning v
 
 - [06-12](digests/2026-06-12.md) — 89 scanned, 0 passed, top: (no papers passed)
+
+- [06-13](digests/2026-06-13.md) — 50 scanned, 0 passed, top: (no papers passed)
