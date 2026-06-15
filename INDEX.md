@@ -406,3 +406,5 @@
 - [06-12](digests/2026-06-12.md) — 89 scanned, 0 passed, top: (no papers passed)
 
 - [06-13](digests/2026-06-13.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [06-14](digests/2026-06-14.md) — 50 scanned, 0 passed, top: (no papers passed)
