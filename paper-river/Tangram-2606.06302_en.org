@@ -1,0 +1,286 @@
+#+title:      Tangram: Unlocking Non-Uniform KV Cache for Efficient Multi-turn LLM Serving
+#+date:       [2026-06-17 Wed 00:07]
+#+filetags:   :paper:river:en:
+#+identifier: 20260617T000738-en
+#+source:     https://arxiv.org/abs/2606.06302
+#+authors:    Hyungmin Kim, Minsoo Kim, Hongseok Kim, Jungwook Choi
+#+venue:      arXiv preprint 2606.06302, 2026 (cs.LG)
+
+* The Problem River
+
+The longer you chat with an AI assistant, the slower it gets and the more GPU memory it consumes — why?
+
+Because with every turn, the model must keep an intact copy of every prior exchange in its "memory" (the Key-Value cache) on the GPU. After a dozen turns, that memory alone dwarfs the model itself. At that point the bottleneck is no longer "too little compute" but "too little GPU memory" — how many users you can serve simultaneously is entirely determined by how small you can squeeze that memory.
+
+The question then becomes: how do you compress that memory without making the model stupider?
+
+The river is hard to navigate precisely because of two things that have long been misaligned:
+
+1. *Algorithm side*: Where do you compress? Giving every attention head the same budget is simple, but it cripples the heads that actually matter. Assigning each head its own budget (non-uniform) yields much better quality, but it is complex.
+2. *System side*: How do you actually reclaim the saved memory inside a real high-throughput server? The entire serving stack (the vLLM family) was built on the assumption that "every head's KV has the same length." Non-uniform compression violates that assumption from the start — the memory you save ends up stranded in fragmentation, unreachable.
+
+The algorithm side says "non-uniform is more accurate"; the system side says "non-uniform is unrunnable." The destination of this river is the moment someone sews that seam shut.
+
+* Source Map
+
+#+begin_example
+                        Algorithm side: Where to compress?
+                        ===================================
+
+[2023.06] H2O -- only a few tokens are important; drop the cold ones
+   |
+   | Problem: KV cache grows with generation, GPU memory runs out
+   | Solution: keep only "heavy hitters" + recent tokens, ranked by
+   |           cumulative attention scores
+   v
+[2024.04] SnapKV -- no need to watch the whole sequence; a tail window suffices
+   |
+   | Problem: H2O's running-sum bookkeeping is costly; same budget for all heads
+   | Solution: use a prompt-tail "observation window" to pick clustered
+   |           important positions independently per head
+   |
+   |   <<< Concurrent branch: ammunition for "why non-uniform?" >>>
+   |   [2019] Voita / [2024.04] Wu "Retrieval Heads"
+   |      Finding: fewer than 5% of heads carry long-context retrieval;
+   |               the rest only attend locally
+   |      Key: this is an intrinsic, input-agnostic property of the model
+   v
+[2024.07] Ada-KV -- heads are unequal, so stop splitting the budget equally
+   |
+   | Problem: uniform budget starves retrieval heads, wastes budget on local heads
+   | Solution: allocate per-head budgets via a theoretical loss upper bound
+   |           (first head-wise non-uniform method)
+   v
+[2024.10] DuoAttention -- binary split: retrieval heads keep full KV,
+                          streaming heads keep only a constant window
+[2025.05] KVzip       -- score KV by context-reconstruction ability;
+                         compress once, reuse across turns (non-uniform)
+
+
+                        System side: How to manage memory?
+                        ===================================
+
+[2023.09] PagedAttention / vLLM -- manage KV memory like an OS virtual memory
+   |
+   | Solution: slice KV into fixed-length "pages", store non-contiguously,
+   |           allocate on demand, near-zero waste
+   | Foundation assumption: one page spans all heads; every head has the
+   |                        same KV length (uniform)
+   |
+   +-------------------------+-------------------------+
+                             |
+         The two rivers collide here: non-uniform compression
+                  violates the uniform assumption
+                             |
+==============================v================================
+[2026.06] Tangram -- making non-uniform compression actually work
+                     in real serving systems
+   Insight: head retention rates follow a two-level structural regularity
+            that is intrinsic and input-agnostic
+         => no need to compute at runtime; calibrate offline with ~50
+            samples into a static blueprint
+   Solution: Budget Reservation + Ragged Paging + AOT Load Balancing
+   Result: drop-in on vLLM; up to 2.6x throughput, no accuracy loss
+==============================================================
+#+end_example
+
+Note: The critique/improvement chain H2O→SnapKV→Ada-KV, and Tangram's critique of vLLM/PagedAttention's "uniform assumption," are all explicitly stated in the paper. Retrieval Heads (Wu) and Voita are cited by Tangram as evidence for "intrinsic head inequality." The "disconnect" between the two rivers (algorithm vs. system) before Tangram is the narrative interpretation of this analysis, not a direct quote from any single paper.
+
+* Evolutionary Narrative
+
+The true protagonist of this line is not any particular compression algorithm, but a shift in understanding: from "compression is dirty real-time bookkeeping," slowly transforming into "head importance is a static blueprint baked into the model." Walking through the timeline, you can feel how this shift was forced out, step by step.
+
+** 2023.06 | H2O: Attention Has "Heavy Hitters" — Keep Them
+
+*** What Problem Did It See?
+
+At the time, people discovered that long-sequence generation (chat, story-writing) was prohibitively expensive — the bottleneck was not compute but the KV cache. Every time the model generated a word, it had to store every prior token's Key/Value for attention lookup. The longer the sequence and the more concurrent users, the larger this pile grew, until GPU memory exploded first.
+
+*** Its Solution
+
+H2O's observation was simple: in the attention matrix, the vast majority of attention concentrates on a small cluster of tokens, which it called "Heavy Hitters." So don't keep them all — retain only these heavy hitters plus the most recent tokens, and discard the rest. It framed "which tokens to discard" as a dynamic submodular optimization problem and provided theoretical guarantees. Just 20% of tokens as heavy hitters was enough to raise throughput by tens of times.
+
+*** Why It Worked (and What Pit It Dug)
+
+It worked because attention is naturally sparse — most historical tokens contribute almost nothing to the current generation step, so retaining them is pure waste.
+
+But it dug two pits. First, it required continuously accumulating per-token attention scores throughout the entire generation process to identify heavy hitters — this "ongoing bookkeeping during generation" was not cheap. Second, and more critically, it treated all attention heads identically, applying roughly the same compression force to each. This planted the seed for the next paper.
+
+** 2024.04 | SnapKV: No Need to Watch the Whole Sequence — the Tail Is Enough
+
+*** What Problem Did It See?
+
+H2O required accumulating scores throughout the full generation, like an accountant who never stops recording. SnapKV noticed something: the "important positions" each attention head focuses on during generation are actually quite stable, and this focus can be read off in advance from a small window at the tail of the prompt (its "observation window"). If you can see it in advance, why keep accounts throughout?
+
+*** Its Solution
+
+Transform the approach continuously: remove H2O's "full-sequence accumulation," replace it with "look only at this observation window at the prompt tail," and replace "pick scattered tokens" with "pick clustered important positions." That gives you SnapKV. It selects positions independently per head, so it is already "head-wise." On 16K inputs it achieves 3.6× faster generation and 8.2× memory savings with negligible accuracy loss.
+
+*** Why It Worked (and What Pit It Dug)
+
+It worked because an attention head's focus pattern has "inertia" — what the tail of the prompt asks about reveals what the head was attending to earlier, so local information predicts global importance.
+
+The new pit: although SnapKV selects positions "per head," the *budget* (how many positions to keep) is still the same for every head. But are all heads truly equal? Answering that question required a separate branch.
+
+** 2024.04 (Branch) | Retrieval Heads / Voita: Heads Are Intrinsically Unequal — and That's Fixed
+
+*** What Problem Did It See?
+
+Voita (2019) had already shown that not all sixteen heads are useful — pruning most of them still works. Wu et al. (2024) nailed it down definitively: the ability to retrieve information from long contexts rests almost entirely on fewer than 5% of heads, which they called "retrieval heads."
+
+*** Its Solution
+
+This was not a solution but a diagnosis — the most critical diagnosis in the line. Retrieval heads have several properties: *universal* (present in all long-context models), *sparse* (fewer than 5%), *intrinsic* (they exist even before context-length extension, emerging from short-context pretraining), and *causal* (remove them and the model immediately hallucinates; remove random heads and nothing happens).
+
+*** Why It Worked (and What It Ignited)
+
+It handed "non-uniform compression" a theoretical weapon: since only a few retrieval heads carry long-range information while the rest attend only locally, SnapKV's equal-budget-per-head policy starves retrieval heads while wasting budget on local heads. Uniform allocation inevitably fails both. The next paper was born to fix this.
+
+** 2024.07 | Ada-KV: Heads Are Unequal, So Budgets Should Be Too
+
+*** What Problem Did It See?
+
+It named the prior work directly: existing methods (e.g., SnapKV) "assign compression budgets uniformly across all heads, ignoring each head's unique attention pattern." Combined with the branch's findings, this is an obvious mismatch.
+
+*** Its Solution
+
+Ada-KV derived a theoretical upper bound on the attention-output loss incurred by compression, then allocated budgets according to this bound: heads where pruning causes large accuracy drops get larger budgets; heads where pruning barely matters get smaller ones. It is the "first head-wise adaptive budget allocation strategy" and is plug-and-play — it can be mounted on top of existing methods like H2O and SnapKV.
+
+*** Why It Worked (and What Pit It Dug)
+
+It worked because it finally aligned "where to save memory" with "where heads are truly important," rather than distributing savings uniformly. Accuracy improved noticeably.
+
+But the new pit quietly shifted domains — from algorithms to systems: different budgets per head means different KV *lengths* per head. Mathematically elegant, but about to collide head-on with the foundation of the entire serving stack.
+
+** 2024.10 / 2025.05 | DuoAttention and KVzip: Pushing Non-Uniformity to the Extreme
+
+*** What Problem Did It See?
+
+Ada-KV's non-uniformity was still on a continuous scale. DuoAttention pushed it to a binary extreme: since heads divide into retrieval heads and streaming heads, give retrieval heads *full* KV and streaming heads only a *constant-length* small cache. And this binary classification is intrinsic to the model — it can be calibrated once offline. KVzip targeted a different pain point: prior compression was "query-aware" (tailored to the current question), so it became useless when the question changed; in multi-turn conversations every turn brings a new question, which is awkward.
+
+*** Its Solution
+
+DuoAttention identifies retrieval heads offline using synthetic data, fixes them, and at inference time keeps retrieval heads fully while streaming heads retain only recency tokens and attention sinks. KVzip goes the opposite direction — query-agnostic: it scores each KV by the model's ability to reconstruct the original context from it, yielding compression that can be reused across arbitrary future questions — naturally suited for multi-turn. Both are non-uniform.
+
+*** Why They Worked (and How Deep the Pit Got)
+
+They made non-uniform compression nearly unimpeachable on accuracy: DuoAttention reduces memory by 2.55×, KVzip by 3–4× with almost no quality drop.
+
+But precisely because they pushed to the extreme, "wildly different KV lengths across heads" became an iron fact. The algorithm side was ready; all the problems had been thrown to the system side — which was still living under a different assumption.
+
+** 2023.09 (A Second River) | PagedAttention / vLLM: Managing GPU Memory Like an OS
+
+*** What Problem Did It See?
+
+Back in 2023, serving systems managed KV memory crudely — fragmentation and redundancy wasted well over half of GPU memory, hard-capping the number of requests that could be batched.
+
+*** Its Solution
+
+PagedAttention borrowed the idea of OS virtual memory: slice each request's KV into fixed-length "pages," store them non-contiguously, allocate on demand — near-zero waste, with cross-request sharing. This became vLLM, and the de facto standard for modern high-throughput serving.
+
+*** Why It Worked (and the Critical Assumption It Buried)
+
+It worked extraordinarily well — it remains the foundation today. But it carries a deeply buried design assumption: *one physical page spans all attention heads, and every head has the same KV length within that page* (the paper's unified block structure of L×H×2×P×d). In the era when "everyone uses full KV or uniform compression," this assumption was self-evident.
+
+But it is fundamentally incompatible with the "non-uniform compression" that had just matured on the algorithm side. Two rivers, destined to collide.
+
+** 2026.06 | Tangram: Sewing the Two Rivers Together
+
+*** What Problem Did It See?
+
+When you actually drop non-uniform compression into vLLM, you discover that all the memory savings the algorithm promised evaporate — or even go negative. Tangram accounts for this precisely, identifying three costs:
+
+1. *Page fragmentation*: vLLM's pages span all heads and are allocated for the longest head. Under non-uniform compression each head has a different length, so the memory of short heads is locked to the page along with the long head and can never be returned to the memory pool — compressed savings are stranded in fragmentation.
+2. *Scheduling overhead*: How long each head's KV is after compression is only known after the forward pass completes. The scheduler must over-allocate upfront and then run an expensive "compress-and-reclaim" pass to recover scattered pages, consuming up to 25% of prefill time.
+3. *Load skew*: With unequal KV lengths per head, static partitioning of GPU kernel workloads causes long-headed tiles to stall the entire decode step (latency up to 1.7×), while dynamic re-partitioning requires recomputation every layer every step, burning 15–20% of decode time.
+
+*** Its Solution
+
+Tangram's key insight extends the branch finding (Retrieval Heads): head retention rates follow a *two-level structural regularity* — the ranking among heads is nearly input-independent, and each head's absolute retention rate fluctuates within a very narrow range. In other words, this "heterogeneity" does not need to be computed at runtime at all; it can be calibrated offline from roughly 50 samples into a *static blueprint*.
+
+Continuously transforming "runtime on-the-fly decisions" into "offline static pre-layout" yields a three-piece toolkit:
+- *Budget Reservation*: each head's budget is fixed offline (mean + safety margin α·σ); the scheduler allocates exactly this at dispatch time, eliminating over-allocation and the entire compress-and-reclaim pipeline.
+- *Ragged Paging*: group heads with similar budgets together; each group gets its own independent page table (rather than one monolithic page spanning all heads), so freed memory can truly be returned to the pool at group granularity; vectorized block tables keep the extra management overhead negligible.
+- *AOT (Ahead-of-Time) Load Balancing*: compute a "load partition map" offline based on fixed head groups; decode steps achieve balanced SM utilization with zero runtime planning.
+
+*** Why It Worked (and the Boundaries It Honestly Admits)
+
+It works because it does not touch the compression algorithm itself — it only fixes each head's budget ratio, leaving the scoring function intact, so it serves as a drop-in substrate for any non-uniform method (Ada-KV, KVzip, DuoAttention, …). It moves all three runtime costs that prior work bore painfully into pre-execution static decisions. Built on top of vLLM, it achieves up to 2.6× throughput with accuracy matching or occasionally exceeding the original dynamic implementations.
+
+The boundaries it acknowledges are honest: fixing budgets offline sacrifices the small flexibility of "adapting to each individual input," relying on the safety margin α to cover the gap. In essence, Tangram does not improve compression ratio (that is inherited from the underlying method); what it improves is the conversion efficiency from "compression ratio on paper" to "real throughput in production."
+
+* Frontier Extensions
+
+As of mid-2026, Tangram is the newest and most complete piece of this puzzle — the first to turn "non-uniform KV compression" from an algorithmic paper promise into a system-deployable throughput gain.
+
+Foreseeable follow-on directions (speculative, not named in the paper):
+- Make the "offline calibration blueprint" a standard artifact auto-generated alongside a model, so any new compression method can plug in at zero cost.
+- Adaptive safety margin α: lightweight dynamic fallback for the occasional input that deviates from the static blueprint, recovering the last bit of accuracy.
+- Merging with heterogeneous memory management lines (Jenga, DiffKV, which handle mixed model/inter-layer heterogeneity) to jointly handle both "across-layer" and "across-head" heterogeneity in a unified framework.
+
+* One Diagram to Understand It All
+
+#+begin_example
+       From "runtime on-the-fly compression"  ->  to "model-intrinsic static blueprint"
+
+Time --->  2023        2024              2025      2026
+          ----        ----              ----      ----
+Algorithm
+Where to  H2O ......> SnapKV ....> Ada-KV ..> KVzip   (reused as
+compress? heavy       obs. window/  per-head   recon    substrate)
+          hitters     per-head sel. budgets    scoring
+          |uniform|   |selection but |non-unif  |multi-
+                      |budget still  |first|    |turn
+                      |uniform|                 |reuse|
+                         ^
+                         | ammunition
+        [2019 Voita / 2024 Retrieval Heads]
+        "heads intrinsically unequal, input-agnostic" ----------+
+                                                                | same insight
+System                                                          | upgraded to
+Memory mgmt:  PagedAttention/vLLM (2023)                       | "static blueprint"
+              page-based KV mgmt, near-zero waste              |
+              |foundation: one page spans all heads, uniform|   |
+                           |                                    |
+                           | non-uniform compression shatters   |
+                           |   this assumption                  |
+                           v                                    v
+                  ==================================
+                   Tangram (2026): sewing the two rivers
+                   Insight: two-level head retention regularity
+                            => offline calibration
+                   Toolkit: Budget Reservation / Ragged Paging /
+                            AOT Load Balancing
+                   Three runtime costs (fragmentation / scheduling /
+                   skew) resolved statically
+                   => drop-in on vLLM, up to 2.6x throughput
+                  ==================================
+
+  Cognitive axis:  "compression is runtime dirty work"
+                   (recompute every step)
+                              =========>
+                   "heterogeneity is a static blueprint"
+                   (calibrate offline once, pre-layout statically)
+#+end_example
+
+* Insight
+
+On the surface this river is about "how to compress the KV cache smaller"; underneath, what is really happening is a shift in attitude toward "attention head heterogeneity":
+
+- *Phase 1 (H2O)*: Heterogeneity is not yet in the picture. Token importance varies; head importance does not.
+- *Phase 2 (SnapKV → Ada-KV → DuoAttention)*: Heterogeneity is seen and exploited — heads are unequal, budgets should be non-uniform. But heterogeneity is still treated as *a quantity that must be measured at runtime, on the fly*.
+- *Phase 3 (Tangram)*: Heterogeneity is reunderstood as *an intrinsic, input-agnostic static structure of the model*. This is the cognitive leap — it takes something "dynamic, unpredictable, must be handled on the spot" and proves it is "static, calibratable, pre-layoutable."
+
+Once a quantity is proven to be "actually static," all the runtime machinery built around it (bookkeeping, over-allocation, reclaim, re-planning) can be moved entirely to before execution and resolved in one pass. Tangram's three-piece toolkit is not three independent tricks; it is the same insight ("it is static") applied uniformly across three surfaces: memory allocation, memory reclaim, and compute partitioning.
+
+The most likely next step: keep finding quantities that are "currently treated as dynamic but are actually static." Attention sparsity patterns, expert routing in MoE, acceptance rates in speculative decoding — wherever something is being measured expensively at runtime and happens to have an "intrinsic model regularity," the same "offline calibration into a blueprint" approach could redo it from scratch.
+
+* Takeaway
+
+For how to do research and how to find problems, this river offers one sharp heuristic:
+
+*When a system is repeatedly and expensively measuring some quantity at runtime, first ask — is that quantity actually dynamic?*
+
+The turning point of the entire line (Tangram) was not inventing a cleverer compression algorithm, but proving that a quantity everyone assumed "must be computed at runtime" (each head's retention budget) can in fact be fixed offline. That proof itself — the two-level structural regularity, the sufficiency of ~50 calibration samples — is the paper's core contribution; the three-piece toolkit is the straightforward engineering realization that follows.
+
+The practical implication: the next time you see a system full of "first over-allocate, then reclaim, then re-plan" runtime patches, resist the urge to optimize those patches. Instead, go look at the quantity they are all orbiting — does it perhaps have an "intrinsic, input-agnostic" stable structure? If so, the entire runtime machinery can collapse into "calibrate offline once + pre-layout statically," saving not just a little but an entire control plane. The long-standing seam between the algorithm side and the system side is often sewn shut precisely in moments like this — when someone re-evaluates whether a quantity is dynamic or static.
