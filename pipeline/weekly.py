@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pipeline._clock import today_utc
 from pipeline.config import load_config
-from pipeline.render import _compact_row, _splice_weekly_into_readme, sort_papers
+from pipeline.render import _bucket_sort_key, _compact_row, _splice_weekly_into_readme
 from sources.base import Paper
 
 
@@ -76,7 +76,7 @@ def render_weekly(
 
     surviving = [(p, d) for p, d in by_id.values() if _passed_gate(p)]
     digest_date_by_id = {p.id: d for p, d in surviving}
-    sorted_papers = sort_papers([p for p, _ in surviving])
+    sorted_papers = sorted((p for p, _ in surviving), key=_bucket_sort_key)
 
     start_date = end_date - timedelta(days=6)
     fname = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}.md"
