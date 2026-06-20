@@ -414,3 +414,5 @@
 - [06-16](digests/2026-06-16.md) — 262 scanned, 3 passed, top: Tangram: Unlocking Non-Uniform KV Cache Compressio
 
 - [06-17](digests/2026-06-17.md) — 260 scanned, 0 passed, top: (no papers passed)
+
+- [06-18](digests/2026-06-18.md) — 85 scanned, 0 passed, top: (no papers passed)
