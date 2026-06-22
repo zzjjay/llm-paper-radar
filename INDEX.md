@@ -420,3 +420,5 @@
 - [06-19](digests/2026-06-19.md) — 82 scanned, 1 passed, top: Rethinking Shrinkage Bias in LLM FP4 Pretraining: 
 
 - [06-20](digests/2026-06-20.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [06-21](digests/2026-06-21.md) — 50 scanned, 0 passed, top: (no papers passed)
