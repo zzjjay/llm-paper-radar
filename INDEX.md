@@ -422,3 +422,5 @@
 - [06-20](digests/2026-06-20.md) — 50 scanned, 0 passed, top: (no papers passed)
 
 - [06-21](digests/2026-06-21.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [06-22](digests/2026-06-22.md) — 275 scanned, 3 passed, top: HyperQuant: A Rate-Distortion-Optimal Quantization
