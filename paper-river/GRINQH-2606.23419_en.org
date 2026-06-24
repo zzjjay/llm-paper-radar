@@ -1,0 +1,271 @@
+#+title:      GRINQH: Graded Input-based Quantization Hierarchy for Efficient LLM Generation
+#+date:       [2026-06-23 Tue 12:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260623T120000-en
+#+source:     https://arxiv.org/abs/2606.23419
+#+authors:    Jette Oberländer, Jan Finkbeiner, Catherine M. Schöfmann, Emre Neftci
+#+venue:      arXiv preprint, June 2026
+
+* The River of Problems
+
+Compressing a large model's weights down to a few bits while actually speeding up inference — why is this so hard?
+
+The difficulty comes from two intertwined contradictions. First, the harder you compress, the greater the precision loss. Second, even if you theoretically save memory, without specialized hardware kernels the real-world speedup never materializes. The deeper trap is that prior methods all treated "inference" as a uniform process — but LLM inference is anything but uniform. Context prefill is compute-bound; token-by-token decoding is memory-bandwidth-bound. Forcing the same compression strategy onto two fundamentally different phases inevitably shortchanges both. And so generation after generation of researchers has traded off accuracy, speed, and memory, each time believing they had found the answer, only to fall into a new pit.
+
+* Source Map
+
+#+begin_example
+[1990] LeCun et al. - Optimal Brain Damage / Surgeon (OBS)
+  |
+  | Problem: pruning driven by intuition, no theoretical basis
+  | Solution: use Hessian second-order info to assess each weight's
+  |           "importance"; prune one at a time and compensate the rest
+  v
+[2022 Aug] Frantar & Alistarh - OBQ (Optimal Brain Compression)
+  |
+  | Problem: OBS only does pruning; no one applied it to quantization;
+  |          only tractable for small models
+  | Solution: extend OBS to quantization (OBQ); layer-wise per-weight
+  |           quantization with closed-form compensation
+  v
+[2022 Oct] Frantar et al. - GPTQ (ICLR 2023)
+  |
+  | Problem: OBQ too slow for very large models (runtime O(d^3);
+  |          175B parameters completely intractable)
+  | Solution: switch from per-weight to per-column; reuse Hessian
+  |           inverse via Cholesky; 1000x speedup
+  v
+[2023 Jun] Lin et al. - AWQ (MLSys 2024 Best Paper)
+  |
+  | Problem: GPTQ treats all weights equally, but 1% of salient
+  |          channels account for 99% of the error
+  | Solution: find salient channels via activation distribution;
+  |           apply equivalent scaling to avoid true mixed precision
+  v
+[2024 Feb] Park et al. - Any-Precision LLM
+  |
+  | Problem: serving 3-bit/4-bit/5-bit models simultaneously
+  |          requires three copies in memory — too wasteful
+  | Solution: nested bit-planes — one n-bit model can be "sliced"
+  |           to any lower precision on the fly
+  v
+[2024 May] Huang et al. - SliM-LLM (ICML 2025)
+  |
+  | Problem: uniform quantization wastes the precision budget;
+  |          element-level mixed precision is not hardware-friendly
+  | Solution: allocate bits at group granularity using Hessian
+  |           salience — structured mixed precision, hardware-friendly
+  v
+[2024 Oct] Chen et al. - PMPD (Progressive Mixed-Precision Decoding)
+  |
+  | Problem: prefill and decode have different characteristics yet
+  |          use the same precision; later tokens are more error-tolerant
+  | Solution: high precision for prefill, progressively lower precision
+  |           during decode; nested storage via Any-Precision LLM
+  v
+[2026 Jun] Oberländer et al. - GRINQH  <-- target paper
+       |
+       | Follow-up: just published; no known citations yet (as of 2026-06-23)
+#+end_example
+
+* The Evolutionary Narrative
+
+** 1990 | OBS: Hessian-guided surgery — pruning by theory, not intuition
+
+*** What problem it saw
+
+The earliest neural-network compression relied on intuition: if a weight has a small absolute value, cut it. This is like a surgeon who removes whatever "looks unimportant" without considering whether the rest of the system will collapse. The result: some tiny-valued weights are actually critical — they connect nodes with high-frequency activations — and deleting them crashes model accuracy.
+
+*** Its solution
+
+The LeCun team recast model compression as an optimization problem: given that we must delete or quantize one weight, how do we minimize the change in the loss function? The answer is to use the Hessian matrix of the loss — its second derivatives — to measure the true "importance" of each weight. After removing a weight, a closed-form formula redistributes and compensates the error back into the remaining weights. This framework became known as Optimal Brain Surgeon (OBS).
+
+*** Why it worked, and what new pit it dug
+
+It worked because it has a theoretical guarantee: the optimal removal is the one that minimizes the Hessian-weighted error. But it only handled pruning, and computing the inverse Hessian costs O(d²), which becomes burdensome even for moderately sized modern networks. "Can the same idea be applied to quantization? Can it scale to models with tens of billions of parameters?" — these are the two questions it left open.
+
+** 2022 Aug | OBQ: OBS for quantization, but stuck on scale
+
+*** What problem it saw
+
+At the time, quantization (mapping floating-point weights to 3/4-bit integers) was done mostly by rounding, with none of the theoretical machinery of OBS. OBQ's authors, Frantar & Alistarh, noticed that pruning sets a weight to zero and quantization rounds it to the nearest integer — the two operations are mathematically identical in structure, so OBS's framework could be applied directly.
+
+*** Its solution
+
+OBQ works layer by layer, quantizing weights one at a time. Each time a weight is quantized, a closed-form Hessian-inverse update immediately compensates the remaining weights, spreading the quantization error outward. The result is dramatically more accurate than naive rounding.
+
+*** Why it worked, and what new pit it dug
+
+It has theoretical backing and outperforms RTN (Round-To-Nearest) by a wide margin. But OBQ's runtime for a d_row × d_col weight matrix is O(d_col³). For ResNet-50 (25M parameters) it needs one hour. For GPT-175B? Completely out of the question. "The quantization framework is right, but it's too slow" — this is the problem left for the next paper.
+
+** 2022 Oct | GPTQ: 1000× speedup for OBQ, making 175B-scale quantization feasible
+
+*** What problem it saw
+
+OBQ updates all remaining weights and recomputes the Hessian inverse every time it quantizes one weight — this "recompute every step" cost is fatal. And the immediate deployment barrier for large language models is sheer scale: GPT-175B requires multiple high-end GPUs, but if it could be compressed to 3–4 bits it could run on a single card. OBQ could not reach that scale.
+
+*** Its solution
+
+GPTQ's key insight: OBQ always quantizes the "easiest" weight first (the one with the smallest error), but you don't need to be that clever — *quantizing in simple column order* yields nearly identical results. Switching from per-weight to *per-column*, and precomputing the Hessian inverse update once via Cholesky decomposition and reusing it, drives the runtime from O(d³) to something practically feasible. A 175B-parameter model is handled in 4 GPU-hours, with negligible quality loss at 3/4-bit precision.
+
+*** Why it worked, and what new pit it dug
+
+GPTQ demonstrated that "you don't need the optimal greedy order; sequential quantization is enough." In experiments, 4-bit GPTQ models are nearly lossless, and 3-bit is acceptable. But GPTQ treats every weight equally — it has no notion that some weight channels affect the model's output far more than others. "1% of weights may carry 99% of the importance" — that fact wouldn't be made explicit until the next paper.
+
+** 2023 Jun | AWQ: No mixed precision, but protect the most important 1% of channels
+
+*** What problem it saw
+
+After GPTQ, the natural next step was: assign more bits to important weights (mixed precision). But hardware dislikes mixed precision — different bit widths require different memory layouts and compute paths, making efficient CUDA kernel implementation very difficult. AWQ's authors discovered a key fact: in any model, only about 1% of weight channels are "salient" — they have an outsized influence on activations, and any quantization error landing on them causes a significant loss spike.
+
+*** Its solution
+
+AWQ's approach is elegant: don't protect that 1% with more bits (that would be mixed precision) — instead, *equivalently rescale* them. Concretely: find the salient channels via the activation distribution (the ones with large activation magnitudes), multiply those weight channels by a scale factor s, then divide by s on the activation side — an equivalent transformation that leaves the output unchanged, but the rescaled weights incur less quantization error (because the relative error of quantization = error / |weight|, so larger weights yield smaller relative error). No change to data layout; fully hardware-friendly.
+
+*** Why it worked, and what new pit it dug
+
+AWQ achieves 3/4-bit quantization with high hardware efficiency, no true mixed precision, and 1.45× inference speedup over GPTQ. But AWQ still treats all tokens' inference as a uniform process — it does not recognize that LLM inference has two fundamentally different phases: *prefill* (parallel processing of the input context, compute-bound) and *decode* (generating one token at a time, memory-bandwidth-bound). These phases have different bottlenecks and should have different optimal precisions.
+
+** 2024 Feb | Any-Precision LLM: Nested bit-planes — one copy in memory serves every precision
+
+*** What problem it saw
+
+If you want to serve 3-bit, 4-bit, and 5-bit precision simultaneously on the same server (say, 3-bit for fast drafting, 5-bit for high-quality output), you have to store three separate copies of the model weights. The memory overhead is 3×.
+
+*** Its solution
+
+Any-Precision LLM proposes nested bit-planes: store weights as n bit-planes, where the lowest k bit-planes constitute the k-bit model. Want 3-bit? Read the first 3 planes. Want 5-bit? Read all 5 planes. One n-bit allocation stores every model from 1-bit to n-bit.
+
+*** Why it worked, and what new pit it dug
+
+This nesting design is elegant and serves as the infrastructure for both PMPD and GRINQH — both borrow it to implement mixed precision without additional memory overhead. But Any-Precision LLM itself only solves the multi-precision *storage* problem; it does not answer: *during inference, when should which precision be used?*
+
+** 2024 May | SliM-LLM: Hessian salience for mixed precision that hardware can actually run
+
+*** What problem it saw
+
+By this point everyone knew that different weights have different importance, and that mixed precision is theoretically better. But the implementation problem had never been solved: if different layers use different bit widths, the memory layout becomes irregular and CUDA kernels cannot parallelize efficiently. SliM-LLM asked: can we do mixed precision while remaining hardware-friendly?
+
+*** Its solution
+
+SliM-LLM reduces mixed precision to group granularity (groups of 128 weight columns): compute a "salience" score for each group using the Hessian matrix (Salience-Determined Bit Allocation, SBA), assign high bits to important groups and compress unimportant groups more aggressively, while keeping the overall average bit-count fixed. Within each group the precision is uniform, so hardware implementations can reuse uniform-quantization kernels.
+
+*** Why it worked, and what new pit it dug
+
+At 2-bit quantization, SliM-LLM reduced perplexity by 48% relative to the then-SOTA. Hardware efficiency is preserved. But SliM-LLM's mixed-precision allocation is *static* — which group gets which precision is decided at calibration time and frozen for inference. It cannot see the actual activation distribution of a live input — if an input happens to strongly activate a channel assigned to low precision, the result degrades. And it still has not recognized the fundamental difference between prefill and decode.
+
+** 2024 Oct | PMPD: Prefill and decode finally treated differently — but granularity is still too coarse
+
+*** What problem it saw
+
+LLM inference has two fundamentally different phases, yet every prior method ignored this. PMPD's authors observed: prefill processes the entire input context in one parallel matrix multiplication (compute-bound); decode produces one token at a time via a matrix–vector multiply (memory-bandwidth-bound). More critically, later tokens in the decode sequence depend heavily on what has already been generated and therefore tolerate approximation errors more gracefully.
+
+*** Its solution
+
+PMPD does two things:
+
+First, use high precision for prefill (compute-bound, so loading weights multiple times is not the bottleneck) and low precision for decode (memory-bound, so every generated token drags all weights across DRAM once).
+
+Second, progressively lower precision during decode: token 1 uses 4-bit, later tokens use lower and lower precision, reaching 2-bit by the end of the sequence. Storage uses Any-Precision LLM's nested bit-planes — no extra memory cost.
+
+*** Why it worked, and what new pit it dug
+
+PMPD demonstrated 1.4–12× speedup on edge GPUs and NPUs. It was the first work to explicitly model the prefill/decode distinction inside the quantization strategy. But its precision schedule is *coarse-grained at the token level*: all weight channels for a given token step use the same precision. It cannot see that within one token step some weight channels have huge activation values (outliers) while others are near zero — the coarse schedule lumps them all together and applies a single precision indiscriminately.
+
+** 2026 Jun | GRINQH: Per-channel precision scheduling at runtime, with hardware that actually goes fast
+
+*** What problem it saw
+
+Combining the unsolved issues of PMPD and SliM-LLM: PMPD's scheduling granularity is too coarse (token-level), and static allocation (à la SliM-LLM) cannot react to runtime outlier activations. GRINQH's authors asked: can we push precision allocation to *runtime, per-channel (row-level)* granularity and simultaneously provide hardware kernels so the whole thing is genuinely fast on a GPU?
+
+*** Its solution
+
+GRINQH has three core design elements that interlock:
+
+*1. Phase decoupling*: prefill always uses maximum precision (compute-bound, so repeated weight loading is not the bottleneck); mixed precision is applied only during decode.
+
+*2. Runtime per-channel precision allocation*: during decode, for each incoming token's activation vector, compute the activation magnitude of every weight channel on the fly; channels with large magnitudes (outliers) receive high precision (e.g., 4-bit) while low-magnitude channels are compressed further (e.g., 2-bit). This is not static Hessian salience — it is *dynamic, activation-driven* allocation, and each token may receive a different precision map.
+
+*3. Hierarchical nested memory layout + custom GPU kernels*: weights are organized as bit-planes; during decode the kernel fetches only the bit-planes needed for each channel from DRAM and skips the rest. Theoretical savings translate directly into measured speedup, matching the throughput of highly optimized fixed-precision kernels (MARLIN).
+
+*** Results
+
+At ~3-bit average precision, GRINQH surpasses 4-bit fixed-precision SOTA (GPTQ, AWQ) in quality while running 25% faster. 2-bit quantization becomes genuinely usable for the first time.
+
+* Frontier Extensions
+
+As of 2026-06-23, GRINQH is a preprint published this month with no known follow-up citations yet.
+
+Several parallel threads are worth watching:
+
+- *MatGPTQ* (Kleinegger et al., 2026): Matryoshka-style nested quantization, listed as a baseline in GRINQH's paper; the two works are in direct competition on the hardware implementation of nested bits.
+
+- *FlexQuant* (2506.12024): a dynamic precision-switching framework targeting the same problem as GRINQH, but emphasizing flexibility over measured hardware throughput.
+
+The most likely next steps in this direction are: extending GRINQH's dynamic per-channel allocation into the prefill phase (where large batch sizes also create memory pressure), and exploring how to port this runtime allocation scheme to NPUs and dedicated accelerator chips.
+
+* One Diagram
+
+#+begin_example
+Problem evolution               Core solution                        Time
+---------------------------------------------------------------------------
+
+"Compress weights               Intuition-based pruning              1980s
+ but don't know                 (cut whatever has small |w|)
+ what's important"               |
+                                 v
+                                OBS/OBD: Hessian to measure          1990
+                                importance
+                                 |
+                                 v
+"Can this apply                 OBQ: extend OBS to quantization,     2022 Aug
+ to quantization?"              layer-wise, but O(d^3) too slow
+                                 |
+                                 v
+"Can't handle                   GPTQ: per-column + Cholesky,         2022 Oct
+ billion-parameter              1000x speedup;
+ models"                        all weights treated equally
+                                 |
+                                 v
+"1% of channels                 AWQ: equivalent scaling of           2023
+ cause most of                  salient channels,
+ the error"                     no true mixed precision needed
+                                 |
+                                 v
+"Multi-precision serving        Any-Prec LLM: nested bit-planes,     2024 Feb
+ needs N copies                 one allocation serves all precisions
+ in memory"
+           |
+           v
+"Different weights              SliM-LLM: Hessian salience,          2024 May
+ deserve different bits"        group-level static mixed precision
+                                 |
+                                 v
+"prefill/decode are             PMPD: phase-split strategy +         2024 Oct
+ fundamentally different"       progressively lower precision
+                                in decode; token granularity, static
+                                 |
+                                 v
+"Outlier channels               GRINQH: runtime per-channel          2026 Jun
+ appear dynamically"            activation-driven allocation +
+                                hierarchical nested memory kernels;
+                                decode precision is genuinely fast
+#+end_example
+
+* Insight
+
+What is really happening along this line is a *dual refinement of the granularity and the timing of compression decisions*.
+
+The implicit assumption of early work (GPTQ/AWQ) was that a weight's importance is an intrinsic property of the model, determinable once during calibration. SliM-LLM accepted this assumption but pushed the granularity to groups. PMPD broke the first assumption — importance also depends on which *phase* of inference you are in. GRINQH breaks both assumptions simultaneously — importance also depends on *the current token's activation distribution*.
+
+Put differently: researchers spent four years advancing "compression" from "model-level static decision" to "token-level dynamic awareness" and then to "channel-level real-time response." Each advance required two things to be in place simultaneously: a theoretical insight (recognizing what varies) and an engineering companion (actually running fast on hardware). GRINQH is the first work to connect per-channel dynamic allocation to GPU kernels that have been empirically validated — that is its real moat.
+
+The most likely next direction: extend dynamic allocation from weights to the KV cache (KV cache salience is also token-dependent), or port the entire framework to AMD/Intel NPUs to validate cross-hardware generality.
+
+* Takeaway
+
+This evolutionary line offers a clear demonstration of how to find problems: *every breakthrough makes one implicit assumption of the previous solution explicit, then relaxes it.*
+
+GPTQ's implicit assumption was "all weights are equal"; AWQ relaxed it. AWQ's implicit assumption was "inference is uniform"; PMPD relaxed it. PMPD's implicit assumption was "everything within a token step is uniform"; GRINQH relaxed it.
+
+This means: when you read a paper, the most valuable question is not "what did this paper do?" but "what assumption has this paper not yet relaxed?" The assumption still left standing is the starting point of the next paper.
