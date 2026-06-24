@@ -1,0 +1,210 @@
+#+title:      RoPE-Aware Bit Allocation for KV-Cache Quantization
+#+date:       [2026-06-24 Wed 00:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260624T000913-en
+#+source:     https://arxiv.org/abs/2606.24033
+#+authors:    Fengfeng Liang, Yuechen Zhang, Jiaya Jia
+#+venue:      arXiv preprint, June 2026
+
+* Source Map
+
+Below is a panoramic view of this evolutionary line. Arrows point from "the work being improved / critiqued" to the later work, annotated with what the later work found wrong.
+
+#+begin_example
+[2024 early]  KIVI (ICML'24) + KVQuant (NeurIPS'24)
+              |
+              | Keys have a channel-wise distribution, Values are per-token;
+              | but scalar quantization must store scale/zeropoint,
+              | adding 1-2 bit of overhead per value
+              v
+[2024.06]    QJL (AAAI'25)
+              |
+              | Zero overhead, but 1-bit is too coarse — suited for
+              | inner-product estimation only, not for MSE objectives
+              v
+[2025.02]    PolarQuant (AISTATS'26)
+              |
+              | Polar-coordinate quantization solves the MSE zero-overhead
+              | problem, but still treats the key vector as a flat whole
+              v
+[2025.04]    TurboQuant (ICLR'26)   <-- merges PolarQuant + QJL
+              |
+              | The TQ-MSE stage treats the key as a flat vector,
+              | ignoring the fact that RoPE partitions the key into
+              | independent frequency blocks
+              v
+[2026.06]    Block-GTQ  <-- target paper
+              |
+              | (No direct successor yet; concurrent work CommVQ takes a
+              |  different route: making the codebook commute with RoPE
+              |  rather than being aware of per-block energy)
+              v
+           [Future?]
+
+Parallel thread (contemporaneous, different angle):
+  TurboESM (2025.03) -- finds RoPE incompatible with orthogonal rotation,
+                        proposes a RoPE-first pipeline
+  CommVQ   (ICML'25) -- designs a RoPE-commutative codebook to sidestep
+                        the rotation conflict
+#+end_example
+
+* Forward Narrative: How the Problem Kept Forcing New Choices
+
+** Layer 0: The KV Cache — Why Is It the Bottleneck?
+
+LLM inference has a simple engineering reality: to avoid recomputing attention over historical tokens, every token's Key and Value vectors must be stored in GPU memory — this is the KV cache.
+
+The trouble is that cache size grows linearly with sequence length. At 128K tokens, an fp16 KV cache easily occupies tens of gigabytes, squeezing the number of requests that can be served concurrently. The only remedy is to store these vectors more compactly — that is, to quantize them to fewer bits.
+
+Quantization itself is not new. But there is a trap: compressing all vectors uniformly tends to cause catastrophic quality collapse below 4 bits.
+
+** Layer 1: Keys and Values Are Fundamentally Different (KIVI + KVQuant, 2024)
+
+Two concurrent papers were the first to articulate the details of the problem.
+
+Liu et al. (KIVI, ICML 2024) did something deceptively simple: they plotted the value distributions inside the KV cache and looked carefully. They found that Key vectors cluster along the *channel dimension* — the same channel tends to have consistent values across different tokens, making channel-wise quantization a natural fit. Value vectors are the opposite: dimensions within the same token are more consistent, favoring per-token quantization. This asymmetric insight drives KIVI's core design: Keys quantized per-channel, Values per-token, at 2 bits, with no fine-tuning required.
+
+Hooper et al. (KVQuant, NeurIPS 2024) independently discovered similar per-channel key quantization but went a step further: *quantize Keys before the RoPE transformation*. The reason is that RoPE applies position-dependent rotation angles that scramble the otherwise clean channel-wise distribution. Quantizing early preserves the cleaner statistical structure.
+
+These two papers settled the question of "which dimension to quantize." But neither could escape an engineering overhead: scalar quantization requires storing scale and zero-point — at least 2 extra floats per block, which translates to 1–2 additional bits per quantized value. A nominal 3-bit scheme effectively becomes 4–5 bits, eroding most of the compression gain.
+
+** Layer 2: Quantization Constants Are Parasites — Eliminate Them with the JL Transform (QJL, 2024)
+
+Zandieh, Daliri, and Han (QJL, AAAI 2025) started from an information-theoretic observation: the reason traditional quantization needs to store a scale is that the value range of the vector is unknown beforehand. If the vector's "shape" were known in advance, no scale would be needed.
+
+The Johnson-Lindenstrauss (JL) transform achieves exactly this: multiplying by a random orthogonal matrix rotates the vector so that its coordinates concentrate uniformly on a hypersphere — the per-coordinate distribution is known. Then only the sign is stored (1 bit per coordinate). The resulting inner-product estimator is unbiased and requires zero stored quantization constants.
+
+The cost is that 1 bit is too coarse — it works for inner-product estimation but is poorly suited for reconstructing the original vector (the MSE loss is large). If your downstream task requires more precise vector reconstruction, 1 bit is insufficient.
+
+** Layer 3: Quantize Angles to Optimality — MSE with Zero Overhead (PolarQuant, 2025)
+
+Han et al. (PolarQuant, AISTATS 2026) wanted to solve the MSE accuracy problem: can we achieve MSE-optimal quantization without storing any scale?
+
+Their key insight: after a random rotation (e.g., a Walsh-Hadamard transform), vectors lie on a hypersphere and their polar-coordinate angles follow an analytically tractable, concentrated distribution — the probability density is known. Because the distribution is known, the optimal quantization grid (a Lloyd-Max codebook) can be precomputed; no per-block scale need be stored. Quantize the angles, recover the MSE-optimal codeword.
+
+PolarQuant proves asymptotic optimality theoretically. But it still treats the key vector within each head as a flat whole, applying a single rotation and a single quantization step. This "flat-vector" assumption persists into TurboQuant as well.
+
+** Layer 4: Merge the Two Lines, Then Correct Bias with Residuals (TurboQuant, 2025)
+
+Zandieh et al. (TurboQuant, ICLR 2026) recognized the individual limitations of each line: QJL is unbiased but MSE-poor; PolarQuant is MSE-optimal but inner-product-biased. Could they be combined?
+
+TurboQuant's two-stage design:
+- Stage 1 (TQ-MSE): random rotation + coordinate-wise scalar quantization, MSE-optimal.
+- Stage 2 (TQ-Prod): 1-bit QJL on the residual, correcting the inner-product bias.
+
+Theoretically, TurboQuant approaches the information-theoretic optimum: 3.5 bits/channel can achieve "absolute quality neutrality," falling short of the Shannon lower bound by only a small constant factor.
+
+This is elegant theory. But the TQ-MSE stage has a blind spot: it minimizes MSE uniformly across the entire key vector, without distinguishing the relative importance of different *regions* within the vector. RoPE is precisely what makes such a distinction meaningful.
+
+** Layer 5: RoPE Splits the Key into Frequency Blocks — Why Allocate Bits Uniformly? (Block-GTQ, 2026)
+
+Liang et al. (Block-GTQ, arXiv 2606.24033) noticed a basic fact about RoPE that every prior work had overlooked:
+
+RoPE's rotation matrix is block-diagonal:
+
+#+begin_example
+  R_delta = diag( R(delta*theta_1), R(delta*theta_2), ..., R(delta*theta_L) )
+#+end_example
+
+where L = d_h / 2, and each R(delta*theta_i) is a 2×2 rotation matrix corresponding to frequency i.
+
+This means the attention logit = q^T R k can be written as a sum of L independent 2D inner products:
+
+#+begin_example
+  attn_logit(q, k, delta) = sum_i  q^(i)^T * R(delta*theta_i) * k^(i)
+#+end_example
+
+Each "frequency block i" contributes independently to the logit. Now ask: if quantization introduces error, which block's error matters most for the final logit?
+
+The answer is determined by energy. A Lemma shows that the mean-squared error of the logit is upper-bounded by:
+
+#+begin_example
+  E[logit error^2] <= sum_i  4^(-b_i) * E[||q^(i)||^2 * ||k^(i)||^2]
+#+end_example
+
+where b_i is the number of bits allocated to frequency block i, and 4^(-b_i) comes from TQ-MSE's rate law (each additional bit divides the MSE by 4).
+
+*High-energy block = high weight = deserves more bits*. This is a weighted MSE optimization problem with integer constraints. Block-GTQ solves it greedily: initialize all blocks at b_min, then use a priority queue keyed on marginal gain delta_i = (3/4) * s_i * 4^(-b_i) to repeatedly give one extra bit to the highest-gain block until the budget is exhausted. An exchange argument proves this greedy solution is optimal.
+
+A crucial detail: rotation preserves norms, so the energy score s_i = (1/2)(E[||q^(i)||^2] + E[||k^(i)||^2]) can be computed in pre-RoPE coordinates, independent of the position offset delta. This means the algorithm is *label-free* — no annotated data or calibration set is needed; only the block-level norms of key vectors need be collected once.
+
+Results: across 367 layers (ten models, two bit budgets), Block-GTQ beats uniform TQ-MSE in every case, reducing MAE by 32–79%. On DeepSeek-R1 at K2V2 precision, uniform TQ-MSE causes AIME 2024/2025 scores to collapse to 0.0 (logits completely distorted), while Block-GTQ recovers to 51.7/37.5 (fp16 baseline: 54.2/37.9).
+
+** Parallel Perspective: Contemporaneous Work on RoPE–Quantization Conflict
+
+Alongside this main line, two concurrent papers approached the conflict between RoPE and quantization from different angles.
+
+*TurboESM* (2025.03, arXiv:2603.26110) ran into trouble porting TurboQuant to the protein language model ESM-2: ESM-2 uses RoPE, and TurboQuant's orthogonal rotation (WHT) does not commute with RoPE's rotation — stacking the two rotations causes mutual interference that disrupts the pre-quantization distribution. The fix is a "RoPE-first pipeline": apply RoPE first, then apply the WHT orthogonal rotation, so the two steps no longer interfere. This paper identifies the problem, but its solution *routes around* the RoPE structure rather than exploiting it.
+
+*CommVQ* (ICML 2025, arXiv:2506.18879) takes a different route: use EM to train a codebook that *commutes* with RoPE rotations. Because the codebook and RoPE can be reordered, decoding can reuse large matrix multiplications and the self-attention computation can be restructured to save compute. This achieves 87.5% KV-cache compression, supporting 1-bit quantization. CommVQ's strategy is to "shake hands with RoPE"; Block-GTQ's strategy is to "read RoPE's frequency intent." The two are not mutually exclusive and could in principle be combined.
+
+* Problem–Solution Overview
+
+#+begin_example
+Problem evolution (x-axis: time, y-axis: layer of insight)
+
+Layer 0: KV cache is a memory bottleneck
+              |
+              v
+Layer 1: Scalar quantization degrades quality below 4 bits
+  --> Finding: Keys are channel-wise, Values are per-token
+  --> Finding: Quantizing after RoPE scrambles distributions;
+               pre-RoPE quantization is cleaner
+  --> But: storing scale/zeropoint eats the compression gain
+              |
+              v
+Layer 2: Parasitic overhead of quantization constants
+  --> QJL: JL transform + 1-bit sign = zero-overhead inner-product quantization
+  --> But: 1-bit is too coarse for MSE reconstruction
+              |
+              v
+Layer 3: Zero-overhead MSE quantization
+  --> PolarQuant: rotation + polar coordinates + precomputed codebook
+                  = zero-overhead MSE-optimal quantization
+  --> But: vector still treated as a flat whole
+              |
+              v
+Layer 4: Theoretically optimal holistic quantization
+  --> TurboQuant: TQ-MSE + QJL residual = near information-theoretic optimum
+  --> But: ignores RoPE's block-diagonal structure
+              |
+              v
+Layer 5: Awareness of non-uniform energy across RoPE frequency blocks
+  --> Block-GTQ: energy scores + greedy bit allocation
+                 = optimal block-level precision assignment
+
+Paper <-> Method <-> Open Problem quick-reference table
++-------------------+----------------------------------+---------------------------+
+| Paper             | Core method                      | Problem left open         |
++-------------------+----------------------------------+---------------------------+
+| KIVI/KVQuant 2024 | Asymmetric quant dim + pre-RoPE  | scale overhead is large   |
+| QJL 2024          | JL transform + 1-bit sign        | MSE accuracy is poor      |
+| PolarQuant 2025   | Polar coords + precomputed book  | vector treated as whole   |
+| TurboQuant 2025   | TQ-MSE + QJL residual            | ignores RoPE block struct |
+| Block-GTQ 2026    | Energy-aware greedy bit alloc    | V-side still uniform      |
++-------------------+----------------------------------+---------------------------+
+#+end_example
+
+* Insights
+
+** What Is Really Happening Beneath This Line?
+
+On the surface, each paper optimizes "how to quantize the KV cache." But if you connect all the papers' critiques into a single thread, a deeper pattern emerges:
+
+*Every step exposes a previously ignored structure and then exploits it.*
+
+KIVI/KVQuant uncovered the "dimensional asymmetry" structure of K/V and exploited it. QJL uncovered the structure that "post-rotation coordinate distributions are predictable" and exploited it. PolarQuant uncovered the structure that "polar-coordinate angles are analytically tractable" and exploited it. TurboQuant uncovered the structure that "MSE error and inner-product bias can be handled in separate stages" and exploited it. Block-GTQ uncovered the structure that "RoPE's block-diagonal form splits the vector into independent frequency blocks" and exploited it.
+
+In other words, the cognitive shift running through this line is not "from bad quantization to good quantization" but rather "from treating KV vectors as unstructured arrays of numbers to understanding their mathematical structure with ever-increasing resolution." Quantization schemes keep improving because the understanding of the vectors' internal structure keeps deepening.
+
+** Where Is the Next Step Most Likely?
+
+Block-GTQ itself acknowledges that the V-side (Value vectors) still uses uniform bit allocation. The paper lists this as a limitation: Value vectors are not touched by RoPE (RoPE only acts on Q and K), so the frequency-block analysis cannot be applied directly. Non-uniform allocation on the V-side requires a different analytical framework — the most likely direction is token-level or head-level importance-aware allocation based on the attention score distribution (softmax output).
+
+A second opening: Block-GTQ currently proves that greedy allocation is optimal under *expected* energy, but during actual inference the query vector q changes with every token — online adaptive allocation (per-token block bit allocation) is a potential direction, though it must resolve the latency problem of obtaining block-level energy of q on the fly.
+
+A third direction: CommVQ's RoPE-commutative codebook and Block-GTQ's frequency-block allocation theory could in principle be combined — use a learned codebook but weight codeword selection by RoPE-block energy. This would stack the advantages of both methods at the cost of introducing training overhead (CommVQ requires EM training of the codebook, whereas Block-GTQ is label-free).
+
+** This Entire Line in One Sentence
+
+To quantize a vector well, you must first see clearly what that vector actually is. This line took three years to bring the key vector in the KV cache into focus sharply enough to recognize that it is really a concatenation of d_h/2 independent frequency blocks — not a flat array of numbers.
