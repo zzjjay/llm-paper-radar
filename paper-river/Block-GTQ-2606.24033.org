@@ -1,0 +1,200 @@
+#+title:      RoPE-Aware Bit Allocation for KV-Cache Quantization
+#+date:       [2026-06-24 Wed 00:09]
+#+filetags:   :paper:river:
+#+identifier: 20260624T000913
+#+source:     https://arxiv.org/abs/2606.24033
+#+authors:    Fengfeng Liang, Yuechen Zhang, Jiaya Jia
+#+venue:      arXiv preprint, June 2026
+
+* 溯源地图
+
+下面是这条演化线的全景。箭头方向是"被改进/被批判"，标注的是后者发现了前者的什么问题。
+
+#+begin_example
+[2024 early]  KIVI (ICML'24) + KVQuant (NeurIPS'24)
+              |
+              | Keys 的分布是 channel-wise 的，Values 是 per-token 的；
+              | 但标量量化需要存 scale/zeropoint，每个数多 1-2 bit 的开销
+              v
+[2024.06]    QJL (AAAI'25)
+              |
+              | 零开销了，但 1-bit 太粗，只适合内积，不适合 MSE 目标
+              v
+[2025.02]    PolarQuant (AISTATS'26)
+              |
+              | 极坐标量化解决了 MSE 零开销问题，但仍把 key 向量视为整体
+              v
+[2025.04]    TurboQuant (ICLR'26)   <-- 合并了 PolarQuant + QJL
+              |
+              | TQ-MSE 阶段把 key 当作扁平向量，
+              | 忽视了 RoPE 把 key 划分成独立频率块的事实
+              v
+[2026.06]    Block-GTQ  <-- 目标论文
+              |
+              | (暂无直接后续；并行工作 CommVQ 走了另一条路：
+              |  让码本与 RoPE 交换律，而不是感知频率块能量)
+              v
+           [未来？]
+
+并行线（同期、不同角度）:
+  TurboESM (2025.03) -- 发现 RoPE 与正交旋转不兼容，提出 RoPE-first 管线
+  CommVQ   (ICML'25) -- 设计 RoPE 交换律码本，规避旋转冲突
+#+end_example
+
+* 正向叙事：问题是怎么一步步逼着人们做出这些选择的
+
+** 第零层：KV 缓存，凭什么是瓶颈？
+
+LLM 推理有一个简单的工程现实：为了避免重复计算历史 token 的注意力，每个 token 的 Key 和 Value 向量都要存在 GPU 显存里——这就是 KV 缓存。
+
+问题在于，缓存大小随序列长度线性增长。处理 128K token 时，fp16 的 KV 缓存很容易占掉几十 GB，挤压了能并发服务的请求数。解决思路只有一个：把这些向量存得更紧——也就是量化到更低的比特数。
+
+量化本身不新鲜。但这里有一个陷阱：把所有向量一视同仁地压缩，往往在 4 bit 以下就会让模型质量崩塌。
+
+** 第一层：Keys 和 Values 根本不一样（KIVI + KVQuant, 2024）
+
+最早发现问题细节的是两篇同期工作。
+
+刘等人（KIVI, ICML 2024）做了一件看似简单的事：把 KV 缓存里的数值分布画出来仔细看。他们发现 Key 向量沿"通道维"（channel dimension）聚集——也就是说，同一通道在不同 token 上的值比较一致，适合沿通道方向做量化。Value 向量则相反，同一 token 内的各维度比较一致，适合沿 token 方向做量化。这个不对称的洞察驱动了 KIVI 的核心设计：Keys 按通道量化，Values 按 token 量化，2 bit，不需要微调。
+
+胡珀等人（KVQuant, NeurIPS 2024）独立发现了类似的 per-channel key 量化，但走得更深一步：*在 RoPE 变换之前量化 Keys*。原因是 RoPE 会用位置相关的旋转角打乱 key 向量，把原本整洁的 channel-wise 分布搅散。提前量化，保留了更干净的统计结构。
+
+这两篇论文解决了"量化什么维度"的问题。但它们都绕不过一个工程上的开销：标量量化需要存储 scale 和 zero-point——每个数据块至少要额外记录 2 个浮点数，折算到每个量化值上多出 1-2 bit。3 bit 量化实际变成了 4-5 bit，压缩收益大打折扣。
+
+** 第二层：量化常数是寄生虫，用 JL 变换消灭它（QJL, 2024）
+
+赞迪耶、达拉里、韩（QJL, AAAI 2025）的出发点是信息论：传统量化之所以要存 scale，是因为量化前向量的值域是未知的。如果能让向量的"形状"事先已知，就不需要记录。
+
+Johnson-Lindenstrauss 变换（JL 变换）可以做到这一点：用一个随机正交矩阵旋转向量，旋转后的坐标会集中在一个均匀的超球面上——每个坐标的分布是已知的。然后只存符号（1 bit per coordinate）。内积估计量是无偏的，而且不需要存任何量化常数。
+
+这个方法的代价是 1 bit 太粗——只适合做内积估计，不适合把原始向量重建出来（MSE 意义下的损失很大）。如果你的下游任务需要更精确的向量重建，1 bit 不够用。
+
+** 第三层：把角度量化到最优，MSE 零开销（PolarQuant, 2025）
+
+韩等人（PolarQuant, AISTATS 2026）想解决 MSE 精度问题：能不能在不存 scale 的情况下，也做到 MSE 最优的量化？
+
+他们的关键发现：随机旋转（比如 Walsh-Hadamard 变换）之后，向量落在超球面上，各坐标的极坐标角度服从一个可解析的集中分布——概率密度是已知的。既然分布已知，就能预先算出最优量化格点（Lloyd-Max 码本），不需要再为每个数据块存 scale。量化角度，取回 MSE 最优的码字。
+
+PolarQuant 从理论上证明了渐近最优性。但它还是把每个 head 里的 key 向量视为一个整体，对其应用一次旋转和量化。这个"扁平向量"假设在 TurboQuant 里也延续了下来。
+
+** 第四层：把两条线合并，再用残差修偏（TurboQuant, 2025）
+
+赞迪耶等人（TurboQuant, ICLR 2026）看到了两条线各自的局限：QJL 无偏但 MSE 差，PolarQuant MSE 优但内积有偏。能不能合起来？
+
+TurboQuant 的两阶段设计：
+- 第一阶段（TQ-MSE）：随机旋转 + 坐标方向标量量化，MSE 最优。
+- 第二阶段（TQ-Prod）：对残差做 1-bit QJL，纠正内积偏差。
+
+理论上，TurboQuant 达到了近信息论最优：3.5 bit/通道可以实现"绝对质量中性"（absolute quality neutrality），只比 Shannon 下界差一个小常数因子。
+
+这是非常漂亮的理论。但 TQ-MSE 阶段有一个盲点：它把整个 key 向量一视同仁地最小化 MSE，没有区分向量内部不同"区域"的重要程度。而 RoPE 恰恰让这种区分变得有意义。
+
+** 第五层：RoPE 把 key 劈成了频率块，凭什么要均匀分配比特？（Block-GTQ, 2026）
+
+梁等人（Block-GTQ, arXiv 2606.24033）注意到一个 RoPE 的基本事实，却是前面所有工作都忽视的：
+
+RoPE 的旋转矩阵是块对角的：
+
+#+begin_example
+  R_delta = diag( R(delta*theta_1), R(delta*theta_2), ..., R(delta*theta_L) )
+#+end_example
+
+其中 L = d_h / 2，每个 R(delta*theta_i) 是一个 2x2 旋转矩阵，对应第 i 个频率。
+
+这意味着：注意力 logit = q^T R k 可以写成 L 个独立的 2D 内积之和——
+
+#+begin_example
+  attn_logit(q, k, delta) = sum_i  q^(i)^T * R(delta*theta_i) * k^(i)
+#+end_example
+
+每个"频率块 i"对 logit 的贡献是独立的。现在问：如果量化引入误差，哪个块的误差对最终的 logit 影响最大？
+
+答案由能量决定。Lemma 证明，logit 的均方误差上界是：
+
+#+begin_example
+  E[logit error^2] <= sum_i  4^(-b_i) * E[||q^(i)||^2 * ||k^(i)||^2]
+#+end_example
+
+其中 b_i 是分配给第 i 个频率块的比特数，4^(-b_i) 来自 TQ-MSE 的速率律（每多 1 bit，MSE 除以 4）。
+
+*高能量块 = 高权重 = 应该分更多比特*。这是一个带整数约束的加权 MSE 最优化问题。贪心算法（Block-GTQ）解它：初始化所有块在 b_min，用优先队列按边际增益 delta_i = (3/4) * s_i * 4^(-b_i) 反复给增益最高的块分一个 bit，直到用完预算。可以用交换论证证明这是最优的。
+
+关键细节：旋转保范数，所以能量分数 s_i = (1/2)(E[||q^(i)||^2] + E[||k^(i)||^2]) 可以在 pre-RoPE 坐标下计算，不依赖位置偏移 delta。这意味着算法是*label-free*的——不需要标注数据或校准集，只需统计一次键向量的块级范数。
+
+效果：在 367 个层（十个模型、两个 bit 预算）上，Block-GTQ 全部打败均匀 TQ-MSE，MAE 降低 32–79%。DeepSeek-R1 在 K2V2 精度下，均匀 TQ-MSE 的 AIME 2024/2025 得分直接崩到 0.0（logit 完全失真），Block-GTQ 恢复到 51.7/37.5（fp16 是 54.2/37.9）。
+
+** 并行视角：同期工作对 RoPE 的不同解法
+
+这条主线之外，同期有两篇工作从不同角度切入了 RoPE 与量化的冲突——
+
+*TurboESM*（2025.03，arXiv:2603.26110）将 TurboQuant 移植到蛋白质语言模型（ESM-2）时碰壁：ESM-2 使用 RoPE，而 TurboQuant 的正交旋转（WHT）与 RoPE 旋转不对易——两个旋转叠加会互相干扰，打乱量化前的分布。解决方案是"RoPE-first 管线"：先施加 RoPE，再做 WHT 正交旋转，两步不再冲突。这是发现问题的一篇论文，但它的解决方式是"绕开"，而不是利用 RoPE 结构。
+
+*CommVQ*（ICML 2025，arXiv:2506.18879）走了另一条路：用 EM 算法训练一个与 RoPE 旋转对易（commutative）的码本。因为码本和 RoPE 可以交换顺序，解码时可以大量复用矩阵乘法，把自注意力计算重新排序以节省算力。达到了 87.5% 的 KV 缓存压缩率，支持 1-bit 量化。CommVQ 的路线是"和 RoPE 握手"，Block-GTQ 的路线是"读懂 RoPE 的频率意图"——两者不互斥，理论上可以组合。
+
+* 问题-解法总览
+
+#+begin_example
+问题演化线（横轴：时间，纵轴：发现的问题层次）
+
+层次 0: KV 缓存是内存瓶颈
+              |
+              v
+层次 1: 标量量化在 <4bit 下失真
+  --> 发现：Key 是 channel-wise，Value 是 per-token
+  --> 发现：RoPE 后量化打乱分布，pre-RoPE 更好
+  --> 但是：存 scale/zeropoint 吃掉了压缩收益
+              |
+              v
+层次 2: 量化常数的寄生开销
+  --> QJL：JL 变换 + 1-bit 符号 = 零开销内积量化
+  --> 但是：1-bit 对 MSE 重建太粗糙
+              |
+              v
+层次 3: 零开销 MSE 量化
+  --> PolarQuant：旋转 + 极坐标 + 预计算码本 = 零开销 MSE 最优
+  --> 但是：仍把向量视为扁平整体
+              |
+              v
+层次 4: 理论最优的整体量化
+  --> TurboQuant：TQ-MSE + QJL 残差 = 近信息论最优
+  --> 但是：忽视了 RoPE 的块对角结构
+              |
+              v
+层次 5: 感知 RoPE 频率块的不均匀能量
+  --> Block-GTQ：能量分数 + 贪心比特分配 = 最优块级精度分配
+
+论文 <-> 方法 <-> 遗留问题 速查表
++-------------------+----------------------------------+---------------------------+
+| 论文              | 核心解法                         | 留下的问题                |
++-------------------+----------------------------------+---------------------------+
+| KIVI/KVQuant 2024 | 非对称量化维度 + pre-RoPE        | scale 开销大              |
+| QJL 2024          | JL 变换 + 1-bit 符号             | MSE 精度差                |
+| PolarQuant 2025   | 极坐标 + 预计算码本              | 向量视为整体              |
+| TurboQuant 2025   | TQ-MSE + QJL 残差               | 忽视 RoPE 块结构          |
+| Block-GTQ 2026    | 能量感知贪心比特分配             | V 侧仍均匀分配            |
++-------------------+----------------------------------+---------------------------+
+#+end_example
+
+* 洞见
+
+** 这条线背后真正在发生什么？
+
+表面上看，每篇论文都在优化"如何量化 KV 缓存"。但如果把所有论文的"批判点"串起来，你会看到一个更深层的模式：
+
+*每一步都是把一个被忽视的结构暴露出来，然后利用它*。
+
+KIVI/KVQuant 发现了 K/V 的"维度不对称"结构，并利用了它。QJL 发现了"旋转后坐标分布可预测"这个结构，并利用了它。PolarQuant 发现了"极坐标角度可解析"这个结构，并利用了它。TurboQuant 发现了"MSE 和内积偏差可以分阶段处理"这个结构，并利用了它。Block-GTQ 发现了"RoPE 的块对角性把向量劈成独立的频率块"这个结构，并利用了它。
+
+换句话说：这条线的认知转变不是"从差量化到好量化"，而是"从把 KV 向量当作无结构数字串，到越来越精细地理解它们的数学结构"。量化方案越来越好，是因为对向量内部结构的理解越来越深。
+
+** 下一步最可能在哪？
+
+Block-GTQ 自己也承认，V 侧（Value 向量）目前仍然是均匀比特分配的。论文把这列为 limitation：Value 向量不受 RoPE 旋转影响（RoPE 只作用于 Q 和 K），所以频率块分析不能直接套用。V 侧的非均匀分配需要另一套分析框架——最可能的方向是基于 attention score 分布（softmax 输出）的 token-level 或 head-level 重要性感知分配。
+
+另一个开口：Block-GTQ 目前只证明了贪心分配在 *期望* 能量下是最优的，实际推理时每个 token 的 q 向量是变化的——在线自适应分配（per-token block bit allocation）可能是一个方向，但要解决"如何在线获得 q 的块能量"的时延问题。
+
+第三条线：CommVQ 的 RoPE-commutative 码本与 Block-GTQ 的频率块分配理论上可以组合——用学到的码本，但按 RoPE 块能量加权选码字。这会把两个方法的优势叠加，代价是引入了训练开销（CommVQ 需要 EM 训练码本，Block-GTQ 是 label-free 的）。
+
+** 一句话总结这条线
+
+把一个向量量化好，先得看清楚这个向量是什么。这条线用了三年，才把 KV 缓存里的 key 向量看清楚到"它其实是 d_h/2 个独立频率块的拼接，而不是一个扁平的数组"这个分辨率。
