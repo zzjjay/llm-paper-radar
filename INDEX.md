@@ -426,3 +426,5 @@
 - [06-22](digests/2026-06-22.md) — 275 scanned, 3 passed, top: HyperQuant: A Rate-Distortion-Optimal Quantization
 
 - [06-23](digests/2026-06-23.md) — 205 scanned, 1 passed, top: RoPE-Aware Bit Allocation for KV-Cache Quantizatio
+
+- [06-24](digests/2026-06-24.md) — 216 scanned, 2 passed, top: Quantization Inflates Reasoning: Token Inflation a
