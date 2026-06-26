@@ -1,0 +1,240 @@
+#+title:      Epiphany-Aware KV Cache Eviction Without the Attention Matrix
+#+date:       [2026-06-26 Fri 00:07]
+#+filetags:   :paper:river:en:
+#+identifier: 20260626T000718-en
+#+source:     https://arxiv.org/abs/2606.26472
+#+authors:    Steven Kolawole, Virginia Smith
+#+venue:      arXiv preprint, June 2026
+
+* The Problem River
+
+During large language model inference, every token generated requires caching the Key and Value vectors of all preceding tokens — this is the KV cache. The longer the sequence, the larger the cache, and eventually it exhausts GPU memory. So which tokens can be discarded?
+
+The question sounds simple but proves remarkably hard: discard the wrong tokens and the model goes off the rails; yet judging "which token matters" requires computing the attention matrix — and computing the attention matrix is itself another culprit behind the memory bottleneck. Generation after generation of researchers has circled this paradox: the more you want to know which tokens are unimportant, the more you must do exactly what you were trying to avoid.
+
+* Source Map
+
+#+begin_example
+[2023] StreamingLLM (Xiao et al.)
+  |  "Attention sinks": KV of the first few tokens must be kept;
+  |  retain only a recent sliding window for the rest
+  |  Problem: all middle content is lost; long reasoning outputs collapse
+  v
+[2023] H2O (Zhang et al.)
+  |  "Heavy Hitters": use cumulative attention scores to find truly important tokens
+  |  Problem: still must materialize the n×n attention matrix;
+  |           accuracy on reasoning traces drops to 5%
+  v
+[2024] SnapKV (Li et al.)
+  |  "Observation window": attention at the prompt tail predicts which tokens
+  |  will be queried during generation
+  |  Problem: handles only prompt compression; cannot handle reasoning chains
+  |           that grow during decoding
+  v
+[2025] ThinKV (Ramachandran et al.)   [2025] LagKV (Liang et al.)
+  |  Hierarchical compression by           |  Skip attention entirely; compare
+  |  thought-segment importance            |  KV statistics directly
+  |  Problem: still reads attention        |  Problem: general-purpose; not
+  |  weights; requires custom kernels      |  reasoning-structure-aware
+  v                                        v
+[2026] EpiKV (Kolawole & Smith)
+       "Epiphany score": replace attention with hidden-state change
+       No matrix, no training, no custom kernels
+       Reasoning-aware by design
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Initial Tokens Are "Attention Black Holes" — Just Keep Them
+
+*** What problem did it see?
+
+The most naive memory-saving strategy is a sliding window: keep only the KV cache of the most recent N tokens. Xiao et al. found that once the text length exceeds the window size, the model collapses entirely — not a graceful accuracy drop, but garbled output. Where does the problem lie?
+
+Experiments revealed a peculiar phenomenon: regardless of content, the very first few tokens of a sequence (sometimes even the single first token) consistently receive extremely high attention scores. These tokens bear no semantic relation to the content being generated, yet they act like black holes, absorbing a disproportionate share of attention weights. These are called *attention sinks*.
+
+By discarding these sinks, the sliding window strips the model of its "anchor points," causing it to lose all orientation.
+
+*** Its solution
+
+Retain two things: a small set of leading sink tokens (typically 4), plus a sliding recent-token window. Everything else is discarded. With fixed attention anchor points, the model can perform stable, unlimited-length inference without retraining.
+
+*** Why it works — and what new pitfalls it buries
+
+The presence of anchor tokens ensures the attention distribution can always "return to zero" at a known position. This works well for multi-turn dialogue where each turn is not too long.
+
+But reasoning models generate chains of thought spanning thousands of tokens. In this setting, keeping only "beginning + recent" means every reasoning step in the middle of the chain is indiscriminately discarded. If the answer at step 5,000 refers back to a conclusion drawn at step 2,000 — too bad, that conclusion is long gone from the cache. StreamingLLM is effectively unusable for reasoning models.
+
+** 2023 | H2O: Not Just Beginning and Recent — There Are "Heavy Hitters" in the Middle Too
+
+*** What problem did it see?
+
+StreamingLLM identified attention sinks, but its conclusion was too blunt: keep nothing between the beginning and the most recent tokens. Zhang et al. found this was wrong — in the attention matrix, certain mid-sequence tokens are queried repeatedly at high frequency, and removing them causes catastrophic performance drops.
+
+Empirical analysis showed that during LLM inference more than 95% of the attention matrix is sparse, and cumulative attention scores follow a power-law distribution: a small minority of tokens capture the vast majority of attention. These are called *Heavy Hitters (H2)*.
+
+*** Its solution
+
+Frame the eviction problem as dynamic submodular optimization: at each decoding step, dynamically balance "retaining heavy hitters" against "retaining recent tokens" based on cumulative attention scores. Heavy hitters are not fixed positions — they are updated dynamically as generation proceeds.
+
+*** Why it works — and what new pitfalls it buries
+
+Theoretically, submodularity guarantees that the greedy selection is at least 63% as good as the optimal. In practice, H2O compresses the KV cache to 20% of its original size while maintaining baseline accuracy on standard tasks — significantly better than StreamingLLM.
+
+But two new problems are seeded:
+
+First, *the attention matrix still has to be read*. Where do cumulative attention scores come from? They must be read from the n×n attention matrix. But modern efficient inference relies on FlashAttention, whose core design is tiled computation — the attention matrix is never fully materialized. Enabling =output_attentions=True= forces full instantiation of the attention matrix, immediately shrinking the usable sequence length on an 80 GB A100 to a fraction of what reasoning traces require.
+
+Second, *the signal is completely distorted on reasoning traces*. The chains of thought generated by reasoning models are saturated with filler tokens like "hmm," "let me think," and "therefore." These tokens momentarily absorb large attention weights at a particular generation step, then are never queried again. H2O's cumulative attention scores misidentify these as "heavy hitters," while the truly important reasoning nodes get evicted. The experimental result: at a KV budget of 1024 tokens, H2O achieves only 5% accuracy on MATH-500.
+
+** 2024 | SnapKV: Peek at the Attention at the Prompt Tail, Then Decide What to Keep
+
+*** What problem did it see?
+
+H2O makes decisions token by token during generation (decode-time eviction), but Li et al. noticed a regularity: the pattern by which attention heads focus on specific prompt positions remains *consistent* throughout the entire generation — whichever prompt tokens receive attention when generating the 1st output token are overwhelmingly the same ones receiving attention at the 100th token.
+
+This means prediction is possible without waiting for generation to proceed.
+
+*** Its solution
+
+Open an "observation window" at the tail of the prompt (e.g., the last 16 tokens). Tally which prompt tokens each attention head attends to most within this window, then use that to decide which prompt tokens' KV entries to retain. Compression completes before generation begins; the generation phase then runs within a fixed, small cache.
+
+*** Why it works — and what new pitfalls it buries
+
+SnapKV achieves 3.6× generation speedup and 8.2× memory improvement on long-context QA tasks, with nearly no accuracy loss.
+
+But it has a fundamental boundary: *it only handles the prompt, not the decode*. Reasoning models' long outputs are not long prompts — they are chains of thought, thousands of tokens long, generated one token at a time during decoding. The observation-window approach cannot help, because you cannot observe a sequence that has not yet been generated.
+
+This path is closed. The field must return to decode-time eviction, but now also solve H2O's signal-distortion problem on reasoning traces.
+
+** 2025 | ThinKV: Thought Segments Vary in Importance — Process Them in Tiers
+
+*** What problem did it see?
+
+Ramachandran et al. looked directly at the chains of thought produced by reasoning models and asked: within these thousands of tokens, which parts are "core reasoning" and which are "transitional filler"?
+
+Observation revealed that different "thought segments" within a chain correspond to different degrees of attention sparsity: key reasoning steps tend to exhibit dense attention, while filler segments exhibit highly sparse attention.
+
+*** Its solution
+
+ThinKV first classifies: it labels thought segments as important or unimportant based on attention sparsity, then applies different strategies to each class — important segments retain full KV; unimportant segments undergo both quantization and eviction. At the systems level, a custom kernel extending PagedAttention is designed so that memory fragmentation from eviction can be efficiently recycled.
+
+*** Why it works — and what new pitfalls it buries
+
+The results are striking: near-lossless accuracy at a 5% KV cache budget, with throughput reaching 5.8× over the best baseline. Accepted as an oral presentation at ICLR 2026.
+
+But ThinKV leaves a dual debt:
+
+*Reasoning-aware, yet attention is still read*. Determining a thought segment's attention sparsity itself requires reading attention weights. The FlashAttention incompatibility problem is entirely unresolved.
+
+*Requires offline calibration and custom kernels*. This means deployment demands modifying the underlying inference infrastructure; it cannot be dropped into existing vLLM or SGLang production stacks.
+
+** 2025 | LagKV: Skip the Attention Entirely — Compare the KV Vectors Directly
+
+*** What problem did it see?
+
+Attention weights are simultaneously the "measurement instrument" and the "memory killer" — can this paradox be circumvented at the root? Liang et al. asked a different question: since attention weights are fundamentally computed from KV vectors, can importance be read directly from the KV vectors themselves, bypassing the attention matrix entirely?
+
+*** Its solution
+
+The core of LagKV: compare a token's current KV vector against the KV vector from several steps earlier (the "lag"). Tokens with large changes indicate the model "noticed something new" and should be retained; tokens with small changes represent inertial continuation and can be evicted. This comparison happens entirely in KV space — no attention matrix, fully compatible with FlashAttention.
+
+*** Why it works — and what new pitfalls it buries
+
+It outperforms SnapKV and StreamingLLM on the RULER benchmark, and exceeds H2O by more than 50 percentage points on the 64-bit key retrieval task. More importantly — zero invasiveness; it plugs directly into existing inference stacks.
+
+But LagKV is a general-purpose solution with no special adaptation for reasoning models. It operates on differences in the KV layer rather than on representational changes deeper in the model. More fundamentally, the theoretical connection between KV-layer change and "how important this token is to the final answer" is weak.
+
+At this point, two requirements hang in the air: *no attention matrix needed* (achieved by LagKV) + *reasoning-aware* (achieved by ThinKV). Can they be unified?
+
+** 2026 | EpiKV: Replace Attention with "Epiphany Moments" in the Hidden State
+
+*** What problem did it see?
+
+Kolawole and Smith drew a key insight from mechanistic interpretability research: the ROME and MEMIT papers on factual recall show that mid-layer feedforward modules (layers 7–13) are the primary locus of factual storage, while EAGLE's work shows that hidden states carry richer predictive signal than token embeddings.
+
+This points toward a hypothesis: if a token causes a large shift in the model's mid-layer hidden states during generation, that token has triggered some cognitive "epiphany" — it has changed the model's expectation of what should come next. And this change is readable during the forward pass, requiring no unrolling of the attention matrix whatsoever.
+
+*** Its solution
+
+EpiKV computes the L2 difference in hidden state induced by each token at each layer:
+
+#+begin_example
+g_l(t) = || h_l(t) - h_l(t-1) ||_2
+#+end_example
+
+where h_l(t) is the hidden-state vector at layer l after processing the t-th token.
+
+Using raw absolute values is problematic, however — at the beginning of a reasoning trace the model has not yet built context, so hidden-state changes are naturally larger, contaminating the signal with positional bias. The solution is local normalization: use the mean and variance of that layer over the past 64 steps to convert absolute change into a local deviation z_l(t).
+
+More critically, there is a dual-band design: analysis reveals that different layers respond to the same token in *opposite directions*:
+
+#+begin_example
+  Layers 7-13  (Band A): large change = important token   (Spearman rho > 0)
+  Layers 18-25 (Band B): large change = expendable token  (Spearman rho < 0)
+#+end_example
+
+Band B corresponds to the layers where the model processes "fluent but low-information continuation tokens." Subtracting one band from the other, the signals cancel in opposing directions: the signal for important tokens is amplified while the signal for filler tokens is suppressed.
+
+Final epiphany score: z_{10}(t) − z_{21}(t) — pure forward pass, no attention matrix, no training, no custom kernels.
+
+*** Why it works — and what new pitfalls it buries
+
+On MATH-500, EpiKV matches ThinKV at a 4096-token budget (71%); on AIME-2024, it surpasses all baselines at an 8192-token budget (37% vs. 33%). The most critical performance figure: 2.8× faster than any attention-based method, because it runs directly on the FlashAttention stack without requiring =output_attentions=True=.
+
+Remaining open questions: the layer ranges for Bands A and B (7–13, 18–25) were determined empirically on specific model architectures — it is unclear how stable these ranges are across different scales and architectures. Why the sign of the Spearman rho reverses between the two bands — the theoretical explanation — remains an open problem.
+
+* Frontier Extensions
+
+EpiKV was submitted on June 25, 2026; as of this writing no work directly citing it yet exists. But by early 2026 the evolutionary line had already crystallized into three clear parallel directions of exploration:
+
+*Direction 1: See ahead*. LookaheadKV (Su et al., 2026) and ForesightKV (Dong et al., 2026) attempt to use a draft generator to "look ahead" at future tokens, thereby more accurately estimating the long-term contribution of current tokens. The cost is additional inference overhead, but the conceptual shift is from "estimate importance from the past" to "estimate importance from the future."
+
+*Direction 2: Information-theoretic foundations*. CapKV (2026) re-derives eviction criteria using the information bottleneck principle, attempting to give the field a theoretical grounding not reliant on heuristics.
+
+*Direction 3: Stochastic eviction*. Value-Aware Stochastic KV Cache Eviction (Chang et al., 2026) finds that the magnitude distribution of Value states is extremely skewed, enabling probabilistic rather than deterministic eviction on this basis — yielding a smoother tradeoff between accuracy and compression ratio.
+
+* One Diagram to Understand It All
+
+#+begin_example
+Problem dimension
+  |
+  |  [FlashAttention incompatible]
+  |  StreamingLLM ----- H2O ------ SnapKV ------ ThinKV
+  |  (sinks+window)  (heavy hitters) (obs. window) (thought-seg tiers)
+  |
+  |  [FlashAttention compatible]
+  |                              LagKV ---------- EpiKV
+  |                              (KV stat. diff)  (hidden-state epiphany)
+  |
+  +--------------------------------------------------------------> Time
+  2023                 2024               2025          2026
+
+                   Degree of reasoning awareness:
+  Low [StreamingLLM, SnapKV] ---> Medium [H2O, LagKV] ---> High [ThinKV, EpiKV]
+
+  Signal source:
+  Attention matrix  [StreamingLLM, H2O, SnapKV, ThinKV]
+  KV statistics     [LagKV]
+  Hidden-state change [EpiKV]
+#+end_example
+
+* Insight
+
+What is really happening across this evolutionary line is an *upward migration of signal source*.
+
+The earliest approaches (StreamingLLM, H2O, ThinKV) all treat attention weights as the ground-truth proxy for token importance — a reasonable but dangerous assumption. Attention weights measure "where the model is focusing at the current step," but "where it is focusing" and "which tokens matter for the final answer" are not the same thing, especially on reasoning traces where attention is frequently captured by filler tokens momentarily.
+
+LagKV and EpiKV ask a different question: *what imprint has this token left inside the model?* LagKV looks for imprints in KV space; EpiKV looks for them in hidden-state space. Hidden states are a higher-level abstraction — they integrate the cumulative effect of a token having been processed through all attention heads and feedforward layers. Using them to gauge "how much this token shifted the model's understanding of the world" is theoretically closer to the target of "long-term token importance" than attention weights are.
+
+This direction is not exhausted. EpiKV's dual-band design is empirical; the underlying mechanism has not been fully theorized. The two most likely next steps are: first, using mechanistic interpretability tools to systematically understand why the Spearman signs in Bands A and B are opposite, thereby establishing a more theoretically grounded layer-selection strategy; and second, combining hidden-state signals with KV statistics signals to form a more robust, multi-dimensional importance estimate.
+
+* Takeaway
+
+This evolutionary line offers one direct lesson for finding research problems: *always ask "where does this method's signal come from, and how far is that signal from the true objective?"*
+
+H2O uses attention weights as a proxy for token importance — but between attention weights and token importance lies the layer of "how the attention mechanism behaves." LagKV uses KV differences as a proxy — one more layer of indirection. EpiKV uses hidden-state change as a proxy — but how far is that proxy still from "whether this token affects the final answer"? Nobody knows.
+
+This means: you can keep climbing, looking for signals ever closer to "final-answer importance" — for instance, gradients directly (too expensive), contrastive generation (requires extra inference), or some lightweight "value-function estimate." Every step closer is a potential research space.
+
+At the practical level, EpiKV's "dual-band subtraction" is a transferable design pattern: in a complex system, if two sensors respond to the same signal with opposite signs, subtracting them is typically more robust than using either alone. This pattern has long existed in signal processing, but in LLM mechanistic research it is only just beginning to be exploited deliberately.

@@ -1,0 +1,352 @@
+#+title:      Information-Aware KV Cache Compression for Long Reasoning
+#+date:       [2026-06-26 Fri 00:37]
+#+filetags:   :paper:river:en:
+#+identifier: 20260626T003751-en
+#+source:     https://arxiv.org/abs/2606.26875
+#+authors:    Jushi Kai, Zhuiri Xiao, Alexandra Birch, Zhouhan Lin
+#+venue:      arXiv 2606.26875 / 2026-06
+
+* The River of Problems
+
+During large-model inference, which tokens in the Key-Value cache (KV Cache) should be kept, and which should be discarded?
+
+The core tension is: *if an attention weight says a token is important, is it truly important?*
+
+In the era of short texts, this was not a big concern. But when o1-style reasoning chains routinely stretch to thousands of tokens and the KV Cache saturates GPU memory, the model must decide what to keep based solely on "tokens with high attention scores"—and that criterion is inherently short-sighted: attention weights mainly reflect how closely the current token relates to nearby history, while remaining blind to "information-dense points" hundreds of tokens away that only become critical at the decisive moment.
+
+So generation after generation of researchers keeps asking the same question: *what signal can genuinely measure a token's contribution to the future?*
+
+* Source Map
+
+#+begin_example
+[2020] BigBird / Longformer
+  |
+  | Problem: Full attention in Transformers is O(n^2) — too expensive
+  | Solution: Sparsify during training — attend only to local windows + global anchors
+  |           (But this is a training-time change; KV Cache still stores everything at inference)
+  v
+[May 2023] Scissorhands (Rice Univ.) --- [Jun 2023] H2O (UT Austin / Stanford)
+  |                                              |
+  | Each independently discovered the same thing:
+  | Only a small number of tokens truly matter;
+  | the rest can be dropped dynamically during inference
+  |         \                          /
+  |          \________________________/
+  |
+  | Problem: Both only compress the generation-phase KV, ignoring the real bottleneck —
+  |           the long prompt during the prefill phase
+  | Problem: Cumulative attention scores are biased toward position
+  |           (tokens that appear earlier naturally accumulate higher scores)
+  v
+[Sep 2023] StreamingLLM (MIT)
+  |
+  | Problem: A sliding window drops the very first tokens, causing the model to collapse
+  | Solution: Discovered the "Attention Sink" phenomenon —
+  |           the first few tokens always score extremely high and must be retained
+  | Residual: purely positional heuristic; ignores token content
+  v
+[Oct 2023] Selective Context (EMNLP 2023)  <-- Parallel branch: information-theoretic direction
+  |
+  | Key insight: A predictable token = redundant; use self-information -log p(x) to measure importance
+  | Problem: Compresses the input prompt, not the KV Cache itself
+  v
+[Jan 2024] SH2 (same author group: Kai + Lin, EMNLP 2024)
+  |
+  | Key insight: Low-probability tokens (high entropy) = factual nouns and keywords
+  |              They are both the source of hallucinations and the carriers of information
+  | Method: Identify high-entropy tokens, re-append them to context, apply contrastive decoding
+  v
+[Apr 2024] SnapKV (NeurIPS 2024)
+  |
+  | Problem: Scissorhands/H2O do not compress the prompt, yet the prompt dominates memory
+  | Solution: Use a trailing "observation window" at the end of the prompt to vote on
+  |           which prefix tokens matter; compress prefill KV once, fixed size thereafter
+  | Residual: Equal budget for all layers, but shallow layers have dense attention
+  |           while deep layers have concentrated attention
+  v
+[Jun 2024] PyramidKV (COLM 2025 Spotlight)
+  |
+  | Problem: SnapKV's uniform layer budget does not match actual attention distribution
+  | Solution: Allocate more budget to shallow layers, less to deep layers — pyramid shape
+  | Residual: Token selection still relies solely on attention scores;
+  |           high-information tokens with low attention are still dropped
+  v
+[Jun 2026] InfoKV (this paper) <== TARGET
+  |
+  | Problem: Attention-selected tokens mainly influence "nearby context"
+  |          while high-entropy tokens (high prediction uncertainty) are key to "distant context"
+  | Solution: Dual-track scoring — attention score + entropy score, weighted fusion
+  v
+[Future] As of 2026-06-26, this is the latest advance in the field
+#+end_example
+
+* Evolutionary Narrative
+
+** 2020 | BigBird / Longformer: Training-Time Sparse Attention — The Distant Ancestor
+
+*** What Problem Did It See
+
+The full attention of the original Transformer is O(n^2): every token must compute similarity against every past token. Long sequences simply cannot be handled.
+
+*** Its Solution
+
+BigBird and Longformer sparsify the attention map *at training time*: retain a local window (attending to nearby tokens) plus a few global anchor tokens (attending globally), and cut all other connections.
+
+Think of the attention matrix as a tightly woven net — these two papers turned it into a fishing net: most threads still connect, but holes are left in a regular pattern.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Training-time sparsification works well, but there is a fundamental issue: during inference, the KV Cache still stores every historical token, and the model only panics when memory runs out. This line of work cares about *compute*, not *storage*. That pit was left for a wave of researchers in 2023.
+
+** 2023 | Scissorhands / H2O: Dynamically Dropping Tokens at Inference — The First Pair of Scissors
+
+*** What Problem Did It See
+
+When large models generate long text, the KV Cache keeps growing and memory/bandwidth become the bottleneck. Nobody had dynamically dropped "unimportant" historical tokens at inference time.
+
+*** Its Solution
+
+Scissorhands (Rice, 2023-05) and H2O (UT Austin / Stanford, 2023-06) arrived at nearly the same answer almost simultaneously and independently — the *Persistent Importance Hypothesis*:
+
+A token that received high attention in past generation steps will continue to be attended to at high frequency in future steps. Therefore, one only needs to maintain a fixed-size cache and, at each step, evict the token with the lowest cumulative attention score.
+
+H2O added a bit of mathematical support, framing token selection as a dynamic submodular optimization problem and proving that the greedy algorithm has a constant-ratio guarantee.
+
+Imagine a desk: the surface is limited (GPU memory), so you keep only the most recently and frequently used files. The difference is that "most frequently used" here is measured by accumulated attention weights.
+
+*** Why It Worked (and What Pits It Left Behind)
+
+It genuinely worked: H2O achieved a 29x throughput improvement on OPT-6.7B. But two pits surfaced simultaneously:
+
+Pit one: *cumulative attention scores are position-biased*. Tokens that appear earlier in the sequence have more opportunities to be attended to, so their scores are naturally high — not a reflection of true importance.
+
+Pit two: *only the generation-phase KV is compressed; the prompt phase is untouched*. Yet in real workloads, a 128K prompt is the real memory monster. This pit led directly to SnapKV.
+
+** 2023 | StreamingLLM: Discovering Attention Sinks — A Small Insight That Fixed a Big Crash
+
+*** What Problem Did It See
+
+If a sliding-window attention (attending only to the most recent N tokens) is used to save memory, once the text exceeds the window size, all earlier tokens fall out of the window and the model's perplexity explodes catastrophically.
+
+*** Its Solution
+
+MIT Han Lab carefully analyzed attention maps and found: *the very first few tokens always receive far more attention than normal*, regardless of their content. They called this the "Attention Sink."
+
+The reason is that softmax must distribute probability mass across all positions; when the model is uncertain where to attend, it "dumps" excess attention onto the beginning of the sequence. This is a kind of "pressure-relief valve" behavior of softmax.
+
+The fix is simple: the sliding window retains the most recent N tokens while *always keeping the first 4 sink tokens*. Experiments ran to 4M token length with perplexity remaining perfectly stable.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+It works, but it is purely a positional heuristic — independent of token content or information value. It solves the engineering problem of "keeping the model from crashing," not the scientific question of "which tokens are truly important."
+
+That question was already being approached from a different angle by information-theoretic researchers at the same time.
+
+** 2023 | Selective Context + LLMLingua: The Parallel Information-Theoretic Branch — Hard-to-Predict Tokens Are the Useful Ones
+
+*** What Problem Did It See
+
+All methods above use "attention score" to measure token importance. But attention score is the model's subjective judgment of "where do I need to look right now" — not an objective measure of how much information a token carries in itself.
+
+Is there an importance metric that does not rely on attention?
+
+*** Its Solution
+
+Edinburgh's Yucheng Li (embedded in the same research ecosystem that InfoKV's collaborators belong to) published Selective Context at the end of 2023: use a language model to assign each token a *self-information* score given the current context:
+
+   I(x) = -log p(x | context)
+
+The idea: the harder a token is to predict in the current context, the more information it carries, and the more it should be retained.
+
+Think of it as a word-guessing game. If the sentence reads "I went to ___ and bought apples," "supermarket" is easy to guess — low information; "island" is nearly impossible to guess — high information. Selective Context preferentially keeps the "hard-to-guess" tokens and discards the "obvious" ones.
+
+Microsoft's LLMLingua did something similar concurrently, using the perplexity of a small model to drive coarse-to-fine compression of prompts for large models, achieving up to 20x compression.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+This branch *compresses the input prompt itself*, not the KV Cache. It proved that "self-information / entropy = a good proxy for token importance," but nobody had yet imported this signal into token eviction decisions inside the KV Cache at inference time.
+
+** 2024 | SH2: The Same Author Group's Preliminary Experiment — High-Entropy Tokens Are Where Facts Live
+
+*** What Problem Did It See
+
+When a large model hallucinates, which tokens does the problem typically occur on?
+
+*** Its Solution
+
+Jushi Kai and Zhouhan Lin (first author and corresponding author of InfoKV) found in SH2 that: *tokens where the model's prediction uncertainty is highest (maximum entropy) tend to be proper nouns and factual words.*
+
+Their method: identify high-entropy tokens, re-append them to the context, then apply contrastive decoding to suppress hallucinations.
+
+This was a critical experiment: it does not directly handle the KV Cache, but it gave the team a solid empirical foundation — *high-entropy tokens have high information density* — an intuition that could be transferred from hallucination reduction to token selection in KV Cache compression.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Published at EMNLP 2024, the results were well validated. But the "re-append tokens" method cannot be directly applied to KV eviction at inference time — that requires a continuous scoring function that can be fused with attention scores, not a binary "high-entropy / low-entropy" label.
+
+** 2024 | SnapKV: Moving Compression to Prefill — Solving the Right Problem
+
+*** What Problem Did It See
+
+H2O and Scissorhands only compress KV entries *added during the generation phase*. But for a task with a 128K prompt, the KV produced during the prefill phase is the real memory monster.
+
+*** Its Solution
+
+SnapKV's key insight: *before generating the very first token, we already know which prompt tokens matter.*
+
+The method has three steps:
+1. Split the prompt into a "prefix" and a trailing "observation window" (the last 16–64 tokens, typically the instruction/question).
+2. Use the query vectors from the observation window to score all prefix tokens.
+3. Each attention head independently selects the top-k highest-scoring prefix tokens; the rest are discarded.
+
+One-shot decision: after this, the KV Cache size is fixed for the entire decoding process and never grows again.
+
+Think of it as pre-exam review: before you start answering, scan the questions, identify which knowledge points are relevant, and only flip to those pages of your notes.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+On an A100, with 16K input, memory reduced by 8.2x and speed improved by 3.6x, with almost no accuracy drop on LongBench.
+
+Remaining pit: *all layers use the same KV budget*. But experiments show that shallow Transformer layers have dense attention maps (many tokens contribute), while deep layers have sparse attention maps (only a few tokens matter). A uniform budget either wastes space in deep layers or starves information in shallow layers.
+
+** 2024 | PyramidKV: Letting the Budget Follow the Attention — Pyramid-Shaped Allocation
+
+*** What Problem Did It See
+
+SnapKV assigns equal budget per layer, mismatching the actual attention sparsity.
+
+*** Its Solution
+
+A careful measurement of attention distributions across all 32 layers of LLaMA revealed "Pyramidal Information Funneling":
+
+- Layers 1–8 (shallow): attention is spread across nearly all tokens — large cache needed
+- Layers 9–24 (middle): attention begins to converge — medium cache
+- Layers 25–32 (deep): attention is highly concentrated on very few tokens — small cache suffices
+
+PyramidKV allocates budget in this shape: wide at the bottom, narrow at the top. With the same total budget, the result beats SnapKV — at an extremely low retention rate (0.7%), accuracy on TREC exceeds competing methods by 20.5 percentage points.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+The pyramid budget solves the inter-layer allocation problem. But the *token selection criterion itself is still the attention score* — unchanged.
+
+The core gap: attention score measures "relevance to the current context," which is short-sighted — it cannot capture "this token's contribution to distant future context." In short texts this is not a major issue, but in reasoning chains spanning thousands of tokens, a critical intermediate inference step may not be referenced until 500 tokens later, and attention score will mistakenly classify it as low-importance and drop it.
+
+That gap is exactly InfoKV's entry point.
+
+** 2026 | InfoKV: Attention + Entropy — Two Rulers Measuring Different Things
+
+*** What Problem Did It See
+
+Every prior method (SnapKV, PyramidKV, D2O, FastKV, ...) uses a single ruler to select tokens: the attention score.
+
+InfoKV's researchers ran a key experiment: they defined "Forward Influence" — remove a given token from the context and measure how much the subsequent prediction distribution changes (quantified by KL divergence).
+
+The experimental conclusion was surprising:
+- *High-attention tokens* have forward influence concentrated in *nearby context* (within a few dozen tokens)
+- *High-entropy tokens* (tokens where the model's prediction is uncertain) have forward influence that extends to *distant context* (hundreds of tokens away)
+
+Reasoning chains are inherently long-range dependency scenarios — the conclusion of an intermediate step may not be cited until 500 tokens later. Selecting tokens by attention score will systematically miss these "high-entropy, distant-critical tokens."
+
+*** Its Solution
+
+InfoKV scores each token with two signals simultaneously:
+
+*Signal 1: Intra-layer attention score A_i^(l)*
+Same as SnapKV/PyramidKV: use the observation window's query vectors to score prefix tokens.
+
+*Signal 2: Entropy score E_i^(l)*
+For each token position, use the hidden state at the current layer to derive a prediction distribution (over the top-k vocabulary entries), compute Shannon entropy H(x_i), then weight by the inter-layer representation drift (cosine distance) — layers closer to the final output layer receive higher weight.
+
+Fusion formula:
+  S_i^(l) = alpha * A_i^(l) + (1 - alpha) * Softmax(E^(l))_i
+  Default alpha = 0.9
+
+After normalizing both scores, they are combined with weighted summation, and the top-k tokens with the highest scores are retained.
+
+Think of it as filtering meeting minutes with two lenses: the attention score finds "points just discussed" (nearby relevance), and the entropy score finds "sentences that were disputed or uncertain" (high uncertainty = information-dense). The two methods capture complementary information.
+
+*** Why It Worked (and What Pits Remain)
+
+On Llama-3.1 / Llama-3.2 / DeepSeek-R1, across reasoning benchmarks including AIME 2024 / LiveCodeBench / IFEval / LongReason, InfoKV consistently outperforms attention-only compression baselines.
+
+Remaining pits:
+- The alpha hyperparameter needs tuning; the paper defaults to 0.9 (90% weight on attention), but optimal values may vary by task
+- Entropy computation requires additional forward passes, incurring non-trivial computational overhead
+- Still operates at the token level; redundancy in the KV vector's channel dimension is not addressed
+- Integration with production-grade kernels such as FlashAttention / Paged Attention has not been clearly established
+
+* Frontier Extensions
+
+As of 2026-06-26, InfoKV was submitted on 2026-06-25 and represents the latest advance in this research line.
+
+Concurrently, *CapKV* (arXiv 2604.25975, 2026-04) derives a KV eviction objective from Information Bottleneck theory via mutual information maximization, forming a theoretical echo of InfoKV: both papers independently verify that "attention score is an approximation of a deeper information-theoretic objective, not the objective itself."
+
+The most likely next directions:
+- Making alpha a learnable, input-adaptive mixing weight
+- Combining information-theoretic token selection with channel-dimension quantization (InfoKV + KIVI / KVSharer)
+- *Dynamic* budget allocation for long reasoning chains (adjusting in real time during inference rather than deciding once at prefill)
+
+* One Diagram to Understand It All
+
+#+begin_example
+Time axis --->
+
+2020        2023                          2024                  2026
+  |           |                             |                     |
+  |  [Sparse  ] --> [Token    ] --> [Prefill   ] --> [Info-theoretic]
+  |  [Attn.  ]     [Eviction ]     [Compress. ]     [Fusion       ]
+  |           |                             |                     |
+  |  BigBird  | Scissorhands               SnapKV              InfoKV
+  | Longformer| H2O  StreamingLLM          PyramidKV
+  |           |      Sel.Context/SH2
+  |           |
+  |  Training | Generation-phase KV evict.  Prefill KV eviction   Dual-signal scoring
+  |  sparsify | Cumulative attention score  Attention window vote  Attention + Entropy
+  |           | (position bias, gen-only)   (uniform layer budget) (fills distant gap)
+  |           |
+  |  Solves:  | Solves: KV doesn't grow     Solves: prompt is the  Solves: high-entropy
+  |  Compute  | Unsolved: prompt all stored  real bottleneck        distant tokens missed
+  |           | Unsolved: high-entropy leaks Unsolved: entropy leak  by attention
+
++---------------------------------------------------------------------+
+| Underlying Conceptual Evolution                                     |
+|                                                                     |
+| "Not all tokens matter"                                             |
+|   -> "Tokens can be dropped dynamically during generation"          |
+|   -> "Prefill is the real memory bottleneck"                        |
+|   -> "Budget should be allocated by per-layer sparsity"             |
+|   -> "Attention score != a token's contribution to the future"      |
+|   -> "Entropy measures a different kind of importance               |
+|        that attention cannot see"                                   |
++---------------------------------------------------------------------+
+#+end_example
+
+* Insight
+
+Reading through this research line, what is really happening is not "compression methods keep getting better" — it is that *researchers' understanding of the concept of "importance" keeps deepening*.
+
+Phase one (2023): importance = high attention weight. This is the most natural definition and also the most short-sighted — attention is essentially asking "where do I need to look right now," not "will this token still matter a thousand steps from now."
+
+Phase two (2024): recognition that importance distributions differ across layers, leading to finer-grained allocation. But optimization is still happening within the attention framework; no one has stepped outside it.
+
+Phase three (2026, InfoKV's position): *a second ruler is introduced — information theory*. The definition of importance is extended: a token can fail to be "selected" by attention, yet carry a large amount of information because it is hard to predict (high entropy), exerting a strong causal influence on distant tokens.
+
+This effectively separates two distinct types of importance:
+- *Local relevance*: how relevant is this token to the current task? (captured by attention)
+- *Global information density*: how much content does this token carry that the surrounding context cannot predict? (captured by entropy)
+
+In short texts these two types almost coincide, so earlier methods were sufficient. In long reasoning chains they begin to diverge, and InfoKV is the first work to explicitly distinguish and exploit this divergence.
+
+*Next-step prediction*: KV compression for long reasoning chains will evolve toward "adaptive dual-signal" schemes — different reasoning phases (problem understanding / intermediate inference / final synthesis) weight the two types of importance differently; a static alpha=0.9 is only the starting point, and the next paper will very likely make alpha dynamic.
+
+* Takeaway
+
+The research methodology in this line shows a pattern that recurs repeatedly: *measure first, then design.*
+
+SnapKV's insight came from measuring "whether attention patterns are stable during generation" — finding stability enabled the feasibility of "one-shot prefill compression."
+
+PyramidKV's insight came from measuring "how attention sparsity varies with layer depth" — finding the pyramidal shape justified per-layer budget allocation.
+
+InfoKV's insight came from measuring "how KL-divergence-based forward influence is distributed" — finding the near/far division of labor between attention and entropy made dual-signal fusion necessary.
+
+*What this means for you*: find a specific "measurement experiment" on top of existing methods — not designing a new method, but first precisely measuring *where the current method is failing*. Where it fails is where the next paper begins. Can't find worthwhile research to do? First find a ruler that is not accurate enough, then build a better one.

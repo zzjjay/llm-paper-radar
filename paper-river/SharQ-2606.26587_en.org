@@ -1,0 +1,232 @@
+#+title:      SharQ: Bridging Activation Sparsity and FP4 Quantization for LLM Inference
+#+date:       [2026-06-26 Fri 00:23]
+#+filetags:   :paper:river:en:
+#+identifier: 20260626T002323-en
+#+source:     https://arxiv.org/abs/2606.26587
+#+authors:    Haoqian Meng, Yilun Luo, Yafei Zhao, Wenyuan Liu, Huaqing Zheng, Xindian Ma, Peng Zhang
+#+venue:      arXiv 2026
+
+* The Problem River
+
+How do you compress a large model's activations to 4 bits, double throughput, and still keep accuracy intact?
+
+The difficulty: during LLM inference, the intermediate outputs (activations) at each layer always contain a few "outliers" — values one or two orders of magnitude larger than everything else. If you try to fit them into 4 bits, the quantization range must stretch so wide that the majority of normal values are crammed into a tiny corner, completely ruined. Generation after generation of researchers has attacked this problem, because 4-bit activation quantization is the last big slice of the compute-efficiency pie — at FP4 precision, theoretical throughput can quadruple compared to FP16, yet the outlier problem has always been the wall nobody could climb over.
+
+* Source Map
+
+#+begin_example
+[2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem: Large models exhibit "emergent outliers" in activations; INT8 quantization collapses
+  | Solution: Mixed precision — keep outlier dimensions in FP16, quantize the rest in INT8
+  v
+[2022] Xiao et al. - SmoothQuant
+  |
+  | Problem: LLM.int8()'s mixed-precision branches incur runtime overhead and resist kernel fusion
+  | Solution: Migrate the "difficulty" of activations offline to weights (per-channel scaling)
+  v
+[2024] Ashkboos et al. - QuaRot
+  |
+  | Problem: Per-channel scaling is static — the same transformation for every input
+  | Solution: Random Hadamard rotation scatters outliers; achieves end-to-end W4A4
+  |
+  | (concurrent) SpinQuant [2024] — learns optimal rotation matrix
+  |              FlatQuant [2024] — learns independent affine transform per layer
+  v
+[2024-2025] NVFP4 / HiFloat4 / MXFP4 (NVIDIA Blackwell)
+  |
+  | Problem: Rotation methods handle "the mean" but cannot adapt to per-input outlier positions;
+  |          FP4's E2M1 format has a very narrow dynamic range; residual errors persist after rotation
+  v
+[2023] Frantar & Alistarh - SparseGPT
+  |                                   (parallel technology thread: sparsity)
+  | Problem: Pruning large models requires retraining — prohibitively expensive
+  | Solution: One-shot "surgical" pruning using second-order information
+  v
+[2026] Meng et al. - SharQ  <== target paper
+  |
+  | Merges both threads: N:M sparsity isolates outliers; remaining values are quantized to FP4
+  v
+[2026] SPARQ (ACM SIGPLAN)  — dedicated accelerator for N:M sparsity + quantization
+#+end_example
+
+* Evolutionary Narrative
+
+** 2022 | LLM.int8(): First, pull the outliers aside
+
+*** What problem it saw
+
+You try INT8-quantizing a 7B-parameter LLaMA and watch perplexity explode. The cause is puzzling: a few dimensions in the activations are 100× or even 1000× larger than the others. Once you pack those "outliers" and normal values into the same quantization bucket, the precision of the normal values gets forcibly diluted by the outliers.
+
+Stranger still: this phenomenon is nearly absent in models below 1B parameters, but once model scale exceeds 6.7B it appears in every Transformer layer, concentrated in the same fixed channels every time. Dettmers et al. called this "emergent outliers" — a byproduct of scale emergence, not a bug, but an intrinsic feature of large models.
+
+*** Its solution
+
+The idea is straightforward: since outliers appear in fixed channels, keep those channels in FP16 and INT8-quantize everything else. Split the matrix multiplication by dimension into two branches, compute separately, then merge. This is mixed-precision decomposition.
+
+*** Why it worked (and where the next pitfall was buried)
+
+It worked because, although outlier channels carry large magnitudes, there are very few of them (in a sequence perhaps only 6 dimensions trigger, less than 0.1%). Tiny cost, large benefit.
+
+New pitfall: this approach requires dynamically identifying outlier channels at runtime, running two separate branches in parallel — hard to fuse efficiently on hardware. The INT8 compute kernel and the FP16 compute kernel run simultaneously, scheduling is complex, and real-world speedup is limited.
+
+** 2022 | SmoothQuant: Migrate the hard part to weights offline
+
+*** What problem it saw
+
+LLM.int8()'s mixed-precision branches require dynamic decisions at inference time about which channels go high-precision, adding runtime bookkeeping and two separate compute paths that are difficult to fuse into an efficient matrix-multiply kernel. Could this work be done offline instead, leaving only a single path at inference time?
+
+*** Its solution
+
+Key observation: weights are easy to quantize (smooth distribution); activations are hard (outliers). But in the matrix multiplication $Y = XW$, you can insert a diagonal matrix $s$, rewriting it as $Y = (X \cdot \text{diag}(s)^{-1}) \cdot (\text{diag}(s) \cdot W)$, which is mathematically equivalent.
+
+Set each element of $s$ to some power of the maximum value of the corresponding activation channel, and you "compress" the large activation values while "amplifying" the weight side. Because weights already have a relatively flat distribution, amplifying them slightly does not hurt quantization quality. This transformation can be computed offline and folded into the weights; at inference time you simply run W8A8 INT8 quantization with no extra branching.
+
+*** Why it worked (and where the next pitfall was buried)
+
+It worked because the diagonal scaling matrix can be absorbed into the preceding layer's LayerNorm or the next layer's weight — zero overhead at runtime. A single compute path throughout; hardware-friendly.
+
+New pitfall: $s$ is a per-channel constant estimated from a small calibration dataset and then frozen. No matter where the outliers fall in a given input, the transformation is the same. When outlier positions vary with input, the fixed $s$ becomes insufficient — especially at lower bit-widths (4-bit or FP4), where this inflexibility is greatly amplified.
+
+** 2024 | QuaRot / SpinQuant / FlatQuant: Scatter outliers with rotation
+
+*** What problem it saw
+
+SmoothQuant's per-channel scaling handles "fixed channels with large values," but at W4A4 (both weights and activations quantized to 4 bits), accuracy degrades. The reason: 4-bit range is too narrow; per-channel scaling is only a linear compression that does not change relative distributions across channels — some channels remain dense with values, others sparse, and outliers persist structurally.
+
+*** Its solution
+
+Core idea: if you can "evenly mix" all channel values so that every channel is roughly the same magnitude, outliers vanish — not deleted, but dispersed into all channels.
+
+Mathematical tool: *Hadamard rotation*. A special orthogonal matrix that evenly scatters an $n$-dimensional vector across all dimensions, with compute cost only $O(n \log n)$, and it can be folded offline into the weights (orthogonal transformations preserve matrix-multiply results — an equivalent reformulation).
+
+QuaRot uses fixed random Hadamard matrices; SpinQuant further learns the optimal rotation matrix via gradient descent on the Cayley manifold; FlatQuant goes further still, learning an independent affine transform per layer for greater expressive power.
+
+*** Why it worked (and where the next pitfall was buried)
+
+After rotation the activation distribution genuinely becomes more Gaussian, quantization error drops significantly, and respectable results are achieved at W4A4.
+
+New pitfall: rotation is a global, static transformation (even learned rotations are optimal for the whole dataset, not for each individual input). Different inputs have outliers in different positions; applying the same rotation matrix to all inputs is a global compromise. When compressing to FP4 (E2M1 — only 2 exponent bits and 1 mantissa bit), even a smoother post-rotation distribution still causes many values to flush to zero, with severe accuracy loss. FlatQuant's per-layer transforms introduce additional inference overhead, reducing its practical utility.
+
+** 2024–2025 | NVFP4 / Blackwell: Hardware arrives; software lags behind
+
+*** What problem it saw
+
+NVIDIA Blackwell GPUs (released 2024) natively support FP4 (E2M1 format); Tensor Cores perform FP4 matrix multiplications directly, with theoretical throughput double that of FP8. The problem: FP4's dynamic range is extremely narrow (E2M1 can represent only about 16 distinct positive values). Weight quantization to FP4 is just barely acceptable (weights have flat distributions); activation quantization to FP4 is a disaster — one outlier and everything else is squeezed to zero.
+
+Rotation methods are effective at FP8 but insufficient at FP4. The quantization hardware is waiting for the software, but activation-quantization algorithms have not yet caught up.
+
+*** Its solution (this is technical context, not one paper's specific proposal)
+
+NVFP4 uses block scaling: 16 values share one FP8 scale, plus one FP32 global scale. This is far better than INT4's dynamic range, but it addresses a "format design" problem without solving the "activation outlier" problem.
+
+*** Why it worked (and where the next pitfall was buried)
+
+The FP4 format itself is excellent — with hardware support, 4-bit matrix multiplication delivers blazing throughput. But activations misbehave: outliers persist, and even with FP4, accuracy still lags FP8/FP16 by a meaningful gap. This is exactly the gap SharQ targets — hardware is ready, activation quantization is not.
+
+** 2023 | SparseGPT: One-shot surgery to remove half the weights
+
+*** What problem it saw
+
+(Parallel sparsity thread, alongside the quantization thread)
+
+Many weight values in large models are small and contribute little — in theory, they can be removed in exchange for inference speedup and memory savings. But deciding "which ones to remove" requires careful computation; prior pruning algorithms need retraining, which is completely impractical for a 175B model.
+
+*** Its solution
+
+Use second-order information (an approximation of the Hessian matrix) to compute how much output error each weight would cause if removed, greedily prune the batch with the smallest error, then use the same second-order information to compensate the remaining weights and pull the error back down. The entire process requires no backpropagation; it is done layer by layer; a 175B model can be pruned in just 4 hours. Supports semi-structured sparsity (the 2:4 pattern — keep 2 of every 4 weights), which NVIDIA GPU hardware natively accelerates.
+
+*** Why it worked (and where the next pitfall was buried)
+
+One-shot pruning combined with second-order compensation keeps post-pruning output as close as possible to the original, preserving accuracy without retraining. The 2:4 sparsity pattern has dedicated sparse Tensor Core support on GPU, delivering a practical ~1.5–2× speedup.
+
+New pitfall: SparseGPT and Wanda primarily prune *weights*, not activations. Activation sparsity is different — it is input-dependent and varies with every inference call. Moreover, directly zeroing activations (N:M sparsity) and then quantizing creates a coupled-error problem: sparsification error and quantization error stack on top of each other, worse than either one alone.
+
+** 2026 | SharQ: Isolate outliers with sparsity, then quantize to FP4
+
+*** What problem it saw
+
+Rotation methods (QuaRot/SpinQuant/FlatQuant) apply a global transformation to smooth distributions, treating every input identically. But outliers are fundamentally input-dependent: this input's outliers may be in channels 3, 17, and 89; the next input's outliers are somewhere else. Applying a fixed rotation to this dynamic problem treats the symptom but not the cause.
+
+Directly applying N:M sparsity to activations (zeroing the smallest N of every M values) and then quantizing to FP4 produces "double error": sparsification error and quantization error accumulate, worse than either alone.
+
+*** Its solution
+
+*SharQ's core insight*: flip the framing — outliers are already a minority, so why not use the sparsity structure to directly *isolate* them, then quantize the remaining normal values?
+
+Concretely:
+1. *Input-adaptive N:M mask*: for each input, dynamically generate an N:M mask that selects the *outlier-dominated activations* (kept on the dense path); the remaining values form the sparse backbone.
+2. *FP4-quantize the sparse backbone*: with outliers removed, the sparse backbone has a smooth distribution and can be safely quantized to FP4.
+3. *Build the dense residual relative to the quantized value*: the key trick — residual = (original dense value) − (quantized sparse backbone), not minus the pre-quantization sparse backbone. This way the residual path simultaneously compensates both sparsification error *and* quantization error.
+4. *Shared FP4 weights, different scale views*: both paths (sparse backbone and dense residual) share the same set of FP4 weights, distinguished only by different scale factors — no extra weight storage.
+5. *Fused kernel*: mask generation, residual construction, and LayerNorm fusion are handled in a single kernel, reducing memory round-trips.
+
+No calibration data, no retraining, no model-specific tuning required.
+
+*** Why it worked (and where the next pitfall was buried)
+
+*Why it works*:
+
+Outliers and normal values now travel separate paths and do not interfere with each other. The sparse backbone contains no extreme values; FP4's dynamic range is sufficient; accuracy is preserved. The residual is computed relative to the *quantized* sparse backbone — this is the most elegant step in the entire design. Without it, quantization error would be overlooked and the residual path's compensation would be incomplete.
+
+*Remaining pitfalls*:
+
+The residual path requires higher precision (FP16 or FP8), introducing some bandwidth overhead. The optimal choice of N and M in N:M varies across models and layers. Additionally, SharQ addresses activation quantization in a single forward pass; extensions to KV cache quantization and similar scenarios require further work.
+
+* Frontier Extensions
+
+** 2026 | SPARQ: Build a dedicated chip for sparsity + quantization
+
+*SPARQ* (ACM SIGPLAN/SIGBED 2026) pushes the SharQ idea further: SharQ is a software algorithm running on general-purpose GPUs; SPARQ is a dedicated accelerator architecture that hardwires the N:M-sparsity-plus-quantization compute paths in silicon. Evaluation shows 1.53× area efficiency and 1.58× energy efficiency improvements. This demonstrates that joint sparsity+quantization compression still has substantial headroom to exploit at the hardware level.
+
+As of now, SharQ represents the state of the art on the algorithmic side of "FP4 activation quantization." Follow-on work will most likely move in two directions: (1) finer-grained outlier detection (block-wise or even token-wise dynamic strategies); (2) joint optimization with KV cache quantization, speculative decoding, and other inference-acceleration techniques.
+
+* One Diagram to Understand It All
+
+#+begin_example
+Time  -->  2022          2023        2024              2025-2026
+           |             |           |                 |
+Activation LLM.int8()    .           SmoothQuant       SharQ
+quant      (discover      .          (static scaling)  (dynamic sparse isolation)
+difficulty  outliers)    |           |                 |
+           |             SparseGPT  QuaRot            SPARQ
+Sparsity   |             (weight     SpinQuant         (dedicated chip)
+tech       |             one-shot    FlatQuant
+           |             pruning)    (rotation smoothing)
+           |             |           |
+Hardware   .             .           Blackwell GPU    RTX 5090
+format                               native FP4       measured 2.2-2.4x
+                                     support
+
+Problem evolution:
+  Outliers exist --> mixed-precision isolation --> static transform smoothing --> dynamic sparse isolation
+  (discovery)        (high runtime overhead)      (fixed transform, not adaptive) (input-adaptive, zero overhead)
+
+Precision roadmap:
+  INT8 (2022) --> W4A8 (2023) --> W4A4 (2024) --> W4A4 FP4 (2026)
+#+end_example
+
+* Insight
+
+Reading through this line of work, a recurring pattern stands out: *every generation tried to eliminate outliers; SharQ is the first approach that chose to accept outliers as a given and simply isolate them.*
+
+LLM.int8() pulls outliers aside and handles them separately (runtime overhead). SmoothQuant transfers the outlier difficulty onto weights (static, not adaptive). QuaRot/SpinQuant scatter outliers by rotation across all dimensions (global transform, sacrifices per-input adaptivity).
+
+SharQ does not try to eliminate, transfer, or dilute outliers — it says "you are what you are; take your own path, and I'll quantize everything else to FP4." This is a cognitive shift, not merely a technical improvement: from "how to make outliers disappear" to "how to coexist with outliers."
+
+This thinking is actually a direct descendant of LLM.int8()'s original intuition, differing only in execution: LLM.int8() separates by channel dimension, SharQ separates by N:M sparsity mask — the latter can exploit modern GPU hardware sparsity support, achieving lower latency.
+
+*Where things go next*:
+1. Finer-grained sparsity masks (currently per-token N:M; future work may target per-head or per-expert in MoE models)
+2. Extending the "compute residual relative to the quantized value" trick to KV cache quantization
+3. Integration with speculative decoding — the draft model can run entirely in FP4; the verify phase uses FP8/FP16
+
+* Takeaway
+
+This evolutionary line offers a counterintuitive research lesson: *the optimal solution is often not to eliminate the problem but to structure it.*
+
+Quantization research has long asked "how do we make activations easier to quantize?" SharQ reframes the question: "which part of the activations is causing trouble?" — and then handles that troublesome part separately.
+
+The implication: the next time you face a problem that is "hard to handle as a whole," first ask "is this difficulty uniformly distributed?" If the difficulty is concentrated (as outliers are always in a few channels), structured isolation is typically more effective and more economical than a global transformation.
+
+A practical heuristic for LLM compression algorithm design: instead of starting from "how to transform the entire distribution," first plot the error distribution — wherever error is concentrated, apply fine-grained treatment there and use a coarser scheme for the rest. This is far cheaper than fine-grained treatment everywhere, and accuracy loss is far more controllable.
