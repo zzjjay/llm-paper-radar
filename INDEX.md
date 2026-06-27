@@ -428,3 +428,5 @@
 - [06-23](digests/2026-06-23.md) — 205 scanned, 1 passed, top: RoPE-Aware Bit Allocation for KV-Cache Quantizatio
 
 - [06-24](digests/2026-06-24.md) — 216 scanned, 2 passed, top: Quantization Inflates Reasoning: Token Inflation a
+
+- [06-25](digests/2026-06-25.md) — 249 scanned, 6 passed, top: RoPE-Aware Bit Allocation for KV-Cache Quantizatio
