@@ -434,3 +434,5 @@
 - [06-26](digests/2026-06-26.md) — 71 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
 
 - [06-27](digests/2026-06-27.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [06-28](digests/2026-06-28.md) — 50 scanned, 0 passed, top: (no papers passed)
