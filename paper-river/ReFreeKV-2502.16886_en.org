@@ -1,0 +1,274 @@
+#+title:      ReFreeKV: Towards Threshold-Free KV Cache Compression
+#+date:       [2026-07-01 Wed 00:29]
+#+filetags:   :paper:river:en:
+#+identifier: 20260701T002917-en
+#+source:     https://arxiv.org/abs/2502.16886
+#+authors:    Xuanfan Ni, Liyan Xu, Chenyang Lyu, Longyue Wang, Mo Yu, Lemao Liu, Fandong Meng, Jie Zhou, Piji Li
+#+venue:      ACL 2026 Findings
+
+* The Problem River
+
+The memory cost of LLM inference keeps growing — every time a new token is generated, the key-value vectors of every past token must stay resident in GPU memory. Which parts of that memory can you actually afford to discard, and how much of it?
+
+The difficulty is that nobody knows how much to throw away. Too little and memory fills up; too much and output quality degrades. The answer changes with every new task and every new model. The field quietly settled on a compromise: let the user guess a "retention-ratio" threshold and prune accordingly. ReFreeKV is the first work to formally declare this compromise unacceptable and to offer a replacement.
+
+* Source Map
+
+#+begin_example
+[2021-2022] SpAtten (Wang et al., HPCA 2021) / Pope et al. (2022)
+  |
+  | Problem: KV cache grows linearly with sequence length, throttling generation
+  | Fix: Hardware-level pruning (SpAtten), or architecture swap (MQA)
+  |      — both require modifying the model itself
+  v
+[2023a] StreamingLLM (Xiao et al., ICLR 2024) + Scissorhands (Liu et al., NeurIPS 2023)
+  |
+  | Problem: Can't touch the model — how to drop unimportant tokens at inference time?
+  | Fix: StreamingLLM discovers attention "sink" tokens;
+  |      Scissorhands discovers "important tokens stay important"
+  |      -> Both still require a manually set fixed budget K
+  v
+[2023b] H2O (Zhang et al., NeurIPS 2023)
+  |
+  | Problem: Keeping only "recent tokens" or "sinks" is insufficient;
+  |          some important tokens are neither at the start nor recent
+  | Fix: Use cumulative attention scores to identify Heavy Hitters,
+  |      dynamically evict low-scoring tokens
+  |      -> Still requires the user to pre-specify K tokens to retain
+  v
+[2024a] SnapKV (Li et al., NeurIPS 2024)
+  |
+  | Problem: H2O only covers the decoding phase; what if the prompt itself is huge?
+  | Fix: During prefill, use an "observation window" at the end of the instruction
+  |      to predict which tokens will matter; select per-head
+  |      -> Still requires the user to pre-specify how many tokens per head (compression ratio)
+  v
+[2024b] PyramidKV (Cai et al., 2024) / Ada-KV (Feng et al., NeurIPS 2025)
+  |
+  | Problem: Attention patterns vary widely across layers and heads;
+  |          a uniform budget is too coarse
+  | Fix: PyramidKV allocates by layer (more for shallow, fewer for deep);
+  |      Ada-KV allocates by head (driven by a theoretical error bound)
+  |      -> Finer allocation, but the "total budget" is still user-specified
+  v
+[2026] ReFreeKV (Ni et al., ACL 2026)   <- target paper
+  |
+  | Problem: All methods above assume the user can supply an appropriate threshold —
+  |          an assumption that simply does not hold in practice
+  | Fix: Use the distribution of "reference tokens" (attention sinks) as a
+  |      data-driven stopping criterion; no user-specified ratio required
+  v
+[2025] GVote (Tang et al., arXiv 2509.03136) /
+       Compactor (Chari & Van Durme, arXiv 2507.08143)
+       [independent concurrent work, corroborating the direction]
+#+end_example
+
+* Evolutionary Narrative
+
+** 2021–2022 | SpAtten + Pope et al.: First to call KV Memory a "Bottleneck"
+
+*** What Problem Did They See?
+
+Every time an LLM generates one token, it must pull the key-value vectors of every past token out of GPU memory and run attention over them. Double the sequence length, double the memory demand, halve the speed. Pope et al. (2022) ran the numbers on PaLM-540B on TPU: a 128K-token KV cache can reach 64 GB — blowing past the A100's capacity. SpAtten (HPCA 2021) arrived at the same observation from the hardware accelerator side: attention is a memory-bandwidth bottleneck, not a compute bottleneck.
+
+To make it concrete: imagine using an LLM to write a long novel. By Chapter 50, the model must keep the KV vectors for every word from the previous 49 chapters in GPU memory. There is simply no room.
+
+*** Their Fix
+
+Two paths, both requiring changes to the model itself:
+
+- *SpAtten*: A custom chip that prunes low-scoring tokens in hardware using cumulative attention scores — but it only runs on that specific chip; useless on an A100. DRAM access is reduced 10×, with theoretical guarantees.
+- *Pope et al.*: Replace multi-head attention with Multi-Query Attention (MQA), where multiple query heads share a single KV pair — shrinking KV size to 1/32 and expanding the supportable context length by 32×. Requires training from scratch.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+MQA genuinely works — Llama and Mistral families both use it today. But already-deployed models cannot have their architectures changed. Large models running on GPUs that cannot be retrained need a method that *works at inference time without touching the model*. SpAtten's key insight — "use attention scores to decide who stays" — was sound, but it was locked inside custom hardware. That insight was waiting to be unlocked into software.
+
+** 2023 | StreamingLLM + Scissorhands: Drop Tokens at Inference Time — but Which Ones?
+
+*** What Problem Did They See?
+
+Without modifying the model, can you dynamically discard some KV entries at inference time? The most intuitive approach: keep only the most recent N tokens (a sliding window). StreamingLLM tried this in 2023 and found that model outputs collapsed entirely — not just degraded, but completely unusable.
+
+Why? Because softmax needs somewhere to "put" its attention weights. The very first few tokens (especially the first one) serve this role — not because they are semantically important, but because the math needs an anchor to stabilize the distribution. Remove them and softmax goes haywire. StreamingLLM named this phenomenon "attention sink."
+
+Scissorhands discovered a complementary phenomenon at the same time: important tokens exhibit *persistence of importance* — if a token receives heavy attention at step t, it very likely still receives heavy attention at step t+10.
+
+*** Their Fix
+
+- *StreamingLLM*: Retain the first 4 "sink tokens" (attention sinks) plus the most recent N tokens; evict everything else. The model can stably handle infinitely long sequences, achieving a 22.2× speed-up.
+- *Scissorhands*: Track each token's historical attention score; retain "persistently high-scoring" tokens; evict by a fixed budget K. Reduces KV cache by 5×; combined with 4-bit quantization, can reach 20×.
+
+Both methods require the user to decide: how many tokens to keep (budget K).
+
+*** Why It Worked (and What Pit It Left Behind)
+
+StreamingLLM's sink discovery was a genuine insight — every subsequent method builds on it. Scissorhands' "persistence of importance" hypothesis also largely holds. But both methods make *the same compromise*: they treat K as a user-supplied known quantity. There is no mechanism to tell you, for this specific piece of text, what K should be.
+
+Moreover, both methods only handle the *decoding phase* — if a prompt already contains 100,000 tokens, these methods offer no relief for the memory pressure during prompt processing.
+
+** 2023 | H2O (NeurIPS): Heavy-Hitter Tokens, Chosen Statistically
+
+*** What Problem Did They See?
+
+StreamingLLM retains sinks plus recent tokens, discarding the middle entirely. For tasks that require remembering early details (e.g., cross-paragraph QA), this fails. Scissorhands retains "historically high-scoring" tokens via a single global list — but different attention heads attend to very different tokens; a unified list is too coarse. H2O explicitly criticized StreamingLLM's "local" strategy, noting that it causes "severe performance collapse."
+
+*** Their Fix
+
+H2O proposes the Heavy-Hitter Oracle: during decoding, maintain each token's *cumulative attention score*. After each generation step, evict the lowest-scoring tokens from the KV cache, keeping only the top-K.
+
+An analogy: you are taking meeting notes. After each speaker, you tally how many times each past speaker has been cited. The least-cited person's remarks get dropped from your notes next time.
+
+H2O formally casts eviction as a dynamic submodular optimization problem, with theoretical guarantees. In practice, throughput improves up to 29× over DeepSpeed/HuggingFace Accelerate.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+H2O can preserve semantically important mid-sequence tokens instead of blindly discarding the middle as StreamingLLM does. But it has two clear limitations:
+
+1. *Only covers the decoding phase*: If a prompt has 100,000 tokens, all their KV entries are loaded first, and then eviction starts. It does not help with the initial load of long prompts.
+2. *K is still user-specified*: You must tell the model "keep 20% of tokens." There is no adaptive mechanism.
+
+** 2024 | SnapKV (NeurIPS): Move to Prefill, Select Per-Head
+
+*** What Problem Did They See?
+
+H2O exposed a blind spot: for long-prompt scenarios, the problem is not how to evict during decoding — the KV cache is already full after processing the prompt, before decoding even begins. SnapKV directly criticizes H2O and FastGen: "they overlook compressing the KV cache of the input sequence, which is the key to reducing memory and computational overhead."
+
+*** Their Fix
+
+A counter-intuitive discovery: the pattern of which prompt positions each attention head will attend to during generation *can already be predicted when prefill finishes*. How? Use the instruction portion at the end of the prompt (the "observation window") as a probe — the attention distribution of those last few tokens over the rest of the prompt predicts which KV entries will be needed during generation.
+
+Analogy: you are reading a contract. By the time you finish the "questions" section, you already know which clauses you will keep flipping back to — so you only retain those right now.
+
+SnapKV also adds per-head selection: different attention heads attend to different positions, so each head independently selects its own important tokens rather than sharing a single list.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+SnapKV completes compression during prefill, so the KV cache is already small when decoding starts. Per-head granularity is far finer than H2O's global strategy. But one assumption remains: the compression ratio (how many tokens to keep per head) is still user-specified. For a simple QA prompt, 20% may be enough; for a complex multi-hop reasoning document, even 80% may not suffice. SnapKV does not know, and does not try to know.
+
+** 2024–2025 | PyramidKV + Ada-KV: Smarter Cake-Cutting, but the Cake Size Is Still Fixed
+
+*** What Problem Did They See?
+
+SnapKV applies the same KV budget to every layer — but attention patterns differ dramatically between shallow and deep layers. PyramidKV found experimentally that shallow-layer attention spreads across many tokens (information is not yet aggregated), while deep-layer attention concentrates on a handful of key tokens (decisions have already been made). Ada-KV found that attention entropy varies enormously across heads; applying the same budget to a diffuse head and a concentrated head wastes capacity.
+
+*** Their Fix
+
+- *PyramidKV*: Shape the budget as a pyramid — more tokens retained in shallow layers, fewer in deep layers. The total budget is unchanged, but allocation is better matched to the "funnel" structure of LLM information processing.
+- *Ada-KV*: Derives a theoretical upper bound on the attention-output error after evicting tokens from each head, then allocates budget per head accordingly: the more diffuse the head's attention, the higher its retention ratio.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Both methods do the same thing: *more intelligently redistribute a fixed global budget*. PyramidKV splits by layer; Ada-KV splits by head — but the user still needs to supply a global "how much to keep."
+
+ReFreeKV later explicitly names Ada-KV: "it is essentially redistributing a pre-defined global budget rather than eliminating the budget constraint itself." This is the last unquestioned assumption in the entire evolutionary chain.
+
+** 2026 | ReFreeKV (ACL): Let the Data Tell You How Much to Keep
+
+*** What Problem Did They See?
+
+In real-world settings, different inputs demand vastly different amounts of KV cache: a simple greeting might need only 5% of tokens; a 128K-token legal document might need 70%. Applying a single threshold to all inputs inevitably wastes memory on simple inputs and degrades quality on complex ones. This is not a hyperparameter-tuning issue — it is a methodological flaw. The optimal threshold "varies by input and domain," and this variability had never been formally raised as a problem before ReFreeKV.
+
+*** Their Fix
+
+ReFreeKV's core insight builds on StreamingLLM's attention sink discovery: sink tokens (the first few in the sequence) consistently receive high attention across all tasks and all layers. This is a "baseline signal" — it reflects a fundamental property of the attention mechanism itself, not the difficulty of any particular text.
+
+ReFreeKV uses this baseline signal as a ruler:
+
+1. Compute each token's attention contribution to the sink (reference) tokens, measured by the Frobenius norm.
+2. These contributions form a distribution — "attention sparsity" varies by input.
+3. Adaptively truncate according to this distribution: sparse inputs (simple text) naturally retain fewer tokens; dense inputs (complex long documents) naturally retain more.
+4. No user-provided ratio is required.
+
+Analogy: instead of saying "record 20% of the meeting's remarks," you say "record whatever is frequently cited by the reference speaker (the chair) — the citation density itself determines how much to record."
+
+Experiments across 13 datasets, spanning different context lengths, task types, and model scales, show that ReFreeKV approaches full-KV-cache performance without any threshold tuning.
+
+*** Why It Worked (and What Pit It Left Behind)
+
+Because the stopping criterion comes from the data itself rather than from a user's guess, there is no threshold-mismatch degradation when transferring across datasets.
+
+Open questions remain: ReFreeKV depends on the existence of attention sinks. For model architectures that do not exhibit sink behavior (e.g., some variants with attention normalization), the reference signal may fail. The additional overhead of computing the reference distribution in ultra-long sequences also warrants further validation.
+
+* Frontier Extensions
+
+ReFreeKV was released in February 2025. Two independent concurrent papers appeared around the same time, confirming that this problem direction is a genuine research hotspot:
+
+*GVote (Tang et al., arXiv 2509.03136, 2025)*
+
+Uses Monte Carlo sampling to predict future query attention demands and dynamically decides which keys to retain. Shares the same problem awareness as ReFreeKV (both oppose fixed budgets) but takes a different path (statistical prediction vs. reference signal). The authors call this the "Procrustes' bed problem" — the size of the bed should not be fixed in advance; it should be determined by whoever lies down on it. The two papers do not cite each other — an independent convergence. Reports 2× memory reduction with no accuracy loss on GSM8K, RULER, and LongBench.
+
+*Compactor (Chari & Van Durme, arXiv 2507.08143, 2025)*
+
+Uses "leverage scores" (a linear-algebra measure of each row's contribution to the determinant) to quantify token importance, paired with a per-model "calibration curve" — fitted once from a small number of samples to capture how much compression can be applied before performance drops. At inference time, the curve is queried to determine the budget for each input. Reports 68% average memory reduction with no performance loss on LongBench, and releases a vLLM integration.
+
+*Shared signal*: Three papers appearing simultaneously, using different mechanisms but pointing in the same direction — "let the input content determine the compression level." This indicates that solving the threshold problem has moved from "has anyone noticed this?" into the "method convergence competition" phase.
+
+* One Diagram
+
+#+begin_example
+Evolution axis: Who decides how much KV cache to keep?
+^
+|
+|  Change model structure    Which tokens to keep    How many tokens to keep
+|  (training time)           (content-sensitive)     (input-adaptive)
+|
+2021  SpAtten -------> Prune by attention score in hardware
+      Pope et al. ----> Switch to MQA architecture, shrink KV footprint
+      [Problem: both require model changes; unusable for already-deployed models]
+      |
+      v
+2023  StreamingLLM --> sink(4) + recent(N)               N set by user
+      Scissorhands --> persistently important tokens, budget K   K set by user
+      [Problem: middle tokens all dropped; long-doc QA collapses]
+      |
+      v
+2023  H2O -----------> cumulative-score top-K eviction   K set by user
+      (decoding phase)
+      [Problem: KV cache already overflowing after prefill before eviction starts]
+      |
+      v
+2024  SnapKV ---------> observation window + per-head selection   ratio set by user
+      (prefill phase)
+      [Problem: same budget per layer; shallow vs. deep needs differ]
+      |
+      v
+2024  PyramidKV ------> distribute total budget by layer (pyramid)   total budget set by user
+2025  Ada-KV ---------> distribute total budget by head              total budget set by user
+      [Problem: finer allocation, but "total amount" is still a hyperparameter]
+      |
+      v
+2026  ReFreeKV -------> reference tokens as a data-driven ruler   *no user specification needed*
+      [ACL 2026]         Frobenius-norm adaptive truncation
+      |
+      v
+2025  GVote ----------> Monte Carlo sampling of future demand      *no user specification needed*
+      Compactor ------> leverage scores + calibration curve        *no user specification needed*
+      [independent concurrent work; method-convergence competition phase]
+
+      ^                       ^                         ^
+      Solve "fits in memory"   Solve "which to keep"     Solve "how many to keep"
+      (structural/system)      (importance judgment)     (budget decision) <-- 2025-2026 battleground
+#+end_example
+
+* Insights
+
+What changed along this line is not technology iterating — it is the *granularity of the problem being refined*.
+
+The first wave (2021–2023) elevated KV cache from "background noise" to "first-class problem," solving "doesn't fit in memory." The second wave (2023–2024) solved "which tokens to keep" — discovering that attention distributions have structure (sinks, heavy hitters, layer-wise funnels) that can support informed selection. The third wave (2025–2026) finally asked "how many to keep" — recognizing that this quantity itself should not be a hyperparameter, but a function of the data.
+
+Each wave attacked something the previous wave *never realized it was assuming*: H2O did not know K was an assumption; SnapKV did not know the compression ratio was an assumption; PyramidKV did not know the total budget was an assumption. ReFreeKV's contribution is to excavate this "unnoticed assumption," put it in plain sight, and demonstrate through experiment that the optimal threshold is indeed sensitive across datasets. The simultaneous appearance of three independent papers (GVote, Compactor, ReFreeKV) shows that the moment was ripe for questioning this assumption — it was not one paper's accidental discovery.
+
+*Where is this most likely to go next?*
+
+1. *Internalized during training*: All current methods are inference-time patches. The next step may be training models to judge for themselves which tokens can be safely forgotten — treating the KV cache as working memory the model manages internally rather than as an externally bolted-on compression module.
+2. *Cross-request reuse*: When the same document is queried by different users repeatedly, can the results of important-token identification be cached and reused at the serving layer? This would be far cheaper than recomputing from scratch on every inference.
+3. *Unifying sparse attention and KV compression*: The two lines — sparse attention architectures vs. runtime KV eviction — currently run in parallel. A unified framework — designing attention at training time to natively support dynamic budgets, with zero-cost adjustment at inference — may be the end state.
+
+* Takeaway
+
+*When searching for problems, auditing "assumptions everyone silently accepts" is more valuable than hunting "pitfalls everyone visibly falls into."*
+
+In this lineage, the threshold / retention ratio was never a "solved problem" — nobody overcame it; it was simply passed silently from paper to paper. H2O assumed the user knows K; SnapKV assumed the user knows the ratio; PyramidKV assumed the total budget is given — not one of them said "this is inconvenient," until ReFreeKV wrote it down explicitly and used experiments to demonstrate cross-dataset threshold sensitivity.
+
+This means you can: in any mature subfield, read the "experimental setup" sections of five mainstream papers, and list the hyperparameters or preconditions they all require but never explain. That is where a paper no one has written yet tends to be hiding. You are not looking for errors — you are looking for collectively accepted compromises.
