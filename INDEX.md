@@ -438,3 +438,5 @@
 - [06-28](digests/2026-06-28.md) — 50 scanned, 0 passed, top: (no papers passed)
 
 - [06-29](digests/2026-06-29.md) — 285 scanned, 0 passed, top: (no papers passed)
+
+- [06-30](digests/2026-06-30.md) — 96 scanned, 1 passed, top: ReFreeKV: Towards Threshold-Free KV Cache Compress

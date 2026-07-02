@@ -1,0 +1,416 @@
+#+title:      SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference
+#+date:       [2026-07-01 Wed 00:44]
+#+filetags:   :paper:river:en:
+#+identifier: 20260701T004416-en
+#+source:     https://arxiv.org/abs/2606.31145
+#+authors:    Amirhossein Abaskohi, Giuseppe Carenini, Peter West, Yuhang He
+#+venue:      arXiv cs.CL, June 2026
+
+* The Problem River
+
+When a large model must handle an ultra-long context of 128K tokens, GPU memory
+simply cannot hold it all — how do you make the model remember the full text
+without running out of VRAM?
+
+The difficulty is that you need both speed and accuracy simultaneously. Speed
+means you cannot let memory-saving crush inference throughput; accuracy means
+that whatever content gets compressed, it can still be retrieved whenever it is
+needed later. Every generation of solutions wrestles with three things: what to
+drop, how to drop it, and whether what was dropped can ever be recovered. Each
+step forward reveals a new cost. That is why, from 2023 to 2026, this problem
+has drawn wave after wave of researchers.
+
+* Source Map
+
+Below is the evolutionary path of this research line from 2023 to 2026 (arrows
+read as "improves upon"):
+
+#+begin_example
+[2023] StreamingLLM - Xiao et al. (ICLR 2024)
+  |    Discovered "attention sinks"; sliding window + pinned initial tokens
+  |    enable infinite-length generation
+  |
+  |  * Problem: position-based eviction blindly discards important middle tokens
+  v
+[2023] H2O - Zhang et al. (NeurIPS 2023)
+  |    Retains "Heavy Hitter" tokens by cumulative attention score;
+  |    content-adaptive eviction
+  |
+  |  * Problem: only compresses the decode phase; ignores prompt KV cache
+  |    (the real memory bottleneck)
+  v
+[2024] SnapKV - Li et al. (NeurIPS 2024)
+  |    Before generation, uses an observation window to vote; selects prompt KV
+  |    independently per head
+  |
+  |  * Problem: every layer gets the same KV budget — wasteful at low layers,
+  |    insufficient at high layers
+  v
+[2024] PyramidKV - Cai et al. (EMNLP 2024)
+  |    Attention pyramid: wide budget at low layers, narrow at high layers;
+  |    dynamic per-layer allocation
+  |
+  |  * Problem: token-level eviction fragments cross-token semantic units;
+  |    eviction is irreversible
+  |
+  +--------> [2025] ChunkKV - Liu et al. (NeurIPS 2025)
+  |                 Chunks as atomic units — retained or evicted as a whole;
+  |                 preserves local coherence
+  |                 * Problem: fixed granularity; token-level detail
+  |                   is unrecoverable after compression
+  |
+  +--------> [2025] SentenceKV - Zhu et al. (COLM 2025)
+                    Sentence granularity; GPU stores semantic vectors,
+                    CPU stores full KV, retrieved on demand
+                    * Problem: sentence granularity is fixed; resolution
+                      is locked in after prefill
+
+                       |
+                       v
+             [2026] SeKV - Abaskohi et al.  <-- TARGET
+                    Entropy-guided semantic spans; GPU stores summary vectors,
+                    CPU stores SVD bases; zoom-in mechanism reconstructs
+                    token-level detail for any span on demand during decoding
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Discovering "Attention Sinks" to Enable Infinite Generation
+
+*** What Problem It Saw
+
+In LLM inference, every newly generated token requires storing its key/value
+vectors in a cache. The longer the sequence, the larger the cache — eventually
+exhausting GPU memory. A natural idea: keep only the most recent N tokens in
+cache, like a sliding window. Xiao et al. found that once this window slides
+past the maximum sequence length seen during training, the model's perplexity
+collapses abruptly — because the positional encodings jump to states the model
+has never encountered, and it no longer knows how to compute attention.
+
+*** Its Solution
+
+They carefully scanned the attention weight distributions across all layers and
+heads and noticed something strange: the very first few tokens of a sequence —
+even semantically empty ones like periods, commas, or the BOS symbol — attract
+extremely high attention scores in almost every layer and head. This is not
+because those tokens are important; rather, softmax must force all scores to sum
+to 1 — when no token stands out, attention "pours" onto these globally visible
+early tokens, like water flowing into a depression. Xiao et al. called these
+tokens *attention sinks*.
+
+The fix is direct: permanently pin the KV of the first 4 sink tokens, and add
+a sliding window to retain the most recent tokens. Softmax has somewhere to
+drain attention, positional encodings no longer jump, and the model can generate
+indefinitely — 22× faster than recomputing from scratch.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+It solves the numerical stability problem of softmax and makes arbitrarily long
+generation feasible. But the cost is steep: everything in the middle — the body
+of a document, the core context of a conversation — is discarded wholesale,
+regardless of importance. This is pure position-based eviction with no regard
+for content. Whether eviction could instead be guided by each token's
+informational value is the question the next paper had to answer.
+
+** 2023 | H2O: Choose What to Keep by Content — Heavy Hitters First
+
+*** What Problem It Saw
+
+StreamingLLM discards middle tokens without asking why. But attention scores
+themselves hint at which tokens matter: tokens that are frequently attended to
+will likely be attended to again in future decoding steps. Zhang et al.
+examined real attention matrices and found a near-power-law distribution — about
+20% of tokens accumulate more than 80% of total attention scores. They called
+these tokens *Heavy Hitters (H2)*.
+
+*** Its Solution
+
+They framed KV eviction as a dynamic submodular optimization problem: at each
+decoding step, retain two categories of token KV — a recent local window (for
+local coherence) and the top-H2 tokens by cumulative attention score (for
+global relevance). The H2 set is re-evaluated after every decoding step,
+allowing dynamic addition and removal. Theoretically this is provably the best
+approximation to attention quality. Empirically, compared with StreamingLLM, it
+achieves significant accuracy gains on long-document tasks while reducing KV
+cache by 5–10×.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+Content-adaptive retention is genuinely better than fixed-position retention.
+But there is one glaring blind spot: H2O only compresses the KV cache for the
+*decode* phase and never touches the *prompt* KV cache. In practice, user
+prompts routinely run to tens of thousands of tokens, far longer than the
+generated response — the true memory bottleneck goes completely untouched.
+
+** 2024 | SnapKV: Compress the Prompt Before Generation Begins
+
+*** What Problem It Saw
+
+Li et al. pointed out that in real-world usage, prompts routinely contain
+thousands to tens of thousands of tokens while generated responses are only a
+few hundred — the compression priority is entirely in the prefill stage, not
+decoding. H2O and StreamingLLM never addressed this.
+
+*** Its Solution
+
+SnapKV compresses the prompt's KV cache *before* generation starts. How to know
+which prompt tokens matter? Use the query vectors from the final short segment
+of the prompt — the *observation window* (typically the last 64 tokens) — to
+score the entire prompt prefix via attention, then aggregate the votes. These
+queries represent "what the model is most focused on right before it starts
+generating." To avoid selecting scattered individual tokens (which would yield
+semantically incomplete fragments), SnapKV applies 1D max-pooling over the
+voting scores, clustering adjacent high-scoring tokens together. Each attention
+head operates independently, ensuring diversity.
+
+If you take H2O's "re-compute heavy hitters after every decode step" and replace
+it with "vote once at prefill time based on an observation window to decide who
+stays," you get the core idea of SnapKV.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+It moves compression to the right place and gains flexibility through per-head
+independent selection. But it still assigns the same KV budget to every layer.
+Experimental evidence shows that attention patterns vary enormously across
+layers of an LLM — low layers attend broadly (requiring large budgets) while
+high layers are already highly focused (small budgets suffice). Uniform budgeting
+is a structural waste.
+
+** 2024 | PyramidKV: Wide at the Bottom, Narrow at the Top — Dynamic Per-Layer Budgets
+
+*** What Problem It Saw
+
+Cai et al. systematically analyzed attention entropy across layers in multiple
+models and found a clear "funnel" shape — *Pyramidal Information Funneling*:
+lower layers distribute attention across many tokens, middle layers concentrate
+progressively, and top layers attend to only a handful of critical tokens. By
+applying a uniform budget across all layers, SnapKV forcibly flattens this
+natural pyramid.
+
+*** Its Solution
+
+Let the KV budget decrease with layer depth, forming a pyramid: large budget at
+the bottom, small at the top. The token selection mechanism reuses SnapKV's
+observation-window voting, but replaces the fixed top-K per layer with a
+function that varies with depth, keeping the total budget constant.
+
+Results: on LLaMA-3-8B, retaining only 12% of the KV cache nearly matches full-
+KV performance; even at an aggressive 0.7% retention, it still outperforms
+other methods by 20 points.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+Budget allocation is smarter, but the underlying logic is unchanged: eviction
+still happens at the token level, discarding individual tokens. The problem is
+that semantics are encoded across tokens. Within a continuous semantic fragment,
+dropping a single token can shatter the whole fragment — keep "138", drop "+86"
+and the rest of the phone number, and what remains in cache is meaningless.
+Could semantic units, rather than individual tokens, become the minimum eviction
+granularity?
+
+** 2025 | ChunkKV + SentenceKV: Semantic Units as Atoms — Coherence Preserved
+
+*** What Problem It Saw
+
+Liu et al. (ChunkKV) and Zhu et al. (SentenceKV) converged almost simultaneously
+on the same root problem: token-level eviction destroys semantic coherence.
+Meaning is encoded across multiple tokens; retaining high-scoring tokens in
+isolation while discarding their context is like keeping a word root and throwing
+away the entire sentence.
+
+*** Their Solutions
+
+*ChunkKV* groups tokens into fixed-size chunks (default: 10 tokens), scores
+each chunk as a whole, and retains or evicts entire chunks together. A complete
+phrase is either fully present or fully absent — no semantic fragments. As a
+bonus, adjacent layers select nearly identical chunk indices, so they introduce
+*cross-layer index reuse* to eliminate redundant computation, yielding a
+measured 26.5% throughput improvement.
+
+*SentenceKV* raises the granularity to sentences. After prefill, each sentence's
+KV is compressed into a single semantic vector stored on the GPU (very compact);
+the full KV is offloaded to CPU (large but loaded only when needed). During
+decoding, the current query vector is compared against all sentence semantic
+vectors by similarity; only the top-ranked sentence KVs are fetched from CPU to
+GPU for attention computation.
+
+The relationship between the two: if you replace ChunkKV's "fixed-size chunk"
+with "punctuation-delimited sentence" and add "GPU stores summary, CPU stores
+full KV, fetched on demand," you arrive at SentenceKV.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+Semantic-unit retention genuinely outperforms token-level selection, and
+SentenceKV's CPU offloading dramatically reduces GPU memory. But both share the
+same fundamental limitation: *compression is performed once at prefill, and
+resolution is fixed from that moment on*. A semantic span judged "unimportant"
+at prefill time cannot have its token-level detail retrieved even if it turns
+out to be critical during decoding. Moreover, chunk/sentence granularity is
+static — there is no mechanism to dynamically decide "zoom into this span,
+compress that one," based on the needs of the current decoding step.
+
+** 2026 | SeKV: Resolution-Adaptive, Zoom Into Semantic Spans On Demand (Target Paper)
+
+*** What Problem It Saw
+
+Abaskohi et al. distill all prior shortcomings into a single sentence: "Once
+compression is complete, token-level detail is permanently gone, with no
+mechanism to recover it on demand during decoding." Whether ChunkKV's chunks or
+SentenceKV's sentences, compression is one-way — gone is gone.
+
+*** Its Solution
+
+SeKV combines three components:
+
+1. *Entropy-guided semantic span segmentation*: Information entropy detects
+   semantic boundaries and segments the context into semantically complete spans
+   — not fixed-length chunks, not punctuation-delimited sentences, but
+   content-adaptive cuts based on information density. High-entropy regions
+   (information-dense, blurry boundaries) are cut finely; low-entropy regions
+   (repetitive or sparse) are cut coarsely.
+
+2. *Two-tier GPU–CPU storage*: Each span stores only a lightweight summary
+   vector on the GPU (used for fast routing decisions; extremely GPU-memory-
+   efficient). The full KV is stored on the CPU in a compressed low-rank SVD
+   basis (far smaller than the raw full KV, and reconstructible losslessly or
+   near-losslessly).
+
+3. *Trainable zoom-in mechanism*: During decoding, if a span's summary vector
+   exceeds a similarity threshold with the current query, its SVD basis is
+   fetched from the CPU and the full token-level KV is reconstructed on-the-fly
+   for high-resolution attention. The routing mechanism itself is trainable but
+   adds fewer than 0.05% extra parameters; the base model is fully frozen.
+
+If you take SentenceKV's "one-shot sentence selection" and replace it with "GPU
+stores only summary vectors, CPU stores SVD-compressed reconstructible full KV,"
+then add "adaptively decide during decoding which spans to zoom into at token
+level," you get SeKV.
+
+*** Why It Works (and Where It Digs a New Hole)
+
+The key innovation is decoupling *compression* from *recoverability* — the GPU
+always stores only summaries, but the "true KV" lives on the CPU in SVD-
+compressed form, ready for reconstruction at any time. Unlike outright
+discarding (ChunkKV/SentenceKV), recovery is genuinely possible. Experimental
+results: at 128K context, GPU memory is reduced by 53.3%; SeKV outperforms the
+strongest semantic-compression baseline by an average of 5.9 percentage points
+across four benchmarks (LongBench, RULER, Needle-in-a-Haystack, and others).
+
+New costs: CPU–GPU data transfer latency is a real penalty in high-concurrency
+or large-batch scenarios; SVD reconstruction itself carries compute overhead;
+if the zoom-in trigger threshold is poorly calibrated, either too many spans are
+fetched (no memory savings) or critical spans are missed (accuracy drops).
+
+* Frontier Extensions
+
+SeKV was submitted on June 30, 2026, and as of this writing has no citing
+follow-up papers (it has been public for less than one week). However, three
+closely related concurrent works from the same period attack the same problem
+from different angles:
+
+*CompressKV (arXiv 2606.24467, June 2026, one week apart from SeKV)*: Finds
+that in GQA architectures a small subset of "Semantic Retrieval Heads" dominate
+semantic localization, and applies a heterogeneous eviction strategy specifically
+to those heads while using a standard approach for the rest. The direction
+matches SeKV — semantic structure over individual tokens — but CompressKV
+operates entirely on GPU with no SVD reconstruction. SeKV's zoom-in can recover
+token-level detail; CompressKV cannot. The two papers do not cite each other;
+they are a genuine case of parallel convergence.
+
+*xKV (arXiv 2503.18893, March 2026)*: Performs joint SVD decomposition across
+layers, projecting KV from adjacent layers into a shared low-rank subspace with
+selective reconstruction at decode time. SeKV's SVD is decomposed along the
+semantic-span dimension; xKV's is along the layer dimension — two orthogonal
+compression axes that could in principle be stacked.
+
+*ScoutAttention (arXiv 2603.27138, DAC 2026)*: Runs attention pre-computation
+one layer ahead on the CPU, overlapping it with GPU computation in a pipeline so
+that CPU–GPU transfer latency is hidden inside compute time, achieving a 2.1×
+speedup. SeKV's primary weakness is precisely CPU–GPU transfer overhead;
+ScoutAttention's approach is a natural engineering patch.
+
+As of July 2026, the combination of SeKV + ScoutAttention has not yet been
+implemented by anyone, but it is an obvious next step.
+
+* One-Chart Summary
+
+The horizontal axis is time; the vertical axis tracks three key attributes:
+eviction granularity, whether the prompt is handled, and whether compression is
+reversible.
+
+#+begin_example
+Year  | Method        | Eviction Granularity | Compresses Prompt | Recoverable  | Layer-Aware
+------+---------------+----------------------+-------------------+--------------+------------
+2023  | StreamingLLM  | Position (fixed)     | No                | No           | No
+2023  | H2O           | Token                | No                | No           | No
+2024  | SnapKV        | Token                | Yes               | No           | No
+2024  | PyramidKV     | Token                | Yes               | No           | Yes
+2025  | ChunkKV       | Chunk (fixed)        | Yes               | No           | Yes
+2025  | SentenceKV    | Sentence (fixed)     | Yes               | No           | No
+2026  | SeKV          | Span (adaptive)      | Yes               | SVD rebuild  | No
+------+---------------+----------------------+-------------------+--------------+------------
+
+Problem evolution (read top to bottom: the right side of each arrow is the
+new problem the next paper discovered):
+
+StreamingLLM --[position eviction ignores content    ]--> H2O
+H2O          --[forgot prompt KV                     ]--> SnapKV
+SnapKV       --[equal budget per layer               ]--> PyramidKV
+PyramidKV    --[token granularity breaks semantics   ]--> ChunkKV / SentenceKV
+ChunkKV      --[fixed granularity, dropped = gone    ]---+
+SentenceKV   --[resolution locked after prefill      ]---+
+                                                         |
+                                                         v
+                                                       SeKV
+                             (adaptive semantic spans + SVD rebuild + zoom-in)
+#+end_example
+
+* Insight
+
+On the surface this evolutionary line is "progress in KV cache compression
+techniques." At a deeper level it is a series of redefinitions of *what
+constitutes the minimal meaningful unit of memory*:
+
+token → chunk → sentence → semantic span (adaptive)
+
+Each upgrade pushes the "adjustable resolution range" of memory one notch
+higher. Coarser granularity saves more memory but loses more information; finer
+granularity preserves information but saves little — this is an intrinsic
+tension. All five preceding papers resolve it by "making a tradeoff at some
+fixed granularity." SeKV is the first to turn the granularity itself into a
+dynamically adjustable parameter at decode time.
+
+The real conceptual shift happens with SeKV: from *compression = loss* to
+*compression = deferred reconstruction*. This is not an engineering trick but a
+paradigm shift — it imports the database-world idea of "storage hierarchy +
+on-demand loading" into the attention mechanism. Previous researchers asked
+"which tokens can we drop with minimum loss?" SeKV reframes the question as
+"how do we design the compression format so that anything can be faithfully
+restored on demand at any time?"
+
+*Most likely next directions*:
+- Upgrade the zoom-in trigger from a threshold decision to a continuous
+  attention-based router (analogous to MoE gating), learning end-to-end "when
+  it is worth spending CPU bandwidth on reconstruction"
+- Stack SeKV (SVD along the span dimension) and xKV (SVD along the layer
+  dimension) to compress along two orthogonal axes simultaneously
+- Apply ScoutAttention's pipeline idea to eliminate SeKV's CPU transfer
+  latency bottleneck
+- Extend the zoom-in mechanism to MoE architectures, where different experts'
+  varying need to zoom into different spans can naturally provide routing signals
+
+* Takeaway
+
+This evolutionary line offers a clear demonstration of *how to find research
+problems*: no paper's contribution starts from a blank creative slate; each one
+advances a *single concrete contradiction* in the prior work to its logical next
+step. StreamingLLM solved infinite generation but missed content awareness. H2O
+added content awareness but missed the prompt. SnapKV addressed the prompt but
+missed layer differences. PyramidKV fixed layer differences but fragmented
+semantic units. ChunkKV/SentenceKV preserved semantic units but locked in the
+resolution.
+
+This suggests a practice: read any method you find interesting as a "system
+with internal contradictions." Do not ask what it does — ask where its logic
+hits a wall if followed to its conclusion. That wall is the entry point for the
+next paper.
