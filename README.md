@@ -258,10 +258,10 @@ Interpret **one** paper on demand — given an arXiv id, URL, or name/acronym. I
 
 - **中文精读 / 翻译** — hands off to `ljg-read` (伴读 + 英译中).
 - **算法背景 + 原理** — hands off to `ljg-paper` (seven-beat story spine).
-- **Paper-river 溯源** — reads the existing `paper-river/*.org` if present, else runs `ljg-paper-river`.
+- **Paper-river lineage** — reads the existing `paper-river/*.org` if present, else runs `ljg-paper-river`.
 - **Radar-native analysis** — same-bucket novelty comparison, direction trend, deployment practicality (from the scored `relevance_breakdown`), and prior triage verdict. This is what no generic reader skill can do.
 
-Output is archived in the repo: 溯源 → `paper-river/<acronym>-<id>.org` (+ `_en.org`), the other angles → `interpretations/<acronym>-<id>__{reading,paper,radar}.org`.
+Output is archived in the repo: lineage → `paper-river/<acronym>-<id>.org` (+ `_en.org` English sibling); the other angles go into a per-paper folder `interpretations/<acronym>-<id>/` as `reading.org` (translation), `paper.org` (principle), `radar.org` (radar-native analysis).
 
 Trigger: `解读 arXiv:2607.01127`, `翻译并讲讲 LogbQuant 的原理`, `溯源这篇 2606.01412`, `interpret this paper: <id>`, `/paper-interpret <id>`.
 
@@ -330,8 +330,8 @@ llm-paper-radar/
 │   └── resolve_paper.py         # resolve arxiv id/name → radar record + triage + siblings (paper-interpret)
 ├── skills/                      # in-repo Claude Code skills (symlinked by install.sh)
 │   ├── paper-triage/            # daily triage workflow over the digest queue
-│   └── paper-interpret/         # on-demand single-paper interpretation (translate/原理/溯源/radar-native)
-├── interpretations/             # paper-interpret output: <acronym>-<id>__{reading,paper,radar}.org
+│   └── paper-interpret/         # on-demand single-paper interpretation (translate/principle/lineage/radar-native)
+├── interpretations/             # paper-interpret output: <acronym>-<id>/{reading,paper,radar}.org (per-paper folder)
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)

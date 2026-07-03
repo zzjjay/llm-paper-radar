@@ -103,22 +103,22 @@ Only this repo has the scored archive. When relevant, add:
 
 Everything the skill produces is archived **in this repo** — override each
 sub-skill's default `~/Documents/notes/` output path and Write to the repo
-instead. Naming mirrors the radar's `<acronym>-<arxiv-id>` convention (dot form,
-`<acronym>` = the paper's short name/acronym).
+instead. `<acronym>-<arxiv-id>` uses dot form; `<acronym>` = the paper's short
+name.
 
 - **Paper-river 溯源 (C)** → `paper-river/<acronym>-<arxiv-id>.org`, plus an
   `_en.org` English sibling (translate the zh original, same as the cron). Reuse
   an existing file instead of regenerating.
-- **中文精读 / 翻译 (A)** → `interpretations/<acronym>-<arxiv-id>__reading.org`
-  (pass ljg-read this exact path to Write).
-- **原理故事 (B)** → `interpretations/<acronym>-<arxiv-id>__paper.org`
-  (same path override for ljg-paper).
-- **Radar-native analysis (D)** → `interpretations/<acronym>-<arxiv-id>__radar.org`,
-  written by this skill itself (same-bucket novelty, trend, practicality, triage
-  verdict); also echo the key points in chat.
+- **The other angles share one per-paper folder** `interpretations/<acronym>-<arxiv-id>/`
+  (create it if missing). One file per angle inside it:
+  - **中文精读 / 翻译 (A)** → `reading.org` (pass ljg-read this exact path to Write).
+  - **原理故事 (B)** → `paper.org` (same path override for ljg-paper; if it
+    extracts an overview image, put it in the same folder).
+  - **Radar-native analysis (D)** → `radar.org`, written by this skill itself
+    (same-bucket novelty, trend, practicality, triage verdict); also echo the
+    key points in chat.
 
-Create the `interpretations/` directory if it doesn't exist, and tell the user
-each path you saved to.
+Tell the user each path you saved to.
 
 ## Output
 
