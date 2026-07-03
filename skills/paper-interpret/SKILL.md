@@ -82,15 +82,28 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
   of web research — tell the user.)
 - **D. Radar-native analysis** (this skill's unique value — see below).
 - **E. 全文中文详解** — when the user wants the *whole* paper in Chinese, NOT
-  the selective 伴读 of (A). Two hard rules:
+  the selective 伴读 of (A). Rules:
   - *Copyright*: arXiv papers are usually under arXiv's non-exclusive license
     (check the license on the abstract page — only CC-BY/CC0 permit a verbatim
     full translation). Under the default license, do **not** produce a
     clause-by-clause translation of the whole paper. Produce a **section-by-section
     Chinese explanation in your own words** (复述) instead — full coverage of
     every section + appendix, with tables/numbers/formulas reproduced verbatim
-    (facts and LaTeX aren't the copyrightable expression). Name the file to
-    reflect that it's a digest, not a 1:1 translation.
+    (facts and LaTeX aren't the copyrightable expression).
+  - *Format = Markdown* (`translation_zh.md`, NOT `.org`): GitHub renders LaTeX
+    math in Markdown (`$...$` inline, `$$...$$` on its own line) and native
+    `| … |` tables, so formulas and tables display correctly when browsing the
+    repo; `.org` renders neither. Do **not** use HTML — GitHub shows `.html` as
+    source, not rendered. Open the file with a line noting it's a paraphrased
+    section digest, not a verbatim translation.
+  - *Figures*: the arXiv HTML usually has NO embedded figure images (they're
+    vector), so grab them from the PDF: `curl -sL https://arxiv.org/pdf/<id> -o
+    /tmp/p.pdf`, find each figure's page (`pdftotext -f N -l N … | grep 'Figure K:'`),
+    render+crop with `pdftocairo -png -r 150 -x <x> -y <y> -W <w> -H <h> -f N -l N`,
+    Read the crop to verify the box, save under
+    `interpretations/<acro>-<id>/images/`, and reference it relatively at the
+    right spot (`![图 K：<caption>](images/<name>.png)`). Skip if the paper has
+    no meaningful figures.
   - *Mechanics*: this is a long output (~30k-token papers). Delegate to a
     **Sonnet subagent** (translation needs language, not Opus-level reasoning —
     cheaper, and it isolates the full text from the main context). Fetch the
@@ -146,9 +159,8 @@ name.
   - **中文精读 / 伴读 (A)** → `reading.org` (pass ljg-read this exact path to Write).
   - **原理故事 (B)** → `paper.org` (same path override for ljg-paper; if it
     extracts an overview image, put it in the same folder).
-  - **全文中文详解 (E)** → `translation_zh.org` (per the copyright/mechanics
-    rules in step 2E; open the file with a line noting it is a paraphrased
-    section digest, not a verbatim translation).
+  - **全文中文详解 (E)** → `translation_zh.md` (Markdown so GitHub renders math +
+    tables; figures cropped from the PDF into `images/`; per the rules in step 2E).
 
   Whenever you add or regenerate an angle file, update `README.md`'s navigation
   section so the hub always reflects what's actually in the folder.
