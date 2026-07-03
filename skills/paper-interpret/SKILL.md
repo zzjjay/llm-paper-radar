@@ -105,8 +105,11 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
       outer math span early and orphans whatever follows (a `\left` then errors);
       write `b\text{-bit}` instead. Likewise **use `\lbrace`/`\rbrace`, never
       `\{`/`\}`** inside math — GitHub's markdown strips the backslash, turning
-      `\left\{` into `\left{` (an invalid delimiter → the `\left` error). After
-      writing, **run
+      `\left\{` into `\left{` (an invalid delimiter → the `\left` error).
+      Also **put a space around every inline `$…$` that touches CJK text** (e.g.
+      `向量 $x$ ，` not `向量 $x$，`) — GitHub won't recognize a `$` delimiter
+      hugging a non-ASCII char, so the span isn't rendered and its `_`/`^` get
+      eaten as Markdown emphasis. After writing, **run
       `uv run python scripts/check_math.py <file>`** — it flags exactly these
       GitHub failure modes (denylisted macros, stray/unbalanced `$`, brace and
       `\left`/`\right` mismatches) with `file:line`. Fix every hit until it

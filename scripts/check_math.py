@@ -122,6 +122,21 @@ def check_file(path: Path) -> list[str]:
         if n_left != n_right:
             findings.append(f"{rel}:{ln}  \\left ({n_left}) / \\right ({n_right}) mismatch in {kind} math")
 
+        # 5. inline $…$ directly touching a non-ASCII (e.g. CJK) char — GitHub
+        # won't recognize the $ as a math delimiter, so the span isn't rendered
+        # and its `_`/`^` get eaten by Markdown emphasis. Needs a space.
+        if kind == "inline":
+            before = text[idx - 1] if idx > 0 else " "
+            after_pos = idx + len(body) + 2
+            after = text[after_pos] if after_pos < len(text) else " "
+            for ch, side in ((before, "before opening"), (after, "after closing")):
+                if ch and not ch.isspace() and ord(ch) > 127:
+                    findings.append(
+                        f"{rel}:{ln}  inline $…$ touches a non-ASCII char "
+                        f"({side}: {ch!r}) — GitHub won't parse the $ delimiter; add a space"
+                    )
+                    break
+
     return findings
 
 
