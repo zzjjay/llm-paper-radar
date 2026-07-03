@@ -97,7 +97,7 @@ crontab -e
 
 `scripts/daily.sh` sources `~/.bashrc` for the Anthropic env vars, runs the full pipeline (`fetch → dedupe → filter → summarize → render`), and only commits + pushes when something actually changed. Logs land in `scripts/log/YYYY-MM-DD.log`. For a manual rerun of a specific arxiv publication day: `./scripts/daily.sh --date 2026-05-20`.
 
-**Option B — GitHub Actions (forks with a public sk-ant key).** Three workflows are wired up under `.github/workflows/`: `daily.yml` (schedule commented out — fetch → render → push), `weekly.yml` (Mondays 23:00 UTC — 7-day rollup), and `cleanup.yml` (Sundays 22:00 UTC — prune old raw data). To use them, set repo secrets and (for `daily.yml`) re-enable the schedule line:
+**Option B — GitHub Actions (forks with a public sk-ant key).** Two workflows are wired up under `.github/workflows/`: `daily.yml` (schedule commented out — fetch → render → push) and `weekly.yml` (Mondays 23:00 UTC — 7-day rollup). `data/summarized/` is retained permanently (it is the source for the weekly + monthly/half-year/yearly rollups), so there is no cleanup workflow. To use them, set repo secrets and (for `daily.yml`) re-enable the schedule line:
 
 | secret | required | what for |
 |---|---|---|
