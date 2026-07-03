@@ -109,7 +109,7 @@ $$\boldsymbol{\ell}=\sigma_{\mathrm{init}}(\boldsymbol{\epsilon}+\alpha\,\boldsy
 
 现在把 GSQ 推广到一般标量量化。设目标是用对称量化、单一共享 scale 把参数量化到 $b$ 比特。式 (1) 的约束集写成：
 
-$$\mathcal{C}_{\text{$b$-bit}}=\left\{\bar{\mathbf{w}}\mid\bar{\mathbf{w}}=s\cdot\mathbf{q};\ s\in\mathbb{R},\ \mathbf{q}\in\mathcal{G}_{b}^{d}\right\},\qquad(5)$$
+$$\mathcal{C}_{b\text{-bit}}=\left\{\bar{\mathbf{w}}\mid\bar{\mathbf{w}}=s\cdot\mathbf{q};\ s\in\mathbb{R},\ \mathbf{q}\in\mathcal{G}_{b}^{d}\right\},\qquad(5)$$
 
 其中 $\mathcal{G}_b$ 是有序量化网格，基数 $|\mathcal{G}_b|=2^b$，指定每个量化参数可取的值集合。此式对网格无结构限制，故均匀与非均匀量化都能容纳。为可微优化，对 $d$ 个坐标各独立做一次 Gumbel-Softmax 采样，每次引入 $2^b$ 个可训练 logits，拼成 $\boldsymbol{\ell}\in\mathbb{R}^{d\times2^b}$；联合优化 $\boldsymbol{\ell}$ 与 scale $s$。
 
@@ -117,7 +117,7 @@ $$\mathcal{C}_{\text{$b$-bit}}=\left\{\bar{\mathbf{w}}\mid\bar{\mathbf{w}}=s\cdo
 
 **更高位宽。** 位宽 $b$ 增大时 logits 数量与所需显存随 bpp 指数增长。为此当 $b>2$ 时改用 local-shift（局部平移）表述（见图 1）。关键观察：每个坐标通常仍靠近其初始化的量化值，跨网格的大跳很少发生（见附录 L.2）。于是不给 $\mathcal{G}_b$ 每个值都配 logit，只学一个小的相对平移。设给定初始量化向量 $\mathbf{q}^0\in\mathcal{G}_b^d$，对坐标 $i$ 记初始格点索引 $j_i^0$，即 $q_i^0=(\mathcal{G}_b)_{j_i^0}$。只引入 5 个 logits 对应离散平移 $\delta_i\in\{-2,-1,0,1,2\}$，logits 记为 $\boldsymbol{\ell}_\delta\in\mathbb{R}^{d\times5}$。每步对 $\boldsymbol{\ell}_\delta$ 第 $i$ 行做 Gumbel-Softmax 得 $\delta_i$，新索引 $j_i=\mathrm{clip}(j_i^0+\delta_i,1,2^b)$（clip 把值夹到有效范围），最终量化值 $q_i=(\mathcal{G}_b)_{j_i}$。等价约束集：
 
-$$\mathcal{C}^{\mathrm{shift}}_{\text{$b$-bit}}=\left\{\bar{\mathbf{w}}\mid\bar{\mathbf{w}}=s\cdot\mathbf{q},\;s\in\mathbb{R},\;q_i=(\mathcal{G}_b)_{\mathrm{clip}(j_i^0+\delta_i,1,2^b)},\;\delta_i\in\{-2,-1,0,1,2\}\right\}.\qquad(6)$$
+$$\mathcal{C}^{\mathrm{shift}}_{b\text{-bit}}=\left\{\bar{\mathbf{w}}\mid\bar{\mathbf{w}}=s\cdot\mathbf{q},\;s\in\mathbb{R},\;q_i=(\mathcal{G}_b)_{\mathrm{clip}(j_i^0+\delta_i,1,2^b)},\;\delta_i\in\{-2,-1,0,1,2\}\right\}.\qquad(6)$$
 
 这样每坐标只需 5 个 logits 而非 $2^b$ 个，可训练参数总数从 $d\times2^b+1$ 降到 $5d+1$，使高位宽优化可行，同时每坐标仍能移到邻近格点。
 
