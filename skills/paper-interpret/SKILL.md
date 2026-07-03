@@ -96,25 +96,26 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
     repo; `.org` renders neither. Do **not** use HTML — GitHub shows `.html` as
     source, not rendered. Open the file with a line noting it's a paraphrased
     section digest, not a verbatim translation.
-    - *GitHub math is a restricted MathJax subset* — tell the subagent (and
-      check afterwards) to avoid macros GitHub rejects: `\operatorname` (use
-      `\arg\min`, `\arg\max`, or a bare `\min`/`\max`), `\lVert`/`\rVert` (use
-      `\|`), and sizing prefixes `\big`/`\bigl`/`\bigr`/`\Big…` before a
-      delimiter (drop them, or use `\left…\right`). Also **never nest `$…$`
-      inside a `$$…$$` block** — e.g. `\text{$b$-bit}` — the inner `$` closes the
-      outer math span early and orphans whatever follows (a `\left` then errors);
-      write `b\text{-bit}` instead. Likewise **use `\lbrace`/`\rbrace`, never
-      `\{`/`\}`** inside math — GitHub's markdown strips the backslash, turning
-      `\left\{` into `\left{` (an invalid delimiter → the `\left` error).
-      Also **put a space around every inline `$…$` that touches CJK text** (e.g.
-      `向量 $x$ ，` not `向量 $x$，`) — GitHub won't recognize a `$` delimiter
-      hugging a non-ASCII char, so the span isn't rendered and its `_`/`^` get
-      eaten as Markdown emphasis. After writing, **run
-      `uv run python scripts/check_math.py <file>`** — it flags exactly these
-      GitHub failure modes (denylisted macros, stray/unbalanced `$`, brace and
-      `\left`/`\right` mismatches) with `file:line`. Fix every hit until it
-      reports clean, or the equations show a red "macro not allowed /
-      unrecognized delimiter" error on GitHub.
+    - *Inline math: use the dollar-backtick form* `` $`…`$ `` **not** plain
+      `$…$`. GitHub officially recommends `` $`…`$ `` when the expression
+      contains chars that clash with Markdown — which in a CJK doc is nearly
+      always: with plain `$…$`, underscores get eaten as emphasis (`\mathcal{G}_b`
+      → `\mathcal{G}b`) and a `$` hugging CJK punctuation (`$x$，`) isn't parsed
+      as a delimiter at all. The `` $`…`$ `` code-span form makes Markdown leave
+      the content alone, so it renders regardless of CJK adjacency. Display math
+      stays `$$…$$` on its own line.
+    - *GitHub math is a restricted MathJax subset* — also avoid macros GitHub
+      rejects: `\operatorname` (use `\arg\min`/`\arg\max` or bare `\min`/`\max`),
+      `\lVert`/`\rVert` (use `\|`), sizing prefixes `\big`/`\bigl`/`\Big…` before
+      a delimiter (drop them or use `\left…\right`), and **`\{`/`\}`** (GitHub
+      strips the backslash → `\left\{` becomes invalid `\left{`; use
+      `\lbrace`/`\rbrace`). **Never nest `$…$` inside `$$…$$`** (e.g.
+      `\text{$b$-bit}` → write `b\text{-bit}`) — the inner `$` closes the block
+      early and orphans the following `\left`. After writing, **run
+      `uv run python scripts/check_math.py <file>`** — it flags these failure
+      modes (denylisted macros, stray/unbalanced `$`, `$` hugging CJK, brace and
+      `\left`/`\right` mismatches) with `file:line`. Fix every hit until clean,
+      or the equations show a red error box on GitHub.
   - *Figures*: the arXiv HTML usually has NO embedded figure images (they're
     vector), so grab them from the PDF: `curl -sL https://arxiv.org/pdf/<id> -o
     /tmp/p.pdf`, find each figure's page (`pdftotext -f N -l N … | grep 'Figure K:'`),
