@@ -242,6 +242,39 @@ uv run python -m pipeline.render
 
 ---
 
+## 🧑‍🔬 Interactive skills
+
+Two Claude Code skills live in `skills/` and are symlinked into `~/.claude/skills/` by `install.sh`. Both run **from the repo root** (they read `data/`, `seeds.yaml`, `paper-river/`); `cd` into the repo and start a fresh session so they're picked up.
+
+### paper-triage
+
+Human-in-the-loop curation over the day's digest — accept the good papers into `seeds.yaml` (optionally hand to `quark-wiki`), reject the noise into `data/curation/rejected.jsonl` (optionally tighten the prefilter blacklist). Runs **after** the cron `daily.sh` rendered a digest.
+
+Trigger: `triage papers`, `triage today's digest`, `看今天 radar 的 paper`, `/paper-triage`.
+
+### paper-interpret
+
+Interpret **one** paper on demand — given an arXiv id, URL, or name/acronym. It resolves the paper against the radar archive first (reusing the bilingual summary, scoring, triage history, and any existing paper-river), then produces the interpretation from whichever angles you ask for:
+
+- **中文精读 / 翻译** — hands off to `ljg-read` (伴读 + 英译中).
+- **算法背景 + 原理** — hands off to `ljg-paper` (seven-beat story spine).
+- **Paper-river 溯源** — reads the existing `paper-river/*.org` if present, else runs `ljg-paper-river`.
+- **Radar-native analysis** — same-bucket novelty comparison, direction trend, deployment practicality (from the scored `relevance_breakdown`), and prior triage verdict. This is what no generic reader skill can do.
+
+Trigger: `解读 arXiv:2607.01127`, `翻译并讲讲 LogbQuant 的原理`, `溯源这篇 2606.01412`, `interpret this paper: <id>`, `/paper-interpret <id>`.
+
+The data-gathering layer is a standalone script you can also run directly:
+
+```bash
+uv run python scripts/resolve_paper.py 2607.01127            # readable report
+uv run python scripts/resolve_paper.py GPTQ --json           # machine-readable
+uv run python scripts/resolve_paper.py "logarithmic space" --siblings 8
+```
+
+It resolves local-first (`data/summarized/`), falls back to a live arXiv fetch for ids the radar never surfaced, disambiguates name collisions, and reports scoring + triage status + siblings + bucket trend in one shot.
+
+---
+
 ## 🚀 Setup your own radar
 
 Want to point this at a different topic (RL, robotics, agent evals, …) or run your own fork? See **[SETUP.md](SETUP.md)** — covers Anthropic credentials, prompt retargeting, config knobs, cron / GitHub Actions scheduling.
@@ -291,9 +324,11 @@ llm-paper-radar/
 │   ├── gen_paper_river.sh       # headless wrapper that runs the ljg-paper-river skill
 │   ├── translate_paper_river.py # auto-translate zh paper-river/*.org → _en.org
 │   ├── seed_add.py              # add a paper to seeds.yaml
-│   └── seed_reject.py           # log a paper into data/curation/rejected.jsonl
+│   ├── seed_reject.py           # log a paper into data/curation/rejected.jsonl
+│   └── resolve_paper.py         # resolve arxiv id/name → radar record + triage + siblings (paper-interpret)
 ├── skills/                      # in-repo Claude Code skills (symlinked by install.sh)
-│   └── paper-triage/            # daily triage workflow over the digest queue
+│   ├── paper-triage/            # daily triage workflow over the digest queue
+│   └── paper-interpret/         # on-demand single-paper interpretation (translate/原理/溯源/radar-native)
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
