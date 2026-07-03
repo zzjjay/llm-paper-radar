@@ -58,8 +58,7 @@ GitHub Actions (cron daily 23:00 UTC)
 llm-paper-radar/
 ├── .github/workflows/
 │   ├── daily.yml
-│   ├── weekly.yml
-│   └── cleanup.yml
+│   └── weekly.yml
 ├── sources/
 │   ├── __init__.py
 │   ├── base.py              # Source ABC + unified Paper schema
@@ -81,12 +80,16 @@ llm-paper-radar/
 │   ├── raw/YYYY-MM-DD/      # 7 days, artifact-only
 │   ├── deduped/             # in-flight, not committed
 │   ├── scored/              # 30 days, artifact-only
-│   ├── summarized/YYYY-MM-DD.json   # 90 days, committed
+│   ├── summarized/YYYY-MM-DD.json   # permanent, committed (source for weekly + rollups)
 │   └── seen.json            # cross-day dedup set, committed
 ├── digests/YYYY-MM-DD.md           # permanent, committed
-├── weekly/YYYYMMDD-YYYYMMDD.md     # permanent, committed (full table, every gated paper)
-├── snapshots/YYYYMMDD.md                 # single-day per-run paper-list snapshot
-├── snapshots/YYYYMMDD-YYYYMMDD-Ndays.md  # multi-day rollup snapshot, committed
+├── snapshots/                      # all periodic snapshots, committed
+│   ├── daily/YYYYMMDD.md               # single-day per-run paper-list snapshot
+│   ├── daily/YYYYMMDD-YYYYMMDD-Ndays.md # multi-day rollup snapshot
+│   ├── weekly/YYYYMMDD-YYYYMMDD.md     # 7-day digest (also spliced into README)
+│   ├── monthly/YYYYMMDD-YYYYMMDD.md    # previous calendar month
+│   ├── halfyear/YYYYMMDD-YYYYMMDD.md   # previous half-year (Jan–Jun / Jul–Dec)
+│   └── yearly/YYYYMMDD-YYYYMMDD.md     # previous calendar year
 ├── README.md                       # always = latest digest
 ├── INDEX.md
 ├── pyproject.toml           # uv-managed
@@ -360,13 +363,35 @@ Grouped by month, one line per day:
 - **11+**: table-only
 - No "abstract keywords" column (kept clean)
 
-### Weekly Digest (`weekly/YYYYMMDD-YYYYMMDD.md`)
+### Weekly Digest (`snapshots/weekly/YYYYMMDD-YYYYMMDD.md`)
 
 Produced manually via `uv run python -m pipeline.weekly --end-date YYYY-MM-DD`:
 - All papers from the past 7 days that pass the hard gate (no Top-N cap)
 - Same compact `# | Bucket | Paper | Authors | Date | Why` table as README
-- Why-column links resolve to `../digests/<date>.md#p-<id>`
+- Why-column links resolve to `../../digests/<date>.md#p-<id>`
 - Filename = `<start>-<end>.md` (7 days inclusive, no week-number cadence)
+
+### Periodic roll-ups (`snapshots/<cadence>/YYYYMMDD-YYYYMMDD.md`)
+
+Longer cadences sharing the weekly table format, produced by
+`pipeline.rollup_digest` (wrapped by `scripts/rollup.sh <cadence>`). Each fires
+on the 1st (halfyear also Jul 1), **after** that day's `daily.sh`, over the
+**previous completed calendar period** — not a trailing N days:
+
+| Cadence | Label | Window | Trigger |
+|---|---|---|---|
+| `monthly` | Monthly | previous calendar month | 1st of month |
+| `halfyear` | Half-Year | the half (Jan–Jun / Jul–Dec) that just ended | Jan 1 & Jul 1 |
+| `yearly` | Yearly | previous calendar year | Jan 1 |
+
+- Pure render-from-cache over `data/summarized/` — no fetch, no scoring, no LLM.
+- Archive-only: never spliced into README/INDEX (unlike weekly).
+- **Completeness**: aborts (non-zero exit, nothing committed) if any day inside
+  the window is missing its summarized JSON — no silent partial table.
+- **Truncation**: a window reaching before the earliest available data is
+  clamped up to that date; the file is named by the rendered window and its
+  header carries a `⚠️ Window truncated to data availability` note.
+- `uv run python -m pipeline.rollup_digest --start … --end … --label … --out-dir snapshots/<cadence>` for a manual one-off.
 
 ---
 
@@ -440,7 +465,7 @@ jobs:
         run: |
           git config user.name "llm-paper-radar[bot]"
           git config user.email "actions@github.com"
-          git add digests/ weekly/ README.md INDEX.md data/seen.json data/summarized/
+          git add digests/ snapshots/weekly/ README.md INDEX.md data/seen.json data/summarized/
           git diff --cached --quiet || git commit -m "📚 Daily digest $(date -u +%Y-%m-%d)"
           git push
       - name: Notify Teams on failure
@@ -492,39 +517,18 @@ jobs:
         run: |
           git config user.name "llm-paper-radar[bot]"
           git config user.email "actions@github.com"
-          git add weekly/ INDEX.md
+          git add snapshots/weekly/ INDEX.md
           git diff --cached --quiet || git commit -m "📅 Weekly digest $(date -u +%Y-W%U)"
           git push
 ```
 
-### `.github/workflows/cleanup.yml`
-
-```yaml
-name: Cleanup old data
-
-on:
-  schedule:
-    - cron: '0 22 * * 0'   # Sundays UTC 22:00
-
-permissions:
-  contents: write
-
-jobs:
-  cleanup:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Remove summarized data older than 90 days
-        run: |
-          find data/summarized/ -type f -mtime +90 -delete
-      - name: Commit
-        run: |
-          git config user.name "llm-paper-radar[bot]"
-          git config user.email "actions@github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "🧹 Cleanup old summarized data"
-          git push
-```
+> **No cleanup workflow.** `data/summarized/` is retained permanently — it is
+> the render-from-cache source for the weekly digest and the monthly/half-year/
+> yearly rollups, so a yearly rollup needs ≥ 365 days of it on disk. (Earlier
+> revisions pruned it after 90 days via a `cleanup.yml`; that was removed once
+> the long-cadence rollups landed.) The gitignored artifact dirs
+> (`data/raw|deduped|scored/`) are not committed, so nothing in the repo needs
+> periodic pruning.
 
 ### Secrets
 
@@ -613,16 +617,23 @@ seeds:
 |------|-----------|-----------|
 | `digests/YYYY-MM-DD.md` | permanent | yes |
 | `weekly/YYYYMMDD-YYYYMMDD.md` | permanent | yes |
+| `rollups/<cadence>/YYYYMMDD-YYYYMMDD.md` (monthly/halfyear/yearly) | permanent | yes |
 | `snapshots/YYYYMMDD.md` (single-day) / `snapshots/YYYYMMDD-YYYYMMDD-Ndays.md` (multi-day) | permanent | yes |
 | `README.md` | always overwritten with latest | yes |
 | `INDEX.md` | permanent (grows over time) | yes |
 | `data/seen.json` | permanent (~50KB/year) | yes |
-| `data/summarized/YYYY-MM-DD.json` | 90 days (sliding via cleanup workflow) | yes |
+| `data/summarized/YYYY-MM-DD.json` | permanent (render-from-cache source for weekly + rollups) | yes |
 | `data/scored/YYYY-MM-DD.json` | 14 days | artifact only (`pipeline-debug`) |
 | `data/deduped/YYYY-MM-DD.json` | 14 days | artifact only (`pipeline-debug`) |
 | `data/raw/YYYY-MM-DD/*.json` | 7 days | artifact only (per-source) |
 
-**Repo size projection**: <50MB after 3–5 years.
+**Repo size projection**: `data/summarized/` is now retained permanently (it
+is the render source for weekly + the monthly/half-year/yearly rollups), at
+~0.9 MB/day ≈ **320 MB/year**. Everything else (digests, weekly, rollups,
+INDEX, seen.json) is comparatively small. Plan for a working tree on the order
+of ~1 GB after ~3 years; if that becomes a problem, prefer a bounded retention
+(e.g. keep ≥ 400 days so the yearly rollup still has a full window) over
+dropping back to a 90-day prune.
 
 ---
 
@@ -664,7 +675,7 @@ gh run watch
 | arXiv API outage | Low | Other Tier 1 source (HF Daily) still works |
 | arXiv throttle returning empty feeds instead of 429 | Medium | `sources/arxiv.py` page-0 validator inspects `<opensearch:totalResults>` to tell a genuine zero day (e.g. quiet weekend) from a throttle: `=0` accepted with a logged "0 papers" reason; missing/non-zero promoted to `ArxivEmptyResponse`, retried inside the same 10-min backoff budget, and raised if persistent so the day is skipped without overwriting existing data |
 | LLM hallucinates relevance | Medium | Threshold + reason field allows audit; can adjust prompt |
-| Repo grows unbounded | Low | Sliding retention + cleanup workflow |
+| Repo grows unbounded | Medium | `data/summarized/` retained permanently for rollups (~320 MB/yr); raw/deduped/scored gitignored. Bound via ≥400-day retention if needed |
 | Cost overrun (>$25/mo) | Low | Hard concurrency limits; can tighten threshold to ≥8 |
 
 ---

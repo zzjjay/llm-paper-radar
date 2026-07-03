@@ -1,4 +1,10 @@
-"""7-day rollup digest as a single compact table; emits weekly/YYYYMMDD-YYYYMMDD.md and splices the same table into README.md (between the WEEKLY markers)."""
+"""7-day rollup digest as a single compact table: emits
+weekly/YYYYMMDD-YYYYMMDD.md and splices the same table into README.md (between
+the WEEKLY markers).
+
+The window-loading (`_collect`) and table-rendering (`_render_table`) helpers are
+reused by `pipeline.rollup_digest` for the longer monthly / half-year / yearly
+cadences, so keep them cadence-agnostic."""
 
 from __future__ import annotations
 
@@ -19,6 +25,51 @@ def _passed_gate(p: Paper) -> bool:
     return not bd.get("hard_gate", False)
 
 
+def _collect(
+    summarized_root: Path,
+    start_date: datetime,
+    end_date: datetime,
+    *,
+    require_complete: bool = False,
+) -> tuple[list[Paper], dict[str, str]]:
+    """Load summarized papers for the inclusive window [start_date, end_date],
+    keeping each paper's best-scoring appearance and the digest date it came
+    from. Returns (sorted_papers, digest_date_by_id).
+
+    With `require_complete=True`, raises SystemExit listing every day in the
+    window that is missing its `summarized/YYYY-MM-DD.json` — used by the
+    monthly/half-year/yearly rollups so a pipeline gap never silently produces
+    a partial table. Weekly leaves it False (tolerates the occasional gap)."""
+    by_id: dict[str, tuple[Paper, str]] = {}
+    missing: list[str] = []
+    cursor = start_date
+    while cursor <= end_date:
+        date_str = cursor.strftime("%Y-%m-%d")
+        f = summarized_root / f"{date_str}.json"
+        if not f.exists():
+            missing.append(date_str)
+            cursor += timedelta(days=1)
+            continue
+        for item in json.loads(f.read_text()):
+            p = Paper.model_validate(item)
+            prev = by_id.get(p.id)
+            if not prev or (p.relevance_score or 0) > (prev[0].relevance_score or 0):
+                by_id[p.id] = (p, date_str)
+        cursor += timedelta(days=1)
+
+    if require_complete and missing:
+        raise SystemExit(
+            f"rollup aborted: {len(missing)} day(s) in "
+            f"{start_date.date()} → {end_date.date()} missing summarized JSON: "
+            f"{', '.join(missing)}"
+        )
+
+    surviving = [(p, d) for p, d in by_id.values() if _passed_gate(p)]
+    digest_date_by_id = {p.id: d for p, d in surviving}
+    sorted_papers = sorted((p for p, _ in surviving), key=_bucket_sort_key)
+    return sorted_papers, digest_date_by_id
+
+
 def _render_table(
     sorted_papers: list[Paper],
     digest_date_by_id: dict[str, str],
@@ -26,15 +77,23 @@ def _render_table(
     end_date: datetime,
     digest_prefix: str,
     digests_dir: Path,
+    label: str = "Weekly",
+    note: str | None = None,
 ) -> str:
-    """Build the compact weekly table. `digest_prefix` is the path to the
+    """Build the compact digest table. `digest_prefix` is the path to the
     digests/ dir relative to wherever the table will live (`../digests/` for
-    the weekly/ file, `digests/` for the repo-root README). `digests_dir` is
-    the on-disk path used to check for an `_en` sibling, so the Why-column can
-    render the symmetric `[zh] · [en]` link like the daily and INDEX tables."""
+    the weekly/ file, `digests/` for the repo-root README, `../../digests/` for
+    a rollups/<cadence>/ file). `digests_dir` is the on-disk path used to check
+    for an `_en` sibling, so the Why-column can render the symmetric
+    `[zh] · [en]` link like the daily and INDEX tables. `label` sets the digest
+    heading ("Weekly" / "Monthly" / "Half-Year" / "Yearly"); `note`, if given,
+    is emitted as a blockquote under the count (used to flag a truncated
+    window)."""
     body: list[str] = []
-    body.append(f"# Weekly Digest · {start_date.date()} → {end_date.date()}\n")
+    body.append(f"# {label} Digest · {start_date.date()} → {end_date.date()}\n")
     body.append(f"> Surfaced: {len(sorted_papers)} papers\n")
+    if note:
+        body.append(f"> {note}\n")
     body.append("| # | Bucket | Paper | Authors | Date | Why |")
     body.append("|---|--------|-------|---------|------|-----|")
     for i, p in enumerate(sorted_papers, start=1):
@@ -56,32 +115,17 @@ def render_weekly(
     readme_path: Path | None = None,
     digests_dir: Path | None = None,
 ) -> None:
-    # digests/ sits at the repo root, sibling to weekly/ (out_dir).
+    # digests/ is always at the repo root regardless of out_dir depth.
     if digests_dir is None:
-        digests_dir = out_dir.parent / "digests"
-    # Track each paper's best score AND the digest date it came from, so the
-    # Why-column link points to the correct daily digest file.
-    by_id: dict[str, tuple[Paper, str]] = {}
-    for d in range(7):
-        date = end_date - timedelta(days=d)
-        date_str = date.strftime("%Y-%m-%d")
-        f = summarized_root / f"{date_str}.json"
-        if not f.exists():
-            continue
-        for item in json.loads(f.read_text()):
-            p = Paper.model_validate(item)
-            prev = by_id.get(p.id)
-            if not prev or (p.relevance_score or 0) > (prev[0].relevance_score or 0):
-                by_id[p.id] = (p, date_str)
-
-    surviving = [(p, d) for p, d in by_id.values() if _passed_gate(p)]
-    digest_date_by_id = {p.id: d for p, d in surviving}
-    sorted_papers = sorted((p for p, _ in surviving), key=_bucket_sort_key)
+        digests_dir = Path("digests")
 
     start_date = end_date - timedelta(days=6)
+    sorted_papers, digest_date_by_id = _collect(summarized_root, start_date, end_date)
+
     fname = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}.md"
 
-    # weekly/<file>.md → ../digests/<date>.md
+    # Link prefix: depth of out_dir levels back to repo root, then digests/.
+    digest_prefix = "../" * len(out_dir.parts) + "digests/"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / fname).write_text(
         _render_table(
@@ -89,7 +133,7 @@ def render_weekly(
             digest_date_by_id,
             start_date,
             end_date,
-            "../digests/",
+            digest_prefix,
             digests_dir,
         )
     )
@@ -115,7 +159,7 @@ if __name__ == "__main__":
     @click.command()
     @click.option("--end-date", default=None)
     @click.option("--in-root", default="data/summarized", type=click.Path(path_type=Path))
-    @click.option("--out-dir", default="weekly", type=click.Path(path_type=Path))
+    @click.option("--out-dir", default="snapshots/weekly", type=click.Path(path_type=Path))
     @click.option("--readme", default="README.md", type=click.Path(path_type=Path))
     def main(end_date, in_root, out_dir, readme):
         load_config()
