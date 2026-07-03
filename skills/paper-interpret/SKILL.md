@@ -101,17 +101,24 @@ Only this repo has the scored archive. When relevant, add:
 
 ## Output location
 
-- **Radar-native analysis (D)** and the resolver's data → rendered in the chat
-  only, not written to disk.
-- **Paper-river 溯源 (C)** → the repo's `paper-river/<acronym>-<arxiv-id>.org`
-  (see step 2C), so it joins the radar archive and gets committed / linked from
-  digests. If you generated a zh original and the user wants English too, mirror
-  the cron convention and write an `_en.org` sibling.
-- **中文精读 (A)** and **原理故事 (B)** → these ride the generic sub-skills'
-  native Denote habit (`~/Documents/notes/{时间戳}--…__paper.org` /
-  `…__reading.org`), since the repo has no home for them. Tell the user the path
-  the sub-skill saved to. If the user asks to keep everything in the repo, save
-  a copy under `paper-river/` too and say so.
+Everything the skill produces is archived **in this repo** — override each
+sub-skill's default `~/Documents/notes/` output path and Write to the repo
+instead. Naming mirrors the radar's `<acronym>-<arxiv-id>` convention (dot form,
+`<acronym>` = the paper's short name/acronym).
+
+- **Paper-river 溯源 (C)** → `paper-river/<acronym>-<arxiv-id>.org`, plus an
+  `_en.org` English sibling (translate the zh original, same as the cron). Reuse
+  an existing file instead of regenerating.
+- **中文精读 / 翻译 (A)** → `interpretations/<acronym>-<arxiv-id>__reading.org`
+  (pass ljg-read this exact path to Write).
+- **原理故事 (B)** → `interpretations/<acronym>-<arxiv-id>__paper.org`
+  (same path override for ljg-paper).
+- **Radar-native analysis (D)** → `interpretations/<acronym>-<arxiv-id>__radar.org`,
+  written by this skill itself (same-bucket novelty, trend, practicality, triage
+  verdict); also echo the key points in chat.
+
+Create the `interpretations/` directory if it doesn't exist, and tell the user
+each path you saved to.
 
 ## Output
 
