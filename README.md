@@ -258,10 +258,10 @@ Interpret **one** paper on demand — given an arXiv id, URL, or name/acronym. I
 
 - **中文精读 / 翻译** — hands off to `ljg-read` (伴读 + 英译中).
 - **算法背景 + 原理** — hands off to `ljg-paper` (seven-beat story spine).
-- **Paper-river lineage** — reads the existing `paper-river/*.org` if present, else runs `ljg-paper-river`.
+- **Paper-river** — reads the existing `paper-river/*.org` lineage analysis if present, else runs `ljg-paper-river`.
 - **Radar-native analysis** — same-bucket novelty comparison, direction trend, deployment practicality (from the scored `relevance_breakdown`), and prior triage verdict. This is what no generic reader skill can do.
 
-Output is archived in the repo: lineage → `paper-river/<acronym>-<id>.org` (+ `_en.org` English sibling); the other angles go into a per-paper folder `interpretations/<acronym>-<id>/` as `reading.org` (translation), `paper.org` (principle), `radar.org` (radar-native analysis).
+Output is archived in the repo: the paper-river analysis → `paper-river/<acronym>-<id>.org` (+ `_en.org` English sibling); the other angles go into a per-paper folder `interpretations/<acronym>-<id>/` as `reading.org` (translation), `paper.org` (principle), `radar.org` (radar-native analysis).
 
 Trigger: `解读 arXiv:2607.01127`, `翻译并讲讲 LogbQuant 的原理`, `溯源这篇 2606.01412`, `interpret this paper: <id>`, `/paper-interpret <id>`.
 
