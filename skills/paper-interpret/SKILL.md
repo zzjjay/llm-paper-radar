@@ -75,7 +75,11 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
 - **C. Paper-river 溯源 (倒读法)** — if the resolver reports an existing
   `paper-river/*.org`, **read and present that** rather than regenerating. If
   none exists and the user wants it, hand off to **`ljg-paper-river`** on the
-  arXiv URL. (Generating fresh is ~5-10 min of web research — tell the user.)
+  arXiv URL, but **override its default output path**: save the result into this
+  repo as `paper-river/<acronym>-<arxiv-id>.org` (dot form, same convention as
+  the cron `gen_paper_river.sh`), NOT the skill's default `~/Documents/notes/`.
+  Use the paper's short acronym for `<acronym>`. (Generating fresh is ~5-10 min
+  of web research — tell the user.)
 - **D. Radar-native analysis** (this skill's unique value — see below).
 
 ## Step 3 — radar-native analysis (the part no generic skill can do)
@@ -94,6 +98,20 @@ Only this repo has the scored archive. When relevant, add:
 4. **是否已被 triage** — if accepted (seed) or rejected, surface the prior human
    verdict and reason so the user doesn't relitigate it. If rejected, lead with
    why the radar's curator passed on it.
+
+## Output location
+
+- **Radar-native analysis (D)** and the resolver's data → rendered in the chat
+  only, not written to disk.
+- **Paper-river 溯源 (C)** → the repo's `paper-river/<acronym>-<arxiv-id>.org`
+  (see step 2C), so it joins the radar archive and gets committed / linked from
+  digests. If you generated a zh original and the user wants English too, mirror
+  the cron convention and write an `_en.org` sibling.
+- **中文精读 (A)** and **原理故事 (B)** → these ride the generic sub-skills'
+  native Denote habit (`~/Documents/notes/{时间戳}--…__paper.org` /
+  `…__reading.org`), since the repo has no home for them. Tell the user the path
+  the sub-skill saved to. If the user asks to keep everything in the repo, save
+  a copy under `paper-river/` too and say so.
 
 ## Output
 
