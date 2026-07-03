@@ -1,33 +1,39 @@
 # interpretations
 
-On-demand single-paper interpretations produced by the `paper-interpret` skill
-(see `skills/paper-interpret/`). Each paper gets its own folder named with the
-radar's `<acronym>-<arxiv-id>` convention, holding one file per angle:
+On-demand single-paper interpretations from the `paper-interpret` skill
+(`skills/paper-interpret/`). One folder per paper, named `<acronym>-<arxiv-id>/`.
+
+## Layout
 
 ```
-interpretations/
-└── <acronym>-<arxiv-id>/
-    ├── README.md          # hub: radar-native analysis + nav to the files below and to lineage/data source
-    │                      #      (GitHub renders this by default when the folder is opened)  (paper-interpret itself)
-    ├── reading.org        # Chinese close-reading / 伴读 (selective, bilingual on skeleton passages)  (ljg-read)
-    ├── paper.org          # background + mechanism (seven-beat story)  (ljg-paper)
-    ├── translation_zh.md  # full section-by-section Chinese digest (all sections + appendices, paraphrased);
-    │                      #   Markdown so GitHub renders formulas/tables  (Sonnet subagent)
-    └── images/            # figures cropped from the PDF (referenced by translation_zh.md)
+<acronym>-<arxiv-id>/
+├── README.md          hub — always present
+├── reading.org        伴读 (ljg-read)          — optional
+├── paper.org          seven-beat story (ljg-paper) — optional
+├── translation_zh.md  full Chinese digest (Sonnet) — optional
+└── images/            figures cropped from the PDF
 ```
 
-Angle files default to `.org` (伴读 / story, since the `ljg-*` skills emit org).
-The full digest uses `.md` because GitHub only renders LaTeX math and native
-tables in Markdown — but note that even in Markdown you must use the
-Markdown-inert math forms (inline `` $`…`$ ``, display ` ```math ` fenced blocks);
-plain `$…$` / `$$…$$` get mangled by GitHub's Markdown pass. `scripts/check_math.py`
-lints for this.
+| File | Angle | Producer |
+|------|-------|----------|
+| `README.md` | Hub: radar-native analysis (novelty / trend / practicality / triage) + nav to the files below, the `../paper-river/` lineage, and the `data/summarized/` source | paper-interpret |
+| `reading.org` | Chinese close-reading, selective, bilingual on key passages | ljg-read |
+| `paper.org` | Background + mechanism, told as a story | ljg-paper |
+| `translation_zh.md` | Every section + appendix in Chinese, paraphrased (not a verbatim translation) | Sonnet subagent |
 
-`README.md` is the paper's hub and is always present; the other files are only
-generated when their angle is requested (the hub's nav lists only what exists).
+Only `README.md` is guaranteed; the rest are generated per requested angle, and
+the hub's nav lists only what exists.
 
-Deep-lineage "倒读法" analyses live in `../paper-river/` instead
-(`<acronym>-<id>.org` + `_en.org`), matching the cron pipeline's archive.
+## Conventions
 
-These files are written on demand and committed with the repo, unlike the
-sub-skills' default `~/Documents/notes/` Denote location.
+- **`README.md` is the hub** — GitHub auto-renders it on folder open; keep its
+  nav in sync when angle files are added.
+- **Format** — angle files are `.org` (the `ljg-*` skills emit org); the digest
+  is `.md` so GitHub renders its math and tables.
+- **Math must be Markdown-inert** — inline `` $`…`$ ``, display ` ```math ` fences.
+  Plain `$…$` / `$$…$$` get mangled by GitHub's Markdown pass (eaten underscores,
+  collapsed `\\`, dropped `\{`). `scripts/check_math.py` lints for this.
+- **Lineage lives elsewhere** — 倒读法 analyses are in `../paper-river/`
+  (`<acronym>-<id>.org` + `_en.org`), from the cron pipeline.
+- Everything here is committed with the repo, unlike the sub-skills' default
+  `~/Documents/notes/`.
