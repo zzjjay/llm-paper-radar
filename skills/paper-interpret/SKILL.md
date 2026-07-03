@@ -103,11 +103,12 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
       delimiter (drop them, or use `\left…\right`). Also **never nest `$…$`
       inside a `$$…$$` block** — e.g. `\text{$b$-bit}` — the inner `$` closes the
       outer math span early and orphans whatever follows (a `\left` then errors);
-      write `b\text{-bit}` instead. After writing, grep the file for
-      `\operatorname|lVert|rVert|\\big`, and check every `$$…$$` line has no
-      stray `$` inside plus that the file's total `$` count is even; fix any
-      hits, or the equations show a red "macro not allowed / unrecognized
-      delimiter" error on GitHub.
+      write `b\text{-bit}` instead. After writing, **run
+      `uv run python scripts/check_math.py <file>`** — it flags exactly these
+      GitHub failure modes (denylisted macros, stray/unbalanced `$`, brace and
+      `\left`/`\right` mismatches) with `file:line`. Fix every hit until it
+      reports clean, or the equations show a red "macro not allowed /
+      unrecognized delimiter" error on GitHub.
   - *Figures*: the arXiv HTML usually has NO embedded figure images (they're
     vector), so grab them from the PDF: `curl -sL https://arxiv.org/pdf/<id> -o
     /tmp/p.pdf`, find each figure's page (`pdftotext -f N -l N … | grep 'Figure K:'`),

@@ -327,7 +327,8 @@ llm-paper-radar/
 │   ├── translate_paper_river.py # auto-translate zh paper-river/*.org → _en.org
 │   ├── seed_add.py              # add a paper to seeds.yaml
 │   ├── seed_reject.py           # log a paper into data/curation/rejected.jsonl
-│   └── resolve_paper.py         # resolve arxiv id/name → radar record + triage + siblings (paper-interpret)
+│   ├── resolve_paper.py         # resolve arxiv id/name → radar record + triage + siblings (paper-interpret)
+│   └── check_math.py            # lint LaTeX math in .md for GitHub's restricted renderer (paper-interpret)
 ├── skills/                      # in-repo Claude Code skills (symlinked by install.sh)
 │   ├── paper-triage/            # daily triage workflow over the digest queue
 │   └── paper-interpret/         # on-demand single-paper interpretation (translate/principle/lineage/radar-native)
