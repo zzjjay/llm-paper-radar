@@ -81,6 +81,27 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
   Use the paper's short acronym for `<acronym>`. (Generating fresh is ~5-10 min
   of web research — tell the user.)
 - **D. Radar-native analysis** (this skill's unique value — see below).
+- **E. 全文中文详解** — when the user wants the *whole* paper in Chinese, NOT
+  the selective 伴读 of (A). Two hard rules:
+  - *Copyright*: arXiv papers are usually under arXiv's non-exclusive license
+    (check the license on the abstract page — only CC-BY/CC0 permit a verbatim
+    full translation). Under the default license, do **not** produce a
+    clause-by-clause translation of the whole paper. Produce a **section-by-section
+    Chinese explanation in your own words** (复述) instead — full coverage of
+    every section + appendix, with tables/numbers/formulas reproduced verbatim
+    (facts and LaTeX aren't the copyrightable expression). Name the file to
+    reflect that it's a digest, not a 1:1 translation.
+  - *Mechanics*: this is a long output (~30k-token papers). Delegate to a
+    **Sonnet subagent** (translation needs language, not Opus-level reasoning —
+    cheaper, and it isolates the full text from the main context). Fetch the
+    full text yourself first via `curl https://arxiv.org/html/<id>vN` (the
+    pipeline fetchers only grab metadata, never the body — nothing to reuse),
+    strip tags to a temp text file, and hand that path to the subagent. Tell
+    the subagent to **write the file incrementally** (Write the front matter +
+    first sections, then Edit-append each remaining section/appendix), because a
+    single huge streamed Write tends to stall mid-response. Note: SKILL guidance
+    is soft — if a run still stalls, resume the subagent and have it append the
+    rest; the partial file on disk is the checkpoint.
 
 ## Step 3 — radar-native analysis (the part no generic skill can do)
 
@@ -117,6 +138,9 @@ name.
   - **Radar-native analysis (D)** → `radar.org`, written by this skill itself
     (same-bucket novelty, trend, practicality, triage verdict); also echo the
     key points in chat.
+  - **全文中文详解 (E)** → `translation_zh.org` (per the copyright/mechanics
+    rules in step 2E; open the file with a line noting it is a paraphrased
+    section digest, not a verbatim translation).
 
 Tell the user each path you saved to.
 
