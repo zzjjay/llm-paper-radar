@@ -131,16 +131,27 @@ name.
   `_en.org` English sibling (translate the zh original, same as the cron). Reuse
   an existing file instead of regenerating.
 - **The other angles share one per-paper folder** `interpretations/<acronym>-<arxiv-id>/`
-  (create it if missing). One file per angle inside it:
-  - **中文精读 / 翻译 (A)** → `reading.org` (pass ljg-read this exact path to Write).
+  (create it if missing). Inside it:
+  - **`README.md` — the hub / 总入口** (always write/update this; it is what
+    GitHub auto-renders when someone opens the folder — NOT `radar.org` or any
+    other name). It holds:
+    - the **radar-native analysis (D)** itself (same-bucket novelty, trend,
+      practicality, triage verdict), written by this skill in Markdown;
+    - a **navigation section** linking every angle file that exists in the
+      folder (`paper.org`, `reading.org`, `translation_zh.org`), plus the
+      paper-river lineage (`../../paper-river/<acronym>-<id>.org` + `_en.org`)
+      and the radar data source (`../../data/summarized/<date>.json`);
+    - the paper's abs / PDF / code links.
+    Also echo the key D points in chat.
+  - **中文精读 / 伴读 (A)** → `reading.org` (pass ljg-read this exact path to Write).
   - **原理故事 (B)** → `paper.org` (same path override for ljg-paper; if it
     extracts an overview image, put it in the same folder).
-  - **Radar-native analysis (D)** → `radar.org`, written by this skill itself
-    (same-bucket novelty, trend, practicality, triage verdict); also echo the
-    key points in chat.
   - **全文中文详解 (E)** → `translation_zh.org` (per the copyright/mechanics
     rules in step 2E; open the file with a line noting it is a paraphrased
     section digest, not a verbatim translation).
+
+  Whenever you add or regenerate an angle file, update `README.md`'s navigation
+  section so the hub always reflects what's actually in the folder.
 
 Tell the user each path you saved to.
 

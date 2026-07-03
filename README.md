@@ -261,7 +261,7 @@ Interpret **one** paper on demand — given an arXiv id, URL, or name/acronym. I
 - **Paper-river** — reads the existing `paper-river/*.org` lineage analysis if present, else runs `ljg-paper-river`.
 - **Radar-native analysis** — same-bucket novelty comparison, direction trend, deployment practicality (from the scored `relevance_breakdown`), and prior triage verdict. This is what no generic reader skill can do.
 
-Output is archived in the repo: the paper-river analysis → `paper-river/<acronym>-<id>.org` (+ `_en.org` English sibling); the other angles go into a per-paper folder `interpretations/<acronym>-<id>/` as `reading.org` (translation), `paper.org` (principle), `radar.org` (radar-native analysis).
+Output is archived in the repo: the paper-river analysis → `paper-river/<acronym>-<id>.org` (+ `_en.org` English sibling); the other angles go into a per-paper folder `interpretations/<acronym>-<id>/` whose `README.md` is the hub (radar-native analysis + navigation, auto-rendered on GitHub), alongside `reading.org` (伴读), `paper.org` (principle), `translation_zh.org` (full-text digest).
 
 Trigger: `解读 arXiv:2607.01127`, `翻译并讲讲 LogbQuant 的原理`, `溯源这篇 2606.01412`, `interpret this paper: <id>`, `/paper-interpret <id>`.
 
@@ -331,7 +331,7 @@ llm-paper-radar/
 ├── skills/                      # in-repo Claude Code skills (symlinked by install.sh)
 │   ├── paper-triage/            # daily triage workflow over the digest queue
 │   └── paper-interpret/         # on-demand single-paper interpretation (translate/principle/lineage/radar-native)
-├── interpretations/             # paper-interpret output: <acronym>-<id>/{reading,paper,radar}.org (per-paper folder)
+├── interpretations/             # paper-interpret output: <acronym>-<id>/README.md hub + reading/paper/translation_zh .org
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
