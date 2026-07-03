@@ -96,6 +96,13 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
     repo; `.org` renders neither. Do **not** use HTML — GitHub shows `.html` as
     source, not rendered. Open the file with a line noting it's a paraphrased
     section digest, not a verbatim translation.
+    - *GitHub math is a restricted MathJax subset* — tell the subagent (and
+      check afterwards) to avoid macros GitHub rejects: `\operatorname` (use
+      `\arg\min`, `\arg\max`, or a bare `\min`/`\max`), `\lVert`/`\rVert` (use
+      `\|`), and sizing prefixes `\big`/`\bigl`/`\bigr`/`\Big…` before a
+      delimiter (drop them, or use `\left…\right`). After writing, grep the file
+      for `\operatorname|lVert|rVert|\\big` and fix any hits, or the equations
+      show a red "macro not allowed / unrecognized delimiter" error on GitHub.
   - *Figures*: the arXiv HTML usually has NO embedded figure images (they're
     vector), so grab them from the PDF: `curl -sL https://arxiv.org/pdf/<id> -o
     /tmp/p.pdf`, find each figure's page (`pdftotext -f N -l N … | grep 'Figure K:'`),
