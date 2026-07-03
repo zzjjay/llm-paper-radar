@@ -102,8 +102,12 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
       always: with plain `$…$`, underscores get eaten as emphasis (`\mathcal{G}_b`
       → `\mathcal{G}b`) and a `$` hugging CJK punctuation (`$x$，`) isn't parsed
       as a delimiter at all. The `` $`…`$ `` code-span form makes Markdown leave
-      the content alone, so it renders regardless of CJK adjacency. Display math
-      stays `$$…$$` on its own line.
+      the content alone, so it renders regardless of CJK adjacency.
+    - *Display math: use a ` ```math ` fenced block*, **not** `$$…$$`. GitHub runs
+      Markdown backslash-processing inside `$$…$$`, which collapses `\\` → `\` and
+      breaks the row separators in `cases` / `matrix` / `aligned` (rows merge onto
+      one line). A ` ```math ` code fence is Markdown-inert, so `\\` and `\{`
+      survive. One equation (or `\qquad`-separated group) per fence.
     - *GitHub math is a restricted MathJax subset* — also avoid macros GitHub
       rejects: `\operatorname` (use `\arg\min`/`\arg\max` or bare `\min`/`\max`),
       `\lVert`/`\rVert` (use `\|`), sizing prefixes `\big`/`\bigl`/`\Big…` before

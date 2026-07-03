@@ -60,10 +60,19 @@ def _iter_math_spans(text: str):
     """
     spans = []
     masked = list(text)
+
+    def _mask(a: int, b: int) -> None:
+        for i in range(a, b):
+            masked[i] = " " if text[i] != "\n" else "\n"
+
+    # ```math … ``` fenced display blocks (the robust GitHub form).
+    for m in re.finditer(r"```math\n(.*?)\n```", text, flags=re.DOTALL):
+        spans.append(("display", m.group(1), m.start()))
+        _mask(m.start(), m.end())
+    # legacy $$ … $$ display blocks (should be migrated to fences).
     for m in re.finditer(r"\$\$(.+?)\$\$", text, flags=re.DOTALL):
         spans.append(("display", m.group(1), m.start()))
-        for i in range(m.start(), m.end()):
-            masked[i] = " " if text[i] != "\n" else "\n"
+        _mask(m.start(), m.end())
     masked_text = "".join(masked)
     # Inline: single $ not adjacent to another $.
     for m in re.finditer(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", masked_text, flags=re.DOTALL):
