@@ -1,0 +1,224 @@
+#+title:      MosaicKV: Serving Long-Context LLM with Dynamic Two-D KV Cache Compression
+#+date:       [2026-07-02 Thu 12:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260702T120000-en
+#+source:     https://arxiv.org/abs/2607.00760
+#+authors:    Sheng Qiang, Ruiwei Chen, Yinpeng Wu, Jinyu Gu, Zhichao Hua, Yubin Xia, Binyu Zang, Haibo Chen
+#+venue:      arXiv 2026
+
+* The Problem River
+
+Feed a million tokens to a large language model — how do you keep GPU memory from exploding, while preserving accuracy and throughput?
+
+The KV Cache is the model's working memory during inference: every token the model sees requires storing the corresponding key and value vectors, and every generated word has to consult that record. The size of that record grows linearly with sequence length — 100K tokens already demands tens of gigabytes; 1M tokens demands hundreds. Even the best H800 only has 80 GB.
+
+Making that record compact without distorting it is the central challenge of this research line. Researchers have come one after another, each wielding a different pair of scissors cutting in a different direction. The final question is: how do you cut from two directions at once without shredding the book?
+
+* Lineage Map
+
+#+begin_example
+[2023.06] H2O -- NeurIPS 2023 (arxiv: 2306.14048)
+  |
+  | Problem: Storing full KV Cache causes memory to explode linearly with sequence length
+  | Solution: Attention follows a power law; keep only "Heavy Hitter" tokens (sequence dimension)
+  v
+[2023.09] StreamingLLM -- ICLR 2024 (arxiv: 2309.17453)  [parallel branch]
+  |
+  | Problem: Sliding window collapses the moment initial tokens are evicted
+  | Solution: Discover "attention sinks"; fix 4 anchor tokens + sliding window
+  v
+         [Sequence dimension near its limit] + [Channel dimension untouched]
+  |
+[2024.02] KIVI -- ICML 2024 (arxiv: 2402.02750)
+  |
+  | Problem: Sequence compression has a hard floor; compress the numbers themselves instead
+  | Solution: Quantize keys per-channel at 2-bit, values per-token (channel dimension)
+  v
+[2024.10] ShadowKV (arxiv: 2410.21465)
+  |
+  | Problem: Either dimension alone cannot handle 1M tokens; they must be combined
+  | Solution: SVD to compress keys + sparse token selection + offload values to CPU (serial stack)
+  v
+[2026.07] MosaicKV -- target paper (arxiv: 2607.00760)
+      Problem: A single global policy ignores non-uniformity inside KV Cache;
+               naive 2D combination degrades accuracy
+      Solution: Per-segment dynamic selection of sequence/channel compression ratios (joint optimization)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023.06 | H2O: Attention Follows a Power Law — Keep Only the Important Tokens
+
+*** What Problem It Saw
+
+Inference service providers faced a dead end: longer context meant higher memory costs, but you could never know in advance which tokens would still be needed later, so everything had to be kept. A single 80 GB A100, after loading the weights of a 7B model, had only twenty-to-thirty gigabytes left for the KV Cache — enough to store about 50K tokens of history. Exceed that, and you either crash or page to CPU, at which point throughput immediately collapses.
+
+Nobody had investigated which tokens were actually being used.
+
+*** Its Solution
+
+The H2O researchers did something straightforward: they pulled out the attention matrix and stared at it, and found that attention scores follow a power law — a small fraction of tokens captures most of the attention weight, while the rest are nearly ignored. These "Heavy Hitter" tokens are not random; they tend to correspond to semantically critical words and frequently co-occurring terms.
+
+H2O therefore proposed a dynamic eviction tournament: maintain a fixed-size KV Cache, and whenever a new token arrives, evict whichever token has accumulated the lowest attention score. Whoever gets used least, gets dropped.
+
+This is compression along the *sequence dimension*: it does not alter the precision of any individual vector; it simply decides which tokens' vectors to retain.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because attention really is extremely sparse — on models such as OPT and LLaMA, over 95% of attention weight concentrates on 5% of tokens. H2O reduced the KV Cache to 5% of its original size with almost no accuracy drop, and achieved 29× throughput improvement over DeepSpeed and HuggingFace Accelerate.
+
+But the hole is right there. Sequence-dimension compression has a hard floor: you always have to keep some tokens, or the model completely loses its memory. As context grows from 100K to 1M tokens, even keeping just 1% of tokens still means 10K absolute tokens remaining, so the memory pressure is not fundamentally relieved. Worse, the eviction policy depends on accumulated attention scores, which is expensive to compute in streaming inference — and there is a counterintuitive phenomenon: no matter how semantically bland the initial tokens are, their attention scores are always strangely high. Why?
+
+** 2023.09 | StreamingLLM: Initial Tokens Are the Attention "Sink" — Never Evict Them
+
+*** What Problem It Saw
+
+Sliding-window attention (keeping only the most recent N tokens) is the most natural streaming compression scheme, but it has a peculiar cliff: once sequence length exceeds the window size, accuracy collapses catastrophically — not a smooth degradation, but an abrupt drop. Why?
+
+H2O had also noticed something odd: initial tokens consistently ranked at the top of the Heavy Hitter list, even when they were punctuation marks or meaningless preamble words. That made no logical sense.
+
+*** Its Solution
+
+Researchers at MIT found the answer. In autoregressive language models, initial tokens are visible to every subsequent token; after extended training, the model deposits its "spare" attention weight into those positions — like tossing loose change into a communal jar. These tokens are "Attention Sinks": what they carry is the normalization requirement of the attention distribution, not genuine semantic dependency.
+
+Once a sliding window evicts these anchor points, the attention distribution loses its normalization ground, the softmax warps, and accuracy avalanches.
+
+StreamingLLM's solution is therefore minimal: always retain the KV of the first 4 sink tokens plus the KV of the most recent N tokens. This enables infinite streaming generation without fine-tuning; LLaMA-2 remains stable across 4M tokens.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked because it explained the prior anomaly and offered a clean fix. In streaming settings it is 22× faster than recomputing with a sliding window.
+
+But StreamingLLM is a *fixed policy*: which tokens are retained is hard-coded and does not adapt to content. It solved the "don't crash" problem; it did not solve "maintain accuracy under high compression ratios." More importantly, both H2O and StreamingLLM only touched the sequence dimension — deciding which tokens to keep — while every retained token's key/value vector is still stored as a full 16-bit float. Can the vectors themselves be compressed?
+
+** 2024.02 | KIVI: Change Direction — Don't Reduce Token Count; Compress Each Vector's Precision
+
+*** What Problem It Saw
+
+The sequence dimension had already been worked over by H2O and StreamingLLM. KIVI's researchers changed angle: the KV Cache stores a large number of floating-point vectors — is 16-bit precision actually necessary? Perhaps the same information can be stored with fewer bits.
+
+But quantizing the KV Cache raises a question nobody had carefully studied: what do the numerical distributions of key vectors and value vectors actually look like? Are channels uniform? Are tokens uniform? Quantize without understanding the distribution, and where does error concentrate?
+
+*** Its Solution
+
+KIVI's researchers systematically studied the KV Cache distributions of models including LLaMA, Falcon, and Mistral, and discovered a regularity: the key cache has outliers locked to specific channels — a small number of particular dimensions carry extremely large values, while the remaining dimensions are relatively smooth.
+
+This pattern directly prescribes the quantization scheme: quantize the key cache per-channel, because the outliers are pinned to fixed channels; setting the quantization range separately for each channel group captures those peaks precisely. The value cache has no such channel-outlier problem, so per-token quantization is more appropriate.
+
+This asymmetric design (keys per-channel, values per-token) plus 2-bit quantization is KIVI's core. A small buffer of full-precision recent tokens is kept as a residual.
+
+This is compression along the *channel dimension*: regardless of which tokens are retained, the bit-width of every retained vector is reduced from 16 to 2.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked, and more impressively than expected: at 2-bit quantization LLaMA accuracy is nearly unchanged, the same memory supports 4× larger batch sizes, and throughput improves by 2.35–3.47×. KIVI opened a path orthogonal to the sequence dimension.
+
+But orthogonality also means limitation: KIVI quantizes and retains all historical tokens — there is no token eviction whatsoever. At 1M tokens, even at 2-bit per vector, the accumulated volume is still enormous: 1M tokens × vectors per layer × 2-bit adds up to tens of gigabytes. Two bits is already an aggressive lower bound; going further in precision will not hold.
+
+Both dimensions have ceilings. Can both paths be used simultaneously?
+
+** 2024.10 | ShadowKV: Walk Both Paths Together, but Strategy Is Still Globally Uniform
+
+*** What Problem It Saw
+
+By late 2024, researchers began seriously considering combining sequence compression and channel compression. ShadowKV was one of the first to do so rigorously.
+
+Its specific challenge: at ultra-long context (128K–1M tokens), neither sequence compression nor channel compression alone is sufficient, yet naively stacking the two methods causes a double penalty in accuracy. There is also a system-level issue: GPU memory is tight, but CPU has ample spare memory — how to combine the two?
+
+*** Its Solution
+
+ShadowKV operates on both dimensions independently:
+
+Channel dimension — apply SVD low-rank decomposition to the pre-RoPE key cache. Within the same sequence, the dominant singular vectors of pre-RoPE keys are highly consistent; a low-rank representation can eliminate a large number of dimensions, retaining only the low-rank projection.
+
+Sequence dimension — aggregate the key cache into per-chunk landmarks; at decode time, query cosine similarity against those landmarks and select only a small number of truly relevant KV pairs for attention computation.
+
+Meanwhile, the entire value cache is offloaded to CPU and fetched back to GPU on demand.
+
+*** Why It Worked (and What New Hole It Dug)
+
+It worked: 3× throughput improvement on A100, support for 6× larger batches, and accuracy close to full KV Cache on multiple long-context benchmarks.
+
+But ShadowKV's "two dimensions" are *serial*, and the strategy is globally uniform: the SVD compression ratio is fixed, the sparse-token ratio is fixed, and every segment is treated identically.
+
+There is a deeper problem it did not discover: different segments inside the KV Cache are not uniform. Some segments have tokens whose attention is highly concentrated at a few key positions (well-suited to sequence compression); some have vectors whose channel-dimension distribution is smooth (well-suited to quantization). Imposing a single global ratio across all segments inevitably over-compresses useful information in some places and preserves useless redundancy in others. That is the opening MosaicKV attacks.
+
+** 2026.07 | MosaicKV: Each Segment Chooses Its Own Compression Strategy
+
+*** What Problem It Saw
+
+MosaicKV starts from an empirical observation: the importance distributions of KV Cache segments along the sequence dimension and the channel dimension are non-uniform.
+
+Every prior method — whether purely sequence-based, purely channel-based, or ShadowKV's serial stacking — governs all segments with one global set of parameters. It is like prescribing a single universal diet for everyone while ignoring individual metabolic differences.
+
+Another underexploited resource: GPUs during the decode phase are memory-bound (memory bandwidth is the bottleneck; compute units sit largely idle), and CPUs have surplus memory. These resources can be used to manage the compressed KV Cache asynchronously, rather than going to waste.
+
+*** Its Solution
+
+MosaicKV partitions the entire KV Cache into segments and independently evaluates each one:
+
+- Sequence-dimension importance: which tokens concentrate attention weight (retain them, evict the rest)
+- Channel-dimension importance: how the variance is distributed across vector dimensions (concentrated variance → more amenable to quantization; otherwise less so)
+
+It then dynamically selects the optimal compression combination for each segment: how much to compress along the sequence dimension, how much along the channel dimension — the ratio is determined by the data characteristics within that segment, not by a global hyperparameter.
+
+It simultaneously exploits idle GPU/CPU resources for asynchronous compression and decompression, hiding the overhead inside the gaps of the decode pipeline.
+
+*** Why It Worked
+
+On H800: 16× speedup in attention computation, 4.8× reduction in decode latency, 7.3× throughput improvement, 3× memory reduction, and an average accuracy loss of only 1.76% on LongBench and RULER.
+
+It works because it found the right level of abstraction: not a globally uniform policy, not a simple overlay of two independent policies, but joint optimization at segment granularity — letting each segment wear shoes that actually fit.
+
+* Frontier Extensions
+
+MosaicKV was published in July 2026; no papers citing it directly have appeared yet.
+
+Two contemporaneous or slightly earlier works are worth reading alongside it:
+
+*EVICPRESS* (arXiv:2512.14946, 2025.12) also attempts joint compression and token eviction, proposing a unified utility function to trade off quantization quality against eviction gain, achieving a 2.19× TTFT speedup. It optimizes for single-request latency; MosaicKV optimizes for batch throughput — complementary perspectives.
+
+*KVComp* (arXiv:2509.00579, 2025.09) performs 2D blockwise lossy compression during the prefill phase, combining quantization with Huffman coding for an 83% compression-ratio improvement. Its compression happens at the storage layer; MosaicKV's compression happens on the attention computation path — the two can be stacked.
+
+As of now, MosaicKV represents the state of the art on the "dynamic 2D per-segment compression" trajectory.
+
+* One Diagram to Understand It All
+
+#+begin_example
+Timeline  2023.06    2023.09     2024.02     2024.10       2026.07
+          |          |           |           |             |
+Sequence  H2O        Stream      (unchanged) ShadowKV      MosaicKV
+dimension power-law  sink anchor            SVD+sparse    per-segment
+          dynamic T  fixed 4+win            global ratio  dynamic ratio
+          |          |           |           |             |
+Channel   (unchanged)(unchanged) KIVI        ShadowKV      MosaicKV
+dimension                        per-channel SVD low-rank  per-segment
+                                 2-bit quant global ratio  dynamic quant
+          |          |           |           |             |
+Strategy  1-D        1-D         1-D         serial stack  joint optim.
+Granular. global     global      global      global        segment
+
+Compression ceiling: sequence -> H2O -> stream -> --- limit ---+
+                                                               |
+                    channel -> KIVI -> ---------- limit -------> combined breakthrough = MosaicKV
+#+end_example
+
+* Insight
+
+Having read through these five layers, a pattern that recurs throughout algorithmic research becomes visible: *first find a new dimension, push it to its limit, then discover two dimensions are orthogonal, then find that naive stacking is not enough, and finally do joint optimization at finer granularity*.
+
+Researchers worked the sequence dimension for two years, the channel dimension for one, then someone stacked the two, and finally someone said "your stacking granularity is wrong — it should be at the segment level." This is not coincidental. Any single-dimension method will hit its intrinsic ceiling, forcing you to find the orthogonal direction; a crude combination of orthogonal directions then runs into policy mismatch, forcing you toward finer-grained joint optimization.
+
+The deeper cognitive shift running through this line is: from "treat the KV Cache as a uniform monolith" to "acknowledge that the KV Cache is internally non-uniform and must be handled differently by region." MosaicKV's core contribution is not any particular compression algorithm — it is this shift in level of abstraction.
+
+*The most likely next step*: hardware-native 2D representation. Today's MosaicKV still decompresses before computing attention; that overhead is hidden in the pipeline but not truly eliminated. The endpoint of this evolutionary line would be a custom kernel that allows the GPU to execute attention matrix multiplication directly on the compressed format.
+
+* Takeaway
+
+The most instructive thing about this line is not its answers — it is the way it frames questions.
+
+The H2O researchers did not ask "how do we optimize the KV Cache"; they first looked at what the distribution of attention scores actually looked like. The KIVI researchers did not directly apply existing quantization recipes; they first examined what structure the numerical distributions of key and value vectors have. The MosaicKV researchers did not directly merge two compression methods; they first asked "are the different segments inside the KV Cache actually uniform?"
+
+*Observation-driven questioning*, not method-driven application.
+
+The implication: any data structure you are currently treating with a single global uniform policy is worth pausing to ask — "is it actually uniform internally?" Most likely it is not, most likely nobody has looked carefully, and that is exactly where something can be done.
