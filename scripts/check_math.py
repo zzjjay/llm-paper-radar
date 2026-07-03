@@ -43,6 +43,8 @@ DENYLIST: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\\newcommand|\\renewcommand|\\def\b"), r"macro definitions are not allowed on GitHub"),
     (re.compile(r"\\color\b|\\textcolor\b"), r"\color/\textcolor is not allowed on GitHub"),
     (re.compile(r"\\require\b|\\htmlClass\b|\\href\b"), r"\require/\htmlClass/\href is not allowed on GitHub"),
+    (re.compile(r"\\[{}]"), r"literal \{ or \} in math → GitHub markdown strips the backslash "
+                           r"(breaks \left\{); use \lbrace / \rbrace"),
 ]
 
 

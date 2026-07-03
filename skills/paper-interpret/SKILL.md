@@ -103,7 +103,10 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
       delimiter (drop them, or use `\left…\right`). Also **never nest `$…$`
       inside a `$$…$$` block** — e.g. `\text{$b$-bit}` — the inner `$` closes the
       outer math span early and orphans whatever follows (a `\left` then errors);
-      write `b\text{-bit}` instead. After writing, **run
+      write `b\text{-bit}` instead. Likewise **use `\lbrace`/`\rbrace`, never
+      `\{`/`\}`** inside math — GitHub's markdown strips the backslash, turning
+      `\left\{` into `\left{` (an invalid delimiter → the `\left` error). After
+      writing, **run
       `uv run python scripts/check_math.py <file>`** — it flags exactly these
       GitHub failure modes (denylisted macros, stray/unbalanced `$`, brace and
       `\left`/`\right` mismatches) with `file:line`. Fix every hit until it
