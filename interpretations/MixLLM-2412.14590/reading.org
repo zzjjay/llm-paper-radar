@@ -1,0 +1,219 @@
+#+title:      伴读：MixLLM — 输出特征间的全局混合精度 LLM 量化
+#+date:       [2026-07-04 Sat 03:59]
+#+filetags:   :reading:
+#+source:     https://arxiv.org/abs/2412.14590
+
+* 全局地图
+
+** 一句话摘要
+
+在"输出通道之间"做混合精度量化：按每个通道对**模型最终损失**的影响（全局，而非层内）
+分配比特，10% 重要通道 8-bit、90% 4-bit（W4.4A8），再用能吃 int8 Tensor Core 的
+kernel 让这套配置真跑得快——多 10% 比特换来接近 8-bit 的精度且 SOTA 效率。
+
+** 结构地图
+
+#+begin_example
+  两难：量化的精度 vs 系统效率
+       |
+       +-- [背景/相关工作] 权重-only 省内存但 4bit 掉点；层内混精/outlier 各有短板
+       |
+       +-- [方法] 输出通道间的全局混合精度
+       |     +-- 3.2 全局重要性：按对最终损失的影响排序（Taylor + Fisher 近似 Hessian）
+       |     +-- 3.1 配置：W4.4A8，8bit 对称/4bit 非对称，group-wise g=128
+       |     +-- 3.3 系统：two-step dequant 上 Tensor Core + 快速 I2F + 软件流水
+       |
+       +-- [实验] 困惑度 / MMLU-Pro / A100·H100 加速
+#+end_example
+
+** 段落分类概览
+
+- [骨] 摘要、引言两条 claim、3.2 全局重要性定义、3.3 two-step dequant 与 fast I2F 的动机
+- [肌] 困惑度表、MMLU-Pro 表、各 GPU 加速曲线、消融
+- [筋] 从背景到方法、从算法到系统的过渡
+
+* 逐段伴读记录
+
+** 第 1 段：摘要 —— 中心主张 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文："MixLLM identifies the important output features in the global view rather
+than within each single layer, effectively assigning larger bit-width to output
+features that need it the most" —— MixLLM 从全局视角（而非每个单层内部）识别重要的
+输出特征，把更大的位宽分配给最需要它的输出特征。
+原文："with only 10% more bits, the perplexity increase can be reduced from about
+0.5 in SOTA to within 0.2 for Llama 3.1 70B" —— 仅多 10% 的比特，Llama-3.1-70B 的
+困惑度增量就能从 SOTA 的约 0.5 降到 0.2 以内。
+#+end_quote
+
+意译（达）：量化的老大难是"精度 vs 效率"二选一。MixLLM 的解法是承认"不同输出特征的
+重要性不同"，于是在输出特征之间混合精度；关键是重要性从**整个模型**的角度判定，不是
+层内。代价只是平均多约 10% 比特（W4.4），换来接近 8-bit 的精度。
+
+*** 结构标注
+
+全文中心论点句。后面算法（怎么定全局重要性）和系统（怎么让混精跑得快）都在为它作证。
+
+*** 注疏（对手·逆光）
+
+最强的反问是："混合精度早有人做，你新在哪？" 作者的两处区分要盯住：(1) 重要性是**全局
+跨层**算的，不是层内启发式；(2) 混的是**输出通道**（成列、规整、能上 Tensor Core），
+不是散点 outlier（只能走慢的稀疏乘）。这两点合起来才是它的护城河。
+
+*** 碰撞
+
+问：作者最想让你接受的一个点是什么？你接受吗？
+—— "全局视角判重要性 优于 层内"。合理，且论文用 Fig.2 佐证：Llama-3.1-8B 各层的高重要
+通道占比差异巨大——若按层内一刀切，就抹掉了这种层间差异。判据本身是否最优（Taylor 近似
+够不够准）留到 3.2 再压力测试。
+
+** 第 2 段：引言两条 claim [骨]
+
+*** 翻译
+
+意译（达）：作者把贡献拆成两句互补的话——
+1. *高精度 + 低内存*：在权重上做输出特征间的混合精度，配全局重要性识别。
+2. *高精度 + 高系统效率*：算法-系统协同的量化配置 + GPU kernel 优化。
+并点出一个让系统更好做的性质（原文）：
+#+begin_quote
+"the mixed-precision between output features makes the system design easier than
+between input features because the calculation of different output features are
+disjoint sub-problems." —— 输出特征间的混合精度比输入特征间更好做系统，因为不同输出
+特征的计算是彼此独立的子问题。
+#+end_quote
+
+*** 结构标注
+
+把"精度"和"效率"两条线明确摆开——这篇的野心是两头都要，而非只报精度。
+
+*** 碰撞
+
+压力测试：反方会说"混合精度的 kernel 通常慢，你的加速是真的吗？" 作者用"输出特征
+计算彼此独立"接住——独立子问题天然可并行、可整列打包，正是能上 Tensor Core 的前提。
+这一反驳接得住，且是它区别于 outlier 路线的根。
+
+** 第 3 段：3.2 全局重要性怎么算 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文："We use the Taylor Expansion method to estimate the loss function l(c),
+ignoring the high-order items" —— 用泰勒展开估计损失函数 l(c)，忽略高阶项。
+原文："We approximate the Hessian with the (empirical) Fisher information matrix
+(FIM)" —— 用（经验）Fisher 信息矩阵近似 Hessian。
+#+end_quote
+
+意译（达）：给每个输出通道打分——如果量化它，模型最终损失会涨多少？用泰勒展开把这个
+增量近似成"一阶梯度项 + 二阶项"，其中二阶的 Hessian 算不动，用 Fisher 信息矩阵在校准集
+上近似。分数一遍算完（single-pass），不迭代——作者说迭代结果相当但开销大得多。
+
+*** 结构标注
+
+方法的心脏：把"哪些通道重要"变成一个可算的、全局的分数。理解这段，才懂它为何比层内准。
+
+*** 注疏（源流·背光）
+
+这条"用二阶信息估计量化损失"的路子，源自 OBD/OBS→GPTQ 那条 Hessian 系传统；MixLLM
+的差别是把它用在**通道级、全局**的比特分配上，且用 Fisher 近似 + 单遍来把成本压下来。
+
+*** 碰撞
+
+问：这段有没有让你皱眉的地方？
+—— 有：泰勒展开"忽略高阶项"在 4-bit 这种较大扰动下未必准；而且分数依赖校准集分布。
+这是它的 self-referential 隐忧——用一个近似的重要性去决定谁被粗量化，若近似偏了，
+错误会被固化。作者没正面给这个近似误差的边界。留到复盘。
+
+** 第 4 段：3.3 为什么要 two-step dequant 与 fast I2F [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文："the I2F instruction is more expensive than the common computations on modern
+GPUs ... can lead to large system performance drop for group-wise quantization
+(>10% drop in our practice)" —— 整数转浮点（I2F）指令在现代 GPU 上比常规运算贵得多，
+分组量化下能带来 >10% 的系统性能下降。
+原文（结果）："the expensive I2F is converted into a single float subtraction"
+—— 把昂贵的 I2F 转化成一次浮点减法。
+#+end_quote
+
+意译（达）：难点在于混着 4-bit 非对称、8-bit 对称、还分组，很难喂给 int8 Tensor Core。
+作者用 two-step dequantization 把它拆成 Tensor Core 吃得下的形状；又发现反量化里"整数
+转浮点"这步出奇地贵，于是用一个跟数值范围挂钩的快速转换，把它简化成一次浮点减法——
+这一步靠 group size 取 128 才成立（128 个 int8 点积的范围刚好可控）。int8 Tensor Core
+的吞吐（A100 上 624 TOPS）远高于 SIMT core（19.5 TFLOPS），所以"能不能上 Tensor Core"
+直接决定快慢。
+
+*** 结构标注
+
+算法-系统协同的落点。这段解释"为什么这套配置不仅准、还真能跑快"。
+
+*** 碰撞
+
+问：这段说服你了吗？
+—— 服。它把"混精难跑快"这个常识性反驳正面拆掉了：不是靠玄学，而是（1）two-step 让配置
+Tensor Core 化，（2）fast I2F 去掉最贵那步，（3）group size 128 是让 fast I2F 成立的
+硬约束。三者环环相扣，且给了 >20 TOPS 的实测改进。
+
+** 第 5-N 段：实验 [肌]（流读）
+
+- 精度：多 10% 比特（W4.4A8），Llama-3.1-70B 困惑度增量 0.5→0.2；三模型 MMLU-Pro
+  损失 1.92→0.99（均 vs SOTA）。W8A8 变体验证 8-bit 激活对称量化已够。
+- 系统：A100 与 H100 上单层 MatMul 与端到端均达 SOTA 效率；对接 vLLM。
+- 消融：单遍 vs 迭代 salience 结果相当（省开销）；校准集对 salience 搜索的影响（4.11 节）。
+
+以上支持第 1、2 段的双主张：全局混精（准）+ 协同 kernel（快）。
+
+* 全文复盘
+
+** 理解轨迹
+
+- 摘要（骨）：双主张，novelty 存疑 → 通过带问号
+- 引言（骨）：抓住"输出特征计算独立"是系统可行的根 → 通过
+- 3.2 全局重要性（骨）：懂了为何比层内准，但对 Taylor 近似起疑 → 停留
+- 3.3 系统（骨）：two-step + fast I2F 把"混精难跑快"正面拆掉 → 强通过
+- 实验（肌）：数字兑现双主张 → 通过
+
+在 3.2 起的疑（Taylor 忽略高阶 + 校准依赖）是全文最该继续追问的裂缝，作者用单遍近似换
+效率，但没量化这个近似误差——这是留给读者/后续的口子。
+
+** 读后一句话
+
+对作者说：你把"混精"从一个纯算法话术，做成了"全局判轻重 + 硬件友好形状 + 协同 kernel"
+的完整一条龙，这份算法-系统一起做的诚意是最有说服力的地方。建议把全局 salience 的
+Taylor/Fisher 近似误差也做一个像系统那样扎实的量化分析——否则"全局更准"这句还差一个
+误差边界的实验。
+
+（层级自评：L2-L3，有判断并生出一个具体的实验诉求。）
+
+** 终局问题
+
+如果"重要性该看全局而非层内"成立，那么这个全局判据本身能不能反过来指导**训练/微调**
+（哪些通道天生该用高精度），而不只是事后 PTQ 分配比特？换句话说，全局 salience 是一个
+部署期的补丁，还是一个贯穿训练-部署的结构信号？
+
+** 术语表
+
+| 英文 | 中文 | 本文含义 |
+|------+------+----------|
+| output feature / channel | 输出特征 / 输出通道 | 线性层权重矩阵的输出维；MixLLM 在这个维度上混精度 |
+| global salience | 全局重要性 | 按对模型最终损失的影响判定的通道重要性（跨层比较） |
+| W4.4A8 | —— | 权重平均 4.4 bit（10% 8bit + 90% 4bit）、激活 8 bit |
+| group-wise | 分组量化 | 每 128 个元素共享一组量化参数 |
+| symmetric / asymmetric | 对称 / 非对称 | 8-bit 用对称、4-bit 用非对称（各取精度/效率折中） |
+| Fisher information matrix (FIM) | Fisher 信息矩阵 | 用来近似难算的 Hessian，估计量化对损失的二阶影响 |
+| two-step dequantization | 两步反量化 | 把混精配置拆成 int8 Tensor Core 吃得下的形状 |
+| I2F | 整数转浮点 | 反量化里昂贵的一步；用 range-dependent 快速法简化成一次浮点减 |
+
+** 下一步线索
+
+- 想追"用二阶信息估计量化损失"的源头：OBD/OBS → GPTQ 那条 Hessian 系脉络，对照读能看清
+  MixLLM 把它从"权重级层内"挪到"通道级全局"改了哪一步。
+- 想验证系统账：代码在 github.com/microsoft/MixLLM，重点看 two-step dequant 与 fast I2F
+  的 kernel 实现，以及和 vLLM 的对接（"混精也能跑快"这句全在这段代码里兑现）。
+- 想比同类：与 SqueezeLLM（outlier + 稀疏）、SpQR、层内混精方法对照，能看出"整列 vs 散点"
+  在系统效率上的分野。
