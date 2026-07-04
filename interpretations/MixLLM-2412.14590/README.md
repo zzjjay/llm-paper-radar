@@ -17,7 +17,7 @@
 |---|---|---|
 | 原理故事 | [paper.org](paper.org) | 七拍故事版，给外行也能复述 |
 | 中文伴读 | [reading.org](reading.org) | 选择性精读，骨架段中英并列 + 碰撞 |
-| 全文详解 | [translation_zh.md](translation_zh.md) | 逐节中文详解（全节 + 附录，复述式非逐句译文） |
+| 中文翻译 | [translation_zh.md](translation_zh.md) | 全文中文翻译（覆盖全节 + 附录；为版权计以复述方式呈现，非逐字直译） |
 
 ## Radar 视角（有限）
 
