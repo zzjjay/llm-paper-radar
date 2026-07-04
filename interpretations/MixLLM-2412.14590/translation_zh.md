@@ -1,5 +1,5 @@
 # MixLLM 中文翻译：输出特征间的全局混合精度 LLM 量化
-> MixLLM 全文中文翻译（为版权计以复述方式呈现，非逐字直译；覆盖全部章节与附录）。原文：https://arxiv.org/abs/2412.14590 ｜ 作者：Zhen Zheng, Xiaonan Song, Chuanjie Liu (Microsoft, AAAI'25)
+> MixLLM 全文中文翻译（为版权计以复述方式呈现，非逐字直译；覆盖全部章节与附录）。原文：https://arxiv.org/abs/2412.14590 ｜ 作者：Zhen Zheng, Xiaonan Song, Chuanjie Liu (Microsoft, 2024-12)
 
 本文是对该论文的逐节复述性讲解，力求忠实覆盖每一节的核心内容、公式与实验数据，但表达方式为作者自己的转述，非逐句翻译。
 

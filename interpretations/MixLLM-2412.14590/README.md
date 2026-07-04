@@ -9,7 +9,7 @@
 
 - **标题**：MixLLM: LLM Quantization with Global Mixed-precision between Output-features and Highly-efficient System Design
 - **链接**：[abs](https://arxiv.org/abs/2412.14590) · [PDF](https://arxiv.org/pdf/2412.14590v2) · [code](https://github.com/microsoft/MixLLM)
-- **作者**：Zhen Zheng, Xiaonan Song, Chuanjie Liu (Microsoft) · AAAI'25 · 2024-12
+- **作者**：Zhen Zheng, Xiaonan Song, Chuanjie Liu (Microsoft) · 2024-12（会议状态未确证：PDF 页脚标 "under review, MLSys"，AAAI'25 无确凿证据）
 
 ## 解读导航
 
@@ -35,4 +35,6 @@
 
 ## 溯源
 
-暂无 paper-river 倒读法脉络（可后续用 ljg-paper-river 生成）。
+倒读法脉络：[../../paper-river/MixLLM-2412.14590.org](../../paper-river/MixLLM-2412.14590.org)
+——从 MixLLM 倒推 6 层至源头：OBS(1993) → OBQ → GPTQ → LLM.int8() → SpQR/SqueezeLLM/OWQ
+→ AWQ → Atom/SliM-LLM → MixLLM（二阶补偿量化 + outlier/salience 分离 这条谱系）。
