@@ -228,11 +228,13 @@ llm-paper-radar/
 │   ├── render.py                # bucket grouping + README splicing + Paper River link
 │   ├── readme_template.md       # static doc template (this file's source)
 │   ├── rollup.py                # N-day rollup compact view used by render
-│   └── weekly.py                # 7-day roll-up as a compact table
+│   ├── weekly.py                # 7-day roll-up as a compact table
+│   └── rollup_digest.py         # monthly/half-year/yearly roll-up (archive-only, render-from-cache)
 ├── scripts/
 │   ├── daily.sh                 # cron entrypoint: fetch → ... → push (--no-fetch skips fetch)
 │   ├── backfill_empty_arxiv.sh  # re-fetch days whose arxiv.json was left empty by a throttle
-│   ├── snapshot.sh              # captures the current README paper-list into snapshots/
+│   ├── snapshot.sh              # captures the current README paper-list into snapshots/daily/
+│   ├── rollup.sh                # cron: monthly|halfyear|yearly → snapshots/<cadence>/
 │   ├── auto_paper_river.py      # scan summarized/, invoke ljg-paper-river per missing paper
 │   ├── gen_paper_river.sh       # headless wrapper that runs the ljg-paper-river skill
 │   ├── translate_paper_river.py # auto-translate zh paper-river/*.org → _en.org
@@ -243,9 +245,13 @@ llm-paper-radar/
 ├── digests/
 │   ├── YYYY-MM-DD.md            # daily digest archive (Chinese)
 │   └── YYYY-MM-DD_en.md         # English sibling (only days summarized after bilingual prompt landed)
-├── snapshots/
-│   ├── YYYYMMDD.md                 # single-day per-run paper-list snapshot
-│   └── YYYYMMDD-YYYYMMDD-Ndays.md  # multi-day rollup snapshot
+├── snapshots/                       # all periodic snapshots (archive-only except weekly splice)
+│   ├── daily/YYYYMMDD.md               # single-day per-run paper-list snapshot
+│   ├── daily/YYYYMMDD-YYYYMMDD-Ndays.md # multi-day rollup snapshot
+│   ├── weekly/YYYYMMDD-YYYYMMDD.md     # 7-day digest (also spliced into README)
+│   ├── monthly/YYYYMMDD-YYYYMMDD.md    # previous calendar month
+│   ├── halfyear/YYYYMMDD-YYYYMMDD.md   # previous half-year (Jan–Jun / Jul–Dec)
+│   └── yearly/YYYYMMDD-YYYYMMDD.md     # previous calendar year
 ├── paper-river/                 # ljg-paper-river deep-lineage analyses (see Pipeline)
 │   ├── <acronym>-<arxiv-id>.org # zh; render auto-links if present
 │   └── <acronym>-<arxiv-id>_en.org  # en sibling; auto-translated by daily.sh
@@ -256,7 +262,7 @@ llm-paper-radar/
 │   ├── summarized/              # tracked
 │   ├── curation/                # tracked: rejected.jsonl + seed-curation logs
 │   └── seen.json                # tracked: papers seen across days for 🔁 marker
-├── .github/workflows/           # daily.yml + weekly.yml + cleanup.yml
+├── .github/workflows/           # daily.yml + weekly.yml
 ├── tests/
 └── pyproject.toml + uv.lock
 ```

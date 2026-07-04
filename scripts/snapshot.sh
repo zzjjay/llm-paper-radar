@@ -73,8 +73,8 @@ else
 fi
 [[ -n "${LABEL:-}" ]] && NAME="${NAME}-${LABEL}"
 
-mkdir -p snapshots
-OUT="snapshots/${NAME}.md"
+mkdir -p snapshots/daily
+OUT="snapshots/daily/${NAME}.md"
 
 SCANNED_LINE="$(grep -m1 -E "^> 📊 Scanned" README.md || true)"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -88,12 +88,12 @@ GIT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     [[ -n "$SCANNED_LINE" ]] && echo "$SCANNED_LINE"
     echo
     # README links are written relative to repo root (digests/, INDEX.md,
-    # config.yaml). Snapshots live in snapshots/, so rewrite to ../ so they
-    # resolve correctly from the snapshot file.
+    # config.yaml). Snapshots live in snapshots/daily/ (two levels deep), so
+    # rewrite to ../../ so they resolve correctly from the snapshot file.
     awk '/<!-- LATEST_START -->/{flag=1} flag; /<!-- LATEST_END -->/{flag=0}' README.md \
-        | sed -e 's|](digests/|](../digests/|g' \
-              -e 's|](INDEX.md)|](../INDEX.md)|g' \
-              -e 's|](config.yaml)|](../config.yaml)|g'
+        | sed -e 's|](digests/|](../../digests/|g' \
+              -e 's|](INDEX.md)|](../../INDEX.md)|g' \
+              -e 's|](config.yaml)|](../../config.yaml)|g'
 } > "$OUT"
 
 echo "snapshot → $OUT"

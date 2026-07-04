@@ -1,0 +1,205 @@
+#+title:      OrbitQuant: Data-Agnostic Quantization for Image and Video Diffusion Transformers
+#+date:       [2026-07-03 Fri 00:07]
+#+filetags:   :paper:river:quantization:diffusion:en:
+#+identifier: 20260703T000747-en
+#+source:     https://arxiv.org/abs/2607.02461
+#+authors:    Lee, Chavan, Nguyen, Huang, Jiang, Panda, Mertens, Shukla
+#+venue:      arXiv preprint, July 2026
+
+* The Problem River
+
+The goal is to compress a generative image/video diffusion model (DiT, Diffusion Transformer) from 16-bit down to 4-bit or lower, so it fits on a consumer-grade GPU. Compression itself is not the hard part — but before compressing, you need to know "what range of values typically appear in this layer." That is called *calibration*.
+
+The trouble is that a DiT is not a static network you simply open and run: the activations of the same layer look completely different at denoising step 1 versus step 40; switch to a different prompt and the distribution shifts again; add classifier-free guidance — a standard technique in text-to-image models — and a single forward pass runs both a "conditional" and an "unconditional" branch, each with its own activation distribution. Carefully calibrated quantization parameters are therefore only valid for the exact conditions under which they were collected. Change the checkpoint or change the task (image model to video model), and you must collect new calibration data and re-tune everything from scratch. At any real scale, this "serve the model fresh every time" workflow becomes a hidden deployment cost.
+
+Put plainly, the river this paper navigates is: *Can we design a quantization scheme that requires no data and no re-calibration per scenario — one that works out of the box when the model or modality changes?*
+
+* Source Map
+
+#+begin_example
+[2022] Frantar et al.  -  GPTQ
+  |
+  | Problem: Quantizing large-model weights is a discrete optimization problem;
+  |          brute-force per-layer search is too slow.
+  | Solution: Greedy column-wise quantization guided by Hessian approximation;
+  |           a single calibration pass handles all weights.
+  v
+[2023] Xiao et al.  -  SmoothQuant
+  |
+  | Problem: Activation tensors contain outlier channels that dwarf weight
+  |          magnitudes; direct quantization destroys accuracy.
+  | Solution: A per-channel scaling factor migrates "activation difficulty"
+  |           to the weights, which can bear it more easily.
+  |           (But the scale factors must be computed from calibration data;
+  |           change data or model → recompute from scratch.)
+  v
+[2024] Chee et al. (QuIP) / Ashkboos et al.  -  QuaRot
+  |
+  | Problem: SmoothQuant only relocates difficulty; outliers are structurally
+  |          still present.
+  | Solution: Multiply weights and activations by random orthogonal /
+  |           Hadamard matrices, scattering outliers into a near-Gaussian
+  |           distribution — structurally eliminating them.
+  |           Enables full end-to-end 4-bit quantization;
+  |           can even skip calibration data (round-to-nearest suffices).
+  v
+[2024] Liu et al.  -  SpinQuant
+  |
+  | Problem: QuaRot uses random rotation matrices; accuracy varies wildly
+  |          across random seeds.
+  | Solution: Constrain rotation matrices to the Stiefel manifold and learn
+  |           them via Cayley SGD, directly minimizing quantization error.
+  |           Clearly outperforms random rotation.
+  |           (Cost: requires a training/calibration pass per model —
+  |           back to data dependence.)
+  v
+[2024] Wu et al.(PTQ4DiT) / Chen et al.(Q-DiT) / Zhao et al.(ViDiT-Q)  -  DiT quantization branch
+  |
+  | Problem: All of the above assume static activations (LLM setting).
+  |          DiT activations drift drastically across timesteps, tokens,
+  |          and guidance branches — fixed calibration parameters simply
+  |          cannot cover the full range.
+  | Solution: Timestep-aware dynamic quantization and per-channel
+  |           rebalancing; quantization parameters are adjusted online
+  |           per timestep and condition.
+  |           (Cost: fundamentally "more frequent calibration"; switching
+  |           checkpoints or moving to the video modality still requires
+  |           a full re-calibration run.)
+  v
+[2026] Lee et al.  -  OrbitQuant  (this paper)
+  |
+  | Problem: Can we skip calibration entirely? Take the "rotation eliminates
+  |          outliers" insight from QuaRot/SpinQuant and apply it to DiT's
+  |          timestep/modality drift in a data-agnostic way?
+  | Solution: Randomly permuted block-Hadamard rotation projects activations
+  |           into a fixed, normalized rotation basis. Paired with a universal
+  |           Lloyd-Max codebook, the same quantization parameters reuse
+  |           across timesteps, prompts, and image/video modalities.
+  |           Weight-side rotation is done offline; inference only needs to
+  |           rotate activations on the fly.
+  v
+[????] Still growing
+#+end_example
+
+Note: two lineages converge here — the LLM quantization thread of "rotation eliminates outliers" (GPTQ → SmoothQuant → QuaRot/SpinQuant), and the DiT-specific thread of "timestep-sensitive distributions" (PTQ4DiT/Q-DiT/ViDiT-Q). OrbitQuant is the confluence of both streams in the DiT setting.
+
+* Evolutionary Narrative
+
+** 2022 | GPTQ: Use Second-Order Information to Quantize Large-Model Weights in One Shot
+
+*** What problem did it see?
+
+Model pruning and quantization are fundamentally discrete optimization problems: billions of weights, each requiring a decision about which quantization grid point it lands on, and gradient descent is powerless over discrete choices. Early methods (such as Optimal Brain Surgeon) provided a theoretical framework, but computing the Hessian matrix at the scale of a GPT-class model was completely intractable.
+
+*** Its solution
+
+Greedy column-wise quantization: after quantizing one column of weights, compensate the error by adjusting the not-yet-quantized columns, using Cholesky decomposition to make the Hessian approximation computable in reasonable time. A 175B-parameter model's weights can be fully quantized in a few hours.
+
+*** Why it worked — and what new pit it dug
+
+GPTQ demonstrated that weight quantization can be done very well without training data (only a small number of calibration samples are needed to estimate the Hessian). But it only handles weights; activations remain in full precision. The pit left behind: once you want to quantize activations to low bit-widths as well, the column-wise error-compensation approach does not apply at all, because outlier channels in activations change token by token — they are not static.
+
+** 2023 | SmoothQuant: Transfer "Activation Difficulty" to the Weights
+
+*** What problem did it see?
+
+In LLM activations, certain channels have values far exceeding all others (outliers). Directly applying per-tensor quantization to activations forces the quantization step size to accommodate these outlier channels, leaving almost no resolution for the rest.
+
+*** Its solution
+
+Apply a per-channel scaling factor that shrinks the "too large" activation channels while enlarging the corresponding weight channels by the same factor — mathematically equivalent, yet the activations become much easier to quantize, and the weights, which are already easy to quantize, can absorb the extra magnitude.
+
+*** Why it worked — and what new pit it dug
+
+This is "transferring difficulty," not "eliminating difficulty": the outliers themselves are still there, merely shifted onto a carrier that can tolerate them better. The scaling factors still have to be computed from calibration data; change the data or the model, and the calibration must be re-run.
+
+** 2024 | QuaRot: Rotation Scatters Outliers — No Calibration Needed
+
+*** What problem did it see?
+
+SmoothQuant's scaling merely moves outliers from activations to weights; it does not fundamentally solve the "uneven value distribution" issue. Research in the QuIP family showed that left- and right-multiplying a weight matrix by orthogonal matrices makes the matrix more "incoherent," and the more incoherent it is, the better it quantizes.
+
+*** Its solution
+
+Rotate weights and activations with random Hadamard matrices — an operation that is numerically transparent (rotate then rotate back, and the network output is unchanged) — scattering outliers that were concentrated in a few channels into a near-Gaussian distribution with a small standard deviation, allowing the quantization step size to be kept very small. Taken to the extreme, calibration data is not needed at all; simple round-to-nearest suffices for 4-bit quantization.
+
+*** Why it worked — and what new pit it dug
+
+A Gaussian distribution is the most quantizer-friendly shape — no single channel can dominate the error. But QuaRot uses random rotation matrices: different random seeds can produce accuracy differences of more than ten percentage points (as the paper itself reports). Furthermore, the entire scheme was designed for LLMs, where activations are "static" (the distribution of a given layer at a given moment does not shift with timestep), and it never had to contend with the kind of severe temporal drift found in diffusion models.
+
+** 2024 | SpinQuant: Stop Gambling — Learn the Rotation Matrix
+
+*** What problem did it see?
+
+QuaRot's random rotation matrices are of inconsistent quality — even among orthogonal matrices, some rotations yield distributions with low quantization error and others do not, and the outcome is purely a matter of luck.
+
+*** Its solution
+
+Constrain the rotation matrix to the Stiefel manifold (the space of all orthogonal matrices) and use Cayley SGD to directly optimize for minimal quantization error, rather than sampling randomly.
+
+*** Why it worked — and what new pit it dug
+
+An optimized rotation naturally fits the specific weight and activation distributions of a given model far better than a random one, yielding a clear accuracy improvement. But the cost is that the rotation matrix is now "learned for this specific model," and switching to a different checkpoint requires re-running the entire training/calibration pipeline — directly contrary to the data-agnostic goal. Moreover, it remains an LLM method and does not answer the question of what to do when the activation distribution is itself dynamically shifting (as in diffusion model timesteps).
+
+** 2024 | PTQ4DiT / Q-DiT / ViDiT-Q: DiT Activations Are a Moving Target That Drifts with Time
+
+*** What problem did it see?
+
+All of the above methods assume "activation distributions are static," but the diffusion model denoising process is a multi-step iteration: the activation distribution of the same layer at timestep 1 and timestep 40 can look completely different. Add in prompt variation and the conditional/unconditional branch switching of classifier-free guidance, and the "drift axes" of activations in DiTs are far more numerous than in LLMs. Covering all timesteps with a single fixed set of quantization parameters is equivalent to artificially inflating the range the quantizer must accommodate.
+
+*** Their solutions
+
+PTQ4DiT uses channel-saliency rebalancing combined with Spearman-correlation-guided dynamic calibration to capture temporal variation; Q-DiT applies fine-grained grouped quantization and dynamic activation quantization, allowing parameters to adapt per timestep online; ViDiT-Q further decomposes the variation along four axes — channel, token, timestep, and guidance branch — performing timestep-aware channel rebalancing and per-token dynamic quantization at each level, and covering both image and video modalities.
+
+*** Why they worked — and what new pit they dug
+
+These methods genuinely capture DiT's distinctive "distribution drift across timesteps and conditions," and achieve much better accuracy than naively applying LLM quantization methods. But the essence of the solution is "more frequent and more granular re-calibration" — the calibration granularity is refined from "once for the whole model" to "once per timestep," increasing engineering complexity and data dependence rather than reducing them. Switching checkpoints, or migrating from an image model to a video model, requires running the entire timestep-aware calibration pipeline all over again. The root problem — "having to serve each new scenario from scratch" — remains unsolved.
+
+** 2026 | OrbitQuant: Bridge "Rotation Eliminates Outliers" to "Data-Agnostic," Purpose-Built for DiT Drift
+
+*** What problem did it see?
+
+The DiT quantization branch (PTQ4DiT/Q-DiT/ViDiT-Q) has been pushing relentlessly toward "finer calibration," but that road has a ceiling: as long as activation distributions keep changing with checkpoint, modality, and prompt, calibrated parameters will always be "valid only here and now." On the other side, QuaRot/SpinQuant had already shown that rotation can structurally eliminate outliers — but one approach relies on randomness and the other on model-specific training; neither truly achieves "zero data inspection."
+
+*** Its solution
+
+Apply randomly permuted block-Hadamard rotation to project activations into a normalized rotation basis — a fixed, structured orthogonal transform that requires no calibration data whatsoever. After rotation, the distribution is regular enough for a universal Lloyd-Max codebook to handle quantization without estimating a per-timestep, per-prompt, or per-checkpoint quantization range. The weight-side rotation is completed offline in a one-time pass; at inference time only the activations need to be rotated, adding negligible runtime overhead.
+
+*** Why it worked — and what open questions remain
+
+The key insight is that DiT activations "drift enough to require re-calibration across timesteps and modalities" fundamentally because the raw activation distribution is irregular (outliers, large inter-channel variance differences). Rotation transforms this shape problem from "content-dependent" to "structure-agnostic": regardless of what the specific values look like, the rotated distribution converges toward the same regular shape, so a single codebook can be reused across different timesteps, prompts, and even transferred directly from an image model to a video model (zero-tuning migration among FLUX.1, Z-Image-Turbo, Wan 2.1, and CogVideoX). Open questions that remain: the method has currently been validated down to the W2A4 (2-bit weights / 4-bit activations) regime; whether even more extreme bit-widths, or architecturally novel DiT variants (e.g., those incorporating new attention mechanisms), would require structural adjustments to the rotation basis is not yet addressed in the paper, nor has independent downstream validation appeared.
+
+* Frontier Extensions
+
+As of this writing (July 2026), this represents the latest development along this line. OrbitQuant was published very recently, and no subsequent work explicitly critiquing or improving it has been identified.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                    Outlier handling           Calibration dependence    Coverage
+                    -----------------          ----------------------    --------
+2022  GPTQ          (weights only, not         Requires calibration      LLM weights
+                     addressed)                data
+2023  SmoothQuant   Scale to shift difficulty  Requires calibration      LLM weights+activations
+                     onto weights              data
+2024  QuaRot        Random rotation scatters   Calibration-free (RTN)    LLM weights+activations
+                     outliers                                             (static)
+2024  SpinQuant     Learned rotation scatters  Requires training /       LLM weights+activations
+                     outliers                  calibration               (static)
+2024  PTQ4DiT /     Fixed or timestep-aware    Requires (more frequent)  DiT image / video
+      Q-DiT /       channel rebalancing        per-timestep calibration  (dynamic drift)
+      ViDiT-Q
+2026  OrbitQuant    Fixed block-Hadamard        Fully data-agnostic       DiT image + video
+                    rotation + universal                                  (zero-tuning across
+                    Lloyd-Max codebook                                    timesteps / modalities)
+#+end_example
+
+* Insight
+
+What is genuinely changing along this line is not that "quantization bit-widths keep getting lower," but rather that *the degree to which quantization methods depend on knowing what the specific data looks like has been steadily declining*. GPTQ needs calibration data to estimate the Hessian; SmoothQuant needs calibration data to compute scaling factors; QuaRot uses rotation to reduce that dependence to "optional"; SpinQuant trades accuracy for data dependence again (training data); the DiT branch, confronted with higher-dimensional and less stable activations, actually made calibration even more elaborate (more data-dependent); OrbitQuant is a reclamation of the "remove data dependence" main thread in the DiT setting. It did not invent a new principle for handling outliers; rather, it correctly adapted the QuaRot insight, letting a "structured, content-blind" rotation directly confront DiT's distinctive "content shifts with time and modality" challenge.
+
+The next logical question is: when models are no longer "image/video DiTs" but longer-sequence world models or multimodal hybrid architectures, will the fixed block-Hadamard structure still be sufficient? And as bit-widths continue to fall below W2A4, will the "look at no data whatsoever" path hit the same wall SpinQuant hit — needing at least a small amount of distribution-specific fine-tuning to preserve accuracy?
+
+* Inspiration
+
+This evolutionary line suggests a useful angle for finding research problems: *when the solutions in a field start becoming "ever more fine-grained" (as DiT quantization progressed from fixed calibration to per-timestep dynamic calibration), it often signals that the path is approaching diminishing returns — and that it is worth stepping back to ask "can we make this fine-grained process unnecessary in the first place."* OrbitQuant did not follow PTQ4DiT/Q-DiT/ViDiT-Q further down the calibration-refinement road; instead it looked back, took a proven idea from a neighboring technical line (rotation-based outlier elimination), stripped away the parts requiring training or calibration, and grafted the remainder onto the current problem. This suggests a concrete strategy: actively search for "validated structural tricks from an adjacent line that haven't been ported over yet," rather than defaulting to incremental additions on top of the existing solutions in your own domain.

@@ -1,0 +1,248 @@
+#+title:      伴读：GSQ — 用 Gumbel-Softmax 采样做高精度低比特 scalar 量化
+#+date:       [2026-07-03 Fri 02:24]
+#+filetags:   :reading:
+#+identifier: 20260703T022452
+#+source:     https://arxiv.org/abs/2604.18556
+
+* 全局地图
+
+** 一句话摘要
+
+2-3 比特下 scalar 量化和 vector 量化之间的精度差距，不是格式的锅，是优化没做到位——
+GSQ 把"每个权重选哪个量化格点"重写成一个可微的离散分配问题，用 Gumbel-Softmax 联合
+优化格点分配和分组 scale，让最朴素的对称 scalar 尺子追平了复杂的 QTIP。
+
+** 结构地图
+
+#+begin_example
+  中心主张：差距在优化，不在格式
+        |
+        +-- [问题] scalar 便宜但 2 bit 崩 / vector 抗压但难部署难扩展
+        |        中心提问：scalar 能不能在保持"即插即用"的前提下补回差距？
+        |
+        +-- [方法] 把 layer 重建 → 可微的离散分配问题
+        |        |
+        |        +-- Gumbel-Softmax：离散"选格点"→ 软概率，可求导
+        |        +-- 联合学：per-coordinate 分配 + per-group scale
+        |        +-- 基数对齐：低比特格点少 → softmax 便宜（tractable 的前提）
+        |        +-- local-shift：b>2 时只学 5 个偏移 logit，参数 d*2^b+1 → 5d+1
+        |
+        +-- [证据] 对称、无零点（表示更弱）却更强
+        |        → 证明增益来自优化，而非更灵活的量化器
+        |
+        +-- [结局] 8B/70B 2bit 逼近 QTIP；三值反超 2bit scalar；
+                 改 GGUF Q2_K；扩到万亿 MoE Kimi-K2.5
+#+end_example
+
+** 段落分类概览
+
+- [骨] 摘要、引言的中心提问、方法的"可微离散分配"定义、"对称无零点即证据"这句
+- [肌] Llama/Kimi/GGUF 的一堆数字表、加速比、消融
+- [筋] 从"问题"到"方法"、从"方法"到"实验"的过渡
+
+* 逐段伴读记录
+
+** 第 1 段：摘要 —— 中心主张 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文："a post-training scalar quantization method which jointly learns the
+per-coordinate grid assignments and the per-group scales" —— 一种训练后
+（post-training）scalar 量化方法，联合学习逐坐标（per-coordinate）的格点分配
+与逐组（per-group）的 scale。
+原文："closes most of the gap between scalar quantization and the QTIP
+frontier at 2 and 3 bits" —— 在 2 比特和 3 比特上，补回了 scalar 量化与
+QTIP 前沿之间的大部分差距。
+#+end_quote
+
+意译（达）：现在业界把低比特量化分成两派——简单的 scalar（GPTQ/AWQ）好用但精度到
+3-4 比特就见顶；复杂的 vector/trellis（QTIP/AQLM）精度高但难实现难扩展。作者问：这
+道差距是本质的吗？他们的答案是不。GSQ 只在"训练后"阶段动手（不重训整个模型），做两件
+事——为每个权重坐标学它该落哪个格点，为每一组权重学一个整体 scale——就把简单 scalar
+尺子的精度拉到逼近 QTIP。
+
+*** 结构标注
+
+全文的中心论点句。后面所有实验都是在为"差距在优化不在格式"这一句作证。
+
+*** 注疏（源流·背光）
+
+为什么"scalar vs vector"是这一行的主轴？scalar 量化 = 用一根一维的尺子，每个权重
+独立映到尺子上的刻度，推理时现成 kernel 直接算；vector 量化 = 把若干权重打包，用一本
+"码本"里的向量去拼，表达力强但要专门 kernel、且码本随规模爆炸。GSQ 的赌注是：把 scalar
+这根尺子的"刻度分配"优化到极致，就不必付 vector 那份工程税。
+
+*** 碰撞
+
+问：作者这段最想让你接受的一个点是什么？你接受吗？
+—— 想让你接受的是"差距 = 优化问题，不是表示能力问题"。这是个强主张，先存疑：只看摘要
+无法证伪，判据全压在后面那个"对称无零点却更强"的对照实验上（见第 4 段）。读的时候要盯住
+它到底有没有把这个对照做干净。
+
+** 第 2 段：引言 —— 中心提问 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文（error wall）：scalar 方法撞墙的位置在 "around 3-4 bits per parameter (bpp)"
+—— 大约每参数 3-4 比特。
+原文（中心提问）："Can scalar quantization bridge most of the accuracy gap to
+complex vector- or trellis-based techniques, while remaining a drop-in
+replacement for existing popular formats?" —— scalar 量化能否在补回与复杂
+vector/trellis 方法大部分精度差距的同时，仍然是现有主流格式的即插即用（drop-in）替代？
+#+end_quote
+
+意译（达）：注意这个提问里有两个约束缺一不可——不只要"精度追上"，还要"即插即用"。
+后半句才是这篇论文真正的护城河：QTIP 也精度高，但它换不进你现有的 GGUF/kernel；GSQ
+的产物必须能直接替换现有格式的权重，换个文件就能跑。
+
+*** 结构标注
+
+把摘要的主张收紧成一个可检验的问题。"drop-in replacement"这个约束是它区别于所有
+vector 方法的关键，也是它 practicality 高的根源。
+
+*** 碰撞
+
+压力测试：如果有人反驳"你追平 QTIP 却比它还慢/还占显存，那即插即用有什么用？"——
+作者用加速比接住了：70B 上均匀 2 比特实测 6.20x（对 BF16），且复用现有 scalar kernel。
+所以"即插即用"不是嘴上说说，是有 kernel 兼容 + 加速数据兜底的。这一反驳接得住。
+
+** 第 3 段：方法 —— 可微的离散分配 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文："reformulate layer-wise reconstruction as a differentiable
+discrete-assignment problem" —— 把逐层重建（layer-wise reconstruction）
+重述为一个可微的离散分配（discrete-assignment）问题。
+原文（目标可导）：损失 "is fully differentiable in both the per-group scales
+and the discrete assignments, and can be optimized jointly" —— 对逐组 scale
+和离散分配都完全可导，可以联合优化。
+#+end_quote
+
+意译（达）：核心机制在这。量化本来是"把每个权重钉到最近的格点"，钉的动作是离散的、不可导,
+GPTQ 只能贪心地一个个钉死。GSQ 换个说法：为每个坐标在几个候选格点上放一组可训练的
+logits，经 Gumbel-Softmax 变成一团"软"的加权格点值——这样"选哪个格点"就变得可导了,
+于是格点分配和 scale 能一起用梯度优化。训练时温度 τ 从高退到低，软分配逐渐硬化成真格点。
+
+*** 结构标注
+
+方法的心脏。理解这一段，后面 local-shift、无零点都只是它的推论和优化。
+
+*** 注疏（同构·侧光）
+
+这招不是 GSQ 独创的思想，而是"把离散选择松弛成可导"这一大类技巧在量化上的落地——
+和神经架构搜索里 DARTS 把"选哪个算子"松弛成 softmax 权重、和稀疏训练里对 mask 做
+Gumbel 采样，是同一个形状。GSQ 的贡献不在"用 Gumbel-Softmax"，而在"发现低比特恰好
+让这招便宜到能跑"（见下段）。
+
+*** 碰撞
+
+问：这段有没有让你皱眉的地方？
+—— 一个隐忧：目标是"让这一层的输出贴近原输出"，这是个*局部/逐层*目标，默认每层各自量化
+好、拼起来全局就好。这个假设牢不牢？留着，到复盘看作者自己有没有撞到它（剧透：撞到了）。
+
+** 第 4 段：两个关键设计 —— local-shift 与无零点 [骨]
+
+*** 翻译
+
+直译（信）：
+#+begin_quote
+原文（爆炸）：候选 logits 的数量 "grows exponentially in bpp" —— 随每参数比特数
+指数增长；观察到 "each coordinate typically remains close to its initialized
+quantized value" —— 每个坐标通常离它的初始量化值不远；于是 "introduce only 5
+logits corresponding to a discrete shift" —— 只引入 5 个对应离散偏移的 logits,
+把参数量从 d*2^b+1 降到 5d+1。
+原文（证据）：用 "symmetric group-wise quantization, without any zero-point
+parameters"，这是 "direct evidence that the gains come from better optimization
+of the discrete assignments rather than from a more flexible quantizer" ——
+对称的逐组量化、不带任何零点参数，这是"增益来自对离散分配的更好优化、而非更灵活的量化器"
+的直接证据。
+#+end_quote
+
+意译（达）：两件事。其一 local-shift：比特一高，格点数 2^b 就爆炸，逐个学不现实；但作者
+发现每个权重量化后离初始值都不远，于是不学"落哪个绝对格点"，只学"往左往右挪几格"δ∈{-2..2}
+——每坐标 5 个数就够。其二，也是全文最硬的一招：他们故意用对称、连零点都不加的尺子，也就是
+主动把自己的表示自由度调到*比基线还低*。结果还赢了。这就把"赢在哪"锁死了——不是靠更花哨的
+格式，而是靠优化。
+
+*** 结构标注
+
+把"差距在优化"从口号变成实证的那一段。无零点的对照是整篇论文可信度的支点。
+
+*** 碰撞
+
+问：作者这段最想说服你的点，你接受吗？
+—— 接受，而且这是全文说服力最强的一处。逻辑很干净：若增益来自"更强的表示"，那给自己更弱的
+表示（对称无零点）就该更差；它反而更好 → 增益只能来自优化。这是一个用"自我设限"来证明因果的
+漂亮实验，比单纯堆一张更高的分数表有说服力得多。
+
+** 第 5-N 段：实验结果 [肌]（流读）
+
+连续呈现，不逐句停。关键数字：
+
+- Llama-3.1-8B-Instruct 平均准确率（越高越好，FP16=73.71）：
+  2 比特 GPTQ *37.53*（基本崩）→ EfficientQAT 63.79 → *GSQ 68.55* → QTIP 69.88（仅差 1.33）
+- Llama-3.1-70B 2 比特：EfficientQAT 71.43 → *GSQ 75.57* → PV-Tuning 76.27 → QTIP 77.25
+- 三值 GSQ 1.71 bpp = 63.44，*超过所有跑在更高 2 比特上的 scalar 基线*
+- GGUF Q2_K（Qwen3-8B）：50.03 → *56.28*，且生成 token 更少（48.78M → 39.69M）
+- Kimi-K2.5 万亿 MoE 2 比特：MATH500 96.68→97.32、LiveCodeBench 61.37→69.37（升）,
+  但 GPQA Diamond 89.29→76.57（降，作者归因校准集偏数学/代码）
+- 加速：70B 均匀 2 比特 6.20x（对 BF16，vLLM+Humming）
+
+以上各段在支持第 1、4 段的中心论证：scalar + 好优化 = 逼近 vector 前沿且能部署。
+
+* 全文复盘
+
+** 理解轨迹
+
+- 摘要（骨）：主张存疑，判据后置 —— 通过但挂了问号
+- 引言（骨）：抓住"drop-in"这第二约束 —— 通过
+- 方法·可微分配（骨）：机制清楚，但对"逐层局部目标"起疑 —— 停留
+- 两个设计（骨）：无零点对照解除主张的疑 —— 强通过
+- 实验（肌）：数字兑现主张，GPQA 掉分暴露校准依赖 —— 通过带星号
+
+那个在第 3 段起的疑（逐层局部目标是否全局最优），在实验里得到印证：作者发现整块联合优化
+反而更差，得改成 Q/K→V/O→MLP 分阶段——正说明"局部拼好=全局好"并不牢靠。读者的皱眉点
+命中了论文的真实裂缝。
+
+** 读后一句话
+
+对作者说：你最有说服力的不是那张追平 QTIP 的表，是那个"故意用更弱的表示还赢"的对照——
+把一个容易被质疑成"调参赢"的结果，钉成了"优化赢"的因果。建议把校准数据分布对能力画像的
+重塑（GPQA 那 13 分）也做成同样级别的对照，否则"通用部署"这四个字还欠一个实验。
+
+（层级自评：L2-L3，有判断并生出一个新的实验诉求。）
+
+** 终局问题
+
+如果"低比特的精度差距主要来自优化不足"，那么把 GSQ 这套可微离散分配用回*更高*比特
+（如 4-8 bit，格点更多、local-shift 更省），是继续有收益，还是会被"格点已够多、优化边际
+递减"吃掉？换句话说——优化的红利，是低比特独有的，还是全比特通用的？
+
+** 术语表
+
+| 英文 | 中文 | 本文含义 | 位置 |
+|------+------+----------+------|
+| scalar quantization | 标量量化 | 每权重独立映到一维尺子的刻度，现成 kernel 可跑 | 全文 |
+| vector/trellis quant. | 向量/网格量化 | 用码本向量拼权重，精度高但难实现难扩展（QTIP/AQLM） | §问题 |
+| per-coordinate grid assignment | 逐坐标格点分配 | 每个权重坐标选哪个量化格点 | §方法 |
+| per-group scale | 逐组 scale | 一组权重共享的整体缩放系数 | §方法 |
+| Gumbel-Softmax | —— | 把离散采样松弛成可导的软概率分布的技巧 | §方法 |
+| local-shift parameterization | 局部偏移参数化 | b>2 时只学 δ∈{-2..2} 的 5 个偏移，省参数 | §方法 |
+| zero-point | 零点 | 非对称量化里的偏移参数；GSQ 故意不用 | §证据 |
+| drop-in replacement | 即插即用替代 | 产物能直接换进现有 GGUF/kernel 格式 | §引言 |
+| bpp | 每参数比特数 | bits per parameter，量化力度的度量 | 全文 |
+
+** 下一步线索
+
+- 想追"离散选择松弛成可导"的源头：DARTS（可微架构搜索）把同一招用在选算子上——看它怎么
+  处理"软→硬"退火的偏差，正是 GSQ 温度退火那步的前身。
+- 想追"逐层重建目标是否够"：GPTQ / OBQ 的逐层贪心量化是 GSQ 的起点（也是它的热启动来源）,
+  对照读能看清 GSQ 把"贪心钉死"换成"梯度联合优化"到底改了哪一步。
+- 想验证工程账：代码在 github.com/IST-DASLab/GSQ，重点看它怎么把优化后的权重投影回 GGUF
+  Q2_K 的同格式（"drop-in"这句能不能兑现，全在这段实现里）。
