@@ -64,8 +64,8 @@ already gathered all of it.
 
 If the user named an angle ("翻译" / "讲原理" / "溯源"), do that. If they just
 said "解读这篇", **produce A + B + C + D by default** (reading, story, paper-river,
-and the radar hub); E (full-text digest) is opt-in — do it when the user asks for
-全文/详解 or "都要". Angles:
+and the radar hub); E (中文翻译 / full translation) is opt-in — do it when the
+user asks for 翻译/全文/详解 or "都要". Angles:
 
 - **A. 中文精读 / 翻译** — faithful Chinese interpretation of the abstract and,
   if the user wants the full text, hand off to **`ljg-read`** (伴读 + 英译中).
@@ -84,8 +84,10 @@ and the radar hub); E (full-text digest) is opt-in — do it when the user asks 
   research — say it's running in the background and wire the README nav link when
   it lands. Skip only if the user explicitly opts out.
 - **D. Radar-native analysis** (this skill's unique value — see below).
-- **E. 全文中文详解** — when the user wants the *whole* paper in Chinese, NOT
-  the selective 伴读 of (A). Rules:
+- **E. 中文翻译（全文）** — when the user wants the *whole* paper in Chinese, NOT
+  the selective 伴读 of (A). The reader-facing label is 中文翻译, but it is a
+  paraphrase, not a verbatim translation (see Copyright below) — say so in the
+  file. Rules:
   - *Copyright*: arXiv papers are usually under arXiv's non-exclusive license
     (check the license on the abstract page — only CC-BY/CC0 permit a verbatim
     full translation). Under the default license, do **not** produce a
@@ -97,8 +99,8 @@ and the radar hub); E (full-text digest) is opt-in — do it when the user asks 
     math in Markdown (`$...$` inline, `$$...$$` on its own line) and native
     `| … |` tables, so formulas and tables display correctly when browsing the
     repo; `.org` renders neither. Do **not** use HTML — GitHub shows `.html` as
-    source, not rendered. Open the file with a line noting it's a paraphrased
-    section digest, not a verbatim translation.
+    source, not rendered. Open the file with a line labeling it 中文翻译 while
+    noting it's a paraphrase, not a verbatim/word-for-word translation.
     - *Inline math: use the dollar-backtick form* `` $`…`$ `` **not** plain
       `$…$`. GitHub officially recommends `` $`…`$ `` when the expression
       contains chars that clash with Markdown — which in a CJK doc is nearly
@@ -186,7 +188,7 @@ name.
   - **中文精读 / 伴读 (A)** → `reading.org` (pass ljg-read this exact path to Write).
   - **原理故事 (B)** → `paper.org` (same path override for ljg-paper; if it
     extracts an overview image, put it in the same folder).
-  - **全文中文详解 (E)** → `translation_zh.md` (Markdown so GitHub renders math +
+  - **中文翻译 (E)** → `translation_zh.md` (Markdown so GitHub renders math +
     tables; figures cropped from the PDF into `images/`; per the rules in step 2E).
 
   Whenever you add or regenerate an angle file, update `README.md`'s navigation

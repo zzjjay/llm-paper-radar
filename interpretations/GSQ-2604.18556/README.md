@@ -19,7 +19,7 @@
 |---|---|---|
 | 原理故事 | [paper.org](paper.org) | 七拍故事版《差距不在格式，在优化》，给外行也能复述 |
 | 中文伴读 | [reading.org](reading.org) | 选择性精读，骨架段中英并列 + 碰撞 + 复盘 |
-| 全文详解 | [translation_zh.md](translation_zh.md) | 逐节中文详解（全节 + 附录，复述式非逐句译文；GitHub 渲染公式/表格/图 1） |
+| 中文翻译 | [translation_zh.md](translation_zh.md) | 全文中文翻译（覆盖全节 + 附录；为版权计以复述方式呈现，非逐字直译；GitHub 渲染公式/表格/图 1） |
 | 溯源倒读 | [../../paper-river/GSQ-2604.18556.org](../../paper-river/GSQ-2604.18556.org) （中）· [_en](../../paper-river/GSQ-2604.18556_en.org)（英） | 倒读法脉络 OBD→OBS→OBQ→GPTQ→GSQ |
 
 数据来源：[data/summarized/2026-05-23.json](../../data/summarized/2026-05-23.json)（radar 打分记录）。
