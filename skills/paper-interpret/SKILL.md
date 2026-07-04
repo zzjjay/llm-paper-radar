@@ -63,7 +63,9 @@ already gathered all of it.
 ## Step 2 — pick angles
 
 If the user named an angle ("翻译" / "讲原理" / "溯源"), do that. If they just
-said "解读这篇", offer the menu (default to A+B when they don't choose):
+said "解读这篇", **produce A + B + C + D by default** (reading, story, paper-river,
+and the radar hub); E (full-text digest) is opt-in — do it when the user asks for
+全文/详解 or "都要". Angles:
 
 - **A. 中文精读 / 翻译** — faithful Chinese interpretation of the abstract and,
   if the user wants the full text, hand off to **`ljg-read`** (伴读 + 英译中).
@@ -72,14 +74,15 @@ said "解读这篇", offer the menu (default to A+B when they don't choose):
   mechanism → result. For a story-shaped retelling hand off to **`ljg-paper`**
   (seven-beat spine). Ground the "prior methods" part in the resolver's
   `related_methods` and `siblings`.
-- **C. Paper-river 溯源 (倒读法)** — if the resolver reports an existing
-  `paper-river/*.org`, **read and present that** rather than regenerating. If
-  none exists and the user wants it, hand off to **`ljg-paper-river`** on the
-  arXiv URL, but **override its default output path**: save the result into this
-  repo as `paper-river/<acronym>-<arxiv-id>.org` (dot form, same convention as
-  the cron `gen_paper_river.sh`), NOT the skill's default `~/Documents/notes/`.
-  Use the paper's short acronym for `<acronym>`. (Generating fresh is ~5-10 min
-  of web research — tell the user.)
+- **C. Paper-river 溯源 (倒读法)** — part of the default set. If the resolver
+  reports an existing `paper-river/*.org`, **read and present that** (cheap). If
+  none exists, **generate it in the background** (don't block the other angles):
+  spawn a subagent doing the 倒读法 (recursively trace ≤5 layers of prior work,
+  then walk forward) and Write to `paper-river/<acronym>-<arxiv-id>.org` (dot
+  form, same convention as the cron `gen_paper_river.sh` / `ljg-paper-river`
+  format), NOT `~/Documents/notes/`. Fresh generation is ~5-10 min of web
+  research — say it's running in the background and wire the README nav link when
+  it lands. Skip only if the user explicitly opts out.
 - **D. Radar-native analysis** (this skill's unique value — see below).
 - **E. 全文中文详解** — when the user wants the *whole* paper in Chinese, NOT
   the selective 伴读 of (A). Rules:
