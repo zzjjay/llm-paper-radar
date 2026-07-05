@@ -1,0 +1,285 @@
+#+title:      MixLLM: LLM Quantization with Global Mixed-precision between Output-features and Highly-efficient System Design
+#+date:       [2026-07-04 Sat 04:10]
+#+filetags:   :paper:river:en:
+#+identifier: 20260704T041000-en
+#+source:     https://arxiv.org/abs/2412.14590
+#+authors:    Zhen Zheng, Xiaonan Song, Chuanjie Liu (Microsoft)
+#+venue:      arXiv 2412.14590 (submitted December 2024; the paper's footer reads "Under review by the Machine Learning and Systems (MLSys) Conference" — not AAAI 2025; see note at end)
+
+* The Problem River
+
+In one sentence: *Not all weights in an LLM are equally important — can we allocate a few extra bits only to the genuinely critical weights and spend the savings elsewhere? And where exactly should "importance" be judged, and at what granularity?*
+
+Why this problem has persisted for decades: back in the era of network pruning, researchers already found that determining which weight to remove with the least damage required second-order information to answer correctly. In the LLM post-training quantization (PTQ) era the same question re-emerges in a new disguise — not "remove or keep" but "how many bits to assign." Every generation of methods has wrestled with two dimensions:
+1. *How to measure "importance"*: is it the magnitude of the weight itself, the magnitude of its corresponding activation, or its true influence on the final loss?
+2. *Over what scope to compare "importance"*: within a single layer, or across layers and the whole model? Too fine a granularity (e.g., individual weights) is hardware-unfriendly; too coarse (e.g., one bit-width per entire layer) wastes the discriminative power of the metric.
+
+MixLLM's thesis is that all prior work either judges importance only within a single layer (a local view that may not align with the end-to-end outcome) or achieves mixed precision in principle but runs slowly in practice (due to sparse or irregular memory access). It aims to get both right simultaneously.
+
+* Source Map
+
+#+begin_example
+[1993] Hassibi & Stork - Optimal Brain Surgeon (OBS)
+  |
+  | Problem: When pruning a neural network, which weight can be removed
+  |          with the least impact on the overall loss?
+  | Solution: Use second-order derivatives (Hessian) to quantify the
+  |           "importance score" of each weight. Remove the least
+  |           important one, then use the inverse Hessian to update
+  |           the remaining weights to compensate for the removal.
+  v
+[2022] Frantar, Singh & Alistarh - Optimal Brain Compression / OBQ
+  |
+  | Problem: OBS was designed for pruning. Can "deletion" be replaced
+  |          with "quantization to low bit-width"?
+  | Solution: Port the OBS compensation idea to quantization: quantize
+  |           weights one at a time; after each quantization step,
+  |           use the inverse Hessian to update the remaining
+  |           unquantized weights.
+  v
+[2022] Frantar, Ashkboos, Hoefler & Alistarh - GPTQ
+  |
+  | Problem: OBQ selects which weight to quantize next in a greedy
+  |          order — O(d^4) / O(d_row * d_col^3) — completely
+  |          infeasible for LLMs with hundreds of billions of parameters.
+  | Solution: Drop the greedy ordering; use a fixed column order +
+  |           batched lazy Hessian updates (with Cholesky decomposition).
+  |           Reduces per-layer quantization time to minutes; first method
+  |           to make PTQ tractable for an entire LLM.
+  v
+(A parallel line merges here) [2022] Dettmers et al. - LLM.int8()
+  |
+  | Problem: GPTQ only handles weights. LLM activations contain a small
+  |          number of dimensions with values orders of magnitude larger
+  |          than the rest (emergent outliers) — quantizing them to
+  |          int8 collapses overall accuracy.
+  | Solution: Identify these outlier dimensions, compute them in fp16,
+  |           compute the rest in int8, then merge the two partial
+  |           matrix-multiplication results.
+  v
+[2023] Dettmers et al. SpQR / Kim et al. SqueezeLLM / Lee et al. OWQ
+  |
+  | Problem: LLM.int8() isolates outliers only on the activation side.
+  |          A small fraction (<1%) of weights also contribute
+  |          disproportionately large quantization errors.
+  | Solution: Extract the most sensitive weight values and store them
+  |           as a sparse fp16 tensor; quantize all other weights
+  |           uniformly to 3/4-bit.
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem: Sparse tensors are slow on GPU (utilization often <10%).
+  |          The extracted outlier weights become a system bottleneck.
+  | Solution: Don't extract anything. Instead, use activation statistics
+  |           to apply a larger scaling factor to "important channels,"
+  |           pushing quantization error away from them. The important
+  |           weights stay inside the dense tensor and are quantized
+  |           at the same bit-width as everything else — hardware-friendly.
+  v
+[2023/24] Zhao et al. Atom / Huang et al. SliM-LLM
+  |
+  | Problem: AWQ only "scales and protects" important channels; the
+  |          bit-width is still the same for all channels. Why not
+  |          give important parts more bits and unimportant parts fewer?
+  | Solution: True mixed-bit allocation within a layer.
+  |           (Atom reorders channels by importance then assigns
+  |            high/low precision; SliM-LLM ranks groups by saliency
+  |            and allocates bits accordingly.)
+  |           Importance is determined by local quantization error
+  |           within each layer.
+  v
+[2024] MixLLM (this paper)
+  |
+  | Problem: An output channel that is "important" within its own layer
+  |          may not actually be important for the model's final,
+  |          end-to-end output — local-loss rankings can mislead
+  |          global bit allocation.
+  | Solution: Use end-to-end loss over a calibration set to rank all
+  |           output channels globally (across all layers). Truly
+  |           impactful channels get 8-bit; the rest get 4-bit.
+  |           A two-step dequantization kernel + a three-stage pipeline
+  |           (memory access / dequantization / GEMM) makes the whole
+  |           scheme fast in practice.
+#+end_example
+
+Note: The OBS → OBQ → GPTQ chain is an explicitly stated lineage — the GPTQ
+paper directly acknowledges it builds on OBQ and overcomes its O(d^4) complexity.
+The LLM.int8() → SpQR/SqueezeLLM step is acknowledged by the latter papers
+themselves ("the outlier isolation idea applied to weights, previously discovered
+in input activations" — SpQR's own words). AWQ's criticism of sparse schemes'
+hardware inefficiency is a direct statement in the AWQ paper. The Atom/SliM-LLM
+→ MixLLM step is explicitly stated in the MixLLM paper ("Atom identifies salient
+channels only locally and at input-feature granularity; SliM-LLM relies solely on
+local per-layer loss and ignores system efficiency"). The arrow drawn between GPTQ
+and LLM.int8() is added here for narrative continuity — the two are actually
+near-simultaneous independent 2022 works that do not critique each other.
+*That connection is a confluence of problem threads, not a citation relationship —
+noted explicitly here.*
+
+* The Evolutionary Narrative
+
+** 1993 | OBS: Which Weight to Prune Hurts Least? Answer with Second-Order Information
+
+*** What Problem It Saw
+
+The earliest neural-network pruning strategy was blunt: remove whichever weight has the smallest absolute value. But small magnitude does not mean small impact on the loss — a numerically tiny weight can, when removed, cause the loss to spike dramatically because of complex coupling with other weights.
+
+*** Its Solution
+
+Use the second-order derivatives of the loss with respect to the weights (the Hessian) to precisely quantify "how much will the loss increase if I remove this weight?" Remove the one with the smallest increase, then use the inverse Hessian to tell the remaining weights exactly how to adjust themselves to compensate for the removal.
+
+*** Why It Worked (and the Trap It Left)
+
+For the first time, "importance" was elevated from "weight magnitude" to "the weight's true influence on the loss," and the follow-up question — "what do we do after removing it?" — was also answered: not leaving a hole, but letting the surviving weights absorb the damage.
+
+The trap: *this second-order method requires inverting the Hessian matrix — completely intractable for modern networks with billions of parameters.* The "too slow" problem left here would take thirty years to fully address.
+
+** 2022 | OBQ / Optimal Brain Compression: Replace "Deletion" with "Quantization"
+
+*** What Problem It Saw
+
+OBS was designed for pruning. As deep learning entered the post-training compression era, a new question arose: *can we, instead of deleting a weight, quantize it to a lower bit-width, and apply the same compensation idea?*
+
+*** Its Solution
+
+Transplant the OBS framework into quantization: quantize weights one at a time, and after each step use the inverse Hessian to update the remaining unquantized weights so they absorb the error introduced by that quantization. Pruning and quantization thus become instances of the same mathematical framework — "remove information, then compensate."
+
+*** Why It Worked (and the Trap It Left)
+
+For the first time, quantization was placed inside a theoretically grounded, iterative-compensation framework rather than simple rounding.
+
+The trap: *OBQ still requires a greedy search at each step — "which weight costs least to quantize right now?" — giving a complexity of O(d_row · d_col^3) per layer.* At GPT-scale, a single layer takes prohibitively long; models beyond a billion parameters are out of reach.
+
+** 2022 | GPTQ: Forget the Greedy Order — Being Fast Enough Comes First
+
+*** What Problem It Saw
+
+OBQ's greedy strategy of "find the optimal quantization order at every step" yields only marginal accuracy gains on large layers while consuming enormous computation. The real bottleneck is speed, not how cleverly the ordering is chosen.
+
+*** Its Solution
+
+Drop the greedy ordering entirely; use a fixed column order (e.g., left-to-right) combined with batched, lazy Hessian updates (via Cholesky decomposition). This lifts per-layer quantization speed by three orders of magnitude, making it possible for the first time to quantize an entire 100B-parameter LLM to 4-bit in a matter of hours.
+
+*** Why It Worked (and the Trap It Left)
+
+Transformed a "theoretically elegant but intractable" method into a "slightly sub-optimal in theory, but workable on real large models" practical solution. GPTQ remains one of the most widely used PTQ baselines to this day.
+
+The trap: *GPTQ operates entirely on weights.* Activation quantization is not in scope — and a thornier problem was quietly brewing in LLM activations.
+
+** 2022 | LLM.int8(): Activations Have Outliers Too — They Need Special Treatment
+
+*** What Problem It Saw
+
+This line of work developed nearly simultaneously with, and independently from, GPTQ (it is not a critique of GPTQ; it discovered a previously overlooked phenomenon). Transformer activations develop, during training, a small number of dimensions whose values are tens to hundreds of times larger than the rest. Quantizing these dimensions to int8 causes the overall accuracy to collapse.
+
+*** Its Solution
+
+Identify the "emergent outlier" dimensions, compute them in fp16, compute all remaining dimensions in int8, split the matrix multiplication into two parts, then merge the results.
+
+*** Why It Worked (and the Trap It Left)
+
+For the first time it was systematically demonstrated that "not all dimensions are equally important — a tiny minority must be treated specially." This insight permeated virtually all subsequent quantization work.
+
+The trap: *the "isolate the outliers" idea was applied only to activations; no one had yet moved it to the weight side.*
+
+** 2023 | SpQR / SqueezeLLM / OWQ: Weights Have Outliers Too — Extract and Store as Sparse fp16
+
+*** What Problem It Saw
+
+LLM.int8() proved that activations have emergent outliers. These papers then asked: *does the same phenomenon exist in weights?* The answer is yes — for certain output hidden dimensions, a small fraction of weight values (typically under 1%) are exceptionally sensitive; quantizing them causes errors far larger than quantizing any other weight.
+
+*** Its Solution
+
+Extract that small fraction of the most sensitive weight values and store them as a sparse fp16 tensor; quantize all remaining weights uniformly to 3/4-bit. SqueezeLLM additionally uses second-order information (Hessian) to design non-uniform quantization grids that further account for sensitivity.
+
+*** Why It Worked (and the Trap It Left)
+
+Applied the "separate by importance" idea systematically to weight compression for the first time, achieving state-of-the-art perplexity at the time.
+
+The trap: *sparse tensor matrix multiplications are very inefficient on GPUs.* Modern GPU Tensor Cores are designed for regular, dense matrices; sparse and irregular memory-access patterns often result in utilization below 10%, making the extracted "important weights" a system-performance bottleneck.
+
+** 2023 | AWQ: Don't Extract — Just Scale
+
+*** What Problem It Saw
+
+SpQR-style methods physically pull the important weights out into a sparse format to protect them — but this "mixed precision + sparse" storage layout is exactly what hardware accelerates worst. Can important weights be protected without breaking the matrix's regular, dense structure?
+
+*** Its Solution
+
+A mathematically equivalent transformation: identify which channels are "important" (judged by the magnitude of the corresponding activations, not the weights themselves), multiply those channels' weights by a larger scaling factor, and divide the corresponding activations by the same factor to cancel out the change. After scaling, quantization error naturally falls more heavily on unimportant channels, reducing the relative error on important ones. *No weights are ever extracted; the matrix stays dense; no column reordering like GPTQ is needed.*
+
+*** Why It Worked (and the Trap It Left)
+
+Replacing "isolation" with "scaling" solved both accuracy and hardware-efficiency concerns at once, with no need for backpropagation or calibration-set fitting, making the approach highly generalizable. This is why AWQ became one of the most widely used weight-quantization methods in industry.
+
+The trap: *AWQ only gives important channels "a little more protection" (through scaling) — the bit-width is still the same for all channels.* If important channels could directly use higher bits and unimportant ones lower bits, could we do better?
+
+** 2023/24 | Atom / SliM-LLM: Real Mixed-Bit Allocation Within a Layer
+
+*** What Problem It Saw
+
+AWQ-style scaling is ultimately a reallocation within the same bit budget. The real question is: *why not let important parts use 8-bit and unimportant parts use 4-bit — differentiate at the level of the bit budget itself?*
+
+*** Its Solution
+
+- Atom: Reorder activations and weights by importance (grouping important channels together), then apply mixed precision to the reordered channels (a small number of channels at high bit-width, the rest at low bit-width). A fused kernel handles the memory-access cost introduced by the reordering.
+- SliM-LLM: Rather than mixing precision at the individual-channel level (too fine-grained for hardware), rank groups by saliency and allocate more bits to highly salient groups, balancing accuracy and hardware regularity.
+
+In both cases, "importance" is determined *within a single layer*, using that layer's local activation statistics or local quantization reconstruction error.
+
+*** Why It Worked (and the Trap It Left)
+
+True mixed-bit allocation was achieved at the level of actual bit budgets rather than mere scaling tricks, giving clear advantages over AWQ/GPTQ in extremely low-bit regimes (2-bit, 3-bit).
+
+The trap (called out directly in the MixLLM paper): *Atom identifies salient channels only locally within a single layer, and at input-feature granularity. SliM-LLM likewise relies solely on per-layer local quantization loss and does not consider system-level execution efficiency.* The key question: is a channel that looks important within its own layer actually important for the model's final, end-to-end output?
+
+** 2024 | MixLLM: Locally Important ≠ Globally Important
+
+*** What Problem It Saw
+
+This is MixLLM's central insight: *a channel that is highly salient within its own layer (i.e., the local loss is sensitive to it) is not necessarily important for the model's final, end-to-end output loss.* All prior work — whether AWQ's scaling or Atom/SliM-LLM's mixed precision — judges "importance" within a single layer. This local scope may produce locally optimal bit assignments that are globally suboptimal.
+
+The second observation is at the system level: for mixed precision to run fast on real hardware, the dequantization and data-movement pipeline must be co-designed with the algorithm; otherwise "better accuracy but slower execution" squanders the gains.
+
+*** Its Solution
+
+1. *Global saliency ranking*: Instead of using a layer's local reconstruction error to decide which output channels are important, use the end-to-end model loss on a calibration set to rank all output channels globally across all layers. Channels that truly matter for final accuracy receive 8-bit; the rest receive 4-bit — spending roughly 10% extra bits for a substantial accuracy gain.
+2. *Output-feature granularity for mixed precision*: Mixed-precision partitioning is performed along the output-channel dimension (rather than Atom's input-channel dimension), combined with group quantization (symmetric for 8-bit, asymmetric for 4-bit), further reducing accuracy loss.
+3. *Algorithm–system co-design*: To make this global mixed-precision scheme fast on GPU, a two-step dequantization is designed to be Tensor-Core-friendly; fast data-type conversion reduces dequantization overhead; a software pipeline overlaps memory access, dequantization, and matrix multiplication. Activations are uniformly quantized to 8-bit (no more aggressive low-bit activation quantization), because analysis shows the GEMM bottleneck lies primarily in the larger weight tensors rather than the smaller activation tensors — 8-bit activations offer the best cost-effectiveness.
+
+*** Why It Worked (and the Gaps It Leaves)
+
+Both long-unsolved problems of this river — the scope of importance judgment and the system efficiency of mixed precision — are addressed together in a single solution. The paper reports that on Llama 3.1 70B, spending ~10% extra bits reduces the perplexity delta from ~0.5 (prior SOTA) to within 0.2; across three mainstream models, MMLU-Pro accuracy loss drops from 1.92 to 0.99.
+
+Gaps left open (directions for future work):
+- The global saliency ranking depends on end-to-end loss estimated on a calibration set; the *calibration-set representativeness problem* (overfitting to the calibration distribution) is not specifically discussed.
+- Output-channel granularity is more flexible than Atom's input-channel granularity, but it is still a one-dimensional partition along a single axis. Whether *simultaneous global mixed precision across both rows (output channels) and columns (input channels)* is feasible remains unexplored.
+- Throughout this river, "importance" is always a scalar score. Whether *the importance metric itself is optimal* (analogous to how BDQ in a parallel quantization thread proposed Flatness as a theoretically grounded criterion) remains heuristic, with no theoretical guarantee.
+
+* Closing: What New Things MixLLM Saw in the Whole River
+
+This river flows from OBS in 1993 to MixLLM in 2024, and is fundamentally the same question being re-asked at ever-changing granularities and scopes:
+
+#+begin_example
+Which weight to prune with least damage? (pruning, individual weight)
+  -> How to compensate quantization error? (individual weight, within a layer)
+  -> Compensation too slow — make it tractable first
+  -> Activations have extreme outliers — handle them separately (dimension level)
+  -> Weights have outliers too — extract and store them (sparse, hardware-unfriendly)
+  -> Don't extract — just scale (dense, hardware-friendly, but no true mixed precision)
+  -> True mixed-bit allocation (but importance judged only within a single layer)
+  -> MixLLM: expand the scope of "importance" from a single layer
+             to end-to-end loss across the whole model,
+             then make this global scheme fast through system co-design
+#+end_example
+
+MixLLM did not invent new quantization mathematics (group quantization and symmetric/asymmetric quantization are all established techniques). Its contribution is *identifying a scale-mismatch problem that the entire preceding river had overlooked*: all prior work judged importance at the scope of a single layer, while the actual optimization target is the output of the entire model. Locally optimal bit assignments aggregated layer by layer are not necessarily globally optimal. At the same time, MixLLM did not treat algorithm (accuracy) and system (efficiency) as separate concerns to be handled in isolation — it placed both in the same design space from the outset, looking for a joint optimum. This is why the paper's title lists "System Design" and "Mixed-precision" as co-equal keywords.
+
+* A Note on Tracing Depth and Uncertainty
+
+- This trace works backward from MixLLM and reaches *6 layers* (MixLLM ← Atom/SliM-LLM ← AWQ ← SpQR/SqueezeLLM/OWQ ← LLM.int8() ← GPTQ ← OBQ, with the ultimate source being OBS in 1993). This exceeds the "at most 5 layers" guideline, but the lineage of second-order compensated quantization (OBS/OBQ/GPTQ) is genuinely deep, so all levels are presented faithfully.
+- Connections that are uncertain or require independent verification by the reader:
+  1. The arrow drawn between GPTQ and LLM.int8() *is not a citation or critique relationship.* The two are near-simultaneous, independent 2022 works. The arrow is purely narrative, connecting two problem threads — stated explicitly in the body text.
+  2. AWQ's criticism of SpQR-style sparse methods' hardware inefficiency is inferred from general statements in the AWQ paper; *it has not been verified word-for-word whether AWQ explicitly names SpQR* (both are 2023 works and may be contemporaneous rather than strictly sequential critiques).
+  3. The description of Atom/SliM-LLM's limitations is drawn from secondary summaries of MixLLM's paper retrieved online; *the exact wording in the corresponding section of the arXiv PDF has not been directly checked.* Readers should verify against the original paper before citing.
+  4. Publication status: the paper's footer states "Under review by the Machine Learning and Systems (MLSys) Conference." No conclusive evidence of AAAI 2025 acceptance was found, so that claim is not used in the venue field. Please consult the authors' final published version for authoritative venue information.
