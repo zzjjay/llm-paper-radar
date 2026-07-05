@@ -10,7 +10,7 @@ On-demand single-paper interpretations from the `paper-interpret` skill
 ├── README.md          hub — always present
 ├── reading.org        伴读 (ljg-read)          — optional
 ├── paper.org          seven-beat story (ljg-paper) — optional
-├── translation_zh.md  full Chinese digest (Sonnet) — optional
+├── translation_zh.md  中文翻译 / Chinese translation (Sonnet) — optional
 └── images/            figures cropped from the PDF
 ```
 
@@ -19,7 +19,7 @@ On-demand single-paper interpretations from the `paper-interpret` skill
 | `README.md` | Hub: radar-native analysis (novelty / trend / practicality / triage) + nav to the files below, the `../paper-river/` lineage, and the `data/summarized/` source | paper-interpret |
 | `reading.org` | Chinese close-reading, selective, bilingual on key passages | ljg-read |
 | `paper.org` | Background + mechanism, told as a story | ljg-paper |
-| `translation_zh.md` | Every section + appendix in Chinese, paraphrased (not a verbatim translation) | Sonnet subagent |
+| `translation_zh.md` | 中文翻译 — every section + appendix in Chinese, paraphrased (not verbatim, for copyright) | Sonnet subagent |
 
 Only `README.md` is guaranteed; the rest are generated per requested angle, and
 the hub's nav lists only what exists.
@@ -28,8 +28,8 @@ the hub's nav lists only what exists.
 
 - **`README.md` is the hub** — GitHub auto-renders it on folder open; keep its
   nav in sync when angle files are added.
-- **Format** — angle files are `.org` (the `ljg-*` skills emit org); the digest
-  is `.md` so GitHub renders its math and tables.
+- **Format** — angle files are `.org` (the `ljg-*` skills emit org); the
+  translation is `.md` so GitHub renders its math and tables.
 - **Math must be Markdown-inert** — inline `` $`…`$ ``, display ` ```math ` fences.
   Plain `$…$` / `$$…$$` get mangled by GitHub's Markdown pass (eaten underscores,
   collapsed `\\`, dropped `\{`). `scripts/check_math.py` lints for this.

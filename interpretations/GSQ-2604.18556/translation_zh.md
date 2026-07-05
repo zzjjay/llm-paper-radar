@@ -1,12 +1,12 @@
-# GSQ 逐节中文详解：用 Gumbel-Softmax 采样做高精度低比特标量量化
+# GSQ 中文翻译：用 Gumbel-Softmax 采样做高精度低比特标量量化
 
 > GSQ: Highly-Accurate Low-Precision Scalar Quantization for LLMs via Gumbel-Softmax Sampling
 >
-> 本文件为逐节中文详解（复述性质，非逐句译文）。原文：https://arxiv.org/abs/2604.18556
+> GSQ 全文中文翻译（为版权计以复述方式呈现，非逐字直译）。原文：https://arxiv.org/abs/2604.18556
 
 日期：2026-07-03。作者：Alireza Dadgarnia, Soroush Tabesh, Mahdi Nikdan, Michael Helcig, Eldar Kurtic, Maximilian Kleinegger, Dan Alistarh。
 
-本文件为逐节中文详解（复述性质，非逐句译文）。目的是让读者读完这份笔记即可把原文吃透：每节用笔者自己的话讲清楚该节要点，公式保留原始 LaTeX 记号并用中文解释含义，表格中的数值原样搬运、表头译成中文并保留原表号，图以中文概括图注。作者单位：ISTA、ETH Zürich、Red Hat AI、TU Wien。通讯作者邮箱 alirezadadgarnia1378@gmail.com、dan.alistarh@ist.ac.at。代码开源于 https://github.com/IST-DASLab/GSQ 。
+本文为 GSQ 全文中文翻译（为版权计以复述方式呈现，非逐字直译）。目的是让读者读完即可把原文吃透：每节用笔者自己的话讲清楚该节要点，公式保留原始 LaTeX 记号并用中文解释含义，表格中的数值原样搬运、表头译成中文并保留原表号，图以中文概括图注。作者单位：ISTA、ETH Zürich、Red Hat AI、TU Wien。通讯作者邮箱 alirezadadgarnia1378@gmail.com、dan.alistarh@ist.ac.at。代码开源于 https://github.com/IST-DASLab/GSQ 。
 
 ## 摘要
 
