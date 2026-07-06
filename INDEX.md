@@ -448,3 +448,5 @@
 - [07-03](digests/2026-07-03.md) — 75 scanned, 0 passed, top: (no papers passed)
 
 - [07-04](digests/2026-07-04.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [07-05](digests/2026-07-05.md) — 50 scanned, 0 passed, top: (no papers passed)
