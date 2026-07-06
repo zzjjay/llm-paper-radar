@@ -36,27 +36,19 @@ _Nothing surfaced today (everything was hard-gated)._
 
 <!-- WEEKLY_START -->
 
-# Weekly Digest · 2026-06-22 → 2026-06-28
+# Weekly Digest · 2026-06-29 → 2026-07-05
 
-> Surfaced: 15 papers
+> Surfaced: 7 papers
 
 | # | Bucket | Paper | Authors | Date | Why |
 |---|--------|-------|---------|------|-----|
-| 1 | PTQ | [HyperQuant: A Rate-Distortion-Optimal Quantization Pipeline for Large Language and Diffusion Models](https://arxiv.org/abs/2606.23406) | Yuval Domb, Hadar Sackstein, Tomer Solberg | 2026-06-22 | [zh](digests/2026-06-22.md#p-2606-23406) · [en](digests/2026-06-22_en.md#p-2606-23406) |
-| 2 | PTQ | [SharQ: Bridging Activation Sparsity and FP4 Quantization for LLM Inference](https://arxiv.org/abs/2606.26587) | Haoqian Meng, Yilun Luo, Yafei Zhao et al. | 2026-06-25 | [zh](digests/2026-06-25.md#p-2606-26587) · [en](digests/2026-06-25_en.md#p-2606-26587) |
-| 3 | PTQ | [GRINQH: Graded Input-based Quantization Hierarchy for Efficient LLM Generation](https://arxiv.org/abs/2606.23419) | Jette Oberländer, Jan Finkbeiner, Catherine M. Schöfmann et al. | 2026-06-22 | [zh](digests/2026-06-22.md#p-2606-23419) · [en](digests/2026-06-22_en.md#p-2606-23419) |
-| 4 | PTQ | [What Survives When You Compress a Recursive Reasoner for the Edge?](https://arxiv.org/abs/2606.26488) | Pearse Jim, Steven Kolawole, Opegbemi Matthias Busoye et al. | 2026-06-25 | [zh](digests/2026-06-25.md#p-2606-26488) · [en](digests/2026-06-25_en.md#p-2606-26488) |
-| 5 | Low-bit (≤ 2-bit) | [CAT-Q: Cost-efficient and Accurate Ternary Quantization for LLMs](https://arxiv.org/abs/2606.26650) | Shigeng Wang, Chao Li, Yangyuxuan Kang et al. | 2026-06-25 | [zh](digests/2026-06-25.md#p-2606-26650) · [en](digests/2026-06-25_en.md#p-2606-26650) |
-| 6 | KV cache | [RoPE-Aware Bit Allocation for KV-Cache Quantization](https://arxiv.org/abs/2606.24033) | Fengfeng Liang, Yuechen Zhang, Jiaya Jia | 2026-06-23 | [zh](digests/2026-06-23.md#p-2606-24033) · [en](digests/2026-06-23_en.md#p-2606-24033) |
-| 7 | KV cache | [Epiphany-Aware KV Cache Eviction Without the Attention Matrix](https://arxiv.org/abs/2606.26472) | Steven Kolawole, Virginia Smith | 2026-06-25 | [zh](digests/2026-06-25.md#p-2606-26472) · [en](digests/2026-06-25_en.md#p-2606-26472) |
-| 8 | KV cache | [Information-Aware KV Cache Compression for Long Reasoning](https://arxiv.org/abs/2606.26875) | Jushi Kai, Zhuiri Xiao, Alexandra Birch et al. | 2026-06-25 | [zh](digests/2026-06-25.md#p-2606-26875) · [en](digests/2026-06-25_en.md#p-2606-26875) |
-| 9 | KV cache | [NLL-Guided Full-Attention Layer Selection for Training-Free Sliding-Window Adaptation](https://arxiv.org/abs/2606.27791) | Qiong Tang, Xiangkun Hu, Xiangyang Liu et al. | 2026-06-26 | [zh](digests/2026-06-26.md#p-2606-27791) · [en](digests/2026-06-26_en.md#p-2606-27791) |
-| 10 | Pruning & distillation | [FlexMoE: One-for-All Nested Intra-Expert Pruning for MoE Language Models](https://arxiv.org/abs/2606.27866) | Fan Mo, Yuxuan Han, Geng Zhang et al. | 2026-06-26 | [zh](digests/2026-06-26.md#p-2606-27866) · [en](digests/2026-06-26_en.md#p-2606-27866) |
-| 11 | Pruning & distillation | [Understanding Knowledge Distillation in Post-Training: When It Helps and When It Fails](https://arxiv.org/abs/2606.22942) | Xin Liu, Simin Ma, Shujian Liu et al. | 2026-06-22 | [zh](digests/2026-06-22.md#p-2606-22942) · [en](digests/2026-06-22_en.md#p-2606-22942) |
-| 12 | Pruning & distillation | [EPTS: Elastic Post-Training Sparsity for Efficient Large Language Model Compression](https://arxiv.org/abs/2606.25285) | Ke Xu, Jiaqi Wan, Wenhao Hu et al. | 2026-06-24 | [zh](digests/2026-06-24.md#p-2606-25285) · [en](digests/2026-06-24_en.md#p-2606-25285) |
-| 13 | Trending | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) 🔁 | Woosuk Kwon, Zhuohan Li, Siyuan Zhuang et al. | 2023-09-12 | [zh](digests/2026-06-26.md#p-2309-06180) · [en](digests/2026-06-26_en.md#p-2309-06180) |
-| 14 | Survey | [Quantization Inflates Reasoning: Token Inflation as a Hidden Cost of Low-Bit Reasoning Models](https://arxiv.org/abs/2606.25519) | Xinyu Lian, Walid Krichene, Beichen Huang et al. | 2026-06-24 | [zh](digests/2026-06-24.md#p-2606-25519) · [en](digests/2026-06-24_en.md#p-2606-25519) |
-| 15 | Survey | [Output-Space Allocation Costs for Calibration-Guided LLM Compression: An Empirical Study](https://arxiv.org/abs/2606.27785) | Qiong Tang, Xiangkun Hu, Xiangyang Liu et al. | 2026-06-26 | [zh](digests/2026-06-26.md#p-2606-27785) · [en](digests/2026-06-26_en.md#p-2606-27785) |
+| 1 | PTQ | [$\text{Log}_\text{b}$Quant: Quantizing Language Models in Logarithmic Space](https://arxiv.org/abs/2607.01127) | Jeremias Bohn, Tizian Dippold, Mahdi Koubaa et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-01127) |
+| 2 | KV cache | [ReFreeKV: Towards Threshold-Free KV Cache Compression](https://arxiv.org/abs/2502.16886) 🔁 | Xuanfan Ni, Liyan Xu, Chenyang Lyu et al. | 2026-06-26 | [zh](digests/2026-06-30.md#p-2502-16886) · [en](digests/2026-06-30_en.md#p-2502-16886) |
+| 3 | KV cache | [GSRQ: Gain-Shape Residual Quantization for Sub-1-bit KV Cache](https://arxiv.org/abs/2607.01065) | Soosung Kim, Minjae Park, Eui-Young Chung et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-01065) |
+| 4 | KV cache | [MosaicKV: Serving Long-Context LLM with Dynamic Two-D KV Cache Compression](https://arxiv.org/abs/2607.00760) | Sheng Qiang, Ruiwei Chen, Yinpeng Wu et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-00760) |
+| 5 | KV cache | [Lynx: Progressive Speculative Quantization for accelerating KV Transfer in Long-Context Inference](https://arxiv.org/abs/2607.01831) | Wenchen Han, Gingfung Matthew Yeung, Marco Barletta et al. | 2026-07-02 | [zh](digests/2026-07-02.md#p-2607-01831) · [en](digests/2026-07-02_en.md#p-2607-01831) |
+| 6 | KV cache | [SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference](https://arxiv.org/abs/2606.31145) | Amirhossein Abaskohi, Giuseppe Carenini, Peter West et al. | 2026-06-30 | [zh](digests/2026-06-30.md#p-2606-31145) · [en](digests/2026-06-30_en.md#p-2606-31145) |
+| 7 | Diffusion | [OrbitQuant: Data-Agnostic Quantization for Image and Video Diffusion Transformers](https://arxiv.org/abs/2607.02461) | Donghyun Lee, Jitesh Chavan, Duy Nguyen et al. | 2026-07-02 | [zh](digests/2026-07-02.md#p-2607-02461) · [en](digests/2026-07-02_en.md#p-2607-02461) |
 
 
 <!-- WEEKLY_END -->
