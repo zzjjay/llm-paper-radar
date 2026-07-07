@@ -1,0 +1,176 @@
+#+title:      KVpop -- Key-Value Cache Compression with Predictive Online Pruning
+#+date:       [2026-07-07 Tue 00:09]
+#+filetags:   :paper:river:en:
+#+identifier: 20260707T000940-en
+#+source:     https://arxiv.org/abs/2607.05061
+#+authors:    Lukas Hauzenberger, Niklas Schmidinger, Anamaria-Roberta Hartl, David Stap, Thomas Schmied, Sebastian Böck, Günter Klambauer, Sepp Hochreiter
+#+venue:      arXiv, 2026 (NXAI / Johannes Kepler University Linz)
+
+* The Problem River
+
+A large language model, as it speaks, must record every word it has ever said in a "notebook" (KV cache). The notebook grows thicker with every token; the longer the generation, the slower and more memory-hungry it becomes. To keep the notebook from expanding without bound, pages must be torn out — but here lies the trouble: the page that seems unimportant right now might be exactly the critical evidence needed thirty pages later.
+
+This river of problems is one that successive generations of researchers have all tried to answer: *how do you know whether a token will still be useful in the future, rather than judging only by how useful it looks right now?* Each generation of methods moves a little closer to the goal of "predicting the future," and each leaves behind new gaps in the process.
+
+* Source Map
+
+#+begin_example
+[2023] Xiao et al. - StreamingLLM
+  |
+  | Problem: once a sliding window evicts the very first few tokens,
+  |           the model collapses immediately (attention sink phenomenon)
+  | Solution: always keep a few "sentinel" initial tokens + a recency window;
+  |           position decides survival
+  v
+[2023-2024] Zhang et al. (H2O) / Li et al. (SnapKV) / Oren et al. (TOVA)
+  |
+  | Problem: keeping tokens by position alone is too blunt;
+  |           the tokens that truly matter may be neither at the start nor in the window
+  | Solution: score each token by its accumulated past attention;
+  |           keep the high-scoring ones
+  v
+[2024] Nawrot et al. - DMC (Dynamic Memory Compression)
+  |
+  | Problem: scoring rules are hand-crafted; training and inference behavior are misaligned
+  | Solution: learn a compression policy during a fine-tuning phase;
+  |           merge unimportant tokens online instead of applying fixed rules
+  v
+[2025] Łańcucki et al. - DMS (Dynamic Memory Sparsification)
+  |
+  | Problem: merging mixes token representations irreversibly
+  | Solution: skip merging; learn a binary keep/evict gate;
+  |           defer the actual eviction with a buffer window
+  v
+[2026] Hauzenberger et al. - KVpop  (target paper)
+  |
+  | Problem: all prior scoring methods use *past* signals;
+  |           the buffer window only delays the *eviction action*, not the *decision moment* —
+  |           the verdict is already locked in the instant a token enters the cache
+  | Solution: supervise the scorer directly with the token's *actual future attention*;
+  |           also delay the *decision itself* until the token is about to leave the buffer window
+  v
+[To date] No clear follow-up critique or improvement found
+          (paper submitted 2026-07-06, survey conducted one day later)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2023 | StreamingLLM: Keep Sentinel Tokens + a Recency Window, Prevent Streaming Collapse
+
+*** What Problem Did It See?
+
+Before StreamingLLM, the most straightforward approach was sliding-window attention: keep only the most recent W tokens and discard everything beyond the window. This seems reasonable — tokens farther away should matter less to the current generation step. But the authors discovered that once those very first tokens are actually evicted, the model's perplexity explodes instantly and outputs collapse. The reason: during training, the earliest few tokens (even semantically meaningless ones, like the very first word) serve as "attention sinks" — an unexpectedly large share of all attention weights piles up on them. Once those buckets are removed, the model's attention distribution has nowhere to land, and the whole mechanism breaks down.
+
+*** Its Solution
+
+Never delete the initial tokens. Fix a set of s "sink tokens" at the start, add a sliding recency window, and discard everything in between. The message to the model is: "I'll keep your emotional trash-cans in place so you can keep dumping attention into them; we'll only clear the middle content that has genuinely aged out."
+
+*** Why It Works (and What Trap It Left Behind)
+
+It works because it does not force the model to change the attention habits it has already learned; it simply designs the cache policy to accommodate those habits. The overhead is minimal and it enables indefinitely long streaming generation. But its retention rule is entirely *position-determines-everything*: no matter how important a token's content is, if it sits outside the sentinel zone and the recency window, it is gone; conversely, even filler tokens inside the window are guaranteed to survive. This left an obvious opening for the next wave of researchers — score by actual content rather than position alone.
+
+** 2023-2024 | H2O / SnapKV / TOVA: Score by Accumulated Past Attention, Not Just Position
+
+*** What Problem Did They See?
+
+StreamingLLM's position rule is too coarse. A critical name or number mentioned outside the window, dozens of steps back, might be referenced repeatedly later — but because it falls outside the "sentinel + window" set, it is erased indiscriminately. This wave of work recognized that retention decisions should be based on "has this token actually been used frequently?" rather than "where does it sit?"
+
+*** Their Solutions
+
+Three approaches converge on the same insight. H2O tallies each token's cumulative incoming attention from its entry into the cache up to the present, keeps the "heavy hitters" plus a recency window. SnapKV uses the attention pattern from a short "observation window" at the end of the prompt to predict which tokens will be repeatedly consulted during generation, and compresses the prompt portion of the cache all at once. TOVA is more aggressive: it treats the Transformer as a "multi-state RNN" and at every step uses the current query's attention scores to evict whichever token scores lowest, dynamically updating the retained set. Common thread: all three use *already-observed* attention signals as a proxy for "is this token useful?"
+
+*** Why It Works (and What Trap It Left Behind)
+
+Far more nuanced than a pure position rule, and genuinely capable of retaining important out-of-window information. But the core assumption — "heavily attended in the past ≈ still needed in the future" — does not always hold. In long-chain reasoning tasks like math problems or code, a token may go unnoticed for dozens of steps and then suddenly become critical (a variable defined earlier that is referenced much later). Using past attention to proxy future utility is inherently lagging and prone to "wrongly evicting" tokens that are temporarily quiet but actually pivotal. Furthermore, all these methods are fixed rules applied post-training (training-free or re-scoring only); there is no learning process to correct this systematic bias.
+
+** 2024 | DMC: Stop Writing Fixed Rules — Let the Model Learn Its Own Compression Strategy
+
+*** What Problem Did It See?
+
+The scoring rules in H2O/SnapKV/TOVA are ultimately hand-engineered heuristics: which statistics to use, how to weight them, when to trigger eviction — all set by researchers intuitively, disconnected from the model's actual behavior. Moreover, these rules are applied "after the fact" at inference time to a model that was never trained with compression in mind. At training time the model sees a full cache; at inference time a chunk of it suddenly disappears. This train-inference mismatch itself degrades performance.
+
+*** Its Solution
+
+DMC proposes a "retrofitting" phase in which the model learns, per layer and per head, its own compression strategy. Rather than simple deletion, it learns to *merge* the representations of unimportant tokens into adjacent ones, and this learning is embedded directly in the training objective, so the model is habituated to and adapts to this compressed cache form.
+
+*** Why It Works (and What Trap It Left Behind)
+
+Because the strategy is learned, it can be customized to the specific behavior patterns of each layer and attention head rather than applying a one-size-fits-all heuristic; it also resolves the training-inference mismatch. However, "merging" itself carries a cost: blending two tokens' key/value representations is lossy compression — once merged, the original information is gone. If the timing or target of a merge is misjudged, the error cannot be undone.
+
+** 2025 | DMS: Skip Merging — Learn a Binary Keep/Evict Decision, but Defer the Eviction Action
+
+*** What Problem Did It See?
+
+DMC's merge operation is an ambiguous, irreversible blending of information. A cleaner approach would be to determine definitively "should this token be kept or evicted?" for more controllable outcomes. At the same time, deciding a token's fate the very instant it enters the cache is too hasty — the importance of many tokens only becomes apparent some steps after they arrive.
+
+*** Its Solution
+
+DMS (Dynamic Memory Sparsification) trains a binary keep/evict gate using Gumbel-sigmoid, a differentiable relaxation that allows discrete 0/1 decisions to be trained via backpropagation. It also introduces a "protection window": even if a token is marked for eviction, it is not immediately removed from the cache. Instead, it lingers until it slides out of the protection window, during which time it remains accessible to subsequent queries.
+
+*** Why It Works (and What Trap It Left Behind)
+
+Cleaner than merging: either the original representation is preserved or it is discarded entirely, with no intermediate information contamination. Deferring eviction also provides a small buffer. But the authors of KVpop pinpoint DMS's flaw precisely: *the protection window only defers the eviction action — it does not defer the decision moment itself*. That is, whether a token is kept or evicted is already locked in by the gate at the instant it enters the cache. Even if, during the protection window, that token accumulates new evidence (e.g., subsequent queries frequently look back at it), this evidence cannot feed back into the original decision — the verdict was already passed, and information gathered during the window is wasted.
+
+** 2026 | KVpop: Supervise with Actual Future Attention, and Also Defer the Decision Itself
+
+*** What Problem Did It See?
+
+Synthesizing all prior work, KVpop identifies two fundamental issues. First, every scoring method — heuristic or learned — is ultimately using some *proxy signal* to guess future utility: past attention, local statistics, merge weights, gate values. Not one of them directly uses "how much attention does this token actually receive in the future" to supervise the scorer, so there is always a gap between the proxy and the true objective. Second, buffer-window methods like DMS conflate "delaying eviction" with "delaying the decision": what should actually be done is letting the decision itself come later, so the scorer can incorporate the near-context evidence a token accumulates *after* entering the cache.
+
+*** Its Solution
+
+Two key designs are combined. First, *future attention targets*: during training, directly compute the total "attention mass" that all future queries actually give a token after it leaves the protection window, and use this ground-truth quantity as the supervision label for training the scorer. This is equivalent to showing the student the answer key with an "oracle view" — at inference time the scorer needs no knowledge of the future; it has simply been taught by this training data how to anticipate it. To avoid storing an entire dense S×S attention map (which would blow up memory), the authors devise a "transposed attention" trick: they reuse the log-sum-exp (LSE) normalization quantities already computed during the training-time forward pass, swapping the roles of queries and keys in a second attention computation, thereby obtaining each key's total future attention mass for free — no extra large matrix required. Second, a *stateful scorer with deferred decisions*: an mLSTM-like memory module continuously absorbs new near-context seen by a token after it enters the protection window. Only when the token is about to slide out of the window and face its keep/evict verdict does the scorer use the memory state accumulated up to that moment to issue a final score. The *decision* is thus genuinely deferred to the point of maximum information, rather than being locked in at entry time as in DMS.
+
+*** Why It Works (and What Trap It Left Behind)
+
+Because the supervision signal is "real future" rather than "guessed future" for the first time, the scorer learns a decision boundary that naturally aligns more closely with true utility. And because the decision itself is deferred to the end of the protection window, the scorer can factor in the near-context evidence accumulated during that window rather than making a hasty early judgment. In experiments on mathematical reasoning tasks (AIME, HMMT), KVpop retains 97%–100% of the teacher model's performance while compressing 75%–88% of the KV cache, clearly outperforming predecessors such as DMS, TOVA, and StreamingLLM. Remaining open questions: this "train with future, infer without it" supervision paradigm depends on training sequences being long enough and varied enough to cover real long-range dependency patterns. If the sequence length or task distribution at training time diverges significantly from deployment, whether this "future knowledge" generalizes is uncertain. The paper itself validates transfer only on math reasoning and code/STEM; whether it holds on broader tasks remains unknown.
+
+* Frontier Extensions
+
+As of this writing, this is the latest development along this line. The paper was submitted on July 6, 2026; this survey was conducted on July 7, 2026 — just one day later — and no subsequent work explicitly citing or critiquing KVpop has been found.
+
+* The Whole Picture at a Glance
+
+#+begin_example
+                Position Rule    Past Scoring       Learning Strategy    Decision Timing
+                (who survives)   (what signal)      (hand-crafted vs     (when is the
+                                                     learned)             verdict reached)
+                ----------       ----------         ------------         ----------
+StreamingLLM    sentinels        none (pure          hand-crafted         locked in at
+   2023         + window         position)           rule                 cache entry
+
+H2O/SnapKV      sentinels        cumulative /        hand-crafted         rolling online
+TOVA 2023-24    + window         local attention     rule                 re-estimation
+                + dynamic set    (proxy past)        (training-free)      (still a proxy)
+
+DMC 2024        sentinels        learned merge        end-to-end           compressed at
+                + window         weights              learning             cache entry
+                + long-range                                              (lossy merge)
+
+DMS 2025        sentinels        learned keep/        end-to-end           locked at entry;
+                + window         evict gate           learning             only the *eviction
+                + long-range     (Gumbel-sigmoid)                         action* is deferred
+
+KVpop 2026      sentinels        actual future        end-to-end           deferred until
+(target)        + window         attention target     learning +           token exits the
+                + long-range     (true supervision    stateful memory      protection window
+                                 at train time)       scorer
+
+Evolution: position -> past proxy signal -> learned merge ->
+           learned binary decision (decision still early) ->
+           learned binary decision (decision also deferred) + true future supervision
+#+end_example
+
+* Insight
+
+On the surface this line looks like an engineering race to "delete KV cache more cleverly," but the underlying shift is an epistemological one: *to predict the future, your signal should be as close to the future as possible, and your decision should be made as late as possible.* StreamingLLM proxies the future with "position" (farther away = less important); the H2O family proxies it with "past statistics" (important before ≈ important again); DMC/DMS proxy it with "learned weights" (let the model fit its own proxy). But all of these remain in the mode of "use whatever is at hand to guess what you actually want." KVpop's turning point is the realization that at training time you *can* directly observe the future (because training sequences are complete and offline), so it simply uses that oracle view directly as the supervision signal rather than continuing to search for a cleverer proxy.
+
+This is a simple but easily overlooked insight: when you have more information available during offline training than you will have at inference time, you should convert that information gap directly into supervision signal, rather than wasting it by training a proxy model that is itself limited to inference-time information.
+
+A second hidden thread is that the *timing of the decision* keeps being pushed later: from "fate sealed at cache entry," to "re-evaluated at every step," to "eviction action deferred via a buffer window," and finally to KVpop explicitly separating "deferred eviction" from "deferred decision" and preserving only the latter's essence. This suggests the next evolutionary step may be: can the decision timing be pushed back even further? For instance, allowing a token to be "resurrected" (reconsidering already-evicted tokens), or making the scorer's memory window length itself a learnable, content-adaptive quantity rather than a fixed hyperparameter w as it is today.
+
+* Takeaways
+
+The most direct practical lesson this evolutionary line offers for "how to find problems" is: *whenever a system has two regimes — training time and deployment time — with different information availability, check whether the extra training-time information has actually been exploited.* People often habitually train a proxy model whose inputs and outputs are fully aligned with inference-time form, forgetting that the training phase itself can often see the "answer" that inference cannot (here: future attention). That gap is a ready-made, free source of supervision signal.
+
+A second lesson is: *when critiquing prior work, decompose down to the smallest individual design choice* rather than saying vaguely "this method isn't good enough." KVpop's critique of DMS is precise to one specific design dimension: "deferred eviction ≠ deferred decision." That scalpel-level decomposition is often exactly where the next publishable idea lives — the practical habit being: when you encounter a "buffer/delay" design in the literature, ask one extra question: "exactly which step of the pipeline is being deferred?" That question alone may be the seed of a paper.

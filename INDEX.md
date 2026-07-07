@@ -450,3 +450,5 @@
 - [07-04](digests/2026-07-04.md) — 50 scanned, 0 passed, top: (no papers passed)
 
 - [07-05](digests/2026-07-05.md) — 50 scanned, 0 passed, top: (no papers passed)
+
+- [07-06](digests/2026-07-06.md) — 218 scanned, 2 passed, top: OrbitQuant: Data-Agnostic Quantization for Image a
