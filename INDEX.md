@@ -452,3 +452,5 @@
 - [07-05](digests/2026-07-05.md) — 50 scanned, 0 passed, top: (no papers passed)
 
 - [07-06](digests/2026-07-06.md) — 218 scanned, 2 passed, top: OrbitQuant: Data-Agnostic Quantization for Image a
+
+- [07-07](digests/2026-07-07.md) — 200 scanned, 1 passed, top: SeKV: Resolution-Adaptive KV Cache with Hierarchic
