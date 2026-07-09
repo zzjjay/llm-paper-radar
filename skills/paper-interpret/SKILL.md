@@ -136,8 +136,20 @@ Angles:
     render+crop with `pdftocairo -png -r 150 -x <x> -y <y> -W <w> -H <h> -f N -l N`,
     Read the crop to verify the box, save under
     `interpretations/<acro>-<id>/images/`, and reference it relatively at the
-    right spot (`![图 K：<caption>](images/<name>.png)`). Skip if the paper has
-    no meaningful figures.
+    right spot (`![图 K：<caption>](images/<name>.png)`). Skip only a figure
+    that is genuinely non-meaningful (e.g. a company logo); do **not** skip a
+    figure just because cropping takes a few tool calls — the PDF crop above
+    works for every figure the paper has, it's mechanical, not "extraction-limited".
+    **Extract every meaningful figure in the paper, not a subset** — a 2026-07
+    run stopped after 2 of 8 figures and reported "figure extraction受限"
+    (extraction-limited) as the reason, which was false: all 8 cropped cleanly
+    once someone actually tried. If delegating this to a subagent (see
+    Mechanics below), tell it explicitly to attempt every figure and only skip
+    ones it verified are non-meaningful, not to stop early for convenience.
+    After the subagent returns, spot-check: figure count in the paper (`grep -c
+    'Figure [0-9]*\.' ` on the stripped text) should roughly match the number
+    of `![...]` embeds in the output file — if it doesn't, resume the subagent
+    (or do it yourself) to fill the gap before calling E done.
   - *Mechanics*: this is a long output (~30k-token papers). Delegate to a
     **Sonnet subagent** (translation needs language, not Opus-level reasoning —
     cheaper, and it isolates the full text from the main context). Fetch the
