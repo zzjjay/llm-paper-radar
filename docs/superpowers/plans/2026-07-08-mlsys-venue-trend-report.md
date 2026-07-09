@@ -897,6 +897,40 @@ git commit -m "docs: add MLSys 2026 LLM inference deployment trend report"
 
 ---
 
+## Task 7: Macro synthesis via ljg-rank
+
+This task has no automated test — like Task 6, it's a manual step run once per conference report, after the per-subfield report exists. It is now a **required** part of producing a venue report, not an optional extra: a report with only per-subfield sections tells you what exists in each bucket, but not why the buckets look the way they do this year.
+
+- [ ] **Step 1: Invoke the `ljg-rank` skill**
+
+Call the `Skill` tool with `skill: "ljg-rank"` and `args` set to a one-paragraph description of the domain: the venue/year, the total in-scope paper count, and the subfield distribution table (name + count for each). Point it at the full report file (`venue-reports/<slug>.md`) for paper-level detail, and state the goal explicitly: find the independent root generators behind the subfield distribution — not a restatement of the buckets, but the few things that, if changed, would make the whole distribution collapse or shift.
+
+Expected: the skill writes its own file to `~/Documents/notes/<timestamp>--<domain>的秩__rank.org` and reports that path back. This file is the source of truth for the full analysis — do not hand-edit it.
+
+- [ ] **Step 2: Condense into a "Macro synthesis" section**
+
+Read the skill's org file. Write a 3-5 paragraph English condensation (the venue report itself is in English; the skill's own output is Chinese prose by design — see its `SKILL.md` for why, don't fight that) covering: the root generators found, one concrete example paper per generator, how they compound or stay independent, and — if the skill's analysis singles out a subfield as a "multiplicative overflow" or otherwise not reducible to a single generator (as `compiler_kernel_fusion` was for MLSys 2026) — call that out explicitly rather than silently smoothing it into the generator list.
+
+- [ ] **Step 3: Prepend to the report**
+
+Insert the condensed section as `## Macro synthesis`, immediately after the report's title (`# <Venue> — LLM Inference Deployment Optimization Trend Report`) and before `## Subfield distribution`. End the section with an italic pointer to the full org file path from Step 1, e.g.:
+
+```markdown
+*(Fuller root-rank writeup with ASCII diagrams, in Chinese: `~/Documents/notes/<timestamp>--<domain>的秩__rank.org`)*
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+cd llm-paper-radar
+git add venue-reports/<slug>.md
+git commit -m "docs: add macro synthesis to <Venue> venue report"
+```
+
+Note: the `~/Documents/notes/*.org` file itself is **not** committed — it lives outside the repo (that's where `ljg-rank` always writes) and is referenced by path, not copied in.
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** Fetch/retry/completeness-threshold (Task 1) ↔ spec §2 step 1 + §3; scoring with judge-unavailable fallback (Task 2) ↔ spec §2 step 2 + §3; grouping (Task 3) ↔ spec §2 step 3; parallel trend analysis + synthesis (Task 5) ↔ spec §2 steps 4-5 + §3 (per-subfield failure isolation); manual verification (Task 6) ↔ spec §4 Testing and §5 Known Risks (decision-field assumption check).

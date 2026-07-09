@@ -8,7 +8,7 @@
 
 ### Goal
 
-Given an academic conference (**first target: MLSys 2026**), do a one-shot fetch of all its **accepted** papers, use an LLM to identify which ones fall under **LLM inference deployment optimization** (broader than `llm-paper-radar`'s existing quantization/compression scope — covers KV cache optimization, quantization, speculative decoding, scheduling & batching, MoE inference, long-context/prefill-decode disaggregation, multi-GPU/heterogeneous deployment, compiler & kernel fusion, etc.), group them by subfield, generate a research-trend summary per subfield, and produce a final Markdown report.
+Given an academic conference (**first target: MLSys 2026**), do a one-shot fetch of all its **accepted** papers, use an LLM to identify which ones fall under **LLM inference deployment optimization** (broader than `llm-paper-radar`'s existing quantization/compression scope — covers KV cache optimization, quantization, speculative decoding, scheduling & batching, MoE inference, long-context/prefill-decode disaggregation, multi-GPU/heterogeneous deployment, compiler & kernel fusion, etc.), group them by subfield, generate a research-trend summary per subfield, distill a macro-level synthesis across all subfields via the `ljg-rank` skill, and produce a final Markdown report.
 
 This is a **new capability** inside the `llm-paper-radar` repo, fully independent of the existing daily rolling-window pipeline (`scripts/daily.sh`) — it does not modify that pipeline's behavior.
 
@@ -23,7 +23,7 @@ This is a **new capability** inside the `llm-paper-radar` repo, fully independen
 
 - Fully fetches all of MLSys 2026's accepted papers; a paper count below a rough floor (e.g. <20) is treated as an incomplete fetch and errors out rather than silently producing a report.
 - Every paper in the scoring stage has a diagnosable hard_gate / subfield / reason; LLM call failures never silently drop a paper (reuses `pipeline/filter.py`'s "judge unavailable" recording pattern).
-- The final report includes: per-subfield paper-count distribution, a trend summary per subfield (core problems, representative papers), and the full paper list.
+- The final report includes: a macro synthesis section (root drivers behind the subfield distribution, via `ljg-rank`) at the top, per-subfield paper-count distribution, a trend summary per subfield (core problems, representative papers), and the full paper list.
 
 ---
 
@@ -80,6 +80,15 @@ workflows/venue_trend_report.js # Workflow script: parallel trend analysis + syn
    → a synthesis agent rolls up all subfield summaries + the count distribution
    → writes venue-reports/mlsys-2026.md (per-conference reports live in their
      own top-level directory, not digests/, since they're not per-day)
+
+6. Macro synthesis (ljg-rank skill, manual invocation after step 5)
+   Given the subfield distribution + full report, find the independent
+   root drivers behind why the distribution looks the way it does — not
+   a restatement of the subfields, but the few generators that would
+   collapse the whole picture if changed. Condensed into a "Macro
+   synthesis" section prepended to venue-reports/mlsys-2026.md; the
+   skill's own full writeup (Chinese, with ASCII diagrams) is saved
+   outside the repo under ~/Documents/notes/ and referenced by path.
 ```
 
 ---

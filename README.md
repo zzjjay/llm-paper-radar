@@ -239,7 +239,7 @@ Unlike the daily pipeline, this doesn't run on a rolling window: it pulls a venu
 ./scripts/venue_report.sh "MLSys.org/2026/Conference"   # fetch → score → group
 ```
 
-The last step (parallel trend analysis + report synthesis) runs as a Claude Code [Workflow](workflows/venue_trend_report.js) rather than a plain script — see [`docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md`](docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md) for the full pipeline and how to feed the grouped output into it.
+The last step (parallel trend analysis + report synthesis) runs as a Claude Code [Workflow](workflows/venue_trend_report.js) rather than a plain script — see [`docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md`](docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md) for the full pipeline and how to feed the grouped output into it. A final **macro synthesis** pass (via the [`ljg-rank`](https://github.com/lijigang/ljg-skills) skill) distills the whole subfield distribution down to its independent root drivers and is prepended to the report — see plan Task 7.
 
 ---
 
