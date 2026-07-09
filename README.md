@@ -301,8 +301,7 @@ llm-paper-radar/
 ├── seeds.yaml                   # curated index of important papers per bucket (used by paper-triage skill)
 ├── install.sh                   # symlinks skills/* into ~/.claude/skills/; run once after clone
 ├── docs/
-│   ├── SPEC.md                  # design spec — buckets, scoring axes, pipeline contract
-│   └── PLAN.md                  # implementation plan + change log
+│   └── SPEC.md                  # design spec — buckets, scoring axes, pipeline contract
 ├── prompts/
 │   ├── relevance.md             # filter rubric (two-axis + buckets + anchors)
 │   └── summary.md               # bilingual (zh + en) summary format prompt
@@ -321,7 +320,6 @@ llm-paper-radar/
 │   ├── summarize.py             # bilingual zh + en summaries
 │   ├── render.py                # bucket grouping + README splicing + Paper River link
 │   ├── readme_template.md       # static doc template (this file's source)
-│   ├── rollup.py                # N-day rollup compact view used by render
 │   ├── weekly.py                # 7-day roll-up as a compact table
 │   └── rollup_digest.py         # monthly/half-year/yearly roll-up (archive-only, render-from-cache)
 ├── scripts/

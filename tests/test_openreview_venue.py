@@ -11,6 +11,17 @@ from sources.openreview_venue import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _anonymous_openreview(monkeypatch):
+    """Force the anonymous path so these respx-mocked tests never trigger a
+    real (unmocked) login POST — they must not depend on whether OpenReview
+    account creds happen to be exported in the environment."""
+    monkeypatch.delenv("OPENREVIEW_EMAIL", raising=False)
+    monkeypatch.delenv("OPENREVIEW_PASSWORD", raising=False)
+    import sources._openreview_auth as auth
+    auth._cached_token = None
+
+
 def _note(note_id: str, title: str, venueid: str) -> dict:
     return {
         "id": note_id,

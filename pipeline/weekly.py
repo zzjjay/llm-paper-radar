@@ -1,6 +1,6 @@
 """7-day rollup digest as a single compact table: emits
-weekly/YYYYMMDD-YYYYMMDD.md and splices the same table into README.md (between
-the WEEKLY markers).
+snapshots/weekly/YYYYMMDD-YYYYMMDD.md and splices the same table into README.md
+(between the WEEKLY markers).
 
 The window-loading (`_collect`) and table-rendering (`_render_table`) helpers are
 reused by `pipeline.rollup_digest` for the longer monthly / half-year / yearly

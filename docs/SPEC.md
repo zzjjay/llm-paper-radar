@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-11
 **Author**: zhaolin
-**Status**: Draft (awaiting review)
+**Status**: Built and running — current design spec for the core daily radar
 
 ## 1. Goal & Non-Goals
 
