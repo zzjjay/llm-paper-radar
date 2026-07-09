@@ -1,5 +1,19 @@
 # MLSys 2026 — LLM Inference Deployment Optimization Trend Report
 
+## Macro synthesis
+
+The 57 in-scope papers look scattered across 8+ named subfields, but underneath them are only two independent root drivers.
+
+**1. Hardware's internal resources don't scale at the same rate.** Matmul throughput grows faster than memory bandwidth, memory capacity, and cross-GPU interconnect — a physical fact of chip scaling, not a software problem. FlashAttention-4 states this most directly: on Blackwell, tensor-core throughput doubled while shared-memory bandwidth and the exponential units didn't, so the whole pipeline had to be redesigned. HipKittens hits the same wall from a different angle — porting kernel primitives from NVIDIA to AMD requires rethinking the primitives, not translating code. Quantization work (MixLLM, block-floating-point scale search) is the same response at the numeric-representation level: since memory is scarcer than compute, shrink the numbers.
+
+**2. Inference workloads are not uniform, but serving systems have long treated them as if they were.** Within one request, prefill is compute-bound and decode is bandwidth-bound — treating them as the same phase wastes both (PLA-Serve, TriInfer, "Beyond the Buzz"). Within one context, some tokens/heads matter more than others (FlexiCache's stable/unstable heads, SkipKV's sentence-level eviction, Kitty's channel-wise precision). Within one decode step, GPU compute sits idle because only one token gets produced per step — speculative decoding (PRISM, SpecDiff-2, TiDAR) exists to fill that idle compute. Within one MoE model, experts are not equally busy and communication doesn't scale with parameter count (CRAFT's expert replication, FarSkip-Collective's compute/communication overlap). The pattern repeats at every granularity — token, head, expert, phase, request — and each subfield is really the same move applied at a different scale: identify the part of the work that doesn't deserve equal treatment, and skip, cache, or relocate it.
+
+These two drivers are independent — you can imagine hardware that never changes with a workload that's still phase-heterogeneous, or a perfectly uniform workload that still needs new kernels for a new chip generation. But they compound: mobile DVFS scheduling is a clean example of both firing at once (independently-governed CPU/GPU/memory frequency scaling × prefill/decode having different power profiles).
+
+**compiler_kernel_fusion doesn't sit inside either driver — it's the overflow from multiplying them.** Hardware generations keep turning over *and* workloads keep fragmenting into finer granularities at the same time; the combinatorial space of (hardware × workload-slice) pairs has outgrown what engineers can hand-tune kernel-by-kernel. FlashInfer-Bench, Wave, Event Tensor, and the rest of that cluster aren't responding to driver 1 or driver 2 specifically — they're responding to the product of the two growing faster than human kernel-writing capacity.
+
+*(Fuller root-rank writeup with ASCII diagrams, in Chinese: `~/Documents/notes/20260709T005837--MLSys2026推理优化的秩__rank.org`)*
+
 ## Subfield distribution
 
 | Subfield | # Papers |
