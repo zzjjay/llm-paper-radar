@@ -229,6 +229,18 @@ uv run python -m pipeline.render
 /plugin install ljg-skills@ljg-skills
 ```
 
+### 📊 Conference venue trend reports
+
+A separate, one-shot capability alongside the daily rolling pipeline: given a specific conference (currently only **MLSys 2026**), fetch its *entire* accepted-paper set from OpenReview, classify each paper into an LLM-inference-deployment-optimization subfield (KV cache, quantization, speculative decoding, scheduling/batching, MoE inference, long-context/PD disaggregation, multi-GPU/heterogeneous, compiler/kernel fusion, or a proposed "other"), and produce a per-subfield trend report — core problems, representative papers, and method commonalities/divergences.
+
+Unlike the daily pipeline, this doesn't run on a rolling window: it pulls a venue's full history in one pass, so it's meant to be run manually per conference, not on a cron. Example output: [`digests/mlsys-2026-report.md`](digests/mlsys-2026-report.md).
+
+```bash
+./scripts/venue_report.sh "MLSys.org/2026/Conference"   # fetch → score → group
+```
+
+The last step (parallel trend analysis + report synthesis) runs as a Claude Code [Workflow](workflows/venue_trend_report.js) rather than a plain script — see [`docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md`](docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md) for the full pipeline and how to feed the grouped output into it.
+
 ---
 
 ## 🧑‍🔬 Interactive skills
