@@ -1,6 +1,6 @@
 # MLSys 2026 — LLM Inference Deployment Optimization Trend Report
 
-*57 of ~135 accepts whose primary contribution is LLM serving. All figures are authors' self-reported bests ("up to X", often microbenchmark) — ceilings, not expectations. One systems venue, auto-selected set — see [Method](#method--caveats).*
+*57 of ~135 accepts whose primary contribution is LLM serving. All figures are authors' self-reported bests ("up to X", often microbenchmark) — ceilings, not expectations. One systems venue, auto-selected set — see [Paper distribution](#paper-distribution).*
 
 ## Takeaway
 
@@ -46,9 +46,7 @@ Notably, **standalone weight quantization has narrowed to a niche** — only [Mi
 
 Ideas densest in KV + spec decoding; production-proven work concentrates in scheduling, kernels, communication.
 
-## Method & caveats
-
-57 filtered from ~135 accepts by an LLM classifier (`pipeline/venue_filter.py` + `prompts/inference_relevance.md`), hard-gating non-inference-deployment work (training-only, model releases, ASIC, eval-only, non-LLM). Biases: (1) borderline cases kept, so a few aren't pure text-LLM (db-SP visual-gen, TriInfer multimodal, diffusion-LM); (2) MLSys pre-selects for systems work, so this is "what MLSys accepted," not "what the field did" — discount venue-shaped trends accordingly.
+## Paper distribution
 
 | Subfield | # | Subfield | # |
 |---|---|---|---|
@@ -57,3 +55,5 @@ Ideas densest in KV + spec decoding; production-proven work concentrates in sche
 | long_context_pd_disaggregation | 7 | quantization | 2 |
 | kv_cache | 7 | other (8 singletons) | 8 |
 | speculative_decoding | 5 | | |
+
+*Mechanical classifier labels; the analysis above is organized by research concern instead. Selection: 57 auto-filtered from ~135 accepts by an LLM classifier (`pipeline/venue_filter.py`), hard-gating non-inference-deployment work. Two biases — a few kept papers aren't pure text-LLM (db-SP, TriInfer, diffusion-LM), and MLSys pre-selects for systems work, so read this as "what MLSys accepted," not "what the field did."*

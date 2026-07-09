@@ -169,9 +169,13 @@ Structure:
    (e.g. "standalone weight-quant nearly gone here"), fold it into the section it
    relates to rather than making a whole section. (The MLSys 2026 report dropped
    this section for exactly this reason.)
-6. `## Method & caveats` — how the set was selected + its biases, at the end.
-7. **Subfield distribution** — the count table last, marked as the mechanical
-   classification, subordinate to the analysis.
+6. `## Paper distribution` (last) — the subfield count table, followed by a
+   single italic footnote: these are mechanical classifier labels (analysis is by
+   concern instead), plus how the set was selected + its two biases (a few kept
+   papers aren't pure text-LLM; the venue pre-selects for systems work, so it's
+   "what the venue accepted," not "what the field did"). Keep it to one line — the
+   caveat is load-bearing for the `[venue artifact]` tags above, but doesn't need
+   its own section.
 
 ### Rigor rules (these are the ones a shallow report violates)
 
@@ -224,8 +228,9 @@ print('missing:', ids-linked)
 Fold any missing paper into its rightful thread — don't leave it out (an unlinked
 in-scope paper is a coverage hole). Reference shape: `venue-reports/mlsys-2026.md`
 (~60 lines, dense, all 57 papers linked, organized by research concern:
-Takeaway + numbered concern sections + Maturity + Method; no standalone
-"what shifted" section — its one grounded nugget was folded into a section).
+Takeaway + numbered concern sections + Maturity + a final Paper-distribution
+section (table + one-line selection/bias footnote); no standalone "what shifted"
+section — its one grounded nugget was folded into a section).
 
 ## Step 4 — commit
 
