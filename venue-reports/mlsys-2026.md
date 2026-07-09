@@ -36,6 +36,8 @@ Largest cluster (16/57), second story as big as KV. **Rebalanced on-chip bottlen
 
 **Energy** (a real cross-cutting thread): [BEAM](https://openreview.net/forum?id=BfNBXM8CCT) spends SLO slack on energy (−51%), [CORE](https://openreview.net/forum?id=PSyHQ8kVUT) coordinates phone CPU/GPU/mem frequencies, [Layered Prefill](https://openreview.net/forum?id=yyDbI3HXco) −22%/token. **Edge/client:** [IntAttention](https://openreview.net/forum?id=CPCRITwAaP) integer softmax on Arm, [VRAM-Constrained xLM](https://openreview.net/forum?id=VKqQYg6JPb) CPU-GPU sharding for NVIDIA's client SDK. **Cost/ops/reliability:** [BOute](https://openreview.net/forum?id=ZVQb92umqX) Bayesian routing+placement, [OptiKIT](https://openreview.net/forum?id=om4H7AI2hc) optimization for non-experts, [MorphServe](https://openreview.net/forum?id=PDu13oOl4G) quantization as a runtime knob, [HELIOS](https://openreview.net/forum?id=CV52m9NJFK) depth as a runtime knob, [FaaScale](https://openreview.net/forum?id=jgL8LuOVyT) serverless cold-scale, [AIRS](https://openreview.net/forum?id=g1RWik4Gy1) Google's rating pipeline, [Breaking the Ice](https://openreview.net/forum?id=eoEobeKTNZ) vLLM cold-start profiling. Two one-offs: [Attribution-based Sparse Activation](https://openreview.net/forum?id=gJFigZeb5D) (skip low-attribution FFN neurons) and [Shannonic](https://openreview.net/forum?id=NhMxI0GbB8) (lossless tensor compression for transfer).
 
+Notably, **standalone weight quantization has narrowed to a niche** — only [MixLLM](https://openreview.net/forum?id=VBbMRQ4VOc) (mixed-precision by output-feature importance), Kitty (KV), and ScaleSearch (BFP scale) appear as theses; otherwise quant is a runtime knob (MorphServe). Read this as a venue-routing effect, though — pure quant algorithms target NeurIPS/ICML, not a systems venue — not a field-wide decline.
+
 ## 8. Maturity: practicality vs research
 
 - **Deployed at scale (experience reports):** [Meta deployment config](https://openreview.net/forum?id=gEbKQeIdxB) (Llama, ~1B MAU), [LinkedIn SLM](https://openreview.net/forum?id=re82zZczHj) (millions QPS), fabric-lib (Perplexity), HipKittens (AMD AITER), AIRS (Google), OptiKIT — trustworthy but workload-specific.
@@ -43,13 +45,6 @@ Largest cluster (16/57), second story as big as KV. **Rebalanced on-chip bottlen
 - **Research prototypes (the majority):** most KV/spec-decoding/MoE algorithm papers — open code, benchmark-validated; "up to X" least safe to extrapolate ([Performance or Illusion?](https://openreview.net/forum?id=fzkqtezFEi)).
 
 Ideas densest in KV + spec decoding; production-proven work concentrates in scheduling, kernels, communication.
-
-## What shifted, and what's conspicuously absent
-
-- **KV cache is the largest single object** (~15–20/57). *(this set)*
-- **Weight quantization nearly gone as a standalone thesis** — only [MixLLM](https://openreview.net/forum?id=VBbMRQ4VOc), Kitty, ScaleSearch survive; else a runtime knob (MorphServe). **[venue artifact]** — pure quant algorithms go to NeurIPS/ICML, not a systems venue.
-- **Reality-check papers are a visible genre** (Beyond the Buzz, Performance or Illusion?, Demystifying the MoE Tax). *(this set)*; more common than before is **[conjecture]**.
-- **Reasoning + agentic workloads are the gravity well** behind the KV/prefix/long-decode work *(this set)*; that it barely existed two years ago is **[conjecture]**.
 
 ## Method & caveats
 

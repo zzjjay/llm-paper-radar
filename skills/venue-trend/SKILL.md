@@ -160,8 +160,15 @@ Structure:
    cutting across the concerns: deployed-at-scale (named production systems) /
    industrial-grade-with-real-tooling / research-prototype. The most useful cut
    for a reader deciding what to adopt vs. watch.
-5. `## What shifted, and what's conspicuously absent` — but **separate grounded
-   from conjectural claims** (see rigor rules). Tag each.
+5. **(Optional) `## What shifted, and what's conspicuously absent`** — include
+   *only* if you have a grounded shift/absence that isn't already covered by the
+   Takeaway or a numbered section. Skip it by default: in practice this section
+   fills with (a) restatements of the thesis and (b) `[conjecture]` /
+   `[venue artifact]` claims we've flagged as not-really-findings — a section
+   built on those weakens the report. If one genuine grounded absence exists
+   (e.g. "standalone weight-quant nearly gone here"), fold it into the section it
+   relates to rather than making a whole section. (The MLSys 2026 report dropped
+   this section for exactly this reason.)
 6. `## Method & caveats` — how the set was selected + its biases, at the end.
 7. **Subfield distribution** — the count table last, marked as the mechanical
    classification, subordinate to the analysis.
@@ -216,8 +223,9 @@ print('missing:', ids-linked)
 
 Fold any missing paper into its rightful thread — don't leave it out (an unlinked
 in-scope paper is a coverage hole). Reference shape: `venue-reports/mlsys-2026.md`
-(~65 lines, dense, all 57 papers linked, organized by research concern with a
-Takeaway + numbered sections + Maturity + What-shifted + Method structure).
+(~60 lines, dense, all 57 papers linked, organized by research concern:
+Takeaway + numbered concern sections + Maturity + Method; no standalone
+"what shifted" section — its one grounded nugget was folded into a section).
 
 ## Step 4 — commit
 
