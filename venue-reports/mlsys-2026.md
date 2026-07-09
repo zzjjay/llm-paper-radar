@@ -2,7 +2,7 @@
 
 *57 of ~135 accepts whose primary contribution is LLM serving. All figures are authors' self-reported bests ("up to X", often microbenchmark) — ceilings, not expectations. One systems venue, auto-selected set — see [Method](#method--caveats).*
 
-## The one thing to take away
+## Takeaway
 
 Two independent shifts drive almost everything, splitting the set ~evenly. **Workload:** reasoning models made outputs long, so the cost center moved prefill→decode (memory-bound), and agents/RAG/multi-turn made requests share context — systems built for short single-turn chat are being retrofitted. **Hardware:** new NVIDIA gens rebalanced the on-chip bottleneck (Blackwell doubled tensor cores but not the memory/exponential units around them), interconnect fell further behind compute, and heterogeneity (AMD, GH200, client GPUs, phones) became a design target — driving the largest bucket, kernels/compilers, none of it about KV.
 
