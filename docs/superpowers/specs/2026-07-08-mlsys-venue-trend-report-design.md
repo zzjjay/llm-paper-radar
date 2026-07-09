@@ -2,7 +2,14 @@
 
 **Date**: 2026-07-08
 **Author**: zhaolin (with Claude)
-**Status**: Draft (awaiting review)
+**Status**: Historical design record — partly superseded by `skills/venue-trend/SKILL.md`
+
+> The fetch → score → group design below is accurate and current. The analysis
+> stage evolved: it is no longer a per-subfield Workflow plus an `ljg-rank` macro
+> pass (§2 steps 4-6, and the ljg-rank mentions in Goal / Success Criteria) —
+> the top model now reads every in-scope abstract inline and writes the report
+> organized by research concern. See `skills/venue-trend/SKILL.md` for the
+> living flow. This file is kept for provenance.
 
 ## 1. Goal & Non-Goals
 

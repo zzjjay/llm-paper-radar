@@ -1,5 +1,13 @@
 # MLSys Venue Trend Report Implementation Plan
 
+> **Historical build record — partly superseded.** This plan built the venue
+> pipeline (Tasks 1-6). The living spec is now `skills/venue-trend/SKILL.md`.
+> Two things changed after this plan: the trend analysis is no longer the
+> per-subfield Workflow (Task 5) — the top model reads all abstracts inline and
+> organizes by research concern; and the ljg-rank macro-synthesis pass (Task 7)
+> was dropped as redundant. The fetch/score/group stages (Tasks 1-4) are still
+> accurate. Kept as-is for provenance.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** One-shot fetch of all MLSys 2026 accepted papers from OpenReview, score them for "LLM inference deployment optimization" relevance + subfield, group by subfield, and produce a Markdown trend report via a parallel Workflow.
