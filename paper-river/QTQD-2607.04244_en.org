@@ -1,0 +1,228 @@
+#+title:      Quantize the Target, Quantize the Drafter: Efficient Inference with Qwen3.5-4B
+#+date:       [2026-07-08 Wed 21:44]
+#+filetags:   :paper:river:en:
+#+identifier: 20260708T214407-en
+#+source:     https://arxiv.org/abs/2607.04244
+#+authors:    Jaeyeon Kim, Jewon Lee, Bo-Kyeong Kim
+#+venue:      Technical Report, ICML 2026 Workshop on AdaptFM (Efficient Qwen Competition, 2026)
+
+* The River of the Problem
+
+How do you get a 4-billion-parameter model to run fast and stay coherent on a single consumer-grade / entry-level GPU with only 24 GB of VRAM (an A10G)?
+
+The difficulty lies in two forces pulling against each other. First, the most straightforward way to make a model fast is to compress it — drop parameters from 16-bit to 4-bit, the model shrinks, arithmetic speeds up, but the model also gets dumber and starts slipping on tasks that demand precise instruction-following or mathematical reasoning. Second, the most straightforward way to make the generation process itself faster is speculative decoding: a small draft model guesses several upcoming tokens, the large target model verifies them all in one shot, and the more guesses land, the fewer verification passes are needed. But if that draft model still generates tokens one at a time the old way, the drafting itself becomes the bottleneck — especially once the target it is serving switches from full-precision to a compressed model, misaligning their "temperaments" and degrading draft acceptance rates.
+
+The problem therefore splits into two simultaneous battles: how do you recover the compressed target model's lost capability? And how do you keep the draft model both fast enough and well-aligned with the now-quantized target? This paper stands at the intersection of two independently evolving lines of work and welds them together.
+
+* The Source Map
+
+#+begin_example
+        Precision-recovery line                     Speculative-decoding speedup line
+           (Target side)                                    (Drafter side)
+               |                                                  |
+ [2017] Mishra & Marr - Apprentice                  [2023] Original speculative decoding
+   Use distillation to recover accuracy                  (Leviathan / Chen et al.)
+   in low-precision networks                         Small model guesses token by token;
+               |                                     large model verifies in batch
+               |                                                  |
+ [Standard PTQ] AWQ / GPTQ                                        v
+   Post-training quantization, simple              [2024] EAGLE / EAGLE-2
+   but causes accuracy drops                         Reuse top-layer hidden features
+               |                                     from the target; guess autoregressively
+               v                                                  |
+ [2026-01] Xin et al. - QAD for NVFP4                            | Problem: top-layer features
+   KL-divergence distillation so the                              | only support predicting the
+   quantized student mimics the full-                             | *next* token; predicting
+   precision teacher's output distribution                        | tokens 2, 3, … ahead strains
+   Solves instability of QAT after                                | this representation
+   multi-stage SFT/RL post-training                               v
+               |                                   [2025-03] Li et al. - EAGLE-3
+               |                                     Drop feature prediction; predict
+               |                                     tokens directly; fuse shallow,
+               |                                     middle, and deep layer features
+               |                                     But still autoregressive token-by-token
+               |                                                  |
+               |                                                  | Problem: sequential
+               |                                                  | generation; extra depth
+               |                                                  | cannot be parallelised;
+               |                                                  | speedup hits a ceiling
+               |                                                  v
+               |                                   [2026-02] Chen et al. - DFlash
+               |                                     Replace autoregression with block
+               |                                     diffusion; one forward pass emits
+               |                                     an entire draft block in parallel;
+               |                                     drafter can be made deeper and more
+               |                                     accurate
+               v                                                  v
+     [2607.04244] Kim, Lee, Kim - This paper
+     Target: apply QAD to recover INT4 target model quality (preserve original quantization grid)
+     Drafter: train a DFlash block-diffusion drafter tailored to the quantized target,
+              then apply PTQ + sliding-window attention (SWA) to lighten the drafter itself
+               |
+               v
+ [2026-06] Tu et al. - Beyond Output Matching (CKA-QAD)
+   Points out that KL-only QAD aligns only "what the model says" (output distribution),
+   not "how the model thinks" (intermediate representations); especially for RL-trained
+   models, representation drift is severe and degrades reasoning / coding ability
+#+end_example
+
+(Honest note: DFlash → this paper and QAD → this paper are both explicitly cited and directly adopted in the paper body — confirmed relationships. EAGLE → EAGLE-3 → DFlash and Apprentice → PTQ → QAD are reconstructed from each paper's related-work sections — also confirmed. Beyond Output Matching has no direct citation relationship with this paper; it is later related work on the same problem, marked as speculative extension rather than confirmed critique.)
+
+* The Evolutionary Narrative
+
+** 2017 | Apprentice: Use Distillation to Recover Compressed-Model Accuracy
+
+*** What problem did it see?
+
+Early model compression (pruning, quantization) was blunt — take a trained large model, chop precision or parameters, the model shrinks but accuracy falls, with no mechanism built into training to prevent that drop.
+
+*** Its solution
+
+Let a full-precision large model act as the "teacher" and the compressed smaller model as the "student." The student no longer learns only from ground-truth labels; it mimics the teacher's output probability distribution (soft labels), distilling the teacher's "experience" into the compressed shell.
+
+*** Why it worked (and what trap it left behind)
+
+Mimicking the teacher's output distribution is information-richer than learning from hard labels, letting the student compensate for information lost to compression. But this was a generic "distillation + compression" framework, not customised for the grid-structured precision loss that quantization specifically introduces, and it did not consider whether distilling after multi-stage SFT and RL post-training could destabilise training.
+
+** Standard PTQ (AWQ / GPTQ): Quantize After Training — Fast but Lossy
+
+*** What problem did it see?
+
+Distillation-based recovery requires extra training, which is expensive. Industry wanted something ready off the shelf — quantize the weights directly, no retraining needed.
+
+*** Its solution
+
+AWQ uses activation distributions to identify important weights and applies non-uniform scaling; GPTQ uses second-order information to calibrate quantization error layer by layer. Neither requires retraining.
+
+*** Why it worked (and what trap it left behind)
+
+Post-training quantization (PTQ) is nearly zero-cost and works well enough for large models. But experiments later in this paper show that applying INT4 PTQ directly to a 4B-scale small model causes IFEval — a benchmark demanding strict instruction-following — to fall below an acceptable floor. The smaller the model, the harder it is to hide quantization-induced accuracy loss.
+
+** 2026-01 | QAD for NVFP4: Fit Quantization with "Modern Distillation"
+
+*** What problem did it see?
+
+The NVIDIA team found that for modern large models that have gone through SFT, RL, and model-merging post-training pipelines, re-running full quantization-aware training (QAT) from scratch to recover accuracy is extremely complex and unstable; furthermore, the full original training data is often unavailable.
+
+*** Its solution
+
+Freeze the original high-precision model as the teacher, treat the quantized model as the student, and use only KL divergence to make the student's output distribution match the teacher's. No full original training data needed, no need to replay the entire post-training pipeline.
+
+*** Why it worked (and what trap it left behind)
+
+This procedure is especially stable for models that have undergone multi-stage post-training, because it only cares whether "what is ultimately said sounds the same," ignoring internal training details. But precisely because it aligns only output distributions, whether the model's internal representations have drifted away from the teacher's is never checked — a blind spot that Beyond Output Matching would expose six months later.
+
+** 2024 | EAGLE / EAGLE-2: The Drafter Should "Read" What the Target Is Thinking
+
+*** What problem did it see?
+
+The earliest speculative decoding used an independently trained small model to guess future tokens blindly, resulting in low acceptance rates, many wasted verification passes, and limited speedup.
+
+*** Its solution
+
+Have the draft model condition on the target model's top-layer hidden features, borrowing the target's "half-formed thoughts" to predict tokens, instead of starting from scratch.
+
+*** Why it worked (and what trap it left behind)
+
+Top-layer features are naturally calibrated for predicting "the next token," so borrowing them to predict the next token works well. The problem is that speculative decoding needs to guess several tokens ahead; using features designed only for "next token" prediction to guess the token after that, and the one after that, strains the representation.
+
+** 2025-03 | EAGLE-3: Don't Trust Only the Top Layer — Fuse Multiple Layers and Predict Tokens Directly
+
+*** What problem did it see?
+
+The "reuse top-layer features" approach has a ceiling: the information in top-layer features is intrinsically locked to the "next token" task. No matter how much training data you throw at the drafter, you cannot squeeze out stronger long-range prediction from a foundation that was never designed for it.
+
+*** Its solution
+
+Stop predicting intermediate features; predict tokens directly instead. And don't rely solely on the top layer — fuse shallow (lexical), middle (syntactic), and deep (semantic) layer features to feed the drafter.
+
+*** Why it worked (and what trap it left behind)
+
+Multi-layer feature fusion gives the drafter a more informative foundation, so training data scale finally translates into improved draft accuracy. But EAGLE-3 is still autoregressive at its core — the drafter still generates one token at a time, and to avoid becoming a bottleneck it is forced to stay very shallow (e.g., a single Transformer layer), which caps how intelligent it can be.
+
+** 2026-02 | DFlash: Stop Guessing One Token at a Time — Emit a Whole Block at Once
+
+*** What problem did it see?
+
+Autoregressive drafters are caught in a bind: greater accuracy requires greater depth and complexity, but every additional layer the drafter runs adds latency to an already-serial, per-token path — smarter means slower, and the speedup ceiling cannot be broken.
+
+*** Its solution
+
+Replace the autoregressive drafter with a block-diffusion drafter: mask an entire block of positions and predict all draft tokens in that block in a single non-causal forward pass, rather than waiting for one token before computing the next.
+
+*** Why it worked (and what trap it left behind)
+
+Because the computation is no longer "guess one token, pause, guess the next," but instead "predict the whole block in parallel," the drafter's cost no longer grows linearly with the number of draft tokens. This frees it to be deeper and more accurate while still achieving lower total latency than a shallow autoregressive drafter. But DFlash was validated against a full-precision target model and left one question unanswered: if the target itself is compressed to low-bit, does the block-diffusion drafter still work?
+
+** 2607.04244 | This Paper: Quantize the Target, Then Put the Drafter on a Diet Too
+
+*** What problem did it see?
+
+The competition's hard constraint is a single A10G (24 GB VRAM), which means the target model must be quantized to INT4 to fit and run fast. But this single compression decision simultaneously steps on the sore spots left by both lines: direct PTQ of the target model degrades instruction-following (the old PTQ problem); and the DFlash drafter was trained and tuned against a full-precision target, so after switching to a quantized target, the drafter's per-step overhead itself becomes the new dominant cost (a new scenario DFlash never addressed).
+
+*** Its solution
+
+Patch each line separately, then combine them. On the target-model side: adopt the QAD distillation approach but deliberately preserve the original AWQ quantization grid (only the de-quantized weight values are updated, not the scaling rules), so the distilled model can still be losslessly packed back into INT4. On the drafter side: follow DFlash's two-stage training recipe (first pre-train on data from the full-precision target, then fine-tune to align with the quantized target), then apply a further round of PTQ (GPTQ) to the drafter itself, plus sliding-window attention (SWA, attending only to the most recent window of context), making this "runs every single step" component substantially lighter.
+
+*** Why it worked (and what trap it left behind)
+
+The two-stage drafter training lets it first learn "how to draft well" on a clean full-precision distribution, then transfer and adapt to the quantized target's "accent," achieving higher acceptance rates than training from scratch on the quantized model alone. PTQ + SWA exploits the multiplicative effect of the drafter running every step: even a small per-step saving is amplified many times over. But the target-model precision-recovery half of this paper still uses pure KL-divergence QAD — which, according to Beyond Output Matching six months later, only guarantees that "what the model says" is aligned, without checking whether the compressed model's "internal thinking" has drifted. For heavily RL-trained reasoning models in particular, this latent risk may be amplified.
+
+* Frontier Extension
+
+** 2026-06 | Beyond Output Matching (CKA-QAD): Matching Lips Isn't Enough — You Need to Match the Neural Pathway Too
+
+*** What problem did it see?
+
+Standard QAD uses only KL divergence to align teacher and student output distributions. But the authors found that many different "internal representation paths" can all produce a final output that looks similar to the teacher's. In other words, output alignment is a very loose constraint: the model can say the same things on the surface while its internal intermediate process has already drifted — especially in reasoning models trained with reinforcement learning, where representation drift is more pronounced and visibly harms reasoning and coding capability.
+
+*** Its solution
+
+Use CKA (Centered Kernel Alignment — a metric for comparing the similarity of two networks' representations) to compare student and teacher intermediate-layer representations layer by layer, and add a lightweight regularisation term so that distillation aligns not just output distributions but also the geometric structure of each layer's representations.
+
+*** Why it worked (and what trap it left behind)
+
+Supervising the intermediate process as well acts as a stricter anchor for distillation. Experiments show improvements over pure-KL QAD on reasoning and coding benchmarks such as AIME25, GPQA-D, and LiveCodeBench, with less than 1% additional training overhead. As of now, this is the latest development on the "target-model quantization precision recovery" branch; no work has yet applied it in conjunction with speculative-decoding drafter optimisation.
+
+* One Diagram to See It All
+
+#+begin_example
+                    Recover compressed-model accuracy        Make the drafter keep up with compressed target
+Timeline                    (Target side)                              (Drafter side)
+ |
+2017          Apprentice: distillation for recovery                         .
+ |             (generic framework, not tailored to quantization)             .
+ |                                                                           .
+2023-24       AWQ/GPTQ: PTQ, no training, but accuracy drops   EAGLE/EAGLE-2: reuse top-layer features
+ |                                                              (autoregressive, sequential, low ceiling)
+ |                                                                           |
+2025-03               .                                         EAGLE-3: fuse multi-layer features, predict tokens
+ |                    .                                          (still autoregressive, depth constrained)
+ |                                                                           |
+2026-01       QAD(NVFP4): KL distillation                 2026-02  DFlash: block diffusion, emit whole block
+ |             align output distributions                            (non-autoregressive, can go deeper)
+ |             (ignores intermediate representations)                        |
+ |____________________|_______________________________________________________|
+                       v
+        2607.04244  This paper: Quantize Target + Quantize Drafter
+        QAD (preserve grid) recovers target model accuracy
+        DFlash custom training + PTQ + SWA lightens the drafter
+                       |
+                       v
+        2026-06  CKA-QAD: aligning output distributions is not enough —
+                  also align the geometric structure of intermediate layers
+#+end_example
+
+* Insight
+
+What is truly changing along this river is not how much "quantization technology" or "speculative decoding technology" have individually advanced, but that the center of gravity of "making inference fast" keeps sinking to finer granularity. Early on, people were satisfied with making compressed models "usable" and draft models "accurate enough." Later it became clear that the real bottlenecks were the high-frequency components that get executed repeatedly and whose costs are amplified without bound — the drafter runs every single step, so even a tiny per-step saving is worth pursuing; a quantized model whose internal representations are only "superficially aligned" will, when called at high frequency (e.g., during RL sampling), accumulate into a visible capability deficit.
+
+The reason these two independently developed lines — how to compress a model and how to speed up generation — were forced together in this paper is that the deployment scenario (a single A10G) simultaneously broke the comfortable assumptions of both: the target cannot stay full-precision, and the drafter cannot simply reuse a recipe designed for a full-precision target.
+
+The most likely next step is to take the Beyond Output Matching approach — "align not just outputs but also intermediate representations" — and apply it in reverse to the quantization and training of the drafter itself. Currently, the drafter's PTQ is validated only by checking that acceptance length does not drop much, which is fundamentally another loose "output-alignment" style of verification. Nobody has yet checked whether a compressed drafter is also achieving similar drafts via a different internal pathway.
+
+* Takeaway
+
+This evolutionary line highlights one thing: when you notice that two lines of work, each optimised in isolation for a long time, must now be combined, resist the urge to immediately search for a "better algorithm." Ask first: which component in the new scenario is called most frequently? This paper makes no algorithmic innovation to DFlash or QAD; instead, it precisely locates the "drafter runs every step" multiplier and concentrates the optimization budget there (PTQ + SWA). That is an optimization intuition that uses call frequency as leverage, not one that chases algorithmic novelty.
+
+The practical implication: whenever you evaluate any "combine technique A with technique B" proposal, first map out the distribution of invocation counts across all components during inference, then decide where to concentrate the optimization budget. That often outperforms simply plugging in the "more advanced" version from each of the two contributing lines.

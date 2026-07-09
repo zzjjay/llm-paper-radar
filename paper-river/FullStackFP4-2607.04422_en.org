@@ -1,0 +1,232 @@
+#+title:      Full-Stack FP4: Stable LLM Pretraining with Quantized Projections, Optimizers, and Attention
+#+date:       [2026-07-08 Wed 21:38]
+#+filetags:   :paper:river:en:
+#+identifier: 20260708T213806-en
+#+source:     https://arxiv.org/abs/2607.04422
+#+authors:    Siyu Ding, Mingchuan Ma, Jiabo Tong, Xingrun Xing, Ziming Wang, Guoqi Li
+#+venue:      arXiv preprint, 2026
+
+* The River of Problems
+
+Should large-model pretraining do its math in 4 bits? The question has shifted from "is it even possible?" to "where will it blow up next?"
+
+Low-precision training has always been a river of "fix whichever component breaks first." Going from 16 bits down to 8 is relatively easy, because matrix multiplication is inherently tolerant of reduced precision. But once you push toward 4 bits, the noise starts approaching the same magnitude as the signal itself, and different components fail in completely different ways: gradients in linear layers get drowned by noise, optimizer second moments accumulate quantization error until they spiral out of control, and the softmax inside attention gets scrambled by outlier values. Fixing one component says nothing about the others — which is precisely why this river split into three separate tributaries, each carving its own path forward for years, until a single paper finally merged them all.
+
+* Source Map
+
+#+begin_example
+                    [2017] Micikevicius et al. - Mixed Precision Training (FP16)
+                      |
+                      | Problem: FP32 training is slow and memory-hungry
+                      | Solution: use FP16 for most computation, keep an FP32
+                      |           master copy of weights for updates
+                      v
+                    [2022] Micikevicius et al. - FP8 Formats for Deep Learning
+                      |
+                      | Problem: FP16 dynamic range still limits lower-bit use
+                      | Solution: define E4M3/E5M2 two FP8 formats, choose per layer
+                      v
+        +-------------+-----------------------------------+
+        |                                                  |
+        v                                                  v
+[Linear Layer Tributary]                        [Attention Tributary]           [Optimizer Tributary]
+[2025] NVIDIA - Pretraining LLMs                    [2022] Dao et al.              [2022] Dettmers et al.
+        with NVFP4 (2509.25149)                     FlashAttention                 8-bit Optimizers
+        |                                                  |                              |
+        | Problem: FP8 is accurate but                     | Problem: long-sequence        | Problem: Adam states
+        |          not fast enough                         |   attention explodes memory   |   cost 2x model memory
+        | Solution: microscaling FP4 +                     | Solution: tiling + online     | Solution: blockwise
+        |           random Hadamard transform              |   softmax, never materializing |   quantization to 8 bit
+        | Limitation: only handles                        |   the full attention matrix    v
+        |   linear layers; optimizer and                  v                       [2023] 4-bit Optimizers
+        |   attention remain in BF16               [2024] SageAttention          via Block-wise Quantization
+        |                                          INT8 quantized QK^T/PV           |
+        |                                          Problem: speeds up inference      | Problem: 8 bit works,
+        |                                            but training is unstable        |   4 bit collapses
+        |                                              v                              v
+        |                                        [2025] SageAttention3           [2025] MuonQ / GRASP
+        |                                        FP4 attention (inference) +     4-bit Muon state quantization
+        |                                        SageBwd INT8 attention (training)  |
+        |                                              |                          | Solution: preserve direction
+        |                                              | Limitation: 8-bit        |   not magnitude; pre-quantization
+        |                                              |   training converges     |   normalization
+        |                                              |   slowly; no 4-bit       v
+        |                                              |   training solution   [2025] Effective Quantization
+        |                                              v                       of Muon Optimizer States
+        |                                        [2026] Attn-QAT
+        |                                        4-bit attention quantization-aware training
+        |                                        (first native 4-bit attention training scheme)
+        |                                              |
+        +----------------------+-----------------------+------------------------------+
+                               |
+                               v
+                    [2026] Ding et al. - Full-Stack FP4 (target paper, 2607.04422)
+                    First time all three tributaries merge in a single framework:
+                    LoRA-SVD for linear layers + new transforms for AdamW/Muon +
+                    mixed-precision QKV/dS for attention
+#+end_example
+
+Note: there is no direct citation relationship between the optimizer and attention tributaries — they evolved independently in parallel. Full-Stack FP4 is the first paper to bring all three into a unified training framework. This is inferred from the abstract and the timelines of the three technical threads, not an explicit claim in the target paper.
+
+* Evolutionary Narrative
+
+** 2017 | Mixed Precision Training: Swap the Heavy Lifting into FP16 First
+
+*** What Problem It Saw
+
+FP32 training costs 4 bytes per number. Models with tens of billions of parameters exhaust GPU memory just storing weights, gradients, and optimizer states — and compute is slow to match.
+
+*** Its Solution
+
+Replace the forward and backward matrix multiplications with FP16, but keep an FP32 "master copy" of weights dedicated to parameter updates, so that small gradients are not rounded to zero.
+
+*** Why It Worked (and What New Pit It Dug)
+
+FP16 has sufficient mantissa bits; its limited exponent range is the bottleneck. Keeping a high-precision backup resolved the tension between "saving memory" and "preserving fidelity" — temporarily. But only temporarily: FP16's dynamic range is still finite, and as models grow larger and deeper, gradient overflow returns. That "insufficient dynamic range" hole pointed directly to the next step.
+
+** 2022 | FP8 Formats for Deep Learning: Tackle the Dynamic-Range Problem Head-On
+
+*** What Problem It Saw
+
+Compressing FP16 one more step down to FP8 runs into two contradictory demands at once: some tensors (activations, for example) need a wider exponent range to prevent overflow, while others (gradients) need more mantissa bits for precision. A single format cannot satisfy both.
+
+*** Its Solution
+
+Define two coexisting FP8 formats: E4M3 (4-bit exponent, 3-bit mantissa — precision-first) for forward weights and activations, and E5M2 (5-bit exponent, 2-bit mantissa — range-first) for backward gradients, assigning formats by each tensor's role.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Switching from "one format for everything" to "pick the right tool for each tensor" let 8-bit training stand firmly on large models for the first time. But this approach still treats the entire model as a single uniform quantization target — it never looks closely at the fact that linear layers, optimizers, and attention have numerically very different behaviors. That coarse granularity planted the seeds for three components to fail in three different ways later. Meanwhile, FP8 was already pushing against the lower precision limit. Dropping one more bit to FP4 puts noise at the same order of magnitude as the signal itself; simply "choosing a format" is no longer enough — precision must be managed at the level of individual modules or even individual numerical blocks.
+
+** 2025 | NVIDIA NVFP4: Linear Layers Are the First to Crack 4 Bits
+
+*** What Problem It Saw
+
+FP8 had exhausted the hardware gains available on Blackwell; FP4 promised a further 2–3× throughput boost, but 4-bit representation is too weak: a single outlier value in a block forces a scaling factor that compresses every other value in the block to near-zero resolution.
+
+*** Its Solution
+
+Use finer-grained microscaling than MXFP4 (each small sub-block gets its own FP8-precision scaling factor), and apply a random Hadamard transform before quantization to "spread" outliers across the whole block. Stochastic rounding on gradients cancels systematic bias.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Outliers cannot be eliminated, so spread them thin — this essentially converts "one large outlier" into "a sum of many small ones," so the quantizer is no longer dominated by a single extreme value. The approach was the first to achieve 4-bit pretraining close to FP8 quality on a 12B model trained for 10 trillion tokens. But the authors themselves acknowledge: the scheme covers *linear layers only*. How optimizer states are stored and how attention is computed still run in BF16 — fixing one leg of a three-legged table. That incomplete state directly spawned the independent evolution of the other two tributaries.
+
+** 2022 | FlashAttention → 2024 | SageAttention: The Attention Tributary First Learns to Run, Then to Run Accurately
+
+*** What Problem It Saw
+
+FlashAttention addressed a memory problem: standard attention must materialize the full N×N similarity matrix, which explodes memory for long sequences. By the time SageAttention arrived, that problem was solved; its new challenge was speed — pushing further with quantization is hard because the Q/K/V distributions inside attention are far less uniform than ordinary linear-layer activations, and naive quantization distorts softmax severely.
+
+*** Its Solution
+
+FlashAttention used tiling and online softmax so the similarity matrix never needs to be fully materialized. SageAttention built on this, quantizing the QK^T and PV steps to INT8 with smoothing tailored to attention's distribution characteristics.
+
+*** Why It Worked (and What New Pit It Dug)
+
+FlashAttention solved "how to compute without blowing up memory"; SageAttention solved "how to compute faster" — but both were designed exclusively for *inference*. SageAttention quantizes the forward QK^T and PV passes and never touches the gradient computations in the backward pass. The gap of "what to do during training" was passed on to the next paper.
+
+** 2025 | SageAttention3: The Attention Tributary's First Attempt at Training-Time Quantization
+
+*** What Problem It Saw
+
+All existing low-bit attention schemes (FlashAttention3, SageAttention) served inference only; nobody had touched training. During training, attention must also perform backpropagation, involving intermediate quantities such as dS (the softmax gradient) that simply do not exist at inference time.
+
+*** Its Solution
+
+Inference side: use NVFP4 microscaling for fully FP4 attention, 5× faster than FlashAttention. Training side: propose SageBwd, which quantizes 6 of the 7 matrix multiplications in the attention backward pass to INT8.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The authors identified a key divide: 8-bit attention is nearly lossless for fine-tuning tasks, but noticeably slows convergence when used in *pretraining* — which shows that pretraining places far stricter precision demands on attention than fine-tuning does. Simply reusing a scheme validated on fine-tuning is insufficient. Moreover, SageBwd only reaches 8 bits; native 4-bit training-time attention remained uncharted territory. And the open-source implementation was later found by follow-up work to contain significant numerical errors in causal attention. These two gaps — the precision ceiling not fully cleared, and a hard engineering defect — together handed the baton to Attn-QAT.
+
+** 2026 | Attn-QAT: The Attention Tributary Steps Into Native 4-Bit Training
+
+*** What Problem It Saw
+
+FP4 has a very small representable set to begin with, and attention activations are heavier-tailed (more outliers) than standard matrix-multiplication activations. The combination causes straightforward quantization-aware training to fail outright — precision mismatches arise inside the backward pass.
+
+*** Its Solution
+
+Recompute the attention probabilities in low precision, while keeping a separate high-precision auxiliary output dedicated to computing the softmax gradient; the backward pass thus separates "how accurate this value needs to be" from "how cheaply it can be stored."
+
+*** Why It Worked (and What New Pit It Dug)
+
+The key insight is that the softmax gradient is extremely sensitive to precision, while the stored attention probabilities can be very coarse — so instead of forcing a single low-precision tensor to carry both burdens, route them through two separate paths. This made 4-bit attention training work for the first time on video generation tasks, with results visually indistinguishable from BF16. But Attn-QAT was still a single-component solution; it had never been validated inside the same training loop as 4-bit linear layers and 4-bit optimizers. The three tributaries kept flowing deeper, but never converged.
+
+** 2022 | 8-bit Optimizers → 2023 | 4-bit Optimizers: The Optimizer Tributary Chews Through 8 Bits, Then 4
+
+*** What Problem It Saw
+
+Adam-family optimizers must store first and second moments for every parameter, incurring at least 2× the model's own memory footprint — and the larger the model, the more alarming that hidden bill becomes.
+
+*** Its Solution
+
+Dettmers et al. first used blockwise quantization to compress optimizer states to 8 bits; follow-up work factorized the second moment and used smaller blocks for the first moment, pushing precision to 4 bits while maintaining convergence curves comparable to 32-bit.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Optimizer states serve as a *reference quantity* rather than a direct participant in matrix multiplications, so they naturally tolerate more error — that is the fundamental reason they can be pushed to lower precision faster than linear layers. But this tributary evolved entirely around Adam/AdamW. When Muon, a new optimizer based on matrix orthogonalization, began replacing AdamW in pretraining, "how to quantize Muon's states" became an entirely new problem to which AdamW experience did not transfer — because Muon depends on the *direction* of the momentum matrix, not on element-wise values. Any quantization error that perturbs the direction is irreversible; Adam can smooth it out over subsequent steps, but Muon cannot.
+
+** 2025 | MuonQ / GRASP: The Optimizer Tributary Pivots to "Preserve Direction, Not Magnitude"
+
+*** What Problem It Saw
+
+Naively applying AdamW quantization techniques to Muon fails, because Muon's updates retain only the direction information from the singular vectors — magnitude is discarded by the orthogonalization itself. If quantization error changes the direction, that error propagates fully into the final update; unlike AdamW, there is no mechanism to average it away over more training steps.
+
+*** Its Solution
+
+MuonQ normalizes gradients and momenta before quantization so that each step's quantization error is consistent in scale, with no systematic directional drift. GRASP identifies that the error concentrates in the top singular subspace of the momentum matrix, stores that subspace in 8 bits, and compresses the remaining residual to 4 bits.
+
+*** Why It Worked (and What New Pit It Dug)
+
+Both approaches reach the same destination by different routes: first locate "which part of the numerical structure is most catastrophically disturbed," then apply targeted mixed-precision treatment rather than quantizing the entire state tensor uniformly. By this point the optimizer tributary had reached a maturity comparable to the linear-layer and attention tributaries. Yet it remained an independent stream — no work had ever tested whether linear layers, attention, and the optimizer running *simultaneously* at 4 bits would amplify one another's quantization noise. That question was the largest gap remaining in the river before the target paper appeared.
+
+** 2026 | Full-Stack FP4 (Target Paper): All Three Tributaries Merge for the First Time
+
+*** What Problem It Saw
+
+The three tributaries had each advanced linear-layer, attention, and optimizer 4-bit training through multiple generations, yet nobody had run all three together in the same training loop. The paper explicitly notes that existing NVFP4 work "mainly focuses on transformer linear layers" — which in essence means: each component is progressing in isolation, but no one has verified that they remain stable when combined. The three components fail at low precision in completely different ways, and independent fixes do not guarantee collective stability.
+
+*** Its Solution
+
+A three-pronged, symptom-specific approach: linear layers use LoRA-SVD decomposition to reduce quantization noise (cutting the loss gap from 1.40% to 0.61%); the optimizer introduces new transforms for AdamW's second moment to support robust low-bit storage, and makes Muon's Newton–Schulz iteration natively compatible with NVFP4; attention adopts mixed precision — quantizing Q/K/V and the backward dS, while keeping select sensitive computation paths in BF16 and using "unified tensor reuse" to ensure forward–backward consistency. The paper also analyzes error accumulation patterns in low-bit matrix multiplication, identifying the PV and dOV^T branches of the attention backward pass as particularly sensitive.
+
+*** Why It Worked (and What New Pit It Dug)
+
+The core contribution of this paper is less any single technical breakthrough than the act of *integration*: taking three tributaries that had each matured independently (NVFP4 linear layers, mixed-precision attention quantization, low-bit optimizer transforms), applying customized treatment to each according to its specific failure mode, and then verifying that running them together does not cause mutual degradation. A 1.47% overall loss gap on 3B parameters and 64B tokens demonstrates that the merger itself is feasible — but this scale is much smaller than NVIDIA's 12B/10T-token validation. Whether the merger remains stable at larger scale is almost certainly a question left for follow-up work.
+
+* Frontier Extensions
+
+As of the paper's submission in July 2026, this is the most recent advance along this river. Because the target paper is a very fresh preprint, no follow-up work that explicitly cites or improves upon it has yet been identified. Directions that can reasonably be anticipated: (1) scaling validation from 3B/64B tokens up to the 10B+/10T-token regime of NVIDIA's NVFP4 paper; (2) testing whether Full-Stack FP4 can combine with Attn-QAT-style native 4-bit attention training (rather than mixed precision); (3) exploring whether a truly unified quantization-error theory exists that simultaneously explains the failure modes of linear layers, optimizers, and attention, rather than requiring three parallel sets of bespoke solutions.
+
+* The Picture in One Glance
+
+#+begin_example
+              Linear Layers         Attention                      Optimizer
+2017  FP16 master copy backup   --                            --
+2022  FP8 dual-format by role   FlashAttention                8-bit blockwise quantization
+                                (tiling, avoid memory explosion)
+2023  --                        --                            4-bit AdamW (factored 2nd moment)
+2024  --                        SageAttention                 --
+                                (INT8 QK/PV, inference only)
+2025  NVFP4 (microscaling +     SageAttention3 (FP4 inference  MuonQ/GRASP
+      Hadamard, linear only)    + SageBwd INT8 training)      (preserve direction,
+                                                               subspace mixed-precision)
+2026  ======= Full-Stack FP4: three tributaries merged, module-level custom quantization =======
+      + Attn-QAT (native 4-bit attention training, parallel effort, not yet merged)
+
+Vertical pattern: every tributary follows the same arc — "quantize the easiest part first
+→ discover one sub-structure that is especially sensitive → craft a bespoke precision
+strategy for that sub-structure." The convergence of all three arcs is the target paper.
+#+end_example
+
+* Insights
+
+What is truly changing along this river is not simply "bit-width dropping from 16 to 4" as a linear progression. It is that the granularity of quantization strategy keeps getting finer: from "one precision for the whole model" (the FP16 era), to "different formats by tensor role" (FP8's E4M3/E5M2), to "custom treatment by module" (Hadamard transform for linear layers, mixed precision for attention, subspace splitting for the optimizer), and finally to "further subdivision within a single module" (Full-Stack FP4 treats the attention backward's PV and dOV^T branches separately). Every additional bit compressed leaves one fewer shortcut, forcing researchers to shift from "empirical tuning" to "first diagnose exactly why this numerical sub-structure is fragile, then treat accordingly."
+
+The most likely next step is generalizing this methodology — "diagnose the failure mode first, then assign precision" — from transformers to other architectures (such as hybrid Mamba-Transformer models, already mentioned in the NVIDIA paper), and transitioning from "manually choosing which layers deserve higher precision" toward some automated, learnable precision-allocation mechanism. The current identification of "which parts are sensitive, which are not" across all three tributaries still relies essentially on human analysis plus empirical experimentation.
+
+* Takeaways
+
+The most interesting aspect of this evolutionary arc is not any specific quantization trick but the research rhythm itself: "divide and conquer, then validate the merger." Three teams worked nearly independently on linear layers, attention, and optimizers — nobody waited for the others to finish, and nobody started with a grand unified plan. This suggests that when you face a complex system that is underperforming as a whole, rather than immediately searching for a universal explanation, it is often faster to decompose the system into independently failing sub-components and carefully determine, for each one, *under exactly what conditions and in exactly what way* it fails. Timing the merger also matters: merging too early means being dragged down by sub-problems not yet fully understood. Full-Stack FP4's choice to merge only after all three tributaries had each individually matured is itself a reusable judgment call.
