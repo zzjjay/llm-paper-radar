@@ -145,26 +145,64 @@ mechanical subfield buckets** — the buckets cut across the real story, so lead
 with them reproduces the disjointed structure this skill exists to avoid.
 Structure:
 
-1. `# <Conf> <Year> — LLM Inference Deployment Optimization Trend Report` + a
-   one-line note on what was analyzed (N in-scope of M total accepts).
-2. **The thesis** — a short opening (2-4 short paragraphs) stating the one or two
-   forces the whole set is responding to, and any field-wide constraint you
-   noticed (for MLSys 2026: frozen weights + vLLM/SGLang target → everything is
-   training-free drop-in co-design). This is the "one thing to take away."
-3. **Sections by concern** — one `##` per real thread you found in Step 2, each a
-   few grounded paragraphs that *name specific papers, mechanisms, and numbers*
-   (not "several papers do X" — say which, and what result). Fold papers into the
-   thread they actually belong to; a paper can be mentioned in more than one.
-   Every paper gets an inline OpenReview link on first mention.
-4. **What shifted / what's absent** — a closing section on the year-over-year
-   movement and notable gaps (a real "we didn't see much X this year" is a
-   finding).
-5. **Subfield distribution (reference)** — the count table at the *end*, marked
-   as the mechanical classification, subordinate to the analysis.
+1. Title + a one-line note on what was analyzed (N in-scope of M total accepts)
+   plus the two standing caveats compressed to one italic line: figures are
+   authors' self-reported bests; one venue + auto-selected set (point to Method).
+2. `## Takeaway` — the thesis in 2-3 tight paragraphs: the one or two forces the
+   whole set responds to, and the field-wide constraint (for MLSys 2026: frozen
+   weights + vLLM/SGLang target → training-free drop-in co-design).
+3. **Numbered sections by concern** (`## 1.`, `## 2.`, …) — one per real thread
+   from Step 2, each a tight paragraph or two that *names specific papers,
+   mechanisms, and numbers* (not "several papers do X" — say which and what
+   result). A paper can appear in more than one thread. Inline OpenReview link on
+   first mention.
+4. `## N. Maturity: what's shipping vs what's a prototype` — a readiness axis
+   cutting across the concerns: deployed-at-scale (named production systems) /
+   industrial-grade-with-real-tooling / research-prototype. The most useful cut
+   for a reader deciding what to adopt vs. watch.
+5. `## What shifted, and what's conspicuously absent` — but **separate grounded
+   from conjectural claims** (see rigor rules). Tag each.
+6. `## Method & caveats` — how the set was selected + its biases, at the end.
+7. **Subfield distribution** — the count table last, marked as the mechanical
+   classification, subordinate to the analysis.
 
-Ground every claim in the abstracts. Cite numbers the papers report (speedups,
-%s, model sizes). Prefer "X does Y, getting Z" over adjectives. Verify every
-in-scope paper is linked somewhere:
+### Rigor rules (these are the ones a shallow report violates)
+
+- **Ground vs. conjecture.** You have *this year's* abstracts, not prior years.
+  Same-year claims ("KV is the largest single object here") are grounded; any
+  year-over-year claim ("X faded", "barely existed two years ago", "more common
+  than before") has no data behind it — mark it `[conjecture]`. External
+  knowledge is allowed *if labeled*.
+- **Venue confound.** This is one systems venue with an auto-selected set, so
+  "what the field values" claims are really "what this venue accepted." When a
+  trend is plausibly a submission-routing artifact (e.g. "pure-algorithm work
+  faded" — it goes to NeurIPS/ICML, not a systems venue), tag it
+  `[venue artifact]`, don't present it as a field shift.
+- **Numbers are self-reported ceilings.** Every speedup/reduction is the authors'
+  own best case, usually "up to X" on a favorable config or microbenchmark. Say
+  this once up top; where a figure is production-trace vs microbenchmark, note it.
+- **Verify quantifiers by counting — never eyeball "most / more than half."** A
+  quick script settles it (the MLSys 2026 draft claimed "more than half the
+  papers are about the KV cache"; an actual count was ~15-20 of 57, i.e. the
+  largest single object but *not* a majority). Count, then write the number.
+- **Analytical attention ∝ cluster size.** The biggest bucket deserves the
+  deepest treatment, not a hand-wave. (The kernel/compiler cluster — the largest
+  — was first dismissed as "overflow"; it needed its own full section.)
+- **A thesis must cover the whole set, or admit what it doesn't.** Don't force a
+  single-object narrative that only explains half. If there are two independent
+  forces, say two, and state plainly what each does *not* touch.
+- **Flag non-core papers.** Borderline in-scope items (visual-gen, multimodal,
+  diffusion-LM — not pure text-LLM inference) get folded in but must be flagged,
+  not silently counted as LLM-serving.
+- **State causation precisely.** "Reasoning models *amplified* the memory-bound
+  decode regime" — not "created" it (autoregressive decode was already
+  memory-bound at small batch). Overclaimed causation is a tell of a shallow read.
+- **Density: state each caveat once, then stop.** Don't repeat the self-reported
+  or venue caveat per paragraph; don't re-link a paper already linked above;
+  merge bullet lists into dense prose. Target roughly the shape below, not double.
+
+Cite numbers the papers report. Prefer "X does Y, getting Z" over adjectives.
+Verify every in-scope paper is linked somewhere:
 
 ```bash
 python3 -c "
@@ -177,9 +215,9 @@ print('missing:', ids-linked)
 ```
 
 Fold any missing paper into its rightful thread — don't leave it out (an unlinked
-in-scope paper is a coverage hole). Reference shape:
-`venue-reports/mlsys-2026.md` (~95 lines, all 57 papers linked, organized by
-seven research concerns rather than eight buckets).
+in-scope paper is a coverage hole). Reference shape: `venue-reports/mlsys-2026.md`
+(~65 lines, dense, all 57 papers linked, organized by research concern with a
+Takeaway + numbered sections + Maturity + What-shifted + Method structure).
 
 ## Step 4 — commit
 
@@ -200,6 +238,14 @@ force-add them.
   concerns you actually found; the buckets are a reference table at the end.
 - **Don't write adjective-driven prose.** Every claim names a paper + mechanism +
   number from its abstract. "Several papers improve throughput" is a non-finding.
+- **Don't state a year-over-year trend as fact** — you have no prior-year data;
+  tag it `[conjecture]`. Same for venue-shaped trends → `[venue artifact]`.
+- **Don't write "most / more than half" without counting.** Verify quantifiers
+  against the data first.
+- **Don't launder "up to X" peak numbers as results.** Flag them as self-reported
+  ceilings; note microbenchmark vs production-trace.
+- **Don't under-serve the largest cluster** or force a one-object thesis that only
+  covers half the set.
 - **Don't proceed on an incomplete fetch.** A 403-storm or a below-floor paper
   count means re-run later, not "analyze what we got" — a report built on a
   partial pull reads as complete and misleads.
