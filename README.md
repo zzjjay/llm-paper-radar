@@ -239,7 +239,7 @@ Unlike the daily pipeline, this doesn't run on a rolling window: it pulls a venu
 ./scripts/venue_report.sh "MLSys.org/2026/Conference"   # fetch → score → group
 ```
 
-The last step (parallel trend analysis + report synthesis) runs as a Claude Code [Workflow](workflows/venue_trend_report.js) rather than a plain script — see [`docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md`](docs/superpowers/plans/2026-07-08-mlsys-venue-trend-report.md) for the full pipeline and how to feed the grouped output into it. A final **macro synthesis** pass (via the [`ljg-rank`](https://github.com/lijigang/ljg-skills) skill) distills the whole subfield distribution down to its independent root drivers and is prepended to the report — see plan Task 7.
+The analysis step is done by the top model reading every in-scope abstract in one context and writing the report organized by research concern — see the [`venue-trend`](#venue-trend) skill below, which orchestrates the whole thing. The per-subfield [Workflow](workflows/venue_trend_report.js) is kept only as a fallback for venues too large to read in one context.
 
 ---
 
@@ -278,7 +278,7 @@ It resolves local-first (`data/summarized/`), falls back to a live arXiv fetch f
 
 ### venue-trend
 
-Analyze a **whole conference** on demand — given a venue (e.g. `MLSys 2026`), it fetches every accepted paper (`scripts/venue_report.sh`), filters to LLM-inference-deployment work, and then the **top model reads every in-scope abstract in one context** and writes a report organized around the real research concerns (what physical fact / workload shift / hardware change the papers are collectively responding to), not a bucket-by-bucket listing. The analysis is done directly, not fanned out to sub-agents — that delegation is what made the first cut shallow. [`ljg-rank`](https://github.com/lijigang/ljg-skills) is an optional second lens; the per-subfield [Workflow](workflows/venue_trend_report.js) is kept only as a fallback for venues too large to read in one context. Example output: [`venue-reports/mlsys-2026.md`](venue-reports/mlsys-2026.md).
+Analyze a **whole conference** on demand — given a venue (e.g. `MLSys 2026`), it fetches every accepted paper (`scripts/venue_report.sh`), filters to LLM-inference-deployment work, and then the **top model reads every in-scope abstract in one context** and writes a report organized around the real research concerns (what physical fact / workload shift / hardware change the papers are collectively responding to), not a bucket-by-bucket listing. The analysis is done directly, not fanned out to sub-agents — that delegation is what made the first cut shallow. The per-subfield [Workflow](workflows/venue_trend_report.js) is kept only as a fallback for venues too large to read in one context. Example output: [`venue-reports/mlsys-2026.md`](venue-reports/mlsys-2026.md).
 
 Trigger: `分析 MLSys 2026 的推理优化论文`, `venue trend report for NeurIPS 2026`, `做一份 ICML 2026 趋势报告`, `/venue-trend <conf>`.
 

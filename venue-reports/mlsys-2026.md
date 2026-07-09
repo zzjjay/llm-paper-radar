@@ -91,5 +91,3 @@ Two genuinely orthogonal outliers round out the set: [Attribution-based Sparse A
 | other (8 singletons) | 8 |
 
 The bucket labels above are the mechanical classification; the analysis is organized by *research concern* instead, because the buckets cut across the real story — e.g. the KV cache appears in kv_cache, long_context, scheduling, and speculative_decoding papers alike, and hardware pressure drives both compiler_kernel_fusion and multi_gpu_heterogeneous.
-
-*(A complementary Chinese-language root-cause decomposition with ASCII diagrams, from the `ljg-rank` skill: `~/Documents/notes/20260709T005837--MLSys2026推理优化的秩__rank.org`.)*

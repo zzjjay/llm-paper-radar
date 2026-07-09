@@ -13,7 +13,7 @@ change the papers are collectively responding to), not a bucket-by-bucket
 listing. The fetch/score/group stages are plain CLI in this repo; **the analysis
 is done by you (the orchestrating model) reading the abstracts directly, not
 delegated to sub-agents** — that delegation is exactly what made the first
-version shallow. `ljg-rank` is available as an optional second lens.
+version shallow.
 
 Distinct from the daily pipeline: this pulls a venue's *full* history in one
 pass, not a rolling window. Run it manually per conference, not on a cron.
@@ -137,19 +137,7 @@ If the in-scope set is too large to hold in one context (rough rule: more than
 still do the synthesis yourself over those summaries. For a normal venue
 (dozens of in-scope papers) read the abstracts directly — it's strictly better.
 
-## Step 3 — (optional) ljg-rank as a complementary root-cause pass
-
-Your Step-2 read already organizes around root concerns. `ljg-rank` is an
-optional **second lens**, not the primary analysis: invoke the global
-**`ljg-rank`** skill with a one-paragraph domain description (venue, in-scope
-count, subfield distribution) to get an independent Chinese root-cause
-decomposition with ASCII diagrams. It writes to
-`~/Documents/notes/<timestamp>--<domain>的秩__rank.org` and reports the path;
-reference that path from the report, don't copy it in or hand-edit it. Use it to
-sanity-check your own synthesis (do the roots agree?) or skip it if your Step-2
-analysis already stands on its own.
-
-## Step 4 — write the report
+## Step 3 — write the report
 
 Write `venue-reports/<slug>.md` (per-conference reports live in `venue-reports/`,
 NOT `digests/` — that's per-day). **Organize by research concern, not by the
@@ -193,16 +181,15 @@ in-scope paper is a coverage hole). Reference shape:
 `venue-reports/mlsys-2026.md` (~95 lines, all 57 papers linked, organized by
 seven research concerns rather than eight buckets).
 
-## Step 5 — commit
+## Step 4 — commit
 
 ```bash
 git add venue-reports/<slug>.md
 git commit -m "docs: add <Conf> <Year> LLM inference deployment trend report"
 ```
 
-The `~/Documents/notes/*.org` file (if you ran Step 3) is **not** committed — it
-lives outside the repo and is referenced by path only. The `data/raw/` and
-`data/scored/` intermediates are gitignored; don't force-add them.
+The `data/raw/` and `data/scored/` intermediates are gitignored; don't
+force-add them.
 
 ## Don't
 
@@ -216,6 +203,6 @@ lives outside the repo and is referenced by path only. The `data/raw/` and
 - **Don't proceed on an incomplete fetch.** A 403-storm or a below-floor paper
   count means re-run later, not "analyze what we got" — a report built on a
   partial pull reads as complete and misleads.
-- **Don't leave an in-scope paper unlinked** (run the coverage check in Step 4).
+- **Don't leave an in-scope paper unlinked** (run the coverage check in Step 3).
 - **Don't hardcode a new venue's accept-detection without checking** the actual
   `venueid` values first (Step 1 caveat).
