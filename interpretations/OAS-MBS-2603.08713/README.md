@@ -18,7 +18,7 @@
 |---|---|---|
 | 原理故事 | [paper.org](paper.org) | 七拍故事版《怪尺子，不如怪量法》——精度差距是软件用法问题还是硬件问题 |
 | 中文伴读 | [reading.org](reading.org) | 选择性精读，骨架段三层翻译 + 碰撞提问（归档模式，Agent 代答） |
-| 中文翻译 | [translation_zh.md](translation_zh.md) | 全文中文翻译（覆盖全部 7 节 + 附录 A-E；版权原因采用 section-by-section 复述，非逐字翻译；含 2 张裁剪自 PDF 的图） |
+| 中文翻译 | [translation_zh.md](translation_zh.md) | 全文中文翻译（覆盖全部 7 节 + 附录 A-E；版权原因采用 section-by-section 复述，非逐字翻译；论文全部 8 张图均已裁剪自 PDF 并嵌入） |
 | 溯源倒读 | [../../paper-river/OAS-MBS-2603.08713.org](../../paper-river/OAS-MBS-2603.08713.org)（中）· [_en](../../paper-river/OAS-MBS-2603.08713_en.org)（英） | 倒读法脉络 LLM.int8→SmoothQuant→GPTQ→块浮点/OCP MX→NVFP4→本文 OAS+MBS |
 
 数据来源：[data/summarized/2026-01-30.json](../../data/summarized/2026-01-30.json)（radar 打分记录）。
