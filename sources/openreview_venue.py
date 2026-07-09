@@ -12,12 +12,10 @@ decisions are released, an accepted submission's `content.venueid.value` is
 rewritten from the `/-/Submission` invitation venue to the venue string
 itself (e.g. "MLSys.org/2026/Conference"); rejected/withdrawn submissions
 get a `.../Rejected_Submission` or `.../Withdrawn_Submission` suffix
-instead. This has not been verified against MLSys 2026 specifically — the
-OpenReview API returned intermittent 403s throughout development (see
-docs/superpowers/specs/2026-07-08-mlsys-venue-trend-report-design.md).
-Run this module's CLI once the API is reachable, inspect a sample of
-`content.venueid.value` values in the raw page cache, and adjust
-`_is_accepted` if MLSys's actual field differs.
+instead. On a venue you haven't run before, inspect a sample of
+`content.venueid.value` values in the raw page cache and adjust
+`_is_accepted` if the actual field differs (see the "new-venue caveat" in
+`skills/venue-trend/SKILL.md`).
 """
 
 from __future__ import annotations

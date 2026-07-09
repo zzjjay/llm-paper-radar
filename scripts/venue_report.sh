@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Fetch, score, and group a conference's accepted papers for the venue
-# trend report. Does NOT run the trend-analysis Workflow — that step needs
-# the Workflow tool and is run separately (see docs/superpowers/plans/
-# 2026-07-08-mlsys-venue-trend-report.md, Task 5).
+# trend report. This is stages 1-3 only; the analysis + report writing is
+# done by the top model reading the abstracts — see skills/venue-trend/SKILL.md.
 set -euo pipefail
 
 VENUE="${1:?usage: venue_report.sh <venue> e.g. MLSys.org/2026/Conference}"
