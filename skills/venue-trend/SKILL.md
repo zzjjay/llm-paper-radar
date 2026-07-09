@@ -156,7 +156,7 @@ Structure:
    mechanisms, and numbers* (not "several papers do X" — say which and what
    result). A paper can appear in more than one thread. Inline OpenReview link on
    first mention.
-4. `## N. Maturity: what's shipping vs what's a prototype` — a readiness axis
+4. `## N. Maturity: production vs research` — a readiness axis
    cutting across the concerns: deployed-at-scale (named production systems) /
    industrial-grade-with-real-tooling / research-prototype. The most useful cut
    for a reader deciding what to adopt vs. watch.
