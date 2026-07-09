@@ -881,7 +881,7 @@ Expected: the workflow returns `{ report: "<markdown string>" }`.
 
 - [ ] **Step 5: Write the report to disk**
 
-Use the `Write` tool to save the returned `report` string to `llm-paper-radar/digests/mlsys-2026-report.md`.
+Use the `Write` tool to save the returned `report` string to `llm-paper-radar/venue-reports/mlsys-2026.md` (per-conference reports live in `venue-reports/`, not `digests/`, since they're not per-day artifacts).
 
 - [ ] **Step 6: Read the report and sanity-check it**
 
@@ -891,7 +891,7 @@ Confirm: the subfield distribution table lists all groups from `mlsys-2026-group
 
 ```bash
 cd llm-paper-radar
-git add digests/mlsys-2026-report.md
+git add venue-reports/mlsys-2026.md
 git commit -m "docs: add MLSys 2026 LLM inference deployment trend report"
 ```
 

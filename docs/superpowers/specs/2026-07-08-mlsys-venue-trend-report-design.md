@@ -78,7 +78,8 @@ workflows/venue_trend_report.js # Workflow script: parallel trend analysis + syn
                      {schema: TREND_SCHEMA}))
    → subfields are independent, run in parallel
    → a synthesis agent rolls up all subfield summaries + the count distribution
-   → writes digests/mlsys-2026-report.md
+   → writes venue-reports/mlsys-2026.md (per-conference reports live in their
+     own top-level directory, not digests/, since they're not per-day)
 ```
 
 ---
