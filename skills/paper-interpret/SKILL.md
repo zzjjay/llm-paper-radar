@@ -63,9 +63,14 @@ already gathered all of it.
 ## Step 2 — pick angles
 
 If the user named an angle ("翻译" / "讲原理" / "溯源"), do that. If they just
-said "解读这篇", **produce A + B + C + D by default** (reading, story, paper-river,
-and the radar hub); E (中文翻译 / full translation) is opt-in — do it when the
-user asks for 翻译/全文/详解 or "都要". Angles:
+said "解读这篇", **produce A + B + C + D + E by default** (reading, story,
+paper-river, the radar hub, and the full-text translation) — all five, every
+time, unless the user explicitly narrows the scope (e.g. "只要溯源" / "先不用
+翻译全文"). Before starting, **restate the five-angle checklist to yourself and
+tick off each one** — this default was missed once (2026-07) by silently
+narrowing "interpret"/"archive" to only C+D; treat the checklist as
+non-negotiable, not a suggestion to weigh against the phrasing of the request.
+Angles:
 
 - **A. 中文精读 / 翻译** — faithful Chinese interpretation of the abstract and,
   if the user wants the full text, hand off to **`ljg-read`** (伴读 + 英译中).
@@ -84,10 +89,10 @@ user asks for 翻译/全文/详解 or "都要". Angles:
   research — say it's running in the background and wire the README nav link when
   it lands. Skip only if the user explicitly opts out.
 - **D. Radar-native analysis** (this skill's unique value — see below).
-- **E. 中文翻译（全文）** — when the user wants the *whole* paper in Chinese, NOT
-  the selective 伴读 of (A). The reader-facing label is 中文翻译, but it is a
-  paraphrase, not a verbatim translation (see Copyright below) — say so in the
-  file. Rules:
+- **E. 中文翻译（全文）** — part of the default set (see above); covers the
+  *whole* paper in Chinese, NOT the selective 伴读 of (A). The reader-facing
+  label is 中文翻译, but it is a paraphrase, not a verbatim translation (see
+  Copyright below) — say so in the file. Rules:
   - *Copyright*: arXiv papers are usually under arXiv's non-exclusive license
     (check the license on the abstract page — only CC-BY/CC0 permit a verbatim
     full translation). Under the default license, do **not** produce a
