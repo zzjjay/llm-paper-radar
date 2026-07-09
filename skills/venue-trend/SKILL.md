@@ -86,6 +86,55 @@ publish decisions under a separate invitation, or use a display `venue` string
 instead), adjust `_is_accepted` in `sources/openreview_venue.py`, re-run its
 tests, then re-run the fetch. Don't silently accept a low count.
 
+## Step 1b — non-OpenReview venues (ASPLOS / ISCA / MICRO / OSDI / SOSP / NSDI …)
+
+Many top systems/architecture venues are **not on OpenReview** (they use HotCRP +
+ACM/USENIX). The `venue_report.sh` fetcher returns 0 papers for them — that's not
+a 403, the venue simply isn't there (verify: `openreview_venue` fetch returns
+empty and the OpenReview group 404s). For these, the score/group CLI doesn't
+apply; do this manual path instead, then resume at Step 2. This is a real,
+proven fallback (used for ASPLOS 2026 → `venue-reports/asplos-2026.md`), not a
+hack — but it *is* manual, so state that in the report's Method note.
+
+1. **Get the accepted-paper titles from the official program page** (WebFetch the
+   `.../program` page). These venues publish titles + authors but usually **no
+   abstracts and no links**. Note the total count.
+2. **Title pre-filter to the LLM-inference subset.** Ask WebFetch for an
+   *inclusive* ML/LLM candidate list first (LLM, inference/serving, KV/attention,
+   MoE, quantization, GPU/accelerator for ML), then narrow yourself to
+   inference-deployment. Expect a small fraction of a broad venue (ASPLOS: ~29 of
+   167). Exclude training-only and non-LLM.
+3. **Backfill abstracts via Semantic Scholar** — the working recipe (ACM DL blocks
+   scraping with 403; arXiv coverage is partial; S2's title-match endpoint is the
+   reliable source):
+
+   ```python
+   # for each title: GET, with 429 backoff + incremental write
+   # https://api.semanticscholar.org/graph/v1/paper/search/match
+   #   ?query=<exact title>&fields=title,abstract,externalIds
+   # unauthenticated S2 is rate-limited — sleep ~2s between calls, retry 429 with
+   # 5s*attempt backoff, write results after each paper. ~29 titles ≈ 2 min.
+   ```
+
+   Verify matches (the returned `title` should contain/greatly overlap yours) and
+   coverage; mark any paper S2 can't find and don't invent its abstract.
+4. **Links:** take `externalIds` from the same S2 call — link each paper to
+   `https://doi.org/<DOI>` (present for essentially all published papers) or the
+   arXiv abs URL. This replaces the OpenReview links in the coverage check.
+5. Resume at **Step 2** (read the abstracts) and **Step 3** (write the report).
+
+Two scope rules specific to architecture venues:
+- **Relax the custom-silicon gate.** The `inference_relevance` rubric hard-gates
+  ASIC/FPGA/PIM/CIM "the contribution is a chip" papers — correct for MLSys, wrong
+  here. At an architecture venue, algorithm-hardware co-design *is* the
+  deployment-optimization story; excluding PIM/CIM/near-storage/FPGA/NPU work
+  guts the picture. Include it, and **state the relaxed scope in the report**.
+- **Split maturity by simulation vs. silicon.** Many hardware results are from
+  simulators / synthesized designs, not deployed chips — their "4×/9×" numbers are
+  projections against modeled baselines, a weaker evidentiary tier than on-GPU
+  measurements. Call this out in §8 and don't compare simulated speedups
+  one-to-one with another venue's measured ones.
+
 ## Step 2 — read every abstract yourself (the analysis, done by you)
 
 **This is the core step, and you (the orchestrating model) do it directly — do
@@ -225,12 +274,16 @@ print('missing:', ids-linked)
 "
 ```
 
+(For a non-OpenReview venue there's no `data/scored/<slug>.json`; instead check
+your title list against the report and grep for `doi.org` / `arxiv.org` links.)
 Fold any missing paper into its rightful thread — don't leave it out (an unlinked
-in-scope paper is a coverage hole). Reference shape: `venue-reports/mlsys-2026.md`
-(~60 lines, dense, all 57 papers linked, organized by research concern:
-Takeaway + numbered concern sections + Maturity + a final Paper-distribution
-section (table + one-line selection/bias footnote); no standalone "what shifted"
-section — its one grounded nugget was folded into a section).
+in-scope paper is a coverage hole). Reference shapes: `venue-reports/mlsys-2026.md`
+(OpenReview path, ~60 lines, 57 papers) and `venue-reports/asplos-2026.md`
+(non-OpenReview path, ~60 lines, 29 papers, DOI links, with the custom-silicon
+scope relaxation and simulation-vs-silicon maturity split). Both: dense, all
+papers linked, organized by research concern — Takeaway + numbered concern
+sections + Maturity + a final Paper-distribution section (table + one-line
+selection/bias footnote); no standalone "what shifted" section.
 
 ## Step 4 — commit
 
