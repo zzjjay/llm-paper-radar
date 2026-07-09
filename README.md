@@ -245,7 +245,7 @@ The last step (parallel trend analysis + report synthesis) runs as a Claude Code
 
 ## 🧑‍🔬 Interactive skills
 
-Two Claude Code skills live in `skills/` and are symlinked into `~/.claude/skills/` by `install.sh`. Both run **from the repo root** (they read `data/`, `seeds.yaml`, `paper-river/`); `cd` into the repo and start a fresh session so they're picked up.
+Three Claude Code skills live in `skills/` and are symlinked into `~/.claude/skills/` by `install.sh`. All run **from the repo root** (they read `data/`, `seeds.yaml`, `paper-river/`); `cd` into the repo and start a fresh session so they're picked up.
 
 ### paper-triage
 
@@ -275,6 +275,12 @@ uv run python scripts/resolve_paper.py "logarithmic space" --siblings 8
 ```
 
 It resolves local-first (`data/summarized/`), falls back to a live arXiv fetch for ids the radar never surfaced, disambiguates name collisions, and reports scoring + triage status + siblings + bucket trend in one shot.
+
+### venue-trend
+
+Analyze a **whole conference** on demand — given a venue (e.g. `MLSys 2026`), it drives the venue pipeline end-to-end: fetch every accepted paper, classify each into an LLM-inference-deployment subfield, run the per-subfield trend Workflow, distill a macro synthesis via [`ljg-rank`](https://github.com/lijigang/ljg-skills), and assemble a tight report under [`venue-reports/`](venue-reports/). It's the orchestrated version of the manual pipeline described under [Conference venue trend reports](#-conference-venue-trend-reports) above — same stages (`scripts/venue_report.sh` → `workflows/venue_trend_report.js` → `ljg-rank`), packaged so you don't hand-run each step. Example output: [`venue-reports/mlsys-2026.md`](venue-reports/mlsys-2026.md).
+
+Trigger: `分析 MLSys 2026 的推理优化论文`, `venue trend report for NeurIPS 2026`, `做一份 ICML 2026 趋势报告`, `/venue-trend <conf>`.
 
 ---
 
