@@ -1,22 +1,84 @@
 # MLSys 2026 — LLM Inference Deployment Optimization Trend Report
 
-## Macro synthesis
+*Analysis of the 57 accepted papers (of ~135 total accepts) whose primary contribution is optimizing how LLMs are served in production. Read from the abstracts; grounded in the specific mechanisms and numbers each paper reports.*
 
-The 57 in-scope papers look scattered across 8+ named subfields, but underneath them are only two independent root drivers.
+## The one thing to take away
 
-**1. Hardware's internal resources don't scale at the same rate.** Matmul throughput grows faster than memory bandwidth, memory capacity, and cross-GPU interconnect — a physical fact of chip scaling, not a software problem. FlashAttention-4 states this most directly: on Blackwell, tensor-core throughput doubled while shared-memory bandwidth and the exponential units didn't, so the whole pipeline had to be redesigned. HipKittens hits the same wall from a different angle — porting kernel primitives from NVIDIA to AMD requires rethinking the primitives, not translating code. Quantization work (MixLLM, block-floating-point scale search) is the same response at the numeric-representation level: since memory is scarcer than compute, shrink the numbers.
+Two things changed underneath the serving stack this year, and almost every paper is a consequence of one or both.
 
-**2. Inference workloads are not uniform, but serving systems have long treated them as if they were.** Within one request, prefill is compute-bound and decode is bandwidth-bound (PLA-Serve, TriInfer, "Beyond the Buzz"). Within one context, some tokens/heads matter more than others (FlexiCache, SkipKV, Kitty). Within one decode step, GPU compute sits idle because only one token comes out — speculative decoding (PRISM, SpecDiff-2, TiDAR) fills it. Within one MoE model, experts aren't equally busy (CRAFT, FarSkip-Collective). The pattern repeats at every granularity — token, head, expert, phase, request — and each subfield is the same move at a different scale: find the part of the work that doesn't deserve equal treatment, and skip, cache, or relocate it.
+**The workload changed shape.** Reasoning models emit thousands of chain-of-thought tokens, so the expensive part of a request moved from reading the prompt (prefill) to writing the answer (decode). And agents, RAG, and multi-turn chat made requests stop being independent — they now share huge spans of context (system prompts, retrieved documents, conversation history, agent templates). Serving systems were built for short, independent, single-turn chat; they are being retrofitted for long, interdependent, reasoning-and-agent traffic.
 
-The two drivers are independent — hardware could freeze and workloads would still be phase-heterogeneous; a perfectly uniform workload would still need new kernels for a new chip — but they compound: mobile DVFS scheduling is both firing at once (independent CPU/GPU/memory frequency scaling × prefill/decode having different power profiles).
+**The hardware changed.** New NVIDIA generations rebalanced the bottleneck (Blackwell doubled tensor-core throughput but not the memory/exponential units around it), interconnect bandwidth kept falling behind compute, and heterogeneity — AMD, GH200 superchips, mixed fleets, client GPUs, phones — became something you design for, not against.
 
-**compiler_kernel_fusion isn't inside either driver — it's the overflow from multiplying them.** Hardware generations keep turning over *and* workloads keep fragmenting into finer granularities, so the (hardware × workload-slice) space has outgrown hand-tuning kernel-by-kernel. FlashInfer-Bench, Wave, Event Tensor and that cluster respond not to driver 1 or 2 but to their product growing faster than human kernel-writing capacity.
+The **KV cache sits at the intersection of both** and is the single most-contested object in the whole set. Long decode makes it grow without bound; shared context makes it reusable across requests; memory-bound decode makes reading it the bottleneck. More than half the papers are, directly or indirectly, about taming it. If there is one sentence: *decode is now memory-bound, the KV cache is why, and the reasoning/agent workload is what made it so.*
 
-*(Fuller root-rank writeup with ASCII diagrams, in Chinese: `~/Documents/notes/20260709T005837--MLSys2026推理优化的秩__rank.org`)*
+A structural constraint shapes everything below: the model weights are frozen (you can't retrain a released model), and the deployment target is a real engine (vLLM / SGLang / TensorRT-LLM). So the field has converged on **training-free, drop-in, algorithm-system co-designed** techniques — nearly every paper markets itself as "plugs into vLLM," "no retraining," "negligible runtime overhead." That's not fashion; it's the only shape a technique can take when the model is fixed and the engine is given.
 
-## Subfield distribution
+---
 
-| Subfield | # Papers |
+## 1. Decode went memory-bound, and the KV cache is the battleground
+
+The recurring physical fact, stated almost verbatim across papers: during decode each new token re-reads the entire, ever-growing KV cache, so long generation is IO-bound, not compute-bound ([MAC-Attention](https://openreview.net/forum?id=b6HBRCejb7), [SpecGen](https://openreview.net/forum?id=yeqrwcWjPu)). Everything in this cluster is an answer to "the KV cache is too big and too slow to read." The answers split into four escalating stances:
+
+- **Shrink it.** [Kitty](https://openreview.net/forum?id=r3mQiuYKIN) pushes KV to 2-bit — where accuracy normally breaks — by keeping only a small fraction of sensitivity-ranked *Key channels* at higher precision, cutting KV memory ~8× for 2–4× throughput. Quantization here is not the headline it once was; it survived as a KV-specific tool.
+- **Skip it.** Exploit that not all cached tokens matter equally: [FlexiCache](https://openreview.net/forum?id=GgX6dPJx9M) observes that *some attention heads are temporally stable* (attend to the same tokens over time) and offloads their cold pages to host memory (−70% GPU footprint); [OPKV](https://openreview.net/forum?id=EB5bgzv4qA) makes offload-and-recall sparsity a clean plugin over paged KV; [BLASST](https://openreview.net/forum?id=6INSBXTQ4x) skips whole attention blocks under a single calibrated softmax threshold (~72% sparsity, 1.5× prefill).
+- **Reuse computation over it.** [MAC-Attention](https://openreview.net/forum?id=b6HBRCejb7) reuses prior attention results for semantically similar recent queries (match–amend–complete), making per-token cost *constant regardless of context length* on a hit — 99% fewer KV accesses. This is a different move from compression: keep everything, recompute less.
+- **Treat it as durable, distributed state.** The most conceptually notable shift: KV has graduated from "a buffer" to "valuable stateful data that needs placement, transfer, replication, and fault tolerance." [GhostServe](https://openreview.net/forum?id=xKjYiUgeOK) erasure-codes the KV cache so a GPU failure doesn't force full recomputation; [RaidServe](https://openreview.net/forum?id=5pl9fdbEkq) does cyclic KV placement + proactive backup for resilient tensor-parallel serving; [fabric-lib](https://openreview.net/forum?id=SjVa05wEiY) builds portable RDMA point-to-point transport specifically because KV-cache transfer (for disaggregation) outgrew simple collectives.
+
+## 2. The workload changed: long reasoning outputs and shared context
+
+Two new workload realities, each spawning its own line of work.
+
+**Reasoning models made outputs long,** which is *why* decode/KV became the bottleneck in the first place. [SkipKV](https://openreview.net/forum?id=0EsV9SIm8p) finds existing token-level KV eviction actively fails on chain-of-thought (unstable scoring, and it makes the model generate *more* to re-derive evicted content) — so it evicts at sentence granularity and steers the model toward conciseness. [SpecGen](https://openreview.net/forum?id=yeqrwcWjPu) is explicitly framed around reasoning models shifting the bottleneck to memory. [Locality-Aware Beam Scheduling](https://openreview.net/forum?id=dTo8jAXm9K) targets test-time compute (beam search), where concurrent decode paths make KV, not weights, the memory bottleneck on consumer GPUs.
+
+**Agents, RAG, and multi-turn made context shared,** so the win is detecting and reusing overlap instead of recomputing prefill. [ContextPilot](https://openreview.net/forum?id=RnKvDy1jv2) indexes overlapping context blocks across users/turns for cross-request KV reuse; [FlashAgents](https://openreview.net/forum?id=m14PPUfgEc) streams tokens between collaborating agents and dedupes shared instruction templates via a radix-tree prefix cache; [BatchLLM](https://openreview.net/forum?id=IuVHde07l6) makes *global* prefix sharing explicit for offline batch jobs (up to 10.8× over vLLM/SGLang) because LRU cache management evicts about-to-be-reused prefixes; [Stream2LLM](https://openreview.net/forum?id=FuRo7Ur5Ib) and [TeleRAG](https://openreview.net/forum?id=YsOyCpMUYD) both hide RAG's retrieval latency behind compute — Stream2LLM streams retrieved context into prefill, TeleRAG prefetches the likely-needed datastore shards from CPU to GPU in parallel with generation (lookahead retrieval). The sharpest framing is [Span Queries](https://openreview.net/forum?id=qcGGSXpFcM): chat, RAG, inference-time scaling, and agentic workloads are all special cases of one structure (an expression tree of inference calls with commutativity constraints), and once you express them that way, cache locality can be optimized generically — 10–20× TTFT, in 492 lines of vLLM changes.
+
+## 3. Prefill and decode want different machines — disaggregation matures past the hype
+
+Prefill (compute-bound, processes the whole prompt) and decode (memory-bound, one token at a time) have opposite resource profiles, so splitting them onto separate instances (PD disaggregation) is now the assumed baseline that other papers build on. This year's contributions are *refinements and reality-checks*, which signals a maturing subfield:
+
+- [Beyond the Buzz](https://openreview.net/forum?id=NqC5tcBsa0) is the sobering measurement study — hundreds of thousands of design points — finding disaggregation only wins for prefill-heavy traffic and larger models, and only with dynamic rate matching and elastic scaling. The message: disaggregation is not free, stop cargo-culting it.
+- [PLA-Serve](https://openreview.net/forum?id=dzjCkSEDyG) notes prefill itself isn't uniform (short vs long prompts bottleneck differently) and disaggregates *within* prefill by length.
+- [TriInfer](https://openreview.net/forum?id=nNovi8fvGN) extends two phases to three (encode–prefill–decode) for multimodal, giving the vision encoder its own instance pool (3.7× throughput).
+
+## 4. MoE broke the dense-serving playbook
+
+MoE is now the mainstream architecture for frontier models, and a whole cluster is cleaning up the fallout: optimizations designed for dense models actively backfire on MoE. [Demystifying the MoE Serving Tax](https://openreview.net/forum?id=lELxqcgrsN) quantifies it — MoE serves 2–3× worse than a FLOP-equivalent dense model — and finds the counterintuitive result that expert load imbalance *hurts prefill but can help decode* (fewer experts activated). The fixes attack different layers: [Layered Prefill](https://openreview.net/forum?id=yyDbI3HXco) shows the standard chunked-prefill trick inflates MoE memory traffic up to 39% via redundant expert-weight reloads, and re-scheduling by *layer groups* instead of token chunks recovers up to 70% TTFT; [CRAFT](https://openreview.net/forum?id=zdRvzU9ZCe) does cost-aware expert replication and shows current schemes *over-replicate*; [FarSkip-Collective](https://openreview.net/forum?id=ruOpvLzsGV) goes furthest — it modifies the model architecture (skip connections, recovered by self-distillation to within 1% accuracy) to overlap the all-to-all expert communication that otherwise blocks compute (32.6% TTFT on DeepSeek-V3).
+
+## 5. Speculative decoding: attack the same bottleneck from the compute side
+
+If decode is memory-bound, the GPU's compute sits idle — so spend it guessing tokens ahead and verifying in parallel. This is the compute-side complement to §1. The draft-quality-vs-draft-cost tension drives the designs: [PRISM](https://openreview.net/forum?id=cvU2HuuxEf) decouples draft-model capacity from draft cost by refactoring parameters across predictive steps (2.6× on an already-optimized engine); [SpecGen](https://openreview.net/forum?id=yeqrwcWjPu) avoids a separate drafter entirely via self-speculation with a sparse-attention "draft." Notably, **diffusion is entering as the non-autoregressive drafter**: [SpecDiff-2](https://openreview.net/forum?id=o42VU86ZsV) calibrates a discrete-diffusion drafter to an AR verifier (+55% tok/s), [TiDAR](https://openreview.net/forum?id=onfxEjoE4L) fuses diffusion drafting and AR sampling in one forward pass (4.7–5.9× tok/s), and standalone [CDLM](https://openreview.net/forum?id=eB8yjR6alL) makes diffusion LMs practical by adding consistency distillation + KV-cache compatibility. But the essential paper here is the reality-check: [Speculative Decoding: Performance or Illusion?](https://openreview.net/forum?id=fzkqtezFEi) benchmarks SD variants in *production* vLLM and finds large gaps between measured and theoretical speedup at realistic batch sizes — a recurring 2026 theme of measuring whether hyped techniques survive contact with a real engine.
+
+## 6. Hardware moved; the software layer scrambles to keep up
+
+Two hardware pressures, one response. **Pressure A — new generations rebalanced the bottleneck:** [FlashAttention-4](https://openreview.net/forum?id=mN5RtvuYl3) redesigns the attention pipeline for Blackwell's *asymmetric scaling* (tensor cores doubled, shared-memory bandwidth and exponential units didn't — so it software-emulates the exponential and cuts non-matmul work); [TokenWeave](https://openreview.net/forum?id=rh2Ylffkq6) exploits Hopper/Blackwell NVSHARP/Multimem for a fused AllReduce–RMSNorm using only 2–8 SMs; [SuperInfer](https://openreview.net/forum?id=RuslSHdIHa) co-designs scheduling for GH200's tightly-coupled GPU-CPU NVLink-C2C; [ScaleSearch](https://openreview.net/forum?id=innqECyZPK) exists because GPUs added native NVFP4/microscaling BFP support and the default max-magnitude scale is suboptimal. **Pressure B — heterogeneity went mainstream:** [HipKittens](https://openreview.net/forum?id=xxSSrndQrI) makes AMD a real target (tile primitives that rival hand-tuned assembly on CDNA3/4); [ParallelKittens](https://openreview.net/forum?id=Cv5e5uRXFb) names the structural cause directly — interconnect bandwidth improving slower than compute — and packages multi-GPU overlap into 8 primitives; [db-SP](https://openreview.net/forum?id=XgKteNxNe0) shows the same interconnect-bound sequence parallelism needs sparsity-aware load balancing once attention is block-sparse (here for diffusion transformers, but the imbalance problem generalizes).
+
+The **response to both is raising the kernel-authoring abstraction** so you don't hand-rewrite per chip × per attention-variant × per dynamic shape (the space that exploded). [Wave](https://openreview.net/forum?id=gcXV1E8HRH) and [Flashlight](https://openreview.net/forum?id=lboOMA8XWr) are Python/compiler-native kernel DSLs; [Event Tensor](https://openreview.net/forum?id=PJqFhAbUHa) is a compiler abstraction for dynamic megakernels (handles data-dependent shapes that static megakernels can't); [DynaFlow](https://openreview.net/forum?id=i0yqC9954S) decouples model definition from execution schedule for intra-device operator overlap. The most forward-looking is [FlashInfer-Bench](https://openreview.net/forum?id=IyryZno8Hh): LLMs now *write* GPU kernels, so it builds the standardized generate→benchmark→hot-swap-into-vLLM/SGLang loop to make that safe and continuous.
+
+## 7. The objective function broadened: energy, edge, cost, reliability
+
+The field is visibly widening past "tokens/sec on an H100."
+
+- **Energy is now a first-class objective, not a side effect.** [BEAM](https://openreview.net/forum?id=BfNBXM8CCT) co-optimizes GPU frequency + batch shape to spend post-SLO latency slack on energy (up to −51% GPU energy); [CORE](https://openreview.net/forum?id=PSyHQ8kVUT) finds mobile DVFS governors act independently per component and coordinates CPU/GPU/memory frequencies for phone LLMs; even [Layered Prefill](https://openreview.net/forum?id=yyDbI3HXco) reports −22% per-token energy.
+- **The edge/client is a real deployment target.** [IntAttention](https://openreview.net/forum?id=CPCRITwAaP) removes the FP softmax detour that dominates INT8 attention latency on Arm CPUs (fully-integer pipeline, 3.7× on edge); [Efficient VRAM-Constrained xLM Inference](https://openreview.net/forum?id=VKqQYg6JPb) does CPU-GPU pipelined sharding for NVIDIA's client SDK; [Locality-Aware Beam Scheduling](https://openreview.net/forum?id=dTo8jAXm9K) targets consumer GPUs.
+- **Cost, operability, and reliability entered the venue.** [BOute](https://openreview.net/forum?id=ZVQb92umqX) co-optimizes query routing + heterogeneous-GPU deployment via Bayesian optimization (38% avg cost cut); [OptiKIT](https://openreview.net/forum?id=om4H7AI2hc) democratizes optimization for non-expert enterprise teams; [MorphServe](https://openreview.net/forum?id=PDu13oOl4G) treats quantization as a *runtime knob*, hot-swapping layers to quantized versions under load pressure and repurposing freed memory for KV (−92% SLO violations); [HELIOS](https://openreview.net/forum?id=CV52m9NJFK) treats depth as the runtime knob — running multiple early-exit models so a token that can't exit early in one exits in another, and loading only the layers likely to be used (1.48× throughput, 15× batch); [FaaScale](https://openreview.net/forum?id=jgL8LuOVyT) tackles serverless cold-scale via pipelined multicast; [AIRS](https://openreview.net/forum?id=g1RWik4Gy1) is a production LLM-rating pipeline under a fixed TPU budget. Two papers are pure production experience reports — [Meta's deployment-configuration study](https://openreview.net/forum?id=gEbKQeIdxB) (searching millions of HW/parallelism/runtime configs for Llama at ~1B users) and [LinkedIn's semantic-search SLM](https://openreview.net/forum?id=re82zZczHj) (pruning + 10× context compression for millions of QPS) — a sign the venue values hard-won operational lessons, not just new mechanisms. And [Breaking the Ice](https://openreview.net/forum?id=eoEobeKTNZ) profiles a mundane-but-real pain: vLLM cold-start latency is CPU-bound and predictable.
+
+Two genuinely orthogonal outliers round out the set: [Attribution-based Sparse Activation](https://openreview.net/forum?id=gJFigZeb5D) (skip low-attribution neurons per input, training-free, 70% sparsity) — the same "skip work that doesn't matter" instinct as the KV-sparsity papers, applied to the FFN; and [Shannonic](https://openreview.net/forum?id=NhMxI0GbB8) (near-Shannon-limit *lossless* tensor compression for bandwidth-bound edge-cloud transfer).
+
+---
+
+## What shifted, and what's conspicuously absent
+
+- **Weight quantization faded as a headline.** After years of dominating the compression literature, standalone weight-quantization is nearly gone here — only mixed-precision weight quant ([MixLLM](https://openreview.net/forum?id=VBbMRQ4VOc), which allocates bits by output-feature importance and gets Llama-3.1-70B's MMLU-Pro loss from 1.92 to 0.99 with +10% bits), KV-cache quant ([Kitty](https://openreview.net/forum?id=r3mQiuYKIN)), and format-specific scale search ([ScaleSearch](https://openreview.net/forum?id=innqECyZPK)) survive, and quant increasingly appears as a *runtime component* inside a serving system ([MorphServe](https://openreview.net/forum?id=PDu13oOl4G)) rather than a paper's thesis. The algorithmic-compression era matured into commodity; the action moved to systems.
+- **Pure algorithmic tricks are out; algorithm-system co-design is in.** Almost every accepted paper ships an engine integration and real serving-trace numbers. "Plugs into vLLM/SGLang, training-free" is table stakes.
+- **Reality-check papers are a recognized genre now.** [Beyond the Buzz](https://openreview.net/forum?id=NqC5tcBsa0) (disaggregation), [Performance or Illusion?](https://openreview.net/forum?id=fzkqtezFEi) (spec decoding), [Demystifying the MoE Tax](https://openreview.net/forum?id=lELxqcgrsN) — the field is spending real effort auditing whether its own hyped techniques hold up at production scale.
+- **Reasoning + agentic workloads are the new gravity well.** The KV-cache, prefix-reuse, and long-decode work is downstream of a workload shift that barely existed two years ago. Expect next year to be even more about serving reasoning and multi-agent systems specifically.
+
+---
+
+## Subfield distribution (reference)
+
+| Subfield | # |
 |---|---|
 | compiler_kernel_fusion | 11 |
 | scheduling_batching | 8 |
@@ -28,104 +90,6 @@ The two drivers are independent — hardware could freeze and workloads would st
 | quantization | 2 |
 | other (8 singletons) | 8 |
 
-## compiler_kernel_fusion (11)
+The bucket labels above are the mechanical classification; the analysis is organized by *research concern* instead, because the buckets cut across the real story — e.g. the KV cache appears in kv_cache, long_context, scheduling, and speculative_decoding papers alike, and hardware pressure drives both compiler_kernel_fusion and multi_gpu_heterogeneous.
 
-Hand-writing kernels can't keep up with new hardware × new attention variants × dynamic shapes. Most papers raise the abstraction so expert performance doesn't need per-combo hand-tuning (DSLs/compilers/tile primitives); a second cluster leans on async/overlap as the speedup lever; a few change the attention math itself; and FlashInfer-Bench builds the generate→benchmark→deploy loop instead of a kernel.
-
-- [FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling](https://openreview.net/forum?id=mN5RtvuYl3) — async-MMA pipeline redesign for Blackwell
-- [HipKittens: Fast and Furious AMD Kernels](https://openreview.net/forum?id=xxSSrndQrI) — tile primitives ported to AMD CDNA
-- [Wave: A Symbolic Python DSL And Compiler for High-Performance Machine Learning](https://openreview.net/forum?id=gcXV1E8HRH) — Python-embedded kernel DSL
-- [Flashlight: PyTorch Compiler Extensions to Accelerate Attention Variants](https://openreview.net/forum?id=lboOMA8XWr) — auto-fused kernels, no static templates
-- [Event Tensor: A Unified Abstraction for Compiling Dynamic Megakernel](https://openreview.net/forum?id=PJqFhAbUHa) — IR for data-dependent megakernels
-- [ParallelKittens: Systematic and Practical Simplification of Multi-GPU AI Kernels](https://openreview.net/forum?id=Cv5e5uRXFb) — overlap primitives for multi-GPU
-- [TokenWeave: Efficient Compute-Communication Overlap for Distributed LLM Inference](https://openreview.net/forum?id=rh2Ylffkq6) — TP compute/comms overlap
-- [DynaFlow: Transparent and Flexible Intra-Device Parallelism via Programmable Operator Scheduling](https://openreview.net/forum?id=i0yqC9954S) — overlap heterogeneous operators
-- [BLASST: Dynamic BLocked Attention Sparsity via Softmax Thresholding](https://openreview.net/forum?id=6INSBXTQ4x) — training-free block-sparse attention
-- [IntAttention: A Fully Integer Attention Pipeline for Efficient Edge Inference](https://openreview.net/forum?id=CPCRITwAaP) — integer-only softmax path
-- [FlashInfer-Bench: Building the Virtuous Cycle for AI-driven LLM Systems](https://openreview.net/forum?id=IyryZno8Hh) — generate→bench→deploy loop for AI-written kernels
-
-## scheduling_batching (8)
-
-Serving as resource allocation under SLO/throughput constraints, without touching the model — the lever is exploiting slack or heterogeneity. Papers split by what they optimize for: throughput, energy, latency-SLO, config search, or scaling speed.
-
-- [BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching](https://openreview.net/forum?id=IuVHde07l6) — offline throughput via global prefix reuse
-- [SuperInfer: SLO-Aware Rotary Scheduling and Memory Management for LLM Inference on Superchips](https://openreview.net/forum?id=RuslSHdIHa) — anti head-of-line-blocking on superchips
-- [MorphServe: Efficient and Workload-Aware LLM Serving via Runtime Quantized Layer Swapping and KV Cache Resizing](https://openreview.net/forum?id=PDu13oOl4G) — adapt precision/KV to workload swings
-- [BEAM: Joint Resource-Power Optimization for Energy-Efficient LLM Inference under SLO constraints](https://openreview.net/forum?id=BfNBXM8CCT) — spend latency slack on energy
-- [HELIOS: Adaptive Model And Early-Exit Selection for Efficient LLM Inference Serving](https://openreview.net/forum?id=CV52m9NJFK) — runtime model + early-exit selection
-- [FaaScale: Unlocking Fast LLM Scaling for Serverless Inference](https://openreview.net/forum?id=jgL8LuOVyT) — fast elastic scaling via multicast weight transfer
-- [Optimizing Deployment Configurations for LLM Inference](https://openreview.net/forum?id=gEbKQeIdxB) — Meta's HW/parallelism/runtime config search at scale
-- [AIRS: Scaling Live Inference in Resource Constrained Environments](https://openreview.net/forum?id=g1RWik4Gy1) — live serving under tight resource limits
-
-## long_context_pd_disaggregation (7)
-
-All treat prefill as a separable phase: split it onto its own hardware, overlap it in time, or delete redundant prefill via reuse. "Beyond the Buzz" is the measurement study rather than a system.
-
-- [PLA-Serve: A Prefill-Length-Aware LLM Serving System](https://openreview.net/forum?id=dzjCkSEDyG) — length-aware prefill/decode disaggregation
-- [TriInfer: Hybrid EPD Disaggregation for Efficient Multimodal Large Language Model Inference](https://openreview.net/forum?id=nNovi8fvGN) — adds a third encode stage for multimodal
-- [Stream2LLM: Overlap Context Streaming and Prefill for Reduced Time-to-First-Token](https://openreview.net/forum?id=FuRo7Ur5Ib) — stream retrieved context into prefill
-- [FlashAgents: Accelerating Multi-Agent LLM Systems via Streaming Prefill Overlap](https://openreview.net/forum?id=m14PPUfgEc) — stream tokens between agents
-- [ContextPilot: Fast Long-Context Inference via Context Reuse](https://openreview.net/forum?id=RnKvDy1jv2) — context index to cut redundant prefill
-- [Using Span Queries to Optimize Cache and Attention Locality](https://openreview.net/forum?id=qcGGSXpFcM) — generalized cache-locality abstraction
-- [Beyond the Buzz: A Pragmatic Take on Inference Disaggregation](https://openreview.net/forum?id=NqC5tcBsa0) — empirical study across the design space
-
-## kv_cache (7)
-
-Every method exploits non-uniform importance in the cache — across tokens, heads/channels, queries/beams, or time — and almost all are training-free plug-ins over paged attention. They split by goal: memory footprint, throughput, reliability, or accuracy-under-compression.
-
-- [Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost](https://openreview.net/forum?id=r3mQiuYKIN) — channel-wise precision, ~8x memory cut
-- [FlexiCache: Leveraging Temporal Stability of Attention Heads for Efficient KV Cache Management](https://openreview.net/forum?id=GgX6dPJx9M) — offload stable heads, keep unstable on GPU
-- [OPKV: A High-Throughput Plugin-Driven Framework for Recallable Sparsity in Paged KV Cache Systems](https://openreview.net/forum?id=EB5bgzv4qA) — recallable sparsity in paged KV
-- [SkipKV: Selective Skipping of KV Generation and Storage for Efficient Inference with Large Reasoning Models](https://openreview.net/forum?id=0EsV9SIm8p) — sentence-level eviction for long CoT
-- [MAC-Attention: a Match-Amend-Complete scheme for fast and accurate attention computation](https://openreview.net/forum?id=b6HBRCejb7) — reuse attention for similar queries
-- [Locality-Aware Beam Scheduling for Efficient Test-Time Compute with a Consumer-grade GPU](https://openreview.net/forum?id=dTo8jAXm9K) — beam/token locality to cut KV transfers
-- [GhostServe: A Lightweight Checkpointing System in the Shadow for Fault-Tolerant LLM Serving](https://openreview.net/forum?id=xKjYiUgeOK) — erasure-coded KV for fast fault recovery
-
-## speculative_decoding (5)
-
-Same draft-then-verify skeleton; the difference is where the cheap draft comes from — a restructured AR drafter, non-AR diffusion drafters, or self-speculation with sparse attention. "Performance or Illusion?" is the reality-check that measures whether any of it survives production batching.
-
-- [PRISM: Parametrically Refactor Inference for Speculative Decoding Draft Models](https://openreview.net/forum?id=cvU2HuuxEf) — decouple draft params across steps
-- [SpecDiff-2: Scaling Diffusion Drafter Alignment For Faster Speculative Decoding](https://openreview.net/forum?id=o42VU86ZsV) — diffusion drafter calibrated to AR verifier
-- [TiDAR: Think in Diffusion, Talk in Autoregression](https://openreview.net/forum?id=onfxEjoE4L) — draft (diffusion) + verify (AR) in one pass
-- [Accelerating Large-Scale Reasoning Model Inference with Sparse Self-Speculative Decoding](https://openreview.net/forum?id=yeqrwcWjPu) — self-speculation, no separate drafter
-- [Speculative Decoding: Performance or Illusion?](https://openreview.net/forum?id=fzkqtezFEi) — production-engine benchmark of SD variants
-
-## multi_gpu_heterogeneous (5)
-
-Squeeze throughput and resilience out of imperfect, non-uniform clusters via load/resource balancing — over flaky GPUs, mixed GPU types, sparse-attention shards, or NIC vendors. Abstraction layers range from comms/fault-tolerance infra up to Bayesian orchestration.
-
-- [RaidServe: High-performance Resilient Serving](https://openreview.net/forum?id=5pl9fdbEkq) — TP serving under irregular GPU availability
-- [BOute: Cost-Efficient LLM Serving with Heterogeneous LLMs and GPUs via Multi-Objective Bayesian Optimization](https://openreview.net/forum?id=ZVQb92umqX) — Bayesian routing over heterogeneous GPUs
-- [db-SP: Accelerating Sparse Attention for Visual Generative Models with Dual-Balanced Sequence Parallelism](https://openreview.net/forum?id=XgKteNxNe0) — balance sparse-attention load across GPUs
-- [fabric-lib: RDMA Point-to-Point Communication for LLM Systems](https://openreview.net/forum?id=SjVa05wEiY) — vendor-portable RDMA p2p
-- [Efficient, VRAM-Constrained xLM Inference on Clients](https://openreview.net/forum?id=VKqQYg6JPb) — adapt placement to CPU/GPU client conditions
-
-## moe_inference (4)
-
-All blame expert parallelism and fix it at the systems layer, not the model — architecture skip-connections for overlap, hot-expert replication for imbalance, or layer-granular scheduling. "Demystifying" is the measurement (2-3x tax) that frames the other three.
-
-- [FarSkip-Collective: Unhobbling Blocking Communication in Mixture of Experts Models](https://openreview.net/forum?id=ruOpvLzsGV) — skip connections for compute/comms overlap
-- [CRAFT: Fine-Grained Cost-Aware Expert Replication For Efficient Mixture-of-Experts Serving](https://openreview.net/forum?id=zdRvzU9ZCe) — replicate hot experts to fix load imbalance
-- [From Tokens to Layers: Redefining Stall-Free Scheduling for MoE Serving with Layered Prefill](https://openreview.net/forum?id=yyDbI3HXco) — layer-granular stall-free scheduling
-- [Demystifying the Mixture of Experts Serving Tax](https://openreview.net/forum?id=lELxqcgrsN) — measures and categorizes the MoE serving tax
-
-## quantization (2)
-
-Both reject one-size-fits-all quant params and search a discrete space guided by an error metric, staying GPU-kernel-friendly — MixLLM allocates precision across output features; ScaleSearch picks the best per-block BFP scale.
-
-- [MixLLM: LLM Quantization with Global Mixed-precision between Output-features and Highly-efficient System Design](https://openreview.net/forum?id=VBbMRQ4VOc)
-- [Search Your Block Floating Point Scales!](https://openreview.net/forum?id=innqECyZPK)
-
-## other (8 singletons)
-
-One paper each — directions that surfaced but didn't cluster this year. Several are early "map the problem" studies (cold-start, DVFS) rather than mature solution spaces.
-
-- [Attribution-based Sparse Activation in Large Language Models](https://openreview.net/forum?id=gJFigZeb5D) — *neuron sparse activation*: per-input neuron skipping via attribution, training-free
-- [Shannonic: Efficient Entropy-Optimal Compression for ML Workloads](https://openreview.net/forum?id=NhMxI0GbB8) — *tensor lossless compression*: near-entropy ANS coding for tensors
-- [Meeting SLOs, Slashing Hours: Automated Enterprise LLM Optimization with OptiKIT](https://openreview.net/forum?id=om4H7AI2hc) — *automated inference optimization*: auto-search deployment configs
-- [Breaking the Ice: Analyzing Cold Start Latency in vLLM](https://openreview.net/forum?id=eoEobeKTNZ) — *cold start latency*: profiling study of vLLM startup
-- [CDLM: Consistency Diffusion Language Models for Faster Sampling](https://openreview.net/forum?id=eB8yjR6alL) — *diffusion LM inference*: consistency distillation to cut sampling steps
-- [TeleRAG: Efficient Retrieval-Augmented Generation Inference with Lookahead Retrieval](https://openreview.net/forum?id=YsOyCpMUYD) — *RAG inference*: lookahead prefetch to overlap retrieval with decode
-- [Scaling Up Large Language Models Serving Systems for Semantic Job Search](https://openreview.net/forum?id=re82zZczHj) — *production serving*: SLM compression + serving lessons (LinkedIn)
-- [Rethinking DVFS for Mobile LLMs: Unified Energy-Aware Scheduling with CORE](https://openreview.net/forum?id=PSyHQ8kVUT) — *mobile DVFS*: coordinated CPU/GPU/memory frequency scaling
+*(A complementary Chinese-language root-cause decomposition with ASCII diagrams, from the `ljg-rank` skill: `~/Documents/notes/20260709T005837--MLSys2026推理优化的秩__rank.org`.)*
