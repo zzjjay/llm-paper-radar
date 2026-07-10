@@ -212,9 +212,10 @@ Structure:
    from Step 2, each a tight paragraph or two that *names specific papers,
    mechanisms, and numbers* (not "several papers do X" — say which and what
    result). A paper can appear in more than one thread. Inline OpenReview link on
-   first mention. **End each section with one judgment sentence** distinct from
-   the Takeaway — see "Section-level judgment" under Rigor rules; a section that
-   only lists papers, however well, is a bibliography, not analysis.
+   first mention. **Open each section with one judgment sentence**, distinct from
+   the Takeaway, self-contained enough to read before any paper is named — see
+   "Section-level judgment, and it leads, not trails" under Rigor rules; a
+   section that only lists papers, however well, is a bibliography, not analysis.
 4. `## N. Maturity: practicality vs research` — a readiness axis
    cutting across the concerns: deployed-at-scale (named production systems) /
    industrial-grade-with-real-tooling / research-prototype. The most useful cut
@@ -270,29 +271,52 @@ Structure:
 - **Density: state each caveat once, then stop.** Don't repeat the self-reported
   or venue caveat per paragraph; don't re-link a paper already linked above;
   merge bullet lists into dense prose. Target roughly the shape below, not double.
-- **Section-level judgment, not just section-level description.** Naming papers +
-  mechanisms + numbers (the rule above) is necessary but not sufficient — a
-  section that stops there is an annotated bibliography. After the descriptive
-  paragraph, add **one sentence that a reader could act on or be wrong to ignore**:
-  a risk, an implication, a "these aren't interchangeable" distinction, or a
-  falsifiable bet (tag forward-looking bets `[conjecture]`, same as elsewhere).
-  Make it *specific to that section's papers*, not a restatement of the Takeaway
-  — the Takeaway earns the report-wide claims, each section earns its own local
-  one. Worked examples from the MLSys 2026 report (§ numbers refer to it):
-  - §1 (KV cache): "the four stances aren't interchangeable — quantization and
-    eviction are lossy and compound each other's error, while compute-reuse and
-    durable-state are lossless; audit for compounding accuracy loss before
-    counting compounding memory savings."
-  - §3 (disaggregation): "a team that disaggregates without also building the
-    elastic re-provisioning the reality-check paper says is required is likely
-    seeing a fraction of the reported gain — a static instance ratio is close to
-    the null result."
-  - §4 (MoE): "the phase-dependent imbalance result rules out any single static
-    load-balancing policy — a placement tuned for prefill will systematically
-    mis-serve decode."
-  - §5 (spec decoding): "read the diffusion-drafter results as promising, not
-    proven — most report self-reported peaks, only one measures against a real
-    batched engine."
+- **Section-level judgment, and it leads, not trails.** Naming papers + mechanisms
+  + numbers (the rule above) is necessary but not sufficient — a section that
+  stops there is an annotated bibliography. Every section needs **one sentence a
+  reader could act on or be wrong to ignore**: a risk, an implication, a "these
+  aren't interchangeable" distinction, or a falsifiable bet (tag forward-looking
+  bets `[conjecture]`). Make it *specific to that section's papers*, not a
+  restatement of the Takeaway — the Takeaway earns the report-wide claims, each
+  section earns its own local one.
+
+  **Put that sentence first, before the paper list**, matching how the Takeaway
+  itself opens with its claim rather than building up to it. Writing the judgment
+  last reads as an afterthought bolted onto a description; leading with it reads
+  as a conclusion the section then supports — and it makes the report skimmable
+  at the level of "read just the first sentence of every section." The one
+  wrinkle: some judgments naturally reference a taxonomy the section itself
+  builds (e.g. "the four stances aren't interchangeable" presumes the four are
+  already named). Handle that by inlining short parenthetical tags as each item
+  is introduced (`**shrink** (lossy) — ...`, `**skip** (lossy) — ...`) so the
+  opening sentence's claim ("two lossy, two lossless") cashes out without
+  forward-referencing undefined terms, or by pointing forward to the evidence
+  ("...as the paper closing this section already argues") and back from it
+  ("...the basis for the claim above") rather than dropping the judgment
+  mid-paragraph where it interrupts the paper list.
+
+  Worked examples, restructured lead-first (§ numbers refer to the MLSys 2026 /
+  ASPLOS 2026 reports):
+  - MLSys §1 (KV cache): "This year's KV defenses split into four stances that
+    don't compose safely — two lossy, two lossless — so a team stacking several
+    should audit for compounding accuracy loss before counting compounding
+    memory savings." *(then the four stances, each tagged lossy/lossless as
+    introduced)*
+  - MLSys §3 (disaggregation): "A team that disaggregates prefill from decode
+    without also building elastic re-provisioning is likely seeing a fraction of
+    the gains this cluster reports — a static instance ratio is close to the null
+    result, not the headline." *(then the papers, with the reality-check paper
+    identified as "the source of that warning")*
+  - MLSys §5 (spec decoding): "Read this cluster's diffusion-drafter results as
+    promising, not proven: most report peaks against baselines, and only one
+    paper measures against a real, batched production engine." *(then the
+    papers, ending with "the reality check: ...")*
+  - ASPLOS §1 (KV cache, cross-venue contrast): "PIM/CIM/near-storage work
+    reframes the KV cache as a *physical placement* decision, not a software
+    cache-policy one — the same object MLSys treats as data to compress or
+    evict, ASPLOS treats as data to relocate onto different silicon." *(then the
+    papers)*
+
   If you can't find a defensible one-sentence judgment for a section, that's a
   signal the section itself may be a weak thread (reconsider merging it) rather
   than a section to ship undigested.
@@ -349,9 +373,11 @@ force-add them.
   ceilings; note microbenchmark vs production-trace.
 - **Don't under-serve the largest cluster** or force a one-object thesis that only
   covers half the set.
-- **Don't end a section on a paper list.** Each numbered section needs its own
-  closing judgment sentence (a risk, an implication, an incompatibility, a
-  falsifiable bet) — a section without one is a bibliography, not analysis.
+- **Don't bury the judgment after the paper list.** Each numbered section needs
+  its own judgment sentence (a risk, an implication, an incompatibility, a
+  falsifiable bet), and it opens the section — a section without one is a
+  bibliography; one with the judgment tacked on at the end reads as an
+  afterthought, not a conclusion.
 - **Don't proceed on an incomplete fetch.** A 403-storm or a below-floor paper
   count means re-run later, not "analyze what we got" — a report built on a
   partial pull reads as complete and misleads.
