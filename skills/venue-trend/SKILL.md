@@ -197,6 +197,14 @@ Structure:
 1. Title + a one-line note on what was analyzed (N in-scope of M total accepts)
    plus the two standing caveats compressed to one italic line: figures are
    authors' self-reported bests; one venue + auto-selected set (point to Method).
+   **End that same italic line with which model did the read** — e.g. "Analysis:
+   Claude Opus 4.8, reading all N abstracts directly (no sub-agent fan-out)." Say
+   whichever model you actually are, not a default guess — if a `/model` switch
+   happened mid-session, the analysis reflects whatever model ran Step 2, and
+   that's what belongs here. This is a rigor marker like the others: a shallower
+   model reading fewer abstracts (or a Workflow fan-out) produces a measurably
+   weaker report, so which model did the synthesis is metadata worth keeping, not
+   a footnote nicety.
 2. `## Takeaway` — the thesis in 2-3 tight paragraphs: the one or two forces the
    whole set responds to, and the field-wide constraint (for MLSys 2026: frozen
    weights + vLLM/SGLang target → training-free drop-in co-design).

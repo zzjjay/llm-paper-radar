@@ -1,6 +1,6 @@
 # ASPLOS 2026 — LLM Inference Deployment Optimization Trend Report
 
-*29 LLM-inference papers hand-selected from the 167 ASPLOS 2026 accepts (title-filtered, then read from abstracts sourced via Semantic Scholar — ASPLOS isn't on OpenReview, so the standard fetcher doesn't apply; see [Method](#paper-distribution)). All figures are authors' self-reported bests ("up to X"), and — important here — many hardware results are from simulation, not silicon (flagged in §8). **Scope note:** unlike the [MLSys 2026 report](mlsys-2026.md), which hard-gates custom-silicon papers, this one includes them — at an architecture venue, algorithm-hardware co-design is the core contribution, and excluding it would gut the picture.*
+*29 LLM-inference papers hand-selected from the 167 ASPLOS 2026 accepts (title-filtered, then read from abstracts sourced via Semantic Scholar — ASPLOS isn't on OpenReview, so the standard fetcher doesn't apply; see [Method](#paper-distribution)). All figures are authors' self-reported bests ("up to X"), and — important here — many hardware results are from simulation, not silicon (flagged in §8). **Scope note:** unlike the [MLSys 2026 report](mlsys-2026.md), which hard-gates custom-silicon papers, this one includes them — at an architecture venue, algorithm-hardware co-design is the core contribution, and excluding it would gut the picture. Analysis: Claude Opus 4.8, reading all 29 abstracts directly (no sub-agent fan-out).*
 
 ## Takeaway
 

@@ -1,6 +1,6 @@
 # MLSys 2026 — LLM Inference Deployment Optimization Trend Report
 
-*57 of ~135 accepts whose primary contribution is LLM serving. All figures are authors' self-reported bests ("up to X", often microbenchmark) — ceilings, not expectations. One systems venue, auto-selected set — see [Paper distribution](#paper-distribution).*
+*57 of ~135 accepts whose primary contribution is LLM serving. All figures are authors' self-reported bests ("up to X", often microbenchmark) — ceilings, not expectations. One systems venue, auto-selected set — see [Paper distribution](#paper-distribution). Analysis: Claude Opus 4.8, reading all 57 abstracts directly (no sub-agent fan-out).*
 
 ## Takeaway
 
