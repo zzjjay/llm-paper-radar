@@ -57,6 +57,15 @@ creds are the first thing to check, not the venue string.
 ```
 
 The venue string is the OpenReview invitation prefix (`<Host>/<Year>/Conference`).
+**Host domain gotcha:** most ML venues use `.cc` — `NeurIPS.cc`, `ICML.cc`,
+`ICLR.cc` — while MLSys uses `.org` (`MLSys.org`). The wrong host returns HTTP
+200 with **zero notes** (not a 404, not a 403), so a `.org` typo on NeurIPS/ICML/
+ICLR looks exactly like "venue not published yet." Before concluding a venue is
+empty, retry with the other host and sanity-check a known-good prior year (e.g.
+`NeurIPS.cc/2025/Conference` returns thousands). A genuinely-unpublished venue
+(decisions not yet out — e.g. NeurIPS's land ~September) has the group scaffolding
+present but the `/-/Submission` invitation returns 0 on the *correct* host too;
+that's a real empty, so stop and tell the user rather than analyzing nothing.
 This chains three stages and writes `data/scored/<slug>-grouped.json` (slug =
 `<conf>-<year>`, e.g. `mlsys-2026`):
 
