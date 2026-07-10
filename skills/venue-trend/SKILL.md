@@ -86,6 +86,31 @@ publish decisions under a separate invitation, or use a display `venue` string
 instead), adjust `_is_accepted` in `sources/openreview_venue.py`, re-run its
 tests, then re-run the fetch. Don't silently accept a low count.
 
+**Mega-venue caveat (ICML / NeurIPS / ICLR: thousands of accepts).** For a
+general ML venue the accepted set is *thousands* of papers (ICML 2026: ~6,341),
+and `venue_report.sh` would LLM-classify every one — disproportionate. Don't run
+the vanilla Step 1 on these. Two things also change:
+- **This is not a systems venue.** LLM-inference *deployment* (serving, kernels,
+  scheduling) mostly goes to MLSys/ASPLOS/OSDI; a general venue's inference work
+  is upstream *algorithms* (efficient/linear attention, KV-compression algorithms,
+  quantization algorithms, speculative/diffusion decoding, MoE routing). The
+  deployment-tuned `inference_relevance` rubric will hard-gate most of it. As with
+  architecture venues, **relax the scope to include algorithmic inference-
+  efficiency work** and say so in the report — else the venue's real contribution
+  vanishes. (Ask the user first if the scope choice is material; ICML 2026 was
+  run at broad scope by explicit user choice.)
+- **Funnel instead of classify-all** (the proven ICML path → `venue-reports/icml-2026.md`):
+  1. Fetch all accepts with abstracts (paginate `/-/Submission`, keep
+     `venueid == "<venue>"`) — API only, cheap.
+  2. **Keyword pre-filter** titles+abstracts to a recall-oriented candidate set
+     (inference/serving/KV/attention/quantization/MoE/decoding/long-context/
+     low-bit terms). ~6,000 → a few hundred.
+  3. LLM-classify only the candidates with a relaxed-scope prompt →
+     `{in_scope, subfield, reason}` (concurrency + incremental save; ~hundreds of
+     calls, not thousands).
+  4. Group by subfield; the in-scope set will be large (ICML: 366).
+  Then Step 2, with the large-set reading rule below.
+
 ## Step 1b — non-OpenReview venues (ASPLOS / ISCA / MICRO / OSDI / SOSP / NSDI …)
 
 Many top systems/architecture venues are **not on OpenReview** (they use HotCRP +
@@ -181,10 +206,22 @@ pass can see:
 - **What shifted and what's conspicuously absent** vs. prior years.
 
 If the in-scope set is too large to hold in one context (rough rule: more than
-~120 papers / ~200 KB of abstracts), fall back to the Workflow at
-`workflows/venue_trend_report.js` for a first-pass per-subfield summary, then
-still do the synthesis yourself over those summaries. For a normal venue
-(dozens of in-scope papers) read the abstracts directly — it's strictly better.
+~120 papers / ~200 KB of abstracts — i.e. mega-venues), do **not** fan out to the
+Workflow (that reintroduces the shallow per-bucket summaries this skill exists to
+avoid). Instead, the proven ICML path: **read the largest clusters in full
+yourself** (ICML 2026: the top four clusters, 202 of 366 papers, read completely)
+and **characterize the smaller clusters from titles + a sampled abstract read**.
+Then two report adaptations for scale:
+- **Don't link all N papers** — a report linking 366 papers is a bibliography
+  dump, not a trend report. Cite representative + standout papers per cluster with
+  links; give exact counts; and **state coverage explicitly** ("read the top four
+  clusters in full, characterized the rest by title + sampled read; per-paper
+  claims outside the top clusters are lower-confidence").
+- The coverage check (all-papers-linked) is replaced by honest coverage
+  disclosure — you are not trying to link every paper, so say what you did read.
+
+For a normal venue (dozens of in-scope papers) read every abstract directly and
+link them all — it's strictly better.
 
 ## Step 3 — write the report
 
@@ -335,16 +372,22 @@ print('missing:', ids-linked)
 ```
 
 (For a non-OpenReview venue there's no `data/scored/<slug>.json`; instead check
-your title list against the report and grep for `doi.org` / `arxiv.org` links.)
-Fold any missing paper into its rightful thread — don't leave it out (an unlinked
-in-scope paper is a coverage hole). Reference shapes: `venue-reports/mlsys-2026.md`
-(OpenReview path, ~60 lines, 57 papers) and `venue-reports/asplos-2026.md`
-(non-OpenReview path, ~60 lines, 29 papers, DOI links, with the custom-silicon
-scope relaxation and simulation-vs-silicon maturity split). Both: dense, all
-papers linked, organized by research concern — Takeaway + numbered concern
-sections (each ending in a section-level judgment sentence, not just a paper
-list) + Maturity + a final Paper-distribution section (table + one-line
-selection/bias footnote); no standalone "what shifted" section.
+your title list against the report and grep for `doi.org` / `arxiv.org` links.
+For a mega-venue you deliberately don't link every paper — skip this check and
+disclose coverage instead, see Step 2.) For normal venues, fold any missing paper
+into its rightful thread — an unlinked in-scope paper is a coverage hole.
+
+Reference shapes (all: dense, organized by research concern — Takeaway + numbered
+concern sections each *opening* with a judgment sentence + Maturity + a final
+Paper-distribution/Method section; no standalone "what shifted" section):
+- `venue-reports/mlsys-2026.md` — OpenReview path, ~60 lines, 57 papers, all linked.
+- `venue-reports/asplos-2026.md` — non-OpenReview path, ~60 lines, 29 papers, DOI
+  links, custom-silicon scope relaxation + simulation-vs-silicon maturity split.
+- `venue-reports/icml-2026.md` — mega-venue path, ~70 lines, 366 in-scope of
+  6,341 (funnel selection), broadened algorithmic scope, top-4-clusters-read-in-
+  full with representative (not exhaustive) linking + explicit coverage
+  disclosure, and a cross-venue read (ICML = algorithms upstream of the systems
+  venues; confirms the quantization "venue artifact").
 
 ## Step 4 — commit
 
