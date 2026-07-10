@@ -204,7 +204,9 @@ Structure:
    from Step 2, each a tight paragraph or two that *names specific papers,
    mechanisms, and numbers* (not "several papers do X" — say which and what
    result). A paper can appear in more than one thread. Inline OpenReview link on
-   first mention.
+   first mention. **End each section with one judgment sentence** distinct from
+   the Takeaway — see "Section-level judgment" under Rigor rules; a section that
+   only lists papers, however well, is a bibliography, not analysis.
 4. `## N. Maturity: practicality vs research` — a readiness axis
    cutting across the concerns: deployed-at-scale (named production systems) /
    industrial-grade-with-real-tooling / research-prototype. The most useful cut
@@ -260,6 +262,32 @@ Structure:
 - **Density: state each caveat once, then stop.** Don't repeat the self-reported
   or venue caveat per paragraph; don't re-link a paper already linked above;
   merge bullet lists into dense prose. Target roughly the shape below, not double.
+- **Section-level judgment, not just section-level description.** Naming papers +
+  mechanisms + numbers (the rule above) is necessary but not sufficient — a
+  section that stops there is an annotated bibliography. After the descriptive
+  paragraph, add **one sentence that a reader could act on or be wrong to ignore**:
+  a risk, an implication, a "these aren't interchangeable" distinction, or a
+  falsifiable bet (tag forward-looking bets `[conjecture]`, same as elsewhere).
+  Make it *specific to that section's papers*, not a restatement of the Takeaway
+  — the Takeaway earns the report-wide claims, each section earns its own local
+  one. Worked examples from the MLSys 2026 report (§ numbers refer to it):
+  - §1 (KV cache): "the four stances aren't interchangeable — quantization and
+    eviction are lossy and compound each other's error, while compute-reuse and
+    durable-state are lossless; audit for compounding accuracy loss before
+    counting compounding memory savings."
+  - §3 (disaggregation): "a team that disaggregates without also building the
+    elastic re-provisioning the reality-check paper says is required is likely
+    seeing a fraction of the reported gain — a static instance ratio is close to
+    the null result."
+  - §4 (MoE): "the phase-dependent imbalance result rules out any single static
+    load-balancing policy — a placement tuned for prefill will systematically
+    mis-serve decode."
+  - §5 (spec decoding): "read the diffusion-drafter results as promising, not
+    proven — most report self-reported peaks, only one measures against a real
+    batched engine."
+  If you can't find a defensible one-sentence judgment for a section, that's a
+  signal the section itself may be a weak thread (reconsider merging it) rather
+  than a section to ship undigested.
 
 Cite numbers the papers report. Prefer "X does Y, getting Z" over adjectives.
 Verify every in-scope paper is linked somewhere:
@@ -282,7 +310,8 @@ in-scope paper is a coverage hole). Reference shapes: `venue-reports/mlsys-2026.
 (non-OpenReview path, ~60 lines, 29 papers, DOI links, with the custom-silicon
 scope relaxation and simulation-vs-silicon maturity split). Both: dense, all
 papers linked, organized by research concern — Takeaway + numbered concern
-sections + Maturity + a final Paper-distribution section (table + one-line
+sections (each ending in a section-level judgment sentence, not just a paper
+list) + Maturity + a final Paper-distribution section (table + one-line
 selection/bias footnote); no standalone "what shifted" section.
 
 ## Step 4 — commit
@@ -312,6 +341,9 @@ force-add them.
   ceilings; note microbenchmark vs production-trace.
 - **Don't under-serve the largest cluster** or force a one-object thesis that only
   covers half the set.
+- **Don't end a section on a paper list.** Each numbered section needs its own
+  closing judgment sentence (a risk, an implication, an incompatibility, a
+  falsifiable bet) — a section without one is a bibliography, not analysis.
 - **Don't proceed on an incomplete fetch.** A 403-storm or a below-floor paper
   count means re-run later, not "analyze what we got" — a report built on a
   partial pull reads as complete and misleads.
