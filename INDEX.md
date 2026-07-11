@@ -1,5 +1,6 @@
 # Digest History Index
 
+- [07-10](digests/2026-07-10.md) — 71 scanned, 0 passed, top: (no papers passed)
 - [07-09](digests/2026-07-09.md) — 215 scanned, 4 passed, top: It Takes a MAESTRO To Prune Bad Experts
 - [07-08](digests/2026-07-08.md) — 227 scanned, 0 passed, top: (no papers passed)
 - [07-07](digests/2026-07-07.md) — 200 scanned, 1 passed, top: SeKV: Resolution-Adaptive KV Cache with Hierarchic
