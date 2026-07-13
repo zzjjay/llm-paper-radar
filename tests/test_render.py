@@ -144,6 +144,71 @@ def test_render_daily_groups_by_topic_with_caps(tmp_path: Path):
     assert "[05-11](digests/2026-05-11.md)" in index.read_text()
 
 
+def test_update_index_keeps_entries_sorted_newest_first(tmp_path: Path):
+    """Rendering days out of order (e.g. a backfill for older dates run after
+    newer ones already exist) must not leave the index in render order —
+    every write re-sorts the whole file so it's always newest-first."""
+    summarized_path = tmp_path / "summarized.json"
+    summarized_path.write_text(json.dumps([_mk("only", 9).model_dump(mode="json")]))
+    digests_dir = tmp_path / "digests"
+    readme = tmp_path / "README.md"
+    index = tmp_path / "INDEX.md"
+
+    # Render 05-11 first, then backfill 05-09 and 05-10 afterward — out of
+    # chronological order, as a manual backfill for older gaps would.
+    for day in (11, 9, 10):
+        render_daily(
+            date=datetime(2026, 5, day, tzinfo=UTC),
+            summarized_path=summarized_path,
+            digests_dir=digests_dir,
+            readme_path=readme,
+            index_path=index,
+            topic_caps={"ptq": 5, "_default": 3},
+        )
+
+    lines = [ln for ln in index.read_text().splitlines() if ln.startswith("- [")]
+    assert lines == [
+        "- [05-11](digests/2026-05-11.md) — 1 scanned, 1 passed, top: Title only",
+        "- [05-10](digests/2026-05-10.md) — 1 scanned, 1 passed, top: Title only",
+        "- [05-09](digests/2026-05-09.md) — 1 scanned, 1 passed, top: Title only",
+    ]
+
+
+def test_update_index_rerender_updates_in_place_without_duplicating(tmp_path: Path):
+    """Re-rendering the same date (e.g. after a --force backfill) must update
+    that day's line, not append a duplicate."""
+    digests_dir = tmp_path / "digests"
+    readme = tmp_path / "README.md"
+    index = tmp_path / "INDEX.md"
+
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]")
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=empty,
+        digests_dir=digests_dir,
+        readme_path=readme,
+        index_path=index,
+        topic_caps={"ptq": 5, "_default": 3},
+    )
+
+    full = tmp_path / "full.json"
+    full.write_text(json.dumps([_mk("only", 9).model_dump(mode="json")]))
+    render_daily(
+        date=datetime(2026, 5, 11, tzinfo=UTC),
+        summarized_path=full,
+        digests_dir=digests_dir,
+        readme_path=readme,
+        index_path=index,
+        topic_caps={"ptq": 5, "_default": 3},
+    )
+
+    lines = [ln for ln in index.read_text().splitlines() if ln.startswith("- [")]
+    assert lines == [
+        "- [05-11](digests/2026-05-11.md) — 1 scanned, 1 passed, top: Title only",
+    ]
+
+
 def test_render_daily_splices_into_existing_readme_markers(tmp_path: Path):
     """README has docs + LATEST markers; render should splice digest between
     them and leave the docs intact (must not overwrite the whole README)."""

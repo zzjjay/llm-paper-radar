@@ -1,7 +1,11 @@
 # Digest History Index
 
+- [07-11](digests/2026-07-11.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
+- [07-10](digests/2026-07-10.md) — 71 scanned, 0 passed, top: (no papers passed)
+- [07-09](digests/2026-07-09.md) — 215 scanned, 4 passed, top: It Takes a MAESTRO To Prune Bad Experts
+- [07-08](digests/2026-07-08.md) — 227 scanned, 0 passed, top: (no papers passed)
 - [07-07](digests/2026-07-07.md) — 200 scanned, 1 passed, top: SeKV: Resolution-Adaptive KV Cache with Hierarchic
-- [07-06](digests/2026-07-06.md) — 218 scanned, 2 passed, top: OrbitQuant: Data-Agnostic Quantization for Image a
+- [07-06](digests/2026-07-06.md) — 273 scanned, 2 passed, top: OrbitQuant: Data-Agnostic Quantization for Image a
 - [07-05](digests/2026-07-05.md) — 161 scanned, 2 passed, top: Quantize the Target, Quantize the Drafter: Efficie
 - [07-04](digests/2026-07-04.md) — 125 scanned, 0 passed, top: (no papers passed)
 - [07-03](digests/2026-07-03.md) — 230 scanned, 1 passed, top: Variable Bit-width Quantization: Learning Per-Grou

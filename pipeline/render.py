@@ -801,21 +801,32 @@ def _load_day(
     return scanned, watched_papers, surviving
 
 
+_INDEX_LINE_DATE_RE = re.compile(r"\]\(digests/(\d{4}-\d{2}-\d{2})\.md\)")
+
+
 def _update_index(
     date: datetime, index_path: Path, scanned: int, surviving: list[Paper]
 ) -> None:
+    """Upsert this day's line and rewrite the whole index sorted newest-first.
+    Previously this only replaced the line in place (or appended at the end),
+    so backfills/reruns landed wherever they happened to run rather than in
+    date order — the file only looked chronological if every day was rendered
+    exactly once, in order. Re-sorting on every write keeps it always newest-
+    first regardless of render order."""
     top_title = surviving[0].title if surviving else "(no papers passed)"
     new_line = render_index_line(date, scanned, len(surviving), top_title[:50])
+    date_str = date.strftime("%Y-%m-%d")
+
+    entries: dict[str, str] = {}
     if index_path.exists():
-        existing = index_path.read_text()
-        marker = f"](digests/{date.strftime('%Y-%m-%d')}.md)"
-        if marker in existing:
-            updated_lines = [new_line if marker in ln else ln for ln in existing.splitlines()]
-            index_path.write_text("\n".join(updated_lines) + "\n")
-        else:
-            index_path.write_text(existing + "\n" + new_line + "\n")
-    else:
-        index_path.write_text("# Digest History Index\n\n" + new_line + "\n")
+        for line in index_path.read_text().splitlines():
+            m = _INDEX_LINE_DATE_RE.search(line)
+            if m:
+                entries[m.group(1)] = line
+    entries[date_str] = new_line
+
+    ordered = [entries[d] for d in sorted(entries, reverse=True)]
+    index_path.write_text("# Digest History Index\n\n" + "\n".join(ordered) + "\n")
 
 
 def render_daily(

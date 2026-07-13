@@ -1,0 +1,438 @@
+---
+name: venue-trend
+description: Use when the user names a whole conference/venue (e.g. "MLSys 2026", "分析下 NeurIPS 2026 的推理优化论文", "做一份 ICML venue 趋势报告", "venue trend report for <conf>") and wants its accepted papers fetched, filtered to LLM inference deployment optimization, grouped by subfield, and turned into a trend report with a macro synthesis. NOT for a single paper (use paper-interpret) and NOT for the daily rolling digest (that's scripts/daily.sh / paper-triage).
+---
+
+# venue-trend
+
+One-shot **conference-level** trend analysis: given a venue, fetch its entire
+accepted-paper set, filter to LLM inference deployment optimization, then — with
+the top model reading every abstract in one context — produce a report organized
+around the real research concerns (what physical fact / workload shift / hardware
+change the papers are collectively responding to), not a bucket-by-bucket
+listing. The fetch/score/group stages are plain CLI in this repo; **the analysis
+is done by you (the orchestrating model) reading the abstracts directly, not
+delegated to sub-agents** — that delegation is exactly what made the first
+version shallow.
+
+Distinct from the daily pipeline: this pulls a venue's *full* history in one
+pass, not a rolling window. Run it manually per conference, not on a cron.
+
+## When to invoke
+
+- User names a venue + year and wants the whole thing analyzed: "分析 MLSys 2026
+  的 LLM 推理优化论文", "venue trend report for NeurIPS 2026", "做一份 ICML 2026
+  推理部署方向的趋势报告".
+- Trigger phrases: "venue trend", "会议趋势", "整个会议的论文", "趋势报告",
+  "/venue-trend".
+
+Do **not** invoke for:
+- A single paper (arXiv id / name) → `paper-interpret`.
+- Accept/reject over the daily digest → `paper-triage`.
+- Fetching/re-scoring the daily rolling window → `scripts/daily.sh`.
+
+## Repo location & prerequisites
+
+Runs from the `llm-paper-radar` repo root (needs `scripts/venue_report.sh`,
+`sources/openreview_venue.py`, `pipeline/venue_filter.py`,
+`pipeline/venue_group.py`, `workflows/venue_trend_report.js`). If invoked
+elsewhere, ask the user to `cd` in first.
+
+Before running, source credentials so the fetch and the LLM judge work:
+
+```bash
+set -a && source .env && set +a
+```
+
+`.env` must have `ANTHROPIC_API_KEY` (real key, not the `sk-ant-xxx` placeholder)
+and `OPENREVIEW_EMAIL`/`OPENREVIEW_PASSWORD`. **Anonymous OpenReview requests get
+403-challenge-walled** (since ~2026-06-30) — without the account creds the fetch
+silently returns 0 papers. If the fetch comes back empty or all-403, the missing
+creds are the first thing to check, not the venue string.
+
+## Step 1 — fetch → score → group
+
+```bash
+./scripts/venue_report.sh "<venue>"    # e.g. "MLSys.org/2026/Conference"
+```
+
+The venue string is the OpenReview invitation prefix (`<Host>/<Year>/Conference`).
+**Host domain gotcha:** most ML venues use `.cc` — `NeurIPS.cc`, `ICML.cc`,
+`ICLR.cc` — while MLSys uses `.org` (`MLSys.org`). The wrong host returns HTTP
+200 with **zero notes** (not a 404, not a 403), so a `.org` typo on NeurIPS/ICML/
+ICLR looks exactly like "venue not published yet." Before concluding a venue is
+empty, retry with the other host and sanity-check a known-good prior year (e.g.
+`NeurIPS.cc/2025/Conference` returns thousands). A genuinely-unpublished venue
+(decisions not yet out — e.g. NeurIPS's land ~September) has the group scaffolding
+present but the `/-/Submission` invitation returns 0 on the *correct* host too;
+that's a real empty, so stop and tell the user rather than analyzing nothing.
+This chains three stages and writes `data/scored/<slug>-grouped.json` (slug =
+`<conf>-<year>`, e.g. `mlsys-2026`):
+
+1. `sources.openreview_venue` — paginate the venue's `/-/Submission` notes,
+   keep only accepted ones (`content.venueid.value == "<venue>"`), write
+   `data/raw/<slug>/accepted.json`. Retries 403/429 with backoff; **refuses to
+   write a partial result** — if it exits non-zero (retries exhausted, or fewer
+   than ~20 accepted papers), do not proceed; wait and re-run (the per-page
+   cache under `data/raw/<slug>/openreview_pages/` resumes from where it failed).
+2. `pipeline.venue_filter` — per-paper LLM classification via
+   `prompts/inference_relevance.md` → `hard_gate` + `subfield` + `reason`.
+   A failed judge call is recorded as a diagnosable `hard_gate=true` entry, not
+   silently dropped.
+3. `pipeline.venue_group` — drop hard-gated papers, group the rest by subfield.
+
+**New-venue caveat (first run only).** `_is_accepted` assumes MLSys's convention
+(accepted papers get `venueid == "<venue>"`, rejects get a `.../Rejected_Submission`
+suffix). Other venues *may* differ. On a venue you haven't run before, before
+trusting the count, inspect a page of raw notes:
+
+```bash
+python3 -c "import json; d=json.load(open('data/raw/<slug>/openreview_pages/page-0000.json')); print(set(n['content'].get('venueid',{}).get('value') for n in d[:20]))"
+```
+
+Confirm one value equals the venue string exactly. If it doesn't (some venues
+publish decisions under a separate invitation, or use a display `venue` string
+instead), adjust `_is_accepted` in `sources/openreview_venue.py`, re-run its
+tests, then re-run the fetch. Don't silently accept a low count.
+
+**Mega-venue caveat (ICML / NeurIPS / ICLR: thousands of accepts).** For a
+general ML venue the accepted set is *thousands* of papers (ICML 2026: ~6,341),
+and `venue_report.sh` would LLM-classify every one — disproportionate. Don't run
+the vanilla Step 1 on these. Two things also change:
+- **This is not a systems venue.** LLM-inference *deployment* (serving, kernels,
+  scheduling) mostly goes to MLSys/ASPLOS/OSDI; a general venue's inference work
+  is upstream *algorithms* (efficient/linear attention, KV-compression algorithms,
+  quantization algorithms, speculative/diffusion decoding, MoE routing). The
+  deployment-tuned `inference_relevance` rubric will hard-gate most of it. As with
+  architecture venues, **relax the scope to include algorithmic inference-
+  efficiency work** and say so in the report — else the venue's real contribution
+  vanishes. (Ask the user first if the scope choice is material; ICML 2026 was
+  run at broad scope by explicit user choice.)
+- **Funnel instead of classify-all** (the proven ICML path → `venue-reports/icml-2026.md`):
+  1. Fetch all accepts with abstracts (paginate `/-/Submission`, keep
+     `venueid == "<venue>"`) — API only, cheap.
+  2. **Keyword pre-filter** titles+abstracts to a recall-oriented candidate set
+     (inference/serving/KV/attention/quantization/MoE/decoding/long-context/
+     low-bit terms). ~6,000 → a few hundred.
+  3. LLM-classify only the candidates with a relaxed-scope prompt →
+     `{in_scope, subfield, reason}` (concurrency + incremental save; ~hundreds of
+     calls, not thousands).
+  4. Group by subfield; the in-scope set will be large (ICML: 366).
+  Then Step 2, with the large-set reading rule below.
+
+## Step 1b — non-OpenReview venues (ASPLOS / ISCA / MICRO / OSDI / SOSP / NSDI …)
+
+Many top systems/architecture venues are **not on OpenReview** (they use HotCRP +
+ACM/USENIX). The `venue_report.sh` fetcher returns 0 papers for them — that's not
+a 403, the venue simply isn't there (verify: `openreview_venue` fetch returns
+empty and the OpenReview group 404s). For these, the score/group CLI doesn't
+apply; do this manual path instead, then resume at Step 2. This is a real,
+proven fallback (used for ASPLOS 2026 → `venue-reports/asplos-2026.md`), not a
+hack — but it *is* manual, so state that in the report's Method note.
+
+1. **Get the accepted-paper titles from the official program page** (WebFetch the
+   `.../program` page). These venues publish titles + authors but usually **no
+   abstracts and no links**. Note the total count.
+2. **Title pre-filter to the LLM-inference subset.** Ask WebFetch for an
+   *inclusive* ML/LLM candidate list first (LLM, inference/serving, KV/attention,
+   MoE, quantization, GPU/accelerator for ML), then narrow yourself to
+   inference-deployment. Expect a small fraction of a broad venue (ASPLOS: ~29 of
+   167). Exclude training-only and non-LLM.
+3. **Backfill abstracts via Semantic Scholar** — the working recipe (ACM DL blocks
+   scraping with 403; arXiv coverage is partial; S2's title-match endpoint is the
+   reliable source):
+
+   ```python
+   # for each title: GET, with 429 backoff + incremental write
+   # https://api.semanticscholar.org/graph/v1/paper/search/match
+   #   ?query=<exact title>&fields=title,abstract,externalIds
+   # unauthenticated S2 is rate-limited — sleep ~2s between calls, retry 429 with
+   # 5s*attempt backoff, write results after each paper. ~29 titles ≈ 2 min.
+   ```
+
+   Verify matches (the returned `title` should contain/greatly overlap yours) and
+   coverage; mark any paper S2 can't find and don't invent its abstract.
+4. **Links:** take `externalIds` from the same S2 call — link each paper to
+   `https://doi.org/<DOI>` (present for essentially all published papers) or the
+   arXiv abs URL. This replaces the OpenReview links in the coverage check.
+5. Resume at **Step 2** (read the abstracts) and **Step 3** (write the report).
+
+Two scope rules specific to architecture venues:
+- **Relax the custom-silicon gate.** The `inference_relevance` rubric hard-gates
+  ASIC/FPGA/PIM/CIM "the contribution is a chip" papers — correct for MLSys, wrong
+  here. At an architecture venue, algorithm-hardware co-design *is* the
+  deployment-optimization story; excluding PIM/CIM/near-storage/FPGA/NPU work
+  guts the picture. Include it, and **state the relaxed scope in the report**.
+- **Split maturity by simulation vs. silicon.** Many hardware results are from
+  simulators / synthesized designs, not deployed chips — their "4×/9×" numbers are
+  projections against modeled baselines, a weaker evidentiary tier than on-GPU
+  measurements. Call this out in §8 and don't compare simulated speedups
+  one-to-one with another venue's measured ones.
+
+## Step 2 — read every abstract yourself (the analysis, done by you)
+
+**This is the core step, and you (the orchestrating model) do it directly — do
+not fan it out to sub-agents.** The earlier design dispatched one weak-model
+agent per subfield via a Workflow; each agent was blind to the others, so the
+result was disjointed, templated, and shallow — bucket-by-bucket restatement,
+not genuine cross-paper insight. The whole point of running the top model is to
+hold all the papers in one context and see the connections between them. So read
+them yourself.
+
+Dump the in-scope papers with **full** abstracts (not truncated — you need the
+mechanisms and numbers), grouped for convenience:
+
+```bash
+python3 -c "
+import json
+from collections import defaultdict
+d=json.load(open('data/scored/<slug>.json'))
+ins=[p for p in d if not (p.get('relevance_breakdown') or {}).get('hard_gate')]
+g=defaultdict(list)
+for p in ins: g[(p.get('relevance_breakdown') or {}).get('subfield','?')].append(p)
+out=[]
+for sf in sorted(g, key=lambda k:-len(g[k])):
+    out.append(f'\n{\"=\"*60}\n{sf} ({len(g[sf])})\n{\"=\"*60}')
+    for p in g[sf]: out.append(f'\n### {p[\"title\"]}\n{p[\"url\"]}\n{p[\"abstract\"]}')
+open('/tmp/<slug>_abstracts.txt','w').write('\n'.join(out))
+print(len(ins),'papers')
+"
+```
+
+`Read` that file and actually read it. As you go, look for what no per-bucket
+pass can see:
+
+- **The shared physical fact** several clusters are all reacting to (for MLSys
+  2026 it was "decode went memory-bound, and the KV cache is why").
+- **Cross-bucket threads** — the same object or pressure showing up in multiple
+  subfields (the KV cache appeared in kv_cache, long_context, scheduling, and
+  spec-decoding papers alike).
+- **Workload or hardware shifts** driving the distribution (reasoning models →
+  long decode; agents/RAG → shared context; new GPU gen → rebalanced bottleneck).
+- **Debates and reality-checks** — papers auditing whether a hyped technique
+  actually holds up (e.g. a "does disaggregation / spec-decoding really help at
+  production scale?" measurement paper is worth more than ten me-too systems).
+- **What shifted and what's conspicuously absent** vs. prior years.
+
+If the in-scope set is too large to hold in one context (rough rule: more than
+~120 papers / ~200 KB of abstracts — i.e. mega-venues), do **not** fan out to the
+Workflow (that reintroduces the shallow per-bucket summaries this skill exists to
+avoid). Instead, the proven ICML path: **read the largest clusters in full
+yourself** (ICML 2026: the top four clusters, 202 of 366 papers, read completely)
+and **characterize the smaller clusters from titles + a sampled abstract read**.
+Then two report adaptations for scale:
+- **Don't link all N papers** — a report linking 366 papers is a bibliography
+  dump, not a trend report. Cite representative + standout papers per cluster with
+  links; give exact counts; and **state coverage explicitly** ("read the top four
+  clusters in full, characterized the rest by title + sampled read; per-paper
+  claims outside the top clusters are lower-confidence").
+- The coverage check (all-papers-linked) is replaced by honest coverage
+  disclosure — you are not trying to link every paper, so say what you did read.
+
+For a normal venue (dozens of in-scope papers) read every abstract directly and
+link them all — it's strictly better.
+
+## Step 3 — write the report
+
+Write `venue-reports/<slug>.md` (per-conference reports live in `venue-reports/`,
+NOT `digests/` — that's per-day). **Organize by research concern, not by the
+mechanical subfield buckets** — the buckets cut across the real story, so leading
+with them reproduces the disjointed structure this skill exists to avoid.
+Structure:
+
+1. Title + a one-line note on what was analyzed (N in-scope of M total accepts)
+   plus the two standing caveats compressed to one italic line: figures are
+   authors' self-reported bests; one venue + auto-selected set (point to Method).
+   **End that same italic line with which model did the read** — e.g. "Analysis:
+   Claude Opus 4.8, reading all N abstracts directly (no sub-agent fan-out)." Say
+   whichever model you actually are, not a default guess — if a `/model` switch
+   happened mid-session, the analysis reflects whatever model ran Step 2, and
+   that's what belongs here. This is a rigor marker like the others: a shallower
+   model reading fewer abstracts (or a Workflow fan-out) produces a measurably
+   weaker report, so which model did the synthesis is metadata worth keeping, not
+   a footnote nicety.
+2. `## Takeaway` — the thesis in 2-3 tight paragraphs: the one or two forces the
+   whole set responds to, and the field-wide constraint (for MLSys 2026: frozen
+   weights + vLLM/SGLang target → training-free drop-in co-design).
+3. **Numbered sections by concern** (`## 1.`, `## 2.`, …) — one per real thread
+   from Step 2, each a tight paragraph or two that *names specific papers,
+   mechanisms, and numbers* (not "several papers do X" — say which and what
+   result). A paper can appear in more than one thread. Inline OpenReview link on
+   first mention. **Open each section with one judgment sentence**, distinct from
+   the Takeaway, self-contained enough to read before any paper is named — see
+   "Section-level judgment, and it leads, not trails" under Rigor rules; a
+   section that only lists papers, however well, is a bibliography, not analysis.
+4. `## N. Maturity: practicality vs research` — a readiness axis
+   cutting across the concerns: deployed-at-scale (named production systems) /
+   industrial-grade-with-real-tooling / research-prototype. The most useful cut
+   for a reader deciding what to adopt vs. watch.
+5. **(Optional) `## What shifted, and what's conspicuously absent`** — include
+   *only* if you have a grounded shift/absence that isn't already covered by the
+   Takeaway or a numbered section. Skip it by default: in practice this section
+   fills with (a) restatements of the thesis and (b) `[conjecture]` /
+   `[venue artifact]` claims we've flagged as not-really-findings — a section
+   built on those weakens the report. If one genuine grounded absence exists
+   (e.g. "standalone weight-quant nearly gone here"), fold it into the section it
+   relates to rather than making a whole section. (The MLSys 2026 report dropped
+   this section for exactly this reason.)
+6. `## Paper distribution` (last) — the subfield count table, followed by a
+   single italic footnote: these are mechanical classifier labels (analysis is by
+   concern instead), plus how the set was selected + its two biases (a few kept
+   papers aren't pure text-LLM; the venue pre-selects for systems work, so it's
+   "what the venue accepted," not "what the field did"). Keep it to one line — the
+   caveat is load-bearing for the `[venue artifact]` tags above, but doesn't need
+   its own section.
+
+### Rigor rules (these are the ones a shallow report violates)
+
+- **Ground vs. conjecture.** You have *this year's* abstracts, not prior years.
+  Same-year claims ("KV is the largest single object here") are grounded; any
+  year-over-year claim ("X faded", "barely existed two years ago", "more common
+  than before") has no data behind it — mark it `[conjecture]`. External
+  knowledge is allowed *if labeled*.
+- **Venue confound.** This is one systems venue with an auto-selected set, so
+  "what the field values" claims are really "what this venue accepted." When a
+  trend is plausibly a submission-routing artifact (e.g. "pure-algorithm work
+  faded" — it goes to NeurIPS/ICML, not a systems venue), tag it
+  `[venue artifact]`, don't present it as a field shift.
+- **Numbers are self-reported ceilings.** Every speedup/reduction is the authors'
+  own best case, usually "up to X" on a favorable config or microbenchmark. Say
+  this once up top; where a figure is production-trace vs microbenchmark, note it.
+- **Verify quantifiers by counting — never eyeball "most / more than half."** A
+  quick script settles it (the MLSys 2026 draft claimed "more than half the
+  papers are about the KV cache"; an actual count was ~15-20 of 57, i.e. the
+  largest single object but *not* a majority). Count, then write the number.
+- **Analytical attention ∝ cluster size.** The biggest bucket deserves the
+  deepest treatment, not a hand-wave. (The kernel/compiler cluster — the largest
+  — was first dismissed as "overflow"; it needed its own full section.)
+- **A thesis must cover the whole set, or admit what it doesn't.** Don't force a
+  single-object narrative that only explains half. If there are two independent
+  forces, say two, and state plainly what each does *not* touch.
+- **Flag non-core papers.** Borderline in-scope items (visual-gen, multimodal,
+  diffusion-LM — not pure text-LLM inference) get folded in but must be flagged,
+  not silently counted as LLM-serving.
+- **State causation precisely.** "Reasoning models *amplified* the memory-bound
+  decode regime" — not "created" it (autoregressive decode was already
+  memory-bound at small batch). Overclaimed causation is a tell of a shallow read.
+- **Density: state each caveat once, then stop.** Don't repeat the self-reported
+  or venue caveat per paragraph; don't re-link a paper already linked above;
+  merge bullet lists into dense prose. Target roughly the shape below, not double.
+- **Section-level judgment, and it leads, not trails.** Naming papers + mechanisms
+  + numbers (the rule above) is necessary but not sufficient — a section that
+  stops there is an annotated bibliography. Every section needs **one sentence a
+  reader could act on or be wrong to ignore**: a risk, an implication, a "these
+  aren't interchangeable" distinction, or a falsifiable bet (tag forward-looking
+  bets `[conjecture]`). Make it *specific to that section's papers*, not a
+  restatement of the Takeaway — the Takeaway earns the report-wide claims, each
+  section earns its own local one.
+
+  **Put that sentence first, before the paper list**, matching how the Takeaway
+  itself opens with its claim rather than building up to it. Writing the judgment
+  last reads as an afterthought bolted onto a description; leading with it reads
+  as a conclusion the section then supports — and it makes the report skimmable
+  at the level of "read just the first sentence of every section." The one
+  wrinkle: some judgments naturally reference a taxonomy the section itself
+  builds (e.g. "the four stances aren't interchangeable" presumes the four are
+  already named). Handle that by inlining short parenthetical tags as each item
+  is introduced (`**shrink** (lossy) — ...`, `**skip** (lossy) — ...`) so the
+  opening sentence's claim ("two lossy, two lossless") cashes out without
+  forward-referencing undefined terms, or by pointing forward to the evidence
+  ("...as the paper closing this section already argues") and back from it
+  ("...the basis for the claim above") rather than dropping the judgment
+  mid-paragraph where it interrupts the paper list.
+
+  Worked examples, restructured lead-first (§ numbers refer to the MLSys 2026 /
+  ASPLOS 2026 reports):
+  - MLSys §1 (KV cache): "This year's KV defenses split into four stances that
+    don't compose safely — two lossy, two lossless — so a team stacking several
+    should audit for compounding accuracy loss before counting compounding
+    memory savings." *(then the four stances, each tagged lossy/lossless as
+    introduced)*
+  - MLSys §3 (disaggregation): "A team that disaggregates prefill from decode
+    without also building elastic re-provisioning is likely seeing a fraction of
+    the gains this cluster reports — a static instance ratio is close to the null
+    result, not the headline." *(then the papers, with the reality-check paper
+    identified as "the source of that warning")*
+  - MLSys §5 (spec decoding): "Read this cluster's diffusion-drafter results as
+    promising, not proven: most report peaks against baselines, and only one
+    paper measures against a real, batched production engine." *(then the
+    papers, ending with "the reality check: ...")*
+  - ASPLOS §1 (KV cache, cross-venue contrast): "PIM/CIM/near-storage work
+    reframes the KV cache as a *physical placement* decision, not a software
+    cache-policy one — the same object MLSys treats as data to compress or
+    evict, ASPLOS treats as data to relocate onto different silicon." *(then the
+    papers)*
+
+  If you can't find a defensible one-sentence judgment for a section, that's a
+  signal the section itself may be a weak thread (reconsider merging it) rather
+  than a section to ship undigested.
+
+Cite numbers the papers report. Prefer "X does Y, getting Z" over adjectives.
+Verify every in-scope paper is linked somewhere:
+
+```bash
+python3 -c "
+import json,re
+d=json.load(open('data/scored/<slug>.json'))
+ids={p['url'].split('id=')[-1] for p in d if not (p.get('relevance_breakdown') or {}).get('hard_gate')}
+linked=set(re.findall(r'forum\?id=([A-Za-z0-9]+)', open('venue-reports/<slug>.md').read()))
+print('missing:', ids-linked)
+"
+```
+
+(For a non-OpenReview venue there's no `data/scored/<slug>.json`; instead check
+your title list against the report and grep for `doi.org` / `arxiv.org` links.
+For a mega-venue you deliberately don't link every paper — skip this check and
+disclose coverage instead, see Step 2.) For normal venues, fold any missing paper
+into its rightful thread — an unlinked in-scope paper is a coverage hole.
+
+Reference shapes (all: dense, organized by research concern — Takeaway + numbered
+concern sections each *opening* with a judgment sentence + Maturity + a final
+Paper-distribution/Method section; no standalone "what shifted" section):
+- `venue-reports/mlsys-2026.md` — OpenReview path, ~60 lines, 57 papers, all linked.
+- `venue-reports/asplos-2026.md` — non-OpenReview path, ~60 lines, 29 papers, DOI
+  links, custom-silicon scope relaxation + simulation-vs-silicon maturity split.
+- `venue-reports/icml-2026.md` — mega-venue path, ~70 lines, 366 in-scope of
+  6,341 (funnel selection), broadened algorithmic scope, top-4-clusters-read-in-
+  full with representative (not exhaustive) linking + explicit coverage
+  disclosure, and a cross-venue read (ICML = algorithms upstream of the systems
+  venues; confirms the quantization "venue artifact").
+
+## Step 4 — commit
+
+```bash
+git add venue-reports/<slug>.md
+git commit -m "docs: add <Conf> <Year> LLM inference deployment trend report"
+```
+
+The `data/raw/` and `data/scored/` intermediates are gitignored; don't
+force-add them.
+
+## Don't
+
+- **Don't fan the analysis out to sub-agents.** Read the abstracts yourself with
+  the top model. Delegated per-bucket summaries are what produced the shallow
+  patchwork this skill was rebuilt to avoid (see Step 2).
+- **Don't organize the report by the subfield buckets.** Organize by the research
+  concerns you actually found; the buckets are a reference table at the end.
+- **Don't write adjective-driven prose.** Every claim names a paper + mechanism +
+  number from its abstract. "Several papers improve throughput" is a non-finding.
+- **Don't state a year-over-year trend as fact** — you have no prior-year data;
+  tag it `[conjecture]`. Same for venue-shaped trends → `[venue artifact]`.
+- **Don't write "most / more than half" without counting.** Verify quantifiers
+  against the data first.
+- **Don't launder "up to X" peak numbers as results.** Flag them as self-reported
+  ceilings; note microbenchmark vs production-trace.
+- **Don't under-serve the largest cluster** or force a one-object thesis that only
+  covers half the set.
+- **Don't bury the judgment after the paper list.** Each numbered section needs
+  its own judgment sentence (a risk, an implication, an incompatibility, a
+  falsifiable bet), and it opens the section — a section without one is a
+  bibliography; one with the judgment tacked on at the end reads as an
+  afterthought, not a conclusion.
+- **Don't proceed on an incomplete fetch.** A 403-storm or a below-floor paper
+  count means re-run later, not "analyze what we got" — a report built on a
+  partial pull reads as complete and misleads.
+- **Don't leave an in-scope paper unlinked** (run the coverage check in Step 3).
+- **Don't hardcode a new venue's accept-detection without checking** the actual
+  `venueid` values first (Step 1 caveat).
