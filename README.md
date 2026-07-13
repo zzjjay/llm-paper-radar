@@ -36,19 +36,20 @@ _Nothing surfaced today (everything was hard-gated)._
 
 <!-- WEEKLY_START -->
 
-# Weekly Digest · 2026-06-29 → 2026-07-05
+# Weekly Digest · 2026-07-06 → 2026-07-12
 
-> Surfaced: 7 papers
+> Surfaced: 8 papers
 
 | # | Bucket | Paper | Authors | Date | Why |
 |---|--------|-------|---------|------|-----|
-| 1 | PTQ | [$\text{Log}_\text{b}$Quant: Quantizing Language Models in Logarithmic Space](https://arxiv.org/abs/2607.01127) | Jeremias Bohn, Tizian Dippold, Mahdi Koubaa et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-01127) |
-| 2 | KV cache | [ReFreeKV: Towards Threshold-Free KV Cache Compression](https://arxiv.org/abs/2502.16886) 🔁 | Xuanfan Ni, Liyan Xu, Chenyang Lyu et al. | 2026-06-26 | [zh](digests/2026-06-30.md#p-2502-16886) · [en](digests/2026-06-30_en.md#p-2502-16886) |
-| 3 | KV cache | [GSRQ: Gain-Shape Residual Quantization for Sub-1-bit KV Cache](https://arxiv.org/abs/2607.01065) | Soosung Kim, Minjae Park, Eui-Young Chung et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-01065) |
-| 4 | KV cache | [MosaicKV: Serving Long-Context LLM with Dynamic Two-D KV Cache Compression](https://arxiv.org/abs/2607.00760) | Sheng Qiang, Ruiwei Chen, Yinpeng Wu et al. | 2026-07-01 | [zh](digests/2026-07-01.md#p-2607-00760) |
-| 5 | KV cache | [Lynx: Progressive Speculative Quantization for accelerating KV Transfer in Long-Context Inference](https://arxiv.org/abs/2607.01831) | Wenchen Han, Gingfung Matthew Yeung, Marco Barletta et al. | 2026-07-02 | [zh](digests/2026-07-02.md#p-2607-01831) · [en](digests/2026-07-02_en.md#p-2607-01831) |
-| 6 | KV cache | [SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference](https://arxiv.org/abs/2606.31145) | Amirhossein Abaskohi, Giuseppe Carenini, Peter West et al. | 2026-06-30 | [zh](digests/2026-06-30.md#p-2606-31145) · [en](digests/2026-06-30_en.md#p-2606-31145) |
-| 7 | Diffusion | [OrbitQuant: Data-Agnostic Quantization for Image and Video Diffusion Transformers](https://arxiv.org/abs/2607.02461) | Donghyun Lee, Jitesh Chavan, Duy Nguyen et al. | 2026-07-02 | [zh](digests/2026-07-02.md#p-2607-02461) · [en](digests/2026-07-02_en.md#p-2607-02461) |
+| 1 | Low-bit (≤ 2-bit) | [BiSCo-LLM: Lookup-Free Binary Spherical Coding for Extreme Low-Bit Large Language Model Compression](https://arxiv.org/abs/2607.08643) | Yuantian Shao, Peisong Wang, Zhilei Liu et al. | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08643) · [en](digests/2026-07-09_en.md#p-2607-08643) |
+| 2 | KV cache | [SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference](https://arxiv.org/abs/2606.31145) 🔁 | Amirhossein Abaskohi, Giuseppe Carenini, Peter West et al. | 2026-06-30 | [zh](digests/2026-07-07.md#p-2606-31145) · [en](digests/2026-07-07_en.md#p-2606-31145) |
+| 3 | KV cache | [KVpop -- Key-Value Cache Compression with Predictive Online Pruning](https://arxiv.org/abs/2607.05061) 🔁 | Lukas Hauzenberger, Niklas Schmidinger, Anamaria-Roberta Hartl et al. | 2026-07-06 | [zh](digests/2026-07-06.md#p-2607-05061) · [en](digests/2026-07-06_en.md#p-2607-05061) |
+| 4 | Pruning & distillation | [It Takes a MAESTRO To Prune Bad Experts](https://arxiv.org/abs/2607.08601) | Palaash Goel, Ayush Maheshwari, Tanmoy Chakraborty | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08601) · [en](digests/2026-07-09_en.md#p-2607-08601) |
+| 5 | Pruning & distillation | [Structured Pruning of Large Language Models via Power Transformation and Sign-Preserving Score Aggregation with Adaptive Feature Retention](https://arxiv.org/abs/2607.08027) | Ryota Kobayashi, Tsubasa Hirakawa, Takayoshi Yamashita et al. | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08027) · [en](digests/2026-07-09_en.md#p-2607-08027) |
+| 6 | Diffusion | [OrbitQuant: Data-Agnostic Quantization for Image and Video Diffusion Transformers](https://arxiv.org/abs/2607.02461) 🔁 | Donghyun Lee, Jitesh Chavan, Duy Nguyen et al. | 2026-07-02 | [zh](digests/2026-07-06.md#p-2607-02461) · [en](digests/2026-07-06_en.md#p-2607-02461) |
+| 7 | Diffusion | [Closing the Null Space: Guidance-Aware Quantization for Classifier-Free Diffusion](https://arxiv.org/abs/2607.08241) | Abdullah Al Shafi, Sumaiya Rahim Suma | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08241) · [en](digests/2026-07-09_en.md#p-2607-08241) |
+| 8 | Trending | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) 🔁 | Woosuk Kwon, Zhuohan Li, Siyuan Zhuang et al. | 2023-09-12 | [zh](digests/2026-07-11.md#p-2309-06180) · [en](digests/2026-07-11_en.md#p-2309-06180) |
 
 
 <!-- WEEKLY_END -->
