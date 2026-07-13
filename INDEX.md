@@ -1,5 +1,6 @@
 # Digest History Index
 
+- [07-12](digests/2026-07-12.md) — 50 scanned, 0 passed, top: (no papers passed)
 - [07-11](digests/2026-07-11.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 - [07-10](digests/2026-07-10.md) — 71 scanned, 0 passed, top: (no papers passed)
 - [07-09](digests/2026-07-09.md) — 215 scanned, 4 passed, top: It Takes a MAESTRO To Prune Bad Experts
