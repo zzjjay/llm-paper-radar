@@ -1,0 +1,253 @@
+#+title:      KronQ: LLM Quantization via Kronecker-Factored Hessian
+#+date:       [2026-07-14 Tue 00:08]
+#+filetags:   :paper:river:quantization:llm:en:
+#+identifier: 20260714T000854-en
+#+source:     https://arxiv.org/abs/2607.07964
+#+authors:    Lee, Li, Yin, Panda (USC / Yale)
+#+venue:      COLM 2026
+
+* The River of Problems
+
+When applying post-training quantization (PTQ) to a 70-billion-parameter model, you must decide "to which grid point should each weight be rounded." This is inherently a discrete problem, but the industry's standard approach — the lineage descending from GPTQ — recasts it as a continuous optimization problem: a matrix H (an approximation of the Hessian) tells you "in which direction to compensate for the error most efficiently."
+
+The question is: where does this H come from? Computing the true Hessian requires knowing the second-order derivatives of the loss with respect to every pair of weights — a matrix of dimension (d_in · d_out)², completely infeasible for layers with matrices of several thousand by several thousand. So starting with GPTQ in 2022, everyone took a shortcut: use only the input-side statistics H_X (the covariance of the calibration data's activations at this layer) as a stand-in for the Hessian, while assuming that all output channels are "equally important."
+
+This assumption went seriously unchallenged for three years — until someone dusted off an old tool from 1990s deep-learning optimization, the Kronecker factorization, ran the numbers, and found: the gradient magnitudes across different output channels can differ by several orders of magnitude. That is, the assumption that "all output channels are equally important" was wrong from the very beginning.
+
+What is truly evolving along this river is not "how to squeeze out a bit more quantization accuracy," but rather: *how long it takes for the field to admit that the approximation formula it has used for three years was missing half of its terms*.
+
+* Source Map
+
+#+begin_example
+[1989-1992] LeCun / Hassibi & Stork  -  Optimal Brain Surgeon (OBS)
+  |
+  | Problem: Neural networks need to be pruned — which weight to touch,
+  |          and how to compensate after touching it?
+  | Solution: Use the Hessian to measure "how much does moving this weight
+  |           cost," then redistribute the error to other weights along the
+  |           Hessian direction
+  v
+[2022] Frantar & Alistarh  -  GPTQ
+  |
+  | Problem: OBS's full Hessian is unaffordable at GPT-scale
+  | Solution: Use only the input activation covariance H_X as a Hessian
+  |           proxy; column-wise greedy + Cholesky approximation;
+  |           quantize a 175B model in a few hours
+  v
+[2023-2024] Chee et al. (QuIP) -> Tseng et al. (QuIP#)   (parallel branch merges in)
+  |
+  | Problem: H_X is highly "coherent" with real weight matrices,
+  |          making quantization error bounds very loose
+  | Solution: Random orthogonal rotations scatter W and H_X alike
+  |           (incoherence); QuIP# replaces dense random rotations with
+  |           Hadamard transforms, making the overhead nearly free
+  v
+[2025] Li et al.  -  GPTAQ
+  |
+  | Problem: GPTQ is layer-by-layer greedy; earlier layers' quantization
+  |          errors "contaminate" later layers' inputs, yet H_X was
+  |          computed only once on clean inputs
+  | Solution: Asymmetric correction to compensate for the extra error
+  |           introduced by "input drift"
+  v
+[2025] Tseng et al.  -  YAQA
+  |
+  | Problem: GPTQ/GPTAQ's H_X is still only input-side information;
+  |          the full Hessian under Kronecker factorization should be
+  |          H_X ⊗ H_G, and H_G (gradient covariance) is entirely ignored
+  | Solution: Fold H_G into a redesigned LDLQ solver — but at the cost
+  |           of expensive power iteration to estimate the Hessian sketch
+  v
+[2026] Lee et al.  -  KronQ  (this paper)
+  |
+  | Problem: YAQA proved H_G is useful but too expensive to run in
+  |          production; meanwhile QuIP's "scattering" only addresses H_X —
+  |          the H_G half remains highly coherent (verified empirically on
+  |          LLaMA, see Figure 1(a)/2(a))
+  | Solution: One backward pass obtains H_G directly (no power iteration);
+  |           bidirectional scattering (rotate both input and output sides);
+  |           solver copied verbatim from GPTAQ — H_G cancels out
+  |           algebraically in the compensation formula
+  v
+[????] Still growing
+#+end_example
+
+Note: The QuIP/QuIP# "scattering" branch is not on the main critical chain, but KronQ's bidirectional incoherence processing stands directly on its shoulders and is therefore listed separately.
+
+* Evolutionary Narrative
+
+** 1989-1992 | OBS: Using the Hessian to Decide "Which Weight to Move and How to Compensate"
+
+*** What problem it saw
+
+The most naïve pruning strategy is to "delete the weights with the smallest values," but this only examines a weight's own magnitude without considering how steep the loss surface is in that direction — a weight with a tiny value might sit precisely on an extremely sensitive direction, and removing it could collapse the model entirely.
+
+*** Its solution
+
+LeCun and Hassibi & Stork proposed using a second-order Taylor expansion to compute "how much will the loss increase if we delete weight i," arriving at w_i² / (2·[H⁻¹]_ii). Going further, you cannot simply leave things alone after deletion — spread this perturbation, along the optimal direction indicated by the Hessian, to the remaining weights, minimizing the total increase in loss.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: You are not asking "which weight is small" but rather "in which direction is the loss surface least sensitive." The Hessian is precisely the local curvature of that surface.
+
+The pit left behind: The full Hessian is a d² × d² matrix (d is the weight matrix dimension) — impossible to store or compute. For 1990s networks with a few thousand parameters this was fine, but for 2020s models with billions of parameters, this theoretical framework was locked away in "small networks" for thirty years.
+
+** 2022 | GPTQ: Use Only Half the Hessian — Get the 175B Model Running First
+
+*** What problem it saw
+
+OBS's full Hessian requires jointly modeling the second-order relationship between every pair of weights i and j — for a d_in × d_out linear layer this is O((d_in·d_out)²), completely infeasible for LLMs.
+
+*** Its solution
+
+Frantar & Alistarh made a key approximation: use the input activation covariance H_X = XXᵀ (only d_in × d_in, affordable) as a Hessian proxy, and extend the per-weight OBS update into a column-wise greedy scheme: quantize one column, redistribute the error to unquantized columns via the inverse of H_X. Combined with Cholesky factorization and lazy block updates, OPT-175B can be quantized on a single A100 in a few hours.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: Since the full Hessian is unaffordable, assume "there is no cross-information between output dimensions" (H_G = I) and keep only the input-side curvature. This is a tractable approximation, and it works well in practice.
+
+New pit: This approximation implicitly embeds an assumption that has never been verified — that all output channels contribute equally to the reconstruction error. Three years later, KronQ would point to this assumption and say: it is wrong. Meanwhile, the layer-by-layer greedy strategy introduces another problem: quantization errors from earlier layers contaminate the "clean" inputs seen by later layers, yet H_X was computed only once on the original inputs.
+
+** 2023-2024 | QuIP / QuIP#: H_X Is Too "Coherent" — It Needs to Be Scattered
+
+*** What problem it saw
+
+Even with GPTQ's framework, quantization error bounds remain loose — because real weight matrices and H_X are highly "coherent" with the coordinate axes: a small number of coordinates carry the vast majority of the magnitude, and quantization error erupts concentrated in those few directions.
+
+*** Its solution
+
+Chee et al. (QuIP) proved that if W and H_X are simultaneously subjected to a random orthogonal rotation — scattering the sensitive directions across all coordinates (incoherence) — the theoretical upper bound on quantization error tightens significantly. QuIP# then replaced the dense random orthogonal matrix with a randomized Hadamard transform, cutting the per-layer overhead from Θ(d^1.5) to Θ(d log d) and making "scattering" essentially free.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: Quantization error is most dangerous when it "clusters" — a large weight and a large Hessian value coinciding in the same direction. Rotation does not change the mathematical essence (orthogonal transforms are invertible) but spreads the risk across all directions.
+
+New pit: This scattering was done only for H_X, because nobody was computing H_G at the time. If the Hessian truly has a neglected output-side factor, that factor is still "clustered" where it was — untouched by anyone.
+
+** 2025 | GPTAQ: Patching the Hole of "Layer-by-Layer Error Accumulation"
+
+*** What problem it saw
+
+GPTQ is layer-by-layer greedy: layer L computes H_X from layer L's clean activations and then moves on. But at inference time, layer L+1 receives inputs that are actually "contaminated" by the quantization errors from earlier layers — no longer clean. GPTQ's objective function never accounts for this "input drift."
+
+*** Its solution
+
+Li et al. replace the optimization objective from "reconstruct using clean inputs" to "reconstruct using the drifted inputs actually produced by the current quantized model," adding an asymmetric correction term to cancel the extra error introduced by ΔX (the drift), significantly reducing perplexity at ultra-low bit-widths.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: Rather than pretending each layer is an independent problem, acknowledge that errors propagate forward and account for them in the objective function upfront.
+
+New pit: GPTAQ still uses only H_X. It refines the "input-side" problem with greater care, but the question of "whether output channels should really be treated equally" passes from GPTQ to GPTAQ without ever being touched.
+
+** 2025 | YAQA: Piercing the Paper Wall — H_G Really Matters, but the Cost Is Prohibitive
+
+*** What problem it saw
+
+Kronecker factorization theory (K-FAC, already available since 2015) has long stated: the full Fisher/Hessian of a layer can be approximated as the Kronecker product of two smaller matrices, H ≈ H_X ⊗ H_G, where H_G is the covariance of the output-side gradients. The GPTQ lineage has always implicitly set H_G = I, which amounts to admitting "we are using only half of one half of the approximation."
+
+*** Its solution
+
+Tseng et al. actually compute H_G and fold it into a redesigned LDLQ solver, making the quantization objective simultaneously aware of curvature on both the input and output sides.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: Since theory says the Hessian should be the product of two factors, recover the one that was discarded. YAQA is the first to demonstrate that doing so genuinely improves accuracy.
+
+New pit: Estimating H_G requires power iteration — repeatedly sampling spectral information from the Hessian — and integrating it into the LDLQ solver requires redesigning the entire pipeline. Both are expensive, expensive enough that nobody would run this in production. YAQA proves "worth doing," but not "cost-effective."
+
+** 2026 | KronQ: One Backward Pass for H_G, Solver Left Untouched
+
+*** What problem it saw
+
+YAQA already proved H_G is worth having; the problem reduced to a pure engineering question: can H_G be obtained far more cheaply than power iteration, without reinventing the solver? Additionally, QuIP's scattering handles only H_X — if H_G is as highly coherent in real weights as H_X is (the authors empirically verify this on the LLaMA series, see Figure 1(a)/2(a) in the paper), the quantization error bounds remain loose.
+
+*** Its solution
+
+KronQ proceeds in two steps:
+
+1. *How to obtain H_G*: H_G = E[ggᵀ], where g is the gradient of this layer's output — requiring only *one backward pass* over the calibration set, at a cost far below YAQA's power iteration.
+2. *How to use H_G*: Do not redesign the solver. The authors prove (Proposition 1) that when the Kronecker-factored objective function is substituted into GPTAQ's column-wise OBS update formula, the H_G term *cancels out algebraically* — meaning the quantization loop is copied verbatim from GPTAQ, and H_G acts only in two places: (a) Bidirectional Incoherence Processing (BiIP) — applying QuIP#'s Hadamard rotation simultaneously to both input and output dimensions; (b) a new inter-layer sensitivity score tr(H_G)·tr(H_X) for mixed-precision allocation, which can distinguish sub-layers such as Q/K/V that share the same input statistics but have completely different downstream gradients.
+
+*** Why it works (and what new pit it digs)
+
+Intuition: YAQA takes the heavy route of "embedding H_G inside the optimization process"; KronQ takes the light route of "letting H_G act only at the preprocessing and scoring stages while leaving the core solver unchanged" — because the authors discover that H_G happens to cancel in the compensation formula, earning a "free" information gain.
+
+Cost: The paper itself reports 8–11 seconds per layer of additional latency (mainly from the dense matrix multiplications in the bidirectional Hadamard rotation) and the need to temporarily store a d_out × d_out matrix H_G during the BiIP preprocessing stage — though this memory is freed once preprocessing is complete, and the quantization loop itself has the same memory footprint as GPTAQ.
+
+New pits left behind: KronQ still inherits K-FAC's independence assumption (x ⊥ g), which is only approximate in real networks; the paper also mentions that LLaMA-3-70B exhibits cases of "abnormally large weights" requiring additional analysis (Appendix D). More fundamentally — if the Kronecker factorization itself is a coarse approximation of the full Hessian, where is the ceiling of the two-factor "H_X ⊗ H_G" model, and who will be the one to pierce it?
+
+* Frontier Extensions
+
+KronQ was released in July 2026 as a COLM 2026 paper. Searching the literature finds no published follow-up work that explicitly cites or critiques KronQ itself — the most recent stop on this river is KronQ.
+
+However, the search did surface one *concurrent* paper attacking the same upstream node (YAQA) rather than KronQ: *Fast and Accurate Fisher-Guided Quantization via Efficient Kronecker Factor Approximation* (under review at OpenReview). Its starting point is nearly identical to KronQ's — "YAQA's Kronecker factor computation is too expensive" — but it proposes a different approximation strategy rather than KronQ's "single backward pass + algebraic cancellation" route. This indicates that "YAQA is too expensive" has already become a crack in this river targeted by multiple parties simultaneously, not just KronQ's own judgment. The two papers are competitors rather than in a citation relationship, and it is not yet possible to determine which cites which.
+
+* One Diagram to Understand It All
+
+#+begin_example
+                     Completeness of Hessian approximation (more complete → right)
+              H_G = I          H_G present, but costly   H_G present, cheap        Full scattering
+                |                  |                    |                  |
+   -------------|------------------|--------------------|------------------|------
+   Responsible  GPTQ/GPTAQ         YAQA                KronQ's H_G        KronQ's
+                (2022/2025)        (2025)              acquisition        BiIP + scoring
+
+   Core action  Use only input-    Fold into LDLQ       One backward       Hadamard rotation
+                side H_X as        solver, estimate     pass; solver       scatters both
+                Hessian proxy      H_G via power iter.  copied from GPTAQ  H_X and H_G
+
+   Assumption/  Implicit H_G=I;    Accuracy improves,   H_G cancels        Extra 8-11s/layer
+   cost         output channels    but nobody runs      algebraically —    rotation overhead
+                "equally weighted" it in production     almost free
+   --------------------------------------------------------------------------------
+   Parallel branch: QuIP(2023)/QuIP#(2024) scattered only the H_X half —
+                    KronQ's BiIP also scatters H_G
+   --------------------------------------------------------------------------------
+
+   What is truly evolving along this river:
+   "When is the output-side half of the full Hessian worth paying for?"
+        |
+        v
+   1992-2022: Don't pay.  Full Hessian unaffordable; assume it's the identity matrix
+   2025 (YAQA): Pay, but it's expensive.  Proves "useful," not "cost-effective"
+   2026 (KronQ): Pay, and it's nearly free.  One backward pass + algebraic cancellation;
+                 the cost-effectiveness question is solved
+
+   ===> Thirty years later, GPTQ's hidden claim — "assume all output channels
+        are equally important" — is finally challenged head-on and overturned
+#+end_example
+
+* Insights
+
+*The core pattern of this river: an approximation written into "standard practice" is often adopted not because it is correct, but because it was the only thing affordable at the time.*
+
+- GPTQ set H_G = I not because anyone had proved output channels are truly equally important, but because the full Hessian was simply unaffordable, and H_X was the only half that could be computed at all.
+- This "engineering compromise" was inherited over three years by GPTAQ, AWQ, BoA, and countless other papers, with no one looking back to question it — until the K-FAC tool (already available since 2015) was applied and found the assumption to be wrong (Figure 1(a) shows output-channel gradient magnitudes differing by several orders of magnitude).
+
+*Second observation: the relationship between YAQA and KronQ is that of "proving feasibility" and "proving cost-effectiveness."*
+
+Academia frequently decouples "does this work" from "is this worth doing." YAQA spent enormous effort proving H_G is useful, but the cost itself kept it confined to a paper; KronQ's contribution is not discovering new information, but discovering that "this information is actually cheap — people just hadn't found the right way to get it (one backward pass) and hadn't noticed it cancels out in the existing solver." *Theoretically feasible ≠ will be used in practice*; in between, there is usually someone needed to find the free lunch.
+
+*Third observation: when something "happens to cancel" algebraically, it is often a signal that the objective function was formulated correctly.*
+
+KronQ's Proposition 1 proving that H_G cancels algebraically in the column-wise compensation formula is not accidental luck; it indicates that the modeling choice of "folding H_G into the existing GPTAQ objective function" is internally consistent. If the modeling were wrong, the cancellation would typically not come out this cleanly.
+
+*Where is the next step most likely to go?*
+
+If the two-factor approximation "H_X ⊗ H_G" itself still has systematic errors (K-FAC's independence assumption x ⊥ g is only an approximation), the next step will most likely involve someone measuring which layers of an LLM violate this independence assumption most severely (e.g., attention modules vs. MLP modules) and introducing targeted third-order or cross-layer correction terms — a direction the concurrent competing paper is already pursuing.
+
+* Takeaways
+
+*For "finding problems"*: Scrutinizing an assumption in a field that "has never been questioned since the field was established" is often the most leveraged entry point for a breakthrough.
+
+GPTQ's H_G = I assumption survived three years, during which GPTAQ, AWQ, BoA, and many others built incremental improvements *on top of* that assumption without ever looking at the foundation. The first thing KronQ did was not propose a new technique, but dig up a hidden assumption from earlier papers and disprove it with a single empirical plot (Figure 1(a)) — after which the rest of the work followed naturally.
+
+*For "doing research"*: A method being "theoretically feasible but too expensive" does not mean the path is exhausted — it may simply mean a cheaper implementation has not yet been found.
+
+YAQA obtains H_G via power iteration; KronQ obtains H_G via one backward pass — the same goal, with an order-of-magnitude difference in engineering cost. When you encounter a technique that "has been proven effective but nobody uses," first ask "where exactly is the expense," rather than rushing to dismiss the entire direction.
+
+*Practical applications:*
+
+- If you work on quantization or compression: examine whether the "standard method" you rely on contains an unverified simplifying assumption (e.g., "some matrix equals the identity") — such assumptions were often made as a compromise to make the method "computationally affordable" three or five years ago and may not reflect reality.
+- If you are optimizing a method already proven "effective but too expensive": first ask whether the same information can be obtained more cheaply (one backward pass vs. power iteration), then ask whether that information simplifies naturally when inserted into the existing pipeline (algebraic cancellation), rather than rushing to redesign the entire solver from scratch.
