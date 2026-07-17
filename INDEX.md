@@ -1,9 +1,9 @@
 # Digest History Index
 
-- [07-15](digests/2026-07-15.md) — 63 scanned, 0 passed, top: (no papers passed)
-- [07-14](digests/2026-07-14.md) — 69 scanned, 0 passed, top: (no papers passed)
+- [07-15](digests/2026-07-15.md) — 184 scanned, 0 passed, top: (no papers passed)
+- [07-14](digests/2026-07-14.md) — 187 scanned, 2 passed, top: A JoLT for the KV Cache: Near-Lossless KV Cache Co
 - [07-13](digests/2026-07-13.md) — 223 scanned, 1 passed, top: KronQ: LLM Quantization via Kronecker-Factored Hes
-- [07-12](digests/2026-07-12.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [07-12](digests/2026-07-12.md) — 140 scanned, 1 passed, top: Reliability Scaling Laws for Quantized Large Langu
 - [07-11](digests/2026-07-11.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
 - [07-10](digests/2026-07-10.md) — 71 scanned, 0 passed, top: (no papers passed)
 - [07-09](digests/2026-07-09.md) — 215 scanned, 4 passed, top: It Takes a MAESTRO To Prune Bad Experts

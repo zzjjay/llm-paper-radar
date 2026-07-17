@@ -74,13 +74,17 @@ for delta in $(seq 1 "$LOOKBACK"); do
     if [[ -f "$f" && "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 2 ]]; then
         echo "[$(date -Is)] backfill_empty_arxiv: ${day} recovered — re-running dedupe→render"
         ok=1
-        for step in dedupe filter summarize render; do
+        for step in dedupe filter summarize; do
             if ! RADAR_TARGET_DATE="$day" uv run python -m "pipeline.${step}" --force; then
                 echo "[$(date -Is)] backfill_empty_arxiv: WARN ${day} pipeline step '${step}' failed"
                 ok=0
                 break
             fi
         done
+        if [[ "$ok" -eq 1 ]] && ! RADAR_TARGET_DATE="$day" uv run python -m pipeline.render; then
+            echo "[$(date -Is)] backfill_empty_arxiv: WARN ${day} pipeline step 'render' failed"
+            ok=0
+        fi
         if [[ "$ok" -eq 1 ]]; then
             recovered=$((recovered + 1))
         else
