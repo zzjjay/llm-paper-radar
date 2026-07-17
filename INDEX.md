@@ -1,5 +1,6 @@
 # Digest History Index
 
+- [07-15](digests/2026-07-15.md) — 63 scanned, 0 passed, top: (no papers passed)
 - [07-14](digests/2026-07-14.md) — 69 scanned, 0 passed, top: (no papers passed)
 - [07-13](digests/2026-07-13.md) — 223 scanned, 1 passed, top: KronQ: LLM Quantization via Kronecker-Factored Hes
 - [07-12](digests/2026-07-12.md) — 50 scanned, 0 passed, top: (no papers passed)
