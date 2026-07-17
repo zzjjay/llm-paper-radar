@@ -1,11 +1,12 @@
 # Digest History Index
 
+- [07-16](digests/2026-07-16.md) — 200 scanned, 1 passed, top: PolyQ: Codesigning End-to-End Quantization Framewo
 - [07-15](digests/2026-07-15.md) — 184 scanned, 0 passed, top: (no papers passed)
 - [07-14](digests/2026-07-14.md) — 187 scanned, 2 passed, top: A JoLT for the KV Cache: Near-Lossless KV Cache Co
 - [07-13](digests/2026-07-13.md) — 223 scanned, 1 passed, top: KronQ: LLM Quantization via Kronecker-Factored Hes
 - [07-12](digests/2026-07-12.md) — 140 scanned, 1 passed, top: Reliability Scaling Laws for Quantized Large Langu
-- [07-11](digests/2026-07-11.md) — 50 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
-- [07-10](digests/2026-07-10.md) — 71 scanned, 0 passed, top: (no papers passed)
+- [07-11](digests/2026-07-11.md) — 140 scanned, 1 passed, top: Efficient Memory Management for Large Language Mod
+- [07-10](digests/2026-07-10.md) — 162 scanned, 0 passed, top: (no papers passed)
 - [07-09](digests/2026-07-09.md) — 215 scanned, 4 passed, top: It Takes a MAESTRO To Prune Bad Experts
 - [07-08](digests/2026-07-08.md) — 227 scanned, 0 passed, top: (no papers passed)
 - [07-07](digests/2026-07-07.md) — 200 scanned, 1 passed, top: SeKV: Resolution-Adaptive KV Cache with Hierarchic
@@ -14,20 +15,20 @@
 - [07-04](digests/2026-07-04.md) — 125 scanned, 0 passed, top: (no papers passed)
 - [07-03](digests/2026-07-03.md) — 230 scanned, 1 passed, top: Variable Bit-width Quantization: Learning Per-Grou
 - [07-02](digests/2026-07-02.md) — 265 scanned, 2 passed, top: OrbitQuant: Data-Agnostic Quantization for Image a
-- [07-01](digests/2026-07-01.md) — 86 scanned, 0 passed, top: (no papers passed)
-- [06-30](digests/2026-06-30.md) — 96 scanned, 1 passed, top: ReFreeKV: Towards Threshold-Free KV Cache Compress
+- [07-01](digests/2026-07-01.md) — 254 scanned, 3 passed, top: GSRQ: Gain-Shape Residual Quantization for Sub-1-b
+- [06-30](digests/2026-06-30.md) — 270 scanned, 2 passed, top: ReFreeKV: Towards Threshold-Free KV Cache Compress
 - [06-29](digests/2026-06-29.md) — 285 scanned, 0 passed, top: (no papers passed)
-- [06-28](digests/2026-06-28.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-27](digests/2026-06-27.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-26](digests/2026-06-26.md) — 71 scanned, 2 passed, top: Efficient Memory Management for Large Language Mod
+- [06-28](digests/2026-06-28.md) — 170 scanned, 1 passed, top: Coverage-Driven KV Cache Eviction for Efficient an
+- [06-27](digests/2026-06-27.md) — 142 scanned, 0 passed, top: (no papers passed)
+- [06-26](digests/2026-06-26.md) — 203 scanned, 5 passed, top: FlexMoE: One-for-All Nested Intra-Expert Pruning f
 - [06-25](digests/2026-06-25.md) — 249 scanned, 6 passed, top: RoPE-Aware Bit Allocation for KV-Cache Quantizatio
 - [06-24](digests/2026-06-24.md) — 216 scanned, 2 passed, top: Quantization Inflates Reasoning: Token Inflation a
 - [06-23](digests/2026-06-23.md) — 205 scanned, 1 passed, top: RoPE-Aware Bit Allocation for KV-Cache Quantizatio
 - [06-22](digests/2026-06-22.md) — 275 scanned, 3 passed, top: HyperQuant: A Rate-Distortion-Optimal Quantization
-- [06-21](digests/2026-06-21.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-20](digests/2026-06-20.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-19](digests/2026-06-19.md) — 82 scanned, 1 passed, top: Rethinking Shrinkage Bias in LLM FP4 Pretraining: 
-- [06-18](digests/2026-06-18.md) — 85 scanned, 0 passed, top: (no papers passed)
+- [06-21](digests/2026-06-21.md) — 154 scanned, 0 passed, top: (no papers passed)
+- [06-20](digests/2026-06-20.md) — 166 scanned, 0 passed, top: (no papers passed)
+- [06-19](digests/2026-06-19.md) — 264 scanned, 3 passed, top: An Empirical Study of OpenPangu Quantization on As
+- [06-18](digests/2026-06-18.md) — 261 scanned, 0 passed, top: (no papers passed)
 - [06-17](digests/2026-06-17.md) — 260 scanned, 0 passed, top: (no papers passed)
 - [06-16](digests/2026-06-16.md) — 262 scanned, 3 passed, top: Tangram: Unlocking Non-Uniform KV Cache Compressio
 - [06-15](digests/2026-06-15.md) — 329 scanned, 0 passed, top: (no papers passed)
