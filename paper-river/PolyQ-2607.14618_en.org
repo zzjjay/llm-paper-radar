@@ -1,0 +1,193 @@
+#+title:      PolyQ: Codesigning End-to-End Quantization Framework for Scalable Edge CPU LLM Inference
+#+date:       [2026-07-17 Fri 00:06]
+#+filetags:   :paper:river:en:
+#+identifier: 20260717T000610-en
+#+source:     https://arxiv.org/abs/2607.14618
+#+authors:    Hyunwoo Oh, Suyeon Jang, Hanning Chen, KyungIn Nam, Sanggeon Yun, Ryozo Masukawa, Mohsen Imani
+#+venue:      ICCAD 2026 (arXiv preprint, 2026-07)
+
+* The Problem River
+
+In one sentence: *Your laptop has only 3.9 GB left to fit a large model, yet every quantization tool on the market gives you just two buttons — "3-bit" or "4-bit." Press 3-bit and you waste 0.9 GB of headroom that could have bought you better accuracy; press 4-bit and the model simply doesn't fit.*
+
+Why is this hard? When deploying large models on CPUs — laptops, edge servers, embedded devices — the true bottleneck is not compute but memory: weights occupy memory, KV cache occupies memory, other software is competing for memory, and the usable budget is often an awkward number like "3.9 GB" that no integer bit-width can exactly match. The theoretical answer is straightforward — different weight channels differ in importance, so give more bits to the important ones and fewer to the rest, yielding a fractional average bit-width (say 3.97 bits/weight) that fits precisely within the budget. But a decades-old deadlock blocks that path: *any scheme fine-grained enough to do this cannot run efficiently on a CPU, and any scheme that runs efficiently on a CPU is too coarse to do it.* CPU low-bit execution relies on look-up table (LUT) instructions, whose table size grows exponentially with bit-width (2^b). Once you allow "odd" widths like 5, 6, or 7 bits, the table grows too large for SIMD registers, forcing a dequantize-to-INT8-then-compute detour — and every throughput and energy saving from going low-bit evaporates. This river is the result of seven years of tension between two forces: ever-finer precision allocation and ever-messier CPU execution.
+
+* Source Map
+
+#+begin_example
+[2019] Wang et al. - HAQ (Hardware-Aware Automated Quantization)
+  |
+  | Problem: One bit-width for the whole model is too blunt; different layers
+  |          vary enormously in sensitivity.
+  | Solution: Use RL to automatically pick a bit-width per layer,
+  |           composing a global resource budget.
+  v
+[2022-23] Frantar et al. - GPTQ  /  Xiao et al. - SmoothQuant
+  |
+  | Problem: Layer-level search is still expensive, and neither method
+  |          addresses "which specific weights suffer most from compression."
+  | Solution: Use second-order information (GPTQ) or activation statistics
+  |           (SmoothQuant) to compensate quantization error precisely per layer.
+  | Leftover: Both still assign a uniform bit-width within a layer —
+  |           no distinction between who deserves more protection inside the layer.
+  v
+[2023] Lin et al. - AWQ
+  |
+  | Problem: Only a small fraction of "activation-salient channels" carry the
+  |          load within each layer; the rest are largely insensitive.
+  | Solution: Identify those salient channels and protect them with per-channel
+  |           scaling rather than crudely raising the whole layer's precision.
+  | Leftover: Protection is achieved via a mathematical scaling trick;
+  |           the stored bit-width is still a uniform integer per layer —
+  |           no true fractional-bit budget is reachable.
+  v
+[2023] Yuan et al. - RPTQ  /  Zhao et al. - Atom  (execution-side branch)
+  |
+  | Problem: Once precision is non-uniform (mixed precision), channels inside a
+  |          matrix are in mixed order, and operators must constantly shuffle data.
+  | Solution: Reorder/cluster channels by value range or precision so that each
+  |           operator sees a more regular data layout.
+  | Leftover: The reordering is *local* — fixed inside a single operator or
+  |           block template; at the next operator boundary it must be done again.
+  v
+[2024-25] Huang et al. - SliM-LLM
+  |
+  | Problem: AWQ's "uniform bit-width per layer" is too coarse; salient channels
+  |          often form a small cluster that deserves its own bit allocation.
+  | Solution: Push the granularity down to channel groups, using a b±1 palette
+  |           for group-level precision assignment.
+  | Leftover: Introduces 5/6/7-bit widths that CPU LUT execution cannot handle
+  |           efficiently; hardware is forced to fall back to INT8 dequantization.
+  v
+[2025] Lee et al. - AMQ
+  |
+  | Problem: The search space for layer/group mixed-precision is ~10^100;
+  |          hitting a precise resource budget accurately and cheaply is hard.
+  | Solution: Use a proxy model + quality predictor to prune the search,
+  |           efficiently approximating the Pareto frontier.
+  | Leftover: The search target is still layer-level bit allocation; the
+  |           reordering-overhead problem on the execution side is untouched.
+  v
+[2026] Oh et al. - PolyQ  (target paper)
+  Merges both branches: CPU-aligned palette {2,3,4,8,16} for channel-level
+    precision assignment (inheriting AWQ/SliM-LLM's "find what matters")
+  + compile-time reordering elevated from operator-local to whole-compute-graph
+    scope (inheriting RPTQ/Atom's "reorder" but eliminating runtime overhead)
+#+end_example
+
+* Evolutionary Narrative
+
+** 2019 | HAQ: Let the machine pick a bit-width per layer instead of relying on human intuition
+
+*** What problem it saw
+
+Early quantization used a single bit-width for the entire model — all 8-bit or all 4-bit. But within a model, some layers (e.g., the first and last) are extremely sensitive to precision loss and collapse if compressed too aggressively, while others tolerate almost any compression. Manually searching which layer should get which bit-width is combinatorially infeasible.
+
+*** Its solution
+
+Frame "choosing a bit-width for each layer" as an RL search problem: the agent repeatedly proposes layer-wise bit-width combinations, receives feedback from real hardware latency and energy measurements, and iteratively converges on an assignment that satisfies the resource budget while minimizing accuracy loss.
+
+*** Why it worked (and what new pit it dug)
+
+This was the first time "total resource budget" was treated as a knob that could be distributed across individual layers rather than applied as a single global cutoff. The obvious limitation: granularity stops at the layer level. If only a handful of weights within a layer are critical, you still have to raise the entire layer's precision to protect them — a massive waste.
+
+** 2022-23 | GPTQ / SmoothQuant: How to compress within a layer more accurately, not just to which bit-width
+
+*** What problem they saw
+
+Even after fixing the target bit-width for each layer, the question of "how to pack this layer's weights into that many bits without distortion" is itself difficult. Naive rounding errors accumulate and amplify through the network, especially in models with tens of billions of parameters.
+
+*** Their solutions
+
+GPTQ leverages second-order (Hessian) information: it quantizes weight columns one at a time and immediately redistributes each column's quantization error onto the remaining unquantized columns. SmoothQuant observes that a subset of activation channels contains extreme outliers that make quantization difficult, and migrates the "outlier-ness" mathematically from the activation side to the weight side so that both become easier to quantize.
+
+*** Why it worked (and what new pit it dug)
+
+Both methods dramatically improved quantization accuracy at a given bit-width and made GPTQ-style post-training quantization an industry standard. But they answer "how to compress accurately," not "which channels within a layer deserve more bits" — the result is still a uniform bit-width inside each layer, with no mechanism for need-based allocation.
+
+** 2023 | AWQ: Identify the small fraction of "salient channels" that carry the load
+
+*** What problem it saw
+
+GPTQ and SmoothQuant, no matter how precisely they compress, treat every channel within a layer equally. But empirical statistics reveal that only ~1% of activation channels in a layer account for the vast majority of output variance. Compress those channels carelessly and the model's output visibly drifts; the remaining ~99% of channels can be compressed almost arbitrarily without harm.
+
+*** Its solution
+
+Use calibration data to measure per-channel activation magnitudes, identify high-magnitude channels as "salient," and apply a per-channel scaling factor that effectively widens their numerical range before uniform quantization — achieving better effective precision for salient channels without nominally changing the bit-width.
+
+*** Why it worked (and what new pit it dug)
+
+This was the first time the line "importance is not uniformly distributed within a layer but concentrated in a few channels" was clearly articulated. However, AWQ's protection mechanism is a scaling trick: the stored bit-width remains a uniform integer at the layer level. It tells you where importance lives but provides no knob to actually spend bit-budget there.
+
+** 2023 | RPTQ / Atom (execution-side branch): Mixed precision scrambles the data layout and the hardware pays for it
+
+*** What problem they saw
+
+Once truly mixed precision is allowed (different channels at different bit-widths), the data inside a matrix is no longer a uniform type and SIMD instructions cannot consume a contiguous block in one shot. Within a single matrix multiplication, 2-bit and 8-bit channels are interleaved, forcing the hardware to constantly split, convert, and reassemble data — and that shuffling is pure overhead.
+
+*** Their solutions
+
+RPTQ pre-sorts channels offline by value range and clusters similar ones together, reducing both quantization error and runtime overhead. Atom reorders channels at GEMM operator boundaries grouped by precision, so that each individual operator sees a maximally regular data layout.
+
+*** Why it worked (and what new pit it dug)
+
+Both demonstrated that "sorting messy mixed-precision data in advance" can significantly reduce execution cost. But the sorting is *local* — RPTQ's reordering is fixed inside a single block template, and Atom's is bound to individual operator boundaries. Once data flows out of that block or crosses an operator boundary into the next layer, the layout is scrambled again, and the reordering overhead recurs at every boundary. It was never solved at the level of the entire compute graph.
+
+** 2024-25 | SliM-LLM: Push the granularity of "importance" down to channel groups
+
+*** What problem it saw
+
+AWQ already knew that "importance lives in a small cluster of channels," but its protection mechanism never actually changed stored bit-widths. Meanwhile, HAQ-style layer-level bit allocation remained too coarse: if salient channels occupy only a small fraction of a layer, raising the entire layer's precision to protect them is paying for many unimportant channels as collateral.
+
+*** Its solution
+
+Push allocation granularity from "layer" down to "channel group": partition a layer's weights by saliency, and independently assign each group a bit-width that is allowed to vary by ±1 from a base value (e.g., one group at 4 bits, another at 5 bits). For the first time, bit allocation genuinely follows local saliency rather than a layer-wide cut.
+
+*** Why it worked (and what new pit it dug)
+
+Precision can finally be distributed according to local importance, yielding noticeably better quality than layer-level methods at the same average bit-width. The cost is introducing 5, 6, and 7-bit widths — integers but awkward ones. CPU low-bit matrix multiplication relies on LUT instructions; a 4-bit LUT fits 16 entries into a SIMD register just fine, but a 7-bit LUT requires 128 entries, destroying LUT efficiency. Hardware must fall back to dequantizing to INT8 before computing, forfeiting all throughput and energy gains from going low-bit. And the method can still only target integer bit-widths — it cannot express a fractional budget of "3.97 bits."
+
+** 2025 | AMQ: Use a proxy model to eliminate the cost of brute-force search
+
+*** What problem it saw
+
+Layer/group mixed-precision theoretically requires searching an exponentially large combination space (~10^100) for an optimal allocation. Evaluating each candidate through real quantization and measurement is prohibitively expensive, forcing prior methods to either search coarsely or search slowly.
+
+*** Its solution
+
+Use prior knowledge to prune clearly unpromising search branches, replace expensive real quantization-and-evaluation with a quantization proxy and a quality predictor, and combine this with iterative search-and-update to rapidly approximate Pareto-optimal bit allocations.
+
+*** Why it worked (and what new pit it dug)
+
+It dramatically reduced the cost of finding a good layer-level bit assignment, making mixed-precision search practically viable. But the optimization target is still layer-granularity bit allocation. It does not touch SliM-LLM's "CPU-unfriendly bit-widths" problem, nor RPTQ/Atom's "reordering only works locally" problem. One pit blocks the precision side, the other blocks the execution side — both still waiting to be solved simultaneously.
+
+* Frontier Extension
+
+As of this writing (the paper was posted on 2026-07-16, only one day ago), no follow-up work directly citing or critiquing PolyQ has yet been found — it is currently the most recent link in this problem's evolutionary chain. What is clear is that PolyQ itself has laid both branch-pits on the table: whether the palette can be refined further (e.g., non-powers-of-two bit-widths), and whether compile-time reorder propagation can extend to multi-device or distributed inference scenarios, are natural next steps — but for now they remain space merely hinted at by the authors, with no independent papers to fill them.
+
+* One Picture to Understand It All
+
+#+begin_example
+                Precision allocation granularity (vertical axis, finer upward)
+                ^
+Group/channel   |                         SliM-LLM(24)   PolyQ(26)
+                |                              *  --------> * (CPU-aligned palette + fractional budget)
+                |                             /
+Saliency-aware  |                    AWQ(23) *
+                |                           /
+Layer-level     |     HAQ(19) *---------- GPTQ/SmoothQuant(22-23) *------ AMQ(25) *
+                |
+                +-------------------------------------------------------------------> Time
+                 2019      2022    2023          2024-25         2025      2026
+
+                Execution regularity (second branch, local -> global)
+                RPTQ/Atom(23) local reordering  ----------------------->  PolyQ(26) whole-graph compile-time reordering
+#+end_example
+
+* Insight
+
+The real shift happening in this river is not simply "bit allocation becoming finer and finer" — it is a movement of the field's center of gravity, from *"how to make the mathematical error smaller"* (the concern of GPTQ, SmoothQuant, and AWQ) toward *"can a mathematically refined scheme actually execute on real hardware"* (the lesson of RPTQ, Atom, SliM-LLM, and ultimately PolyQ). In other words, quantization research has spent years "opening progressively larger design degrees of freedom" (layer → group → channel), but each new degree of freedom immediately runs into a new wall on the execution side (within-layer waste → awkward bit-widths → locally-scoped reordering). PolyQ's approach demonstrates that this wall cannot be sidestepped by having the algorithm "back off" (as SliM-LLM implicitly did by abandoning CPU friendliness in exchange for accuracy). Instead, the hardware constraints — LUT table size, SIMD width, operator boundaries — must be written into the search space from the very beginning: the palette admits only CPU-friendly bit-widths from the start, and reordering is solved once at compile time over the entire compute graph rather than patched up after the fact. The most likely next direction is extending this kind of "joint design of algorithmic freedom and hardware constraint" to more hardware backends (NPU, DSP) and more structural degrees of freedom (fractional-bit activation quantization, quantization of inter-device communication in distributed inference).
+
+* Takeaway
+
+This evolutionary arc offers one concrete lesson for researchers: *when every successive "finer-grained" improvement along a direction is accompanied by a new deployment pitfall, the root problem is that the algorithm and the hardware were modeled in isolation.* SliM-LLM's 5/6/7-bit pitfall was not caused by poor algorithm design — it was caused by having only one objective function in mind ("minimize mathematical error") with no awareness of LUT table size as a hard constraint. This suggests a practical heuristic: when you encounter a scheme that is theoretically optimal yet consistently underperforms in deployment, resist the urge to keep optimizing on the algorithmic side. Instead, step back and ask — should the constraints (hardware, system, protocol) have been embedded in the objective function or the search space from day one, rather than left to be "patched in" as engineering afterthoughts during deployment?
