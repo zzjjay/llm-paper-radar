@@ -36,11 +36,15 @@ fi
 PROJECT_ROOT="/proj/xcohdstaff7/zhaolin/code/llm-paper-radar"
 cd "$PROJECT_ROOT" || { echo "cannot cd to $PROJECT_ROOT" >&2; exit 1; }
 
+# shellcheck disable=SC1091
+source "${PROJECT_ROOT}/scripts/lib/alert.sh"
+
 RAW_ROOT="data/raw"
 recovered=0
 still_empty=0
 failed=0
 attempted=0
+failed_days=()
 
 echo "[$(date -Is)] backfill_empty_arxiv: scanning last ${LOOKBACK} day(s)"
 
@@ -66,6 +70,7 @@ for delta in $(seq 1 "$LOOKBACK"); do
     if ! RADAR_TARGET_DATE="$day" uv run python -m sources.arxiv --force; then
         echo "[$(date -Is)] backfill_empty_arxiv: WARN ${day} re-fetch returned non-zero"
         failed=$((failed + 1))
+        failed_days+=("${day}: arxiv re-fetch failed")
         sleep 30
         continue
     fi
@@ -74,21 +79,25 @@ for delta in $(seq 1 "$LOOKBACK"); do
     if [[ -f "$f" && "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 2 ]]; then
         echo "[$(date -Is)] backfill_empty_arxiv: ${day} recovered — re-running dedupe→render"
         ok=1
+        failed_step=""
         for step in dedupe filter summarize; do
             if ! RADAR_TARGET_DATE="$day" uv run python -m "pipeline.${step}" --force; then
                 echo "[$(date -Is)] backfill_empty_arxiv: WARN ${day} pipeline step '${step}' failed"
                 ok=0
+                failed_step="$step"
                 break
             fi
         done
         if [[ "$ok" -eq 1 ]] && ! RADAR_TARGET_DATE="$day" uv run python -m pipeline.render; then
             echo "[$(date -Is)] backfill_empty_arxiv: WARN ${day} pipeline step 'render' failed"
             ok=0
+            failed_step="render"
         fi
         if [[ "$ok" -eq 1 ]]; then
             recovered=$((recovered + 1))
         else
             failed=$((failed + 1))
+            failed_days+=("${day}: pipeline step '${failed_step}' failed after arxiv recovery")
         fi
     else
         echo "[$(date -Is)] backfill_empty_arxiv: ${day} still empty (likely genuine zero day, or still throttled)"
@@ -102,7 +111,12 @@ done
 echo "[$(date -Is)] backfill_empty_arxiv: done — attempted=${attempted} recovered=${recovered} still_empty=${still_empty} failed=${failed}"
 
 # Non-zero exit only on hard failures, so the caller can surface a real problem
-# without treating "genuine zero weekend" as an error.
+# without treating "genuine zero weekend" as an error. daily.sh treats this
+# as non-fatal (log + continue), so an email here is the only thing standing
+# between a real regression and another silent month — see scripts/lib/alert.sh.
 if [[ "$failed" -gt 0 ]]; then
+    reason=$(printf 'backfill_empty_arxiv: %d/%d day(s) failed:\n%s' \
+        "$failed" "$attempted" "$(printf '  - %s\n' "${failed_days[@]}")")
+    alert_failure "backfill_empty_arxiv.sh" "$reason"
     exit 1
 fi

@@ -74,6 +74,9 @@ LOG_DIR="${PROJECT_ROOT}/scripts/log"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/rollup-${CADENCE}-$(date +%Y-%m-%d).log"
 
+# shellcheck disable=SC1091
+source "${PROJECT_ROOT}/scripts/lib/alert.sh"
+
 exec >>"$LOG_FILE" 2>&1
 echo "================================================================"
 echo "[$(date -Is)] rollup.sh start (cadence=${CADENCE} window=${START}..${END} tag=${TAG})"
@@ -89,12 +92,12 @@ cd "$PROJECT_ROOT"
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
 echo "[$(date -Is)] git pull --rebase"
-git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
+git pull --rebase --autostash || { echo "git pull failed, aborting"; alert_failure "rollup.sh" "git pull --rebase failed (cadence=${CADENCE})" "$LOG_FILE"; exit 3; }
 
 echo "[$(date -Is)] step: pipeline.rollup_digest ${LABEL} ${START}..${END}"
 uv run python -m pipeline.rollup_digest \
     --start "$START" --end "$END" --label "$LABEL" --out-dir "$OUT_DIR" \
-    || { echo "rollup_digest failed"; exit 4; }
+    || { echo "rollup_digest failed"; alert_failure "rollup.sh" "pipeline.rollup_digest failed (cadence=${CADENCE} window=${START}..${END})" "$LOG_FILE"; exit 4; }
 
 if [[ -z "$(git status --porcelain "$OUT_DIR")" ]]; then
     echo "[$(date -Is)] no ${CADENCE} changes to commit"
@@ -103,8 +106,8 @@ else
     if [[ -z "$(git diff --cached --name-only)" ]]; then
         echo "[$(date -Is)] nothing staged after add"
     else
-        git commit -m "📅 ${LABEL} digest ${TAG}" || { echo "commit failed"; exit 5; }
-        git push || { echo "push failed"; exit 6; }
+        git commit -m "📅 ${LABEL} digest ${TAG}" || { echo "commit failed"; alert_failure "rollup.sh" "git commit failed (cadence=${CADENCE})" "$LOG_FILE"; exit 5; }
+        git push || { echo "push failed"; alert_failure "rollup.sh" "git push failed (cadence=${CADENCE})" "$LOG_FILE"; exit 6; }
         echo "[$(date -Is)] pushed ${CADENCE} digest ${TAG}"
     fi
 fi

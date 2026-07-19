@@ -38,6 +38,9 @@ LOG_DIR="${PROJECT_ROOT}/scripts/log"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/weekly-$(date +%Y-%m-%d).log"
 
+# shellcheck disable=SC1091
+source "${PROJECT_ROOT}/scripts/lib/alert.sh"
+
 exec >>"$LOG_FILE" 2>&1
 echo "================================================================"
 echo "[$(date -Is)] weekly.sh start (end_date=${END_DATE})"
@@ -54,10 +57,10 @@ cd "$PROJECT_ROOT"
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
 echo "[$(date -Is)] git pull --rebase"
-git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
+git pull --rebase --autostash || { echo "git pull failed, aborting"; alert_failure "weekly.sh" "git pull --rebase failed" "$LOG_FILE"; exit 3; }
 
 echo "[$(date -Is)] step: pipeline.weekly --end-date ${END_DATE}"
-uv run python -m pipeline.weekly --end-date "$END_DATE" || { echo "weekly failed"; exit 4; }
+uv run python -m pipeline.weekly --end-date "$END_DATE" || { echo "weekly failed"; alert_failure "weekly.sh" "pipeline.weekly failed (end_date=${END_DATE})" "$LOG_FILE"; exit 4; }
 
 if [[ -z "$(git status --porcelain snapshots/weekly/ README.md)" ]]; then
     echo "[$(date -Is)] no weekly changes to commit"
@@ -67,8 +70,8 @@ else
         echo "[$(date -Is)] nothing staged after add"
     else
         WEEK_TAG=$(date -u +%Y-W%V)
-        git commit -m "📅 Weekly digest ${WEEK_TAG}" || { echo "commit failed"; exit 5; }
-        git push || { echo "push failed"; exit 6; }
+        git commit -m "📅 Weekly digest ${WEEK_TAG}" || { echo "commit failed"; alert_failure "weekly.sh" "git commit failed" "$LOG_FILE"; exit 5; }
+        git push || { echo "push failed"; alert_failure "weekly.sh" "git push failed" "$LOG_FILE"; exit 6; }
         echo "[$(date -Is)] pushed weekly digest ${WEEK_TAG}"
     fi
 fi

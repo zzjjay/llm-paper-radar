@@ -39,3 +39,19 @@ no caps; manual runs should default to the same unless the user opts out.
 When the user says "rerun", "force", or "redo today" — match what cron
 would do. Pass `--force` if needed for idempotency, but keep all the
 heavy steps enabled by default.
+
+## Pull before you push
+
+**Always `git pull` (fast-forward, or `--rebase` if you have local commits) before
+`git push`** — never push straight from a local checkout that hasn't just synced with
+`origin/main`. `daily.sh`/`weekly.sh`/`rollup.sh` already do this internally
+(`git pull --rebase --autostash` before their own commit+push); apply the same discipline
+to any git action you run manually outside those scripts.
+
+- **Why:** caught in practice on a sibling repo in the same working tree — a session
+  committed and nearly pushed on a base 24 commits behind `origin/main`. This repo's cron
+  scripts push frequently (daily digest, weekly rollup), so a manual checkout goes stale
+  fast.
+- **How to apply:** before any manual `git push`, run `git fetch` + check
+  `git log HEAD..origin/main`; if behind, pull first. Applies mid-session too — cron may
+  have pushed a new digest while you were working.
