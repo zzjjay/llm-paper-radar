@@ -87,6 +87,9 @@ LOG_DIR="${PROJECT_ROOT}/scripts/log"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/$(date +%Y-%m-%d).log"
 
+# shellcheck disable=SC1091
+source "${PROJECT_ROOT}/scripts/lib/alert.sh"
+
 exec >>"$LOG_FILE" 2>&1
 echo "================================================================"
 echo "[$(date -Is)] daily.sh start (window=${DAYS}d, backfill=${BACKFILL})"
@@ -101,6 +104,7 @@ set -u
 
 if [[ -z "${ANTHROPIC_CUSTOM_HEADERS:-}" ]]; then
     echo "[$(date -Is)] ERROR: ANTHROPIC_CUSTOM_HEADERS not set after sourcing ~/.bashrc"
+    alert_failure "daily.sh" "ANTHROPIC_CUSTOM_HEADERS not set after sourcing ~/.bashrc" "$LOG_FILE"
     exit 2
 fi
 
@@ -111,7 +115,7 @@ export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 
 # Pull latest so we don't push on a stale base.
 echo "[$(date -Is)] git pull --rebase"
-git pull --rebase --autostash || { echo "git pull failed, aborting"; exit 3; }
+git pull --rebase --autostash || { echo "git pull failed, aborting"; alert_failure "daily.sh" "git pull --rebase failed" "$LOG_FILE"; exit 3; }
 
 run_step() {
     local name="$1"; shift
@@ -170,9 +174,9 @@ fi
 
 PIPELINE_FORCE_FLAG=()
 if [[ "$FORCE" -eq 1 ]]; then PIPELINE_FORCE_FLAG=(--force); fi
-run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 4
-run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 5
-run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || exit 6
+run_step "dedupe"    uv run python -m pipeline.dedupe    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || { alert_failure "daily.sh" "step 'dedupe' failed" "$LOG_FILE"; exit 4; }
+run_step "filter"    uv run python -m pipeline.filter    --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || { alert_failure "daily.sh" "step 'filter' failed" "$LOG_FILE"; exit 5; }
+run_step "summarize" uv run python -m pipeline.summarize --backfill-days "${BACKFILL}" "${PIPELINE_FORCE_FLAG[@]}" || { alert_failure "daily.sh" "step 'summarize' failed" "$LOG_FILE"; exit 6; }
 
 # Auto-generate paper-river .org files for papers surfaced in the
 # current rollup window (--window-days matches --days, default 2), so
@@ -200,7 +204,7 @@ fi
 run_step "translate_paper_river" uv run python scripts/translate_paper_river.py --all \
     || echo "  (paper-river translation failed, continuing)"
 
-run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || exit 7
+run_step "render"    uv run python -m pipeline.render    --backfill-days "${BACKFILL}" || { alert_failure "daily.sh" "step 'render' failed" "$LOG_FILE"; exit 7; }
 
 # Recover days whose arxiv.json is still empty from an earlier throttle-failed
 # fetch. Runs every day so a day zeroed out by a 429 storm gets re-attempted on
@@ -215,7 +219,7 @@ elif [[ "${BACKFILL_EMPTY_SKIP:-0}" -eq 1 ]]; then
     echo "[$(date -Is)] backfill_empty_arxiv: skipped (BACKFILL_EMPTY_SKIP=1)"
 else
     run_step "backfill_empty_arxiv" ./scripts/backfill_empty_arxiv.sh \
-        || echo "  (backfill_empty_arxiv reported failures, continuing)"
+        || { echo "  (backfill_empty_arxiv reported failures, continuing)"; alert_failure "daily.sh" "backfill_empty_arxiv reported failures (non-fatal, run continued)" "$LOG_FILE"; }
 fi
 
 # Snapshot the rendered paper list into snapshots/ (single-day: <YYYYMMDD>.md;
@@ -235,8 +239,8 @@ else
     if [[ -z "$(git diff --cached --name-only)" ]]; then
         echo "[$(date -Is)] nothing staged after add"
     else
-        git commit -m "📚 Digest ${DATE_STR} (window=${DAYS}d)" || { echo "commit failed"; exit 8; }
-        git push || { echo "push failed"; exit 9; }
+        git commit -m "📚 Digest ${DATE_STR} (window=${DAYS}d)" || { echo "commit failed"; alert_failure "daily.sh" "git commit failed" "$LOG_FILE"; exit 8; }
+        git push || { echo "push failed"; alert_failure "daily.sh" "git push failed" "$LOG_FILE"; exit 9; }
         echo "[$(date -Is)] pushed digest for ${DATE_STR}"
     fi
 fi
