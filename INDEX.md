@@ -1,7 +1,8 @@
 # Digest History Index
 
+- [07-19](digests/2026-07-19.md) — 50 scanned, 0 passed, top: (no papers passed)
 - [07-18](digests/2026-07-18.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [07-17](digests/2026-07-17.md) — 75 scanned, 0 passed, top: (no papers passed)
+- [07-17](digests/2026-07-17.md) — 187 scanned, 2 passed, top: PagedWeight: Efficient MoE LLM Serving with Dynami
 - [07-16](digests/2026-07-16.md) — 200 scanned, 1 passed, top: PolyQ: Codesigning End-to-End Quantization Framewo
 - [07-15](digests/2026-07-15.md) — 184 scanned, 0 passed, top: (no papers passed)
 - [07-14](digests/2026-07-14.md) — 187 scanned, 2 passed, top: A JoLT for the KV Cache: Near-Lossless KV Cache Co
