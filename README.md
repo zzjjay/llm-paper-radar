@@ -36,21 +36,18 @@ _Nothing surfaced today (everything was hard-gated)._
 
 <!-- WEEKLY_START -->
 
-# Weekly Digest · 2026-07-06 → 2026-07-12
+# Weekly Digest · 2026-07-13 → 2026-07-19
 
-> Surfaced: 9 papers
+> Surfaced: 6 papers
 
 | # | Bucket | Paper | Authors | Date | Why |
 |---|--------|-------|---------|------|-----|
-| 1 | Low-bit (≤ 2-bit) | [BiSCo-LLM: Lookup-Free Binary Spherical Coding for Extreme Low-Bit Large Language Model Compression](https://arxiv.org/abs/2607.08643) | Yuantian Shao, Peisong Wang, Zhilei Liu et al. | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08643) · [en](digests/2026-07-09_en.md#p-2607-08643) |
-| 2 | KV cache | [SeKV: Resolution-Adaptive KV Cache with Hierarchical Semantic Memory for Long-Context LLM Inference](https://arxiv.org/abs/2606.31145) 🔁 | Amirhossein Abaskohi, Giuseppe Carenini, Peter West et al. | 2026-06-30 | [zh](digests/2026-07-07.md#p-2606-31145) · [en](digests/2026-07-07_en.md#p-2606-31145) |
-| 3 | KV cache | [KVpop -- Key-Value Cache Compression with Predictive Online Pruning](https://arxiv.org/abs/2607.05061) 🔁 | Lukas Hauzenberger, Niklas Schmidinger, Anamaria-Roberta Hartl et al. | 2026-07-06 | [zh](digests/2026-07-06.md#p-2607-05061) · [en](digests/2026-07-06_en.md#p-2607-05061) |
-| 4 | Pruning & distillation | [It Takes a MAESTRO To Prune Bad Experts](https://arxiv.org/abs/2607.08601) | Palaash Goel, Ayush Maheshwari, Tanmoy Chakraborty | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08601) · [en](digests/2026-07-09_en.md#p-2607-08601) |
-| 5 | Pruning & distillation | [Structured Pruning of Large Language Models via Power Transformation and Sign-Preserving Score Aggregation with Adaptive Feature Retention](https://arxiv.org/abs/2607.08027) | Ryota Kobayashi, Tsubasa Hirakawa, Takayoshi Yamashita et al. | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08027) · [en](digests/2026-07-09_en.md#p-2607-08027) |
-| 6 | Diffusion | [OrbitQuant: Data-Agnostic Quantization for Image and Video Diffusion Transformers](https://arxiv.org/abs/2607.02461) 🔁 | Donghyun Lee, Jitesh Chavan, Duy Nguyen et al. | 2026-07-02 | [zh](digests/2026-07-06.md#p-2607-02461) · [en](digests/2026-07-06_en.md#p-2607-02461) |
-| 7 | Diffusion | [Closing the Null Space: Guidance-Aware Quantization for Classifier-Free Diffusion](https://arxiv.org/abs/2607.08241) | Abdullah Al Shafi, Sumaiya Rahim Suma | 2026-07-09 | [zh](digests/2026-07-09.md#p-2607-08241) · [en](digests/2026-07-09_en.md#p-2607-08241) |
-| 8 | Trending | [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) 🔁 | Woosuk Kwon, Zhuohan Li, Siyuan Zhuang et al. | 2023-09-12 | [zh](digests/2026-07-11.md#p-2309-06180) · [en](digests/2026-07-11_en.md#p-2309-06180) |
-| 9 | Survey | [Reliability Scaling Laws for Quantized Large Language Models](https://arxiv.org/abs/2607.10855) | Sirine Ayadi, Sándor Daróczi, Stephan Günnemann et al. | 2026-07-12 | [zh](digests/2026-07-12.md#p-2607-10855) · [en](digests/2026-07-12_en.md#p-2607-10855) |
+| 1 | PTQ | [PagedWeight: Efficient MoE LLM Serving with Dynamic Quality-Aware Weight Quantization](https://arxiv.org/abs/2607.16184) | Yuchen Yang, Yifan Zhao, Anisha Dasgupta et al. | 2026-07-17 | [zh](digests/2026-07-17.md#p-2607-16184) · [en](digests/2026-07-17_en.md#p-2607-16184) |
+| 2 | PTQ | [Saturation Makes Quantization Error Additive: A Coverage Model with a Certificate](https://arxiv.org/abs/2607.12266) | Joshua Hill | 2026-07-14 | [zh](digests/2026-07-14.md#p-2607-12266) · [en](digests/2026-07-14_en.md#p-2607-12266) |
+| 3 | PTQ | [PolyQ: Codesigning End-to-End Quantization Framework for Scalable Edge CPU LLM Inference](https://arxiv.org/abs/2607.14618) | Hyunwoo Oh, Suyeon Jang, Hanning Chen et al. | 2026-07-16 | [zh](digests/2026-07-16.md#p-2607-14618) · [en](digests/2026-07-16_en.md#p-2607-14618) |
+| 4 | Low-bit (≤ 2-bit) | [KronQ: LLM Quantization via Kronecker-Factored Hessian](https://arxiv.org/abs/2607.07964) | Donghyun Lee, Yuhang Li, Ruokai Yin et al. | 2026-07-08 | [zh](digests/2026-07-13.md#p-2607-07964) · [en](digests/2026-07-13_en.md#p-2607-07964) |
+| 5 | QAT | [QUADS: Stabilizing NVFP4 Reinforcement Learning for MoE via QUantization-error Alignment across Dual Sides](https://arxiv.org/abs/2607.15810) | Zhengyang Zhuge, Hao Yu, Xin Wang et al. | 2026-07-17 | [zh](digests/2026-07-17.md#p-2607-15810) · [en](digests/2026-07-17_en.md#p-2607-15810) |
+| 6 | KV cache | [A JoLT for the KV Cache: Near-Lossless KV Cache Compression via Joint Tucker and JL-Residual Allocation for LLMs](https://arxiv.org/abs/2607.12550) | Rahul Krishnan, Volker Schulz | 2026-07-14 | [zh](digests/2026-07-14.md#p-2607-12550) · [en](digests/2026-07-14_en.md#p-2607-12550) |
 
 
 <!-- WEEKLY_END -->
