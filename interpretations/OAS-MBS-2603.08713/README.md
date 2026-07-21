@@ -16,6 +16,7 @@
 
 | 角度 | 文件 | 内容 |
 |---|---|---|
+| 算法总览 | ![算法总览](images/algorithm_overview.png) | 一图看懂 OAS+MBS 三阶段流程：量化预处理（① MBS 加 8-bit 细化因子 + ② OAS 把 block amax 映到 (3.5,7]，reference 用 7 不用 8）→ 复用**不变**的 MXFP4 GEMM kernel → 轻量 epilogue 校正（×σ，<1.6% 开销）。核心洞见：只改 kernel 前后、纯软件、不动硬件 |
 | 原理故事 | [paper.org](paper.org) | 七拍故事版《怪尺子，不如怪量法》——精度差距是软件用法问题还是硬件问题 |
 | 中文伴读 | [reading.org](reading.org) | 选择性精读，骨架段三层翻译 + 碰撞提问（归档模式，Agent 代答） |
 | 中文翻译 | [translation_zh.md](translation_zh.md) | 全文中文翻译（覆盖全部 7 节 + 附录 A-E；版权原因采用 section-by-section 复述，非逐字翻译；论文全部 8 张图均已裁剪自 PDF 并嵌入） |
