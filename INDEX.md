@@ -1,7 +1,8 @@
 # Digest History Index
 
+- [07-20](digests/2026-07-20.md) — 174 scanned, 2 passed, top: C$^2$KV: Compressed and Composable KV Cache Reuse 
 - [07-19](digests/2026-07-19.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [07-18](digests/2026-07-18.md) — 50 scanned, 0 passed, top: (no papers passed)
+- [07-18](digests/2026-07-18.md) — 131 scanned, 1 passed, top: Half the Experts, All the Code: One-Shot Domain Pr
 - [07-17](digests/2026-07-17.md) — 187 scanned, 2 passed, top: PagedWeight: Efficient MoE LLM Serving with Dynami
 - [07-16](digests/2026-07-16.md) — 200 scanned, 1 passed, top: PolyQ: Codesigning End-to-End Quantization Framewo
 - [07-15](digests/2026-07-15.md) — 184 scanned, 0 passed, top: (no papers passed)
