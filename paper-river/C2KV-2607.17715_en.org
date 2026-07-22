@@ -1,0 +1,160 @@
+#+title:      C$^2$KV: Compressed and Composable KV Cache Reuse for Efficient LLM Inference
+#+date:       [2026-07-21 Tue 00:00]
+#+filetags:   :paper:river:en:
+#+identifier: 20260721T000000-en
+#+source:     https://arxiv.org/abs/2607.17715
+#+authors:    Chuheng Du, Junyi Chen, Hanlin Tang, Kan Liu, Tao Lan, Lin Qu, Chaoyue Niu, Shengzhong Liu, Guihai Chen, Fan Wu
+#+venue:      arXiv, 2026-07
+
+* The River of Problems
+
+A RAG (Retrieval-Augmented Generation) system retrieves a few documents from a database each time it answers a question, stitches them into a context, and feeds that context to a large model. Those same documents may well have appeared in other users' requests yesterday or the day before — their attention computations already done. Can we store those computed results and simply splice them in next time, skipping the recomputation?
+
+The idea sounds simple, but the difficulty is real: in a Transformer, every token's attention depends on all preceding tokens. The same document placed first in one request and third in another has an entirely different "preceding context," which means the KV cache stored for it is, in principle, wrong. And you cannot guarantee a fixed retrieval order — a search engine may return different rankings each time. This is the *non-prefix KV reuse* problem: how do you let a pre-computed, positionally unconstrained document cache be arbitrarily spliced together and used directly, while keeping storage and bandwidth costs low? Wave after wave of work over the years has chewed on this bone without fully finishing it.
+
+* Source Map
+
+#+begin_example
+[2023-11] Gim et al. - Prompt Cache
+[2023-12] Zheng et al. - SGLang / RadixAttention
+  |
+  | Problem: only reuses "exactly matching prefixes";
+  |          reorder documents and the entire cache is invalid
+  | (This line of thinking adds rules/indices but never solves
+  |  the ordering problem itself)
+  v
+[2024-05] Yao et al. - CacheBlend  (arXiv:2405.16444)
+  |
+  | Problem: training-free "partial recompute" to correct
+  |          splicing errors; the less you recompute, the more
+  |          residual bias remains; stacked with compression it breaks
+  v
+[2024-09] Sun & Wang et al. - Block-Attention  (arXiv:2409.15355)
+  |
+  | Problem: skips recomputation; fine-tunes the whole model
+  |          to learn "attend within independent blocks"; but
+  |          fine-tuning hurts general capability (LongBench -10.4%),
+  |          and every new base model requires a fresh fine-tuning run
+  v
+[2025-02] Yang et al. - KVLink  (arXiv:2502.16002)
+  |
+  | Problem: uses trainable "link tokens" + position re-encoding
+  |          to fix Block-Attention's cross-document bridging;
+  |          compression and training cost are still two separate concerns
+  v
+[2026-07] Du et al. - C2KV  (target paper, arXiv:2607.17715)
+        Solves both "reuse" and "compression" simultaneously with a
+        frozen base model + lightweight bypass Extractor; base
+        parameters untouched; arbitrary-order splicing is native
+#+end_example
+
+(Note: CacheBlend's critique of Prompt Cache / SGLang-style prefix-cache methods is inferred from its problem statement rather than verbatim citation. Block-Attention's critique of CacheBlend and KVLink's critique of Block-Attention both appear as direct comparisons in those papers' original text and are considered reliable.)
+
+* Evolutionary Narrative
+
+** 2023 | Prompt Cache / RadixAttention: Push "prefix reuse" to its limit
+
+*** What problem did it see?
+
+Early KV caches were one-shot — compute this request, discard the cache, recompute the same prefix next time. Prompt Cache pre-computed common system prompts and templates as "modules" and stored them. RadixAttention used a radix tree to automatically identify and reuse any shared prefix across requests, with no manual annotation required.
+
+*** Its solution
+
+Both methods fundamentally "trust the prefix": if two requests share an identical token sequence at the front, the attention computation over that segment is identical and can be copied over exactly — losslessly.
+
+*** Why it works (and where it buries a new problem)
+
+This is the safest form of reuse because it never violates the causal assumption of attention — the prefix genuinely has not changed, so the result genuinely is correct. But it requires that both content and position match exactly. In a RAG scenario the same document might appear first in one request and third in another; there is no shared prefix to speak of, and these methods fail outright. The problem shifts to: can a cached segment be detached from its original position and re-spliced arbitrarily?
+
+** 2024-05 | CacheBlend: Allow arbitrary ordering, at the cost of "patching" a subset
+
+*** What problem did it see?
+
+The fatal weakness of prefix methods is "position must match." CacheBlend wants to concatenate the KV caches of several documents directly, regardless of where they originally appeared or where they land now. But naive concatenation is flawed: each token's KV values implicitly encode "what came before it," and changing neighbors means those values should change — reusing old values as-is introduces bias.
+
+*** Its solution
+
+CacheBlend does not aim for exactness; it aims for good enough. It runs one layer, identifies which tokens have the largest KV deviation ("high-deviation tokens"), recomputes only that small subset, and propagates the rest from the old cache; it repeats this layer by layer, with a shrinking recompute fraction. In effect: "patch wherever the error is worst, copy everything else."
+
+*** Why it works (and where it buries a new problem)
+
+Most tokens' semantics are relatively insensitive to their immediate neighbors (function words, common collocations, etc.); only a small number of salient tokens are strongly context-dependent. Recomputing just those saves most of the computation. But this also means: as long as you do not recompute everything, some uncorrected bias remains — the paper calls it "inherent KV deviation," and it grows as the recompute fraction shrinks. Worse, this approach handles only "splicing" and ignores "compression." If you want to also compress each document's KV cache before storing it (e.g., layering SnapKV on top), CacheBlend's patching mechanism breaks down completely: the paper reports HotpotQA scores dropping from 0.297 to 0.053. Compression plus reuse together causes outright collapse.
+
+** 2024-09 | Block-Attention: Skip patching; train the model to "see in blocks"
+
+*** What problem did it see?
+
+Block-Attention argues that CacheBlend's after-the-fact patching is symptomatic treatment: as long as recomputation is incomplete, bias never fully disappears. It takes a different angle — rather than fixing the output after encoding, make the model natively understand independently encoded document blocks from the start.
+
+*** Its solution
+
+Inputs are split into independent blocks, each encoded in isolation (blocks cannot attend to one another); only the final block can attend to the concatenated result of all preceding blocks. Each block's position encoding is re-indexed according to its actual position in the final sequence. Because a Transformer trained with full-context attention has never seen this block-isolated attention pattern, it cannot read inputs encoded this way — so the team uses block fine-tuning to adapt the model to this regime.
+
+*** Why it works (and where it buries a new problem)
+
+The bias is eliminated at the root: the model was trained to "see in blocks," so there are no stale values that "should have been updated but weren't." In principle, accuracy can match full recomputation. The cost, however, is touching the model's own parameters — the paper self-reports that Llama3.1-8B after block fine-tuning drops 10.4% on LongBench, meaning the model's general capability is sacrificed for this computational saving. And whenever a new base model appears (several times a year in the open-source world), the fine-tuning must be rerun from scratch, an impossible pace to keep. The question becomes: can we eliminate bias without harming general capability?
+
+** 2025-02 | KVLink: Don't fine-tune the whole model; a few "link tokens" will do
+
+*** What problem did it see?
+
+Block-Attention's block fine-tuning is overkill — to teach the model to splice documents, it retrains the entire model, dragging general capability down with it. Moreover, it only removes position encodings and fine-tunes; it has no dedicated mechanism for "how one document should connect to the next," so cross-document bridging remains suboptimal.
+
+*** Its solution
+
+KVLink introduces a set of trainable special tokens inserted between documents. These tokens are dedicated to "reconstructing," at inference time, the inter-document associations that full attention would otherwise provide. Simultaneously, the KV cache position encodings are adjusted to reflect the actual positions after splicing — without retraining the base model's parameters.
+
+*** Why it works (and where it buries a new problem)
+
+Only a small number of "connector" tokens are trained; the main model parameters are largely unchanged, so general capability is better preserved and training cost is far lower than full fine-tuning. But it still addresses only the "splicing" half of the problem. If you also want to compress each document's cache to save storage, KVLink has not treated compression as a first-class citizen — compression and reuse remain two separate systems bolted together, and once combined they can still conflict with each other.
+
+** 2026-07 | C2KV (target paper): Design "compression" and "composability" as one unified thing
+
+*** What problem did it see?
+
+Looking back at this lineage, a pattern emerges: CacheBlend solved "arbitrary ordering" but left bias; Block-Attention / KVLink solved "bias" but required touching the model or incurred training cost; and virtually none of these methods seriously addressed "compression." Once you want to store smaller caches (storage and bandwidth are the real bottlenecks in long-context settings), naively stacking a general-purpose compression method such as SnapKV breaks every reuse scheme, because those compression methods produce representations that are tightly bound to their original full context — when the context is re-spliced, the selection patterns that compression relied on no longer align.
+
+*** Its solution
+
+C2KV leaves all original document tokens entirely untouched (their KVs remain exactly what the frozen base model computes) and instead inserts a set of "compression tokens" (C2Tokens) at a fixed stride (e.g., one every k tokens). These tokens carry no lexical meaning; they are pure learnable placeholders. At each layer, these placeholder tokens receive a dedicated set of new, trainable Q/K/V projections (original document tokens continue to use the frozen projections), and attention masks strictly govern information flow: document tokens cannot attend to compression tokens (keeping the original cache uncontaminated); compression tokens attend only within their own block (making the compression ratio precisely controllable); compression tokens can attend to one another sequentially (allowing the compressed representation to accumulate document-wide context). At inference time, only the KV of these compression tokens is stored; their position indices are renumbered to match the new spliced order and concatenated directly — no patching, no base-model fine-tuning, only this small bypass (~10% of parameters) is ever trained.
+
+*** Why it works (and where the remaining gaps are)
+
+The key is division of labor: correctness of the original document tokens is guaranteed by "frozen base model + unidirectional isolation" (inheriting Block-Attention's advantage of zero residual bias), while compression and composability are handled by a small set of newly added, purpose-trained tokens designed from the ground up for arbitrary splicing order (avoiding the base-model modification and capability degradation of Block-Attention / KVLink). In other words, C2KV folds "compression" — the dimension that nearly every prior reuse method ignored — into the same tokens and the same training pass as "reuse," rather than treating them as independent systems to be combined afterwards. Remaining limitations: the per-layer Q/K/V projections are still a bypass module that must be retrained for each new base model, which, while far cheaper than full fine-tuning, does not fully escape the "change base model → re-adapt" problem this entire lineage has never resolved. Additionally, the compression stride k is a fixed block granularity; the paper does not discuss whether content-adaptive compression ratios are feasible.
+
+* Frontier Extensions
+
+C2KV was submitted in July 2026, and no follow-up work explicitly citing or critiquing it has been found within the search scope. As of now, this is the latest development on the "non-prefix KV reuse" evolutionary line with respect to co-designing compression and reuse.
+
+* One Figure to Understand It All
+
+#+begin_example
+                 Arbitrary order?   Zero bias?     Base model frozen?  Compression-compatible?
+                 ---------------   ----------     ------------------  -----------------------
+PromptCache/          X               O                  O                     -
+RadixAttention    (prefix only)    (exact match)     (no training)
+
+CacheBlend            O               X                  O                     X
+                  (any splice)    (patch leaves     (training-free)      (collapses when stacked)
+                                   residual bias)
+
+Block-Attention       O               O                  X                     -
+                  (block encode)  (arch-level fix)  (full model FT)
+
+KVLink                O               O               Partial                  X
+                  (block encode)  (arch-level fix)  (link tokens only)    (not designed for)
+
+C2KV                  O               O                  O                     O
+(target paper)    (any splice)    (orig. tokens     (10% bypass only)   (same token set)
+                                   unchanged)
+#+end_example
+
+Reading across the rows: "arbitrary order" was solved by CacheBlend as early as 2024; achieving "zero bias + frozen base model" simultaneously took from Block-Attention through KVLink — roughly a year of incremental progress; and the "compression-compatible" column is essentially blank for the first four papers. C2KV fills precisely that cell.
+
+* Insight
+
+What is really changing along this lineage is not that "reuse techniques keep getting stronger" — it is that the field's understanding of "what should be modified and what should not" keeps getting sharper. The earliest thinking was blunt: prefix methods touch nothing and only activate when there is a perfect match; CacheBlend swung to the opposite extreme, patching everywhere after the fact; Block-Attention swung back to drastic action, retraining the entire model. By KVLink and C2KV, the thinking converges on a single principle: "freeze almost everything; train only at a minimal, purpose-built interface." Whether compression and reuse can coexist is, at its core, the same question viewed from another angle: general-purpose compression methods conflict with reuse because their selection patterns are tightly coupled to the original context; C2KV's answer is to design the "compression unit" from scratch as a context-decoupled placeholder that exists solely to be spliced. Underlying all of this is an increasingly clear systems-design philosophy: anchor correctness in the frozen, trustworthy part; delegate flexibility to a small, specialized trainable bypass. The natural next step is to make that bypass more adaptive — dynamically adjusting the compression stride k based on document importance, or enabling a single Extractor to transfer to a new base model without full retraining.
+
+* Inspiration
+
+The biggest methodological lesson from this evolutionary line is about *how to find problems*. When you notice that several methods in a domain each leave a gap on a different dimension (ordering, bias, training cost, compression), the productive move is not to out-compete them on any single dimension. Instead, draw a matrix like the one above, and find the column that is still empty. C2KV's existence depends largely on the fact that it did not compete with its predecessors on "splicing accuracy" or "training efficiency" — it fixed its gaze on the "compression-compatible" column that almost no one had seriously addressed. The practical takeaway: once you have four or five representative papers from a field, resist the urge to immediately brainstorm new methods. First, place all the papers in a shared capability matrix and align them. The empty cells are usually where the next paper belongs.
