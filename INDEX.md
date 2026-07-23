@@ -1,5 +1,6 @@
 # Digest History Index
 
+- [07-22](digests/2026-07-22.md) — 204 scanned, 0 passed, top: (no papers passed)
 - [07-21](digests/2026-07-21.md) — 222 scanned, 0 passed, top: (no papers passed)
 - [07-20](digests/2026-07-20.md) — 174 scanned, 2 passed, top: C$^2$KV: Compressed and Composable KV Cache Reuse 
 - [07-19](digests/2026-07-19.md) — 129 scanned, 0 passed, top: (no papers passed)
