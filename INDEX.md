@@ -38,9 +38,9 @@
 - [06-17](digests/2026-06-17.md) — 260 scanned, 0 passed, top: (no papers passed)
 - [06-16](digests/2026-06-16.md) — 262 scanned, 3 passed, top: Tangram: Unlocking Non-Uniform KV Cache Compressio
 - [06-15](digests/2026-06-15.md) — 329 scanned, 0 passed, top: (no papers passed)
-- [06-14](digests/2026-06-14.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-13](digests/2026-06-13.md) — 50 scanned, 0 passed, top: (no papers passed)
-- [06-12](digests/2026-06-12.md) — 89 scanned, 0 passed, top: (no papers passed)
+- [06-14](digests/2026-06-14.md) — 185 scanned, 5 passed, top: How to Score Experts for One-Shot MoE Expert Pruni
+- [06-13](digests/2026-06-13.md) — 164 scanned, 2 passed, top: Beyond Layer Importance in Layer-wise Sparsity: An
+- [06-12](digests/2026-06-12.md) — 239 scanned, 2 passed, top: Realizing Native INT8 Compute for Diffusion Transf
 - [06-11](digests/2026-06-11.md) — 285 scanned, 4 passed, top: ReSET: Accurate Latency-Critical NVFP4 Reasoning v
 - [06-10](digests/2026-06-10.md) — 278 scanned, 1 passed, top: Holding the FP8 Quality Ceiling at 8-Bit Weights a
 - [06-09](digests/2026-06-09.md) — 313 scanned, 8 passed, top: SpenseGPT: Practical One-shot Pruning Enabling Spa
