@@ -81,7 +81,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "page_title": "# LLM 推理优化日报 · {date}\n",
         "window_line": "> 📅 窗口：{date}（UTC daily）",
         "scan_line": (
-            "> 📊 扫描 {scanned} 篇 → 未被 hard_gate {surviving}"
+            "> 📊 {sources} → 去重 {scanned} 篇 → 未被 hard_gate {surviving}"
             " → 精选 {highlighted}（按主题上限）"
             " · 👤 {watched} 篇来自关注作者"
         ),
@@ -115,7 +115,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "page_title": "# LLM Inference Optimization Daily · {date}\n",
         "window_line": "> 📅 Window: {date} (UTC daily)",
         "scan_line": (
-            "> 📊 Scanned {scanned} papers → passed hard_gate {surviving}"
+            "> 📊 {sources} → deduped {scanned} papers → passed hard_gate {surviving}"
             " → surfaced {highlighted} (per-topic cap)"
             " · 👤 {watched} from watched authors"
         ),
@@ -203,6 +203,31 @@ def _bucket_of(p: Paper) -> str:
     if bucket in BUCKET_TITLES:
         return bucket
     return UNBUCKETED
+
+
+# Preferred display order for the funnel line; sources not listed here
+# (shouldn't happen — SourceRecord.name is a closed Literal) sort last.
+_SOURCE_DISPLAY_ORDER = ["arxiv", "hf_daily", "openreview", "arxiv_authors"]
+
+
+def _source_counts(papers: list[Paper]) -> dict[str, int]:
+    """Count papers per originating source. A paper found by more than one
+    source (e.g. posted to arXiv and also HF Daily) counts once per source,
+    so the sum of counts can exceed len(papers) — mirrors how dedup merges
+    `sources` onto a single Paper rather than dropping the duplicate."""
+    counts: dict[str, int] = {}
+    for p in papers:
+        for name in {s.name for s in p.sources}:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _format_source_breakdown(counts: dict[str, int]) -> str:
+    """Render `_source_counts` as 'arxiv (138) + hf_daily (84)', ordered by
+    `_SOURCE_DISPLAY_ORDER` with zero-count sources omitted."""
+    ordered = [n for n in _SOURCE_DISPLAY_ORDER if counts.get(n)]
+    ordered += [n for n in counts if n not in _SOURCE_DISPLAY_ORDER and counts[n]]
+    return " + ".join(f"{name} ({counts[name]})" for name in ordered) or "0"
 
 
 def _passed_gate(p: Paper) -> bool:
@@ -649,6 +674,7 @@ def _render_detail_md(
     highlighted_total: int,
     lang: str = "zh",
     paper_river_dir: Path | None = None,
+    source_counts: dict[str, int] | None = None,
 ) -> str:
     s = STRINGS[lang]
     date_str = date.strftime("%Y-%m-%d")
@@ -657,6 +683,7 @@ def _render_detail_md(
     body.append(s["window_line"].format(date=date_str))
     body.append(
         s["scan_line"].format(
+            sources=_format_source_breakdown(source_counts or {}),
             scanned=scanned,
             surviving=len(surviving),
             highlighted=highlighted_total,
@@ -712,6 +739,7 @@ def _render_compact_md(
     surviving: list[Paper],
     digest_filename: str,
     en_digest_filename: str | None = None,
+    source_counts: dict[str, int] | None = None,
 ) -> str:
     """Compact README view: header + one bucketed table covering everything
     that passed hard_gate. Watched-author papers sort into their topic bucket
@@ -729,7 +757,8 @@ def _render_compact_md(
     body.append(f"# LLM Inference Optimization Daily · {date.strftime('%Y-%m-%d')}\n")
     body.append(f"> 📅 Publication date: {date.strftime('%Y-%m-%d')} (UTC)")
     body.append(
-        f"> 📊 Scanned {scanned} papers → passed hard_gate {len(surviving)}"
+        f"> 📊 {_format_source_breakdown(source_counts or {})}"
+        f" → deduped {scanned} papers → passed hard_gate {len(surviving)}"
         f" · 👤 {watched_count} from watched authors"
     )
     body.append("")
@@ -754,15 +783,16 @@ def _render_compact_md(
 
 def _compute_day(
     summarized_path: Path,
-) -> tuple[int, list[Paper], list[Paper]]:
-    """Read a summarized JSON and return (scanned, watched, surviving).
+) -> tuple[int, list[Paper], list[Paper], dict[str, int]]:
+    """Read a summarized JSON and return (scanned, watched, surviving, source_counts).
     Side-effect free — does NOT write a digest file. Use this from any
-    caller that only needs the in-memory triple (e.g. rollup queries)."""
+    caller that only needs the in-memory data (e.g. rollup queries)."""
     all_papers = [Paper.model_validate(p) for p in json.loads(summarized_path.read_text())]
     scanned = len(all_papers)
     watched_papers = sort_papers([p for p in all_papers if _watched_meta(p) is not None])
     surviving = sort_papers([p for p in all_papers if _passed_gate(p)])
-    return scanned, watched_papers, surviving
+    source_counts = _source_counts(all_papers)
+    return scanned, watched_papers, surviving, source_counts
 
 
 def _load_day(
@@ -771,11 +801,12 @@ def _load_day(
     digests_dir: Path,
     topic_caps: dict[str, int],
     paper_river_dir: Path | None = None,
-) -> tuple[int, list[Paper], list[Paper]]:
-    """Write the per-day digest file(s) and return (scanned, watched, surviving)
-    for downstream README rendering. Always writes the Chinese <date>.md;
-    additionally writes <date>_en.md when any paper has summary_en data."""
-    scanned, watched_papers, surviving = _compute_day(summarized_path)
+) -> tuple[int, list[Paper], list[Paper], dict[str, int]]:
+    """Write the per-day digest file(s) and return (scanned, watched, surviving,
+    source_counts) for downstream README rendering. Always writes the Chinese
+    <date>.md; additionally writes <date>_en.md when any paper has summary_en
+    data."""
+    scanned, watched_papers, surviving, source_counts = _compute_day(summarized_path)
     watched_ids = {p.id for p in watched_papers}
     topic_pool = [p for p in surviving if p.id not in watched_ids]
     grouped = _group_with_caps(topic_pool, topic_caps)
@@ -796,9 +827,10 @@ def _load_day(
             highlighted_total,
             lang,
             paper_river_dir,
+            source_counts,
         )
         (digests_dir / f"{date_str}{suffix}.md").write_text(text)
-    return scanned, watched_papers, surviving
+    return scanned, watched_papers, surviving, source_counts
 
 
 _INDEX_LINE_DATE_RE = re.compile(r"\]\(digests/(\d{4}-\d{2}-\d{2})\.md\)")
@@ -840,7 +872,7 @@ def render_daily(
 ) -> None:
     if topic_caps is None:
         topic_caps = {"ptq": 5, "_default": 2}
-    scanned, watched_papers, surviving = _load_day(
+    scanned, watched_papers, surviving, source_counts = _load_day(
         date, summarized_path, digests_dir, topic_caps, paper_river_dir
     )
     date_str = date.strftime("%Y-%m-%d")
@@ -854,6 +886,7 @@ def render_daily(
         surviving,
         digest_filename=digest_filename,
         en_digest_filename=en_filename,
+        source_counts=source_counts,
     )
     # Don't let re-rendering an OLDER day pull the README's LATEST block
     # backwards. A backfill that recovers several past days renders them one by
@@ -872,7 +905,7 @@ def render_daily(
 
 
 def _render_aggregated_compact_md(
-    days: list[tuple[datetime, int, list[Paper], list[Paper]]],
+    days: list[tuple[datetime, int, list[Paper], list[Paper], dict[str, int]]],
     digests_dir: Path,
 ) -> str:
     """N-day rollup compact view: one merged table sorted by bucket (then the
@@ -883,7 +916,11 @@ def _render_aggregated_compact_md(
     days_sorted = sorted(days, key=lambda x: x[0], reverse=True)  # newest first
     start_date = min(d[0] for d in days)
     end_date = max(d[0] for d in days)
-    total_scanned = sum(s for _, s, _, _ in days)
+    total_scanned = sum(s for _, s, _, _, _ in days)
+    total_source_counts: dict[str, int] = {}
+    for _, _, _, _, source_counts in days:
+        for name, count in source_counts.items():
+            total_source_counts[name] = total_source_counts.get(name, 0) + count
 
     pairs: list[tuple[datetime, Paper]] = []
     seen_ids: set[str] = set()
@@ -891,7 +928,7 @@ def _render_aggregated_compact_md(
     # paper the LLM judge has marked hard_gate=True (out of scope) is
     # noise — keep it out of the rollup table even if a watched author is
     # on the author list.
-    for date, _, _watched, surviving in days_sorted:
+    for date, _, _watched, surviving, _src in days_sorted:
         for p in surviving:
             if p.id in seen_ids:
                 continue
@@ -912,7 +949,8 @@ def _render_aggregated_compact_md(
     body.append(f"# LLM Inference Optimization Daily · {title_suffix}\n")
     body.append(f"> 📅 Window: {span}")
     body.append(
-        f"> 📊 Scanned {total_scanned} papers → surfaced {len(pairs)}"
+        f"> 📊 {_format_source_breakdown(total_source_counts)}"
+        f" → deduped {total_scanned} papers → surfaced {len(pairs)}"
         f" · 👤 {watched_count} from watched authors"
     )
     body.append("")
@@ -949,13 +987,13 @@ def render_aggregated(
     N-day table into README."""
     if topic_caps is None:
         topic_caps = {"ptq": 5, "_default": 2}
-    days: list[tuple[datetime, int, list[Paper], list[Paper]]] = []
+    days: list[tuple[datetime, int, list[Paper], list[Paper], dict[str, int]]] = []
     for date, in_path in targets:
-        scanned, watched, surviving = _load_day(
+        scanned, watched, surviving, source_counts = _load_day(
             date, in_path, digests_dir, topic_caps, paper_river_dir
         )
         _update_index(date, index_path, scanned, surviving)
-        days.append((date, scanned, watched, surviving))
+        days.append((date, scanned, watched, surviving, source_counts))
         print(f"render: wrote digest for {date.date()}")
     if not days:
         return

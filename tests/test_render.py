@@ -265,7 +265,7 @@ def test_render_aggregated_merges_n_days_into_single_readme_table(tmp_path: Path
     # own day's digest.
     content = readme.read_text()
     assert "3-day · 2026-05-11 → 2026-05-13" in content
-    assert "Scanned 5 papers → surfaced 5" in content
+    assert "arxiv (5) + hf_daily (5) → deduped 5 papers → surfaced 5" in content
     for day, ids in [(11, ["a1", "a2"]), (12, ["b1"]), (13, ["c1", "c2"])]:
         for pid in ids:
             assert f"digests/2026-05-{day}.md#p-{pid}" in content
